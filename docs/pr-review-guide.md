@@ -10,7 +10,7 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - 開 **Dismiss stale pull request approvals when new commits are pushed**（取代 v1.7 嘅「確認綁定 commit hash」）。
 - 開 **Require approval of the most recent reviewable push**，最後 push 嘅人唔可以自己批准。
 - 開 **Require review from Code Owners**。
-- **Bypass list**：`main` ruleset 可以保留 OrganizationAdmin bypass（日常 `--admin` merge 唔變；spec 決定 96 修訂，待產品經理確認）。SDK 唔會檢查 `main` 嘅 bypass；`--release-approval` 實作之後，高風險 release 先會獨立驗證 PR review 同 tree 相等，令 admin bypass merge 出唔到高風險 release（`--release-approval` 未實作，實作之前唔成立，今日冇保護）。
+- **Bypass list**：`main` ruleset 可以保留 OrganizationAdmin bypass（日常 `--admin` merge 唔變；spec 決定 96 修訂，已確認（產品經理 2026-10-14））。SDK 唔會檢查 `main` 嘅 bypass；`--release-approval` 實作之後，高風險 release 先會獨立驗證 PR review 同 tree 相等，令 admin bypass merge 出唔到高風險 release（`--release-approval` 未實作，實作之前唔成立，今日冇保護）。
 - 以上 required review 同 up-to-date 設定照樣一定要開。
 
 ## 1A. Release tag ruleset（`v*`，spec 決定 96）

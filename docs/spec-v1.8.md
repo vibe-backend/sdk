@@ -2,7 +2,7 @@
 
 <!-- spec-status: draft -->
 >
-> 狀態：草稿，喺 v1.7 定稿基礎上修改，基準係 vibe-backend/sdk main `4239c95` 嘅 `docs/spec-v1.7.md`（相對 merge commit `df378ce`，只有第 1 節目錄改成樹狀圖，已經包含喺本稿）。新決定 73–96 全部待產品經理確認；確認之前 v1.7 照樣係有效定稿。網站 `/latest/` 照樣指 v1.7（呢份文件有 `spec-status: draft` 標記，build 時唔會成為 latest，決定 94）。
+> 狀態：草稿，喺 v1.7 定稿基礎上修改，基準係 vibe-backend/sdk main `4239c95` 嘅 `docs/spec-v1.7.md`（相對 merge commit `df378ce`，只有第 1 節目錄改成樹狀圖，已經包含喺本稿）。新決定 73–119 已經由產品經理確認（2026-10-14；決定 80、116 已取代）；文件仍然係草稿（`spec-status: draft`），v1.8 正式定稿之前 v1.7 照樣係有效定稿。網站 `/latest/` 照樣指 v1.7（呢份文件有 `spec-status: draft` 標記，build 時唔會成為 latest，決定 94）。
 >
 > 核心架構：所有定義（model、method、api、pipeline、provider、migration）嘅 source `.md` 一律用自然語言寫。編譯流程係「自然語言 source `.md` → 結構化 lock markdown（`{name}.lock.md`）→ 簽名 manifest」。lock md 係 runtime 唯一依據，runtime 永遠唔會解譯自然語言。
 >
@@ -55,8 +55,8 @@
 | 4 | 取消「public endpoint 只可以 call `writes: false` method」嘅限制（風險控制見 7.2；剩餘風險由後續版本內容審核 hook 處理）。 | 7.2、12.6 |
 | 5 | `sign-token` 放喺 model 層做 method（例如 `user.sign-token`）；`auth` 類 pipeline 透過呼叫 model method 做嘢。 | 4、12.6、12.8 |
 | 9 | api 層都可以用自然語言寫。 | 2 |
-| 10 | （v1.8 由決定 77 修訂，待產品經理確認）SDK 唔再分自動／人手確認；CI 由 source build 出嚟嘅所有 lock（structured 或者 natural）通過驗證器同決定 114 policy，而且 artifact 有決定 113 attestation，就可以部署（決定 117：lock 唔 commit，冇重編比對）。「係咪 structured」照樣由 deterministic parser 判斷，只影響使唔使 call LLM。 | 2A.5 |
-| 11 | （v1.8 由決定 77 修訂，待產品經理確認）SDK 冇確認角色；邊個可以 merge 由 Git 平台 rulesets（分支規則） 決定（見 9C 同 [`pr-review-guide.md`](pr-review-guide.md)）。 | 2A.5 |
+| 10 | （v1.8 由決定 77 修訂，已確認（產品經理 2026-10-14））SDK 唔再分自動／人手確認；CI 由 source build 出嚟嘅所有 lock（structured 或者 natural）通過驗證器同決定 114 policy，而且 artifact 有決定 113 attestation，就可以部署（決定 117：lock 唔 commit，冇重編比對）。「係咪 structured」照樣由 deterministic parser 判斷，只影響使唔使 call LLM。 | 2A.5 |
+| 11 | （v1.8 由決定 77 修訂，已確認（產品經理 2026-10-14））SDK 冇確認角色；邊個可以 merge 由 Git 平台 rulesets（分支規則） 決定（見 9C 同 [`pr-review-guide.md`](pr-review-guide.md)）。 | 2A.5 |
 | 12 | 單一職責上限係 warning。 | 12.3a、10 |
 | 13 | 軟刪除永遠唔會實際刪除資料，冇 purge。v1.8 澄清（已確認（產品經理 2026-10-14））：決定 13 只管用戶 API 同用戶資料；平台系統表（例如決定 104 嘅 `_platform_idempotency`）由 runtime 按 TTL 清理，唔受決定 13 限制。 | 12.9 |
 | 14 | CRUD 嘅 list 用 offset 分頁（保留 page-size 上限）。 | 12.9 |
@@ -69,8 +69,8 @@
 | 16 | （v1.8 由決定 112 修訂：高風險欄位一定要喺 frontmatter 宣告）安全設定照用自然語言寫，**唔強制**結構化 frontmatter；防線係 frontmatter 高風險宣告（決定 112）、獨立驗證器、決定 114 deterministic policy、決定 113 attestation（build once, promote，決定 118；LLM 輸出唔決定性，所以冇重編比對）同 runtime 限制（v1.8 決定 77：SDK 唔再做人手 review，已確認（產品經理 2026-10-14））。 | 2.2、2A.5、2A.7 |
 | 17 | 編譯器輸出一定要通過獨立、deterministic 嘅驗證器（唔靠 LLM 自律）；編譯器冇任何工具權限，網絡只准連編譯用 LLM endpoint 嘅 host（v1.7 決定 57 修訂）；source 入面似指令嘅句子（prompt injection 模式）出 warning 並喺 PR 高亮。 | 2A.7、10.9 |
 | 18 | 編譯用嘅 model pin 死 snapshot；compiler-hash（model snapshot + prompt + 編譯器版本）寫入 lock；（v1.8 決定 113、117：唔再做重編比對，部署靠 attestation 同決定 114 policy）；會改變輸出嘅 minor 升級當 major 處理。 | 2A.1、2A.6 |
-| 19 | （v1.8 由決定 78 修訂，待產品經理確認）安全項目由驗證器 deterministic 抽出，寫入 lock 同部署報告做資訊性高亮；唔再要求逐項確認人、兩個非作者或者 PR 數量上限；PR 同部署報告照樣顯示有效權限摘要。 | 2A.5、10.10 |
-| 20 | 「係咪 structured」由 deterministic parser 判斷（v1.8 決定 77 修訂，待產品經理確認：唔再影響確認，只決定編譯使唔使 call LLM）。 | 2A.5 |
+| 19 | （v1.8 由決定 78 修訂，已確認（產品經理 2026-10-14））安全項目由驗證器 deterministic 抽出，寫入 lock 同部署報告做資訊性高亮；唔再要求逐項確認人、兩個非作者或者 PR 數量上限；PR 同部署報告照樣顯示有效權限摘要。 | 2A.5、10.10 |
+| 20 | 「係咪 structured」由 deterministic parser 判斷（v1.8 決定 77 修訂，已確認（產品經理 2026-10-14）：唔再影響確認，只決定編譯使唔使 call LLM）。 | 2A.5 |
 | 21 | Public 寫入收緊：每租戶每日寫入配額（強制）；建立資料嘅 endpoint 要 captcha 或者 proof-of-work；一律 audit-log；配額用完只封鎖 public 寫入。 | 7.2 |
 | 22 | Public 寫入只准 INSERT 同 UPDATE 明確列出嘅欄位；平台黑名單封鎖敏感欄位（role、permissions、tenant、owner 等）；UPDATE 一定要有 WHERE 同 RLS。 | 7.2、10.7 |
 | 23 | Public 寫入嘅 `tenant_id` 由平台按 slug 注入；body 含 `tenant_id`、`id`、`created_by` 一律拒絕。 | 7.2 |
@@ -78,7 +78,7 @@
 | 25 | Public 路徑預設禁止對外 call；昂貴 step 用更嚴嘅限流。 | 7.2 |
 | 26 | `public_write_access` 只可以由租戶 admin 喺平台 UI 開啟。 | 7.2 |
 | 27 | 所有 lock 禁止 DDL 同 TRUNCATE（migration 另外處理）；UPDATE 一定要用主鍵或者 RLS 限定範圍；DB role 冇 DELETE／TRUNCATE 權限。 | 2A.4、7.1、10.8 |
-| 28 | （v1.8 由決定 77 取代，待產品經理確認）SDK 冇 commit hash 綁定嘅確認；建議喺 Git 平台開「有新 commit 就撤銷 approval」（見 [`pr-review-guide.md`](pr-review-guide.md)）。 | 2A.5 |
+| 28 | （v1.8 由決定 77 取代，已確認（產品經理 2026-10-14））SDK 冇 commit hash 綁定嘅確認；建議喺 Git 平台開「有新 commit 就撤銷 approval」（見 [`pr-review-guide.md`](pr-review-guide.md)）。 | 2A.5 |
 | 29 | CODEOWNERS 必須（v1.8 照舊，唔係建議）：`api/`、`models/`、`migrations/`、`providers/`、`pipelines/`、`.github/`、`.compiler/`，同埋編譯器、驗證器版本設定，一定要有 CODEOWNERS 覆蓋，改動要 code owner review；release build 會檢查（決定 93）。Release manifest 用 Sigstore keyless（決定 119），只喺要 Jack 批准嘅 `release` environment 用 release workflow 嘅 GitHub OIDC 身份簽（決定 79、89、118）。 | 9B |
 | 30 | Token 簽發喺 lock 明確標示 capability 旗標（唔靠 method 名推斷）；claim 白名單；roles 同 tenant_id 由平台從 DB 讀；exp 有上限；key 只用引用。 | 12.6 |
 | 31 | 新增緊急 kill switch，可以停用個別 endpoint（回 503、寫審計、唔使重新部署）。 | 9A |
@@ -91,8 +91,8 @@
 | 6 | Refresh token 每次使用都輪換；重用舊 token 會撤銷成個 token 家族；登出可以 revoke。refresh token ttl 上限 30 日（家族絕對壽命），閒置 7 日失效；access token 上限 1 小時。 | 4A |
 | 7 | 平台密碼底線：最少 12 個字元，加洩漏密碼檢查；物件只可以收緊，唔可以放寬。 | 4A |
 | 8 | 15 分鐘內失敗 5 次就鎖帳戶 15 分鐘，另加 IP 限流。防惡意鎖帳戶：同一帳戶 15 分鐘內失敗 3 次之後要 captcha；鎖定期間經 email 連結重設密碼可以即時解鎖；鎖定期間回應同密碼錯完全一樣。 | 4A |
-| 33 | （v1.8 由決定 77 取代，待產品經理確認）SDK 冇雙人確認，細團隊規則唔再適用；需要雙人 review 由 rulesets（分支規則） 設定。 | 2A.5 |
-| 34 | （v1.8 由決定 78 取代，待產品經理確認）取消每個 PR 安全項目上限。 | 2A.5 |
+| 33 | （v1.8 由決定 77 取代，已確認（產品經理 2026-10-14））SDK 冇雙人確認，細團隊規則唔再適用；需要雙人 review 由 rulesets（分支規則） 設定。 | 2A.5 |
+| 34 | （v1.8 由決定 78 取代，已確認（產品經理 2026-10-14））取消每個 PR 安全項目上限。 | 2A.5 |
 | 35 | Model snapshot：平台承諾 snapshot 喺宣布淘汰之後最少保留 12 個月，項目有 90 日遷移窗口；窗口內舊 lock 照常有效。Golden corpus 由平台編譯器團隊維護（最少 500 個案例），項目可以加自己嘅案例。 | 2A.6 |
 | 36 | Public 最低回應耗時：一般 300ms，login 類 500ms；實際超過只出 warning，唔係 error。 | 7.2、10.9 |
 | 37 | 語意一致性檢查（lock 多過 source）係 error；prompt injection 規則命中係 warning，項目可以喺受 CODEOWNERS 保護嘅 allowlist 加精確句子豁免（v1.8 照舊：`.compiler/injection-allowlist` 一定要有 CODEOWNERS 覆蓋，release build 檢查，決定 93）。零寬／bidi 字元仍然係 error。 | 2A.7 |
@@ -116,7 +116,7 @@
 | 48 | 樂觀鎖用 HTTP `ETag`／`If-Match`：update 一定要帶 `If-Match`，缺少回 428，唔對應回 412；method input 欄位叫 `if_match`，只可以由 `req.header.if-match` 映射。 | 8、12.9 |
 | 49 | challenge 語法統一：`challenge: { type: none \| captcha \| pow, when: always \| after-failures, after-failures: <n> }`；有 INSERT 嘅 public endpoint 一定要 `when: always`。 | 7.2、10.7 |
 | 50 | 私隱刪除流程已經喺 12.10 定義（決定 42），後續版本改為「資料主體自助提交入口」，唔再列「正式流程」。 | 14 |
-| 51 | 新增 `kind: migration`：source `migrations/{provider}/{seq}-{name}.md`，lock `.lock.md`；DDL 只准喺呢度；用臨時 migration role；一律標高風險安全項目（v1.8 決定 78：資訊性，唔再要人手確認，待產品經理確認）；平台自動加 `tenant_id`、RLS、FORCE；DROP 租戶資料要行「棄用 30 日」流程。 | 2B |
+| 51 | 新增 `kind: migration`：source `migrations/{provider}/{seq}-{name}.md`，lock `.lock.md`；DDL 只准喺呢度；用臨時 migration role；一律標高風險安全項目（v1.8 決定 78：資訊性，唔再要人手確認，已確認（產品經理 2026-10-14））；平台自動加 `tenant_id`、RLS、FORCE；DROP 租戶資料要行「棄用 30 日」流程。 | 2B |
 
 ### 0.6 v1.6 修正嘅前後矛盾
 
@@ -176,34 +176,34 @@
 | 71 | `max-page-size` 平台上限 500（model 可以設低，唔可以設高）。 | 已確認（產品經理 2026-10-14） | 12.9 |
 | 72 | Refresh endpoint 分類：public（冇 access token）但唔屬 public 寫入（只寫平台表，唔計 public 寫入配額）；限流 IP 30/min、家族 10/min；最低回應耗時 300ms。 | 已確認（產品經理 2026-10-14） | 4A.1 |
 
-### 0.10 v1.8 新決定（決定 73 起，全部待產品經理確認）
+### 0.10 v1.8 新決定（決定 73 起，已確認（產品經理 2026-10-14））
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
-| 73 | `vibe dev`：本地 web API server，唔使預先編譯。Request 嚟到先按路由搵 `.md`，第一次用先編譯成 lock，cache key 係 source hash 加全部依賴 hash 加 compiler-hash 輸入；file watch 偵測到改動就重編受影響嘅 lock；驗證器每次編譯同每次載入 cache 都跑，唔通過就回 500 並喺 terminal 報錯。 | 待產品經理確認 | 2C.2 |
-| 74 | 正式支援 in-memory 資料庫（Jack 新要求，取代原本「預設內嵌 PostgreSQL」）：`vibe dev` 預設用 in-memory，`vibe serve --memory` 亦用同一個 in-memory 執行器。In-memory 只限開發同測試，server 一停所有資料即刻消失。喺非 dev build-mode 或者 production 環境一律拒絕 in-memory，啟動報錯退出，冇 override（決定 91）。因為 in-memory 係預設 dev 路徑，執行器一定要模擬租戶隔離（RLS＋FORCE 語意）、role grant 同 column grant，令 dev 行為同 production 一致；已知語意差異喺 2C.4 列明；CI 整合測試照樣要對真 PostgreSQL 跑。內嵌 PostgreSQL 保留做 opt-in `--db postgres`，用嚟做保真度測試。 | 待產品經理確認 | 2C.2、2C.4 |
-| 75 | Dev 編譯嘅 lock 同 manifest 一律唔可以部署：lock 記 `build-mode: dev`，manifest 用本機 dev key 簽；production runtime 只接受 Sigstore keyless 簽、身份符合決定 119 嘅 release manifest。2A.8 嘅本地 LLM http 規則只喺 dev 適用。 | 待產品經理確認 | 2C.2、2A.8.4 |
-| 76 | `vibe build`：一個指令做晒編譯（只編譯過時嘅 lock）、驗證、manifest 產生同簽名，冇 reviewer 步驟（審核由 Git 平台設定負責）；（決定 117）lock 係 build 輸出，冇 `--check-determinism`。 | 待產品經理確認 | 2C.3 |
+| 73 | `vibe dev`：本地 web API server，唔使預先編譯。Request 嚟到先按路由搵 `.md`，第一次用先編譯成 lock，cache key 係 source hash 加全部依賴 hash 加 compiler-hash 輸入；file watch 偵測到改動就重編受影響嘅 lock；驗證器每次編譯同每次載入 cache 都跑，唔通過就回 500 並喺 terminal 報錯。 | 已確認（產品經理 2026-10-14） | 2C.2 |
+| 74 | 正式支援 in-memory 資料庫（Jack 新要求，取代原本「預設內嵌 PostgreSQL」）：`vibe dev` 預設用 in-memory，`vibe serve --memory` 亦用同一個 in-memory 執行器。In-memory 只限開發同測試，server 一停所有資料即刻消失。喺非 dev build-mode 或者 production 環境一律拒絕 in-memory，啟動報錯退出，冇 override（決定 91）。因為 in-memory 係預設 dev 路徑，執行器一定要模擬租戶隔離（RLS＋FORCE 語意）、role grant 同 column grant，令 dev 行為同 production 一致；已知語意差異喺 2C.4 列明；CI 整合測試照樣要對真 PostgreSQL 跑。內嵌 PostgreSQL 保留做 opt-in `--db postgres`，用嚟做保真度測試。 | 已確認（產品經理 2026-10-14） | 2C.2、2C.4 |
+| 75 | Dev 編譯嘅 lock 同 manifest 一律唔可以部署：lock 記 `build-mode: dev`，manifest 用本機 dev key 簽；production runtime 只接受 Sigstore keyless 簽、身份符合決定 119 嘅 release manifest。2A.8 嘅本地 LLM http 規則只喺 dev 適用。 | 已確認（產品經理 2026-10-14） | 2C.2、2A.8.4 |
+| 76 | `vibe build`：一個指令做晒編譯（只編譯過時嘅 lock）、驗證、manifest 產生同簽名，冇 reviewer 步驟（審核由 Git 平台設定負責）；（決定 117）lock 係 build 輸出，冇 `--check-determinism`。 | 已確認（產品經理 2026-10-14） | 2C.3 |
 | 77 | SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 刪除 `status`、`approval-mode`、`approved-by`、`approved-at`、`approval-ref`、`approved-commit`；SDK 讀到呢啲舊欄位（包括舊 lock 嘅 `approval-ref`，同決定 90 嘅 build 旗標 `--release-approval` 係兩回事）會忽略並出 warning，唔再以佢哋做部署條件。取代決定 10、11、16（人手 review 部分）、20（人手確認部分）、28、33。 | 已確認（產品經理 2026-10-14） | 2A.1、2A.5、10.1 |
-| 78 | `security-items` 保留，但改為資訊性：驗證器 deterministic 抽出、寫入 lock 同部署報告，方便 PR 高亮同 label；唔再要求逐項確認人、原因、兩個非作者，亦冇每個 PR 5 項上限。取代決定 19（確認部分）、34。 | 待產品經理確認 | 2A.5、10.10 |
+| 78 | `security-items` 保留，但改為資訊性：驗證器 deterministic 抽出、寫入 lock 同部署報告，方便 PR 高亮同 label；唔再要求逐項確認人、原因、兩個非作者，亦冇每個 PR 5 項上限。取代決定 19（確認部分）、34。 | 已確認（產品經理 2026-10-14） | 2A.5、10.10 |
 | 79 | Lock 唔再有 `signature`（lock 完整性靠 `source-hash`、依賴 hash、compiler-hash；v1.8 部署靠決定 113 attestation，決定 117 之後 lock 唔 commit）；manifest 照樣簽名，由 `vibe build` 簽：release 用 Sigstore keyless（決定 119），以 `release` environment（要 Jack 批准；真正閘門係 environment，唔係 tag，見決定 118）入面 release workflow 嘅 GitHub OIDC 身份簽，本機用 dev key。Production runtime 只信任 pin 死嘅 Sigstore 身份（issuer `https://token.actions.githubusercontent.com`，certificate identity 完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`，trust root 見決定 119），dev key 永遠唔信任。 | 已確認（產品經理 2026-10-14） | 2A.1、9、9B、10.1 |
-| 80 | （已由決定 117 取代：lock 唔再 commit）建議 `*.lock.md` 同 source 一齊 commit，令 PR diff 睇到編譯結果；CI 重編決定性檢查保留，唔一致照樣封鎖部署，冇 override。 | 待產品經理確認 | 2A.6、2C.3 |
-| 81 | CLI 所有指令嘅 `--project` 預設係目前目錄（cwd）。 | 待產品經理確認 | 2C.1 |
-| 82 | README 快速開始簡化做兩行：`vibe dev` 加一個 `curl`。 | 待產品經理確認 | 2C.1 |
+| 80 | （已由決定 117 取代：lock 唔再 commit）建議 `*.lock.md` 同 source 一齊 commit，令 PR diff 睇到編譯結果；CI 重編決定性檢查保留，唔一致照樣封鎖部署，冇 override。 | 已取代（決定 117） | 2A.6、2C.3 |
+| 81 | CLI 所有指令嘅 `--project` 預設係目前目錄（cwd）。 | 已確認（產品經理 2026-10-14） | 2C.1 |
+| 82 | README 快速開始簡化做兩行：`vibe dev` 加一個 `curl`。 | 已確認（產品經理 2026-10-14） | 2C.1 |
 | 83 | 接受「未經人手 review 嘅 LLM 輸出可以直接部署」嘅剩餘風險（見 9C）；人手 review 由用戶喺 Git 平台用 rulesets（分支規則） 自行設定（指引見 [`pr-review-guide.md`](pr-review-guide.md)）；但 release 層面仍然有決定 89–93 嘅硬性要求（受保護 environment、高風險要 approval 參照、CODEOWNERS）。 | 已確認（產品經理 2026-10-14） | 9C |
-| 84 | Admin `user.register` 保留 409 `EMAIL_TAKEN`：只限 admin、已認證、有限流同審計，admin 本身已經可以列出租戶用戶，所以唔當 enumeration 洩漏。 | 待產品經理確認 | 11.4、12.11 |
-| 85 | `create-user` 可以安全重試：`user.register` 用「insert CTE + SELECT」一個 statement，以明確 `created` 欄位分 201／200（唔靠 `xmax`）；對「已存在、未驗證、冇密碼」嘅用戶唔報錯，回原有 id（200），再由 `user.invite` 重新寄邀請；已驗證或者有密碼先回 409。解決 7.1 每個 query 獨立 commit 時「建立咗用戶但邀請失敗」嘅狀況。 | 待產品經理確認 | 11.4、11.4a |
-| 86 | 新增 re-invite endpoint `POST /users/v2/{id}/invite`（admin），用 `user.invite` 重新寄邀請；用戶已驗證回 409 `ALREADY_ACTIVE`（決定 69 延伸）。 | 待產品經理確認 | 11.4b |
-| 87 | 11.3 `_version` 同 11.4 create-user 嘅 rate-limit 補 `key`（分別係 `user` 同 `user`），合 4.3 schema；冇 `key` 嘅 rate-limit 係驗證器 error。 | 待產品經理確認 | 11.3、11.4、10.3 |
-| 88 | Admin 建立用戶時遇到自己註冊緊（未驗證、冇密碼）嘅同一個 email：當同一個用戶處理，邀請 token 取代註冊 token（`email_verify_purpose` 變 `invite`），用戶只會收到邀請信。 | 待產品經理確認 | 11.4 |
-| 89 | 產品經理基線 1：release manifest 只可以喺有專用 release ruleset 嘅 `v*` tag（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；真正閘門係要 Jack 批准嘅 `release` environment）（v1.8 修訂：唔再由 `main` 直接出 release，見決定 96）、經有 required reviewers（Jack）、只准 `v*` tag嘅 GitHub environment `release`（Prevent self-review 關閉，見決定 96；admin bypass 保持開啟，Jack 已接受風險）、用 Sigstore keyless（決定 119） 簽；依賴 issue #28（release.yml 加固）完成先可以出第一個 release。 | 待產品經理確認 | 2C.3、9B、9C |
+| 84 | Admin `user.register` 保留 409 `EMAIL_TAKEN`：只限 admin、已認證、有限流同審計，admin 本身已經可以列出租戶用戶，所以唔當 enumeration 洩漏。 | 已確認（產品經理 2026-10-14） | 11.4、12.11 |
+| 85 | `create-user` 可以安全重試：`user.register` 用「insert CTE + SELECT」一個 statement，以明確 `created` 欄位分辨新建立同重試（唔靠 `xmax`）；兩種都回 202 `{ user_id, created, invite_status }`（決定 95）；對「已存在、未驗證、冇密碼」嘅用戶唔報錯，回原有 id（`created: false`），再由 `user.invite` 重新寄邀請；只有已驗證或者有密碼先回 409 `EMAIL_TAKEN`。解決 7.1 每個 query 獨立 commit 時「建立咗用戶但邀請失敗」嘅狀況。 | 已確認（產品經理 2026-10-14） | 11.4、11.4a |
+| 86 | 新增 re-invite endpoint `POST /users/v2/{id}/invite`（admin），用 `user.invite` 重新寄邀請，邀請入 outbox 之後回 202 `{ invite_status: "invite_pending" }`（決定 95）；用戶已驗證回 409 `ALREADY_ACTIVE`（決定 69 延伸）。 | 已確認（產品經理 2026-10-14） | 11.4b |
+| 87 | 11.3 `_version` 同 11.4 create-user 嘅 rate-limit 補 `key`（分別係 `user` 同 `user`），合 4.3 schema；冇 `key` 嘅 rate-limit 係驗證器 error。 | 已確認（產品經理 2026-10-14） | 11.3、11.4、10.3 |
+| 88 | Admin 建立用戶時遇到自己註冊緊（未驗證、冇密碼）嘅同一個 email：當同一個用戶處理，邀請 token 取代註冊 token（`email_verify_purpose` 變 `invite`），用戶只會收到邀請信。 | 已確認（產品經理 2026-10-14） | 11.4 |
+| 89 | 產品經理基線 1：release manifest 只可以喺有專用 release ruleset 嘅 `v*` tag（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；真正閘門係要 Jack 批准嘅 `release` environment）（v1.8 修訂：唔再由 `main` 直接出 release，見決定 96）、經有 required reviewers（Jack）、只准 `v*` tag嘅 GitHub environment `release`（Prevent self-review 關閉，見決定 96；admin bypass 保持開啟，Jack 已接受風險）、用 Sigstore keyless（決定 119） 簽；依賴 issue #28（release.yml 加固）完成先可以出第一個 release。 | 已確認（產品經理 2026-10-14） | 2C.3、9B、9C |
 | 90 | 產品經理基線 2（同決定 118 對齊）：release build 有高風險 `security-items` 就 fail closed，除非提供有效嘅 `--release-approval`（`env:<run_id>`，可以加 `pr:<n>`）。`--release-approval` **唔數 PR review 做批准**；真正批准係 `release` environment 由 Jack 批准（決定 118）。佢只驗證 deterministic 前置條件同批准存在（2C.3a）：`tree(B) == tree(H)`、build commit 喺 `main`、ruleset 同 CODEOWNERS 設定、attestation 輸入（repo、workflow、tag、commit SHA）一致，同埋呢個 run 有 `release` environment 嘅 approved 紀錄；任何 API 錯誤即失敗。驗證結果寫入 manifest 同部署報告。 | 已確認（產品經理 2026-10-14） | 2A.5、2C.3a、9C |
-| 91 | 產品經理基線 3：production 一律拒絕 in-memory 資料庫，啟動直接報錯退出；冇任何 override 旗標。Production 定義只睇 build-mode 同環境：manifest 唔係 `build-mode: dev`，或者 `VIBE_ENV=production`。Listen 地址唔係 loopback（例如 Docker 入面 `vibe dev` 綁 `0.0.0.0`）只會警告，唔會拒絕；Docker 入面請明確設 `VIBE_ENV=development`。 | 待產品經理確認 | 2C.4、9C |
-| 92 | 產品經理基線 4（v1.8 由決定 119 修訂）：CI release build 冇辦法用 Sigstore keyless 簽（攞唔到 OIDC token、Fulcio 或者 Rekor 失敗）就失敗，永遠唔 fallback 去 dev key 或者任何 secret；production runtime 只信任 pin 死嘅 Sigstore 身份，dev key 永遠唔信任。 | 待產品經理確認 | 2C.2、2C.3、9B |
+| 91 | 產品經理基線 3：production 一律拒絕 in-memory 資料庫，啟動直接報錯退出；冇任何 override 旗標。Production 定義只睇 build-mode 同環境：manifest 唔係 `build-mode: dev`，或者 `VIBE_ENV=production`。Listen 地址唔係 loopback（例如 Docker 入面 `vibe dev` 綁 `0.0.0.0`）只會警告，唔會拒絕；Docker 入面請明確設 `VIBE_ENV=development`。 | 已確認（產品經理 2026-10-14） | 2C.4、9C |
+| 92 | 產品經理基線 4（v1.8 由決定 119 修訂）：CI release build 用 Sigstore keyless 加 Rekor 簽；OIDC、Fulcio 或者 Rekor 用唔到就失敗，永遠冇 fallback（唔 fallback 去 dev key、任何 secret 或者冇 Rekor 嘅簽名）；production runtime 只信任 pin 死嘅 Sigstore 身份，dev key 永遠唔信任。 | 已確認（產品經理 2026-10-14） | 2C.2、2C.3、9B |
 | 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；`vibe build` release 模式檢查 CODEOWNERS 覆蓋路徑，冇就失敗。 | 已確認（產品經理 2026-10-14）：CODEOWNERS required 係 source PR 合併條件 | 2A.7、9B |
-| 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 待產品經理確認 | 文件標頭、網站 |
+| 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 已確認（產品經理 2026-10-14） | 文件標頭、網站 |
 | 95 | create-user 邀請（v1.8 修訂）：邀請信寫入 transactional outbox（同其他寫入同一個 transaction）之後，create-user 同 re-invite 回 **202**，body 帶 `user_id` 同 `invite_status: invite_pending`。Mail worker 喺背景寄同重試；超過重試上限標 `delivery_failed`。邀請狀態（`invite_pending`／`sent`／`delivery_failed`）可以查詢，亦可以經 re-invite 重寄。只有 transaction 失敗（outbox 冇寫入，成個 request rollback，決定 99）先回 503 `INVITE_NOT_QUEUED`（帶 `Retry-After`）。`INVITE_DELIVERY_FAILED` 唔再係 503 錯誤碼，改為狀態值 `delivery_failed`。同 issue #26 相關。 | 已確認（產品經理 2026-10-14） | 11.4、11.4a、11.4b |
-| 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i) 做**臨時方案**）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。高風險 `--release-approval` 係計劃中、未實作，實作後先額外把關。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，同時開返 Prevent self-review。另外 live `release` environment `can_admins_bypass` 而家係 `true`，Jack 負責關閉。高風險 release build 用只有 Administration: read 嘅專用 GitHub App 讀呢個 ruleset，讀唔到、`bypass_actors` 唔係空、唔係 active、缺少三條 rule、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass，SDK 唔檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval`（未實作）實作後會獨立驗證 PR review（2C.3a）。普通 build 只記錄。 | 待產品經理確認 | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
+| 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i) 做**臨時方案**）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。高風險 `--release-approval` 係計劃中、未實作，實作後先額外把關。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，同時開返 Prevent self-review。另外 live `release` environment `can_admins_bypass` 而家係 `true`，Jack 負責關閉。高風險 release build 用只有 Administration: read 嘅專用 GitHub App 讀呢個 ruleset，讀唔到、`bypass_actors` 唔係空、唔係 active、缺少三條 rule、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass，SDK 唔檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval`（未實作）實作後會獨立驗證 PR review（2C.3a）。普通 build 只記錄。 | 已確認（產品經理 2026-10-14） | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
 | 97 | 租戶隔離身份（v1 blocker）：runtime 為每個（租戶、role 類別）開獨立連線池，直接以 `LOGIN` 租戶 role 登入再執行 lock SQL；runtime 連線 role 同租戶 role 之間冇任何 membership，租戶連線入面冇辦法切返其他身份（唔用 `SET LOCAL ROLE`；除非之後證明 PostgreSQL 17 嘅 `SET LOCAL ROLE` 不可逆）。租戶 role `NOINHERIT`、只有自己 schema 嘅權限、唔係其他 role 嘅成員；憑證只存 runtime secret store。平台表（refresh token、idempotency、outbox）只喺租戶自己 schema，租戶 role 讀唔到任何跨租戶共用表。`app.tenant_id` 之類 GUC 只可以輔助（例如 log），永遠唔係身份來源。安全細節經私人 security advisory 處理。 | 已確認（產品經理 2026-10-14） | 7.1、7.1a、9C |
 | 98 | Lock SQL parser 白名單：用 PostgreSQL 解析器（例如 `pg_query`）解析，只准單一 DML statement；禁止 transaction 控制、身份切換語句、會話設定修改同 schema-qualified 名稱；function 同 type 只准白名單；解析失敗即 fail closed。Conformance 要有跨租戶負面測試。 補充（已確認（產品經理 2026-10-14），Code Reviewer）：function 白名單係正面清單，冇列就禁止（動態 SQL／XML 查詢函數、introspection、取檔／外連函數、large object 全部唔喺入面）；lock SQL 唔可以有任何會話設定修改；唔可以引用平台表；migration 同樣用 parser 檢查（禁止提權 function、非白名單語言嘅 function／trigger、role 同權限操作、會話設定修改）；全部 fail closed，並有對應負面測試。 | 已確認（產品經理 2026-10-14） | 2A.4、7.1a、10.1 |
 | 99 | 跨 model transaction：一個 request = 一個 runtime 管理嘅 transaction（`READ COMMITTED`）；用戶 SQL 控制唔到 transaction 邊界；庫存扣減用條件 UPDATE（`WHERE stock >= qty`）再檢查 affected rows，唔夠就 409 同 rollback；冇跨 request、跨 DB 或者分散式 transaction；寫入按固定次序、喺租戶 role 之下執行。取代 7.1「每個 query 獨立 transaction」。 | 已確認（產品經理 2026-10-14） | 7.1、7.4、12.6 |
@@ -485,7 +485,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - `query` 只准單一 statement，唔准 `;` 串多句、唔准 `SET`／`RESET`／`COPY`／`DO`／function 定義。驗證器同 runtime 都用 PostgreSQL 解析器檢查（決定 98，見 7.1a），唔靠字串比對。
 - `UPDATE` 一定要有 `WHERE`，而且要用主鍵（或者唯一鍵）限定，或者明確依賴 RLS 範圍（lock 寫 `scope: pk` 或者 `scope: rls`）；冇 WHERE 嘅 UPDATE 一律 error。
 
-### 2A.5 安全項目同 review（v1.8 改寫，決定 77、78，待產品經理確認）
+### 2A.5 安全項目同 review（v1.8 改寫，決定 77、78，已確認（產品經理 2026-10-14））
 
 - SDK 唔再有確認步驟：冇 `vibe approve`、冇 `pending`／`approved` 狀態、冇 commit hash 綁定、冇確認人資格檢查。CI 由 source build、通過驗證器（2A.7、第 10 節）同決定 114 policy、artifact 有決定 113 attestation，就可以部署（決定 117）。
 - 「係咪 structured」照樣由平台 deterministic parser 判斷（決定 20），只決定編譯使唔使 call LLM。
@@ -704,7 +704,7 @@ jobs:
 
 - `vibe` 係 SDK CLI 名（暫定）；deploy job 唔設任何 `LLM_*` 或者 `OPENAI_*` 變數。
 
-## 2C. SDK CLI：`vibe dev` 同 `vibe build`（決定 73–76、81、82，待產品經理確認）
+## 2C. SDK CLI：`vibe dev` 同 `vibe build`（決定 73–76、81、82，已確認（產品經理 2026-10-14））
 
 ### 2C.1 通用
 
@@ -768,7 +768,7 @@ Release build 只喺 `v*` tag 上跑（決定 96），build 緊嘅 commit（`B =
 2. 由呢個 PR 攞 `head.sha`（`H`，即係 PR 最後一次 push）、`base.sha`（`P`，merge 前受保護 `main` 嘅 commit）同 `user`（PR 作者）。
 3. Tree 相等：`GET /repos/{owner}/{repo}/commits/{B}` 同 `GET /repos/{owner}/{repo}/commits/{H}` 嘅 `commit.tree.sha` 一定要一樣。因為 `main` 嘅 rulesets（分支規則）一定要開 **Require branches to be up to date before merging**（ruleset `required_status_checks` rule 嘅 `parameters.strict_required_status_checks_policy: true`，而且最少有一個 required status check，否則呢個設定唔生效；見第 7 節），merge commit 或者 squash commit 嘅 tree 會同 `H` 一樣；唔一樣就失敗。Rebase merge 都一樣要 tree 相等。
 4. Tag 一定要指向 `main` 上嘅 commit：`B` 一定要喺 `main` 上。`GET /repos/{owner}/{repo}/compare/main...{B}` 嘅 `status` 一定要係 `identical` 或者 `behind`；`ahead` 或者 `diverged` 就失敗。
-5. **唔支援 merge queue**：merge queue 會喺 `gh-readonly-queue/*` 砌新 commit，同上面嘅 tree 規則對唔上。用 merge queue 嘅 repo，高風險 release build 一律失敗（待產品經理確認）。
+5. **唔支援 merge queue**：merge queue 會喺 `gh-readonly-queue/*` 砌新 commit，同上面嘅 tree 規則對唔上。用 merge queue 嘅 repo，高風險 release build 一律失敗（已確認（產品經理 2026-10-14））。
 
 #### 3. PR review（唔計做批准）
 
@@ -804,8 +804,8 @@ Branch rule 檢查（`main`）：
 
 - 用 `GET /repos/{owner}/{repo}/rules/branches/main`（rulesets，有 `metadata: read` 就讀到），一定要有 active 嘅 `pull_request` rule，而且 `parameters.require_last_push_approval` 係 `true`。
 - 同一個回應一定要有 active 嘅 `required_status_checks` rule，`parameters.strict_required_status_checks_policy` 係 `true`，而且 `parameters.required_status_checks` 唔係空 array（GitHub 規定要最少一個 status check 呢個設定先生效）；冇就失敗。
-- 我哋揀 **rulesets 做唯一接受嘅來源**：舊式 branch protection（`GET /repos/{owner}/{repo}/branches/{branch}/protection`）要 repo admin 權限先讀到，release workflow 唔應該攞 admin。所以呢個設定一定要用 ruleset 開；rulesets 搵唔到就失敗（待產品經理確認）。
-- **`main` 嘅 `bypass_actors` 唔再檢查（決定 96 修訂，待產品經理確認）**：`main` ruleset 可以保留 OrganizationAdmin bypass（例如 ruleset 25057946），日常 `--admin` merge 唔變。上面兩條係**一定要有嘅設定**，但 SDK 唔會讀 `main` ruleset 嘅 `bypass_actors`，有 bypass 都唔會令 build 失敗。點解仍然安全：
+- 我哋揀 **rulesets 做唯一接受嘅來源**：舊式 branch protection（`GET /repos/{owner}/{repo}/branches/{branch}/protection`）要 repo admin 權限先讀到，release workflow 唔應該攞 admin。所以呢個設定一定要用 ruleset 開；rulesets 搵唔到就失敗（已確認（產品經理 2026-10-14））。
+- **`main` 嘅 `bypass_actors` 唔再檢查（決定 96 修訂，已確認（產品經理 2026-10-14））**：`main` ruleset 可以保留 OrganizationAdmin bypass（例如 ruleset 25057946），日常 `--admin` merge 唔變。上面兩條係**一定要有嘅設定**，但 SDK 唔會讀 `main` ruleset 嘅 `bypass_actors`，有 bypass 都唔會令 build 失敗。點解仍然安全：
   - `--release-approval`（計劃中、**未實作**；實作之前呢點唔成立）唔數 PR review；高風險 release 嘅真正批准係 `release` environment 由 Jack 批准（決定 118）。
   - CODEOWNERS 設定由 PR `base.sha` 讀（第 6 節），admin bypass 改唔到今次檢查用嘅設定（未實作，今日冇保護）。
   - 剩餘風險：admin bypass 可以跳過 up-to-date 規則（PR 冇 rebase 就 merge）。呢個情況下 merge commit 嘅 tree 通常同 `H` 唔一樣，第 2 節嘅 `tree(B) == tree(H)` 檢查會失敗，所以都出唔到高風險 release；代價係要重新開 PR 再批准。呢個緩解靠 `tree(B) == tree(H)` 檢查，而呢個檢查係 `--release-approval` 嘅一部分，同樣未實作，實作之前唔成立，今日冇保護。
@@ -899,7 +899,7 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
 - **閘門**：臨時方案 (i) 下，任何有寫權限嘅人都可以開 `v*` tag，所以 `v*` tag **唔係**真正閘門；`--source-ref` 驗證只證明 artifact 嚟自邊個 tag。真正閘門係 `release` environment 要 Jack 批准（`--release-approval` 實作之後再加埋，現時未實作）。
 - 將來目標：方案 (iii)，專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，並開啟 `prevent_self_review`。
 
-### 2C.4 In-memory 執行器（決定 74，待產品經理確認）
+### 2C.4 In-memory 執行器（決定 74，已確認（產品經理 2026-10-14））
 
 適用：`vibe dev`（預設）同 `vibe serve --memory`。
 
@@ -1496,7 +1496,7 @@ migration 放喺 ./migrations/main/。
 
 ### 10.3 Pipeline 同 auth（error）
 
-- `rate-limit` 冇 `key`，或者 `key` 唔係 4.3 准用值（決定 87，待產品經理確認）。
+- `rate-limit` 冇 `key`，或者 `key` 唔係 4.3 准用值（決定 87，已確認（產品經理 2026-10-14））。
 - 引用唔存在嘅 pipeline；pipeline 參數唔合 `## Parameters` schema；auth 次序錯；剔走 auth 但冇 `public: true`；`roles: []`。
 - pipeline lock 用咗白名單以外嘅 op，或者直接寫 `query`／`call`。
 - JWT alg 唔喺 RS256／ES256，或者冇驗 `iss`、`aud`、`exp`、`nbf`；`jwks-uri` 唔係 https；clock skew 超過 60 秒；JWKS cache 設定超出 4.1 範圍。
@@ -1782,7 +1782,7 @@ security-items: [{ item: rate-limit-new, risk: medium, reason: "登入防爆破"
 POST。只有 admin 可以用，每分鐘最多 30 次。
 請求 body 要有 email（合法 email）同 name（1 至 50 字）。
 用 user.register 建立用戶（唔設密碼、未驗證），再用 user.invite 寄邀請信。
-邀請信寫入 outbox 之後回 202（新建立同重試都一樣，決定 95），回用戶嘅 id、email、name 同 `invite_status: invite_pending`，並帶 Location。
+邀請信寫入 outbox 之後回 202（新建立同重試都一樣，決定 95），回 `{ user_id, created, invite_status: "invite_pending" }`（`created` 分辨新建立同重試），並帶 Location。
 email 已經屬於已驗證或者有密碼嘅用戶就回 409 EMAIL_TAKEN；驗證唔通過回 422。
 ```
 
@@ -1837,11 +1837,11 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" 
 ## Response
 | status | schema | headers |
 |---|---|---|
-| 202 | { id, email, name, invite_status } | Location |
+| 202 | { user_id, created, invite_status } | Location |
 
 ## Transform
 - in: { email: req.body.email, name: req.body.name }
-- out: { id: u.id, email: u.email, name: u.name }
+- out: { user_id: u.id, created: u.created, invite_status: "invite_pending" }
 
 ## Steps
 ### s1 method
@@ -1875,12 +1875,12 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" 
 ````
 
 - 邀請（決定 95，已確認（產品經理 2026-10-14））：邀請信寫入 transactional outbox，`email_outbox` 列同其他寫入喺同一個 transaction 寫入；commit 之後 create-user 回 **202**，body `{ user_id, invite_status: "invite_pending" }`。Mail worker commit 之後先寄，commit 之前永遠唔寄；失敗按退避重試，超過重試上限將邀請狀態標 `delivery_failed`（狀態值，唔係錯誤碼）。Admin 可以查詢用戶嘅邀請狀態（`invite_pending`／`sent`／`delivery_failed`），亦可以 call re-invite（11.4b）重寄（發新 token 同新信）。只有 transaction 失敗（outbox 冇寫入）先回 503 `INVITE_NOT_QUEUED`（帶 `Retry-After`），成個 request rollback（決定 99），唔會留低半完成狀態。實作見 issue #26。
-- 失敗恢復（決定 85，待產品經理確認）：v1.8 起一個 request 一個 transaction（決定 99），s2 失敗會 rollback s1；但 commit 之後先失敗（例如回應途中斷線）或者舊資料仍然可能有「已建立、未邀請」嘅用戶。Admin 用同一個 body 重試 create-user：`user.register` 對已存在、未驗證、冇密碼嘅用戶回原有 id（`created: false`），s2 重新寄邀請，回 202（`invite_pending`）；或者用 11.4b 嘅 re-invite endpoint。
-- `EMAIL_TAKEN`（決定 84，待產品經理確認）：只限 admin（已認證、`roles: [admin]`、按用戶限流、audit-log），admin 本身可以列出租戶用戶，所以 409 唔當 enumeration 洩漏；public 註冊（12.11）照樣唔分辨。
-- 同一個 email 自己註冊緊（未驗證、冇密碼）：當同一個用戶，邀請 token 取代註冊 token（決定 88，待產品經理確認）。
+- 失敗恢復（決定 85，已確認（產品經理 2026-10-14））：v1.8 起一個 request 一個 transaction（決定 99），s2 失敗會 rollback s1；但 commit 之後先失敗（例如回應途中斷線）或者舊資料仍然可能有「已建立、未邀請」嘅用戶。Admin 用同一個 body 重試 create-user：`user.register` 對已存在、未驗證、冇密碼嘅用戶回原有 id，s2 重新寄邀請，回 202 `{ user_id, created: false, invite_status: "invite_pending" }`；只有已驗證或者有密碼先回 409 `EMAIL_TAKEN`；或者用 11.4b 嘅 re-invite endpoint。
+- `EMAIL_TAKEN`（決定 84，已確認（產品經理 2026-10-14））：只限 admin（已認證、`roles: [admin]`、按用戶限流、audit-log），admin 本身可以列出租戶用戶，所以 409 唔當 enumeration 洩漏；public 註冊（12.11）照樣唔分辨。
+- 同一個 email 自己註冊緊（未驗證、冇密碼）：當同一個用戶，邀請 token 取代註冊 token（決定 88，已確認（產品經理 2026-10-14））。
 - 邀請流程（決定 69，已確認（產品經理 2026-10-14））：admin 建立嘅用戶冇 password、`email_verified_at` 係 null，所以未接受邀請之前唔可以 login（決定 55）。完整流程見 12.11.9。
 
-### 11.4a Method 範例：`user.register` 同 `user.invite`（決定 84、85、88，待產品經理確認）
+### 11.4a Method 範例：`user.register` 同 `user.invite`（決定 84、85、88，已確認（產品經理 2026-10-14））
 
 `models/user/methods/register.md`
 
@@ -2034,7 +2034,7 @@ security-items:
 - s4 失敗（outbox insert 錯誤）：method fail `INVITE_NOT_QUEUED`（503，決定 95）；寄信失敗唔會令 method fail，只會喺背景重試，超過上限標 `delivery_failed`；成個 request rollback（決定 99），s2 嘅 token 輪換都唔會生效，舊邀請連結照樣有效（如果未過期）；重試或者 re-invite 會發新連結。
 - 用戶唔存在同已驗證都回 `ALREADY_ACTIVE`（admin 路徑，404／409 分唔分冇私隱影響；揀一個錯誤碼令 lock 簡單）。
 
-### 11.4b Re-invite：`api/users/v2/re-invite/re-invite.md`（路由 `POST /users/v2/{id}/invite`，決定 86，待產品經理確認）
+### 11.4b Re-invite：`api/users/v2/re-invite/re-invite.md`（路由 `POST /users/v2/{id}/invite`，決定 86，已確認（產品經理 2026-10-14））
 
 ```markdown
 # 重新寄邀請
@@ -3541,7 +3541,7 @@ security-items:
 
 私隱法（PDPO、GDPR）部分嘅建議請法律意見覆核。
 
-另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–119 已經由產品經理確認）；確認之前 v1.7 定稿照樣有效。
+另外，0.10 嘅決定 73–119 已經由產品經理確認（2026-10-14；決定 80、116 已取代）；文件仍然係草稿，v1.8 正式定稿之前 v1.7 定稿照樣有效。
 
 ## 14. 後續版本
 
