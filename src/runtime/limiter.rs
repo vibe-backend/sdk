@@ -136,7 +136,6 @@ impl<V> BoundedMap<V> {
     pub fn remove(&mut self, key: &str) -> Option<V> {
         self.entries.remove(key).map(|(_, v)| v)
     }
-
 }
 
 /// Sliding one-minute windows, sharded by `(route, key type)`.
