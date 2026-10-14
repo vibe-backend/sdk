@@ -38,9 +38,10 @@ impl QueryExec for MemoryExec {
     async fn execute(
         &self,
         tenant_id: &str,
-        _role: &str,
+        role: &str,
         stmt: Stmt,
     ) -> Result<Vec<Row>, ExecError> {
+        role_allows(role, &stmt).map_err(ExecError::Message)?;
         let mut tables = self
             .tables
             .lock()
@@ -203,32 +204,92 @@ fn project(row: &Row, columns: &[Col]) -> Row {
     out
 }
 
-/// Privileges of the runtime connection role, as read from `pg_roles`.
-#[derive(Debug, Clone, PartialEq)]
+/// Privileges of the runtime connection role, as read from the catalog.
+/// Everything is evaluated with `pg_has_role(.., 'MEMBER')`, so a role that
+/// could `SET ROLE` to a privileged or owning role (even through NOINHERIT
+/// membership) counts as having that privilege.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RoleStatus {
     pub name: String,
-    pub superuser: bool,
-    pub bypass_rls: bool,
-    pub owned_tables: i64,
+    /// Superuser roles the connection role is (or can become).
+    pub superuser_via: Vec<String>,
+    /// BYPASSRLS roles the connection role is (or can become).
+    pub bypass_rls_via: Vec<String>,
+    /// Tenant-schema relations (tables, views, sequences, ...) it can own.
+    pub owned_relations: i64,
+    /// Tenant-schema functions/procedures it can own.
+    pub owned_functions: i64,
+    /// Tenant-schema types it can own.
+    pub owned_types: i64,
+    /// Tenant schemas it can own.
     pub owned_schemas: i64,
 }
 
 impl RoleStatus {
     pub fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.superuser {
-            out.push("is a superuser".to_string());
+        if !self.superuser_via.is_empty() {
+            out.push(format!(
+                "is or can become a superuser ({})",
+                self.superuser_via.join(", ")
+            ));
         }
-        if self.bypass_rls {
-            out.push("has BYPASSRLS".to_string());
+        if !self.bypass_rls_via.is_empty() {
+            out.push(format!(
+                "is or can become a BYPASSRLS role ({})",
+                self.bypass_rls_via.join(", ")
+            ));
         }
-        if self.owned_tables > 0 {
-            out.push(format!("owns {} tenant table(s)", self.owned_tables));
-        }
-        if self.owned_schemas > 0 {
-            out.push(format!("owns {} tenant schema(s)", self.owned_schemas));
+        for (count, what) in [
+            (self.owned_relations, "tenant relation(s)"),
+            (self.owned_functions, "tenant function(s)"),
+            (self.owned_types, "tenant type(s)"),
+            (self.owned_schemas, "tenant schema(s)"),
+        ] {
+            if count > 0 {
+                out.push(format!("can own {count} {what}"));
+            }
         }
         out
+    }
+}
+
+/// Catalog query behind [`PgExec::check_runtime_role`].
+pub const ROLE_STATUS_SQL: &str = "\
+SELECT current_user::text, \
+ COALESCE((SELECT array_agg(m.rolname::text ORDER BY m.rolname) FROM pg_roles m \
+   WHERE m.rolsuper AND pg_has_role(current_user, m.oid, 'MEMBER')), '{}'), \
+ COALESCE((SELECT array_agg(m.rolname::text ORDER BY m.rolname) FROM pg_roles m \
+   WHERE m.rolbypassrls AND pg_has_role(current_user, m.oid, 'MEMBER')), '{}'), \
+ (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+   WHERE n.nspname LIKE 't\\_%' AND pg_has_role(current_user, c.relowner, 'MEMBER')), \
+ (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+   WHERE n.nspname LIKE 't\\_%' AND pg_has_role(current_user, p.proowner, 'MEMBER')), \
+ (SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+   WHERE n.nspname LIKE 't\\_%' AND t.typrelid = 0 \
+   AND pg_has_role(current_user, t.typowner, 'MEMBER')), \
+ (SELECT count(*) FROM pg_namespace n WHERE n.nspname LIKE 't\\_%' \
+   AND pg_has_role(current_user, n.nspowner, 'MEMBER'))";
+
+/// Logical caller classes passed as `role` to [`QueryExec::execute`], and the
+/// statements each may run. Enforced by every executor (spec §7.1/§7.2:
+/// public readers only read; nobody deletes).
+pub fn role_allows(role: &str, stmt: &Stmt) -> Result<(), String> {
+    let allowed = match role {
+        "public_reader" => matches!(stmt, Stmt::Select { .. }),
+        "public_writer" | "app_rw" => matches!(
+            stmt,
+            Stmt::Select { .. }
+                | Stmt::Insert { .. }
+                | Stmt::Update { .. }
+                | Stmt::SoftDelete { .. }
+        ),
+        other => return Err(format!("unknown executor role {other}")),
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(format!("role {role} may not run this statement"))
     }
 }
 
@@ -258,24 +319,18 @@ impl PgExec {
     pub async fn check_runtime_role(&self) -> Result<(), String> {
         let client = self.client.lock().await;
         let row = client
-            .query_one(
-                "SELECT r.rolname::text, r.rolsuper, r.rolbypassrls, \
-                 (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-                   WHERE n.nspname LIKE 't\\_%' AND c.relkind IN ('r', 'p') \
-                   AND pg_has_role(r.oid, c.relowner, 'USAGE')), \
-                 (SELECT count(*) FROM pg_namespace n WHERE n.nspname LIKE 't\\_%' \
-                   AND pg_has_role(r.oid, n.nspowner, 'USAGE')) \
-                 FROM pg_roles r WHERE r.rolname = current_user",
-                &[],
-            )
+            .query_one(ROLE_STATUS_SQL, &[])
             .await
             .map_err(|err| err.to_string())?;
+        drop(client);
         let status = RoleStatus {
             name: row.get(0),
-            superuser: row.get(1),
-            bypass_rls: row.get(2),
-            owned_tables: row.get(3),
-            owned_schemas: row.get(4),
+            superuser_via: row.get(1),
+            bypass_rls_via: row.get(2),
+            owned_relations: row.get(3),
+            owned_functions: row.get(4),
+            owned_types: row.get(5),
+            owned_schemas: row.get(6),
         };
         let problems = status.problems();
         if problems.is_empty() {
@@ -309,10 +364,10 @@ impl QueryExec for PgExec {
         role: &str,
         stmt: Stmt,
     ) -> Result<Vec<Row>, ExecError> {
-        // Postgres enforcement comes from the connection role itself (checked
-        // at startup by `check_runtime_role`) plus the grants `vibe migrate`
-        // issues to VIBE_RUNTIME_DB_ROLE; `role` is the logical caller class.
-        let _ = role;
+        // `role` is the logical caller class. It limits which statements may
+        // run; the database additionally enforces the non-owner connection
+        // role (checked by `check_runtime_role`) and its migrate-time grants.
+        role_allows(role, &stmt).map_err(ExecError::Message)?;
         let (sql, params) = sql::render(&stmt).map_err(ExecError::Message)?;
         let returning = returning_cols(&stmt);
         let mut client = self.client.lock().await;
@@ -406,35 +461,53 @@ pub fn etag(id: &str, updated_at: &str) -> String {
 
 #[cfg(test)]
 mod role_tests {
-    use super::RoleStatus;
-
-    fn status() -> RoleStatus {
-        RoleStatus {
-            name: "app".into(),
-            superuser: false,
-            bypass_rls: false,
-            owned_tables: 0,
-            owned_schemas: 0,
-        }
-    }
+    use super::*;
 
     #[test]
     fn safe_role_has_no_problems() {
-        assert!(status().problems().is_empty());
+        assert!(RoleStatus::default().problems().is_empty());
     }
 
     #[test]
     fn unsafe_roles_are_reported() {
-        let mut s = status();
-        s.superuser = true;
-        s.bypass_rls = true;
-        s.owned_tables = 2;
-        s.owned_schemas = 1;
+        let s = RoleStatus {
+            name: "app".into(),
+            superuser_via: vec!["postgres".into()],
+            bypass_rls_via: vec!["etl".into()],
+            owned_relations: 2,
+            owned_functions: 1,
+            owned_types: 1,
+            owned_schemas: 1,
+        };
         let p = s.problems();
-        assert_eq!(p.len(), 4, "{p:?}");
-        assert!(p.iter().any(|x| x.contains("superuser")));
-        assert!(p.iter().any(|x| x.contains("BYPASSRLS")));
-        assert!(p.iter().any(|x| x.contains("table")));
-        assert!(p.iter().any(|x| x.contains("schema")));
+        assert_eq!(p.len(), 6, "{p:?}");
+        assert!(p[0].contains("postgres"));
+        assert!(p[1].contains("etl"));
+    }
+
+    fn select() -> Stmt {
+        Stmt::Select {
+            table: "t".into(),
+            columns: vec![],
+            id: None,
+            filters: vec![],
+            sort: None,
+            limit: 1,
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn executor_role_is_enforced() {
+        assert!(role_allows("public_reader", &select()).is_ok());
+        assert!(role_allows("app_rw", &select()).is_ok());
+        assert!(role_allows("bogus", &select()).is_err());
+        let insert = Stmt::Insert {
+            table: "t".into(),
+            values: vec![],
+            returning: vec![],
+        };
+        assert!(role_allows("public_reader", &insert).is_err());
+        assert!(role_allows("public_writer", &insert).is_ok());
     }
 }

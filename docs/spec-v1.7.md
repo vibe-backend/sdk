@@ -873,6 +873,7 @@ migration 放喺 ./migrations/main/。
 - RLS policy 一律用 `tenant_id = current_setting('app.tenant_id', false)`；冇設定 tenant 嘅話，query 會直接報錯，唔會回空結果。
 - `search_path` 由平台固定產生：schema 模式係 `t_{tenant_id}`，唔包括 `public`；`public` schema 嘅 CREATE 權限要收走。
 - 連線 role 唔可以係表嘅 owner，亦唔可以有 `BYPASSRLS`。
+  - SDK 實作：`vibe migrate` 用 `VIBE_MIGRATE_DATABASE_URL`（owner role）連線，並將 `SELECT`、`INSERT`、`UPDATE` 授權畀 `VIBE_RUNTIME_DB_ROLE`（必填），收走 tenant schema 嘅 `CREATE`，並用 `ALTER DEFAULT PRIVILEGES` 令之後 migration 建嘅表都有同樣授權；`vibe serve` 用 `VIBE_DATABASE_URL`（runtime role）連線，啟動時檢查：如果呢個 role 係（或者可以 `SET ROLE` 成為，即 `pg_has_role(..., 'MEMBER')`）superuser 或者 `BYPASSRLS` role，或者可以擁有任何 tenant schema、relation、function 或 type，就拒絕啟動。
 - 所有 runtime DB role（`app_rw`、`public_reader`、`public_writer`）都冇 `DELETE`、`TRUNCATE`、DDL 權限（決定 27）。
 - 平台專用 role（用戶 lock 唔可以用）：
 

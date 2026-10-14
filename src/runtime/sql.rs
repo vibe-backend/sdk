@@ -107,7 +107,7 @@ fn render_insert(
             continue;
         }
         params.push(json_text(value));
-        placeholders.push(format!("${}::{}", params.len(), cast(&col.ty)));
+        placeholders.push(format!("${}::text::{}", params.len(), cast(&col.ty)));
     }
     let ret = returning
         .iter()
@@ -147,13 +147,13 @@ fn render_select(
     let mut where_sql = vec!["\"deleted_at\" IS NULL".to_string()];
     if let Some(id) = id {
         params.push(Some(id.to_string()));
-        where_sql.push(format!("\"id\" = ${}::uuid", params.len()));
+        where_sql.push(format!("\"id\" = ${}::text::uuid", params.len()));
     }
     for (col, value) in filters {
         params.push(json_text(value));
         let n = params.len();
         where_sql.push(format!(
-            "(${n}::text IS NULL OR {} = ${n}::{})",
+            "(${n}::text IS NULL OR {} = ${n}::text::{})",
             quote(&col.name)?,
             cast(&col.ty)
         ));
@@ -171,7 +171,7 @@ fn render_select(
     params.push(Some(offset.to_string()));
     let offset_n = params.len();
     let sql = format!(
-        "SELECT {cols} FROM {table} WHERE {}{order} LIMIT ${limit_n}::bigint OFFSET ${offset_n}::bigint",
+        "SELECT {cols} FROM {table} WHERE {}{order} LIMIT ${limit_n}::text::bigint OFFSET ${offset_n}::text::bigint",
         where_sql.join(" AND ")
     );
     Ok((sql, params))
@@ -187,7 +187,7 @@ fn render_soft_delete(
     let owner_sql = owner_predicate(owner, &mut params)?;
     Ok((
         format!(
-            "UPDATE {table} SET \"deleted_at\" = now(), \"updated_at\" = now() WHERE \"id\" = $1::uuid AND \"deleted_at\" IS NULL{owner_sql} RETURNING \"id\"::text"
+            "UPDATE {table} SET \"deleted_at\" = now(), \"updated_at\" = now() WHERE \"id\" = $1::text::uuid AND \"deleted_at\" IS NULL{owner_sql} RETURNING \"id\"::text"
         ),
         params,
     ))
@@ -202,7 +202,7 @@ fn owner_predicate(
     };
     params.push(json_text(value));
     Ok(format!(
-        " AND {} = ${}::{}",
+        " AND {} = ${}::text::{}",
         quote(&col.name)?,
         params.len(),
         cast(&col.ty)
@@ -223,7 +223,7 @@ fn render_update(
     for (col, value) in sets {
         params.push(json_text(value));
         assigns.push(format!(
-            "{} = ${}::{}",
+            "{} = ${}::text::{}",
             quote(&col.name)?,
             params.len(),
             cast(&col.ty)
@@ -240,7 +240,7 @@ fn render_update(
         .collect::<Result<Vec<_>, String>>()?
         .join(", ");
     let sql = format!(
-        "UPDATE {table} SET {} WHERE \"id\" = ${id_n}::uuid AND \"updated_at\" = ${ts_n}::timestamptz AND \"deleted_at\" IS NULL{owner_sql} RETURNING {ret}",
+        "UPDATE {table} SET {} WHERE \"id\" = ${id_n}::text::uuid AND \"updated_at\" = ${ts_n}::text::timestamptz AND \"deleted_at\" IS NULL{owner_sql} RETURNING {ret}",
         assigns.join(", ")
     );
     Ok((sql, params))
@@ -294,6 +294,22 @@ pub fn runtime_grant_statements(
         format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
         format!("REVOKE ALL ON {qualified} FROM {role}"),
         format!("GRANT SELECT, INSERT, UPDATE ON {qualified} TO {role}"),
+    ])
+}
+
+/// Schema-level statements for the runtime role: no CREATE on the tenant
+/// schema (for anyone but the owner), and default privileges so tables that
+/// migrations create later get the same SELECT/INSERT/UPDATE grant.
+pub fn runtime_schema_statements(schema: &str, role: &str) -> Result<Vec<String>, String> {
+    let schema = quote(schema)?;
+    let role = quote(role)?;
+    Ok(vec![
+        format!("REVOKE CREATE ON SCHEMA {schema} FROM PUBLIC"),
+        format!("REVOKE CREATE ON SCHEMA {schema} FROM {role}"),
+        format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
+        format!(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT, INSERT, UPDATE ON TABLES TO {role}"
+        ),
     ])
 }
 

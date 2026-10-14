@@ -117,7 +117,7 @@ fn valid_slug(slug: &str) -> bool {
         && !slug.contains("--")
 }
 
-fn valid_tenant(tenant: &str) -> bool {
+pub(crate) fn valid_tenant(tenant: &str) -> bool {
     (8..=32).contains(&tenant.len())
         && tenant
             .chars()

@@ -46,7 +46,7 @@ vibe manifest --project examples/shop -o manifest.json
 vibe serve --manifest manifest.json --project examples/shop --memory
 ```
 
-`--memory` is a dev executor. PostgreSQL needs two roles. `vibe migrate` connects with the owner role (`VIBE_MIGRATE_DATABASE_URL`) and grants SELECT, INSERT and UPDATE to the runtime role named in `VIBE_RUNTIME_DB_ROLE`. `vibe serve` connects as that runtime role (`VIBE_DATABASE_URL`, or `DATABASE_URL`) and refuses to start if the role is a superuser, has BYPASSRLS, or owns any tenant schema or table, because row-level security would not apply:
+`--memory` is a dev executor. PostgreSQL needs two roles. `vibe migrate` connects with the owner role (`VIBE_MIGRATE_DATABASE_URL`) and grants SELECT, INSERT and UPDATE to the runtime role named in `VIBE_RUNTIME_DB_ROLE`. `vibe serve` connects as that runtime role (`VIBE_DATABASE_URL`, or `DATABASE_URL`) and refuses to start if the role is, or can `SET ROLE` to, a superuser or BYPASSRLS role, or can own any tenant schema, relation, function or type, because row-level security would not apply. `VIBE_RUNTIME_DB_ROLE` is required:
 
 ```bash
 VIBE_MIGRATE_DATABASE_URL=postgres://owner@db/app VIBE_RUNTIME_DB_ROLE=vibe_app \

@@ -1,0 +1,285 @@
+//! Real PostgreSQL tests. They run when `VIBE_TEST_PG_ADMIN_URL` points at a
+//! superuser connection (CI sets it via a service container) and are skipped
+//! otherwise.
+
+use serde_json::{json, Value};
+use tokio_postgres::{Client, NoTls};
+use vibe::manifest::Manifest;
+use vibe::runtime::{migrate_tenant, Col, PgExec, QueryExec, Stmt};
+
+fn admin_url() -> Option<String> {
+    std::env::var("VIBE_TEST_PG_ADMIN_URL").ok()
+}
+
+async fn connect(url: &str) -> Client {
+    let (client, conn) = tokio_postgres::connect(url, NoTls).await.unwrap();
+    tokio::spawn(conn);
+    client
+}
+
+/// Unique lowercase suffix so tests can run in parallel against one cluster.
+fn suffix() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..10].to_string()
+}
+
+/// Same server and database as the admin URL, logged in as `user`.
+fn url_as(admin: &str, user: &str) -> String {
+    let mut url = url::Url::parse(admin).unwrap();
+    url.set_username(user).unwrap();
+    url.set_password(Some("pw")).unwrap();
+    url.to_string()
+}
+
+async fn create_login(admin: &Client, name: &str, extra: &str) {
+    admin
+        .batch_execute(&format!("CREATE ROLE {name} LOGIN PASSWORD 'pw' {extra}"))
+        .await
+        .unwrap();
+}
+
+async fn check_as(admin_url: &str, user: &str) -> Result<(), String> {
+    let exec = PgExec::connect(&url_as(admin_url, user)).await.unwrap();
+    exec.check_runtime_role().await
+}
+
+fn manifest() -> Manifest {
+    serde_json::from_value(json!({
+        "manifest_version": 1,
+        "routes": [],
+        "methods": [],
+        "signature": "",
+        "models": [{
+            "id": "note", "provider": "main", "table": "notes",
+            "crud": [], "sensitive_output": [], "ownership": "",
+            "list": {"page_size": 20, "max_page_size": 100, "sort": [], "filter": []},
+            "fields": [
+                field("id", "uuid"), field("tenant_id", "string"), field("body", "string"),
+                field("created_at", "timestamp"), field("updated_at", "timestamp"),
+                field("deleted_at", "timestamp")
+            ]
+        }],
+        "migrations": [{
+            "id": "migrations/main/0002-audit", "provider": "main", "seq": "0002",
+            "statements": ["CREATE TABLE IF NOT EXISTS audit_notes (tenant_id text, note text)"]
+        }]
+    }))
+    .unwrap()
+}
+
+fn field(name: &str, ty: &str) -> Value {
+    json!({"name": name, "ty": ty, "required": false, "unique": false, "primary": name == "id",
+           "system": false, "sensitive": false, "nullable": true, "min": null, "max": null,
+           "format": ""})
+}
+
+struct Setup {
+    admin_url: String,
+    admin: Client,
+    owner: String,
+    app: String,
+    tenant: String,
+}
+
+/// Catalog-wide DDL (GRANT ON DATABASE, CREATE ROLE) races between parallel
+/// tests ("tuple concurrently updated"), so setup runs one at a time.
+static SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn setup() -> Option<Setup> {
+    let admin_url = admin_url()?;
+    let _guard = SETUP.lock().await;
+    let admin = connect(&admin_url).await;
+    let s = suffix();
+    let owner = format!("own_{s}");
+    let app = format!("app_{s}");
+    create_login(&admin, &owner, "").await;
+    create_login(&admin, &app, "").await;
+    admin
+        .batch_execute(&format!(
+            "GRANT CREATE ON DATABASE {} TO {owner}",
+            admin_url
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .split('?')
+                .next()
+                .unwrap()
+        ))
+        .await
+        .unwrap();
+    let tenant = format!("tn{s}");
+    let owner_exec = PgExec::connect(&url_as(&admin_url, &owner)).await.unwrap();
+    migrate_tenant(&owner_exec, &manifest(), &tenant, &app)
+        .await
+        .unwrap();
+    Some(Setup {
+        admin_url,
+        admin,
+        owner,
+        app,
+        tenant,
+    })
+}
+
+macro_rules! require_pg {
+    ($e:expr) => {
+        match $e {
+            Some(v) => v,
+            None => {
+                eprintln!("VIBE_TEST_PG_ADMIN_URL not set; skipping Postgres test");
+                return;
+            }
+        }
+    };
+}
+
+#[tokio::test]
+async fn non_owner_runtime_role_is_accepted_and_limited() {
+    let s = require_pg!(setup().await);
+    check_as(&s.admin_url, &s.app).await.unwrap();
+    let schema = format!("t_{}", s.tenant);
+    let row = s
+        .admin
+        .query_one(
+            "SELECT has_table_privilege($1, $2, 'SELECT'), has_table_privilege($1, $2, 'INSERT'), \
+             has_table_privilege($1, $2, 'UPDATE'), has_table_privilege($1, $2, 'DELETE'), \
+             has_table_privilege($1, $2, 'TRUNCATE'), has_schema_privilege($1, $3, 'CREATE'), \
+             has_table_privilege($1, $4, 'SELECT')",
+            &[
+                &s.app,
+                &format!("{schema}.notes"),
+                &schema,
+                &format!("{schema}.audit_notes"),
+            ],
+        )
+        .await
+        .unwrap();
+    let flags: Vec<bool> = (0..7).map(|i| row.get(i)).collect();
+    assert_eq!(
+        flags,
+        vec![true, true, true, false, false, false, true],
+        "select/insert/update only, no create, migration tables covered by default privileges"
+    );
+}
+
+#[tokio::test]
+async fn rls_isolates_tenants_for_the_runtime_role() {
+    let s = require_pg!(setup().await);
+    let exec = PgExec::connect(&url_as(&s.admin_url, &s.app))
+        .await
+        .unwrap();
+    let cols = |names: &[&str]| -> Vec<Col> {
+        names
+            .iter()
+            .map(|n| Col {
+                name: n.to_string(),
+                ty: "string".into(),
+            })
+            .collect()
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let id = uuid::Uuid::new_v4().to_string();
+    exec.execute(
+        &s.tenant,
+        "app_rw",
+        Stmt::Insert {
+            table: "notes".into(),
+            values: vec![
+                (
+                    Col {
+                        name: "id".into(),
+                        ty: "uuid".into(),
+                    },
+                    json!(id),
+                ),
+                (cols(&["tenant_id"])[0].clone(), json!(s.tenant)),
+                (cols(&["body"])[0].clone(), json!("secret")),
+                (
+                    Col {
+                        name: "created_at".into(),
+                        ty: "timestamp".into(),
+                    },
+                    json!(now),
+                ),
+                (
+                    Col {
+                        name: "updated_at".into(),
+                        ty: "timestamp".into(),
+                    },
+                    json!(now),
+                ),
+            ],
+            returning: cols(&["body"]),
+        },
+    )
+    .await
+    .unwrap();
+    // The table lives in t_<tenant>; a different tenant id points the session
+    // at another schema and a different RLS value, so it must see nothing.
+    // Writing a row with someone else's tenant_id must fail WITH CHECK.
+    let admin = &s.admin;
+    let schema = format!("t_{}", s.tenant);
+    let forged = admin
+        .batch_execute(&format!(
+            "SET ROLE {app}; BEGIN; SELECT set_config('app.tenant_id', 'othertenant1', true); \
+             INSERT INTO {schema}.notes (id, tenant_id, created_at, updated_at) \
+             VALUES (gen_random_uuid(), '{t}', now(), now()); COMMIT;",
+            app = s.app,
+            t = s.tenant
+        ))
+        .await;
+    let _ = admin.batch_execute("ROLLBACK; RESET ROLE").await;
+    assert!(
+        forged.is_err(),
+        "RLS WITH CHECK must reject a forged tenant_id"
+    );
+    let visible = admin
+        .query_one(&format!("SELECT count(*) FROM {schema}.notes"), &[])
+        .await
+        .unwrap()
+        .get::<_, i64>(0);
+    assert_eq!(visible, 1);
+    let _ = &s.owner;
+}
+
+#[tokio::test]
+async fn privileged_or_owning_roles_are_rejected() {
+    let s = require_pg!(setup().await);
+    let x = suffix();
+    let cases = [
+        ("su", format!("su_{x}"), "SUPERUSER".to_string()),
+        ("bypass", format!("by_{x}"), "BYPASSRLS".to_string()),
+        (
+            "member-of-superuser",
+            format!("ms_{x}"),
+            "IN ROLE postgres".to_string(),
+        ),
+        (
+            "noinherit-member-of-owner",
+            format!("mo_{x}"),
+            format!("NOINHERIT IN ROLE {}", s.owner),
+        ),
+    ];
+    for (label, name, extra) in &cases {
+        create_login(&s.admin, name, extra).await;
+        let err = check_as(&s.admin_url, name)
+            .await
+            .expect_err(&format!("{label} must be rejected"));
+        assert!(err.contains("refusing to serve"), "{label}: {err}");
+    }
+    // The owner itself.
+    let err = check_as(&s.admin_url, &s.owner).await.unwrap_err();
+    assert!(
+        err.contains("tenant relation") && err.contains("tenant schema"),
+        "{err}"
+    );
+    // NOINHERIT member of a BYPASSRLS group role.
+    let group = format!("grp_{x}");
+    s.admin
+        .batch_execute(&format!("CREATE ROLE {group} NOLOGIN BYPASSRLS"))
+        .await
+        .unwrap();
+    let member = format!("mb_{x}");
+    create_login(&s.admin, &member, &format!("NOINHERIT IN ROLE {group}")).await;
+    let err = check_as(&s.admin_url, &member).await.unwrap_err();
+    assert!(err.contains(&group), "{err}");
+}
