@@ -4,6 +4,34 @@ Rust SDK and `vibe` CLI for a markdown-driven serverless backend. Source files u
 
 The specification is [docs/spec-v1.7.md](docs/spec-v1.7.md).
 
+## Install
+
+Download `vibe` from [GitHub Releases](https://github.com/vibe-backend/sdk/releases). The CLI is not published to crates.io and it is not published as a container image.
+
+| Platform | Archive |
+| --- | --- |
+| Linux x86_64 | `vibe-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux aarch64 | `vibe-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS x86_64 | `vibe-x86_64-apple-darwin.tar.gz` |
+| macOS aarch64 | `vibe-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `vibe-x86_64-pc-windows-msvc.zip` |
+
+Each release also has `SHA256SUMS`. On Linux or macOS:
+
+```bash
+tag=v0.1.0
+asset=vibe-x86_64-unknown-linux-gnu.tar.gz
+curl -fsSL -O "https://github.com/vibe-backend/sdk/releases/download/${tag}/${asset}"
+curl -fsSL -O "https://github.com/vibe-backend/sdk/releases/download/${tag}/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf "$asset"
+install -m 755 vibe "$HOME/.local/bin/vibe"
+```
+
+On Windows, download `vibe-x86_64-pc-windows-msvc.zip`, check it against `SHA256SUMS`, and unpack `vibe.exe`.
+
+A checkout with Rust 1.89 can also build the binary with `cargo build --release --locked`.
+
 ## Run the sample shop
 
 From a checkout with Rust 1.89 (`rust-version` in `Cargo.toml`; `rust-toolchain.toml` pins the same channel):
@@ -51,5 +79,8 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 
 ## CI/CD
 
-- **CI** (`.github/workflows/ci.yml`, on PRs and pushes to `main`): Markdown lint + local link check; Rust 1.89 `cargo check --locked`, `fmt`, `clippy`, and `test` once a `Cargo.toml` exists; Docker build (no push) once a `Dockerfile` exists.
-- **CD** (`.github/workflows/cd.yml`, on pushes to `main` and `v*` tags): builds and pushes `ghcr.io/vibe-backend/sdk` from the root Dockerfile.
+Required CI checks are **Markdown lint & link check** and **Rust fmt / clippy / test**. There is no Docker image job.
+
+- **CI** (`.github/workflows/ci.yml`, on PRs and pushes to `main`): Markdown lint + local link check; Rust 1.89 `cargo check --locked`, `fmt`, `clippy`, and `test` once a `Cargo.toml` exists.
+- **Release** (`.github/workflows/release.yml`, on tags `v*`): builds `vibe` for Linux x86_64 and aarch64, macOS x86_64 and aarch64, and Windows x86_64. Archives are `tar.gz` (Unix) or `zip` (Windows), plus `SHA256SUMS`, on a GitHub Release. Nothing is pushed to GHCR or crates.io.
+- **CD** (`.github/workflows/cd.yml`): GHCR image publishing is disabled.

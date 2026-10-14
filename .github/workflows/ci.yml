@@ -53,23 +53,3 @@ jobs:
         run: cargo test --locked --all-features
       - if: steps.detect.outputs.present != 'true'
         run: echo "No Cargo.toml yet; skipping Rust checks."
-
-  docker:
-    name: Docker build (no push)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Detect Dockerfile
-        id: detect
-        run: echo "present=${{ hashFiles('Dockerfile') != '' }}" >> "$GITHUB_OUTPUT"
-      - if: steps.detect.outputs.present == 'true'
-        uses: docker/setup-buildx-action@v4
-      - if: steps.detect.outputs.present == 'true'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: false
-          cache-from: type=gha
-          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max' || '' }}
-      - if: steps.detect.outputs.present != 'true'
-        run: echo "No Dockerfile yet; skipping Docker build."
