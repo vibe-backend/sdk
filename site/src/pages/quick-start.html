@@ -1,0 +1,38 @@
+<h1>Quick start</h1>
+<p>This walkthrough shows the shape of a vibe-backend project as defined in <a href="docs/spec.html">Spec v1.5</a>.</p>
+<h2>1. Lay out your project</h2>
+<pre data-lang="plaintext">
+project/
+  providers/main.md                     # database provider (PostgreSQL by default)
+  pipelines/login-guard.md              # reusable request pipeline
+  models/user/user.md                   # model definition
+  models/user/methods/sign-token.md     # model method
+  api/users/_definition.md              # shared settings for the "users" API
+  api/users/v1/_version.md              # settings for version v1
+  api/users/v1/login/login.md           # the entry point: POST /users/v1/login
+</pre>
+<p>All names are kebab-case (<code>a-z0-9-</code>). Files starting with <code>_</code> are reserved and never routed.</p>
+<h2>2. Describe a feature in plain language</h2>
+<p>A feature file says what the endpoint does. Suggested (optional) headings help the compiler: purpose, input, output, approach, errors and permissions.</p>
+<pre data-lang="markdown">
+# login
+
+Public endpoint. Uses POST.
+
+## Input
+- email
+- password
+
+## Approach
+Run the login-guard pipeline, then call user.sign-token and return the tokens.
+
+## Errors
+- Wrong email or password returns 401.
+</pre>
+<h2>3. Compile, review, deploy</h2>
+<ol class="steps">
+  <li>The compiler writes <code>login.lock.md</code> next to your source with fixed sections such as <code>## Route</code>, <code>## Access</code>, <code>## Request</code>, <code>## Steps</code> and <code>## Errors</code>. Never edit locks by hand.</li>
+  <li>An owner or maintainer confirms the lock in the PR review; the validator highlights every security item.</li>
+  <li>On deploy, confirmed locks become a signed manifest and the endpoint is served serverless.</li>
+</ol>
+<p>Next: read the <a href="docs/index.html">docs</a> for the full lock format, validation rules and examples.</p>

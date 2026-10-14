@@ -1,0 +1,11 @@
+<h1>Features</h1>
+<div class="cards">
+  <div class="card"><h3>Markdown as the source of truth</h3><p>Models, methods, APIs, pipelines and providers are all written as natural-language Markdown. Optional frontmatter (e.g. <code>method: POST</code>) is allowed but never required.</p></div>
+  <div class="card"><h3>Folder-based routing</h3><p>Entry points live in <code>api/{definition}/{version}/{feature}/{feature}.md</code> and route to <code>/{definition}/{version}/{feature}</code>. Versions are path-only (<code>v1</code>, <code>v2</code>, …); v1 supports HTTP GET, POST, PUT and DELETE.</p></div>
+  <div class="card"><h3>Reviewed lock files</h3><p>Every source compiles to a structured <code>.lock.md</code>. Locks touching security items always need human confirmation, bound to the commit hash; high-risk changes need two non-author approvers.</p></div>
+  <div class="card"><h3>Signed manifest &amp; serverless runtime</h3><p>Confirmed locks are merged into a signed manifest. Each request runs with a cold start (p95 target under 1 second); the runtime never reads source Markdown.</p></div>
+  <div class="card"><h3>Deterministic validation</h3><p>An independent validator checks lock integrity, routing, pipelines and auth, providers, RLS and public access. The compiler has no network or tool access, and its model snapshot is pinned via a compiler hash.</p></div>
+  <div class="card"><h3>Built-in account security</h3><p>Refresh tokens rotate on every use (reuse revokes the family), access tokens last at most 1 hour, passwords need 12+ characters plus a breached-password check, and 5 failures in 15 minutes lock an account.</p></div>
+  <div class="card"><h3>Tenant isolation</h3><p>PostgreSQL providers by default, row-level security, DDL and TRUNCATE are forbidden in locks, and public writes are tightly limited with quotas, field allow-lists and audit logs.</p></div>
+  <div class="card"><h3>Operations</h3><p>RFC 9110 status codes, structured logs, an emergency kill switch that disables an endpoint within 30 seconds (p99) without redeploying, and supply-chain protection via CODEOWNERS.</p></div>
+</div>
