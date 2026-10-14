@@ -209,6 +209,21 @@ pub fn analyze(sql: &str) -> Result<SqlInfo, String> {
     })
 }
 
+/// Whether a single statement yields rows (a query, or a write with
+/// RETURNING), from its parse tree. Unparseable SQL yields no rows.
+pub fn returns_rows(sql: &str) -> bool {
+    let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+        return false;
+    };
+    match statements.as_slice() {
+        [Statement::Query(_)] => true,
+        [Statement::Insert(insert)] => insert.returning.is_some(),
+        [Statement::Update { returning, .. }] => returning.is_some(),
+        [Statement::Delete(delete)] => delete.returning.is_some(),
+        _ => false,
+    }
+}
+
 /// Why `sql` may not run as a `query` step, or None when it may.
 pub fn query_problem(sql: &str) -> Option<String> {
     let statements = match Parser::parse_sql(&PostgreSqlDialect {}, sql) {
@@ -281,6 +296,18 @@ pub fn wrapped_problem(wrapped: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{analyze, query_problem, wrap_for_rows, wrapped_problem, SqlInfo};
+
+    #[test]
+    fn returns_rows_reads_returning_from_the_parse_tree() {
+        use super::returns_rows;
+        assert!(returns_rows("select 1"));
+        assert!(returns_rows("insert into t (a) values ($1) returning id"));
+        assert!(!returns_rows("insert into t (a) values ('returning')"));
+        assert!(returns_rows(
+            "update t set a = 1 where id = $1 returning id"
+        ));
+        assert!(!returns_rows("delete from t where id = $1"));
+    }
 
     #[test]
     fn analyze_reads_the_statement_kind() {
