@@ -2493,7 +2493,7 @@ signature: MEYCIQ...
 
 - 冇 `set-password` capability、冇 `hash-password` step：公開註冊永遠唔寫 password。
 - Upsert 規則（決定 67）：
-  - `INSERT` 只寫 `email`、`name`、`email_verify_hash`、`email_verify_expires_at`；`ON CONFLICT DO UPDATE` 只准改 `email_verify_hash`、`email_verify_expires_at`，一定要有 `where users.email_verified_at is null and users.deleted_at is null`。驗證器檢查 `columns.update` 係 `columns.insert` 嘅子集，而且唔包括 password、`name`、`email` 或者任何黑名單欄位。
+  - `INSERT` 只寫 `email`、`name`、`email_verify_hash`、`email_verify_expires_at`、`email_verify_purpose`（固定 `'register'`）；`ON CONFLICT DO UPDATE` 只准改 `email_verify_hash`、`email_verify_expires_at`、`email_verify_purpose`（設返 `'register'`），一定要有 `where users.email_verified_at is null and users.deleted_at is null and not (users.email_verify_purpose = 'invite' and users.email_verify_expires_at > now())`，即係未驗證、未刪除、而且冇未過期嘅邀請。驗證器檢查 `columns.update` 係 `columns.insert` 嘅子集，而且唔包括 password、`name`、`email` 或者任何黑名單欄位。
   - `scope: pk` 嘅意思：conflict target 係租戶內嘅唯一鍵 `(tenant_id, email)`（`tenant_id` 由 RLS 同平台注入，唔喺 SQL 參數入面），所以 DO UPDATE 最多只會影響同一租戶入面同一 email 嘅一列。
   - 有未過期 admin 邀請（`email_verify_purpose = 'invite'` 而且 `email_verify_expires_at > now()`）嘅 email：DO UPDATE 條件唔成立，邀請 token、到期時間同所有欄位都唔變，`ins.id` 係 null，所以 enqueue 寄「已經有帳戶」中性通知；回應同其他情況一樣係 202。邀請過期之後，註冊就當普通未驗證帳戶處理（輪換成 `register` token）。
   - 一個 upsert 只算一次 public 寫入（不論最後係 INSERT 定 UPDATE），計入每日配額一次。
