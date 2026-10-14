@@ -37,7 +37,7 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
     fs::create_dir_all(root.join("providers")).unwrap();
     fs::write(
         root.join("providers/main.md"),
-        include_str!("../examples/shop/providers/main.md"),
+        include_str!("fixtures/shop/providers/main.md"),
     )
     .unwrap();
     fs::write(
@@ -65,6 +65,7 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
         seed: 0,
         endpoint_host: "api.openai.com".into(),
         endpoint_private: false,
+        api_style: "chat".into(),
     };
     let adapter = FakeAdapter {
         responder: |request: &LlmRequest| {
