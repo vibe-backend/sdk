@@ -35,7 +35,7 @@
 
 ### 0.1 範圍
 
-- v1 只支援 HTTP API 入口，method 限 GET／POST／PUT／PATCH／DELETE（PATCH 由決定 105 加入，待產品經理確認）；排程、queue、webhook 入口唔喺 v1 範圍內。
+- v1 只支援 HTTP API 入口，method 限 GET／POST／PUT／PATCH／DELETE（PATCH 由決定 105 加入，已確認（產品經理 2026-10-14））；排程、queue、webhook 入口唔喺 v1 範圍內。
 - `{definition}` 代表 domain；`{version}` 代表 API 版本。
 - 主檔用 `{feature}/{feature}.md`，唔用 `index.md`。
 - 只用路徑揀版本，唔支援 `Accept-Version` header；每個 version 可以有自己獨立嘅 feature。
@@ -58,7 +58,7 @@
 | 10 | （v1.8 由決定 77 修訂，待產品經理確認）SDK 唔再分自動／人手確認；所有 lock（structured 或者 natural）通過驗證器同 CI 重編就可以 build 同部署。「係咪 structured」照樣由 deterministic parser 判斷，只影響使唔使 call LLM。 | 2A.5 |
 | 11 | （v1.8 由決定 77 修訂，待產品經理確認）SDK 冇確認角色；邊個可以 merge 由 Git 平台 rulesets（分支規則） 決定（見 9C 同 [`pr-review-guide.md`](pr-review-guide.md)）。 | 2A.5 |
 | 12 | 單一職責上限係 warning。 | 12.3a、10 |
-| 13 | 軟刪除永遠唔會實際刪除資料，冇 purge。 | 12.9 |
+| 13 | 軟刪除永遠唔會實際刪除資料，冇 purge。v1.8 澄清（已確認（產品經理 2026-10-14））：決定 13 只管用戶 API 同用戶資料；平台系統表（例如決定 104 嘅 `_platform_idempotency`）由 runtime 按 TTL 清理，唔受決定 13 限制。 | 12.9 |
 | 14 | CRUD 嘅 list 用 offset 分頁（保留 page-size 上限）。 | 12.9 |
 | 15 | 編譯器 major version 升級會強制重新編譯所有 lock；minor 升級唔會。 | 2A.6 |
 
@@ -210,11 +210,11 @@
 | 100 | Transaction 超時同衝突：預設 `statement_timeout` 5s、transaction 總時間 10s、`idle_in_transaction_session_timeout` 5s；超時 rollback，回 504 `TX_TIMEOUT`。Deadlock（`40P01`）同 serialization failure（`40001`）回 503 `TX_CONFLICT`，body `retryable: true`，帶 `Retry-After: 1`；平台永遠唔會自動重試非冪等寫入。 | 已確認（產品經理 2026-10-14） | 7.4、8 |
 | 101 | 瀏覽器 refresh cookie（issue #78）：refresh token 放 `__Host-vibe_rt_{slug}` cookie（`HttpOnly; Secure; Path=/`，冇 `Domain`）；產品經理確認防 subdomain 覆蓋比限定 Path 重要。兩個模式：預設 `same-site`（`SameSite=Strict`）；明確開嘅 `cross-site`（`SameSite=None`），一定要同時有嚴格 `Origin` 白名單（完全相等、唔准 `*`）同 `X-Vibe-CSRF` 自訂 header 檢查（強制 CORS preflight），缺任何一樣 build／部署失敗。每次 refresh 輪換，重用撤銷成個家族；access token 唔放 cookie；CORS credentials 只限 refresh 同 logout；logout 清 cookie 同撤銷家族。 | 已確認（產品經理 2026-10-14） | 4A.1、4A.1a |
 | 102 | Build TOCTOU：`vibe build` 只讀一次 source 同 lock 入記憶體，驗證同之後所有 build 步驟（manifest、報告、簽名）都用同一份內容；之後檔案改動唔會影響今次 build。 | 已確認（產品經理 2026-10-14） | 2C.3 |
-| 103 | CORS（issue #84）：`_definition.md` 加 `## Cors`（`allow-origins`、`allow-headers`、`expose-headers`、`max-age`）；origin 完全相等比對；`*` 只准喺冇 credentials 時用而且 release build 出 warning；`localhost` port 萬用只限 dev build；`## Cors` 唔准開 credentials（credentials 只限決定 101 嘅 refresh／logout）；永遠帶 `Vary: Origin`；`OPTIONS` preflight 由 runtime 處理。 | 待產品經理確認 | 2.3a、4A.1a、8 |
-| 104 | `Idempotency-Key`（issue #85）：POST／PATCH api 可以喺 lock 開 `## Idempotency`；public endpoint 唔准開；key 範圍 `(tenant, subject, route, key)`；request hash 同成功回應喺同一個 request transaction（決定 99）寫入；同 key 唔同 body 回 422 `IDEMPOTENCY_KEY_REUSED`；處理緊回 409 `IDEMPOTENCY_IN_PROGRESS`；ttl 預設 24h；失敗回應唔儲存。平台照樣唔自動重試（決定 100）。 | 待產品經理確認 | 2.3b、8 |
-| 105 | PATCH（issue #86）：route method 加 `PATCH`（修訂 0.1、2.3 嘅 GET／POST／PUT／DELETE）；語意係 JSON Merge Patch（RFC 7396），只限宣告欄位；`null` 只可以清 nullable 欄位；唔可以改嘅欄位回 422；內置 CRUD `update`（`partial: true`）用 PATCH、`partial: false` 用 PUT；CRUD update 照樣一定要 `If-Match`（決定 48），自訂 PATCH 可以選擇要唔要。 | 待產品經理確認 | 0.1、2.3、2.3c、12.9 |
-| 106 | Cursor 分頁同區間篩選（issue #87）：CRUD `list` 可以揀 `pagination: cursor`（offset 照樣係預設，決定 14）；cursor 係簽名嘅不透明值，綁定 sort、filter 同租戶；排序一定加主鍵做 tiebreaker；`page-size` 預設 20、上限 100；`range` 篩選只准宣告咗而且有 index 嘅欄位，運算子 `gte`／`gt`／`lte`／`lt`；編譯時驗證；cursor 同 sort／filter 唔對應回 400 `INVALID_CURSOR`。 | 待產品經理確認 | 12.9 |
-| 107 | 多欄唯一鍵：model lock 加 `## Constraints`（`- unique: [col_a, col_b]`，平台自動喺前面加 `tenant_id`）；一定要有對應 migration 建 unique index；衝突回 409 `UNIQUE_VIOLATION`，唔回顯欄位值。 | 待產品經理確認 | 12.2、8 |
+| 103 | CORS（issue #84）：`_definition.md` 加 `## Cors`（`allow-origins`、`allow-headers`、`expose-headers`、`max-age`）；origin 完全相等比對；`*` 只准喺冇 credentials 時用而且 release build 出 warning；`localhost` port 萬用只限 dev build；`## Cors` 唔准開 credentials（credentials 只限決定 101 嘅 refresh／logout）；永遠帶 `Vary: Origin`；`OPTIONS` preflight 由 runtime 處理。 | 已確認（產品經理 2026-10-14） | 2.3a、4A.1a、8 |
+| 104 | `Idempotency-Key`（issue #85）：POST／PATCH api 可以喺 lock 開 `## Idempotency`；public endpoint 唔准開；key 範圍 `(tenant, subject, route, key)`；request hash 同成功回應喺同一個 request transaction（決定 99）寫入；同 key 唔同 body 回 422 `IDEMPOTENCY_KEY_REUSED`；處理中租約（`lease` 預設 30s，一定大過 transaction 上限 10s）有效時先回 409 `IDEMPOTENCY_IN_PROGRESS`，租約過期（例如 crash）當未開始、重試可以接手；過期紀錄由 runtime 按 TTL 清理（平台系統表，唔受決定 13 限制）；ttl 預設 24h；失敗回應唔儲存。平台照樣唔自動重試（決定 100）。 | 已確認（產品經理 2026-10-14） | 2.3b、8 |
+| 105 | PATCH（issue #86）：route method 加 `PATCH`（修訂 0.1、2.3 嘅 GET／POST／PUT／DELETE）；語意係 JSON Merge Patch（RFC 7396），只限宣告欄位；`null` 只可以清 nullable 欄位；唔可以改嘅欄位回 422；內置 CRUD `update`（`partial: true`）用 PATCH、`partial: false` 用 PUT；CRUD update 照樣一定要 `If-Match`（決定 48），自訂 PATCH 可以選擇要唔要。 | 已確認（產品經理 2026-10-14） | 0.1、2.3、2.3c、12.9 |
+| 106 | Cursor 分頁同區間篩選（issue #87）：CRUD `list` 可以揀 `pagination: cursor`（offset 照樣係預設，決定 14）；cursor 係簽名嘅不透明值，綁定 sort、filter 同租戶；排序一定加主鍵做 tiebreaker；`page-size` 預設 20，`max-page-size` 同 offset 一樣跟決定 71（平台上限 500），冇另外嘅 100 上限；`range` 篩選只准宣告咗而且有 index 嘅欄位，運算子 `gte`／`gt`／`lte`／`lt`；編譯時驗證；cursor 同 sort／filter 唔對應回 400 `INVALID_CURSOR`。 | 已確認（產品經理 2026-10-14） | 12.9 |
+| 107 | 多欄唯一鍵：model lock 加 `## Constraints`（`- unique: [col_a, col_b]`，平台自動喺前面加 `tenant_id`）；一定要有對應 migration 建 unique index；衝突回 409 `UNIQUE_VIOLATION`，唔回顯欄位值。 | 已確認（產品經理 2026-10-14） | 12.2、8 |
 
 ## 1. 目錄同命名
 
@@ -306,7 +306,7 @@ project/
 | `## Steps` | 有序步驟；api 層只准 `method`、`validate`、`transform`、`respond` 四種 op，**唔准 `query` 或者 `call`** |
 | `## Errors` | 業務錯誤碼對應狀態碼 |
 
-### 2.3a 跨來源請求 CORS（決定 103，待產品經理確認，issue #84）
+### 2.3a 跨來源請求 CORS（決定 103，已確認（產品經理 2026-10-14），issue #84）
 
 `api/{definition}/_definition.md` 可以加：
 
@@ -331,7 +331,7 @@ project/
 - `max-age`：預設 600 秒，上限 7200。
 - `allow-headers` 只可以包括平台認識嘅 header（`authorization`、`content-type`、`idempotency-key`、`if-match`、`x-vibe-csrf`）同 `## Request` 宣告咗嘅 header。
 
-### 2.3b `Idempotency-Key`（決定 104，待產品經理確認，issue #85）
+### 2.3b `Idempotency-Key`（決定 104，已確認（產品經理 2026-10-14），issue #85）
 
 POST 或者 PATCH 嘅 api lock 可以加：
 
@@ -341,21 +341,26 @@ POST 或者 PATCH 嘅 api lock 可以加：
 - header: Idempotency-Key
 - required: false
 - ttl: 24h
+- lease: 30s
 ```
 
 - 範圍：key 按 `(tenant, subject, route, key)` 分開；`subject` 係已認證用戶（或者 API key）嘅 id。**Public endpoint 唔准開**（冇 subject，唔同人用同一個 key 會攞到人哋嘅回應）。
 - Key：1–255 個可見 ASCII 字元；DB 只存 `HMAC-SHA-256(pepper, key)`。`required: true` 而冇帶 header 回 400 `IDEMPOTENCY_KEY_REQUIRED`。
 - Request hash：`SHA-256`（method、path、正規化之後嘅 JSON body）。
 - 流程（全部喺決定 99 嘅 request transaction 入面）：
-  1. 用 `pg_try_advisory_xact_lock` 鎖住 key；攞唔到（另一個同 key 請求處理緊）即回 409 `IDEMPOTENCY_IN_PROGRESS`，帶 `Retry-After: 1`。
+  1. 攞 key 嘅「處理中」租約（lease）：
+     - `lease` 預設 30s，一定要大過決定 100 嘅 transaction 上限 10s（驗證器檢查）。
+     - PostgreSQL 實作用 `pg_try_advisory_xact_lock`：租約綁住 transaction，commit、rollback、連線斷或者 process crash 都會即刻釋放，所以實際持有時間唔會超過 transaction 上限。冇 transaction 級 lock 嘅儲存（例如 in-memory 執行器或者之後嘅外部 store）用 `lease_expires_at` 欄位，處理期間每 10s heartbeat 延長。
+     - 租約仲有效（另一個同 key 請求處理緊）即回 409 `IDEMPOTENCY_IN_PROGRESS`，帶 `Retry-After: 1`；**只有租約有效時先回 409**。
+     - 租約過期（例如 crash、冇 heartbeat）：因為成個 request 喺同一個 transaction，冇任何嘢 commit 過，所以當「未開始」，重試可以接手重新執行。
   2. 搵未過期嘅紀錄：有而且 request hash 一樣，就重播儲存咗嘅狀態碼、body 同 `ETag`／`Location`，加 header `Idempotent-Replayed: true`，唔執行 steps；hash 唔一樣回 422 `IDEMPOTENCY_KEY_REUSED`。
   3. 冇紀錄就照常執行；成功（2xx）先喺同一個 transaction 寫入紀錄（request hash、狀態碼、body、`expires_at`），同業務寫入一齊 commit。
   4. 失敗回應（4xx／5xx、`TX_TIMEOUT`、`TX_CONFLICT`）會 rollback，唔儲存；用同一個 key 重試會重新執行。
 - 儲存：平台表 `_platform_idempotency`（每個租戶 schema 一張，有 RLS），由平台 role `idempotency_store`（SELECT、INSERT、UPDATE）寫；body 用租戶資料 key 加密（同 12.10 crypto-shredding）。
-- `ttl` 預設 24h，上限 7d；過期紀錄當唔存在，同一個 key 可以再用（UPDATE 覆蓋）。實體清理屬平台維護，唔經用戶 lock；同決定 13（唔准 DELETE）嘅關係待產品經理確認。
+- `ttl` 預設 24h，上限 7d；過期紀錄當唔存在，同一個 key 可以再用。`_platform_idempotency` 係平台系統表，由 runtime 按 TTL 清理過期紀錄（平台 role，唔經用戶 lock）；決定 13 只管用戶 API 同用戶資料，唔適用於平台系統表。
 - 平台照樣唔會自動重試（決定 100）；`Idempotency-Key` 係畀 client 安全重試用。
 
-### 2.3c PATCH（決定 105，待產品經理確認，issue #86）
+### 2.3c PATCH（決定 105，已確認（產品經理 2026-10-14），issue #86）
 
 - 語意：JSON Merge Patch（RFC 7396）。接受 `Content-Type: application/merge-patch+json` 同 `application/json`。
   - 只可以改 `## Request` 宣告咗嘅欄位；未宣告欄位照樣 422。
@@ -2315,7 +2320,7 @@ source 用自然語言描述欄位，例如「email 係唯一嘅合法 email」�
 | `sensitive` | 敏感欄位（見 12.9） |
 
 - 平台會自動加 `tenant_id` 欄位同 RLS policy（寫入 `## Policies`）；用戶唔可以自己宣告 `tenant_id`。
-- 多欄唯一鍵（決定 107，待產品經理確認）：source 用自然語言講（例如「同一張訂單入面每件商品只可以出現一次」），編譯成 model lock 嘅 `## Constraints`：
+- 多欄唯一鍵（決定 107，已確認（產品經理 2026-10-14））：source 用自然語言講（例如「同一張訂單入面每件商品只可以出現一次」），編譯成 model lock 嘅 `## Constraints`：
 
   ```md
   ## Constraints
@@ -2769,14 +2774,14 @@ security-items:
 
 - 預設唔會自動生成任何 CRUD。model source 要明確講（例如「提供 get、list、update」或者「提供全部 CRUD」），lock 嘅 `## CRUD` 列咗邊樣就注入邊樣。
 - CRUD 選項（喺 source 用自然語言講，編譯成 `## CRUD` 表）：
-  - `list`：`pagination`（`offset` 預設，或者 `cursor`，決定 106）、`page-size`（預設 20）、`max-page-size`（預設 100，平台上限 500，決定 71，已確認（產品經理 2026-10-14）；超過上限驗證器報 error；`cursor` 模式上限 100）、`sort` 白名單、`filter` 白名單（欄位後面加 `: range` 開區間篩選）。
+  - `list`：`pagination`（`offset` 預設，或者 `cursor`，決定 106）、`page-size`（預設 20）、`max-page-size`（預設 100，平台上限 500，決定 71，已確認（產品經理 2026-10-14）；超過上限驗證器報 error；offset 同 cursor 模式一樣跟決定 71）、`sort` 白名單、`filter` 白名單（欄位後面加 `: range` 開區間篩選）。
   - `update`：`partial`（預設 true）。
   - `delete`：一律軟刪除，冇 `soft: false` 選項（決定 13）。
 - 注入嘅 method 名同簽名（每個都有平台產生同簽名嘅 lock，`source-type: structured`，`id` 例如 `user/crud/get`）：
   - `create`：input 係所有可寫欄位，output 係物件。
   - `get`：input 係 `id`，冇結果就 fail `NOT_FOUND`。
   - `list`：offset 分頁（決定 14），input 係 `page`（由 1 開始）、`page-size`（唔可以超過 `max-page-size`，超過回 422）、`sort`、`filter`；只准用白名單欄位排序同篩選；output 係 `{ items, page, page_size, has_more }`。
-  - `list`（`pagination: cursor`，決定 106，待產品經理確認）：
+  - `list`（`pagination: cursor`，決定 106，已確認（產品經理 2026-10-14））：
     - 例：`| list | pagination: cursor, page-size: 20, max-page-size: 100, sort: [created_at, price_cents], filter: [category, price_cents: range] |`。
     - Input：`cursor`（選填）、`page-size`、`sort`、`filter`；output 係 `{ items, next_cursor }`，最後一頁 `next_cursor` 係 `null`。
     - 排序穩定：平台一定喺 sort 欄位後面加主鍵 `id` 做 tiebreaker；sort 欄位一定要 NOT NULL（驗證器檢查）。
@@ -3453,7 +3458,7 @@ security-items:
 
 私隱法（PDPO、GDPR）部分嘅建議請法律意見覆核。
 
-另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–102 已經由產品經理確認；決定 103–107 待產品經理確認）；確認之前 v1.7 定稿照樣有效。
+另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–107 已經由產品經理確認）；確認之前 v1.7 定稿照樣有效。
 
 ## 14. 後續版本
 
