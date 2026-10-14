@@ -113,7 +113,7 @@ async fn run_steps(
             "query" | "verify-password" | "hash-password" | "random-token" | "hash-token"
             | "sign-jwt" => {
                 let value = match step.op.as_str() {
-                    "query" => super::ops::query(exec, step, &vars, ctx).await?,
+                    "query" => super::ops::query(exec, method, step, &vars, ctx).await?,
                     "verify-password" => super::ops::verify_password(step, &vars).await?,
                     "hash-password" => super::ops::hash_password_op(step, &vars).await?,
                     "random-token" => super::ops::random_token(step, ctx)?,
@@ -869,6 +869,11 @@ fn db(err: ExecError) -> MethodFail {
     }
 }
 
+/// Platform argon2id parameters; verify accepts only hashes made with them.
+pub const ARGON2_M_COST: u32 = 65_536;
+pub const ARGON2_T_COST: u32 = 3;
+pub const ARGON2_P_COST: u32 = 1;
+
 pub fn hash_password(plain: &str) -> Result<String, MethodFail> {
     let len = plain.chars().count();
     if !(12..=256).contains(&len)
@@ -879,7 +884,7 @@ pub fn hash_password(plain: &str) -> Result<String, MethodFail> {
             "password does not meet the platform baseline",
         ));
     }
-    let params = argon2::Params::new(65_536, 3, 1, Some(32))
+    let params = argon2::Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
         .map_err(|err| MethodFail::code("INTERNAL", err.to_string()))?;
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
