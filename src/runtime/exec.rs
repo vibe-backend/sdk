@@ -203,6 +203,35 @@ fn project(row: &Row, columns: &[Col]) -> Row {
     out
 }
 
+/// Privileges of the runtime connection role, as read from `pg_roles`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoleStatus {
+    pub name: String,
+    pub superuser: bool,
+    pub bypass_rls: bool,
+    pub owned_tables: i64,
+    pub owned_schemas: i64,
+}
+
+impl RoleStatus {
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.superuser {
+            out.push("is a superuser".to_string());
+        }
+        if self.bypass_rls {
+            out.push("has BYPASSRLS".to_string());
+        }
+        if self.owned_tables > 0 {
+            out.push(format!("owns {} tenant table(s)", self.owned_tables));
+        }
+        if self.owned_schemas > 0 {
+            out.push(format!("owns {} tenant schema(s)", self.owned_schemas));
+        }
+        out
+    }
+}
+
 pub struct PgExec {
     client: tokio::sync::Mutex<tokio_postgres::Client>,
 }
@@ -220,6 +249,44 @@ impl PgExec {
         Ok(Self {
             client: tokio::sync::Mutex::new(client),
         })
+    }
+
+    /// Refuses a connection role that can bypass row-level security: a
+    /// superuser, a role with BYPASSRLS, or a role that owns (directly or via
+    /// membership) any tenant schema or table. Spec §7.1: the connection role
+    /// must not own the tables and must not have BYPASSRLS.
+    pub async fn check_runtime_role(&self) -> Result<(), String> {
+        let client = self.client.lock().await;
+        let row = client
+            .query_one(
+                "SELECT r.rolname::text, r.rolsuper, r.rolbypassrls, \
+                 (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                   WHERE n.nspname LIKE 't\\_%' AND c.relkind IN ('r', 'p') \
+                   AND pg_has_role(r.oid, c.relowner, 'USAGE')), \
+                 (SELECT count(*) FROM pg_namespace n WHERE n.nspname LIKE 't\\_%' \
+                   AND pg_has_role(r.oid, n.nspowner, 'USAGE')) \
+                 FROM pg_roles r WHERE r.rolname = current_user",
+                &[],
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        let status = RoleStatus {
+            name: row.get(0),
+            superuser: row.get(1),
+            bypass_rls: row.get(2),
+            owned_tables: row.get(3),
+            owned_schemas: row.get(4),
+        };
+        let problems = status.problems();
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "refusing to serve: database role `{}` {}; connect with a non-owner role without BYPASSRLS (use VIBE_MIGRATE_DATABASE_URL for `vibe migrate`)",
+                status.name,
+                problems.join(", ")
+            ))
+        }
     }
 
     pub async fn batch(&self, statements: &[String]) -> Result<(), String> {
@@ -242,6 +309,9 @@ impl QueryExec for PgExec {
         role: &str,
         stmt: Stmt,
     ) -> Result<Vec<Row>, ExecError> {
+        // Postgres enforcement comes from the connection role itself (checked
+        // at startup by `check_runtime_role`) plus the grants `vibe migrate`
+        // issues to VIBE_RUNTIME_DB_ROLE; `role` is the logical caller class.
         let _ = role;
         let (sql, params) = sql::render(&stmt).map_err(ExecError::Message)?;
         let returning = returning_cols(&stmt);
@@ -332,4 +402,39 @@ pub fn etag(id: &str, updated_at: &str) -> String {
     hasher.update(b"|");
     hasher.update(updated_at.as_bytes());
     format!("\"{}\"", hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::RoleStatus;
+
+    fn status() -> RoleStatus {
+        RoleStatus {
+            name: "app".into(),
+            superuser: false,
+            bypass_rls: false,
+            owned_tables: 0,
+            owned_schemas: 0,
+        }
+    }
+
+    #[test]
+    fn safe_role_has_no_problems() {
+        assert!(status().problems().is_empty());
+    }
+
+    #[test]
+    fn unsafe_roles_are_reported() {
+        let mut s = status();
+        s.superuser = true;
+        s.bypass_rls = true;
+        s.owned_tables = 2;
+        s.owned_schemas = 1;
+        let p = s.problems();
+        assert_eq!(p.len(), 4, "{p:?}");
+        assert!(p.iter().any(|x| x.contains("superuser")));
+        assert!(p.iter().any(|x| x.contains("BYPASSRLS")));
+        assert!(p.iter().any(|x| x.contains("table")));
+        assert!(p.iter().any(|x| x.contains("schema")));
+    }
 }

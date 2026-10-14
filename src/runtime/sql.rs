@@ -280,6 +280,23 @@ fn json_text(value: &Value) -> Option<String> {
     }
 }
 
+/// Grants for the runtime (non-owner) role: schema usage plus SELECT, INSERT
+/// and UPDATE on the table. Never DELETE or TRUNCATE (spec §7.1).
+pub fn runtime_grant_statements(
+    schema: &str,
+    table: &str,
+    role: &str,
+) -> Result<Vec<String>, String> {
+    let schema = quote(schema)?;
+    let qualified = format!("{schema}.{}", quote(table)?);
+    let role = quote(role)?;
+    Ok(vec![
+        format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
+        format!("REVOKE ALL ON {qualified} FROM {role}"),
+        format!("GRANT SELECT, INSERT, UPDATE ON {qualified} TO {role}"),
+    ])
+}
+
 pub fn bootstrap_statements(
     schema: &str,
     table: &str,
@@ -336,6 +353,18 @@ pub fn bootstrap_statements(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_grants_never_include_delete() {
+        let stmts = runtime_grant_statements("t_acme0001", "products", "vibe_app").unwrap();
+        assert!(stmts
+            .iter()
+            .any(|s| s.contains("GRANT SELECT, INSERT, UPDATE")));
+        assert!(stmts
+            .iter()
+            .all(|s| !s.contains("DELETE") && !s.contains("TRUNCATE")));
+        assert!(runtime_grant_statements("t_x", "products", "bad\"role").is_err());
+    }
     use serde_json::json;
 
     #[test]
