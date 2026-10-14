@@ -12,7 +12,9 @@
 //! would reset the counter). To stop one client network from filling a shard
 //! with pinned buckets, every rate bucket is charged to the network that
 //! created it (an IPv4 address or an IPv6 /48, see [`owner_of`]), and one
-//! network may hold at most [`OWNER_CAP`] active buckets per shard.
+//! network may hold at most [`OWNER_CAP`] active buckets per shard, each
+//! wider network (IPv4 /24, IPv6 /32) at most [`NETWORK_CAP`], and the last
+//! [`RESERVE`] slots only go to clients that hold few buckets.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -24,9 +26,19 @@ pub const WINDOW: Duration = Duration::from_secs(60);
 /// Pinned entries examined per eviction before refusing a new key.
 const EVICT_SCAN: usize = 64;
 /// Active buckets one client network (IPv4 address or IPv6 /48) may own in a
-/// single shard. A client needs `SHARD_CAPACITY / OWNER_CAP` distinct
-/// networks to fill a shard.
+/// single shard.
 pub const OWNER_CAP: usize = SHARD_CAPACITY / 100;
+/// Active buckets one wider network (IPv4 /24 or IPv6 /32) may own in a
+/// single shard, so many addresses from one block cannot fill it either.
+pub const NETWORK_CAP: usize = SHARD_CAPACITY / 10;
+/// The last `RESERVE` slots of a shard are kept for clients that hold few
+/// buckets: once a shard is that full, a new bucket is only created for a
+/// network below `RESERVE_OWNER_CAP` (and its wider network below
+/// `RESERVE_NETWORK_CAP`). New clients keep getting buckets even after heavy
+/// clients have used up everything else.
+pub const RESERVE: usize = SHARD_CAPACITY / 10;
+pub const RESERVE_OWNER_CAP: usize = 5;
+pub const RESERVE_NETWORK_CAP: usize = 50;
 
 /// A map with a fixed capacity and least-recently-used eviction.
 pub struct BoundedMap<V> {
@@ -165,71 +177,95 @@ impl RateShard {
         }
     }
 
-    fn release(owned: &mut HashMap<String, usize>, owner: &str) {
-        if let Some(n) = owned.get_mut(owner) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                owned.remove(owner);
+    fn release(owned: &mut HashMap<String, usize>, owners: &[String; 2]) {
+        for owner in owners {
+            if let Some(n) = owned.get_mut(owner) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    owned.remove(owner);
+                }
             }
         }
     }
 
-    /// Makes room for one more bucket owned by `owner`: drops that owner's
-    /// buckets that have no hit in the current window (removing them loses no
-    /// state). Returns false when the owner still holds `OWNER_CAP` active
-    /// buckets.
-    fn owner_has_room(&mut self, owner: &str, now: Instant) -> bool {
-        if self.owned.get(owner).copied().unwrap_or(0) < OWNER_CAP {
+    fn count(&self, owner: &str) -> usize {
+        self.owned.get(owner).copied().unwrap_or(0)
+    }
+
+    /// Frees `owner`'s buckets that have no hit in the current window
+    /// (removing them loses no state) until it owns fewer than `cap`, with a
+    /// bounded scan. Returns whether it is below `cap`.
+    fn prune_below(&mut self, owner: &str, cap: usize, now: Instant) -> bool {
+        if self.count(owner) < cap {
             return true;
         }
-        let Some(keys) = self.owner_keys.get_mut(owner) else {
-            return true;
+        let Some(mut keys) = self.owner_keys.remove(owner) else {
+            return false;
         };
         let mut scanned = 0;
-        while scanned < EVICT_SCAN {
+        while scanned < EVICT_SCAN && self.count(owner) >= cap {
             let Some(key) = keys.pop_front() else { break };
             scanned += 1;
             let Some(window) = self.map.get(&key) else {
                 continue; // evicted or removed already
             };
-            if window.owner != owner {
+            if !window.owners.iter().any(|o| o == owner) {
                 continue;
             }
             if window.is_idle(now) {
-                self.map.remove(&key);
-                Self::release(&mut self.owned, owner);
-                if self.owned.get(owner).copied().unwrap_or(0) < OWNER_CAP {
-                    return true;
+                if let Some(old) = self.map.remove(&key) {
+                    Self::release(&mut self.owned, &old.owners);
                 }
             } else {
                 keys.push_back(key);
             }
         }
-        self.owned.get(owner).copied().unwrap_or(0) < OWNER_CAP
+        self.owner_keys.insert(owner.to_string(), keys);
+        self.count(owner) < cap
     }
 
-    fn insert(&mut self, key: &str, owner: &str, limit: u32, now: Instant) -> bool {
+    /// Whether a new bucket may be charged to `owners`; `Err` names the
+    /// reason for the saturation log.
+    fn admit(&mut self, owners: &[String; 2], now: Instant) -> Result<(), &'static str> {
+        if !self.prune_below(&owners[0], OWNER_CAP, now) {
+            return Err("owner_cap");
+        }
+        if !self.prune_below(&owners[1], NETWORK_CAP, now) {
+            return Err("network_cap");
+        }
+        if self.map.entries.len() >= SHARD_CAPACITY - RESERVE
+            && (!self.prune_below(&owners[0], RESERVE_OWNER_CAP, now)
+                || !self.prune_below(&owners[1], RESERVE_NETWORK_CAP, now))
+        {
+            return Err("reserve");
+        }
+        Ok(())
+    }
+
+    fn insert(&mut self, key: &str, owners: &[String; 2], limit: u32, now: Instant) -> bool {
         let owned = &mut self.owned;
         let made = self.map.touch_pinned_with(
             key,
             || RateWindow {
                 limit,
                 hits: Vec::new(),
-                owner: owner.to_string(),
+                owners: owners.clone(),
             },
             |w| w.evictable(now),
-            |old| Self::release(owned, &old.owner),
+            |old| Self::release(owned, &old.owners),
         );
         if made.is_none() {
             return false;
         }
-        *self.owned.entry(owner.to_string()).or_insert(0) += 1;
-        let keys = self.owner_keys.entry(owner.to_string()).or_default();
-        keys.push_back(key.to_string());
-        let live = self.owned.get(owner).copied().unwrap_or(0);
-        if keys.len() > live * 4 + 16 {
-            let map = &self.map;
-            keys.retain(|k| map.get(k).is_some_and(|w| w.owner == owner));
+        for owner in owners {
+            *self.owned.entry(owner.clone()).or_insert(0) += 1;
+            let live = self.count(owner);
+            let keys = self.owner_keys.entry(owner.clone()).or_default();
+            keys.push_back(key.to_string());
+            if keys.len() > live * 4 + 16 {
+                let map = &self.map;
+                keys.retain(|k| map.get(k).is_some_and(|w| w.owners.contains(owner)));
+            }
         }
         if self.owner_keys.len() > self.owned.len() * 2 + 64 {
             let owned = &self.owned;
@@ -261,7 +297,8 @@ impl RateShard {
 pub struct RateWindow {
     limit: u32,
     hits: Vec<Instant>,
-    owner: String,
+    /// `[network, wider network]` the bucket is charged to.
+    owners: [String; 2],
 }
 
 impl RateWindow {
@@ -323,9 +360,11 @@ impl RateBuckets {
         if let Some(wait) = worst {
             return RateDecision::Limited(wait);
         }
-        // New keys: refuse when the creating network already owns
-        // `OWNER_CAP` active buckets in that shard, or when the shard is full
+        // New keys: refuse when the creating network or its wider network is
+        // over its cap in that shard, when the shard is into its reserve and
+        // the client already holds several buckets, or when the shard is full
         // of pinned buckets. Nothing is counted or created on refusal.
+        let owners = owner_levels(owner);
         for (shard, key, _) in checks {
             let rs = self
                 .shards
@@ -334,8 +373,8 @@ impl RateBuckets {
             if rs.map.get(key).is_some() {
                 continue;
             }
-            if !rs.owner_has_room(owner, now) {
-                rs.log_saturation(shard, "owner_cap", now);
+            if let Err(reason) = rs.admit(&owners, now) {
+                rs.log_saturation(shard, reason, now);
                 return RateDecision::Limited(WINDOW.as_secs());
             }
         }
@@ -344,7 +383,7 @@ impl RateBuckets {
             if rs.map.get(key).is_some() {
                 continue;
             }
-            if !rs.insert(key, owner, *limit, now) {
+            if !rs.insert(key, &owners, *limit, now) {
                 rs.log_saturation(shard, "pinned", now);
                 return RateDecision::Limited(WINDOW.as_secs());
             }
@@ -381,6 +420,24 @@ pub fn owner_of(ip_bucket: &str) -> String {
         Ok(IpAddr::V4(v4)) => v4.to_string(),
         Err(_) => ip_bucket.to_string(),
     }
+}
+
+/// `[network, wider network]` for an [`owner_of`] string: an IPv4 address
+/// and its /24, or an IPv6 /48 and its /32.
+pub fn owner_levels(owner: &str) -> [String; 2] {
+    let addr = owner.split('/').next().unwrap_or(owner);
+    let wider = match addr.parse::<IpAddr>().map(|ip| ip.to_canonical()) {
+        Ok(IpAddr::V6(v6)) => {
+            let net = mask(u128::from(v6), 32, 128);
+            format!("{}/32", std::net::Ipv6Addr::from(net))
+        }
+        Ok(IpAddr::V4(v4)) => {
+            let net = mask(u32::from(v4) as u128, 24, 32) as u32;
+            format!("{}/24", std::net::Ipv4Addr::from(net))
+        }
+        Err(_) => format!("{owner}/*"),
+    };
+    [owner.to_string(), wider]
 }
 
 /// Daily public-write counters, one bounded shard per key type.
@@ -519,7 +576,7 @@ mod tests {
         for i in 0..(SHARD_CAPACITY * 2) {
             let decision = rates.check(
                 &[(shard.clone(), format!("junk{i}"), 5)],
-                &format!("10.0.{}.{}", i / 256 % 256, i % 256),
+                &format!("10.{}.{}.1", i / 256 % 256, i % 256),
                 now,
             );
             assert!(matches!(decision, RateDecision::Allow));
@@ -564,7 +621,7 @@ mod tests {
         for i in 0..(SHARD_CAPACITY * 2) {
             rates.check(
                 &[(shard.clone(), format!("junk{i}"), 3)],
-                &format!("10.1.{}.{}", i / 256 % 256, i % 256),
+                &format!("11.{}.{}.1", i / 256 % 256, i % 256),
                 now,
             );
         }
@@ -594,7 +651,7 @@ mod tests {
         for i in 0..SHARD_CAPACITY {
             rates.check(
                 &[(shard.clone(), format!("k{i}"), 1)],
-                &format!("10.2.{}.{}", i / 256 % 256, i % 256),
+                &format!("12.{}.{}.1", i / 256 % 256, i % 256),
                 now,
             );
         }
@@ -742,7 +799,7 @@ mod tests {
         // Other networks flood shard a: LRU evicts the owner's (not at-limit)
         // buckets and its count drops, so it may create buckets again.
         for i in 0..SHARD_CAPACITY {
-            let o = format!("10.3.{}.{}", i / 256 % 256, i % 256);
+            let o = format!("13.{}.{}.1", i / 256 % 256, i % 256);
             rates.check(&[("a:input.email".into(), format!("j{i}"), 5)], &o, now);
         }
         assert!(matches!(
@@ -757,5 +814,125 @@ mod tests {
         assert_eq!(owner_of("2001:db8:1:ffff::/64"), "2001:db8:1::/48");
         assert_ne!(owner_of("2001:db8:2::/64"), owner_of("2001:db8:1::/64"));
         assert_eq!(owner_of("1.2.3.4"), "1.2.3.4");
+    }
+
+    fn pinned_fill(
+        rates: &mut RateBuckets,
+        shard: &str,
+        owner: &str,
+        keys: usize,
+        tag: &str,
+        now: Instant,
+    ) {
+        for k in 0..keys {
+            rates.check(&[(shard.to_string(), format!("{tag}-{k}"), 1)], owner, now);
+        }
+    }
+
+    #[test]
+    fn a_hundred_ipv6_48s_cannot_lock_out_new_clients() {
+        let now = Instant::now();
+        // Same /32: the wider-network cap stops them at NETWORK_CAP.
+        let mut rates = RateBuckets::default();
+        for n in 0..100 {
+            let owner = format!("2001:db8:{n:x}::/48");
+            pinned_fill(&mut rates, "login:ip", &owner, OWNER_CAP, &owner, now);
+        }
+        assert_eq!(rates.shards["login:ip"].map.entries.len(), NETWORK_CAP);
+        // 100 /48s in 100 different /32s: the reserve keeps room.
+        let mut rates = RateBuckets::default();
+        for n in 0..100 {
+            let owner = format!("2001:{:x}:1::/48", 0x100 + n);
+            pinned_fill(&mut rates, "login:ip", &owner, OWNER_CAP, &owner, now);
+        }
+        assert!(rates.shards["login:ip"].map.entries.len() < SHARD_CAPACITY);
+        let fresh = ip_bucket("2a00:1450:4001::1".parse().unwrap());
+        assert!(matches!(
+            rates.check(
+                &[("login:ip".into(), fresh.clone(), 1)],
+                &owner_of(&fresh),
+                now
+            ),
+            RateDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn a_hundred_ipv4_addresses_cannot_lock_out_new_emails() {
+        let now = Instant::now();
+        let shard = "login:input.email";
+        // One /24.
+        let mut rates = RateBuckets::default();
+        for n in 0..100 {
+            let owner = format!("198.51.100.{n}");
+            pinned_fill(&mut rates, shard, &owner, OWNER_CAP, &owner, now);
+        }
+        assert_eq!(rates.shards[shard].map.entries.len(), NETWORK_CAP);
+        // 100 different /24s.
+        let mut rates = RateBuckets::default();
+        for n in 0..100 {
+            let owner = format!("100.{n}.0.1");
+            pinned_fill(&mut rates, shard, &owner, OWNER_CAP, &owner, now);
+        }
+        for user in 0..20 {
+            let owner = format!("203.0.{user}.7");
+            assert!(
+                matches!(
+                    rates.check(
+                        &[(shard.into(), format!("new-user-{user}"), 5)],
+                        &owner,
+                        now
+                    ),
+                    RateDecision::Allow
+                ),
+                "new user {user}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_ip_without_trusted_proxies_is_capped_but_others_are_not() {
+        // Many users behind one CGNAT address (or one proxy when
+        // VIBE_TRUSTED_PROXIES is unset) share that address's allowance.
+        let now = Instant::now();
+        let shard = "signup:input.email";
+        let mut rates = RateBuckets::default();
+        let cgnat = "100.64.0.1";
+        for user in 0..OWNER_CAP {
+            assert!(matches!(
+                rates.check(&[(shard.into(), format!("u{user}"), 5)], cgnat, now),
+                RateDecision::Allow
+            ));
+        }
+        assert!(matches!(
+            rates.check(&[(shard.into(), "one-more".into(), 5)], cgnat, now),
+            RateDecision::Limited(_)
+        ));
+        // Neighbours in the same /24 and other networks are unaffected.
+        assert!(matches!(
+            rates.check(&[(shard.into(), "neighbour".into(), 5)], "100.64.0.2", now),
+            RateDecision::Allow
+        ));
+        assert!(matches!(
+            rates.check(&[(shard.into(), "elsewhere".into(), 5)], "192.0.2.10", now),
+            RateDecision::Allow
+        ));
+        // Existing users behind the shared address keep working, and new ones
+        // get in again once the window has passed.
+        assert!(matches!(
+            rates.check(&[(shard.into(), "u0".into(), 5)], cgnat, now),
+            RateDecision::Allow
+        ));
+        let later = now + WINDOW + Duration::from_secs(1);
+        assert!(matches!(
+            rates.check(&[(shard.into(), "one-more".into(), 5)], cgnat, later),
+            RateDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn owner_levels_nest() {
+        assert_eq!(owner_levels("2001:db8:1::/48")[1], "2001:db8::/32");
+        assert_eq!(owner_levels("198.51.100.7")[1], "198.51.100.0/24");
     }
 }
