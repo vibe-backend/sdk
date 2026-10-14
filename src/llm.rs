@@ -33,6 +33,8 @@ pub struct LlmRequest {
     pub model: String,
     pub seed: u64,
     pub timeout: Duration,
+    /// Shared per-source / per-run cap on attempts and time (#83).
+    pub budget: Option<std::sync::Arc<crate::llm_budget::CallBudget>>,
 }
 
 #[derive(Clone, Debug)]
@@ -630,17 +632,49 @@ impl LlmAdapter for HttpAdapter {
         let started = std::time::Instant::now();
         let deadline = retry_deadline();
         loop {
-            match self.compile_once(request).await {
+            // Every attempt reserves from the shared budget and may not run
+            // past the retry deadline or the budget's time left.
+            let mut window = deadline.saturating_sub(started.elapsed());
+            if let Some(budget) = &request.budget {
+                match budget.reserve() {
+                    Ok(left) => window = window.min(left),
+                    Err(why) => return Err(why),
+                }
+            }
+            if window.is_zero() {
+                return Err(format!(
+                    "LLM retry deadline {}s reached",
+                    deadline.as_secs()
+                ));
+            }
+            let attempt_result =
+                match tokio::time::timeout(window, self.compile_once(request)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(CallError {
+                        message: format!(
+                            "LLM call stopped after {}ms: deadline or budget reached",
+                            window.as_millis()
+                        ),
+                        retryable: false,
+                        retry_after: None,
+                    }),
+                };
+            match attempt_result {
                 Ok(response) => return Ok(response),
                 Err(err) if err.retryable && attempt < max => {
                     // 408/429/5xx/network/timeouts: honor Retry-After, else
                     // exponential backoff with jitter (#83); never past the
-                    // overall deadline.
+                    // overall deadline or the budget.
                     let delay = err.retry_after.unwrap_or_else(|| retry_delay(attempt));
-                    if started.elapsed() + delay > deadline {
+                    let budget_left = request
+                        .budget
+                        .as_ref()
+                        .map(|b| b.remaining())
+                        .unwrap_or(Duration::MAX);
+                    if started.elapsed() + delay >= deadline || delay >= budget_left {
                         return Err(redact(
                             &format!(
-                                "{} (gave up: retry deadline {}s reached)",
+                                "{} (gave up: retry deadline {}s or LLM budget reached)",
                                 err.message,
                                 deadline.as_secs()
                             ),
@@ -1100,6 +1134,7 @@ mod tests {
             model: "vendor-model-2026-09-01".into(),
             seed: 0,
             timeout: Duration::from_secs(1),
+            budget: None,
         };
         let unknown = model_capabilities(OPENAI, &request.model, 0);
         assert!(unknown.is_empty());
@@ -1294,6 +1329,7 @@ mod responses_tests {
                 model: model.into(),
                 seed: 7,
                 timeout: Duration::from_secs(5),
+                budget: None,
             };
             let err = adapter.compile(&request).await.unwrap_err();
             assert!(err.contains(&status.to_string()), "{status}: {err}");
@@ -1333,6 +1369,7 @@ mod responses_tests {
                 model: model.into(),
                 seed: config.seed,
                 timeout: config.timeout,
+                budget: None,
             };
             let (_, body, _) = openai_responses_call(&config, &request);
             let stamp = params.to_map();
@@ -1428,6 +1465,7 @@ mod responses_tests {
             model: model.into(),
             seed: 7,
             timeout: Duration::from_secs(5),
+            budget: None,
         };
         *reply.lock().unwrap() =
             json!({"status": "completed", "model": model, "output_text": "## A"});
@@ -1457,6 +1495,7 @@ mod responses_tests {
             model: "gpt-5.1-2026-01-01".into(),
             seed: 0,
             timeout: Duration::from_secs(1),
+            budget: None,
         };
         let body = openai_responses_body(&request, &model_capabilities(OPENAI, "gpt-5.1", 0));
         assert_eq!(body["instructions"], "sys");

@@ -42,6 +42,7 @@ async fn retries_stop_at_the_deadline() {
             model: "gpt-test-2026-01-01".into(),
             seed: 0,
             timeout: Duration::from_secs(5),
+            budget: None,
         })
         .await
     else {

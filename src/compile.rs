@@ -34,13 +34,21 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
     let mut docs: HashMap<String, LockDoc> = HashMap::new();
     let mut ordered: Vec<String> = Vec::new();
     // (cache key, LLM sections) for sources whose fresh LLM output compiled.
-    let mut pending_cache: Vec<(String, String)> = Vec::new();
+    // Written only once the source also passes semantic_check (below).
+    let mut pending_cache: HashMap<String, (String, String)> = HashMap::new();
+    let budget = std::sync::Arc::new(crate::llm_budget::CallBudget::from_env());
+    if let Err(err) = crate::lockcommit::recover(opts.root) {
+        report.push(Diag::error(
+            "compile",
+            format!("cannot recover an interrupted lock commit: {err}"),
+        ));
+        return Err(report);
+    }
 
     let mut ranked = sources.clone();
     ranked.sort_by_key(|source| (rank(source), source.rel.clone()));
 
     for source in &ranked {
-        pending_cache.clear();
         let hits = scan::scan_text(&source.combined_text());
         for hit in &hits {
             let diag = if hit.fatal {
@@ -88,11 +96,14 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                 ));
                 sections
             } else {
-                match llm_sections(opts, source, &docs).await {
+                budget.begin_source();
+                match llm_sections(opts, source, &docs, &budget).await {
                     Ok((sections, fingerprint)) => {
                         if let Some(key) = &key {
-                            pending_cache
-                                .push((key.clone(), crate::lock::render_sections(&sections)));
+                            pending_cache.insert(
+                                source.id.clone(),
+                                (key.clone(), crate::lock::render_sections(&sections)),
+                            );
                         }
                         if let Some(fingerprint) = fingerprint {
                             report.push(Diag::warning(
@@ -136,9 +147,6 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         }
         ordered.push(source.id.clone());
         docs.insert(source.id.clone(), doc);
-        if let Some((key, text)) = pending_cache.pop() {
-            write_cache(opts.root, &key, &text);
-        }
     }
 
     // #83: one failing source no longer blocks the others. Sources that
@@ -176,6 +184,9 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         semantic_check(&docs[id], &ranked, &mut report);
         if report.errors().count() > before {
             failed.insert(id.clone());
+        } else if let Some((key, text)) = pending_cache.remove(id) {
+            // Cache only output that compiled and passed semantic_check.
+            write_cache(opts.root, &key, &text);
         }
     }
 
@@ -234,7 +245,7 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
     if report.has_errors() {
         return Err(report);
     }
-    if let Err(err) = commit_locks(&writes) {
+    if let Err(err) = crate::lockcommit::commit_journaled(opts.root, &writes) {
         report.push(Diag::error(
             "compile",
             format!("cannot write locks (none changed): {err}"),
@@ -244,91 +255,8 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
     Ok(CompileOutput { files, report })
 }
 
-/// Replace every lock in one step: stage each to a fsynced temp file in the
-/// same directory, move existing locks aside, rename all temps in, fsync the
-/// directories, then drop the backups. Any failure restores the previous
-/// locks, so readers see either the old set or the new set.
 pub(crate) fn commit_locks(writes: &[(std::path::PathBuf, String)]) -> std::io::Result<()> {
-    use std::io::Write;
-    let tag = uuid::Uuid::new_v4().simple().to_string();
-    let suffix = |path: &Path, kind: &str| {
-        let mut name = path.file_name().unwrap_or_default().to_os_string();
-        name.push(format!(".{kind}-{tag}"));
-        path.with_file_name(name)
-    };
-    let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-    let cleanup = |staged: &[(std::path::PathBuf, std::path::PathBuf)]| {
-        for (tmp, _) in staged {
-            let _ = fs::remove_file(tmp);
-        }
-    };
-    for (path, text) in writes {
-        let tmp = suffix(path, "tmp");
-        let result = (|| {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()
-        })();
-        if let Err(err) = result {
-            let _ = fs::remove_file(&tmp);
-            cleanup(&staged);
-            return Err(err);
-        }
-        staged.push((tmp, path.clone()));
-    }
-    let mut done: Vec<(std::path::PathBuf, Option<std::path::PathBuf>)> = Vec::new();
-    for (tmp, path) in &staged {
-        let backup = if path.exists() {
-            let bak = suffix(path, "bak");
-            if let Err(err) = fs::rename(path, &bak) {
-                rollback(&done);
-                cleanup(&staged);
-                return Err(err);
-            }
-            Some(bak)
-        } else {
-            None
-        };
-        if let Err(err) = fs::rename(tmp, path) {
-            if let Some(bak) = &backup {
-                let _ = fs::rename(bak, path);
-            }
-            rollback(&done);
-            cleanup(&staged);
-            return Err(err);
-        }
-        done.push((path.clone(), backup));
-    }
-    let mut dirs: Vec<&Path> = staged.iter().filter_map(|(_, p)| p.parent()).collect();
-    dirs.sort();
-    dirs.dedup();
-    for dir in dirs {
-        if let Ok(handle) = fs::File::open(dir) {
-            let _ = handle.sync_all();
-        }
-    }
-    for (_, backup) in &done {
-        if let Some(bak) = backup {
-            let _ = fs::remove_file(bak);
-        }
-    }
-    Ok(())
-}
-
-fn rollback(done: &[(std::path::PathBuf, Option<std::path::PathBuf>)]) {
-    for (path, backup) in done.iter().rev() {
-        match backup {
-            Some(bak) => {
-                let _ = fs::rename(bak, path);
-            }
-            None => {
-                let _ = fs::remove_file(path);
-            }
-        }
-    }
+    crate::lockcommit::commit(writes)
 }
 
 /// `.vibe/cache/llm/<key>.md` key: everything that can change the LLM output
@@ -409,6 +337,7 @@ async fn llm_sections(
     opts: &CompileOptions<'_>,
     source: &SourceFile,
     docs: &HashMap<String, LockDoc>,
+    budget: &std::sync::Arc<crate::llm_budget::CallBudget>,
 ) -> Result<(Vec<Section>, Option<String>), Diag> {
     let adapter = opts
         .llm
@@ -428,6 +357,7 @@ async fn llm_sections(
         model: config.model.clone(),
         seed: config.seed,
         timeout: config.timeout,
+        budget: Some(budget.clone()),
     };
     let response = adapter
         .compile(&request)
