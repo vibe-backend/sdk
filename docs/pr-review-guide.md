@@ -22,7 +22,7 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - 把關：開 tag 唔會自動發佈；發佈 job 要經 `release` environment 批准（live reviewer：`j113203`，`prevent_self_review: false`）。`--release-approval` 係計劃中、**未實作**，今日唔提供任何保護。
 - **剩餘風險（Jack 已接受）**：所有 agent 都用 `j113203` push，任何 `j113203` agent 都可以開 `v*` tag **再自己批准 release**。
 - 以上係**臨時方案 (i)**。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一開 `v*` tag 嘅 actor，同時開返 Prevent self-review。
-- Live `release` environment `can_admins_bypass` 而家係 `true`，要關閉（Jack 負責）。
+- `release` environment `can_admins_bypass: true` 保持開啟（Jack 決定保留，已接受風險：admin 可以跳過 `release` environment 嘅批准，即係跳過真正閘門）。
 - 讀 ruleset 嘅專用 GitHub App：只裝喺呢個 repo，喺 `release` environment job 入面 mint installation token：
   - 權限只畀 repository **Administration: read** 同 **Metadata: read**；**唔畀 Administration: write**。
   - GitHub 只會將 `bypass_actors` 回畀對 ruleset 有寫權限嘅 caller；如果 read 睇唔到，高風險 release build 會失敗，要另外搵產品經理批准，唔好自己加權限。
@@ -76,7 +76,7 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
 
 - 開一個 `release` environment，設 **Required reviewers**；**Deployment branches and tags** 揀 Selected branches and tags，只加 tag 規則 `v*`（唔加任何 branch），即係只准受 release ruleset 保護嘅 `v*` tag 部署。
 - `release` environment **Required reviewers** 係 `j113203`（Jack）；**Prevent self-review 關閉**（spec 決定 96）。所有 agent 都用 `j113203` push，所以 agent 觸發嘅 release 可以由同一個帳戶自己批准；呢個風險 Jack 已經接受。`--release-approval` 未實作；實作後 `j113203` 觸發 run 嘅 env 批准唔計入高風險 2 人。
-- `release` environment **唔好開 Allow administrators to bypass configured protection rules**，否則 admin 可以跳過 required reviewers。
+- `release` environment 嘅 **Allow administrators to bypass configured protection rules** 保持開啟（Jack 決定）。剩餘風險：admin 可以跳過 required reviewers；Jack 已接受。
 - 改 CODEOWNERS（`.github/`、root、`docs/` 任何一個）一律當高風險，要 2 個批准。
 - CODEOWNERS 用 team（`@org/team`）嘅話，release workflow 要用 GitHub App installation token（organization Members: read，其他只讀），`GITHUB_TOKEN` 查唔到 team 成員；冇就失敗。
 - Machine user（普通帳戶做自動化）SDK 分唔到係唔係真人，唔好畀佢哋 write 權限或者 CODEOWNERS 身份。

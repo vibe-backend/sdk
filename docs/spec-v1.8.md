@@ -851,7 +851,7 @@ Release ruleset 檢查（`v*` tag，決定 96）：
 - **點解仍然要求 bypass 空**：冇 `creation` rule 之後，開 tag 唔使 bypass，所以空 bypass 唔會阻住 release；保持空代表連 admin 都唔可以移或者刪已經開咗嘅 `v*` tag，`B` 同 tag 嘅對應唔會事後被改。
 - **剩餘風險（Jack 已接受）**：所有 agent 都用 `j113203` push，live `release` environment 嘅 reviewer 都係 `j113203`，而且 `prevent_self_review: false`。所以**任何用 `j113203` 嘅 agent 都可以開 `v*` tag，再自己批准 release**；開 tag 本身唔會發佈，但發佈只係多一步 `j113203` 自己批准。
 - **而家冇額外保護**：`--release-approval`（第 2–7 節）係 v1.8 設計，**未實作**，今日唔會擋任何 release。實作之後，高風險 release 先會要 2 個合資格 PR reviewer（`j113203` 觸發 run 嘅 env 批准會被第 5 節排除）。
-- **Live 設定同要求唔一致**：`release` environment `can_admins_bypass` 而家係 `true`（admin 可以跳過 environment 批准），要求係關閉；由 Jack 修正，SDK spec 唔改 live 設定。
+- **Admin bypass 保持開啟**：`release` environment `can_admins_bypass: true` 由 Jack 直接決定保留，係 Jack 已接受嘅風險：admin 可以跳過 environment 批准。SDK 唔要求關閉，亦唔改 live 設定。
 - **目標方案 (iii)（取代臨時方案 (i)，未生效）**：專用 release GitHub App 係**唯一**開 `v*` tag 嘅 actor（加返 `creation` rule，bypass list 只放呢個 App），同時 `release` environment 開返 **Prevent self-review**。生效之前 SDK 照 (i) 檢查（bypass 空、唔要求 `creation`）。
 
 #### 8. Token、權限同錯誤處理
@@ -864,7 +864,7 @@ Release ruleset 檢查（`v*` tag，決定 96）：
 - 有 team owner 時要另外一個 GitHub App installation token（repo：Contents、Pull requests、Actions、Metadata read；organization：Members read），唔可以有寫權限。
 - 任何 API 錯誤、404（除咗第 6 節 team membership 嘅 404 代表「唔係成員」）、403、rate limit（429，或者 `x-ratelimit-remaining: 0`）、分頁未讀完、回應格式唔啱，一律當驗證失敗（fail closed），唔會 retry 到放寬。
 - 驗證結果（PR 號碼、`B`、`H`、`P`、tree sha、用咗邊個 CODEOWNERS 檔、排除名單、對唔到嘅 co-author email、每個批准人嘅 login、id、來源同時間）寫入 manifest 同部署報告。
-- `release` environment 一定要設 **Required reviewers**（Jack）、**Prevent self-review 關閉**（決定 96：所有 agent 用 `j113203` push，開咗 Jack 就批唔到）、**Deployment branches and tags** 揀 Selected 而且只加 tag 規則 `v*`，同埋**唔好開 Allow administrators to bypass configured protection rules**（見 [`pr-review-guide.md`](pr-review-guide.md)）。
+- `release` environment 一定要設 **Required reviewers**（Jack）、**Prevent self-review 關閉**（決定 96：所有 agent 用 `j113203` push，開咗 Jack 就批唔到）、**Deployment branches and tags** 揀 Selected 而且只加 tag 規則 `v*`，同埋 **Allow administrators to bypass configured protection rules** 保持開啟（Jack 決定保留，已接受風險：admin 可以跳過 `release` environment 嘅批准，即係跳過真正閘門）（見 [`pr-review-guide.md`](pr-review-guide.md)）。
 
 ### 2C.3b 部署來源同部署前檢查（決定 113–116，issue #97）
 
@@ -1453,6 +1453,7 @@ migration 放喺 ./migrations/main/。
 
 剩餘風險：
 
+- `release` environment 嘅 admin bypass（`can_admins_bypass: true`）保持開啟：admin 可以跳過 Jack 嘅 environment 批准，令真正閘門失效；Jack 直接決定保留，已接受呢個風險。
 - 臨時方案 (i) 下任何有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；唯一真正閘門係 `release` environment 要 Jack 批准（`--release-approval` 未實作）。將來改用方案 (iii)（專用 release App 唯一開 tag，開啟 `prevent_self_review`）。
 - LLM 誤解自然語言，產生「合規但唔係作者原意」嘅 lock（例如 endpoint 意外 public、多咗一個可寫欄位、放寬咗限流），驗證器規則冇覆蓋嘅就會直接上線。
 - Prompt injection：source 或者依賴入面嘅惡意句子影響編譯結果；驗證器只出 warning（決定 37）。
