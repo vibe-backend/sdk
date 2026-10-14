@@ -11,6 +11,7 @@
 // is shown with a notice banner in that locale.
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Marked } from 'marked';
 import hljs from 'highlight.js';
@@ -25,7 +26,6 @@ const src = path.join(here, 'src');
 const REPO = 'https://github.com/vibe-backend/sdk';
 const SITE_URL = (process.env.SITE_URL || 'https://vibe-backend.github.io/sdk/').replace(/\/?$/, '/');
 const locales = Object.keys(LOCALES);
-
 
 const slugify = (s) => s.toLowerCase().trim()
   .replace(/<[^>]+>/g, '').replace(/[`*_~]/g, '')
@@ -157,6 +157,10 @@ const docTitle = (d, loc) => {
   return titleOf(d.variants[loc].md, d.slug);
 };
 
+// Cache-busting: ?v=<content hash> for every file in src/assets (GitHub Pages caches for 10 minutes).
+const assetVersion = Object.fromEntries(fs.readdirSync(path.join(src, 'assets')).map((f) =>
+  [f, createHash('sha256').update(fs.readFileSync(path.join(src, 'assets', f))).digest('hex').slice(0, 10)]));
+
 // ---------- layout ----------
 const NAV = [['index.html', 'home'], ['features.html', 'features'], ['quick-start.html', 'quickStart'], ['docs/index.html', 'docs']];
 const THEME_BOOT = "try{var t=localStorage.getItem('vb-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}document.documentElement.classList.add('js')";
@@ -180,8 +184,8 @@ function layout({ loc, rel, title, body, active, sidebar = '', wide = false }) {
 <meta name="color-scheme" content="light dark">
 <link rel="canonical" href="${SITE_URL}${loc}/${rel}">${alternates}
 <script>${THEME_BOOT}</script>
-<link rel="stylesheet" href="${toRoot}assets/style.css">
-<script defer src="${toRoot}assets/site.js"></script>
+<link rel="stylesheet" href="${toRoot}assets/style.css?v=${assetVersion['style.css']}">
+<script defer src="${toRoot}assets/site.js?v=${assetVersion['site.js']}"></script>
 </head><body>
 <header class="top"><div class="bar">
 <a class="brand" href="${toLoc}index.html">vibe<span>-backend</span></a>
@@ -224,24 +228,99 @@ function docsSidebar(loc, current) {
 
 // ---------- development activity (omitted when unavailable) ----------
 const activity = await fetchActivity(process.env.GITHUB_TOKEN);
+// Compact number for axis labels: 1200 -> "1.2k".
+const compact = (n, locale) => new Intl.NumberFormat(locale, { notation: 'compact', maximumFractionDigits: 2 }).format(n);
+
+// Inline SVG: stacked additions/deletions per day on a square-root scale (so one huge day doesn't
+// flatten the rest), merged-PR counts as dots on a linear right-hand axis.
+function activityChart(loc) {
+  const L = LOCALES[loc]; const t = L.activity;
+  const nf = new Intl.NumberFormat(L.numberLocale);
+  const num = (n) => nf.format(Number.isSafeInteger(n) && n >= 0 ? n : 0);
+  const [yy, mo] = activity.month.split('-').map(Number);
+  const dayNums = activity.rows.map((r) => Number(r.day.slice(8)));
+  const byDay = new Map(activity.rows.map((r) => [Number(r.day.slice(8)), r]));
+  const todayN = Number(activity.today.slice(8));
+  const n = dayNums.length;
+
+  const W = 720, H = 300, ml = 52, mr = 34, mt = 34, mb = 36;
+  const pw = W - ml - mr, ph = H - mt - mb;
+  // Few days: fixed-width slots centred in the plot (no full-width slab); many days: fill the width.
+  const slot = Math.min(pw / n, 72), bw = Math.min(40, Math.max(4, slot * 0.62));
+  const x0 = ml + (pw - slot * n) / 2;
+  const fullLabels = n <= 7;
+  const maxLines = Math.max(1, ...activity.rows.map((r) => r.additions + r.deletions));
+  const maxPrs = Math.max(1, ...activity.rows.map((r) => r.prs));
+  // nice ceiling for lines (sqrt scale) and PRs (linear)
+  const niceCeil = (v) => { const p = 10 ** Math.floor(Math.log10(v)); return [1, 2, 2.5, 5, 10].map((m) => m * p).find((x) => x >= v); };
+  const topLines = niceCeil(maxLines), topPrs = Math.max(2, Math.ceil(maxPrs * 1.15));
+  const yL = (v) => mt + ph - Math.sqrt(v / topLines) * ph;
+  const yP = (v) => mt + ph - (v / topPrs) * ph;
+  const r1 = (v) => Math.round(v * 10) / 10;
+
+  const ticks = [0, 0.01, 0.1, 0.25, 0.5, 1].map((f) => topLines * f).filter((v, i, a) => a.indexOf(v) === i && (v === 0 || v >= 1));
+  let svg = '';
+  for (const v of ticks) {
+    const y = r1(yL(v));
+    svg += `<line class="grid" x1="${ml}" x2="${W - mr}" y1="${y}" y2="${y}"/><text class="tick" x="${ml - 8}" y="${y}" text-anchor="end" dy="0.32em">${esc(compact(v, L.numberLocale))}</text>`;
+  }
+  for (let v = 0; v <= topPrs; v += Math.max(1, Math.ceil(topPrs / 4))) {
+    svg += `<text class="tick prs-tick" x="${W - mr + 8}" y="${r1(yP(v))}" dy="0.32em">${v}</text>`;
+  }
+  let bars = '', dots = '', labels = '';
+  dayNums.forEach((d, i) => {
+    const cx = x0 + slot * (i + 0.5);
+    const r = byDay.get(d);
+    const keyLabel = fullLabels || i === 0 || d % 5 === 0 || d === todayN;
+    labels += `<text class="day${keyLabel ? '' : ' minor'}${d === todayN ? ' today' : ''}" x="${r1(cx)}" y="${mt + ph + 6}" dy="1em" text-anchor="middle">${esc(fullLabels || i === 0 ? t.day(mo, d) : String(d))}</text>`;
+    if (!r) { bars += `<rect class="empty" fill="#d2d2d7" x="${r1(cx - bw / 2)}" y="${mt + ph - 2}" width="${r1(bw)}" height="2" rx="1"/>`; return; }
+    const total = r.additions + r.deletions;
+    const label = esc(t.dayLabel(t.day(mo, d), num(r.additions), num(r.deletions), num(r.prs)));
+    if (total > 0) {
+      const top = yL(total), hTot = mt + ph - top;
+      const hDel = hTot * (r.deletions / total);
+      bars += `<g role="listitem" aria-label="${label}"><title>${label}</title>`
+        + `<rect class="add" fill="#30d158" x="${r1(cx - bw / 2)}" y="${r1(top)}" width="${r1(bw)}" height="${r1(hTot - hDel)}" rx="2"/>`
+        + (hDel > 0 ? `<rect class="del" fill="#ff453a" x="${r1(cx - bw / 2)}" y="${r1(mt + ph - hDel)}" width="${r1(bw)}" height="${r1(hDel)}" rx="2"/>` : '')
+        + (fullLabels
+          ? `<text class="peak" x="${r1(cx)}" y="${r1(top - 8)}" text-anchor="middle"><tspan class="v-add" fill="#1f9d55">+${esc(num(r.additions))}</tspan> <tspan class="v-del" fill="#d93a3a">−${esc(num(r.deletions))}</tspan></text>`
+          : `<text class="val${total === maxLines ? ' peak' : ''}" x="${r1(cx)}" y="${r1(top - 6)}" text-anchor="middle">${esc(compact(total, L.numberLocale))}</text>`)
+        + '</g>';
+    } else {
+      bars += `<rect class="empty" fill="#d2d2d7" x="${r1(cx - bw / 2)}" y="${mt + ph - 2}" width="${r1(bw)}" height="2" rx="1"/>`;
+    }
+    if (r.prs > 0) dots += `<circle class="prs" fill="#ffffff" stroke="#0071e3" stroke-width="2.5" cx="${r1(cx)}" cy="${r1(yP(r.prs))}" r="4.5"><title>${label}</title></circle>`
+      + (fullLabels ? `<text class="prs-val" x="${r1(cx + bw / 2 + 8)}" y="${r1(yP(r.prs))}" dy="0.32em">${esc(t.prsShort(num(r.prs)))}</text>` : '');
+  });
+  const busiestRow = activity.rows.reduce((b, r) => (r.additions + r.deletions > (b ? b.additions + b.deletions : 0) ? r : b), null);
+  const busiest = busiestRow ? t.busiest(t.day(mo, Number(busiestRow.day.slice(8))), num(busiestRow.additions), num(busiestRow.deletions), num(busiestRow.prs)) : '';
+  const monthName = t.title(yy, mo).split(/[:：]\s*/).pop();
+  const title = esc(t.chartTitle(monthName));
+  const desc = esc(t.chartDesc(num(activity.totals.prs), num(activity.totals.additions), num(activity.totals.deletions), busiest));
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-labelledby="act-chart-title act-chart-desc" preserveAspectRatio="xMidYMid meet">`
+    + `<title id="act-chart-title">${title}</title><desc id="act-chart-desc">${desc}</desc>`
+    + `<g class="axis">${svg}<line class="base" x1="${ml}" x2="${W - mr}" y1="${mt + ph}" y2="${mt + ph}"/></g>`
+    + `<g role="list">${bars}</g><g class="dots">${dots}</g><g class="days" aria-hidden="true">${labels}</g></svg>`;
+}
+
 function activitySection(loc) {
   if (!activity) return '';
   const t = LOCALES[loc].activity;
   const nf = new Intl.NumberFormat(LOCALES[loc].numberLocale);
   const num = (n) => (Number.isSafeInteger(n) && n >= 0 ? nf.format(n) : '0');
-  const max = Math.max(1, ...activity.rows.map((r) => r.additions + r.deletions));
-  const pct = (n) => Math.round((n / max) * 1000) / 10;
   const rows = activity.rows.map((r) => {
     const [, mm, dd] = r.day.split('-').map(Number);
     return `<tr${r.prs ? '' : ' class="zero"'}><th scope="row"><time datetime="${esc(r.day)}">${esc(t.day(mm, dd))}</time></th><td class="n">${num(r.prs)}</td>`
-      + `<td class="n add">+${num(r.additions)}</td><td class="n del">−${num(r.deletions)}</td>`
-      + `<td class="bar" aria-hidden="true"><span class="a" style="width:${pct(r.additions)}%"></span><span class="d" style="width:${pct(r.deletions)}%"></span></td></tr>`;
+      + `<td class="n add">+${num(r.additions)}</td><td class="n del">−${num(r.deletions)}</td><td class="n">${num(r.additions + r.deletions)}</td></tr>`;
   }).join('');
   const [yy, mo] = activity.month.split('-').map(Number);
   const repos = activity.repos.map((r) => `<a href="https://github.com/${esc(r)}">${esc(r.split('/')[1])}</a>`).join(', ');
-  return `<section class="activity" aria-labelledby="activity-title"><div class="section-head reveal"><p class="eyebrow">${esc(t.eyebrow)}</p><h2 id="activity-title">${esc(t.title(yy, mo))}</h2>`
-    + `<p class="sub">${esc(t.summary(num(activity.totals.prs), num(activity.totals.additions), num(activity.totals.deletions)))}</p></div>`
-    + `<div class="table-wrap reveal"><table class="activity-table"><thead><tr><th scope="col">${esc(t.date)}</th><th scope="col" class="n">${esc(t.prs)}</th><th scope="col" class="n">${esc(t.additions)}</th><th scope="col" class="n">${esc(t.deletions)}</th><th scope="col" class="bar"><span class="sr">${esc(t.chart)}</span></th></tr></thead><tbody>${rows}</tbody></table></div>`
+  const tot = activity.totals;
+  return `<section class="activity" aria-labelledby="activity-title"><div class="section-head reveal"><p class="eyebrow">${esc(t.eyebrow)}</p><h2 id="activity-title">${esc(t.title(yy, mo))}</h2><p class="sub">${esc(t.since(t.day(mo, Number(activity.startDay.slice(8)))))}</p></div>`
+    + `<div class="act-stats reveal"><div><b>${num(tot.prs)}</b><span>${esc(t.statPrs)}</span></div><div class="add"><b>+${num(tot.additions)}</b><span>${esc(t.statAdd)}</span></div><div class="del"><b>−${num(tot.deletions)}</b><span>${esc(t.statDel)}</span></div></div>`
+    + `<figure class="chart-card reveal">${activityChart(loc)}`
+    + `<figcaption><span class="lg add">${esc(t.legendAdd)}</span><span class="lg del">${esc(t.legendDel)}</span><span class="lg prs">${esc(t.legendPrs)}</span><small>${esc(t.scaleNote)}</small></figcaption></figure>`
+    + `<details class="act-table reveal"><summary>${esc(t.showTable)}</summary><div class="table-wrap"><table class="activity-table"><thead><tr><th scope="col">${esc(t.date)}</th><th scope="col" class="n">${esc(t.prs)}</th><th scope="col" class="n">${esc(t.additions)}</th><th scope="col" class="n">${esc(t.deletions)}</th><th scope="col" class="n">${esc(t.total)}</th></tr></thead><tbody>${rows}</tbody></table></div></details>`
     + `<p class="note reveal">${esc(t.scope(activity.org, activity.repos.length))} ${repos}. ${esc(t.method(activity.generatedAt.slice(0, 16).replace('T', ' ') + ' UTC'))}</p></section>`;
 }
 
