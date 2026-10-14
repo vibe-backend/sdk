@@ -83,6 +83,16 @@ pub const MODEL_EXAMPLE: &str = "## Table
 (none)
 ";
 
+/// Mapping for Chinese (and other non-English) sources (#94).
+const CJK_GUIDE: &str = "\
+NON-ENGLISH SOURCES (e.g. Chinese): keys, section names, table headers and types stay in English exactly as above; only string values may be Chinese.
+- 最長/最多/不超過 N 字 → `max: N`; 至少 N 字 → `min: N`; N 至 M 字 → `min: N, max: M` (never max_length/min_length).
+- 必填 → `required`; 可以冇/可選/可為空 → `nullable`; 唯一 → `unique` on that one column.
+- 組合唯一/聯合唯一 (several columns unique together) → do NOT put `unique` on those columns.
+- 移除 auth/唔使 auth/免登入/不需要登入 → `### -auth` with `- removed: true` and nothing else for auth; never add `### auth`, jwt, or token settings.
+- Use ASCII `|` in tables, never full-width `｜`.
+";
+
 /// Extra prompt text appended after the base prompt for one kind.
 pub fn guide(kind: Kind, scope: Option<Scope>) -> String {
     let mut out = String::from("\n\n");
@@ -90,8 +100,10 @@ pub fn guide(kind: Kind, scope: Option<Scope>) -> String {
     match (kind, scope) {
         (Kind::Model, _) => {
             out.push_str(MODEL_KEYS);
+            out.push_str(CJK_GUIDE);
             out.push_str("\nEXAMPLE MODEL LOCK BODY:\n");
             out.push_str(MODEL_EXAMPLE);
+            return out;
         }
         (Kind::Method, _) => {
             out.push_str(METHOD_KEYS);
@@ -99,6 +111,9 @@ pub fn guide(kind: Kind, scope: Option<Scope>) -> String {
         }
         (Kind::Api, Some(Scope::Feature) | None) => out.push_str(API_KEYS),
         _ => {}
+    }
+    if matches!(kind, Kind::Model | Kind::Method | Kind::Api) {
+        out.push_str(CJK_GUIDE);
     }
     out
 }

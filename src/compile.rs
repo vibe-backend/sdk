@@ -269,7 +269,7 @@ async fn llm_sections(
             .compile(&request)
             .await
             .map_err(|err| Diag::error(&source.rel, err))?;
-        let text = strip_fence(&response.text);
+        let text = normalize_table_pipes(&strip_fence(&response.text));
         match check_llm_output(&text, source.kind, source.scope) {
             Ok(sections) => return Ok((sections, response.system_fingerprint)),
             Err(errors) if attempt < retries => {
@@ -522,6 +522,7 @@ fn normalize_model(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Dia
             .at_section("Fields"),
         );
     }
+    let table = canonical_fields(table);
     let user_rows: Vec<Vec<String>> = table
         .rows
         .into_iter()
@@ -1065,6 +1066,21 @@ fn semantic_check(doc: &LockDoc, sources: &[SourceFile], report: &mut Report) {
         return;
     };
     let text = source.combined_text().to_lowercase();
+    let removes_auth = source_removes_auth(&text);
+    if doc
+        .meta
+        .security_items
+        .iter()
+        .any(|sec| sec.item == "auth-removed")
+        && !removes_auth
+        && !text.contains("public")
+        && !text.contains("公開")
+    {
+        report.push(Diag::error(
+            &doc.meta.source,
+            "lock declares auth-removed but the source does not mention it",
+        ));
+    }
     let mut require = |needle: &[&str], item: &str| {
         if doc.meta.security_items.iter().any(|sec| sec.item == item)
             && !needle.iter().any(|word| text.contains(word))
@@ -1078,17 +1094,6 @@ fn semantic_check(doc: &LockDoc, sources: &[SourceFile], report: &mut Report) {
     require(&["public", "公開"], "public");
     require(
         &[
-            "-auth",
-            "唔使 auth",
-            "no auth",
-            "without auth",
-            "public",
-            "公開",
-        ],
-        "auth-removed",
-    );
-    require(
-        &[
             "write", "寫", "insert", "update", "create", "delete", "save",
         ],
         "write-sql",
@@ -1098,6 +1103,216 @@ fn semantic_check(doc: &LockDoc, sources: &[SourceFile], report: &mut Report) {
     require(&["password", "密碼"], "password-write");
     require(&["write", "寫", "public", "公開"], "public-writes");
     require(&["ownership", "tenant-wide", "owner"], "ownership");
+    if removes_auth {
+        if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
+            if pipes
+                .blocks
+                .iter()
+                .any(|b| pipeline_name(&b.heading) == "auth" && !b.heading.contains("-auth"))
+            {
+                report.push(
+                    Diag::error(
+                        &doc.meta.source,
+                        "the source removes auth but the lock adds an auth pipeline; use `### -auth` with `- removed: true`",
+                    )
+                    .at_section("Pipelines"),
+                );
+            }
+        }
+    }
+    if mentions_composite_unique(&text) {
+        let uniques: Vec<&str> = find_section(&doc.sections, "Fields")
+            .and_then(|s| s.table.as_ref())
+            .map(|t| {
+                t.rows
+                    .iter()
+                    .filter(|r| {
+                        r.get(2)
+                            .is_some_and(|rules| rules.split(',').any(|p| p.trim() == "unique"))
+                    })
+                    .filter_map(|r| r.first().map(String::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if uniques.len() >= 2 {
+            report.push(
+                Diag::error(
+                    &doc.meta.source,
+                    format!(
+                        "the source describes a composite unique, but the lock marks each column unique ({}); per-column unique is a different constraint, so drop `unique` and add a migration with a composite unique index",
+                        uniques.join(", ")
+                    ),
+                )
+                .at_section("Fields"),
+            );
+        }
+    }
+}
+
+/// Auth-removal phrases (English and Chinese) in lowercased source text.
+fn source_removes_auth(text: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "-auth",
+        "remove auth",
+        "removes auth",
+        "without auth",
+        "no auth",
+        "移除 auth",
+        "移除auth",
+        "移除認證",
+        "移除验证",
+        "移除認證管道",
+        "取消 auth",
+        "取消auth",
+        "唔使 auth",
+        "不用 auth",
+        "不需要 auth",
+        "不需 auth",
+        "免 auth",
+        "免登入",
+        "毋須登入",
+        "不需登入",
+        "不需要登入",
+    ];
+    PHRASES.iter().any(|p| text.contains(p))
+}
+
+fn mentions_composite_unique(text: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "組合唯一",
+        "组合唯一",
+        "聯合唯一",
+        "联合唯一",
+        "複合唯一",
+        "复合唯一",
+        "一齊唯一",
+        "一起唯一",
+        "composite unique",
+        "unique together",
+        "together unique",
+        "unique combination",
+    ];
+    PHRASES.iter().any(|p| text.contains(p))
+}
+
+/// Full-width `｜` table rows (common in CJK output) become ASCII `|`.
+fn normalize_table_pipes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        if line.trim_start().starts_with('｜') {
+            out.push_str(&line.replace('｜', "|"));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Column index for a Fields header cell (English or Chinese).
+fn field_column(header: &str) -> Option<usize> {
+    let h = header.trim().to_lowercase();
+    match h.as_str() {
+        "name" | "field" | "欄位" | "字段" | "名稱" | "名称" | "欄位名稱" | "欄位名" => {
+            Some(0)
+        }
+        "type" | "類型" | "类型" | "型別" | "型态" | "型態" => Some(1),
+        "rules" | "rule" | "規則" | "规则" | "驗證" | "验证" | "約束" | "约束" => {
+            Some(2)
+        }
+        "system" | "系統" | "系统" => Some(3),
+        _ => None,
+    }
+}
+
+fn is_required_column(header: &str) -> bool {
+    matches!(
+        header.trim().to_lowercase().as_str(),
+        "required" | "必填" | "必要" | "必須" | "必需"
+    )
+}
+
+/// Map Fields cells by header into `name | type | rules | system` and
+/// normalize length-rule aliases (`max_length` → `max`). Tables without
+/// recognizable headers are left positional.
+fn canonical_fields(table: Table) -> Table {
+    let cols: Vec<Option<usize>> = table.headers.iter().map(|h| field_column(h)).collect();
+    let required_col = table.headers.iter().position(|h| is_required_column(h));
+    let positional = required_col.is_none()
+        && cols
+            .iter()
+            .enumerate()
+            .all(|(idx, col)| col.is_none_or(|c| c == idx));
+    let mapped = cols.iter().filter(|c| c.is_some()).count() >= 2;
+    let rows = table
+        .rows
+        .into_iter()
+        .map(|row| {
+            let mut out = if positional || !mapped {
+                row.clone()
+            } else {
+                let mut out = vec![String::new(); 4];
+                for (idx, cell) in row.iter().enumerate() {
+                    if let Some(Some(col)) = cols.get(idx) {
+                        out[*col] = cell.clone();
+                    }
+                }
+                out
+            };
+            while out.len() < 3 {
+                out.push(String::new());
+            }
+            if let Some(idx) = required_col.filter(|_| mapped) {
+                let yes = matches!(
+                    row.get(idx).map(|c| c.trim().to_lowercase()).as_deref(),
+                    Some("yes" | "true" | "是" | "必填" | "y")
+                );
+                if yes && !out[2].split(',').any(|p| p.trim() == "required") {
+                    out[2] = if out[2].trim().is_empty() {
+                        "required".into()
+                    } else {
+                        format!("required, {}", out[2])
+                    };
+                }
+            }
+            out[2] = canonical_rules(&out[2]);
+            if !positional && mapped && out.get(3).is_some_and(|c| c.trim().is_empty()) {
+                out[3] = "no".into();
+            }
+            out
+        })
+        .collect();
+    Table {
+        headers: vec![
+            "name".into(),
+            "type".into(),
+            "rules".into(),
+            "system".into(),
+        ],
+        rows,
+    }
+}
+
+fn canonical_rules(rules: &str) -> String {
+    let lower = rules.to_lowercase();
+    if !(lower.contains("len") || lower.contains("chars")) {
+        return rules.to_string();
+    }
+    rules
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            let Some((key, value)) = part.split_once(':') else {
+                return part.to_string();
+            };
+            match key.trim().to_lowercase().replace(['_', '-'], "").as_str() {
+                "maxlength" | "maxlen" | "maxchars" => format!("max: {}", value.trim()),
+                "minlength" | "minlen" | "minchars" => format!("min: {}", value.trim()),
+                _ => part.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn lock_rel(source_rel: &str) -> String {
@@ -1340,5 +1555,89 @@ mod prompt_tests {
         };
         let text = format!("{report:?}");
         assert!(text.contains("unknown method target nope.get"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod zh_tests {
+    use super::*;
+
+    fn feature(text: &str, pipelines: &str) -> (LockDoc, Vec<SourceFile>) {
+        let source = SourceFile {
+            rel: "api/shop/v1/x/x.md".into(),
+            abs: "/tmp/x".into(),
+            kind: Kind::Api,
+            scope: Some(Scope::Feature),
+            id: "shop/v1/x".into(),
+            text: text.into(),
+            schema: None,
+        };
+        let mut doc = LockDoc {
+            meta: Meta::pending(Kind::Api, Some(Scope::Feature), &source.id, &source.rel),
+            sections: crate::lock::parse_sections(&format!("## Pipelines\n{pipelines}")).unwrap(),
+        };
+        doc.meta.security_items = security::extract_items(&doc);
+        (doc, vec![source])
+    }
+
+    fn errors(text: &str, pipelines: &str) -> Vec<String> {
+        let (doc, sources) = feature(text, pipelines);
+        let mut report = Report::new();
+        semantic_check(&doc, &sources, &mut report);
+        report.errors().map(|d| d.message.clone()).collect()
+    }
+
+    #[test]
+    fn chinese_auth_removal_is_recognized() {
+        let removed = "### -auth\n- removed: true\n";
+        for text in [
+            "呢個 endpoint 移除 auth。",
+            "健康檢查，免登入。",
+            "Remove auth here.",
+        ] {
+            assert!(
+                errors(text, removed).is_empty(),
+                "{text}: {:?}",
+                errors(text, removed)
+            );
+        }
+    }
+
+    #[test]
+    fn jwt_pipeline_when_source_removes_auth_is_an_error() {
+        let errs = errors("呢個 endpoint 移除 auth。", "### auth\n- mode: jwt\n");
+        assert!(errs.iter().any(|e| e.contains("removes auth")), "{errs:?}");
+    }
+
+    #[test]
+    fn length_aliases_become_max_min() {
+        assert_eq!(
+            canonical_rules("required, max_length: 80"),
+            "required, max: 80"
+        );
+        assert_eq!(
+            canonical_rules("min-length: 1,maxLength: 5"),
+            "min: 1, max: 5"
+        );
+        assert_eq!(canonical_rules("required,unique"), "required,unique");
+    }
+
+    #[test]
+    fn canonical_headers_stay_positional() {
+        let t = Table {
+            headers: vec![
+                "name".into(),
+                "type".into(),
+                "rules".into(),
+                "system".into(),
+            ],
+            rows: vec![vec![
+                "a".into(),
+                "string".into(),
+                "max: 3".into(),
+                "no".into(),
+            ]],
+        };
+        assert_eq!(canonical_fields(t.clone()).rows, t.rows);
     }
 }
