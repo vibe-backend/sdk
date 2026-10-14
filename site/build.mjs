@@ -1,0 +1,139 @@
+// Static site builder for the vibe-backend product site.
+// Docs are generated at build time from ../docs/spec-v1.5.md and ../docs/best-practices/*.md.
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { Marked } from 'marked';
+import hljs from 'highlight.js';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const root = path.resolve(here, '..');
+const out = path.join(here, 'dist');
+const src = path.join(here, 'src');
+const REPO = 'https://github.com/vibe-backend/sdk';
+
+const slugify = (s) => s.toLowerCase().trim()
+  .replace(/<[^>]+>/g, '').replace(/[`*_~]/g, '')
+  .replace(/[^\p{L}\p{N}\s-]/gu, '').replace(/\s+/g, '-') || 'section';
+const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function render(md) {
+  const toc = [];
+  const seen = new Map();
+  const marked = new Marked({
+    gfm: true,
+    renderer: {
+      code({ text, lang }) {
+        const l = (lang || '').split(/\s/)[0];
+        const html = l && hljs.getLanguage(l)
+          ? hljs.highlight(text, { language: l }).value
+          : hljs.highlightAuto(text).value;
+        return `<pre><code class="hljs${l ? ' language-' + esc(l) : ''}">${html}</code></pre>\n`;
+      },
+      heading({ tokens, depth }) {
+        const inner = this.parser.parseInline(tokens);
+        let id = slugify(inner);
+        const n = seen.get(id) || 0; seen.set(id, n + 1);
+        if (n) id += '-' + n;
+        if (depth >= 2 && depth <= 3) toc.push({ depth, id, text: inner.replace(/<[^>]+>/g, '') });
+        return `<h${depth} id="${id}"><a class="anchor" href="#${id}">#</a>${inner}</h${depth}>\n`;
+      },
+      link({ href, title, tokens }) {
+        // Rewrite links between docs (*.md) to generated pages.
+        let h = href;
+        const m = /^(?:\.\.?\/)*(?:best-practices\/)?([\w.-]+)\.md(#.*)?$/.exec(href || '');
+        if (m) h = `${m[1] === 'spec-v1.5' ? 'spec' : m[1]}.html${m[2] || ''}`;
+        return `<a href="${esc(h)}"${title ? ` title="${esc(title)}"` : ''}>${this.parser.parseInline(tokens)}</a>`;
+      },
+    },
+  });
+  const html = marked.parse(md);
+  return { html, toc };
+}
+
+function titleOf(md, fallback) {
+  const m = /^#\s+(.+)$/m.exec(md);
+  return m ? m[1].trim() : fallback;
+}
+
+// ---- collect docs ----
+const docs = [];
+const specPath = path.join(root, 'docs', 'spec-v1.5.md');
+if (fs.existsSync(specPath)) {
+  const md = fs.readFileSync(specPath, 'utf8');
+  docs.push({ slug: 'spec', group: 'Specification', title: 'Spec v1.5', fullTitle: titleOf(md, 'Spec v1.5'), md, source: 'docs/spec-v1.5.md' });
+}
+const bpDir = path.join(root, 'docs', 'best-practices');
+if (fs.existsSync(bpDir)) {
+  for (const f of fs.readdirSync(bpDir).filter((f) => f.endsWith('.md')).sort()) {
+    const md = fs.readFileSync(path.join(bpDir, f), 'utf8');
+    const slug = f.replace(/\.md$/, '');
+    const t = titleOf(md, slug);
+    docs.push({ slug, group: 'Best practices', title: t, fullTitle: t, md, source: `docs/best-practices/${f}` });
+  }
+}
+
+// ---- layout ----
+const nav = [
+  ['index.html', 'Home'], ['features.html', 'Features'], ['quick-start.html', 'Quick start'], ['docs/index.html', 'Docs'],
+];
+function layout({ title, body, depth = 0, active, sidebar = '' }) {
+  const pre = depth ? '../'.repeat(depth) : '';
+  const links = nav.map(([h, t]) => `<a href="${pre}${h}"${active === t ? ' class="active"' : ''}>${t}</a>`).join('');
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)} · vibe-backend</title>
+<meta name="description" content="vibe-backend: a Markdown-driven serverless backend SDK.">
+<link rel="stylesheet" href="${pre}assets/style.css"><link rel="stylesheet" href="${pre}assets/hljs.css">
+</head><body>
+<header class="top"><a class="brand" href="${pre}index.html">vibe<span>-backend</span></a><nav>${links}<a href="${REPO}">GitHub</a></nav></header>
+<div class="${sidebar ? 'docs-wrap' : 'wrap'}">${sidebar}<main>${body}</main></div>
+<footer>vibe-backend SDK · dual licensed MIT / Apache-2.0 · <a href="${REPO}">Source on GitHub</a></footer>
+</body></html>`;
+}
+
+function docsSidebar(current) {
+  const groups = {};
+  for (const d of docs) (groups[d.group] ||= []).push(d);
+  let s = '<aside class="sidebar"><a href="index.html" class="' + (current === 'index' ? 'cur' : '') + '">Docs home</a>';
+  for (const [g, items] of Object.entries(groups)) {
+    s += `<h4>${esc(g)}</h4>` + items.map((d) => `<a href="${d.slug}.html"${d.slug === current ? ' class="cur"' : ''}>${esc(d.title)}</a>`).join('');
+  }
+  return s + '</aside>';
+}
+
+// ---- write ----
+fs.rmSync(out, { recursive: true, force: true });
+fs.mkdirSync(path.join(out, 'docs'), { recursive: true });
+fs.cpSync(path.join(src, 'assets'), path.join(out, 'assets'), { recursive: true });
+fs.copyFileSync(path.join(here, 'node_modules/highlight.js/styles/github-dark.css'), path.join(out, 'assets/hljs.css'));
+fs.writeFileSync(path.join(out, '.nojekyll'), '');
+
+for (const [file, title, active] of [
+  ['index.html', 'Markdown-driven serverless backend', 'Home'],
+  ['features.html', 'Features', 'Features'],
+  ['quick-start.html', 'Quick start', 'Quick start'],
+]) {
+  let body = fs.readFileSync(path.join(src, 'pages', file), 'utf8');
+  // Allow ```code``` fences in hand-written pages to be highlighted too.
+  body = body.replace(/<pre data-lang="(\w+)">([\s\S]*?)<\/pre>/g, (_, l, c) =>
+    `<pre><code class="hljs">${hljs.highlight(c.replace(/^\n/, ''), { language: l }).value}</code></pre>`);
+  fs.writeFileSync(path.join(out, file), layout({ title, body, active }));
+}
+
+const cards = docs.map((d) => `<a class="card" href="${d.slug}.html"><small>${esc(d.group)}</small><h3>${esc(d.title)}</h3><p><code>${esc(d.source)}</code></p></a>`).join('');
+fs.writeFileSync(path.join(out, 'docs/index.html'), layout({
+  title: 'Docs', depth: 1, active: 'Docs', sidebar: docsSidebar('index'),
+  body: `<h1>Documentation</h1><p>These pages are generated at build time from the Markdown files in <code>docs/</code> of the SDK repository. The specification is currently authored in Cantonese (Traditional Chinese) and is rendered as written.</p><div class="cards">${cards}</div>`,
+}));
+
+for (const d of docs) {
+  const { html, toc } = render(d.md);
+  const tocHtml = toc.length ? `<nav class="toc"><strong>On this page</strong>${toc.map((t) => `<a class="d${t.depth}" href="#${t.id}">${esc(t.text)}</a>`).join('')}</nav>` : '';
+  fs.writeFileSync(path.join(out, 'docs', d.slug + '.html'), layout({
+    title: d.title, depth: 1, active: 'Docs', sidebar: docsSidebar(d.slug),
+    body: `<p class="src">Source: <a href="${REPO}/blob/main/${d.source}"><code>${d.source}</code></a></p><article class="md">${html}</article>${tocHtml}`,
+  }));
+}
+
+console.log(`Built ${3 + 1 + docs.length} pages (${docs.length} docs) into ${path.relative(root, out)}/`);

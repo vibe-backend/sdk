@@ -1,0 +1,15 @@
+{
+  "name": "vibe-backend-site",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Product website for the vibe-backend SDK (static, built for GitHub Pages)",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "serve": "npx --yes serve dist"
+  },
+  "dependencies": {
+    "highlight.js": "^11.10.0",
+    "marked": "^14.1.0"
+  }
+}
