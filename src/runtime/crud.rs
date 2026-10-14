@@ -47,10 +47,10 @@ pub async fn run_method(
     let model = crate::manifest::model(manifest, &method.crud_model)
         .ok_or_else(|| MethodFail::code("INTERNAL", "unknown model"))?;
     match method.crud_action.as_str() {
-        "create" => create(exec, model, input, ctx).await,
+        "create" => create(manifest, exec, model, input, ctx).await,
         "get" => get(exec, model, input, ctx).await,
-        "list" => list(exec, model, input, ctx).await,
-        "update" => update(exec, model, input, ctx).await,
+        "list" => list(manifest, exec, model, input, ctx).await,
+        "update" => update(manifest, exec, model, input, ctx).await,
         "delete" => delete(exec, model, input, ctx).await,
         other => Err(MethodFail::code(
             "INTERNAL",
@@ -142,6 +142,7 @@ fn eval_or_input(
 }
 
 async fn create(
+    manifest: &Manifest,
     exec: &dyn QueryExec,
     model: &ModelSpec,
     input: &Value,
@@ -232,6 +233,7 @@ async fn create(
             ));
         }
     }
+    check_refs(manifest, exec, model, &row_values, ctx).await?;
     let returning = output_cols(model, false);
     let rows = exec
         .execute(
@@ -291,6 +293,7 @@ async fn get(
 }
 
 async fn list(
+    manifest: &Manifest,
     exec: &dyn QueryExec,
     model: &ModelSpec,
     input: &Value,
@@ -364,11 +367,12 @@ async fn list(
         .await
         .map_err(db)?;
     let has_more = rows.len() as i64 > page_size;
-    let items: Vec<Value> = rows
+    let mut items: Vec<Value> = rows
         .into_iter()
         .take(page_size as usize)
         .map(|row| Value::Object(row_output(model, &row, false).0))
         .collect();
+    expand_refs(manifest, exec, model, &mut items, ctx).await?;
     Ok(CallResult {
         value: serde_json::json!({
             "items": items,
@@ -382,6 +386,7 @@ async fn list(
 }
 
 async fn update(
+    manifest: &Manifest,
     exec: &dyn QueryExec,
     model: &ModelSpec,
     input: &Value,
@@ -451,6 +456,7 @@ async fn update(
             "update needs at least one field",
         ));
     }
+    check_refs(manifest, exec, model, &sets, ctx).await?;
     let touched = chrono::Utc::now().to_rfc3339();
     let rows = exec
         .execute(
@@ -508,6 +514,174 @@ async fn delete(
         etag: None,
         status: 204,
     })
+}
+
+/// `ref: <model>` fields: the referenced row must exist, not be soft-deleted,
+/// and be readable by this caller (the target's ownership applies). Read-only.
+async fn check_refs(
+    manifest: &Manifest,
+    exec: &dyn QueryExec,
+    model: &ModelSpec,
+    values: &[(Col, Value)],
+    ctx: CallCtx<'_>,
+) -> Result<(), MethodFail> {
+    for field in model.fields.iter().filter(|f| !f.reference.is_empty()) {
+        let Some((_, value)) = values.iter().find(|(c, _)| c.name == field.name) else {
+            continue;
+        };
+        let Some(id) = value.as_str() else { continue };
+        if !ref_exists(manifest, exec, &field.reference, id, ctx).await? {
+            let code = if field.on_missing == 404 {
+                "NOT_FOUND"
+            } else {
+                "VALIDATION_FAILED"
+            };
+            return Err(MethodFail::code(
+                code,
+                format!("{} references a missing {}", field.name, field.reference),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn ref_target<'m>(manifest: &'m Manifest, target: &str) -> Result<&'m ModelSpec, MethodFail> {
+    crate::manifest::model(manifest, target)
+        .ok_or_else(|| MethodFail::code("INTERNAL", format!("unknown ref target {target}")))
+}
+
+async fn ref_exists(
+    manifest: &Manifest,
+    exec: &dyn QueryExec,
+    target: &str,
+    id: &str,
+    ctx: CallCtx<'_>,
+) -> Result<bool, MethodFail> {
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Ok(false);
+    }
+    let target = ref_target(manifest, target).await?;
+    let rows = exec
+        .execute(
+            ctx.tenant_id,
+            ctx.role,
+            Stmt::Select {
+                table: target.table.clone(),
+                columns: vec![Col {
+                    name: "id".into(),
+                    ty: "uuid".into(),
+                }],
+                id: Some(id.to_string()),
+                filters: owner_filters(target, ctx.caller)?,
+                sort: None,
+                limit: 1,
+                offset: 0,
+            },
+        )
+        .await
+        .map_err(db)?;
+    Ok(!rows.is_empty())
+}
+
+/// List `expand: [product.name, ...]`: attach the named fields of each
+/// referenced row under `expand_key(field)` (null when the row is gone or
+/// not readable). One read per distinct referenced id on the page.
+async fn expand_refs(
+    manifest: &Manifest,
+    exec: &dyn QueryExec,
+    model: &ModelSpec,
+    items: &mut [Value],
+    ctx: CallCtx<'_>,
+) -> Result<(), MethodFail> {
+    if model.list.expand.is_empty() {
+        return Ok(());
+    }
+    for field in model.fields.iter().filter(|f| !f.reference.is_empty()) {
+        let wanted: Vec<&str> = model
+            .list
+            .expand
+            .iter()
+            .filter_map(|e| e.split_once('.'))
+            .filter(|(t, _)| *t == field.reference)
+            .map(|(_, f)| f)
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let target = ref_target(manifest, &field.reference).await?;
+        let mut columns = vec![Col {
+            name: "id".into(),
+            ty: "uuid".into(),
+        }];
+        for name in &wanted {
+            if *name == "id" {
+                continue;
+            }
+            let spec = target
+                .fields
+                .iter()
+                .find(|f| f.name == *name)
+                .ok_or_else(|| MethodFail::code("INTERNAL", format!("unknown expand {name}")))?;
+            if spec.sensitive || spec.ty == "password" {
+                return Err(MethodFail::code("INTERNAL", "sensitive expand"));
+            }
+            columns.push(col(spec));
+        }
+        let key = crate::manifest::expand_key(&field.name);
+        let mut cache: BTreeMap<String, Value> = BTreeMap::new();
+        for item in items.iter_mut() {
+            let Some(obj) = item.as_object_mut() else {
+                continue;
+            };
+            let id = obj
+                .get(&field.name)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let expanded = if id.is_empty() || uuid::Uuid::parse_str(&id).is_err() {
+                Value::Null
+            } else if let Some(hit) = cache.get(&id) {
+                hit.clone()
+            } else {
+                let rows = exec
+                    .execute(
+                        ctx.tenant_id,
+                        ctx.role,
+                        Stmt::Select {
+                            table: target.table.clone(),
+                            columns: columns.clone(),
+                            id: Some(id.clone()),
+                            filters: owner_filters(target, ctx.caller)?,
+                            sort: None,
+                            limit: 1,
+                            offset: 0,
+                        },
+                    )
+                    .await
+                    .map_err(db)?;
+                let value = rows
+                    .into_iter()
+                    .next()
+                    .map(|row| {
+                        let mut out = Map::new();
+                        for c in &columns {
+                            if c.name == "id" || wanted.contains(&c.name.as_str()) {
+                                out.insert(
+                                    c.name.clone(),
+                                    row.get(&c.name).cloned().unwrap_or(Value::Null),
+                                );
+                            }
+                        }
+                        Value::Object(out)
+                    })
+                    .unwrap_or(Value::Null);
+                cache.insert(id, value.clone());
+                value
+            };
+            obj.insert(key.clone(), expanded);
+        }
+    }
+    Ok(())
 }
 
 fn finish_row(model: &ModelSpec, row: Row, include_sensitive: bool) -> CallResult {
@@ -1028,6 +1202,8 @@ mod ownership_tests {
                 min: None,
                 max: None,
                 format: String::new(),
+                reference: String::new(),
+                on_missing: 0,
             }],
             crud: vec![],
             list: ListOpts::default(),

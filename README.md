@@ -15,6 +15,8 @@ curl http://localhost:8080/catalog/v1/acme/items
 
 `vibe dev` will use an in-memory database for development and testing only; all data is lost when the server stops.
 
+**References (#21).** A model field typed `ref: <model>` stores the target row's uuid. Create and update return 422 (or 404 with `on-missing: 404`) unless the referenced row exists in the same tenant, is not soft-deleted and is readable by the caller under the target's ownership. A list option `expand: [product.name, product.price_cents]` attaches those fields of each referenced row under `product` (from `product_id`; other names get `<field>_ref`), or `null` when the row is gone. `vibe validate` checks that the target is a model on the same provider, and that expanded fields exist and are not sensitive.
+
 ## Install
 
 Download `vibe` from [GitHub Releases](https://github.com/vibe-backend/sdk/releases). The CLI is not published to crates.io and it is not published as a container image.

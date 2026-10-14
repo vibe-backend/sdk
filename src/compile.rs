@@ -987,19 +987,20 @@ fn field_row(name: &str, ty: &str, rules: &str, system: &str) -> Vec<String> {
 }
 
 fn known_type(ty: &str) -> bool {
-    matches!(
-        ty,
-        "uuid"
-            | "string"
-            | "string[]"
-            | "integer"
-            | "number"
-            | "boolean"
-            | "timestamp"
-            | "password"
-            | "json"
-            | "bytes"
-    )
+    crate::manifest::ref_target(ty).is_some()
+        || matches!(
+            ty,
+            "uuid"
+                | "string"
+                | "string[]"
+                | "integer"
+                | "number"
+                | "boolean"
+                | "timestamp"
+                | "password"
+                | "json"
+                | "bytes"
+        )
 }
 
 fn defaults_section(timeout: &str, body: &str) -> Section {

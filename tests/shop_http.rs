@@ -838,3 +838,190 @@ async fn manifest_output_is_relative_to_the_current_directory() {
     assert!(cwd.join("out.json").exists());
     assert!(!root.join("out.json").exists());
 }
+
+async fn shop_app_with(edit: impl Fn(&Path)) -> Result<axum::Router, String> {
+    let root = copy_shop();
+    edit(&root);
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .map_err(|err| err.to_string())?;
+    vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+        root: &root,
+        deploy: false,
+        verify_key: None,
+    })
+    .map_err(|err| err.to_string())?;
+    let key = sign::load_or_create(&root).unwrap();
+    approve_project(&ApproveOptions {
+        root: &root,
+        reviewers: &["ada@example.com".into(), "grace@example.com".into()],
+        reason: "ref test",
+        approval_ref: "local",
+        commit: "local",
+        now: "2026-10-14T00:00:00Z",
+        signing_key: &key,
+    })
+    .map_err(|err| err.to_string())?;
+    let manifest = manifest_from_project(&root, &key).map_err(|err| err.to_string())?;
+    let mut auth = AuthConfig::anonymous();
+    auth.public_pem = PUBLIC_PEM.into();
+    auth.alg = Algorithm::ES256;
+    Ok(router(Arc::new(AppState {
+        manifest,
+        exec: Arc::new(MemoryExec::new()),
+        auth,
+        slugs: std::collections::HashMap::new(),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
+        trusted_proxies: Vec::new(),
+        disabled: std::collections::HashSet::new(),
+        min_override_ms: Some(0),
+        honor_test_ip: true,
+        dev_hints: true,
+    })))
+}
+
+fn edit_cart(root: &Path, from: &str, to: &str) {
+    let path = root.join("models/cart-item/cart-item.md");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains(from), "{from}");
+    fs::write(&path, text.replace(from, to)).unwrap();
+}
+
+#[tokio::test]
+async fn ref_fields_check_existence_and_list_expands() {
+    let app = shop_app_with(|root| {
+        edit_cart(
+            root,
+            "| product_id | uuid | required | no |",
+            "| product_id | ref: product | required, on-missing: 422 | no |",
+        );
+        edit_cart(
+            root,
+            "sort: [created_at] |",
+            "sort: [created_at], expand: [product.name, product.price_cents] |",
+        );
+    })
+    .await
+    .unwrap_or_else(|err| panic!("{err}"));
+    let staff = bearer(&token("staff-user", &["staff"], "tenant0001"));
+    let customer = bearer(&token("customer-1", &["customer"], "tenant0001"));
+    let other_tenant = bearer(&token("customer-2", &["customer"], "tenant0002"));
+    let created = send(
+        &app,
+        "POST",
+        "/catalog/v1/products",
+        Some(staff.clone()),
+        Some(product("SKU-R1", "Widget", 1250)),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.json);
+    let pid = created.json["id"].as_str().unwrap().to_string();
+    let add = |who: String, product_id: String| {
+        let app = app.clone();
+        async move {
+            send(
+                &app,
+                "POST",
+                "/shop/v1/cart-items",
+                Some(who),
+                Some(json!({"product_id": product_id, "qty": 1})),
+            )
+            .await
+        }
+    };
+    let missing = add(customer.clone(), uuid::Uuid::new_v4().to_string()).await;
+    assert_eq!(
+        missing.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{:?}",
+        missing.json
+    );
+    // Another tenant cannot reference this tenant's product.
+    let cross = add(other_tenant, pid.clone()).await;
+    assert_eq!(cross.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let ok = add(customer.clone(), pid.clone()).await;
+    assert_eq!(ok.status, StatusCode::CREATED, "{:?}", ok.json);
+    let listed = send(
+        &app,
+        "GET",
+        "/shop/v1/cart-items",
+        Some(customer.clone()),
+        None,
+    )
+    .await;
+    let item = &listed.json["items"][0];
+    assert_eq!(item["product"]["name"], "Widget", "{:?}", listed.json);
+    assert_eq!(item["product"]["price_cents"], 1250);
+    assert_eq!(item["product"]["id"], pid.as_str());
+    assert!(item["product"].get("sku").is_none(), "only listed fields");
+    // Soft-deleted products cannot be referenced and expand to null.
+    let deleted = send(
+        &app,
+        "DELETE",
+        &format!("/catalog/v1/products/{pid}"),
+        Some(staff),
+        None,
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{:?}", deleted.json);
+    let gone = add(customer.clone(), pid.clone()).await;
+    assert_eq!(gone.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let listed = send(&app, "GET", "/shop/v1/cart-items", Some(customer), None).await;
+    assert!(
+        listed.json["items"][0]["product"].is_null(),
+        "{:?}",
+        listed.json
+    );
+}
+
+#[tokio::test]
+async fn bad_refs_and_expands_fail_validation() {
+    for (label, from, to, expect) in [
+        (
+            "unknown target",
+            "| product_id | uuid | required | no |",
+            "| product_id | ref: nope | required | no |",
+            "ref target nope is not a model",
+        ),
+        (
+            "bad on-missing",
+            "| product_id | uuid | required | no |",
+            "| product_id | ref: product | required, on-missing: 500 | no |",
+            "on-missing must be 422 or 404",
+        ),
+        (
+            "expand without ref",
+            "sort: [created_at] |",
+            "sort: [created_at], expand: [product.name] |",
+            "no ref field points at product",
+        ),
+    ] {
+        let err = shop_app_with(|root| edit_cart(root, from, to))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{label} should fail"));
+        assert!(err.contains(expect), "{label}: {err}");
+    }
+    let err = shop_app_with(|root| {
+        edit_cart(
+            root,
+            "| product_id | uuid | required | no |",
+            "| product_id | ref: product | required | no |",
+        );
+        edit_cart(
+            root,
+            "sort: [created_at] |",
+            "sort: [created_at], expand: [product.secret] |",
+        );
+    })
+    .await
+    .err()
+    .unwrap();
+    assert!(err.contains("product has no field secret"), "{err}");
+}

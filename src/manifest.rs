@@ -199,6 +199,12 @@ pub struct FieldSpec {
     pub min: Option<i64>,
     pub max: Option<i64>,
     pub format: String,
+    /// Target model id for a `ref: <model>` field (stored as a uuid column).
+    #[serde(default)]
+    pub reference: String,
+    /// Status when the referenced row is missing: 422 (default) or 404.
+    #[serde(default)]
+    pub on_missing: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -207,6 +213,10 @@ pub struct ListOpts {
     pub max_page_size: i64,
     pub sort: Vec<String>,
     pub filter: Vec<String>,
+    /// `expand: [product.name, product.price_cents]`: read-only fields of
+    /// referenced rows attached to each listed item.
+    #[serde(default)]
+    pub expand: Vec<String>,
 }
 
 impl Default for ListOpts {
@@ -216,8 +226,29 @@ impl Default for ListOpts {
             max_page_size: 100,
             sort: vec!["created_at".into()],
             filter: Vec::new(),
+            expand: Vec::new(),
         }
     }
+}
+
+/// The target model of a `ref: <model>` field type, if `ty` is one.
+pub fn ref_target(ty: &str) -> Option<&str> {
+    let target = ty.strip_prefix("ref:")?.trim();
+    (!target.is_empty()
+        && target
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+    .then_some(target)
+}
+
+/// JSON key under which an expanded reference is attached: `product_id` →
+/// `product`, otherwise `<field>_ref`.
+pub fn expand_key(field: &str) -> String {
+    field
+        .strip_suffix("_id")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{field}_ref"))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -372,9 +403,22 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
                 }
                 let rules = row.get(2).map(String::as_str).unwrap_or("");
                 let stringy = matches!(row[1].as_str(), "string" | "password" | "bytes");
+                let reference = ref_target(&row[1]).unwrap_or("").to_string();
                 fields.push(FieldSpec {
                     name: row[0].clone(),
-                    ty: row[1].clone(),
+                    ty: if reference.is_empty() {
+                        row[1].clone()
+                    } else {
+                        "uuid".into()
+                    },
+                    on_missing: if reference.is_empty() {
+                        0
+                    } else if text_rule(rules, "on-missing") == "404" {
+                        404
+                    } else {
+                        422
+                    },
+                    reference,
                     required: rules.split(',').any(|part| part.trim() == "required"),
                     unique: rules.split(',').any(|part| part.trim() == "unique"),
                     primary: rules.split(',').any(|part| part.trim() == "primary"),
@@ -431,6 +475,7 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
                         .min(500);
                     list.sort = bracket_list(options, "sort");
                     list.filter = bracket_list(options, "filter");
+                    list.expand = bracket_list(options, "expand");
                     if list.sort.is_empty() {
                         list.sort.push("created_at".into());
                     }

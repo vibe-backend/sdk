@@ -66,6 +66,7 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
     check_routes(&docs, &mut report);
     check_calls(&docs, &mut report);
     check_migrations(&docs, &mut report);
+    check_refs(&docs, &mut report);
     if opts.deploy {
         check_approval_set(&docs, &source_by_id, opts, &mut report);
     }
@@ -716,6 +717,172 @@ fn check_routes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
     }
 }
 
+/// `ref: <model>` fields and list `expand`: the target model exists on the
+/// same provider; expand only names refs this model holds and readable,
+/// non-sensitive target fields; `on-missing` is 422 or 404.
+fn check_refs(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    let provider = |doc: &LockDoc| {
+        find_section(&doc.sections, "Table")
+            .and_then(|s| s.get("provider"))
+            .unwrap_or("")
+            .to_string()
+    };
+    let rows = |doc: &LockDoc| -> Vec<Vec<String>> {
+        find_section(&doc.sections, "Fields")
+            .and_then(|s| s.table.as_ref())
+            .map(|t| t.rows.clone())
+            .unwrap_or_default()
+    };
+    let mut ids: Vec<&String> = docs.keys().collect();
+    ids.sort();
+    for id in ids {
+        let doc = &docs[id];
+        if doc.meta.kind != Kind::Model {
+            continue;
+        }
+        let file = doc.meta.source.as_str();
+        let own_rows = rows(doc);
+        // field name -> target model
+        let mut refs: Vec<(String, String)> = Vec::new();
+        for row in &own_rows {
+            let ty = row.get(1).map(String::as_str).unwrap_or("");
+            let rules = row.get(2).map(String::as_str).unwrap_or("");
+            let on_missing = rules
+                .split(',')
+                .find_map(|p| p.trim().strip_prefix("on-missing:").map(str::trim));
+            let Some(target) = crate::manifest::ref_target(ty) else {
+                if on_missing.is_some() {
+                    report.push(
+                        Diag::error(file, format!("{}: on-missing needs a ref type", row[0]))
+                            .at_section("Fields"),
+                    );
+                }
+                continue;
+            };
+            if let Some(code) = on_missing {
+                if !matches!(code, "422" | "404") {
+                    report.push(
+                        Diag::error(file, format!("{}: on-missing must be 422 or 404", row[0]))
+                            .at_section("Fields"),
+                    );
+                }
+            }
+            match docs.get(target) {
+                Some(t) if t.meta.kind == Kind::Model => {
+                    if provider(t) != provider(doc) {
+                        report.push(
+                            Diag::error(
+                                file,
+                                format!(
+                                    "{}: ref target {target} is on a different provider",
+                                    row[0]
+                                ),
+                            )
+                            .at_section("Fields"),
+                        );
+                    }
+                }
+                _ => report.push(
+                    Diag::error(
+                        file,
+                        format!("{}: ref target {target} is not a model", row[0]),
+                    )
+                    .at_section("Fields"),
+                ),
+            }
+            refs.push((row[0].clone(), target.to_string()));
+        }
+        let Some(crud) = find_section(&doc.sections, "CRUD").and_then(|s| s.table.as_ref()) else {
+            continue;
+        };
+        for row in &crud.rows {
+            if row.first().map(String::as_str) != Some("list") {
+                continue;
+            }
+            let options = row.get(1).map(String::as_str).unwrap_or("");
+            let Some(idx) = options.find("expand:") else {
+                continue;
+            };
+            let rest = options[idx + 7..].trim();
+            let list = rest
+                .find(']')
+                .filter(|_| rest.starts_with('['))
+                .and_then(|end| crate::lock::parse_string_list(&rest[..=end]).ok());
+            let Some(list) = list else {
+                report.push(
+                    Diag::error(file, "expand must be a [model.field, ...] list")
+                        .at_section("CRUD"),
+                );
+                continue;
+            };
+            for entry in list {
+                let Some((target, field)) = entry.split_once('.') else {
+                    report.push(
+                        Diag::error(file, format!("expand {entry} must be model.field"))
+                            .at_section("CRUD"),
+                    );
+                    continue;
+                };
+                let holders: Vec<&String> = refs
+                    .iter()
+                    .filter(|(_, t)| t == target)
+                    .map(|(f, _)| f)
+                    .collect();
+                if holders.is_empty() {
+                    report.push(
+                        Diag::error(
+                            file,
+                            format!("expand {entry}: no ref field points at {target}"),
+                        )
+                        .at_section("CRUD"),
+                    );
+                    continue;
+                }
+                for holder in holders {
+                    let key = crate::manifest::expand_key(holder);
+                    if own_rows.iter().any(|r| r[0] == key) {
+                        report.push(
+                            Diag::error(
+                                file,
+                                format!("expand of {holder} would overwrite field {key}"),
+                            )
+                            .at_section("CRUD"),
+                        );
+                    }
+                }
+                let Some(target_doc) = docs.get(target) else {
+                    continue;
+                };
+                let target_rows = rows(target_doc);
+                let builtin = matches!(field, "id" | "created_at" | "updated_at");
+                match target_rows.iter().find(|r| r[0] == field) {
+                    Some(r) => {
+                        let ty = r.get(1).map(String::as_str).unwrap_or("");
+                        let rules = r.get(2).map(String::as_str).unwrap_or("");
+                        if ty == "password" || rules.contains("sensitive") || field == "tenant_id" {
+                            report.push(
+                                Diag::error(
+                                    file,
+                                    format!("expand {entry}: sensitive fields cannot be expanded"),
+                                )
+                                .at_section("CRUD"),
+                            );
+                        }
+                    }
+                    None if builtin => {}
+                    None => report.push(
+                        Diag::error(
+                            file,
+                            format!("expand {entry}: {target} has no field {field}"),
+                        )
+                        .at_section("CRUD"),
+                    ),
+                }
+            }
+        }
+    }
+}
+
 fn check_calls(docs: &HashMap<String, LockDoc>, report: &mut Report) {
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
     for doc in docs.values() {
@@ -934,19 +1101,20 @@ fn sql_writes(sql: &str) -> bool {
 }
 
 fn known_type(ty: &str) -> bool {
-    matches!(
-        ty,
-        "uuid"
-            | "string"
-            | "string[]"
-            | "integer"
-            | "number"
-            | "boolean"
-            | "timestamp"
-            | "password"
-            | "json"
-            | "bytes"
-    )
+    crate::manifest::ref_target(ty).is_some()
+        || matches!(
+            ty,
+            "uuid"
+                | "string"
+                | "string[]"
+                | "integer"
+                | "number"
+                | "boolean"
+                | "timestamp"
+                | "password"
+                | "json"
+                | "bytes"
+        )
 }
 
 fn is_secret_ref(value: &str) -> bool {
