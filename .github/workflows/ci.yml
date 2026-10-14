@@ -37,17 +37,20 @@ jobs:
       - if: steps.detect.outputs.present == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.89"
           components: rustfmt, clippy
       - if: steps.detect.outputs.present == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - if: steps.detect.outputs.present == 'true'
+        run: cargo check --locked --all-targets --all-features
+      - if: steps.detect.outputs.present == 'true'
         run: cargo fmt --all -- --check
       - if: steps.detect.outputs.present == 'true'
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - if: steps.detect.outputs.present == 'true'
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
       - if: steps.detect.outputs.present != 'true'
         run: echo "No Cargo.toml yet; skipping Rust checks."
 
