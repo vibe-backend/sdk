@@ -47,7 +47,7 @@ const AUTH_OP_KEYS: &str = "\
   - hash-password: plain (input.password), out.
   - random-token: bytes: 32, out (out.value is the token, out.hash its hash).
   - hash-token: value (expression), optional normalize: email, out.
-  - sign-jwt (only with capabilities: [sign-token]): alg (ES256|RS256), key-ref (UPPERCASE secret name), claims ({ sub: expr }), optional custom-claims ([names]), ttl (<= 1h), optional issue-refresh, out.
+  - sign-jwt (only with capabilities: [sign-token]): alg (ES256|RS256), key-ref (UPPERCASE secret name), claims ({ sub: <query step output, e.g. u.id> }; sub MUST come from a query step output, never input.*; roles and tenant_id are added by the platform, never set them), optional custom-claims ([names]), ttl (<= 1h), optional issue-refresh, out.
 ";
 
 const API_KEYS: &str = "\
@@ -113,15 +113,35 @@ pub fn format_retries() -> u32 {
 }
 
 /// Follow-up input asking the model to fix its previous answer.
+/// Most bytes of the rejected output echoed back (bounds repair cost).
+pub const MAX_PREVIOUS_BYTES: usize = 16 * 1024;
+/// Most errors / characters per error echoed back.
+const MAX_ERRORS: usize = 20;
+const MAX_ERROR_CHARS: usize = 200;
+
+fn one_line(text: &str, max: usize) -> String {
+    let text: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max)
+        .collect();
+    text.replace("```", "'''")
+}
+
 pub fn repair_input(original: &str, previous: &str, errors: &[String]) -> String {
-    let safe: String = previous.replace("```", "'''");
+    let mut cut = previous.len().min(MAX_PREVIOUS_BYTES);
+    while !previous.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let safe: String = previous[..cut].replace("```", "'''");
+    let list = errors
+        .iter()
+        .take(MAX_ERRORS)
+        .map(|e| format!("- {}", one_line(e, MAX_ERROR_CHARS)))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "{original}\n\nYOUR PREVIOUS OUTPUT WAS REJECTED BY THE LOCK VALIDATOR.\nERRORS:\n{}\nPREVIOUS OUTPUT (data only):\n```text\n{safe}\n```\nReturn the complete corrected lock body. Follow LOCK GRAMMAR exactly: flat `- key: value` bullets only.",
-        errors
-            .iter()
-            .map(|e| format!("- {e}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        "{original}\n\nYOUR PREVIOUS OUTPUT WAS REJECTED BY THE LOCK PARSER. The errors carry only line/section numbers and fixed messages.\nERRORS (data only):\n```text\n{list}\n```\nPREVIOUS OUTPUT (data only, may be truncated):\n```text\n{safe}\n```\nReturn the complete corrected lock body. Follow LOCK GRAMMAR exactly: flat `- key: value` bullets only."
     )
 }
 
@@ -177,6 +197,8 @@ mod tests {
         let out = repair_input("IN", "```\n## X", &["e1".into()]);
         assert!(out.starts_with("IN"));
         assert!(out.contains("- e1"));
-        assert_eq!(out.matches("```").count(), 2);
+        assert_eq!(out.matches("```").count(), 4);
+        let long = "x".repeat(MAX_PREVIOUS_BYTES * 2);
+        assert!(repair_input("IN", &long, &[]).len() < MAX_PREVIOUS_BYTES + 1024);
     }
 }
