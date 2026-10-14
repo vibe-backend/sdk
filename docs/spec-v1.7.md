@@ -1,5 +1,7 @@
-# Markdown 驅動 Serverless Backend：架構 Spec v1.7（定稿）
+# Markdown 驅動 Serverless Backend：架構 Spec v1.7（定稿候選）
 
+> 狀態：定稿候選。0.9 嘅決定 67–72 全部經 Jack 確認之後，標題改為「v1.7（定稿）」。
+>
 > 核心架構：所有定義（model、method、api、pipeline、provider、migration）嘅 source `.md` 一律用自然語言寫。編譯流程係「自然語言 source `.md` → 結構化 lock markdown（`{name}.lock.md`）→ 簽名 manifest」。lock md 係 runtime 唯一依據，runtime 永遠唔會解譯自然語言。
 >
 > v1.4 起嘅內容：安全設定照用自然語言寫，唔強制結構化 frontmatter，防線改為「獨立 deterministic 驗證器 + 收緊嘅人手 review」；編譯器冇工具、網絡只准連編譯用 LLM endpoint；model snapshot pin 死同 compiler-hash；確認綁定 commit；收緊 public 寫入；禁止 DDL／TRUNCATE；token 簽發用 capability 旗標；新增緊急 kill switch；public 最低回應耗時改為固定值。
@@ -142,16 +144,16 @@
 | 58 | Adapter 按 model capability 送決定性參數：model 唔支援嘅參數（例如 `temperature`、`top_p`、`seed`）就唔送，唔可以強送；決定性只靠 CI 重編比對保證。Model pin 用 provider 回報嘅 model id／snapshot id，唔再要求 id 帶日期後綴。 | 已確認 | 2A.6、2A.8.2、2A.8.3、2A.8.6 |
 | 59 | 三個 provider 嘅 request path 同 header 固定寫入 adapter：OpenAI `POST {base}/chat/completions`＋`Authorization: Bearer`；Anthropic `POST {base}/v1/messages`＋`x-api-key`＋`anthropic-version: 2023-06-01`；Gemini `POST {base}/models/{model}:generateContent`＋`x-goog-api-key`。 | 已確認 | 2A.8.2 |
 | 60 | Refresh cookie 嘅 `Path` 一定包含 `{slug}`：`/{definition}/{version}/{slug}/refresh`（同 10.7 一致）。 | 已確認 | 4A.1 |
-| 61 | Refresh 寬限期精確定義：DB 只存 hash；寬限期內用返舊 token，平台用 `used_at` 判斷，撤銷上一次發出嘅子 token，再喺同一家族發一組新 token；唔儲存、唔重發明文。 | 已確認 | 4A.1 |
+| 61 | Refresh 寬限期精確定義：DB 只存 hash；寬限期內用返舊 token，平台用 `used_at` 判斷，撤銷上一次發出嘅子 token，再喺同一家族發一組新 token；唔儲存、唔重發明文。每個舊 token 最多重發一次（`used_at` 加 `grace_reissued_at`）；寬限期內第二次再用即當重用，撤銷成個家族。 | 已確認 | 4A.1 |
 | 62 | `sign-token` 嘅 `tenant_id` 只有一個來源：平台由 slug（public）或者已驗證 token（auth）解析出嚟嘅 `ctx.tenant_id`；永遠唔由 client 或者 method 傳入，亦唔由 `users` 表讀。 | 已確認 | 12.6、12.8 |
 | 63 | `mail_worker` 加入 7.1 平台專用 role 表。 | 已確認 | 7.1 |
 | 64 | `compiler-hash` 只有一個標準定義（2A.1），包括 seed 同實際送出嘅決定性參數。 | 已確認 | 2A.1、2A.6、10.1 |
 | 65 | 補齊 grammar：`rate-limit` 參數 schema、`## Order` 准用值、`subject-key` 寫法、`token-revoke` 參數。 | 已確認 | 4.3、4.4、4A.1、12.10 |
 | 66 | 非阻塞修正：CI 範例 pin `vibe` 版本同用 SHA pin action；Ollama 記 tag（唔係 digest）；token 類型統一；`email-outbox.enqueue` 嘅 `template` 寫入 Signature；註冊耗時用固定下限＋固定工作量（唔受 argon2 排隊影響）。 | 已確認 | 2A.8.3、2A.8.8、12.11 |
-| 67 | 防預先註冊搶帳戶：未驗證 email 再註冊會覆寫 password 同驗證 token；未驗證帳戶 24 小時後由平台匿名化並 soft delete（唔 DELETE，決定 13）；驗證成功即撤銷該用戶所有 refresh 家族。 | 待 Jack 確認 | 12.11 |
+| 67 | 防預先註冊搶帳戶：公開註冊只收 email（同 name），唔收密碼；驗證連結帶用戶去「設定密碼」一步，一個 UPDATE 同時設 password 同 `email_verified_at`（同決定 69 邀請共用同一個 method `user.complete-verification`）。未驗證 email 再註冊只會輪換驗證 token（舊 token 即時失效），永遠唔改任何 credential。驗證成功即撤銷該用戶所有 session（refresh 家族）。未驗證帳戶喺 `email_verify_expires_at` 過咗之後由平台匿名化並 soft delete（唔 DELETE，決定 13）。確認之後，決定 56 入面「註冊一律做 `hash-password`」改為喺設定密碼一步做（56 狀態唔變）。 | 待 Jack 確認 | 12.11 |
 | 68 | Audit 永遠唔記明文 email（記 HMAC hash 或者遮罩）；`email_outbox` 加 `recipient_hash`，令冇 `user_id` 嘅列都可以私隱刪除；outbox 列發送後 30 日由平台匿名化。 | 待 Jack 確認（保留期） | 9、12.10、12.11 |
-| 69 | Admin 建立用戶改為邀請流程：admin 建立時唔設 password、唔設 `email_verified_at`；用戶用邀請 token 設 password，同時設 `email_verified_at`，令決定 55 成立。 | 待 Jack 確認 | 11.4、12.11.9 |
-| 70 | 列層擁有權預設規則：有 `owner-key` 嘅 model，非 admin 只可以讀寫 `owner-key = ctx.user_id` 嘅列；要放寬一定喺 source 明寫，屬高風險安全項目。 | 待 Jack 確認 | 12.6a |
+| 69 | Admin 建立用戶改為邀請流程：admin 建立時唔設 password、唔設 `email_verified_at`；用戶用邀請 token 經 `user.complete-verification`（同決定 67 共用）設 password，同時設 `email_verified_at`，令決定 55 成立。 | 待 Jack 確認 | 11.4、12.11.9 |
+| 70 | 列層擁有權預設規則：有 `owner-key` 嘅 model，非 admin 只可以讀寫 `owner-key = ctx.user.id` 嘅列；要放寬一定喺 source 明寫，屬高風險安全項目。 | 待 Jack 確認 | 12.6a |
 | 71 | `max-page-size` 平台上限 500（model 可以設低，唔可以設高）。 | 待 Jack 確認（數值） | 12.9 |
 | 72 | Refresh endpoint 分類：public（冇 access token）但唔屬 public 寫入（只寫平台表，唔計 public 寫入配額）；限流 IP 30/min、家族 10/min；最低回應耗時 300ms。 | 待 Jack 確認（數值） | 4A.1 |
 
@@ -401,7 +403,10 @@ v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`（決定 57�
 - `openai` 用 Chat Completions，因為所有 OpenAI-compatible 本地 API 都支援；Responses API 唔喺 v1 範圍（見第 14 節）。
 - 決定性參數唔再按 provider 寫死，改由 adapter 按 model capability 決定（決定 58，見 2A.8.6）。已知限制（2026-10 查證）：
   - Anthropic：較新 model（Opus 4.6 之後）只接受 `temperature: 1`、拒絕 `top_k`、`top_p` 只接受 ≥ 0.99；就算 `temperature: 0` 都唔保證決定性；冇 seed。
-  - OpenAI：GPT-5 系列 reasoning model 只喺 reasoning effort `none`（5.1、5.2）先接受 `temperature`／`top_p`，較舊 GPT-5 model 一律拒絕；`seed` 屬 beta、best-effort。
+  - OpenAI（`openai` adapter 規則）：
+    - `temperature`／`top_p` 只喺 capability 表列明支援、而且 adapter 同時送 `reasoning_effort: "none"` 嘅 model 先送（例如 GPT-5.1、GPT-5.2）；唔支援 `none` 嘅 reasoning model（例如較舊 GPT-5、GPT-6 Astra、GPT-6.1 Sol）唔送任何 sampling 參數。
+    - capability 表冇列出嘅 model（包括所有 OpenAI-compatible 本地 API 嘅 model，除非表有登記），一律唔送任何 sampling 參數（`temperature`、`top_p`、`seed`、`reasoning_effort` 都唔送）。
+    - `seed`：OpenAI API reference（Create chat completion，<https://platform.openai.com/docs/api-reference/chat/create>）寫明 "This feature is in Beta"、系統只會 "make a best effort to sample deterministically"、"Determinism is not guaranteed"，並建議用 `system_fingerprint` 監察 backend 變動。所以 `seed` 只當 best-effort，冇決定性保證；adapter 將回應嘅 `system_fingerprint` 寫入編譯報告（唔計入 compiler-hash）。
   - Gemini：`generationConfig.temperature`、`topP`、`topK`、`seed` 都接受，但 `seed` 只係 best-effort。
 - 所有 provider 一律唔帶 `tools`／`functions`／`tool_choice`／`toolConfig`，唔用 streaming。
 - 決定性最終由 CI 重編比對保證（2A.6）：任何 provider 重編結果同 lock 唔一致，一律封鎖部署，冇 override。
@@ -728,10 +733,11 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 - 每次用 refresh token 都輪換：發新 refresh token 同新 access token，舊 refresh token 即時失效。
 - 同一次登入產生嘅 refresh token 屬同一個家族（`family_id`）；偵測到重用已失效嘅 refresh token，即時撤銷成個家族，並寫審計記錄、通知用戶。
 - 寬限期（決定 61）：為咗容忍網絡重試，輪換後 `reuse-grace`（預設同上限 10 秒）內再用同一個舊 token，唔當重用。DB 只存 hash，平台冇可能回返上一次嘅明文，所以做法係：
-  1. 用 `HMAC-SHA-256(pepper, token)` 搵到嗰列；佢 `used_at` 唔係 null、`now() - used_at <= reuse-grace`、家族未撤銷。
-  2. 喺同一個 transaction 撤銷佢嘅 `replaced_by` 子 token（`revoke_reason: grace-reissue`），再由同一個舊 token 發一個新子 token（同一個 `family_id`，`parent_id` 指舊 token），更新舊 token 嘅 `replaced_by`；`used_at` 唔改（寬限期唔會延長）。
+  1. 用 `HMAC-SHA-256(pepper, token)` 搵到嗰列；佢 `used_at` 唔係 null、`now() - used_at <= reuse-grace`、`grace_reissued_at` 係 null、家族未撤銷。
+  2. 喺同一個 transaction 撤銷佢嘅 `replaced_by` 子 token（`revoke_reason: grace-reissue`），再由同一個舊 token 發一個新子 token（同一個 `family_id`，`parent_id` 指舊 token），更新舊 token 嘅 `replaced_by`，設 `grace_reissued_at = now()`；`used_at` 唔改（寬限期唔會延長）。用 `update ... where grace_reissued_at is null` 做條件更新，兩個並發請求只有一個成功，另一個當重用。
   3. 回新 access token 同新 refresh token。家族唔變，絕對壽命唔變。
-  4. 超過寬限期、或者家族已撤銷、或者子 token 已經再被輪換過，一律當重用：撤銷成個家族。
+  4. 每個舊 token 最多重發一次。超過寬限期、或者 `grace_reissued_at` 已經有值（寬限期內第二次再用）、或者家族已撤銷、或者子 token 已經再被輪換過，一律當重用：撤銷成個家族。
+  5. 可選：平台可以額外比對 client 指紋（例如 User-Agent hash）先准重發；v1 唔要求。
 - 登出：revoke 當前家族；「全部裝置登出」revoke 該用戶所有家族。
 - refresh 流程由平台內置 `token-refresh` pipeline 實現，用 `method` op 呼叫標咗 `capabilities: [sign-token]` 嘅 model method 簽新 access token。
 - 簽發：`sign-jwt` op 嘅 `issue-refresh` 參數決定係咪同時發 refresh token：`new-family`（登入）、`rotate`（refresh，由 `token-refresh` pipeline 注入）、`none`；由平台按呼叫來源決定，method 唔可以自己揀 `rotate`。
@@ -781,6 +787,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 | `family_expires_at` | timestamp | 家族第一次簽發 + `refresh-ttl` |
 | `idle_expires_at` | timestamp | 每次輪換更新 |
 | `used_at` | timestamp | 被用嚟輪換嘅時間 |
+| `grace_reissued_at` | timestamp | 寬限期重發嘅時間；非 null 代表已經重發過一次 |
 | `replaced_by` | uuid | 新 token id |
 | `revoked_at` | timestamp | |
 | `revoke_reason` | string | `logout`、`logout-all`、`reuse-detected`、`grace-reissue`、`email-verified`、`erasure`、`admin` |
@@ -1234,25 +1241,25 @@ signature: MEYCIQ...
 
 ## Order
 - must-run: before-steps
-- after: [auth]
 
 ## Steps
 ### s1 rate-limit-check
 - op: rate-limit-check
-- key: req.ip
+- key: ip
 - per-minute: params.ip-per-minute
 - source-lines: 2-2
 
 ### s2 rate-limit-check
 - op: rate-limit-check
-- key: req.body.email
+- key: input.email                 # 4.3：normalize 之後 HMAC，唔儲存明文
 - per-minute: params.account-per-minute
 - source-lines: 2-2
 
 ### s3 audit
 - op: audit
 - event: login-attempt
-- fields: [req.ip, req.body.email]
+- fields: [req.ip]
+- hash: [req.body.email]           # 決定 68：記 HMAC，唔記明文 email
 - redact: [req.body.password]
 - source-lines: 4-4
 ````
@@ -1758,7 +1765,7 @@ api source 寫「用 user.login 驗證帳戶密碼」，編譯成：
 
 - RLS 只保證租戶隔離；租戶內「邊個可以掂邊列」由列層擁有權規則決定。
 - model 可以喺 `## Table` 宣告 `owner-key: {欄位}`（例如 `user_id`，或者 `users` 表本身嘅 `id`）。
-- 有 `owner-key` 嘅 model：非 admin 呼叫者嘅 read／update query，驗證器要求 SQL 帶 `{owner-key} = ctx.user_id`；insert 嘅 `{owner-key}` 一定由 `ctx.user_id` 填，唔可以由 input 提供。
+- 有 `owner-key` 嘅 model：非 admin 呼叫者嘅 read／update query，驗證器要求 SQL 帶 `{owner-key} = ctx.user.id`；insert 嘅 `{owner-key}` 一定由 `ctx.user.id` 填，唔可以由 input 提供。
 - 放寬（例如「同租戶所有已登入用戶可以讀」或者「admin 可以掂任何列」）一定喺 source 明寫，lock 記 `ownership: tenant-wide` 或者 `ownership: role(admin)`，屬高風險安全項目。
 - 冇 `owner-key` 嘅 model 視為租戶共享資料，驗證器出 warning。
 
@@ -1830,7 +1837,7 @@ signature: MEUCIQ...
 | id | uuid | primary, default: gen | yes |
 | email | string | format: email, unique, max: 254, untrusted, personal: standard | no |
 | name | string | max: 50, untrusted, personal: standard | no |
-| password | password | argon2id | no |
+| password | password | argon2id, nullable（公開註冊同邀請未設定密碼之前係 null，決定 67、69） | no |
 | roles | string[] | default: [], max-items: 20 | no |
 | last_login_at | timestamp | nullable, public-writable | no |
 | email_verified_at | timestamp | nullable, public-writable (confirm-verification) | no |
@@ -1852,7 +1859,7 @@ signature: MEUCIQ...
 ## Policies
 - rls: enable, force
 - policy: tenant_id = current_setting('app.tenant_id', false)
-- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer [UPDATE(last_login_at, email_verified_at, email_verify_hash, email_verify_expires_at), INSERT(email, name, password, email_verify_hash, email_verify_expires_at)]
+- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer [INSERT(email, name, email_verify_hash, email_verify_expires_at), UPDATE(email_verify_hash, email_verify_expires_at, password, email_verified_at, last_login_at)]   # model 層係所有 public endpoint 嘅聯集；每個 api 嘅實際 grant 只限佢 lock 用到嘅欄位（見 12.11.6、12.11.7）
 ````
 
 `models/user/methods/sign-token.md`
@@ -2198,7 +2205,7 @@ signature: MEYCIQ...
 
 ### 12.11 完整範例：public 註冊同 email 驗證
 
-呢個範例用到決定 52–56（已確認）。範例示範全部 public 寫入規則點樣一齊運作：slug 租戶、`public-writes`、`writable-columns`、黑名單、`set-password`、`confirm-verification`、captcha、每日配額、audit-log、固定 300ms、untrusted 內容、IP 加租戶限流、冇對外 call。
+呢個範例用到決定 52–56（已確認）同決定 67–69（待 Jack 確認）。範例示範全部 public 寫入規則點樣一齊運作：slug 租戶、`public-writes`、`writable-columns`、黑名單、`set-password`、`confirm-verification`、captcha、每日配額、audit-log、固定 300ms、untrusted 內容、IP 加租戶限流、冇對外 call。
 
 公開註冊用 `user.self-register`（同 11.4 admin 用嘅 `user.register` 分開：admin 版本會回 409 `EMAIL_TAKEN`，public 版本一定唔可以分辨 email 係咪存在）。
 
@@ -2206,7 +2213,7 @@ signature: MEYCIQ...
 
 ```markdown
 # 加 email 驗證欄位
-users 表加 email_verified_at（時間，可以冇）、email_verify_hash（bytes，唯一，可以冇）、email_verify_expires_at（時間，可以冇）。
+users 表嘅 password 改為可以冇；加 email_verified_at（時間，可以冇）、email_verify_hash（bytes，唯一，可以冇）、email_verify_expires_at（時間，可以冇）。
 另外開一張 email_outbox 表：id、user_id（可以冇）、email、recipient_hash（收件人 email 嘅 hash，用嚟私隱刪除）、template、token（敏感）、sent_at、created_at。
 ```
 
@@ -2238,6 +2245,11 @@ users 表加 email_verified_at（時間，可以冇）、email_verify_hash（byt
 ### s4 ddl
 - op: ddl
 - sql: `create unique index concurrently users_email_verify_hash_uq on users (tenant_id, email_verify_hash)`
+- source-lines: 2-2
+
+### s4b ddl
+- op: ddl
+- sql: `alter table users alter column password drop not null`   # 放寬約束，非破壞性（決定 67、69）
 - source-lines: 2-2
 
 ### s5 ddl
@@ -2313,8 +2325,8 @@ users 表加 email_verified_at（時間，可以冇）、email_verify_hash（byt
 ```markdown
 # enqueue
 排一封 email 入 outbox。
-輸入：user_id（uuid，可以冇）、email（合法 email）、token（敏感字串，43 字 base64url，可以冇）。
-範本唔由輸入揀：如果冇 user_id，就用 already-registered 範本，唔放 token；有 user_id 就用 verify-email 範本。
+輸入：user_id（uuid，可以冇）、email（合法 email）、token（敏感字串，43 字 base64url，可以冇）、purpose（register 或者 invite，由呼叫嘅 method 喺 lock 寫死）。
+範本唔由終端用戶揀：冇 user_id 就用 already-registered 範本，唔放 token；purpose 係 invite 就用 invite 範本（連結去設定密碼）；否則用 verify-email 範本（連結去驗證並設定密碼）。
 同時記低收件人 email 嘅 hash，方便私隱刪除。
 冇輸出內容。
 ```
@@ -2345,8 +2357,8 @@ security-items:
 signature: MEUCIQ...
 ---
 ## Signature
-- input: { user_id: { type: uuid, required: false }, email: { type: string, format: email, max: 254, required: true }, token: { type: string, length: 43, pattern: base64url, sensitive: true, required: false } }
-- derived: { template: { enum: [verify-email, already-registered], rule: "user_id != null → verify-email；否則 already-registered（token 唔寫入）" } }
+- input: { user_id: { type: uuid, required: false }, email: { type: string, format: email, max: 254, required: true }, token: { type: string, length: 43, pattern: base64url, sensitive: true, required: false }, purpose: { type: string, enum: [register, invite], required: true, const-from-caller: true } }
+- derived: { template: { enum: [verify-email, already-registered, invite], rule: "user_id == null → already-registered（token 唔寫入）；purpose == invite → invite；否則 verify-email" } }
 - output: {}
 - errors: []
 - writes: true
@@ -2366,8 +2378,8 @@ signature: MEUCIQ...
 - op: query
 - provider: main
 - table: email_outbox
-- sql: `insert into email_outbox (user_id, email, recipient_hash, template, token) values ($1, $2, $4, case when $1::uuid is null then 'already-registered' else 'verify-email' end, case when $1::uuid is null then null else $3 end)`
-- params: [input.user_id, input.email, input.token, rh]
+- sql: `insert into email_outbox (user_id, email, recipient_hash, template, token) values ($1, $2, $4, case when $1::uuid is null then 'already-registered' when $5 = 'invite' then 'invite' else 'verify-email' end, case when $1::uuid is null then null else $3 end)`
+- params: [input.user_id, input.email, input.token, rh, input.purpose]
 - writes: true
 - columns: [user_id, email, recipient_hash, template, token]
 - out: (none)
@@ -2379,25 +2391,23 @@ signature: MEUCIQ...
 - source-lines: 5-5
 ````
 
-- 範本選擇寫喺單一參數化 INSERT 入面，唔使條件分支 step；`template` 由 Signature 嘅 `derived` 宣告，驗證器對比 SQL 嘅 `case` 同 `derived.rule` 一致（決定 66）。
+- 範本選擇寫喺單一參數化 INSERT 入面，唔使條件分支 step；三個範本 `verify-email`、`already-registered`、`invite` 都由同一個 `case` 覆蓋，兩種連結（驗證、邀請）都去同一個設定密碼頁，最後都係 `user.complete-verification`；`template` 由 Signature 嘅 `derived` 宣告，驗證器對比 SQL 嘅 `case` 同 `derived.rule` 一致（決定 66）。
 - Token 類型統一（決定 66）：`random-token` 產生 32 bytes，對外一律係 43 字 base64url 字串（`vt.value`、email 連結、verify-email 嘅 `body.token`）；DB 只存 `bytea`：`users.email_verify_hash` 係 `HMAC-SHA-256(pepper, token)`，`email_outbox.token` 係 DEK 加密嘅明文。
 - 保留期（決定 68，待 Jack 確認）：`sent_at` 之後 30 日，`mail_worker` 將 `email` 換成遮罩、`token` 設 null（DEK 已銷毀）、`recipient_hash` 保留到 12.10 私隱刪除；未發送嘅列唔受影響。12.10 刪除時按 `user_id` 或者 `recipient_hash` 搵出所有 outbox 列一併匿名化，包括 `user_id` 係 null 嘅「已經有帳戶」通知。
 - token 屬 sensitive，DB 入面以 crypto-shredding 加密，mail worker 發送後即時銷毀 DEK。
 
-#### 12.11.4 Method：`models/user/methods/self-register.md`
+#### 12.11.4 Method：`models/user/methods/self-register.md`（決定 67，待 Jack 確認）
 
 ```markdown
 # self-register
-訪客自己註冊。
-輸入：email（合法 email，最多 254 字）、name（1 至 50 字）、password（字串）。
-呢個 method 會設定密碼。
+訪客自己註冊，只收 email 同 name，唔收密碼。
+輸入：email（合法 email，最多 254 字）、name（1 至 50 字）。
 
 做法：
-1. 密碼一定先 hash（唔合平台密碼底線就 fail WEAK_PASSWORD）。
-2. 產生一個 email 驗證 token，24 小時有效。
-3. 建立用戶，未驗證。如果 email 已經存在但未驗證，就用今次嘅 name、密碼同新 token 覆寫（舊 token 即時失效）；如果已經驗證就乜都唔改。
-4. 用 email-outbox.enqueue 排一封信：新用戶或者覆寫咗嘅未驗證用戶就係驗證信（帶 token），已驗證用戶就係「已經有帳戶」通知。
-5. 唔好話畀人知 email 係咪已經存在，輸出一律空。
+1. 產生一個 email 驗證 token，24 小時有效。
+2. 建立用戶，未驗證、冇密碼。如果 email 已經存在但未驗證，只換新 token 同到期時間（舊 token 即時失效），其他欄位一律唔改；如果已經驗證就乜都唔改。
+3. 用 email-outbox.enqueue（purpose 係 register）排一封信：新用戶或者未驗證用戶收驗證信（帶 token），已驗證用戶收「已經有帳戶」通知。
+4. 唔好話畀人知 email 係咪已經存在，輸出一律空。
 ```
 
 `models/user/methods/self-register.lock.md`
@@ -2414,104 +2424,7 @@ dependencies:
   - { id: email-outbox/methods/enqueue, kind: method, hash: sha256:81aa...c2 }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
-compiler-hash: sha256:c0de...77
-status: approved
-approval-mode: manual
-approved-by: [jack@example, mei@example]
-approved-at: 2026-10-14T15:35:00+08:00
-approval-ref: pr#150
-approved-commit: a1b2c150
-security-items:
-  - { item: set-password, risk: high, reason: "公開註冊要設定密碼", approved-by: [jack@example, mei@example] }
-  - { item: write-sql, risk: medium, reason: "建立未驗證用戶", approved-by: [jack@example] }
-signature: MEYCIQ...
----
-## Signature
-- input: { email: { type: string, format: email, max: 254, required: true }, name: { type: string, min: 1, max: 50, required: true }, password: { type: string, min: 1, max: 256, required: true } }
-- output: {}
-- errors: [WEAK_PASSWORD]
-- writes: true
-- capabilities: [set-password]
-
-## Calls
-- methods: [email-outbox.enqueue]
-- external: (none)
-
-## Steps
-### s1 hash-password
-- op: hash-password
-- cost: high
-- plain: input.password
-- policy: platform-floor        # 最少 12 字元 + 洩漏密碼檢查，唔合 fail WEAK_PASSWORD
-- out: pw
-- source-lines: 7-7
-
-### s2 random-token
-- op: random-token
-- bytes: 32
-- out: vt                       # vt.value（sensitive）、vt.hash
-- source-lines: 8-8
-
-### s3 query
-- op: query
-- provider: main
-- table: users
-- sql: `insert into users (email, name, password, email_verify_hash, email_verify_expires_at) values ($1, $2, $3, $4, now() + interval '24 hours') on conflict (tenant_id, email) do update set name = excluded.name, password = excluded.password, email_verify_hash = excluded.email_verify_hash, email_verify_expires_at = excluded.email_verify_expires_at where users.email_verified_at is null and users.deleted_at is null returning id`
-- params: [input.email, input.name, pw, vt.hash]
-- writes: true
-- columns: [email, name, password, email_verify_hash, email_verify_expires_at]
-- password-source: s1
-- out: ins                      # email 已驗證時 ins.id 係 null；未驗證就覆寫並回 id
-- source-lines: 9-9
-
-### s4 method
-- op: method
-- target: email-outbox.enqueue
-- args: { user_id: ins.id, email: input.email, token: vt.value }
-- out: (none)
-- source-lines: 10-10
-
-### s5 respond
-- op: respond
-- value: {}
-- source-lines: 11-11
-````
-
-- 防預先註冊搶帳戶（決定 67，待 Jack 確認）：
-  - 攻擊者用受害人 email 先註冊，因為冇受害人信箱而無法驗證；受害人之後註冊會覆寫 password 同 token，攻擊者設嘅密碼即時作廢。
-  - `ON CONFLICT DO UPDATE` 只准更新 `writable-columns` 入面嘅欄位，而且一定要有 `where users.email_verified_at is null`，驗證器檢查；已驗證帳戶永遠唔會被公開註冊改。
-  - 未驗證帳戶（`email_verified_at is null` 而且 `created_at` 超過 24 小時）由平台 job 用 `erasure` role 匿名化（email 換成 `erased+{id}@invalid`、password 同 token hash 清走），再 soft delete（`deleted_at`）；唔 DELETE（決定 13），email 唯一鍵即時釋放。
-  - 驗證成功（12.11.5）之後平台撤銷該用戶所有 refresh 家族（`revoke_reason: email-verified`），所以驗證前任何人建立嘅 session 都唔會延續。
-- 註冊耗時（決定 66）：s1 每次都做；`hash-password` 用平台固定大小嘅 argon2 worker pool，排隊時間同 email 存唔存在無關。最低回應耗時 300ms 由收到 request 開始計，喺所有工作（包括排隊同 hash）完成之後先補足；如果實際耗時超過 300ms，一律補到下一個 100ms 倍數，避免排隊長短透露資訊。
-- s1 每次都做（包括 email 已存在），令耗時一致；password 欄位嘅值嚟自 s1（`password-source`），合決定 47。
-- `roles` 冇寫，用 default `[]`；黑名單欄位（`roles`、`tenant_id`、`email_verified_at` 等）冇出現喺 INSERT。
-- 單一職責：自己物件只有 1 個寫入 sql；寫 email_outbox 經佢自己嘅 method（決定 3）。呼叫深度 2 層。
-
-#### 12.11.5 Method：`models/user/methods/verify-email.md`
-
-```markdown
-# verify-email
-用 email 入面嘅 token 確認 email。
-輸入：token（字串，43 字）。
-呢個 method 負責確認驗證。
-token 要啱、未過期、未驗證過，就記低驗證時間同清走 token；否則 fail INVALID_TOKEN。
-```
-
-`models/user/methods/verify-email.lock.md`
-
-````markdown
----
-lock-version: 1
-kind: method
-id: user/methods/verify-email
-source: models/user/methods/verify-email.md
-source-hash: sha256:9e02...7b
-source-type: natural
-dependencies:
-  - { id: main, kind: provider, hash: sha256:9a1c...e2 }
-  - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: {} }
 compiler-hash: sha256:c0de...77
 status: approved
 approval-mode: manual
@@ -2520,49 +2433,153 @@ approved-at: 2026-10-14T15:40:00+08:00
 approval-ref: pr#150
 approved-commit: a1b2c150
 security-items:
-  - { item: confirm-verification, risk: high, reason: "訪客用 token 確認 email", approved-by: [jack@example, mei@example] }
-signature: MEQCIF...
+  - { item: write-sql, risk: medium, reason: "建立未驗證用戶或者輪換驗證 token", approved-by: [jack@example] }
+signature: MEYCIQ...
 ---
 ## Signature
-- input: { token: { type: string, length: 43, pattern: base64url, required: true } }
+- input: { email: { type: string, format: email, max: 254, required: true }, name: { type: string, min: 1, max: 50, required: true } }
 - output: {}
-- errors: [INVALID_TOKEN]
+- errors: []
 - writes: true
-- capabilities: [confirm-verification]
 
 ## Calls
-(none)
+- methods: [email-outbox.enqueue]
+- external: (none)
 
 ## Steps
-### s1 hash-token
-- op: hash-token
-- value: input.token
-- out: th
-- source-lines: 3-4
+### s1 random-token
+- op: random-token
+- bytes: 32
+- out: vt                       # vt.value（sensitive，43 字 base64url）、vt.hash（bytes）
+- source-lines: 5-5
 
 ### s2 query
 - op: query
 - provider: main
 - table: users
-- sql: `update users set email_verified_at = now(), email_verify_hash = null, email_verify_expires_at = null where email_verify_hash = $1 and email_verify_expires_at > now() and email_verified_at is null and deleted_at is null returning id`
-- params: [th]
+- sql: `insert into users (email, name, email_verify_hash, email_verify_expires_at) values ($1, $2, $3, now() + interval '24 hours') on conflict (tenant_id, email) do update set email_verify_hash = excluded.email_verify_hash, email_verify_expires_at = excluded.email_verify_expires_at where users.email_verified_at is null and users.deleted_at is null returning id`
+- params: [input.email, input.name, vt.hash]
 - writes: true
-- scope: pk                     # email_verify_hash 係唯一鍵
-- columns: [email_verified_at, email_verify_hash, email_verify_expires_at]
-- out: upd
-- source-lines: 5-5
+- scope: pk                     # conflict target (tenant_id, email) 係唯一鍵，DO UPDATE 最多影響一列
+- columns: { insert: [email, name, email_verify_hash, email_verify_expires_at], update: [email_verify_hash, email_verify_expires_at] }
+- out: ins                      # 新用戶或者未驗證用戶回 id；已驗證用戶 ins.id 係 null
+- source-lines: 6-6
 
-### s3 validate
-- op: validate
-- when: `upd.id == null`
-- fail: INVALID_TOKEN
-- source-lines: 5-5
+### s3 method
+- op: method
+- target: email-outbox.enqueue
+- args: { user_id: ins.id, email: input.email, token: vt.value, purpose: register }
+- out: (none)
+- source-lines: 7-7
 
 ### s4 respond
 - op: respond
 - value: {}
-- source-lines: 5-5
+- source-lines: 8-8
 ````
+
+- 冇 `set-password` capability、冇 `hash-password` step：公開註冊永遠唔寫 password。
+- Upsert 規則（決定 67）：
+  - `INSERT` 只寫 `email`、`name`、`email_verify_hash`、`email_verify_expires_at`；`ON CONFLICT DO UPDATE` 只准改 `email_verify_hash`、`email_verify_expires_at`，一定要有 `where users.email_verified_at is null and users.deleted_at is null`。驗證器檢查 `columns.update` 係 `columns.insert` 嘅子集，而且唔包括 password、`name`、`email` 或者任何黑名單欄位。
+  - `scope: pk` 嘅意思：conflict target 係租戶內嘅唯一鍵 `(tenant_id, email)`（`tenant_id` 由 RLS 同平台注入，唔喺 SQL 參數入面），所以 DO UPDATE 最多只會影響同一租戶入面同一 email 嘅一列。
+  - 一個 upsert 只算一次 public 寫入（不論最後係 INSERT 定 UPDATE），計入每日配額一次。
+- 攻擊者用受害人 email 先註冊：因為冇密碼，帳戶冇任何 credential；受害人再註冊只會輪換 token，攻擊者手上嘅舊 token 即時失效。設密碼只可以經 email 連結（12.11.5），所以冇受害人信箱就冇辦法搶帳戶。
+- 未驗證帳戶清理（決定 67，待 Jack 確認）：平台 job 定時搵 `email_verified_at is null and email_verify_expires_at < now() and deleted_at is null` 嘅用戶，用 `erasure` role 匿名化（email 換成 `erased+{id}@invalid`、token hash 清走），再 soft delete（`deleted_at`）；唔 DELETE（決定 13）。因為 key 係 `email_verify_expires_at`，再註冊輪換 token 會順延清理時間；邀請（72 小時）用同一條規則。
+- 單一職責：自己物件只有 1 個寫入 sql；寫 email_outbox 經佢自己嘅 method（決定 3）。呼叫深度 2 層。
+
+#### 12.11.5 Method：`models/user/methods/complete-verification.md`（決定 67、69 共用，待 Jack 確認）
+
+```markdown
+# complete-verification
+用 email 連結入面嘅 token 確認 email，同時設定密碼。註冊驗證同 admin 邀請都用呢個 method。
+輸入：token（字串，43 字）、password（字串）。
+呢個 method 負責確認驗證，亦會設定密碼。
+
+做法：
+1. 密碼一定先 hash（唔合平台密碼底線就 fail WEAK_PASSWORD）。
+2. token 要啱、未過期、未驗證過，就喺同一個更新入面設密碼、記低驗證時間同清走 token；否則 fail INVALID_TOKEN。
+```
+
+`models/user/methods/complete-verification.lock.md`
+
+````markdown
+---
+lock-version: 1
+kind: method
+id: user/methods/complete-verification
+source: models/user/methods/complete-verification.md
+source-hash: sha256:9e02...7b
+source-type: natural
+dependencies:
+  - { id: main, kind: provider, hash: sha256:9a1c...e2 }
+  - { id: user, kind: model, hash: sha256:aa41...0f }
+compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: {} }
+compiler-hash: sha256:c0de...77
+status: approved
+approval-mode: manual
+approved-by: [jack@example, mei@example]
+approved-at: 2026-10-14T15:40:00+08:00
+approval-ref: pr#150
+approved-commit: a1b2c150
+security-items:
+  - { item: set-password, risk: high, reason: "用 email token 設定密碼", approved-by: [jack@example, mei@example] }
+  - { item: confirm-verification, risk: high, reason: "訪客用 token 確認 email", approved-by: [jack@example, mei@example] }
+signature: MEQCIF...
+---
+## Signature
+- input: { token: { type: string, length: 43, pattern: base64url, sensitive: true, required: true }, password: { type: string, min: 1, max: 256, required: true } }
+- output: {}
+- errors: [WEAK_PASSWORD, INVALID_TOKEN]
+- writes: true
+- capabilities: [set-password, confirm-verification]
+
+## Calls
+(none)
+
+## Steps
+### s1 hash-password
+- op: hash-password
+- cost: high
+- plain: input.password
+- policy: platform-floor        # 最少 12 字元 + 洩漏密碼檢查，唔合 fail WEAK_PASSWORD
+- out: pw
+- source-lines: 6-6
+
+### s2 hash-token
+- op: hash-token
+- value: input.token
+- out: th
+- source-lines: 7-7
+
+### s3 query
+- op: query
+- provider: main
+- table: users
+- sql: `update users set password = $1, email_verified_at = now(), email_verify_hash = null, email_verify_expires_at = null where email_verify_hash = $2 and email_verify_expires_at > now() and email_verified_at is null and deleted_at is null returning id`
+- params: [pw, th]
+- writes: true
+- scope: pk                     # (tenant_id, email_verify_hash) 係唯一鍵
+- columns: [password, email_verified_at, email_verify_hash, email_verify_expires_at]
+- password-source: s1
+- out: upd
+- source-lines: 7-7
+
+### s4 validate
+- op: validate
+- when: `upd.id == null`
+- fail: INVALID_TOKEN
+- source-lines: 7-7
+
+### s5 respond
+- op: respond
+- value: {}
+- source-lines: 7-7
+````
+
+- 一個 UPDATE 同時設 password 同 `email_verified_at`（決定 53、67、69）：冇「已驗證但冇密碼」或者「有密碼但未驗證」嘅中間狀態，所以決定 55 成立。
+- s1 每次都做（token 錯都做），令耗時一致；`hash-password` 用平台固定大小嘅 argon2 worker pool。最低回應耗時 300ms 由收到 request 開始計，喺所有工作完成之後先補足；超過 300ms 就補到下一個 100ms 倍數（決定 66）。
+- 成功 commit 之後，平台用 `refresh_store` 撤銷該用戶所有 refresh 家族（`revoke_reason: email-verified`）；method lock 唔需要寫，屬平台行為（決定 67）。
+- 決定 56 嘅「一律做 `hash-password`」喺新設計移到呢一步（決定 67 確認後生效）。
 
 #### 12.11.6 api：`api/auth/v1/register/register.md`（路由 `POST /auth/v1/{slug}/register`）
 
@@ -2570,13 +2587,12 @@ signature: MEQCIF...
 # 註冊
 POST，路徑 /auth/v1/{slug}/register。
 公開，唔使 auth，租戶由 slug 決定。
-會建立用戶同設定密碼，准許公開寫入同寫密碼。一定要 captcha。
-每個 IP 每分鐘最多 5 次，每個租戶每分鐘最多 60 次；用平台預設每日寫入配額；要記審計。
+會建立未驗證用戶，准許公開寫入，唔寫密碼。一定要 captcha。
+每個 IP 每分鐘最多 5 次，每個租戶每分鐘最多 60 次；用平台預設每日寫入配額；要記審計，email 只記 hash。
 
-請求 body：email（合法 email，最多 254 字）、name（1 至 50 字）、password（1 至 256 字）。
+請求 body：email（合法 email，最多 254 字）、name（1 至 50 字）。
 用 user.self-register 註冊。
 無論 email 係咪已經存在，都回 202 同一句「如果資料正確，你會收到確認電郵」。
-密碼太弱回 422 WEAK_PASSWORD。
 ```
 
 `api/auth/v1/register/register.lock.md`
@@ -2593,19 +2609,18 @@ source-type: natural
 dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: user/methods/self-register, kind: method, hash: sha256:d3c9...10 }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: {} }
 compiler-hash: sha256:c0de...77
 status: approved
 approval-mode: manual
 approved-by: [jack@example, mei@example]
-approved-at: 2026-10-14T15:45:00+08:00
+approved-at: 2026-10-14T15:40:00+08:00
 approval-ref: pr#151
 approved-commit: a1b2c151
 security-items:
   - { item: public, risk: high, reason: "訪客註冊入口", approved-by: [jack@example, mei@example] }
   - { item: auth-removed, risk: high, reason: "未有帳戶", approved-by: [jack@example, mei@example] }
-  - { item: public-writes, risk: high, reason: "建立用戶同 outbox", approved-by: [jack@example, mei@example] }
-  - { item: password-write, risk: high, reason: "註冊設定密碼", approved-by: [jack@example, mei@example] }
+  - { item: public-writes, risk: high, reason: "建立未驗證用戶同 outbox", approved-by: [jack@example, mei@example] }
 signature: MEUCIH...
 ---
 ## Route
@@ -2616,12 +2631,12 @@ signature: MEUCIH...
 - public: true
 - tenant: { from: path, param: slug }
 - public-writes: true
-- password-write: allow
 - role: public_writer
-- writable-columns: { users: [email, name, password, email_verify_hash, email_verify_expires_at], email_outbox: [user_id, email, recipient_hash, template, token] }
+- writable-columns: { users: { insert: [email, name, email_verify_hash, email_verify_expires_at], update: [email_verify_hash, email_verify_expires_at] }, email_outbox: { insert: [user_id, email, recipient_hash, template, token] } }
+- effective-grant: public_writer [users: INSERT(email, name, email_verify_hash, email_verify_expires_at), UPDATE(email_verify_hash, email_verify_expires_at); email_outbox: INSERT(user_id, email, recipient_hash, template, token)]
 - challenge: { type: captcha, when: always }
 - external-calls: forbidden
-- daily-write-quota: platform-default     # 每租戶 1,000、每 IP 50
+- daily-write-quota: platform-default     # 每租戶 1,000、每 IP 50；每次 upsert 算一次
 - audit-log: required
 - min-response: 300ms
 
@@ -2639,7 +2654,6 @@ signature: MEUCIH...
 
 ### p4 audit-log
 - event: public-register
-- redact: [req.body.password]
 - hash: [req.body.email]           # 記 HMAC，唔記明文 email（決定 68）
 
 ## Limits
@@ -2649,19 +2663,18 @@ signature: MEUCIH...
 
 ## Request
 | field | type | rules | required |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | path.slug | string | | yes |
 | body.email | string | format: email, max: 254, untrusted | yes |
 | body.name | string | min: 1, max: 50, untrusted | yes |
-| body.password | string | min: 1, max: 256 | yes |
 
 ## Response
 | status | schema | headers |
-|---|---|---|
+| --- | --- | --- |
 | 202 | { message: "如果資料正確，你會收到確認電郵" } | |
 
 ## Transform
-- in: { email: req.body.email, name: req.body.name, password: req.body.password }
+- in: { email: req.body.email, name: req.body.name }
 - out: { message: "如果資料正確，你會收到確認電郵" }
 
 ## Steps
@@ -2680,28 +2693,29 @@ signature: MEUCIH...
 
 ## Errors
 | status | code | from |
-|---|---|---|
-| 422 | WEAK_PASSWORD | user.self-register |
+| --- | --- | --- |
 | 422 | VALIDATION_FAILED | platform |
 | 429 | QUOTA_EXCEEDED | platform |
 ````
 
-- `cost: high`（s1 `hash-password`）令實際限流變成一半：IP 每分鐘 2 次（向下取整）、租戶每分鐘 30 次（決定 25、39）。
-- body 有 `tenant_id`、`id`、`created_by`（或者任何未宣告欄位，例如 `roles`）一律 422。
-- `WEAK_PASSWORD` 只同密碼本身有關，唔會洩露 email 係咪存在。
-- 有效權限摘要：public；role public_writer；寫 users（email、name、password、email_verify_hash、email_verify_expires_at；未驗證帳戶可以覆寫）同 email_outbox（包括 recipient_hash）；audit 只記 email hash；冇讀 output；唔簽 token；冇對外 call；captcha 每次；IP 2/min、租戶 30/min（已減半）；每日配額 1,000／租戶、50／IP；最低 300ms。
+- 冇 `hash-password`，所以唔觸發 `cost: high` 減半：限流就係 IP 每分鐘 5 次、租戶每分鐘 60 次。
+- body 有 `password`、`tenant_id`、`id`、`created_by`（或者任何未宣告欄位，例如 `roles`）一律 422。
+- 耗時：新用戶、未驗證、已驗證三條路都係「1 個 upsert + 1 個 outbox insert」，工作量一樣；再補到 300ms。
+- 有效權限摘要：public；role public_writer，grant 等於上面 `effective-grant`；唔寫 password；冇讀 output；唔簽 token；冇對外 call；captcha 每次；IP 5/min、租戶 60/min；每日配額 1,000／租戶、50／IP（每次 upsert 算一次）；audit 只記 email hash；最低 300ms。
 
 #### 12.11.7 api：`api/auth/v1/verify-email/verify-email.md`（路由 `POST /auth/v1/{slug}/verify-email`）
 
 ```markdown
-# 確認電郵
+# 驗證 email 同設定密碼
 POST，路徑 /auth/v1/{slug}/verify-email。
 公開，唔使 auth，租戶由 slug 決定。
-會寫入驗證狀態，准許公開寫入同確認驗證。
-每個 IP 每分鐘最多 10 次，每個租戶每分鐘最多 120 次；要記審計。
+email 連結會開一個設定密碼頁；用戶輸入密碼之後，頁面將 token 同密碼一齊送嚟呢度。
+會設定密碼同確認 email，准許公開寫入、寫密碼同寫驗證欄位。唔使 captcha（冇 INSERT）。
+每個 IP 每分鐘最多 10 次，每個租戶每分鐘最多 120 次；要記審計，token 同 email 唔記明文。
 
-請求 body：token（43 字）。
-用 user.verify-email 確認，成功回 204；token 錯、過期或者用過都回 422 INVALID_TOKEN。
+請求 body：token（43 字 base64url）、password（1 至 256 字）。
+用 user.complete-verification。成功回 204。
+token 錯、過期或者用過回 422 INVALID_TOKEN；密碼太弱回 422 WEAK_PASSWORD。
 ```
 
 `api/auth/v1/verify-email/verify-email.lock.md`
@@ -2713,25 +2727,26 @@ kind: api
 scope: feature
 id: auth/v1/verify-email
 source: api/auth/v1/verify-email/verify-email.md
-source-hash: sha256:b6f4...08
+source-hash: sha256:b81f...4d
 source-type: natural
 dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
-  - { id: user/methods/verify-email, kind: method, hash: sha256:9e02...7b }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+  - { id: user/methods/complete-verification, kind: method, hash: sha256:9e02...7b }
+compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: {} }
 compiler-hash: sha256:c0de...77
 status: approved
 approval-mode: manual
 approved-by: [jack@example, mei@example]
-approved-at: 2026-10-14T15:50:00+08:00
+approved-at: 2026-10-14T15:40:00+08:00
 approval-ref: pr#152
 approved-commit: a1b2c152
 security-items:
-  - { item: public, risk: high, reason: "訪客由電郵連結確認", approved-by: [jack@example, mei@example] }
-  - { item: auth-removed, risk: high, reason: "未登入", approved-by: [jack@example, mei@example] }
-  - { item: public-writes, risk: high, reason: "寫驗證狀態", approved-by: [jack@example, mei@example] }
-  - { item: verification-write, risk: high, reason: "token 確認 email", approved-by: [jack@example, mei@example] }
-signature: MEUCIA...
+  - { item: public, risk: high, reason: "email 連結入口", approved-by: [jack@example, mei@example] }
+  - { item: auth-removed, risk: high, reason: "未有密碼", approved-by: [jack@example, mei@example] }
+  - { item: public-writes, risk: high, reason: "更新用戶", approved-by: [jack@example, mei@example] }
+  - { item: password-write, risk: high, reason: "設定密碼", approved-by: [jack@example, mei@example] }
+  - { item: verification-write, risk: high, reason: "確認 email", approved-by: [jack@example, mei@example] }
+signature: MEUCIQ...
 ---
 ## Route
 - method: POST
@@ -2741,10 +2756,12 @@ signature: MEUCIA...
 - public: true
 - tenant: { from: path, param: slug }
 - public-writes: true
+- password-write: allow
 - verification-write: allow
 - role: public_writer
-- writable-columns: { users: [email_verified_at, email_verify_hash, email_verify_expires_at] }
-- challenge: { type: none }               # 冇 INSERT；token 有 256 bit
+- writable-columns: { users: { update: [password, email_verified_at, email_verify_hash, email_verify_expires_at] } }
+- effective-grant: public_writer [users: UPDATE(password, email_verified_at, email_verify_hash, email_verify_expires_at)]
+- challenge: { type: none }
 - external-calls: forbidden
 - daily-write-quota: platform-default
 - audit-log: required
@@ -2764,60 +2781,63 @@ signature: MEUCIA...
 
 ### p4 audit-log
 - event: public-verify-email
-- redact: [req.body.token]
+- redact: [req.body.token, req.body.password]
 
 ## Limits
 - provider: main
 - timeout: 10s
-- body: 1KB
+- body: 2KB
 
 ## Request
 | field | type | rules | required |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | path.slug | string | | yes |
 | body.token | string | length: 43, pattern: base64url | yes |
+| body.password | string | min: 1, max: 256 | yes |
 
 ## Response
 | status | schema | headers |
-|---|---|---|
+| --- | --- | --- |
 | 204 | (none) | |
 
 ## Transform
-- in: { token: req.body.token }
+- in: { token: req.body.token, password: req.body.password }
 - out: (none)
 
 ## Steps
 ### s1 method
 - op: method
-- target: user.verify-email
+- target: user.complete-verification
 - args: transform.in
 - out: (none)
-- source-lines: 7-7
+- source-lines: 8-8
 
 ### s2 respond
 - op: respond
 - status: 204
-- source-lines: 7-7
+- source-lines: 8-8
 
 ## Errors
 | status | code | from |
-|---|---|---|
-| 422 | INVALID_TOKEN | user.verify-email |
+| --- | --- | --- |
+| 422 | WEAK_PASSWORD | user.complete-verification |
+| 422 | INVALID_TOKEN | user.complete-verification |
 | 422 | VALIDATION_FAILED | platform |
 | 429 | QUOTA_EXCEEDED | platform |
 ````
 
-- token 錯、過期、用過、租戶冇開 public 寫入以外嘅情況都回同一個 422 `INVALID_TOKEN`，耗時補到 300ms；token 只以 hash 比對，唔寫 log（audit redact）。
-- 驗證成功之後先可以用 11／12.8 嘅 login（決定 55，已確認）。
-- `confirm-verification` 成功嘅 UPDATE commit 之後，平台用 `refresh_store` 撤銷該用戶所有 refresh 家族（`revoke_reason: email-verified`，決定 67，待 Jack 確認）；method lock 唔需要寫，屬平台行為。
-- Audit 記 token hash 嘅前 8 字元，唔記 token 同 email。
+- `cost: high`（`hash-password`）令實際限流減半：IP 每分鐘 5 次、租戶每分鐘 60 次（決定 25、39）。
+- token 錯、過期、用過都回同一個 422 `INVALID_TOKEN`，耗時補到 300ms；token 只以 hash 比對，唔寫 log（audit redact）。
+- 驗證成功之後先可以用 11／12.8 嘅 login（決定 55，已確認）；成功時平台撤銷該用戶所有 refresh 家族（決定 67）。
+- 設定密碼頁由前端提供；連結格式 `https://{前端}/verify#token={token}`，token 放 fragment，唔會出現喺 server log 或者 Referer。
 
 #### 12.11.8 驗證器對呢個範例檢查咗乜
 
-- public 寫入：`public-writes: true`、IP 加租戶限流、每日配額、audit-log 都有；`writable-columns` 同 sql 實際寫入欄位一致，冇黑名單欄位；`public_writer` grant 等於 lock 用到嘅表同欄位。
-- 註冊：有 INSERT 所以 `challenge: { type: captcha, when: always }`；password 欄位值嚟自 `hash-password`；method 有 `set-password`，api 有 `password-write: allow`。
-- 驗證：`email_verified_at` 只喺有 `confirm-verification` 嘅 method、用 `hash-token` 做 WHERE、有過期檢查、同時清 token hash 嘅 UPDATE 入面寫；api 有 `verification-write: allow`。
+- public 寫入：`public-writes: true`、IP 加租戶限流、每日配額、audit-log 都有；`writable-columns` 同 sql 實際寫入欄位一致（INSERT 同 UPDATE 分開對比），冇黑名單欄位；`public_writer` 嘅 `effective-grant` 等於 lock 用到嘅表、欄位同操作。
+- 註冊：有 INSERT 所以 `challenge: { type: captcha, when: always }`；冇寫 password；upsert 嘅 DO UPDATE 欄位係 INSERT 欄位嘅子集，有 `email_verified_at is null` 條件，`scope: pk` 嘅 conflict target 係租戶內唯一鍵。
+- 驗證：password 同 `email_verified_at` 只喺有 `set-password` 加 `confirm-verification` 嘅 method、用 `hash-token` 做 WHERE、有過期檢查、同時清 token hash 嘅一個 UPDATE 入面寫；password 值嚟自 `hash-password`；api 有 `password-write: allow` 同 `verification-write: allow`。
 - `random-token` 嘅 `value` 只傳去 `email-outbox.enqueue` 嘅 sensitive input，冇出現喺 respond 或者 log。
+- Audit 冇明文 email（只有 `hash:`），冇 token、password。
 - 冇 DELETE、DDL、`call`；所有 sql 參數化、單一 statement；UPDATE 有 `scope: pk`。
 - Request 冇 `tenant_id`、`id`、`created_by`；untrusted 欄位全部有長度上限。
 - 安全項目每項有原因，高風險有兩個非作者確認。每個 PR 上限 5 個安全項目，所以分 4 個 PR，按次序合併：
@@ -2825,23 +2845,19 @@ signature: MEUCIA...
   | PR | 內容 | 安全項目 | 數量 |
   | --- | --- | --- | --- |
   | PR#149 | migration `0004-add-email-verification` | migration-ddl（高） | 1 |
-  | PR#150 | `email-outbox` model、`email-outbox.enqueue`、`user.self-register`、`user.verify-email`，同埋 user model 改動 | write-sql（中，enqueue）、set-password（高）、write-sql（中，self-register）、confirm-verification（高） | 4 |
-  | PR#151 | `api/auth/v1/register` | public、auth-removed、public-writes、password-write（全部高） | 4 |
-  | PR#152 | `api/auth/v1/verify-email` | public、auth-removed、public-writes、verification-write（全部高） | 4 |
+  | PR#150 | `email-outbox` model、`email-outbox.enqueue`、`user.self-register`、`user.complete-verification`，同埋 user model 改動 | write-sql（中，enqueue）、write-sql（中，self-register）、set-password（高）、confirm-verification（高） | 4 |
+  | PR#151 | `api/auth/v1/register` | public、auth-removed、public-writes（全部高） | 3 |
+  | PR#152 | `api/auth/v1/verify-email` | public、auth-removed、public-writes、password-write、verification-write（全部高） | 5 |
 
   - 每個 PR 都喺 5 項上限以內；後面嘅 PR 依賴前面 PR 嘅 lock hash，要等前面合併先可以確認。
   - 注意：user model 改動（新增 public 可寫欄位）本身亦係安全項目；如果計埋，PR#150 會有 5 項，仍然喺上限內。
 
 #### 12.11.9 Admin 邀請流程（決定 69，待 Jack 確認）
 
-- `user.invite`（admin 路徑，要 `auth` 同 admin role）：用 `random-token` 產生邀請 token，`users.email_verify_hash` 寫 token hash、`email_verify_expires_at` 設 72 小時後；經 `email-outbox.enqueue` 用 `invite` 範本寄出。`enqueue` 嘅 `derived.template` 規則加多一條：呼叫來源係 `user.invite` → `invite`。
-- `user.accept-invite`（public 路徑 `POST /auth/v1/{slug}/accept-invite`，body：`token`、`password`）：
-  - Signature：`capabilities: [set-password, confirm-verification]`，兩項都係高風險安全項目。
-  - Steps：`hash-password`（每次都做）→ `hash-token` → 一個 UPDATE：`update users set password = $1, email_verified_at = now(), email_verify_hash = null, email_verify_expires_at = null where email_verify_hash = $2 and email_verify_expires_at > now() and email_verified_at is null and deleted_at is null returning id`，`scope: pk`。
-  - 錯誤一律 422 `INVALID_TOKEN`（弱密碼照回 `WEAK_PASSWORD`）；冇 INSERT，challenge 可以 `type: none`，但照樣 IP 加租戶限流、audit-log（token 同 email 唔記明文）、最低 300ms。
-  - 成功之後平台撤銷該用戶所有 refresh 家族（同 12.11.7）。
-- 同一個 UPDATE 同時設 password 同 `email_verified_at`，所以 admin 建立嘅用戶喺接受邀請之前冇辦法 login，決定 55 成立。
-- 重新邀請會覆寫 token hash 同到期時間，舊邀請即時失效。
+- `user.invite`（admin 路徑，要 `auth` 同 admin role）：用 `random-token` 產生邀請 token，`users.email_verify_hash` 寫 token hash、`email_verify_expires_at` 設 72 小時後；經 `email-outbox.enqueue`（`purpose: invite`，lock 寫死）寄出，範本係 `invite`。
+- 用戶開邀請連結，去同一個設定密碼頁，送去同一個 `POST /auth/v1/{slug}/verify-email`，由同一個 `user.complete-verification` 處理（決定 67、69 共用 code path）：一個 UPDATE 同時設 password 同 `email_verified_at`，成功後撤銷所有 refresh 家族。
+- admin 建立嘅用戶喺接受邀請之前冇 password、未驗證，冇辦法 login，決定 55 成立。
+- 重新邀請會覆寫 token hash 同到期時間，舊邀請即時失效；過期冇接受就按 12.11.4 同一條清理規則處理（key 係 `email_verify_expires_at`）。
 
 ## 13. 待確認
 
