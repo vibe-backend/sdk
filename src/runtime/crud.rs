@@ -971,7 +971,35 @@ fn lookup(path: &str, vars: &Map<String, Value>) -> Value {
     current
 }
 
-fn when_matches(expr: &str, vars: &Map<String, Value>) -> bool {
+/// Checks that an expression parses the way the runtime will parse it.
+pub fn check_expr(input: &str) -> Result<(), String> {
+    let (_, rest) = parse_expr(input.trim())?;
+    if !rest.trim().is_empty() {
+        return Err(format!("trailing input in expression {input}"));
+    }
+    Ok(())
+}
+
+/// Checks a `when` condition: only `<path> is empty` and `<path> != true`
+/// are understood.
+pub fn check_when(expr: &str) -> Result<(), String> {
+    let expr = expr.trim();
+    let path = expr
+        .strip_suffix(" is empty")
+        .or_else(|| expr.strip_suffix(" != true"))
+        .ok_or_else(|| {
+            format!("unsupported condition `{expr}` (use `<path> is empty` or `<path> != true`)")
+        })?;
+    let (_, rest) = take_path(path.trim())?;
+    if !rest.trim().is_empty() {
+        return Err(format!("unsupported condition `{expr}`"));
+    }
+    Ok(())
+}
+
+/// Unknown conditions fail closed (the step's `fail` fires); `vibe validate`
+/// rejects them before deploy.
+pub(crate) fn when_matches(expr: &str, vars: &Map<String, Value>) -> bool {
     let expr = expr.trim();
     if let Some(name) = expr.strip_suffix(" is empty") {
         let value = lookup(name.trim(), vars);
@@ -982,7 +1010,7 @@ fn when_matches(expr: &str, vars: &Map<String, Value>) -> bool {
     if let Some(name) = expr.strip_suffix(" != true") {
         return lookup(name.trim(), vars) != Value::Bool(true);
     }
-    false
+    true
 }
 
 pub fn req_var(
@@ -1090,5 +1118,24 @@ mod ownership_tests {
         let (column, value) = owner_eq(&users, caller("u1", &[])).unwrap().unwrap();
         assert_eq!(column.name, "id");
         assert_eq!(value, Value::String("u1".into()));
+    }
+}
+
+#[cfg(test)]
+mod expr_check_tests {
+    use super::{check_expr, check_when, when_matches};
+    use serde_json::Map;
+
+    #[test]
+    fn expressions_and_conditions_are_checked_like_the_runtime() {
+        assert!(check_expr("{sku: req.body.sku, qty: req.body.qty}").is_ok());
+        assert!(check_expr("result").is_ok());
+        assert!(check_expr("{sku: }").is_err());
+        assert!(check_expr("a b").is_err());
+        assert!(check_when("found is empty").is_ok());
+        assert!(check_when("user.verified != true").is_ok());
+        assert!(check_when("qty > 5").is_err());
+        // Unknown conditions fail closed at runtime.
+        assert!(when_matches("qty > 5", &Map::new()));
     }
 }
