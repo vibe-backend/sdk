@@ -22,6 +22,8 @@ pub struct LlmConfig {
     pub seed: u64,
     pub endpoint_host: String,
     pub endpoint_private: bool,
+    /// When false (`LLM_SEND_SAMPLING=0`), omit temperature/seed/top_* (#35).
+    pub send_sampling: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -79,11 +81,24 @@ impl SentParams {
 
 /// Capability table shipped with this SDK version (spec 2A.8.6, decision 58).
 ///
-/// Gemini accepts temperature, topP, topK, and seed for every model. OpenAI
-/// sends sampling parameters only for models that also accept
-/// `reasoning_effort: none` (GPT-5.1 and GPT-5.2). Everything else, including
-/// Anthropic and local OpenAI-compatible tags, gets no sampling parameters.
+/// Every supported provider defaults to `temperature: 0` and a pinned `seed`
+/// so natural-language compiles are deterministic (#35). Gemini also gets
+/// topP/topK. OpenAI GPT-5.1 / GPT-5.2 also get `reasoning_effort: none`.
+/// Set `LLM_SEND_SAMPLING=0` to omit sampling parameters for gateways that
+/// reject them.
 pub fn model_capabilities(provider: &str, model: &str, seed: u64) -> SentParams {
+    model_capabilities_with(provider, model, seed, true)
+}
+
+pub fn model_capabilities_with(
+    provider: &str,
+    model: &str,
+    seed: u64,
+    send_sampling: bool,
+) -> SentParams {
+    if !send_sampling {
+        return SentParams::default();
+    }
     let model = model.to_ascii_lowercase();
     if provider == GEMINI {
         return SentParams {
@@ -94,16 +109,26 @@ pub fn model_capabilities(provider: &str, model: &str, seed: u64) -> SentParams 
             reasoning_effort: None,
         };
     }
-    if provider == OPENAI && (model.contains("gpt-5.1") || model.contains("gpt-5.2")) {
+    if provider == OPENAI || provider == ANTHROPIC {
+        let reasoning = (provider == OPENAI
+            && (model.contains("gpt-5.1") || model.contains("gpt-5.2")))
+        .then(|| "none".into());
         return SentParams {
             temperature: Some("0".into()),
             top_p: Some("1".into()),
             top_k: None,
             seed: Some(seed.to_string()),
-            reasoning_effort: Some("none".into()),
+            reasoning_effort: reasoning,
         };
     }
-    SentParams::default()
+    // Unknown provider tag: still pin temperature/seed when sampling is on.
+    SentParams {
+        temperature: Some("0".into()),
+        top_p: None,
+        top_k: None,
+        seed: Some(seed.to_string()),
+        reasoning_effort: None,
+    }
 }
 
 pub fn sampling_registered(provider: &str, model: &str) -> bool {
@@ -249,6 +274,13 @@ pub fn load_llm_config(
     if report.has_errors() {
         return Err(report);
     }
+    // Default on: pin temperature/seed for deterministic NL compiles (#35).
+    let send_sampling = !matches!(
+        env.get("LLM_SEND_SAMPLING")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    );
     Ok(LlmConfig {
         provider,
         base_url,
@@ -259,6 +291,7 @@ pub fn load_llm_config(
         seed,
         endpoint_host: host,
         endpoint_private: private,
+        send_sampling,
     })
 }
 
@@ -666,7 +699,12 @@ fn openai_call(
     request: &LlmRequest,
 ) -> (String, Value, Vec<(&'static str, String)>) {
     let url = join_url(&config.base_url, "chat/completions");
-    let params = model_capabilities(&config.provider, &request.model, config.seed);
+    let params = model_capabilities_with(
+        &config.provider,
+        &request.model,
+        config.seed,
+        config.send_sampling,
+    );
     let body = openai_body(request, &params);
     let headers = vec![("Authorization", format!("Bearer {}", config.api_key))];
     (url, body, headers)
@@ -677,7 +715,12 @@ fn anthropic_call(
     request: &LlmRequest,
 ) -> (String, Value, Vec<(&'static str, String)>) {
     let url = join_url(&config.base_url, "v1/messages");
-    let params = model_capabilities(&config.provider, &request.model, config.seed);
+    let params = model_capabilities_with(
+        &config.provider,
+        &request.model,
+        config.seed,
+        config.send_sampling,
+    );
     let body = anthropic_body(request, &params);
     let headers = vec![
         ("x-api-key", config.api_key.clone()),
@@ -694,7 +737,7 @@ fn gemini_call(
         &config.base_url,
         &format!("models/{}:generateContent", request.model),
     );
-    let params = model_capabilities(GEMINI, &request.model, config.seed);
+    let params = model_capabilities_with(GEMINI, &request.model, config.seed, config.send_sampling);
     let body = gemini_body(request, &params);
     let headers = vec![("x-goog-api-key", config.api_key.clone())];
     (url, body, headers)
@@ -843,23 +886,30 @@ mod tests {
             timeout: Duration::from_secs(1),
         };
         let unknown = model_capabilities(OPENAI, &request.model, 0);
-        assert!(unknown.is_empty());
+        assert!(
+            !unknown.is_empty(),
+            "unlisted OpenAI models still get temperature/seed"
+        );
         let openai = openai_body(&request, &unknown);
-        assert!(openai.get("temperature").is_none());
-        assert!(openai.get("seed").is_none());
+        assert_eq!(openai["temperature"], 0);
+        assert_eq!(openai["seed"], 0);
         assert!(openai.get("tools").is_none());
         assert!(openai.get("functions").is_none());
         assert!(openai.get("tool_choice").is_none());
+        let off = model_capabilities_with(OPENAI, &request.model, 0, false);
+        assert!(off.is_empty());
         let pinned = model_capabilities(OPENAI, "gpt-5.1", 0);
         let openai_pinned = openai_body(&request, &pinned);
         assert_eq!(openai_pinned["temperature"], 0);
         assert_eq!(openai_pinned["top_p"], 1);
         assert_eq!(openai_pinned["seed"], 0);
         assert_eq!(openai_pinned["reasoning_effort"], "none");
-        let anthropic = anthropic_body(&request, &SentParams::default());
-        assert!(anthropic.get("temperature").is_none());
+        let anthropic = anthropic_body(
+            &request,
+            &model_capabilities(ANTHROPIC, "claude-sonnet-2026-09-01", 0),
+        );
+        assert_eq!(anthropic["temperature"], 0);
         assert!(anthropic.get("tools").is_none());
-        assert!(anthropic.get("top_p").is_none());
         let gemini = gemini_body(&request, &model_capabilities(GEMINI, &request.model, 0));
         assert_eq!(gemini["generationConfig"]["temperature"], 0);
         assert_eq!(gemini["generationConfig"]["topK"], 1);
