@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 pub const COMPILER_NAME: &str = "md-logic";
 pub const COMPILER_VERSION: &str = "0.1.0";
-pub const PROMPT_VERSION: &str = "prompt-1";
+pub const PROMPT_VERSION: &str = "prompt-2";
 pub const LOCK_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
