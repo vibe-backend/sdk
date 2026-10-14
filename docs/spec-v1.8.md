@@ -203,7 +203,7 @@
 | 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；`vibe build` release 模式檢查 CODEOWNERS 覆蓋路徑，冇就失敗。 | 待產品經理確認 | 2A.7、9B |
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 待產品經理確認 | 文件標頭、網站 |
 | 95 | create-user 邀請失敗：`user.invite` 嘅 enqueue（s4）失敗時，create-user 回 503 `INVITE_DELIVERY_FAILED`（只帶 `Retry-After`，body 唔帶 `user_id`），唔回 201／200；因為 s2 已經輪換咗 token 但信冇寄出，用戶手上冇有效連結，恢復方法係重試 create-user（決定 85）或者 re-invite（決定 86），兩者都會發新 token 同新信。同 issue #26（auth flow 實作）相關。 | 待產品經理確認 | 11.4、11.4a |
-| 96 | （v1.8 修訂，issue #70，待產品經理確認）Release ruleset 驗證：另設一個專用 tag ruleset（target `tag`、`refs/tags/v*`、限制 creation／update／deletion、禁止 non-fast-forward），`bypass_actors` 一定要係空；release build 只可以由 `v*` tag 出。高風險 release build 用專用 GitHub App installation token 讀呢個 ruleset，讀唔到、唔係空、唔係 active、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass（日常 `--admin` merge 唔變），SDK 唔再檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval` 會獨立驗證 PR review（2C.3a）。所需權限以實測為準（文件顯示要 Administration: write 先睇到 `bypass_actors`）。普通 build 只記錄。 | 待產品經理確認 | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
+| 96 | （v1.8 修訂，issue #70，待產品經理確認）Release ruleset 驗證：另設一個專用 tag ruleset（target `tag`、`refs/tags/v*`、限制 creation／update／deletion、禁止 non-fast-forward），`bypass_actors` 一定要係空；release build 只可以由 `v*` tag 出。高風險 release build 用專用 GitHub App installation token 讀呢個 ruleset，讀唔到、唔係空、唔係 active、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass（日常 `--admin` merge 唔變），SDK 唔再檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval` 會獨立驗證 PR review（2C.3a）。所需權限以實測為準（文件顯示要 Administration: write 先睇到 `bypass_actors`）。普通 build 只記錄。現狀：bypass list 空，`v*` tag 開唔到，release 凍結。計劃修訂 (iii)（未生效，待 Jack／產品經理於 #70 確定）：bypass list 只准剛好一個 `Integration` actor，id 等於設定嘅 release App id，由呢個 App 開 tag；其他 actor 一律失敗。 | 待產品經理確認 | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
 
 ## 1. 目錄同命名
 
@@ -737,10 +737,12 @@ Release ruleset 檢查（`v*` tag，決定 96）：
   5. 其他 build：只記錄搵到嘅 ruleset 同 `bypass_actors` 內容或者「讀唔到」。
   6. Organization 層級 tag ruleset（`source_type: Organization`）一樣用 repo endpoint 讀。
 
-- **未解決衝突（待產品經理確認）**：GitHub 嘅 `creation` rule 係「只有 bypass list 入面嘅人先可以開符合 pattern 嘅 tag」。`bypass_actors` 一定要空，即係**冇人可以開 `v*` tag**（包括 admin 同 App），release 流程會卡死。要喺第一個 `v*` tag 之前揀一個：
-  - (i) 唔加 `creation` rule：任何有 write 權限嘅人都可以開 `v*` tag，但 `update`、`deletion`、`non_fast_forward` 照樣禁止，tag 一開就改唔到；安全靠 `release` environment required reviewers 同 `--release-approval`。
-  - (ii) 保留 `creation`，每次 release 暫時改 ruleset（會留 ruleset history，但要 admin 手動操作，而且改嘅期間保護會鬆咗）。
-  - 喺確認之前，上面第 3 點嘅 `creation` 要求視為暫定。
+- **現狀：release 凍結**。`creation` rule 係「只有 bypass list 入面嘅 actor 先可以開符合 pattern 嘅 tag」；而家 bypass list 係空，所以冇人（包括 admin）可以開 `v*` tag，release 暫停。上面第 3 點（`bypass_actors` 一定要空）係**現行**檢查。
+- **計劃修訂 (iii)（未生效，待 Jack／產品經理於 #70 確定）**：
+  - Release tag ruleset 嘅 bypass list 只放一個專用 release GitHub App（冇任何人類帳戶），由呢個 App 開 `v*` tag；tag 唔再由 `j113203` push，所以 Jack 做 `release` environment reviewer 唔會撞 Prevent self-review。
+  - 生效之後，第 3 點嘅 `bypass_actors` 檢查改做：**剛好一個** actor，`actor_type` 係 `Integration`，而且 `actor_id` 等於設定咗嘅 release App id；有任何其他 actor（包括 `OrganizationAdmin`、`RepositoryRole`、`Team`、`User`、`DeployKey` 或者其他 App）就失敗。
+  - 唔揀「唔加 `creation` rule」：所有 agent 都用 `j113203` push，開放開 tag 等於冇把關。
+  - 喺 (iii) 正式生效同 spec 更新之前，SDK 照現行規則（空 bypass list）檢查。
 
 #### 8. Token、權限同錯誤處理
 

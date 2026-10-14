@@ -19,7 +19,8 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - 開 **Restrict creations**、**Restrict updates**、**Restrict deletions**、**Block force pushes**。
 - **Bypass list 一定要留空**，admin 都唔例外；唔設白名單。高風險 release build 會讀呢個 ruleset，讀唔到、唔係空、唔係 Active、或者冇 target 到今次嘅 tag 就失敗。
 - Release 只可以由 `v*` tag 出，tag 一定要指向 `main` 上嘅 commit。
-- **注意（待產品經理確認）**：Restrict creations 加上空 bypass list，即係**冇人可以開 `v*` tag**（包括 admin 同 App）。第一個 release 之前要決定：唔開 Restrict creations（tag 開咗就改唔到、刪唔到），定係每次 release 暫時改 ruleset。見 spec 2C.3a.7。
+- **現狀：release 凍結**。Restrict creations 加上空 bypass list，冇人（包括 admin）可以開 `v*` tag。
+- **計劃 (iii)（未生效，待 Jack／產品經理於 #70 確定）**：bypass list 只加一個專用 release GitHub App（唔加任何人），由 App 開 `v*` tag；SDK 屆時只接受剛好一個 `Integration` actor 而且 id 係 release App id。唔好喺確定之前自己加 bypass actor。見 spec 2C.3a.7。
 - 為咗讀到 `bypass_actors`，要開一個專用 GitHub App，只裝喺呢個 repo，喺 release workflow 嘅 `release` environment job 入面 mint installation token：
   - GitHub 只會將 `bypass_actors` 回畀對 ruleset 有寫權限嘅 caller。先試 repository **Administration: read**；實測讀唔到就要 **Administration: write**（呢個權限可以改 repo 設定，要產品經理確認）。
   - 加 **Metadata: read**（預設）；唔好加其他權限。
