@@ -1775,7 +1775,7 @@ security-items: [{ item: rate-limit-new, risk: medium, reason: "登入防爆破"
 POST。只有 admin 可以用，每分鐘最多 30 次。
 請求 body 要有 email（合法 email）同 name（1 至 50 字）。
 用 user.register 建立用戶（唔設密碼、未驗證），再用 user.invite 寄邀請信。
-新建立就回 201，如果同一個 email 之前建立咗但未接受邀請（重試），就回 200；兩種都回用戶嘅 id、email、name，並帶 Location。
+邀請信寫入 outbox 之後回 202（新建立同重試都一樣，決定 95），回用戶嘅 id、email、name 同 `invite_status: invite_pending`，並帶 Location。
 email 已經屬於已驗證或者有密碼嘅用戶就回 409 EMAIL_TAKEN；驗證唔通過回 422。
 ```
 
@@ -1830,8 +1830,7 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" 
 ## Response
 | status | schema | headers |
 |---|---|---|
-| 201 | { id, email, name } | Location |
-| 200 | { id, email, name } | Location |
+| 202 | { id, email, name, invite_status } | Location |
 
 ## Transform
 - in: { email: req.body.email, name: req.body.name }
@@ -1854,7 +1853,7 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" 
 
 ### s3 respond
 - op: respond
-- status: `u.created ? 201 : 200`
+- status: 202   # 決定 95：邀請已入 outbox，invite_status = invite_pending
 - value: transform.out
 - location: /users/v2/{u.id}
 - source-lines: 5-5
@@ -1869,7 +1868,7 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" 
 ````
 
 - 邀請（決定 95，已確認（產品經理 2026-10-14））：邀請信寫入 transactional outbox，`email_outbox` 列同其他寫入喺同一個 transaction 寫入；commit 之後 create-user 回 **202**，body `{ user_id, invite_status: "invite_pending" }`。Mail worker commit 之後先寄，commit 之前永遠唔寄；失敗按退避重試，超過重試上限將邀請狀態標 `delivery_failed`（狀態值，唔係錯誤碼）。Admin 可以查詢用戶嘅邀請狀態（`invite_pending`／`sent`／`delivery_failed`），亦可以 call re-invite（11.4b）重寄（發新 token 同新信）。只有 transaction 失敗（outbox 冇寫入）先回 503 `INVITE_NOT_QUEUED`（帶 `Retry-After`），成個 request rollback（決定 99），唔會留低半完成狀態。實作見 issue #26。
-- 失敗恢復（決定 85，待產品經理確認）：v1.8 起一個 request 一個 transaction（決定 99），s2 失敗會 rollback s1；但 commit 之後先失敗（例如回應途中斷線）或者舊資料仍然可能有「已建立、未邀請」嘅用戶。Admin 用同一個 body 重試 create-user：`user.register` 對已存在、未驗證、冇密碼嘅用戶回原有 id（`created: false`），s2 重新寄邀請，回 200；或者用 11.4b 嘅 re-invite endpoint。
+- 失敗恢復（決定 85，待產品經理確認）：v1.8 起一個 request 一個 transaction（決定 99），s2 失敗會 rollback s1；但 commit 之後先失敗（例如回應途中斷線）或者舊資料仍然可能有「已建立、未邀請」嘅用戶。Admin 用同一個 body 重試 create-user：`user.register` 對已存在、未驗證、冇密碼嘅用戶回原有 id（`created: false`），s2 重新寄邀請，回 202（`invite_pending`）；或者用 11.4b 嘅 re-invite endpoint。
 - `EMAIL_TAKEN`（決定 84，待產品經理確認）：只限 admin（已認證、`roles: [admin]`、按用戶限流、audit-log），admin 本身可以列出租戶用戶，所以 409 唔當 enumeration 洩漏；public 註冊（12.11）照樣唔分辨。
 - 同一個 email 自己註冊緊（未驗證、冇密碼）：當同一個用戶，邀請 token 取代註冊 token（決定 88，待產品經理確認）。
 - 邀請流程（決定 69，已確認（產品經理 2026-10-14））：admin 建立嘅用戶冇 password、`email_verified_at` 係 null，所以未接受邀請之前唔可以 login（決定 55）。完整流程見 12.11.9。
@@ -2033,7 +2032,7 @@ security-items:
 ```markdown
 # 重新寄邀請
 POST，路徑 /users/v2/{id}/invite。只有 admin 可以用，每個 admin 每分鐘最多 10 次。
-用 user.invite 重新寄邀請，舊邀請即時失效。成功回 204。
+用 user.invite 重新寄邀請，舊邀請即時失效。邀請入 outbox 之後回 202，body `{ invite_status: "invite_pending" }`（決定 95）；亦可以用嚟重寄 `delivery_failed` 嘅邀請。
 用戶已經驗證回 409 ALREADY_ACTIVE。
 ```
 
