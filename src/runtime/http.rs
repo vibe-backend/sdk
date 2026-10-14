@@ -216,13 +216,19 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         .keys()
         .any(|key| matches!(key.as_str(), "api_key" | "api-key" | "key"))
     {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "API keys are not accepted in the query",
-            &request_id,
-            &[],
-        );
+        return finish(
+            found.route,
+            &state,
+            started,
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "API keys are not accepted in the query",
+                &request_id,
+                &[],
+            ),
+        )
+        .await;
     }
     let headers = header_map(req.headers());
     let peer = req
@@ -234,23 +240,35 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     let bytes = match axum::body::to_bytes(req.into_body(), body_limit.saturating_add(1)).await {
         Ok(bytes) => bytes,
         Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                "Could not read the body",
-                &request_id,
-                &[],
-            );
+            return finish(
+                found.route,
+                &state,
+                started,
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    "BAD_REQUEST",
+                    "Could not read the body",
+                    &request_id,
+                    &[],
+                ),
+            )
+            .await;
         }
     };
     if bytes.len() > body_limit {
-        return error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "PAYLOAD_TOO_LARGE",
-            "Body is too large",
-            &request_id,
-            &[],
-        );
+        return finish(
+            found.route,
+            &state,
+            started,
+            error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "PAYLOAD_TOO_LARGE",
+                "Body is too large",
+                &request_id,
+                &[],
+            ),
+        )
+        .await;
     }
     let content_type = headers.get("content-type").cloned().unwrap_or_default();
     let body = if bytes.is_empty() {
@@ -260,36 +278,39 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             .to_ascii_lowercase()
             .starts_with("application/json")
     {
-        return error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "UNSUPPORTED_MEDIA_TYPE",
-            "Content-Type must be application/json",
-            &request_id,
-            &[],
-        );
-    } else {
-        match serde_json::from_slice::<Value>(&bytes) {
-            Ok(value) => value,
-            Err(_) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "BAD_REQUEST",
-                    "Body is not JSON",
-                    &request_id,
-                    &[],
-                );
-            }
-        }
-    };
-    if let Err(fail) = validate_request(found.route, &body, &query, &found.params) {
         return finish(
             found.route,
             &state,
             started,
-            fail_response(found.route, fail, &request_id),
+            error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "UNSUPPORTED_MEDIA_TYPE",
+                "Content-Type must be application/json",
+                &request_id,
+                &[],
+            ),
         )
         .await;
-    }
+    } else {
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return finish(
+                    found.route,
+                    &state,
+                    started,
+                    error_response(
+                        StatusCode::BAD_REQUEST,
+                        "BAD_REQUEST",
+                        "Body is not JSON",
+                        &request_id,
+                        &[],
+                    ),
+                )
+                .await;
+            }
+        }
+    };
     let principal = if found.route.public && found.route.auth_removed {
         let slug = found.params.get("slug").cloned().unwrap_or_default();
         match state.slugs.get(&slug) {
@@ -394,6 +415,17 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
     }
+    // Validate only after authentication and authorization, so unauthenticated
+    // callers cannot probe the request schema of protected endpoints.
+    if let Err(fail) = validate_request(found.route, &body, &query, &found.params, &headers) {
+        return finish(
+            found.route,
+            &state,
+            started,
+            fail_response(found.route, fail, &request_id),
+        )
+        .await;
+    }
     if found.route.public_writes && quota_exhausted(&state, &principal.tenant_id, &ip) {
         let retry = seconds_until_utc_midnight().to_string();
         return finish(
@@ -454,18 +486,16 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     let input = match crud::eval_expr(&found.route.transform_in, &vars) {
         Ok(value) => value,
         Err(err) => {
-            return finish(
-                found.route,
-                &state,
-                started,
+            return finish(found.route, &state, started, {
+                tracing::warn!(%request_id, error = %err, "transform.in failed");
                 error_response(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "VALIDATION_FAILED",
-                    &err,
+                    "Invalid request",
                     &request_id,
                     &[],
-                ),
-            )
+                )
+            })
             .await;
         }
     };
@@ -491,18 +521,16 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     match crud::eval_expr(&step.args, &vars) {
                         Ok(value) => value,
                         Err(err) => {
-                            return finish(
-                                found.route,
-                                &state,
-                                started,
+                            return finish(found.route, &state, started, {
+                                tracing::warn!(%request_id, error = %err, "step args failed");
                                 error_response(
                                     StatusCode::UNPROCESSABLE_ENTITY,
                                     "VALIDATION_FAILED",
-                                    &err,
+                                    "Invalid request",
                                     &request_id,
                                     &[],
-                                ),
-                            )
+                                )
+                            })
                             .await;
                         }
                     }
@@ -692,12 +720,32 @@ fn normalize_request_path(path: &str) -> String {
     path
 }
 
+/// Validates the request against the route's declared fields.
+///
+/// Key policy: only top-level body keys are declared and checked; a declared
+/// field's value may be any JSON of its type, and nested objects/arrays are
+/// not walked (types are scalar, so an object value fails the type check).
+/// Duplicate JSON keys are resolved by the parser (serde_json keeps the last
+/// occurrence) before validation; duplicate query keys likewise keep the last
+/// value.
 fn validate_request(
     route: &RouteSpec,
     body: &Value,
     query: &BTreeMap<String, String>,
     path: &BTreeMap<String, String>,
+    headers: &BTreeMap<String, String>,
 ) -> Result<(), MethodFail> {
+    let has_body_fields = route.request.iter().any(|field| field.location == "body");
+    if !body.is_null() && !body.is_object() {
+        return Err(MethodFail::code(
+            "VALIDATION_FAILED",
+            if has_body_fields {
+                "body must be a JSON object"
+            } else {
+                "body is not allowed"
+            },
+        ));
+    }
     if let Some(obj) = body.as_object() {
         for key in obj.keys() {
             if !route
@@ -732,10 +780,13 @@ fn validate_request(
             }
             "query" => query.contains_key(&field.name),
             "path" => path.contains_key(&field.name),
-            "header" => true,
+            // An empty (or whitespace-only) header counts as missing.
+            "header" => headers
+                .get(&field.name.to_ascii_lowercase())
+                .is_some_and(|v| !v.trim().is_empty()),
             _ => false,
         };
-        if field.required && field.location != "header" && !present {
+        if field.required && !present {
             return Err(MethodFail::code(
                 "VALIDATION_FAILED",
                 format!("{} is required", field.name),
@@ -748,6 +799,13 @@ fn validate_request(
         }
         if field.location == "query" {
             if let Some(raw) = query.get(&field.name) {
+                check_type(field, &coerce(raw, &field.ty))?;
+            }
+        }
+        // Path params are typed too, so e.g. a malformed `path.id` uuid is a
+        // 422 here and never reaches SQL.
+        if field.location == "path" {
+            if let Some(raw) = path.get(&field.name) {
                 check_type(field, &coerce(raw, &field.ty))?;
             }
         }
@@ -803,9 +861,52 @@ fn check_type(field: &crate::manifest::ReqField, value: &Value) -> Result<(), Me
                 ));
             }
         }
-        _ => {}
+        "number" => {
+            if !value.is_number() {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be a number", field.name),
+                ));
+            }
+        }
+        "boolean" => {
+            if !value.is_boolean() {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be a boolean", field.name),
+                ));
+            }
+        }
+        "uuid" => {
+            if value.as_str().is_none_or(|s| !is_canonical_uuid(s)) {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be a uuid", field.name),
+                ));
+            }
+        }
+        other => {
+            // `vibe validate` rejects unknown types; an old manifest fails closed.
+            return Err(MethodFail::code(
+                "INTERNAL",
+                format!("unsupported request type {other} for {}", field.name),
+            ));
+        }
     }
     Ok(())
+}
+
+/// Request field types the runtime understands.
+pub const REQUEST_TYPES: [&str; 5] = ["string", "integer", "number", "boolean", "uuid"];
+
+/// Only the canonical hyphenated form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
+/// (either case); braces, `urn:uuid:` and the 32-hex simple form are rejected.
+fn is_canonical_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
 }
 
 fn coerce(raw: &str, ty: &str) -> Value {
@@ -820,7 +921,13 @@ fn coerce(raw: &str, ty: &str) -> Value {
             .and_then(serde_json::Number::from_f64)
             .map(Value::Number)
             .unwrap_or(Value::String(raw.into())),
-        "boolean" => Value::Bool(raw == "true"),
+        // Only the exact strings `true` and `false`; anything else stays a
+        // string and fails the boolean check.
+        "boolean" => match raw {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => Value::String(raw.into()),
+        },
         _ => Value::String(raw.into()),
     }
 }
@@ -1426,5 +1533,166 @@ mod pepper_tests {
         assert!(warn.is_some());
         let (_, warn) = resolve_pepper(RunEnv::Dev, Some("short")).unwrap();
         assert!(warn.is_some());
+    }
+}
+
+#[cfg(test)]
+mod request_validation_tests {
+    use super::*;
+    use crate::manifest::ReqField;
+    use serde_json::json;
+
+    fn field(location: &str, name: &str, ty: &str, required: bool) -> ReqField {
+        ReqField {
+            location: location.into(),
+            name: name.into(),
+            ty: ty.into(),
+            required,
+            min: None,
+            max: None,
+            format: String::new(),
+        }
+    }
+
+    fn route(request: Vec<ReqField>) -> RouteSpec {
+        let mut value = json!({
+            "method": "POST", "path": "/x", "feature_id": "f", "public": false,
+            "auth_removed": false, "auth_mode": "jwt", "roles": [], "scopes": [],
+            "rates": [], "body_limit": 0, "request": [], "transform_in": "",
+            "transform_out": "", "steps": [], "errors": [], "min_response_ms": 0,
+            "public_writes": false, "challenge_type": "", "challenge_when": "",
+            "deprecated": false, "sunset": ""
+        });
+        value["request"] = serde_json::to_value(request).unwrap();
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn check(route: &RouteSpec, body: Value, headers: &[(&str, &str)]) -> Result<(), MethodFail> {
+        let headers = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        validate_request(route, &body, &BTreeMap::new(), &BTreeMap::new(), &headers)
+    }
+
+    fn check_path(route: &RouteSpec, path: &[(&str, &str)]) -> Result<(), MethodFail> {
+        let path = path
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        validate_request(
+            route,
+            &Value::Null,
+            &BTreeMap::new(),
+            &path,
+            &BTreeMap::new(),
+        )
+    }
+
+    fn check_query(route: &RouteSpec, query: &[(&str, &str)]) -> Result<(), MethodFail> {
+        let query = query
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        validate_request(
+            route,
+            &Value::Null,
+            &query,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+    }
+
+    #[test]
+    fn path_params_are_typed() {
+        let r = route(vec![
+            field("path", "id", "uuid", true),
+            field("path", "n", "integer", false),
+        ]);
+        let ok = "6f1c1e7e-8a4b-4c55-9b0e-2b8f6f0f2a11";
+        assert!(check_path(&r, &[("id", ok)]).is_ok());
+        assert!(check_path(&r, &[("id", "1; DROP TABLE x")]).is_err());
+        assert!(check_path(&r, &[("id", ok), ("n", "12")]).is_ok());
+        assert!(check_path(&r, &[("id", ok), ("n", "1x")]).is_err());
+    }
+
+    #[test]
+    fn query_booleans_are_exact() {
+        let r = route(vec![field("query", "flag", "boolean", false)]);
+        assert!(check_query(&r, &[("flag", "true")]).is_ok());
+        assert!(check_query(&r, &[("flag", "false")]).is_ok());
+        for bad in ["1", "yes", "TRUE", ""] {
+            assert!(check_query(&r, &[("flag", bad)]).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn uuid_must_be_canonical_hyphenated() {
+        let f = field("body", "v", "uuid", true);
+        for bad in [
+            "6f1c1e7e8a4b4c559b0e2b8f6f0f2a11",
+            "{6f1c1e7e-8a4b-4c55-9b0e-2b8f6f0f2a11}",
+            "urn:uuid:6f1c1e7e-8a4b-4c55-9b0e-2b8f6f0f2a11",
+        ] {
+            assert!(check_type(&f, &json!(bad)).is_err(), "{bad}");
+        }
+        assert!(check_type(&f, &json!("6F1C1E7E-8A4B-4C55-9B0E-2B8F6F0F2A11")).is_ok());
+    }
+
+    #[test]
+    fn unknown_types_fail_closed() {
+        let f = field("body", "v", "date", true);
+        assert_eq!(check_type(&f, &json!("x")).unwrap_err().code, "INTERNAL");
+    }
+
+    #[test]
+    fn required_headers_are_enforced_case_insensitively() {
+        let r = route(vec![field("header", "Idempotency-Key", "string", true)]);
+        assert!(check(&r, Value::Null, &[]).is_err());
+        assert!(
+            check(&r, Value::Null, &[("idempotency-key", "")]).is_err(),
+            "empty = missing"
+        );
+        assert!(check(&r, Value::Null, &[("idempotency-key", "  ")]).is_err());
+        assert!(check(&r, Value::Null, &[("idempotency-key", "k")]).is_ok());
+    }
+
+    #[test]
+    fn non_object_bodies_are_rejected() {
+        let r = route(vec![field("body", "sku", "string", false)]);
+        for body in [
+            json!([{"sku": "x"}]),
+            json!("x"),
+            json!(1),
+            json!(true),
+            json!([]),
+        ] {
+            assert!(check(&r, body.clone(), &[]).is_err(), "{body}");
+        }
+        assert!(check(&r, json!({"sku": "x"}), &[]).is_ok());
+        // A null body (no body) is fine when no body field is required.
+        assert!(check(&r, Value::Null, &[]).is_ok());
+        let required = route(vec![field("body", "sku", "string", true)]);
+        assert!(check(&required, Value::Null, &[]).is_err());
+    }
+
+    #[test]
+    fn every_type_is_checked() {
+        let cases = [
+            ("number", json!(1.5), json!("1.5")),
+            ("boolean", json!(true), json!("true")),
+            (
+                "uuid",
+                json!("6f1c1e7e-8a4b-4c55-9b0e-2b8f6f0f2a11"),
+                json!("not-a-uuid"),
+            ),
+            ("integer", json!(3), json!(3.5)),
+            ("string", json!("s"), json!(1)),
+        ];
+        for (ty, good, bad) in cases {
+            let f = field("body", "v", ty, true);
+            assert!(check_type(&f, &good).is_ok(), "{ty} good");
+            assert!(check_type(&f, &bad).is_err(), "{ty} bad");
+        }
     }
 }

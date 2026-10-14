@@ -12,6 +12,7 @@ pub use exec::{
 };
 pub use http::{
     hash_api_secret, resolve_pepper, router, AppState, AuthConfig, RunEnv, Slug, StoredKey,
+    REQUEST_TYPES,
 };
 pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
 pub use migrate::migrate_tenant;

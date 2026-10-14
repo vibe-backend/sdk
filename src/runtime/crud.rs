@@ -135,7 +135,10 @@ fn eval_or_input(
         }
         return Ok(input.clone());
     }
-    eval_expr(args, vars).map_err(|err| MethodFail::code("VALIDATION_FAILED", err))
+    eval_expr(args, vars).map_err(|err| {
+        tracing::warn!(error = %err, "method args expression failed");
+        MethodFail::code("VALIDATION_FAILED", "Invalid request")
+    })
 }
 
 async fn create(
