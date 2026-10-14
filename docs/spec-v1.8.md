@@ -68,7 +68,7 @@
 | --- | --- | --- |
 | 16 | （v1.8 由決定 112 修訂：高風險欄位一定要喺 frontmatter 宣告）安全設定照用自然語言寫，**唔強制**結構化 frontmatter；防線係獨立驗證器、CI 重編決定性檢查同 runtime 限制（v1.8 決定 77：SDK 唔再做人手 review，已確認（產品經理 2026-10-14））。 | 2.2、2A.5、2A.7 |
 | 17 | 編譯器輸出一定要通過獨立、deterministic 嘅驗證器（唔靠 LLM 自律）；編譯器冇任何工具權限，網絡只准連編譯用 LLM endpoint 嘅 host（v1.7 決定 57 修訂）；source 入面似指令嘅句子（prompt injection 模式）出 warning 並喺 PR 高亮。 | 2A.7、10.9 |
-| 18 | 編譯用嘅 model pin 死 snapshot；compiler-hash（model snapshot + prompt + 編譯器版本）寫入 lock；CI 重編同 lock 唔一致就封鎖部署，冇 override；會改變輸出嘅 minor 升級當 major 處理。 | 2A.1、2A.6 |
+| 18 | 編譯用嘅 model pin 死 snapshot；compiler-hash（model snapshot + prompt + 編譯器版本）寫入 lock；（v1.8 決定 113、117：唔再做重編比對，部署靠 attestation 同決定 114 policy）；會改變輸出嘅 minor 升級當 major 處理。 | 2A.1、2A.6 |
 | 19 | （v1.8 由決定 78 修訂，待產品經理確認）安全項目由驗證器 deterministic 抽出，寫入 lock 同部署報告做資訊性高亮；唔再要求逐項確認人、兩個非作者或者 PR 數量上限；PR 同部署報告照樣顯示有效權限摘要。 | 2A.5、10.10 |
 | 20 | 「係咪 structured」由 deterministic parser 判斷（v1.8 決定 77 修訂，待產品經理確認：唔再影響確認，只決定編譯使唔使 call LLM）。 | 2A.5 |
 | 21 | Public 寫入收緊：每租戶每日寫入配額（強制）；建立資料嘅 endpoint 要 captcha 或者 proof-of-work；一律 audit-log；配額用完只封鎖 public 寫入。 | 7.2 |
@@ -186,7 +186,7 @@
 | 76 | `vibe build`：一個指令做晒編譯（只編譯過時嘅 lock）、驗證、manifest 產生同簽名，冇 reviewer 步驟（審核由 Git 平台設定負責）；`--check-determinism` 用喺 CI。 | 待產品經理確認 | 2C.3 |
 | 77 | SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 刪除 `status`、`approval-mode`、`approved-by`、`approved-at`、`approval-ref`、`approved-commit`；SDK 讀到呢啲舊欄位（包括舊 lock 嘅 `approval-ref`，同決定 90 嘅 build 旗標 `--release-approval` 係兩回事）會忽略並出 warning，唔再以佢哋做部署條件。取代決定 10、11、16（人手 review 部分）、20（人手確認部分）、28、33。 | 已確認（產品經理 2026-10-14） | 2A.1、2A.5、10.1 |
 | 78 | `security-items` 保留，但改為資訊性：驗證器 deterministic 抽出、寫入 lock 同部署報告，方便 PR 高亮同 label；唔再要求逐項確認人、原因、兩個非作者，亦冇每個 PR 5 項上限。取代決定 19（確認部分）、34。 | 待產品經理確認 | 2A.5、10.10 |
-| 79 | Lock 唔再有 `signature`（lock 完整性靠 `source-hash`、依賴 hash、compiler-hash 同 CI 重編）；manifest 照樣簽名，由 `vibe build` 用 build key 簽：release 用受保護 ref 加 GitHub environment 嘅 OIDC 綁定 KMS key（決定 89），本機用 dev key。Production runtime 只信任平台 pin 死嘅 release 公鑰，dev key 永遠唔信任。 | 已確認（產品經理 2026-10-14） | 2A.1、9、9B、10.1 |
+| 79 | Lock 唔再有 `signature`（lock 完整性靠 `source-hash`、依賴 hash、compiler-hash；v1.8 部署靠決定 113 attestation，決定 117 之後 lock 唔 commit）；manifest 照樣簽名，由 `vibe build` 用 build key 簽：release 用受保護 ref 加 GitHub environment 嘅 OIDC 綁定 KMS key（決定 89），本機用 dev key。Production runtime 只信任平台 pin 死嘅 release 公鑰，dev key 永遠唔信任。 | 已確認（產品經理 2026-10-14） | 2A.1、9、9B、10.1 |
 | 80 | （已由決定 117 取代：lock 唔再 commit）建議 `*.lock.md` 同 source 一齊 commit，令 PR diff 睇到編譯結果；CI 重編決定性檢查保留，唔一致照樣封鎖部署，冇 override。 | 待產品經理確認 | 2A.6、2C.3 |
 | 81 | CLI 所有指令嘅 `--project` 預設係目前目錄（cwd）。 | 待產品經理確認 | 2C.1 |
 | 82 | README 快速開始簡化做兩行：`vibe dev` 加一個 `curl`。 | 待產品經理確認 | 2C.1 |
@@ -200,7 +200,7 @@
 | 90 | 產品經理基線 2：release build 有高風險 `security-items` 就 fail closed，除非提供有效嘅 `--release-approval`（`pr:<n>`、`env:<run_id>` 或者兩者合併）。驗證（2C.3a）：搵返 build commit 屬於嘅唯一 merged PR，批准一定要喺 PR 最後 head SHA 上，而 build commit 嘅 tree 要同 PR head 一樣（要開 Require branches to be up to date）；合資格批准人要有 write 權限、唔喺排除名單（PR 所有 commit 嘅 author、committer、對到嘅 co-author、PR 作者、env run 觸發者）、唔係 bot，高風險路徑要係 CODEOWNER（由 PR base 讀，SDK 自己計；team owner 要 GitHub App token，冇就失敗；改 CODEOWNERS 本身係高風險）；`main` 一定要用 ruleset 開 Require approval of the most recent reviewable push；唔支援 merge queue；高風險要 2 個唔同批准人（PR review 同 environment approval 合併計）；任何 API 錯誤即失敗。Release environment 嘅 Prevent self-review 由決定 96 改為關閉；env run 觸發者嘅批准唔計入合資格批准人。批准參照寫入 manifest 同部署報告（同已移除嘅 lock `approval-ref` 無關）。 | 待產品經理確認 | 2A.5、2C.3a、9C |
 | 91 | 產品經理基線 3：production 一律拒絕 in-memory 資料庫，啟動直接報錯退出；冇任何 override 旗標。Production 定義只睇 build-mode 同環境：manifest 唔係 `build-mode: dev`，或者 `VIBE_ENV=production`。Listen 地址唔係 loopback（例如 Docker 入面 `vibe dev` 綁 `0.0.0.0`）只會警告，唔會拒絕；Docker 入面請明確設 `VIBE_ENV=development`。 | 待產品經理確認 | 2C.4、9C |
 | 92 | 產品經理基線 4：CI release build 攞唔到 KMS key 就失敗，永遠唔 fallback 去 dev key；production runtime 只信任平台 pin 死嘅 release 公鑰，dev key 永遠唔信任。 | 待產品經理確認 | 2C.2、2C.3、9B |
-| 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；`vibe build` release 模式檢查 CODEOWNERS 覆蓋路徑，冇就失敗。 | 待產品經理確認 | 2A.7、9B |
+| 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；`vibe build` release 模式檢查 CODEOWNERS 覆蓋路徑，冇就失敗。 | 已確認（產品經理 2026-10-14）：CODEOWNERS required 係 source PR 合併條件 | 2A.7、9B |
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 待產品經理確認 | 文件標頭、網站 |
 | 95 | create-user 邀請失敗：`user.invite` 嘅 enqueue（s4）失敗時，create-user 回 503 `INVITE_DELIVERY_FAILED`（只帶 `Retry-After`，body 唔帶 `user_id`），唔回 201／200；因為 s2 已經輪換咗 token 但信冇寄出，用戶手上冇有效連結，恢復方法係重試 create-user（決定 85）或者 re-invite（決定 86），兩者都會發新 token 同新信。同 issue #26（auth flow 實作）相關。v1.8 修訂（決定 99，已確認（產品經理 2026-10-14））：成個 request 喺同一個 transaction，enqueue 失敗會 rollback 埋 token 輪換同用戶建立；邀請信經 transactional outbox：`email_outbox` 列同其他寫入喺同一個 transaction 寫入，commit 之後先由 mail worker 寄出，commit 之前永遠唔寄；rollback 會連 outbox 列一齊丟棄。 | 待產品經理確認 | 11.4、11.4a |
 | 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i) 做**臨時方案**）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。高風險 `--release-approval` 係計劃中、未實作，實作後先額外把關。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，同時開返 Prevent self-review。另外 live `release` environment `can_admins_bypass` 而家係 `true`，Jack 負責關閉。高風險 release build 用只有 Administration: read 嘅專用 GitHub App 讀呢個 ruleset，讀唔到、`bypass_actors` 唔係空、唔係 active、缺少三條 rule、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass，SDK 唔檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval`（未實作）實作後會獨立驗證 PR review（2C.3a）。普通 build 只記錄。 | 待產品經理確認 | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
@@ -222,9 +222,10 @@
 | 112 | 修訂決定 16：高風險欄位（寫入、公開、auth、secret）一定要喺 source frontmatter 宣告；宣告同譯文唔一致，或者偵測到未宣告嘅高風險行為，即 fail closed，錯誤訊息講明缺咗邊個宣告。關鍵字檢查係一致性檢查（縱深防禦），唔係唯一防線。api feature 唔再做寫入 sql 關鍵字檢查（由已檢查嘅 method lock 繼承）。 | 已確認（產品經理 2026-10-14） | 2.2、2.1a、2A.7 |
 | 113 | 部署來源（issue #97，取代 lock 簽名做閘門）：runtime／部署只接受 CI 喺 `release` environment 由 source 重新 build 嘅 artifact，帶 GitHub artifact attestation（build provenance，SLSA），綁定 repo、workflow 路徑、受保護 ref 同 commit SHA；再加現有 KMS manifest 簽名。部署器驗證 attestation、manifest 簽名同 subject digest，任何一樣失敗即拒絕。Lock 係 build 輸出，唔 commit（決定 117）；部署輸入只有 CI 呢次 build 嘅 artifact；唔做重編比對（LLM 唔決定性）。注意：KMS key 嘅建立、權限同輪換喺實際部署之前要 Jack 本人批准（唔喺產品經理代決範圍）。CI 重編再比對唔再係部署條件（修訂決定 80 同 2A.6）。 | 已確認（產品經理 2026-10-14） | 2C.3b、9C、10.1 |
 | 114 | 部署前 deterministic policy 檢查（對 artifact）：roles、寫入、public、auth 一定要等於決定 112 嘅 frontmatter 宣告；SQL 通過決定 98 parser 白名單；UPDATE 一定要有引用主鍵／唯一鍵或者宣告篩選欄位、而且綁參數嘅 WHERE；保守規則拒絕冇 WHERE、常數或者恆真條件；判斷唔到即 fail closed；任何錯誤即 fail closed。 | 已確認（產品經理 2026-10-14） | 2C.3b、10.1 |
-| 115 | CODEOWNERS 唔再係主要閘門（決定 77 已經移除人手確認），只係建議。 | 已確認（產品經理 2026-10-14） | 2C.3b、9C |
+| 115 | CODEOWNERS 唔係部署 gate，部署由決定 113／114 把關；CODEOWNERS required 照舊係 source PR 合併條件（決定 93）。 | 已確認（產品經理 2026-10-14） | 2C.3b、9C |
 | 116 | （已由決定 117 取代）Artifact 同 repo lock 嘅差異：release job 產生 artifact 同 repo lock 嘅 deterministic diff（SQL 先經 parse tree 正規化，只係格式唔同唔計），放入 job summary 並 attest；高風險 release 嘅 diff 涉及 roles、寫入、public、auth 或者 SQL 就失敗，錯誤訊息講明 artifact 同 repo lock 喺邊度唔同（lock id、section、step），直到 repo lock 更新到一致。 | 已確認（產品經理 2026-10-14） | 2C.3b |
 | 117 | Lock 係 build 輸出（Jack 方向，取代決定 80 同決定 116）：`*.lock.md` 唔再 commit（加入 `.gitignore`），由 CI／CD 喺部署時 build。Release job 將產生嘅 lock 存做審計 artifact 並納入 attestation，同上一個已部署版本比較，喺 release summary **列出**（唔阻擋）roles、寫入、public、auth 同 SQL 嘅變化（SQL 經 parse tree 正規化比較）。主要閘門照樣係決定 113 attestation 加決定 114 deterministic policy。`compile --check` 只喺本地／CI 驗證 build 結果同 policy，唔同已 commit 嘅 lock 比較。剩餘風險：產生嘅 SQL 唔再有人手 review；保護靠 source PR review frontmatter 宣告、決定 114 policy 同 release summary 列出變化。 | 已確認（產品經理 2026-10-14） | 2.1、2A.6、2C.3、2C.3b、9C |
+| 118 | Build once, promote（待產品經理確認）：release job 只喺受保護 `v*` tag build 一次，同一個 artifact 原封不動 promote 去各環境，唔重新 build；部署器用 `gh attestation verify --source-ref refs/tags/v<version>` 驗證。PR CI build 只係非權威預覽，結果唔可以部署。LLM key：release 用 `release` environment secret `VIBE_LLM_API_KEY`，PR 預覽用 `VIBE_LLM_API_KEY_PREVIEW`，兩條分開。Artifact 入面要有審計戳記（tag、commit SHA、workflow run id、compiler-hash、build 時間），唔包含任何 key。 | 待產品經理確認 | 2A.8、2C.3b |
 
 ## 1. 目錄同命名
 
@@ -524,7 +525,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - 編譯一定要盡量 deterministic：固定 prompt、固定 snapshot；`temperature`、`top_p`、`seed` 等參數只喺 model capability 支援時先送固定值（決定 58，見 2A.8.6），唔支援就唔送，唔可以強送。決定性唔靠參數保證，靠 CI 重編比對。CI 會用 lock 記錄嘅 `compiler-hash` 重編一次比對；唔一致就**封鎖部署，冇任何 override**。
 - 翻譯（2.1a，決定 108–111）：譯文同 `translation` 欄位唔計入 `source-hash` 同 `compiler-hash`，所以翻譯 prompt 或者翻譯 model 改咗唔會令 lock 過時；但編譯（包括 `vibe build` 同 CI 重編）一定會用當前設定重新做翻譯同一致性檢查，失敗即封鎖。
 - **決定 113、117 修訂**：lock 係 build 輸出，唔 commit，所以冇「同 repo lock 比對」呢回事；`--check-determinism` 同重編比對唔再係部署條件。部署只接受 CI 由 source 重新 build、有 attestation 嘅 artifact（2C.3b）；`compile --check` 只驗證 build 結果同決定 114 policy。本文其他講「重編比對封鎖部署」或者「CI 重編同 lock 唔一致」嘅地方，一律以呢條為準。
-- 唔准手改 lock：要改就改 source 再重新編譯。Lock 冇簽名（決定 79），手改嘅 lock 會喺 CI 重編決定性檢查（2A.6）失敗，封鎖部署。
+- 唔准手改 lock：要改就改 source 再重新編譯。Lock 冇簽名（決定 79），而且 lock 唔 commit（決定 117），部署只用 CI 由 source build 嘅 artifact（決定 113），所以手改嘅 lock 唔會去到部署。
 
 ### 2A.7 獨立驗證器同編譯器隔離
 
@@ -564,7 +565,7 @@ v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`（決定 57�
     - `seed`：OpenAI API reference（Create chat completion，<https://platform.openai.com/docs/api-reference/chat/create>）寫明 "This feature is in Beta"、系統只會 "make a best effort to sample deterministically"、"Determinism is not guaranteed"，並建議用 `system_fingerprint` 監察 backend 變動。所以 `seed` 只當 best-effort，冇決定性保證；adapter 將回應嘅 `system_fingerprint` 寫入編譯報告（唔計入 compiler-hash）。
   - Gemini：`generationConfig.temperature`、`topP`、`topK`、`seed` 都接受，但 `seed` 只係 best-effort。
 - 所有 provider 一律唔帶 `tools`／`functions`／`tool_choice`／`toolConfig`，唔用 streaming。
-- 決定性最終由 CI 重編比對保證（2A.6）：任何 provider 重編結果同 lock 唔一致，一律封鎖部署，冇 override。
+- 決定性只係盡力而為；部署安全唔靠重編比對，靠決定 113 attestation 同決定 114 deterministic policy（決定 117）。
 - Azure OpenAI 唔喺 v1 範圍（見第 14 節）。
 
 #### 2A.8.3 環境變數同優先次序
@@ -595,14 +596,14 @@ v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`（決定 57�
 
 - CI 同 production 編譯一定要 `https://` 加公開 host；喺 CI 偵測到 loopback、內網地址或者 `LLM_ALLOW_PRIVATE_HOST=true`，即刻 error。
 - 用本地或者內網 host 編譯出嚟嘅 lock（`endpoint-private: true`）**唔可以部署去 production**；一定要喺 CI 用公開 https endpoint 重新編譯，再經 CI 決定性比對同正常確認，先可以部署。
-- 呢點同 CI 決定性檢查一致：CI 重編用 lock 記錄嘅 provider、host、model；本地 lock 嘅 host 喺 CI 用唔到，所以本地 lock 只可以用嚟本地試，唔可以直接合併做部署依據。
+- 本地 lock 只可以用嚟本地試；佢係 gitignore 嘅 build 輸出（決定 117），部署只用 release job 用 release 設定 build 嘅 artifact（決定 113）。
 
 #### 2A.8.5 Key 保護
 
 - Key 永遠唔可以出現喺 repo、source、lock、manifest、log、部署報告、PR 留言或者錯誤訊息；錯誤訊息只可以講「`LLM_API_KEY` 無效或者缺少」。
 - 編譯器同 CLI 輸出 log 前會遮蔽 key（同第 9 節 token／secret 規則一致）。
 - CI 用 secret scanning 掃 repo、lock、manifest、部署報告同 CI log；發現疑似 key（包括 `LLM_API_KEY`／`OPENAI_API_KEY` 嘅實際值）即刻 fail build。
-- CI 用 GitHub Actions secrets 提供變數；fork 嚟嘅 PR 攞唔到 secret，只跑驗證器，唔重編。
+- CI 用 GitHub Actions secrets 提供變數：release job 用 `release` environment secret `VIBE_LLM_API_KEY`；PR CI 用另一條 `VIBE_LLM_API_KEY_PREVIEW`（決定 118）。fork 嚟嘅 PR 攞唔到 secret，只跑驗證器，唔編譯。
 - Runtime 環境變數唔可以有任何 `LLM_*` 或者 `OPENAI_*`；部署時平台檢查，發現就部署失敗。
 - `.env` 一定要喺 `.gitignore`；repo 只准有 `.env.example`（冇真 key）。改 `.gitignore` 移除 `.env`、改 CI workflow 嘅 secret 用法，都受 CODEOWNERS 保護（9B）。
 
@@ -662,9 +663,9 @@ interface LlmAdapter {
 
 - 2A.7 沙盒：網絡只准 egress 去 `LLM_BASE_URL`（或者 provider 預設 base URL）嘅 host；冇工具規則不變。
 - 2A.1／2A.6：lock 嘅 `compiler` 記 `llm-provider`、`endpoint-host`、`endpoint-private` 同 `model-snapshot`，全部計入 `compiler-hash`；永遠唔記 key。
-- 改 provider、endpoint host 或者 model：當 major 改動，所有 lock 強制重新編譯，CI 重編比對通過先可以部署（決定 77）。
+- 改 provider、endpoint host 或者 model：當 major 改動，所有 lock 強制重新編譯，release job 由 source build、通過決定 114 policy 同 attestation 先可以部署（決定 77、113、117）。
 - 只改 base URL 嘅 path（host 唔變）唔當 major，但 CI 決定性比對照樣要通過。
-- CI 決定性檢查照舊：用同一 provider、host、model、seed 同 2A.8.2 決定性設定重編，同 lock 唔一致就封鎖部署，冇 override。
+- 唔再做 CI 重編比對（決定 113、117）；2A.8.2 決定性設定照送，只為減少 release summary 入面嘅無謂變化。
 
 #### 2A.8.8 GitHub Actions 範例
 
@@ -693,7 +694,7 @@ jobs:
         env:
           LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_KEY: ${{ secrets.VIBE_LLM_API_KEY }}   # release environment；PR 預覽用 VIBE_LLM_API_KEY_PREVIEW（決定 118）
           LLM_MODEL: ${{ vars.LLM_MODEL }}
         run: vibe build                       # 編譯 + 驗證 + policy 檢查 + manifest（決定 76、114、117）
 ```
@@ -875,7 +876,7 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
 - Artifact 一定要有 GitHub artifact attestation（build provenance，predicate `https://slsa.dev/provenance/v1`），綁定：repo、workflow 路徑（例如 `.github/workflows/release.yml`）、受保護 ref（`refs/tags/v*`，決定 96）、commit SHA；runner 一定係 GitHub-hosted。
 - 另外照樣要有 KMS manifest 簽名（決定 79、89、92）。**KMS key 嘅建立、權限同輪換，喺實際部署之前一定要 Jack 本人批准**，唔喺產品經理代決範圍。
 - 部署器全部驗證，任何一樣失敗即拒絕部署：
-  - Attestation：例如 `gh attestation verify <artifact> --repo <owner>/<repo> --signer-workflow <owner>/<repo>/.github/workflows/release.yml --source-ref refs/tags/<tag> --source-digest <commit sha> --deny-self-hosted-runners`，或者用 sigstore 驗證同樣條件。
+  - Attestation：例如 `gh attestation verify <artifact> --repo <owner>/<repo> --signer-workflow <owner>/<repo>/.github/workflows/release.yml --source-ref refs/tags/v<version> --source-digest <commit sha> --deny-self-hosted-runners`，或者用 sigstore 驗證同樣條件。
   - Manifest 簽名用 pin 死嘅 release public key（決定 92）。
   - Attestation 嘅 subject digest 一定等於實際部署嘅 artifact digest。
 - Lock 係 build 輸出，唔 commit（決定 117）；部署輸入只有 CI 呢次 build 嘅 artifact。
@@ -904,6 +905,14 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
 - 同上一個已部署版本嘅審計 artifact 比較（按 lock id 排序，逐 section 比對；SQL 先用 PostgreSQL 解析器轉成 parse tree 再正規化，只係格式唔同唔算），喺 release summary **列出**以下變化，講明 lock id、section、step 同欄位：roles、寫入、public、auth、SQL。
 - 呢個列表**唔阻擋**部署；閘門係第 1、2 節（決定 113、114）。
 - 剩餘風險：產生嘅 SQL 唔再有人手 review。保護靠：source PR review frontmatter 高風險宣告（決定 112）、決定 114 deterministic policy、release summary 列出變化畀人睇。
+
+#### 5. Build once, promote（決定 118，待產品經理確認）
+
+- Release job 只喺受保護 `v*` tag build 一次；同一個 artifact（同一個 digest）promote 去 staging 同 production，唔重新 build。
+- 每次 promote，部署器都用 `gh attestation verify <artifact> --source-ref refs/tags/v<version>`（加第 1 節其他條件）驗證。
+- PR CI 嘅 build 只係**非權威預覽**（例如畀 release summary 預覽同 label），永遠唔可以部署。
+- LLM key 分開：release job 用 `release` environment secret `VIBE_LLM_API_KEY`；PR 預覽用 `VIBE_LLM_API_KEY_PREVIEW`。兩條 key 都唔可以出現喺 artifact、log 或者 summary。
+- Artifact 入面有審計戳記：tag、commit SHA、workflow run id、compiler-hash、build 時間。
 
 ### 2C.4 In-memory 執行器（決定 74，待產品經理確認）
 
@@ -1470,7 +1479,7 @@ migration 放喺 ./migrations/main/。
 - structured 判斷：lock 寫 `source-type: structured` 但 deterministic parser 判斷係 natural。
 - Manifest 簽名錯：runtime 驗證 manifest 簽名失敗，或者 manifest 入面 lock hash 同 lock 內容唔一致（決定 79）。
 - 手改：lock 格式唔合 2A（frontmatter 欄位或者次序錯、多咗或者少咗 section、step 欄位次序錯）。
-- 重編唔一致：CI 用 lock 嘅 `compiler-hash` 重編，結果同 lock 唔一致，封鎖部署，冇 override。
+- （已取消，決定 113、117）重編唔一致唔再封鎖部署；改為 attestation 或者決定 114 policy 唔通過就封鎖。
 - 編譯器：`compiler-hash` 按 2A.1 標準定義重算唔一致；`model-snapshot` 唔係 provider 回報嘅 model id；`compiler.version` major 唔一致；冇 `model-snapshot` 或者用咗浮動別名；編譯器名唔係平台登記。
 - `kind` 或者 `id` 同檔案路徑唔一致；`lock-version` 唔支援。
 - 編譯器 LLM 設定（決定 57）：
@@ -3543,7 +3552,7 @@ security-items:
 
 私隱法（PDPO、GDPR）部分嘅建議請法律意見覆核。
 
-另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–117 已經由產品經理確認）；確認之前 v1.7 定稿照樣有效。
+另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–117 已經由產品經理確認；決定 118 待產品經理確認）；確認之前 v1.7 定稿照樣有效。
 
 ## 14. 後續版本
 
