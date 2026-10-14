@@ -15,15 +15,15 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 
 ## 1A. Release tag ruleset（`v*`，spec 決定 96）
 
-- 另開一個 **tag ruleset**（target：Tag，enforcement：Active），target `refs/tags/v*`（UI 入面 include pattern `v*`）。
-- 開 **Restrict creations**、**Restrict updates**、**Restrict deletions**、**Block force pushes**。
-- **Bypass list 一定要留空**，admin 都唔例外；唔設白名單。高風險 release build 會讀呢個 ruleset，讀唔到、唔係空、唔係 Active、或者冇 target 到今次嘅 tag 就失敗。
+- 專用 **tag ruleset**（target：Tag，enforcement：Active），target `refs/tags/v*`（UI 入面 include pattern `v*`）。
+- 只開 **Restrict updates**、**Restrict deletions**、**Block force pushes**；**唔開 Restrict creations**（產品經理代 Jack 決定採用 (i)）。任何有 write 權限嘅人都可以開 `v*` tag，開咗就改唔到、刪唔到。
+- **Bypass list 一定要留空**，admin 都唔例外；唔設白名單。高風險 release build 會讀呢個 ruleset，讀唔到、唔係空、唔係 Active、缺少上面三條規則、或者冇 target 到今次嘅 tag 就失敗。
 - Release 只可以由 `v*` tag 出，tag 一定要指向 `main` 上嘅 commit。
-- **現狀：release 凍結**。Restrict creations 加上空 bypass list，冇人（包括 admin）可以開 `v*` tag。
-- **計劃 (iii)（未生效，待 Jack／產品經理於 #70 確定）**：bypass list 只加一個專用 release GitHub App（唔加任何人），由 App 開 `v*` tag；SDK 屆時只接受剛好一個 `Integration` actor 而且 id 係 release App id。唔好喺確定之前自己加 bypass actor。見 spec 2C.3a.7。
-- 為咗讀到 `bypass_actors`，要開一個專用 GitHub App，只裝喺呢個 repo，喺 release workflow 嘅 `release` environment job 入面 mint installation token：
-  - GitHub 只會將 `bypass_actors` 回畀對 ruleset 有寫權限嘅 caller。先試 repository **Administration: read**；實測讀唔到就要 **Administration: write**（呢個權限可以改 repo 設定，要產品經理確認）。
-  - 加 **Metadata: read**（預設）；唔好加其他權限。
+- 把關：開 tag 唔會自動發佈；發佈 job 要經 `release` environment 由 Jack 批准，高風險 release 仲要 `--release-approval`。
+- 剩餘風險：所有 agent 都用 `j113203` push，任何有 write 權限嘅 agent 都可以開 tag；保護靠 environment 批准同 `--release-approval`。
+- 讀 ruleset 嘅專用 GitHub App：只裝喺呢個 repo，喺 `release` environment job 入面 mint installation token：
+  - 權限只畀 repository **Administration: read** 同 **Metadata: read**；**唔畀 Administration: write**。
+  - GitHub 只會將 `bypass_actors` 回畀對 ruleset 有寫權限嘅 caller；如果 read 睇唔到，高風險 release build 會失敗，要另外搵產品經理批准，唔好自己加權限。
   - App private key 放 `release` environment secret；mint token 時收窄到呢個 repo；token 唔好印出嚟。
   - 冇呢個 App 嘅話，高風險 release build 會失敗；普通 build 只記錄。
 
@@ -74,7 +74,7 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
 ## 6. Release environment 同 KMS（spec 決定 89、92）
 
 - 開一個 `release` environment，設 **Required reviewers**；**Deployment branches and tags** 揀 Selected branches and tags，只加 tag 規則 `v*`（唔加任何 branch），即係只准受 release ruleset 保護嘅 `v*` tag 部署。
-- `release` environment 一定要開 **Prevent self-review**，觸發部署嘅人唔可以自己批准（spec 決定 90）。
+- `release` environment **Required reviewers** 設 Jack；**Prevent self-review 關閉**（spec 決定 96）：所有 agent 都用 `j113203` push，開咗 Jack 就批唔到。Jack 批准自己帳戶觸發嘅 run 唔計入高風險 2 人（run 觸發者會被排除），高風險 release 仍然要 2 個合資格 PR reviewer。
 - `release` environment **唔好開 Allow administrators to bypass configured protection rules**，否則 admin 可以跳過 required reviewers。
 - 改 CODEOWNERS（`.github/`、root、`docs/` 任何一個）一律當高風險，要 2 個批准。
 - CODEOWNERS 用 team（`@org/team`）嘅話，release workflow 要用 GitHub App installation token（organization Members: read，其他只讀），`GITHUB_TOKEN` 查唔到 team 成員；冇就失敗。

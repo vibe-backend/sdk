@@ -2,12 +2,11 @@
 
 Before the first `v*` tag. Items 1–2 are repository settings decided by the product manager; this PR does not change them:
 
-1. **Release tag ruleset (#70)** — A separate ruleset dedicated to release tags: target **tags** matching `v*`, restrict creation, block updates, deletion and force-push.
-   - **Current state: releases are frozen.** `bypass_actors` is empty, and GitHub's creation restriction only lets bypass actors create matching tags, so nobody (not even organization admins) can create a `v*` tag.
-   - **Planned (iii), NOT in effect:** the bypass list will contain exactly one dedicated release GitHub App (no human accounts), and that App creates `v*` tags. Tags are no longer pushed by `j113203`, so Jack as a `release` environment reviewer does not collide with Prevent self-review. The final design will be set with Jack in #70 before the first release. Do not add bypass actors before then.
-   - Opening tag creation to everyone with write access was rejected: all agents push as `j113203`, so it would provide no gatekeeping.
-   - The existing `main` ruleset (25057946, "main protection") keeps its OrganizationAdmin bypass; that bypass does not apply to `v*` tags, which are governed only by the release ruleset (spec decision 96).
-2. **Environment `release`** — Settings → Environments → `release` with required reviewers. The release job in `.github/workflows/release.yml` uses this environment.
+1. **Release tag ruleset (#70, live: ruleset 25067953 "release tags v*")** — Target **tags** matching `refs/tags/v*`, enforcement active, rules: `update`, `deletion`, `non_fast_forward` (block moving, deleting and force-pushing tags). There is **no creation rule**: anyone with write access can create a `v*` tag (the product manager, on Jack's behalf, chose option (i)). `bypass_actors` is empty, so not even organization admins can move or delete a published tag.
+   - Gating: creating a tag does not publish anything. The publishing job runs in the `release` environment and needs Jack's approval; high-risk releases also need `vibe build --release-approval` (spec §2C.3a).
+   - Residual risk: all agents push as `j113203`, so any write-capable agent can create a `v*` tag. Protection is the environment approval plus the release-approval check.
+   - The existing `main` ruleset (25057946, "main protection") keeps its OrganizationAdmin bypass; it does not apply to `v*` tags (spec decision 96).
+2. **Environment `release`** — Settings → Environments → `release` with Jack as required reviewer, Prevent self-review **disabled** (all agents push as `j113203`), deployments limited to `v*` tags, and administrator bypass disabled. The release job in `.github/workflows/release.yml` uses this environment.
 3. **Pinned actions and runners** — `release.yml` pins `actions/checkout`, `upload-artifact`, `download-artifact`, `attest-build-provenance`, and `dtolnay/rust-toolchain` to full commit SHAs; runners are pinned images (no `*-latest`); checkout uses `persist-credentials: false`.
 4. **No clobber** — Existing GitHub Releases are never overwritten (`gh release upload --clobber` removed).
 5. **Provenance** — Each matrix asset and `SHA256SUMS` are attested. Only the build/checksum jobs get `id-token`/`attestations`; the publishing job has `contents: write` only.
