@@ -1,6 +1,4 @@
-# Markdown 驅動 Serverless Backend：架構 Spec v1.7（定稿候選）
-
-> 狀態：定稿候選。0.9 嘅決定 67–72 全部經 Jack 確認之後，標題改為「v1.7（定稿）」。
+# Markdown 驅動 Serverless Backend：架構 Spec v1.7（定稿）
 >
 > 核心架構：所有定義（model、method、api、pipeline、provider、migration）嘅 source `.md` 一律用自然語言寫。編譯流程係「自然語言 source `.md` → 結構化 lock markdown（`{name}.lock.md`）→ 簽名 manifest」。lock md 係 runtime 唯一依據，runtime 永遠唔會解譯自然語言。
 >
@@ -127,7 +125,7 @@
 | 53 | Email 驗證寫入：`email_verified_at` 屬黑名單「verified」類欄位；只有標 `capabilities: [confirm-verification]` 嘅 model method 可以喺 public 路徑寫佢，而且一定要喺一個 UPDATE 入面，WHERE 用 `hash-token` 輸出對比唯一 token hash 欄位、檢查未過期同未驗證，並同時清走 token hash。屬高風險安全項目，api lock 要寫 `verification-write: allow`。 | 7.2、10.7 |
 | 54 | Email 發送唔用對外 `call`：method 經 `email-outbox.enqueue` 寫入 `email_outbox` 表，由平台 mail worker 非同步發送；payload 嘅 token 屬 `personal: sensitive`（crypto-shredding），發送後平台即時銷毀 DEK。 | 12.11 |
 | 55 | Login 只接受已驗證 email 嘅用戶（`email_verified_at is not null`）；未驗證同密碼錯回同一個 401。 | 12.8 |
-| 56 | 註冊唔分辨 email 係咪已經存在：一律做 `hash-password`、一律 enqueue 一封信（新用戶收驗證信，已存在用戶收「已經有帳戶」通知，由 mail worker 按 `user_id` 係咪空揀範本），一律回 202 同一個 body，耗時補到 300ms。註：如果決定 67 經 Jack 確認，註冊唔再收密碼，`hash-password` 改為喺 `user.complete-verification`（設定密碼一步）每次都做；67 未確認之前，呢句照原文解讀。 | 12.11 |
+| 56 | 註冊唔分辨 email 係咪已經存在：一律做 `hash-password`、一律 enqueue 一封信（新用戶收驗證信，已存在用戶收「已經有帳戶」通知，由 mail worker 按 `user_id` 係咪空揀範本），一律回 202 同一個 body，耗時補到 300ms。註（決定 67 已確認，2026-10-14 起生效）：註冊唔再收密碼，`hash-password` 改為喺 `user.complete-verification`（設定密碼一步）每次都做；「一律做 `hash-password`」以呢個為準。 | 12.11 |
 
 ### 0.8 已確認決定（v1.7 編譯器 LLM 設定）
 
@@ -137,7 +135,7 @@
 
 ### 0.9 v1.7 review 修訂（決定 58 起）
 
-呢節係 PR #5 code review 之後加嘅決定。純技術修正由架構直接定為「已確認」；涉及產品、私隱或者安全政策取捨嘅標「待 Jack 確認」，喺確認之前照用下表寫嘅建議值，但唔可以當定案引用。
+呢節係 PR #5 code review 之後加嘅決定。純技術修正（58–66）由架構直接定為「已確認」；涉及產品、私隱或者安全政策取捨嘅 67–72 由 Jack 授權產品經理確認（2026-10-14），全部已確認，數值以下表為準。
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
@@ -150,12 +148,12 @@
 | 64 | `compiler-hash` 只有一個標準定義（2A.1），包括 seed 同實際送出嘅決定性參數。 | 已確認 | 2A.1、2A.6、10.1 |
 | 65 | 補齊 grammar：`rate-limit` 參數 schema、`## Order` 准用值、`subject-key` 寫法、`token-revoke` 參數。 | 已確認 | 4.3、4.4、4A.1、12.10 |
 | 66 | 非阻塞修正：CI 範例 pin `vibe` 版本同用 SHA pin action；Ollama 記 tag（唔係 digest）；token 類型統一；`email-outbox.enqueue` 嘅 `template` 寫入 Signature；註冊耗時用固定下限＋固定工作量（唔受 argon2 排隊影響）。 | 已確認 | 2A.8.3、2A.8.8、12.11 |
-| 67 | 防預先註冊搶帳戶：公開註冊只收 email（同 name），唔收密碼；驗證連結帶用戶去「設定密碼」一步，一個 UPDATE 同時設 password 同 `email_verified_at`（同決定 69 邀請共用同一個 method `user.complete-verification`）。未驗證 email 再註冊只會輪換驗證 token（舊 token 即時失效），永遠唔改任何 credential。驗證成功即撤銷該用戶所有 session（refresh 家族）。未驗證帳戶喺 `email_verify_expires_at` 過咗之後由平台匿名化並 soft delete（唔 DELETE，決定 13）。確認之後，決定 56 入面「註冊一律做 `hash-password`」改為喺設定密碼一步做（56 狀態唔變）。 | 待 Jack 確認 | 12.11 |
-| 68 | Audit 永遠唔記明文 email（記 HMAC hash 或者遮罩）；`email_outbox` 加 `recipient_hash`，令冇 `user_id` 嘅列都可以私隱刪除；outbox 列發送後 30 日由平台匿名化。 | 待 Jack 確認（保留期） | 9、12.10、12.11 |
-| 69 | Admin 建立用戶改為邀請流程：admin 建立時唔設 password、唔設 `email_verified_at`；用戶用邀請 token 經 `user.complete-verification`（同決定 67 共用）設 password，同時設 `email_verified_at`，令決定 55 成立。 | 待 Jack 確認 | 11.4、12.11.9 |
-| 70 | 列層擁有權預設規則：有 `owner-key` 嘅 model，非 admin 只可以讀寫 `owner-key = ctx.user.id` 嘅列；要放寬一定喺 source 明寫，屬高風險安全項目。 | 待 Jack 確認 | 12.6a |
-| 71 | `max-page-size` 平台上限 500（model 可以設低，唔可以設高）。 | 待 Jack 確認（數值） | 12.9 |
-| 72 | Refresh endpoint 分類：public（冇 access token）但唔屬 public 寫入（只寫平台表，唔計 public 寫入配額）；限流 IP 30/min、家族 10/min；最低回應耗時 300ms。 | 待 Jack 確認（數值） | 4A.1 |
+| 67 | 防預先註冊搶帳戶：公開註冊只收 email（同 name），唔收密碼；驗證連結帶用戶去「設定密碼」一步，一個 UPDATE 同時設 password 同 `email_verified_at`（同決定 69 邀請共用同一個 method `user.complete-verification`）。未驗證 email 再註冊只會輪換驗證 token（舊 token 即時失效），永遠唔改任何 credential。驗證成功即撤銷該用戶所有 session（refresh 家族）。未驗證帳戶喺 `email_verify_expires_at` 過咗之後由平台匿名化並 soft delete（唔 DELETE，決定 13）。決定 56 入面「註冊一律做 `hash-password`」改為喺設定密碼一步做（56 狀態唔變）。 | 已確認（產品經理 2026-10-14） | 12.11 |
+| 68 | Audit 永遠唔記明文 email（記 HMAC hash 或者遮罩）；`email_outbox` 加 `recipient_hash`，令冇 `user_id` 嘅列都可以私隱刪除；outbox 列發送後 30 日由平台匿名化。 | 已確認（產品經理 2026-10-14） | 9、12.10、12.11 |
+| 69 | Admin 建立用戶改為邀請流程：admin 建立時唔設 password、唔設 `email_verified_at`；用戶用邀請 token 經 `user.complete-verification`（同決定 67 共用）設 password，同時設 `email_verified_at`，令決定 55 成立。 | 已確認（產品經理 2026-10-14） | 11.4、12.11.9 |
+| 70 | 列層擁有權預設規則：有 `owner-key` 嘅 model，非 admin 只可以讀寫 `owner-key = ctx.user.id` 嘅列；要放寬一定喺 source 明寫，屬高風險安全項目。 | 已確認（產品經理 2026-10-14） | 12.6a |
+| 71 | `max-page-size` 平台上限 500（model 可以設低，唔可以設高）。 | 已確認（產品經理 2026-10-14） | 12.9 |
+| 72 | Refresh endpoint 分類：public（冇 access token）但唔屬 public 寫入（只寫平台表，唔計 public 寫入配額）；限流 IP 30/min、家族 10/min；最低回應耗時 300ms。 | 已確認（產品經理 2026-10-14） | 4A.1 |
 
 ## 1. 目錄同命名
 
@@ -754,7 +752,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 
 - 對應 endpoint 寫法：api feature 寫「呢個係 refresh token endpoint」，lock 會有 `pipelines: [-auth, token-refresh: {...}]`，`public: true`（因為冇 access token），租戶由 slug 決定；`token-revoke` 用喺登出 endpoint，要 `auth`。
 
-- Refresh endpoint 分類（決定 72，待 Jack 確認數值）：
+- Refresh endpoint 分類（決定 72，已確認（產品經理 2026-10-14））：
   - `public: true`（因為冇 access token），租戶由 slug 決定。
   - 唔屬 public 寫入：用戶 lock 冇寫入 step，只有平台 `refresh_store` 寫平台表，所以唔計 7.2 嘅 public 寫入每日配額，亦唔需要 captcha。
   - 平台固定限流：IP 每分鐘 30 次、同一家族每分鐘 10 次；用 4.3 嘅 schema 寫入 lock。
@@ -1413,7 +1411,7 @@ signature: MEUCIG...
 | 422 | VALIDATION_FAILED | platform |
 ````
 
-- 邀請流程（決定 69，待 Jack 確認）：admin 建立嘅用戶冇 password、`email_verified_at` 係 null，所以未接受邀請之前唔可以 login（決定 55）。完整流程見 12.11.9。
+- 邀請流程（決定 69，已確認（產品經理 2026-10-14））：admin 建立嘅用戶冇 password、`email_verified_at` 係 null，所以未接受邀請之前唔可以 login（決定 55）。完整流程見 12.11.9。
 
 ### 11.5 `api/users/v2/get-user/get-user.md`（路由 `GET /users/v2/{id}`）
 
@@ -1768,7 +1766,7 @@ api source 寫「用 user.login 驗證帳戶密碼」，編譯成：
 - `capabilities: [set-password]`：只有標咗呢個 capability 嘅 model method 可以喺 public 路徑寫 password 欄位，值一定要係 `hash-password` 輸出（見 7.2）；已認證路徑嘅改密碼 method 同樣建議標呢個 capability，方便 review。
 - login 類 endpoint 一定同時按 IP 同帳戶限流（例如 11.2 嘅 `login-guard`），並跟 4A.3 嘅鎖定同 captcha 規則。
 
-### 12.6a 列層擁有權（決定 70，待 Jack 確認）
+### 12.6a 列層擁有權（決定 70，已確認（產品經理 2026-10-14））
 
 - RLS 只保證租戶隔離；租戶內「邊個可以掂邊列」由列層擁有權規則決定。
 - model 可以喺 `## Table` 宣告 `owner-key: {欄位}`（例如 `user_id`，或者 `users` 表本身嘅 `id`）。
@@ -2166,7 +2164,7 @@ signature: MEYCIQ...
 
 - 預設唔會自動生成任何 CRUD。model source 要明確講（例如「提供 get、list、update」或者「提供全部 CRUD」），lock 嘅 `## CRUD` 列咗邊樣就注入邊樣。
 - CRUD 選項（喺 source 用自然語言講，編譯成 `## CRUD` 表）：
-  - `list`：`page-size`（預設 20）、`max-page-size`（預設 100，平台上限 500，決定 71 待 Jack 確認；超過上限驗證器報 error）、`sort` 白名單、`filter` 白名單。
+  - `list`：`page-size`（預設 20）、`max-page-size`（預設 100，平台上限 500，決定 71，已確認（產品經理 2026-10-14）；超過上限驗證器報 error）、`sort` 白名單、`filter` 白名單。
   - `update`：`partial`（預設 true）。
   - `delete`：一律軟刪除，冇 `soft: false` 選項（決定 13）。
 - 注入嘅 method 名同簽名（每個都有平台產生同簽名嘅 lock，`source-type: structured`，`id` 例如 `user/crud/get`）：
@@ -2213,7 +2211,7 @@ signature: MEYCIQ...
 
 ### 12.11 完整範例：public 註冊同 email 驗證
 
-呢個範例用到決定 52–56（已確認）同決定 67–69（待 Jack 確認）。範例示範全部 public 寫入規則點樣一齊運作：slug 租戶、`public-writes`、`writable-columns`、黑名單、`set-password`、`confirm-verification`、captcha、每日配額、audit-log、固定 300ms、untrusted 內容、IP 加租戶限流、冇對外 call。
+呢個範例用到決定 52–56（已確認）同決定 67–69（已確認（產品經理 2026-10-14））。範例示範全部 public 寫入規則點樣一齊運作：slug 租戶、`public-writes`、`writable-columns`、黑名單、`set-password`、`confirm-verification`、captcha、每日配額、audit-log、固定 300ms、untrusted 內容、IP 加租戶限流、冇對外 call。
 
 公開註冊用 `user.self-register`（同 11.4 admin 用嘅 `user.register` 分開：admin 版本會回 409 `EMAIL_TAKEN`，public 版本一定唔可以分辨 email 係咪存在）。
 
@@ -2330,7 +2328,7 @@ users 表嘅 password 改為可以冇；加 email_verify_purpose（register 或�
 - policy: tenant_id = current_setting('app.tenant_id', false)
 - grants: app_rw [SELECT, INSERT], public_writer [INSERT(user_id, email, recipient_hash, template, token)], mail_worker(platform) [SELECT, UPDATE(sent_at, email, token, recipient_hash)]
 - subject-key: [user_id, hash:recipient_hash]
-- retention: { after: sent_at + 30d, action: anonymize, by: mail_worker }   # 決定 68，待 Jack 確認保留期
+- retention: { after: sent_at + 30d, action: anonymize, by: mail_worker }   # 決定 68，已確認（產品經理 2026-10-14）：發送後 30 日匿名化
 ````
 
 #### 12.11.3 Method：`models/email-outbox/methods/enqueue.md`
@@ -2406,10 +2404,10 @@ signature: MEUCIQ...
 
 - 範本選擇寫喺單一參數化 INSERT 入面，唔使條件分支 step；三個範本 `verify-email`、`already-registered`、`invite` 都由同一個 `case` 覆蓋，兩種連結（驗證、邀請）都去同一個設定密碼頁，最後都係 `user.complete-verification`；`template` 由 Signature 嘅 `derived` 宣告，驗證器對比 SQL 嘅 `case` 同 `derived.rule` 一致（決定 66）。
 - Token 類型統一（決定 66）：`random-token` 產生 32 bytes，對外一律係 43 字 base64url 字串（`vt.value`、email 連結、verify-email 嘅 `body.token`）；DB 只存 `bytea`：`users.email_verify_hash` 係 `HMAC-SHA-256(pepper, token)`，`email_outbox.token` 係 DEK 加密嘅明文。
-- 保留期（決定 68，待 Jack 確認）：`sent_at` 之後 30 日，`mail_worker` 將 `email` 換成遮罩、`token` 設 null（DEK 已銷毀）、`recipient_hash` 保留到 12.10 私隱刪除；未發送嘅列唔受影響。12.10 刪除時按 `user_id` 或者 `recipient_hash` 搵出所有 outbox 列一併匿名化，包括 `user_id` 係 null 嘅「已經有帳戶」通知。
+- 保留期（決定 68，已確認（產品經理 2026-10-14））：`sent_at` 之後 30 日，`mail_worker` 將 `email` 換成遮罩、`token` 設 null（DEK 已銷毀）、`recipient_hash` 保留到 12.10 私隱刪除；未發送嘅列唔受影響。12.10 刪除時按 `user_id` 或者 `recipient_hash` 搵出所有 outbox 列一併匿名化，包括 `user_id` 係 null 嘅「已經有帳戶」通知。
 - token 屬 sensitive，DB 入面以 crypto-shredding 加密，mail worker 發送後即時銷毀 DEK。
 
-#### 12.11.4 Method：`models/user/methods/self-register.md`（決定 67，待 Jack 確認）
+#### 12.11.4 Method：`models/user/methods/self-register.md`（決定 67，已確認（產品經理 2026-10-14））
 
 ```markdown
 # self-register
@@ -2498,10 +2496,10 @@ signature: MEYCIQ...
   - 有未過期 admin 邀請（`email_verify_purpose = 'invite'` 而且 `email_verify_expires_at > now()`）嘅 email：DO UPDATE 條件唔成立，邀請 token、到期時間同所有欄位都唔變，`ins.id` 係 null，所以 enqueue 寄「已經有帳戶」中性通知；回應同其他情況一樣係 202。邀請過期之後，註冊就當普通未驗證帳戶處理（輪換成 `register` token）。
   - 一個 upsert 只算一次 public 寫入（不論最後係 INSERT 定 UPDATE），計入每日配額一次。
 - 攻擊者用受害人 email 先註冊：因為冇密碼，帳戶冇任何 credential；受害人再註冊只會輪換 token，攻擊者手上嘅舊 token 即時失效。設密碼只可以經 email 連結（12.11.5），所以冇受害人信箱就冇辦法搶帳戶。
-- 未驗證帳戶清理（決定 67，待 Jack 確認）：平台 job 定時搵 `email_verified_at is null and email_verify_expires_at < now() and deleted_at is null` 嘅用戶，用 `erasure` role 匿名化（email 換成 `erased+{id}@invalid`、token hash 清走），再 soft delete（`deleted_at`）；唔 DELETE（決定 13）。因為 key 係 `email_verify_expires_at`，再註冊輪換 token 會順延清理時間；邀請（72 小時）用同一條規則。
+- 未驗證帳戶清理（決定 67，已確認（產品經理 2026-10-14））：平台 job 定時搵 `email_verified_at is null and email_verify_expires_at < now() and deleted_at is null` 嘅用戶，用 `erasure` role 匿名化（email 換成 `erased+{id}@invalid`、token hash 清走），再 soft delete（`deleted_at`）；唔 DELETE（決定 13）。因為 key 係 `email_verify_expires_at`，再註冊輪換 token 會順延清理時間；邀請（72 小時）用同一條規則。
 - 單一職責：自己物件只有 1 個寫入 sql；寫 email_outbox 經佢自己嘅 method（決定 3）。呼叫深度 2 層。
 
-#### 12.11.5 Method：`models/user/methods/complete-verification.md`（決定 67、69 共用，待 Jack 確認）
+#### 12.11.5 Method：`models/user/methods/complete-verification.md`（決定 67、69 共用，已確認（產品經理 2026-10-14））
 
 ```markdown
 # complete-verification
@@ -2593,7 +2591,7 @@ signature: MEQCIF...
 - 一個 UPDATE 同時設 password 同 `email_verified_at`（決定 53、67、69）：冇「已驗證但冇密碼」或者「有密碼但未驗證」嘅中間狀態，所以決定 55 成立。
 - s1 每次都做（token 錯都做），令耗時一致；`hash-password` 用平台固定大小嘅 argon2 worker pool。最低回應耗時 300ms 由收到 request 開始計，喺所有工作完成之後先補足；超過 300ms 就補到下一個 100ms 倍數（決定 66）。
 - 成功 commit 之後，平台用 `refresh_store` 撤銷該用戶所有 refresh 家族（`revoke_reason: email-verified`）；method lock 唔需要寫，屬平台行為（決定 67）。
-- 決定 56 嘅「一律做 `hash-password`」喺新設計移到呢一步（決定 67 確認後生效）。
+- 決定 56 嘅「一律做 `hash-password`」已移到呢一步（決定 67 已確認）。
 
 #### 12.11.6 api：`api/auth/v1/register/register.md`（路由 `POST /auth/v1/{slug}/register`）
 
@@ -2866,7 +2864,7 @@ signature: MEUCIQ...
   - 每個 PR 都喺 5 項上限以內；後面嘅 PR 依賴前面 PR 嘅 lock hash，要等前面合併先可以確認。
   - 注意：user model 改動（新增 public 可寫欄位）本身亦係安全項目；如果計埋，PR#150 會有 5 項，仍然喺上限內。
 
-#### 12.11.9 Admin 邀請流程（決定 69，待 Jack 確認）
+#### 12.11.9 Admin 邀請流程（決定 69，已確認（產品經理 2026-10-14））
 
 - `user.invite`（admin 路徑，要 `auth` 同 admin role）：用 `random-token` 產生邀請 token，`users.email_verify_hash` 寫 token hash、`email_verify_expires_at` 設 72 小時後、`email_verify_purpose` 設 `invite`；經 `email-outbox.enqueue`（`purpose: invite`，lock 寫死）寄出，範本係 `invite`。
 - 用戶開邀請連結，去同一個設定密碼頁，送去同一個 `POST /auth/v1/{slug}/verify-email`，由同一個 `user.complete-verification` 處理（決定 67、69 共用 code path）：一個 UPDATE 同時設 password 同 `email_verified_at`，成功後撤銷所有 refresh 家族。
@@ -2877,8 +2875,6 @@ signature: MEUCIQ...
 ## 13. 待確認
 
 私隱法（PDPO、GDPR）部分嘅建議請法律意見覆核。
-
-另外，0.9 標「待 Jack 確認」嘅決定 67–72 等 Jack 簽核；簽核之前照用建議值。
 
 ## 14. 後續版本
 
