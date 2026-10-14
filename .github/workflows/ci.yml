@@ -17,7 +17,7 @@ jobs:
     name: Markdown lint & link check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: DavidAnson/markdownlint-cli2-action@v24
         with:
           globs: "**/*.md"
@@ -30,7 +30,7 @@ jobs:
     name: Rust fmt / clippy / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Detect Cargo.toml
         id: detect
         run: echo "present=${{ hashFiles('Cargo.toml') != '' }}" >> "$GITHUB_OUTPUT"
@@ -55,14 +55,14 @@ jobs:
     name: Docker build (no push)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Detect Dockerfile
         id: detect
         run: echo "present=${{ hashFiles('Dockerfile') != '' }}" >> "$GITHUB_OUTPUT"
       - if: steps.detect.outputs.present == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       - if: steps.detect.outputs.present == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
