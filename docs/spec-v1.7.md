@@ -127,7 +127,7 @@
 | 53 | Email 驗證寫入：`email_verified_at` 屬黑名單「verified」類欄位；只有標 `capabilities: [confirm-verification]` 嘅 model method 可以喺 public 路徑寫佢，而且一定要喺一個 UPDATE 入面，WHERE 用 `hash-token` 輸出對比唯一 token hash 欄位、檢查未過期同未驗證，並同時清走 token hash。屬高風險安全項目，api lock 要寫 `verification-write: allow`。 | 7.2、10.7 |
 | 54 | Email 發送唔用對外 `call`：method 經 `email-outbox.enqueue` 寫入 `email_outbox` 表，由平台 mail worker 非同步發送；payload 嘅 token 屬 `personal: sensitive`（crypto-shredding），發送後平台即時銷毀 DEK。 | 12.11 |
 | 55 | Login 只接受已驗證 email 嘅用戶（`email_verified_at is not null`）；未驗證同密碼錯回同一個 401。 | 12.8 |
-| 56 | 註冊唔分辨 email 係咪已經存在：一律做 `hash-password`、一律 enqueue 一封信（新用戶收驗證信，已存在用戶收「已經有帳戶」通知，由 mail worker 按 `user_id` 係咪空揀範本），一律回 202 同一個 body，耗時補到 300ms。 | 12.11 |
+| 56 | 註冊唔分辨 email 係咪已經存在：一律做 `hash-password`、一律 enqueue 一封信（新用戶收驗證信，已存在用戶收「已經有帳戶」通知，由 mail worker 按 `user_id` 係咪空揀範本），一律回 202 同一個 body，耗時補到 300ms。註：如果決定 67 經 Jack 確認，註冊唔再收密碼，`hash-password` 改為喺 `user.complete-verification`（設定密碼一步）每次都做；67 未確認之前，呢句照原文解讀。 | 12.11 |
 
 ### 0.8 已確認決定（v1.7 編譯器 LLM 設定）
 
@@ -906,7 +906,8 @@ migration 放喺 ./migrations/main/。
   - **註冊（password 寫入）**（決定 47）：public 路徑寫 password 類型欄位只准一種方式：
     - method 標 `capabilities: [set-password]`（高風險安全項目），而且寫入 password 欄位嘅值一定係同一 method 內 `hash-password` op 嘅輸出；直接用 request 值寫 password 欄位一律 error。
     - api lock `## Access` 寫 `password-write: allow`，`writable-columns` 明確列出 password 欄位。
-    - 照樣要 captcha（`when: always`，因為有 INSERT）、每日配額同 audit-log；回應唔可以分辨 email 係咪已經註冊（一律 202 加統一訊息，經 email 完成驗證，見決定 56，已確認）。
+    - 三個條件缺一不可：method 有 `set-password`、值嚟自同一 method 嘅 `hash-password`、api 有 `password-write: allow`。captcha 唔係 password 寫入嘅條件：只有 public INSERT（例如註冊）先一定要 captcha（`when: always`）；冇 INSERT 嘅 password 寫入（例如 12.11.7 用 token 設定密碼）可以 `type: none`，但照樣要 IP 加租戶限流。
+    - 照樣要每日配額同 audit-log；回應唔可以分辨 email 係咪已經註冊（一律 202 加統一訊息，經 email 完成驗證，見決定 56，已確認）。
   - **Email 驗證**（決定 53，已確認）：`email_verified_at` 只可以由標 `capabilities: [confirm-verification]` 嘅 method 寫，一個 UPDATE 入面用 token hash 做 WHERE、檢查未過期同未驗證、同時清走 token hash；api lock 寫 `verification-write: allow`。冇 INSERT，所以 challenge 可以 `type: none`，但照樣 IP 加租戶限流同 audit-log。
   - **審計**：public 寫入一律經 `audit-log`，唔可以剔走。
   - **Untrusted 內容**：public 寫入嘅欄位喺 model 標記 `untrusted: true`；所有輸出（包括已認證 endpoint 讀返出嚟）都按 Content-Type 做 output encoding；每個欄位要有長度上限，陣列要有數量上限，冇上限就 error（決定 24）。
@@ -955,7 +956,12 @@ migration 放喺 ./migrations/main/。
 ## 9. Log 同 Manifest
 
 - log 記錄 request id、狀態碼、耗時同 stack；stack 只會寫入 log，唔會放喺回應。token、key 同 secret 一律唔會記錄。
-- `audit-log` pipeline 會記錄邊個做咗咩操作。Audit 永遠唔記明文 email（決定 68）：email 類欄位（`format: email`）預設記 `HMAC-SHA-256(pepper, normalize(email))`，或者寫 `mask:` 記遮罩（例如 `j***@e***.com`）；驗證器見到 audit 會記 email 明文就報 error。
+- `audit-log` pipeline 會記錄邊個做咗咩操作。Audit 永遠唔記明文 email（決定 68）：email 類欄位（`format: email`）預設用 `hash:` 記錄，或者寫 `mask:` 記遮罩（例如 `j***@e***.com`）；驗證器見到 audit 會記 email 明文就報 error。
+- Audit `hash:` 值格式（決定 68）：記錄值一律係字串 `hash:v1:<64 字小寫 hex>`，hex 係 `HMAC-SHA-256(tenant_audit_key, normalize(value))`。
+  - `normalize`：email 做 trim 同 lowercase；其他欄位做 trim。
+  - `tenant_audit_key` 係每個租戶獨立嘅 audit key，放喺平台 secret，lock 同 log 都唔會出現。同一租戶同一 email 永遠得出同一個值，方便查審計；唔同租戶冇辦法對比。
+  - 同 `subject-key` 嘅 `hash:{column}` 唔同：嗰個係 DB 欄位，值係 `HMAC-SHA-256(pepper, normalize(email))` 嘅 raw bytes（`bytea`），用嚟做私隱刪除；audit 用另一條 key，所以 audit log 外洩唔可以直接對比 DB。
+  - lock 入面 `hash: [req.body.email]`（例如 11.2、12.11.6）一律指呢個格式。
 - 部署時將所有 lock 編譯成 manifest，入面有 routes、pipelines、steps、provider 對應、公開 endpoint 清單、public 寫入 endpoint 清單，同埋每個 lock 嘅 id、hash 同簽名。
 - manifest 會簽名；runtime 只會載入驗證成功而且簽名有效嘅 manifest，冷啟動唔會再解析任何 md（source 或者 lock 都唔會）。
 - 編譯 manifest 前會逐個驗證 lock 嘅簽名同 hash；任何一個 lock 唔合格，成個部署失敗。
@@ -1055,7 +1061,8 @@ migration 放喺 ./migrations/main/。
 - public 寫入嘅 `UPDATE` 冇 `WHERE`，或者唔係用主鍵／RLS 限定。
 - public 寫入 endpoint 嘅 `## Request` 宣告咗 `tenant_id`、`id` 或者 `created_by`。
 - `challenge` 唔合統一語法；有 INSERT 嘅 public endpoint 唔係 `{ type: captcha | pow, when: always }`；login 類 endpoint 冇 `when: after-failures, after-failures: 3`。
-- public 路徑寫 password 欄位但冇 `password-write: allow`、method 冇 `capabilities: [set-password]`，或者寫入值唔係 `hash-password` 輸出。
+- public 路徑寫 password 欄位但缺少以下任何一項：api 嘅 `password-write: allow`、method 嘅 `capabilities: [set-password]`、寫入值係同一 method 內 `hash-password` 輸出。
+- 有 public INSERT 嘅 endpoint 冇 `challenge: { type: captcha | pow, when: always }`（冇 INSERT 嘅 password 或者驗證寫入唔要求 captcha，唔報 error）。
 - public 路徑寫 `email_verified_at`（或者其他 verified 類欄位）但冇 `verification-write: allow`、method 冇 `capabilities: [confirm-verification]`，或者 UPDATE 唔係用 `hash-token` 輸出做 WHERE、冇檢查過期、冇同時清走 token hash。
 - `random-token` 嘅 `value` 流去 `respond`、log、或者非 sensitive 嘅 input／欄位。
 - public 寫入欄位冇 `untrusted: true`，或者冇長度／數量上限。
@@ -1843,6 +1850,7 @@ signature: MEUCIQ...
 | email_verified_at | timestamp | nullable, public-writable (confirm-verification) | no |
 | email_verify_hash | bytes | nullable, unique, public-writable | no |
 | email_verify_expires_at | timestamp | nullable, public-writable | no |
+| email_verify_purpose | string | nullable, enum: [register, invite]（決定 67、69） | no |
 | created_at | timestamp | default: now | yes |
 | updated_at | timestamp | default: now | yes |
 | deleted_at | timestamp | nullable | yes |
@@ -1859,7 +1867,7 @@ signature: MEUCIQ...
 ## Policies
 - rls: enable, force
 - policy: tenant_id = current_setting('app.tenant_id', false)
-- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer [INSERT(email, name, email_verify_hash, email_verify_expires_at), UPDATE(email_verify_hash, email_verify_expires_at, password, email_verified_at, last_login_at)]   # model 層係所有 public endpoint 嘅聯集；每個 api 嘅實際 grant 只限佢 lock 用到嘅欄位（見 12.11.6、12.11.7）
+- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer [INSERT(email, name, email_verify_hash, email_verify_expires_at, email_verify_purpose), UPDATE(email_verify_hash, email_verify_expires_at, email_verify_purpose, password, email_verified_at, last_login_at)]   # model 層係所有 public endpoint 嘅聯集；每個 api 嘅實際 grant 只限佢 lock 用到嘅欄位（見 12.11.6、12.11.7）
 ````
 
 `models/user/methods/sign-token.md`
@@ -2213,7 +2221,7 @@ signature: MEYCIQ...
 
 ```markdown
 # 加 email 驗證欄位
-users 表嘅 password 改為可以冇；加 email_verified_at（時間，可以冇）、email_verify_hash（bytes，唯一，可以冇）、email_verify_expires_at（時間，可以冇）。
+users 表嘅 password 改為可以冇；加 email_verify_purpose（register 或者 invite，可以冇）、email_verified_at（時間，可以冇）、email_verify_hash（bytes，唯一，可以冇）、email_verify_expires_at（時間，可以冇）。
 另外開一張 email_outbox 表：id、user_id（可以冇）、email、recipient_hash（收件人 email 嘅 hash，用嚟私隱刪除）、template、token（敏感）、sent_at、created_at。
 ```
 
@@ -2245,6 +2253,11 @@ users 表嘅 password 改為可以冇；加 email_verified_at（時間，可以�
 ### s4 ddl
 - op: ddl
 - sql: `create unique index concurrently users_email_verify_hash_uq on users (tenant_id, email_verify_hash)`
+- source-lines: 2-2
+
+### s4a ddl
+- op: ddl
+- sql: `alter table users add column email_verify_purpose text null check (email_verify_purpose in ('register', 'invite'))`
 - source-lines: 2-2
 
 ### s4b ddl
@@ -2405,8 +2418,8 @@ signature: MEUCIQ...
 
 做法：
 1. 產生一個 email 驗證 token，24 小時有效。
-2. 建立用戶，未驗證、冇密碼。如果 email 已經存在但未驗證，只換新 token 同到期時間（舊 token 即時失效），其他欄位一律唔改；如果已經驗證就乜都唔改。
-3. 用 email-outbox.enqueue（purpose 係 register）排一封信：新用戶或者未驗證用戶收驗證信（帶 token），已驗證用戶收「已經有帳戶」通知。
+2. 建立用戶，未驗證、冇密碼。如果 email 已經存在但未驗證，只換新 token 同到期時間（舊 token 即時失效），其他欄位一律唔改；如果已經驗證、或者有未過期嘅 admin 邀請，就乜都唔改。
+3. 用 email-outbox.enqueue（purpose 係 register）排一封信：新用戶或者未驗證用戶收驗證信（帶 token），已驗證用戶或者有未過期邀請嘅用戶收「已經有帳戶」通知。
 4. 唔好話畀人知 email 係咪已經存在，輸出一律空。
 ```
 
@@ -2457,12 +2470,12 @@ signature: MEYCIQ...
 - op: query
 - provider: main
 - table: users
-- sql: `insert into users (email, name, email_verify_hash, email_verify_expires_at) values ($1, $2, $3, now() + interval '24 hours') on conflict (tenant_id, email) do update set email_verify_hash = excluded.email_verify_hash, email_verify_expires_at = excluded.email_verify_expires_at where users.email_verified_at is null and users.deleted_at is null returning id`
+- sql: `insert into users (email, name, email_verify_hash, email_verify_expires_at, email_verify_purpose) values ($1, $2, $3, now() + interval '24 hours', 'register') on conflict (tenant_id, email) do update set email_verify_hash = excluded.email_verify_hash, email_verify_expires_at = excluded.email_verify_expires_at, email_verify_purpose = 'register' where users.email_verified_at is null and users.deleted_at is null and not (users.email_verify_purpose = 'invite' and users.email_verify_expires_at > now()) returning id`
 - params: [input.email, input.name, vt.hash]
 - writes: true
 - scope: pk                     # conflict target (tenant_id, email) 係唯一鍵，DO UPDATE 最多影響一列
-- columns: { insert: [email, name, email_verify_hash, email_verify_expires_at], update: [email_verify_hash, email_verify_expires_at] }
-- out: ins                      # 新用戶或者未驗證用戶回 id；已驗證用戶 ins.id 係 null
+- columns: { insert: [email, name, email_verify_hash, email_verify_expires_at, email_verify_purpose], update: [email_verify_hash, email_verify_expires_at, email_verify_purpose] }
+- out: ins                      # 新用戶或者未驗證用戶回 id；已驗證或者有未過期邀請 ins.id 係 null
 - source-lines: 6-6
 
 ### s3 method
@@ -2482,6 +2495,7 @@ signature: MEYCIQ...
 - Upsert 規則（決定 67）：
   - `INSERT` 只寫 `email`、`name`、`email_verify_hash`、`email_verify_expires_at`；`ON CONFLICT DO UPDATE` 只准改 `email_verify_hash`、`email_verify_expires_at`，一定要有 `where users.email_verified_at is null and users.deleted_at is null`。驗證器檢查 `columns.update` 係 `columns.insert` 嘅子集，而且唔包括 password、`name`、`email` 或者任何黑名單欄位。
   - `scope: pk` 嘅意思：conflict target 係租戶內嘅唯一鍵 `(tenant_id, email)`（`tenant_id` 由 RLS 同平台注入，唔喺 SQL 參數入面），所以 DO UPDATE 最多只會影響同一租戶入面同一 email 嘅一列。
+  - 有未過期 admin 邀請（`email_verify_purpose = 'invite'` 而且 `email_verify_expires_at > now()`）嘅 email：DO UPDATE 條件唔成立，邀請 token、到期時間同所有欄位都唔變，`ins.id` 係 null，所以 enqueue 寄「已經有帳戶」中性通知；回應同其他情況一樣係 202。邀請過期之後，註冊就當普通未驗證帳戶處理（輪換成 `register` token）。
   - 一個 upsert 只算一次 public 寫入（不論最後係 INSERT 定 UPDATE），計入每日配額一次。
 - 攻擊者用受害人 email 先註冊：因為冇密碼，帳戶冇任何 credential；受害人再註冊只會輪換 token，攻擊者手上嘅舊 token 即時失效。設密碼只可以經 email 連結（12.11.5），所以冇受害人信箱就冇辦法搶帳戶。
 - 未驗證帳戶清理（決定 67，待 Jack 確認）：平台 job 定時搵 `email_verified_at is null and email_verify_expires_at < now() and deleted_at is null` 嘅用戶，用 `erasure` role 匿名化（email 換成 `erased+{id}@invalid`、token hash 清走），再 soft delete（`deleted_at`）；唔 DELETE（決定 13）。因為 key 係 `email_verify_expires_at`，再註冊輪換 token 會順延清理時間；邀請（72 小時）用同一條規則。
@@ -2555,11 +2569,11 @@ signature: MEQCIF...
 - op: query
 - provider: main
 - table: users
-- sql: `update users set password = $1, email_verified_at = now(), email_verify_hash = null, email_verify_expires_at = null where email_verify_hash = $2 and email_verify_expires_at > now() and email_verified_at is null and deleted_at is null returning id`
+- sql: `update users set password = $1, email_verified_at = now(), email_verify_hash = null, email_verify_expires_at = null, email_verify_purpose = null where email_verify_hash = $2 and email_verify_expires_at > now() and email_verified_at is null and deleted_at is null returning id`
 - params: [pw, th]
 - writes: true
 - scope: pk                     # (tenant_id, email_verify_hash) 係唯一鍵
-- columns: [password, email_verified_at, email_verify_hash, email_verify_expires_at]
+- columns: [password, email_verified_at, email_verify_hash, email_verify_expires_at, email_verify_purpose]
 - password-source: s1
 - out: upd
 - source-lines: 7-7
@@ -2632,8 +2646,8 @@ signature: MEUCIH...
 - tenant: { from: path, param: slug }
 - public-writes: true
 - role: public_writer
-- writable-columns: { users: { insert: [email, name, email_verify_hash, email_verify_expires_at], update: [email_verify_hash, email_verify_expires_at] }, email_outbox: { insert: [user_id, email, recipient_hash, template, token] } }
-- effective-grant: public_writer [users: INSERT(email, name, email_verify_hash, email_verify_expires_at), UPDATE(email_verify_hash, email_verify_expires_at); email_outbox: INSERT(user_id, email, recipient_hash, template, token)]
+- writable-columns: { users: { insert: [email, name, email_verify_hash, email_verify_expires_at, email_verify_purpose], update: [email_verify_hash, email_verify_expires_at, email_verify_purpose] }, email_outbox: { insert: [user_id, email, recipient_hash, template, token] } }
+- effective-grant: public_writer [users: INSERT(email, name, email_verify_hash, email_verify_expires_at, email_verify_purpose), UPDATE(email_verify_hash, email_verify_expires_at, email_verify_purpose); email_outbox: INSERT(user_id, email, recipient_hash, template, token)]
 - challenge: { type: captcha, when: always }
 - external-calls: forbidden
 - daily-write-quota: platform-default     # 每租戶 1,000、每 IP 50；每次 upsert 算一次
@@ -2759,8 +2773,8 @@ signature: MEUCIQ...
 - password-write: allow
 - verification-write: allow
 - role: public_writer
-- writable-columns: { users: { update: [password, email_verified_at, email_verify_hash, email_verify_expires_at] } }
-- effective-grant: public_writer [users: UPDATE(password, email_verified_at, email_verify_hash, email_verify_expires_at)]
+- writable-columns: { users: { update: [password, email_verified_at, email_verify_hash, email_verify_expires_at, email_verify_purpose] } }
+- effective-grant: public_writer [users: UPDATE(password, email_verified_at, email_verify_hash, email_verify_expires_at, email_verify_purpose)]
 - challenge: { type: none }
 - external-calls: forbidden
 - daily-write-quota: platform-default
@@ -2854,9 +2868,10 @@ signature: MEUCIQ...
 
 #### 12.11.9 Admin 邀請流程（決定 69，待 Jack 確認）
 
-- `user.invite`（admin 路徑，要 `auth` 同 admin role）：用 `random-token` 產生邀請 token，`users.email_verify_hash` 寫 token hash、`email_verify_expires_at` 設 72 小時後；經 `email-outbox.enqueue`（`purpose: invite`，lock 寫死）寄出，範本係 `invite`。
+- `user.invite`（admin 路徑，要 `auth` 同 admin role）：用 `random-token` 產生邀請 token，`users.email_verify_hash` 寫 token hash、`email_verify_expires_at` 設 72 小時後、`email_verify_purpose` 設 `invite`；經 `email-outbox.enqueue`（`purpose: invite`，lock 寫死）寄出，範本係 `invite`。
 - 用戶開邀請連結，去同一個設定密碼頁，送去同一個 `POST /auth/v1/{slug}/verify-email`，由同一個 `user.complete-verification` 處理（決定 67、69 共用 code path）：一個 UPDATE 同時設 password 同 `email_verified_at`，成功後撤銷所有 refresh 家族。
 - admin 建立嘅用戶喺接受邀請之前冇 password、未驗證，冇辦法 login，決定 55 成立。
+- 有未過期邀請嘅 email 被人公開註冊：邀請完全唔受影響，註冊者只會收到「已經有帳戶」中性通知（見 12.11.4）。
 - 重新邀請會覆寫 token hash 同到期時間，舊邀請即時失效；過期冇接受就按 12.11.4 同一條清理規則處理（key 係 `email_verify_expires_at`）。
 
 ## 13. 待確認
