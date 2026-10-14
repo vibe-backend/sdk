@@ -1,4 +1,5 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use zeroize::Zeroizing;
 
 pub fn sign_bytes(bytes: &[u8], key: &SigningKey) -> String {
     hex::encode(key.sign(bytes).to_bytes())
@@ -15,19 +16,23 @@ pub fn verify_bytes(bytes: &[u8], signature_hex: &str, key: &VerifyingKey) -> bo
 }
 
 pub fn generate_key() -> SigningKey {
-    let mut seed = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+    let mut seed = Zeroizing::new([0u8; 32]);
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, seed.as_mut());
     SigningKey::from_bytes(&seed)
 }
 
 const DEV_KEY: &str = "signing.key";
 const DEV_PUB: &str = "signing.pub";
 
-fn decode_key(hex_key: &str, what: &str) -> Result<[u8; 32], String> {
-    let bytes = hex::decode(hex_key.trim()).map_err(|_| format!("{what} is not hex"))?;
-    bytes
-        .try_into()
-        .map_err(|_| format!("{what} must be 32 bytes"))
+fn decode_key(hex_key: &str, what: &str) -> Result<Zeroizing<[u8; 32]>, String> {
+    let bytes =
+        Zeroizing::new(hex::decode(hex_key.trim()).map_err(|_| format!("{what} is not hex"))?);
+    if bytes.len() != 32 {
+        return Err(format!("{what} must be 32 bytes"));
+    }
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 /// `vibe keygen`: creates a development key pair in `<dir>/.vibe`. The private
@@ -48,8 +53,8 @@ pub fn create_dev_key(dir: &std::path::Path) -> Result<SigningKey, String> {
             err.to_string()
         }
     })?;
-    std::io::Write::write_all(&mut file, hex::encode(key.to_bytes()).as_bytes())
-        .map_err(|err| err.to_string())?;
+    let encoded = Zeroizing::new(hex::encode(key.to_bytes()));
+    std::io::Write::write_all(&mut file, encoded.as_bytes()).map_err(|err| err.to_string())?;
     std::fs::write(
         vibe.join(DEV_PUB),
         hex::encode(key.verifying_key().to_bytes()),
@@ -78,38 +83,56 @@ pub fn load_dev_key(dir: &std::path::Path) -> Result<SigningKey, String> {
     }
     #[cfg(not(unix))]
     let _ = meta;
-    let text = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
-    Ok(SigningKey::from_bytes(&decode_key(&text, "signing key")?))
+    let text = Zeroizing::new(std::fs::read_to_string(&path).map_err(|err| err.to_string())?);
+    Ok(SigningKey::from_bytes(&*decode_key(&text, "signing key")?))
 }
 
 /// Release signing key: only from `VIBE_RELEASE_SIGNING_KEY` (hex), set as a
 /// secret of the protected `release` environment. There is no fallback to a
 /// file or a generated key.
 pub fn load_release_key() -> Result<SigningKey, String> {
-    let text = std::env::var("VIBE_RELEASE_SIGNING_KEY").map_err(|_| {
+    let text = Zeroizing::new(std::env::var("VIBE_RELEASE_SIGNING_KEY").map_err(|_| {
         "release builds need VIBE_RELEASE_SIGNING_KEY (the release environment secret); there is no fallback".to_string()
-    })?;
-    Ok(SigningKey::from_bytes(&decode_key(
+    })?);
+    Ok(SigningKey::from_bytes(&*decode_key(
         &text,
         "VIBE_RELEASE_SIGNING_KEY",
     )?))
 }
 
-/// The pinned release public key: `VIBE_MANIFEST_PUBKEY` (hex) from the
-/// runtime configuration, else one compiled into the binary with
-/// `VIBE_RELEASE_PUBKEY` at build time.
+/// The pinned release public key. A key compiled into the binary with
+/// `VIBE_RELEASE_PUBKEY` at build time is the trust root: the runtime
+/// `VIBE_MANIFEST_PUBKEY` cannot override it (a differing value is refused).
+/// Without a compiled-in key, `VIBE_MANIFEST_PUBKEY` (hex) is used.
 pub fn pinned_public_key() -> Result<Option<VerifyingKey>, String> {
-    let raw = std::env::var("VIBE_MANIFEST_PUBKEY")
-        .ok()
-        .or_else(|| option_env!("VIBE_RELEASE_PUBKEY").map(str::to_string));
-    match raw {
-        Some(text) if !text.trim().is_empty() => {
-            let bytes = decode_key(&text, "pinned manifest public key")?;
-            VerifyingKey::from_bytes(&bytes)
-                .map(Some)
-                .map_err(|err| err.to_string())
+    resolve_pinned(
+        option_env!("VIBE_RELEASE_PUBKEY"),
+        std::env::var("VIBE_MANIFEST_PUBKEY").ok().as_deref(),
+    )
+}
+
+fn parse_public(text: &str) -> Result<VerifyingKey, String> {
+    let bytes = decode_key(text, "pinned manifest public key")?;
+    VerifyingKey::from_bytes(&bytes).map_err(|err| err.to_string())
+}
+
+pub(crate) fn resolve_pinned(
+    compiled: Option<&str>,
+    runtime: Option<&str>,
+) -> Result<Option<VerifyingKey>, String> {
+    let compiled = compiled.filter(|t| !t.trim().is_empty());
+    let runtime = runtime.filter(|t| !t.trim().is_empty());
+    match (compiled, runtime) {
+        (Some(c), Some(r)) => {
+            let (c, r) = (parse_public(c)?, parse_public(r)?);
+            if c != r {
+                return Err("VIBE_MANIFEST_PUBKEY differs from the release key compiled into this binary; the compiled-in key cannot be overridden".into());
+            }
+            Ok(Some(c))
         }
-        _ => Ok(None),
+        (Some(c), None) => parse_public(c).map(Some),
+        (None, Some(r)) => parse_public(r).map(Some),
+        (None, None) => Ok(None),
     }
 }
 
@@ -118,5 +141,25 @@ pub fn pinned_public_key() -> Result<Option<VerifyingKey>, String> {
 pub fn load_dev_public(dir: &std::path::Path) -> Result<VerifyingKey, String> {
     let text =
         std::fs::read_to_string(dir.join(".vibe").join(DEV_PUB)).map_err(|err| err.to_string())?;
-    VerifyingKey::from_bytes(&decode_key(&text, "public key")?).map_err(|err| err.to_string())
+    VerifyingKey::from_bytes(&*decode_key(&text, "public key")?).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_key_cannot_override_the_compiled_key() {
+        let a = hex::encode(generate_key().verifying_key().to_bytes());
+        let b = hex::encode(generate_key().verifying_key().to_bytes());
+        let err = resolve_pinned(Some(&a), Some(&b)).unwrap_err();
+        assert!(err.contains("cannot be overridden"), "{err}");
+        let same = resolve_pinned(Some(&a), Some(&a)).unwrap().unwrap();
+        assert_eq!(hex::encode(same.to_bytes()), a);
+        let compiled = resolve_pinned(Some(&a), None).unwrap().unwrap();
+        assert_eq!(hex::encode(compiled.to_bytes()), a);
+        let runtime = resolve_pinned(None, Some(&b)).unwrap().unwrap();
+        assert_eq!(hex::encode(runtime.to_bytes()), b);
+        assert!(resolve_pinned(None, None).unwrap().is_none());
+    }
 }

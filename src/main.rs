@@ -46,11 +46,13 @@ enum Command {
         /// Output path, relative to the current directory (like `serve --manifest`).
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
-        /// Release build: signs with VIBE_RELEASE_SIGNING_KEY only and fails on
-        /// high-risk items without --release-approval.
+        /// Release build: signs with VIBE_RELEASE_SIGNING_KEY only, never reads
+        /// .env, requires an allowlisted LLM host, and fails closed on
+        /// high-risk items until release-environment approval verification (#80).
         #[arg(long)]
         release: bool,
-        /// Reference to the approval of this release's high-risk items.
+        /// Recorded for audit only. It is not accepted as approval: the approval
+        /// is the `release` environment approval (decision 90/118, #80).
         #[arg(long)]
         release_approval: Option<String>,
         /// Source commit to record (default: GITHUB_SHA or `git rev-parse HEAD`).
@@ -65,7 +67,13 @@ enum Command {
         /// Output path, relative to the current directory.
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
-        /// Reference to the approval of this release's high-risk items.
+        /// Directory for the compiled lock files (build output, never the
+        /// repo; default `<project>/.vibe/build/locks`). Replaced as a whole
+        /// only when the build succeeds.
+        #[arg(long)]
+        locks_dir: Option<PathBuf>,
+        /// Recorded for audit only. It is not accepted as approval: the approval
+        /// is the `release` environment approval (decision 90/118, #80).
         #[arg(long)]
         release_approval: Option<String>,
         /// Source commit to record (default: GITHUB_SHA or `git rev-parse HEAD`).
@@ -183,9 +191,13 @@ async fn run(cli: Cli) -> Result<(), String> {
         Command::Build {
             project,
             output,
+            locks_dir,
             release_approval,
             commit,
-        } => cmd_build(&project, &output, release_approval, commit).await,
+        } => {
+            let locks_dir = locks_dir.unwrap_or_else(|| default_locks_dir(&project));
+            cmd_build(&project, &output, &locks_dir, release_approval, commit).await
+        }
         Command::Keygen { project } => {
             sign::create_dev_key(&project)?;
             println!("wrote {}", project.join(".vibe/signing.key").display());
@@ -346,11 +358,18 @@ async fn cmd_manifest(
 /// Reads the release inputs once (sources compiled in memory, never lock
 /// files from disk).
 async fn compile_release(project: &Path) -> Result<vibe::validate::LoadedProject, String> {
-    load_dotenv(project);
-    // The release environment provides the compiler key as VIBE_LLM_API_KEY.
+    let _ = project;
+    // A release build never reads the project .env: every input comes from
+    // the release environment, which provides the compiler key as
+    // VIBE_LLM_API_KEY.
     let mut env = llm::env_map_from_process();
     if let Some(key) = env.get("VIBE_LLM_API_KEY").cloned() {
         env.entry("LLM_API_KEY".into()).or_insert(key);
+    }
+    // No LLM key (VIBE_LLM_API_KEY or LLM_API_KEY) is ever sent to a host
+    // outside the release allowlist.
+    if let Ok(config) = llm::load_llm_config(&env, true) {
+        llm::check_release_endpoint(&config)?;
     }
     let config = llm::load_llm_config(&env, true).ok();
     let adapter = match &config {
@@ -391,6 +410,7 @@ fn resolve_commit(project: &Path, commit: Option<String>) -> String {
 async fn cmd_build(
     project: &Path,
     output: &Path,
+    locks_dir: &Path,
     release_approval: Option<String>,
     commit: Option<String>,
 ) -> Result<(), String> {
@@ -420,9 +440,67 @@ async fn cmd_build(
     let manifest = manifest::build_signed(project, &loaded, &key, &info)
         .map_err(|err| format!("{err}\nnothing was written"))?;
     print_high_risk(&manifest);
-    manifest::write_manifest(output, &manifest).map_err(|err| err.to_string())?;
+    // All or nothing: the locks are staged first, the manifest is written
+    // atomically, and only then does the staged lock directory replace the
+    // previous one.
+    let staged = stage_locks(locks_dir, &loaded)?;
+    if let Err(err) = manifest::write_manifest(output, &manifest) {
+        let _ = fs::remove_dir_all(&staged);
+        return Err(err.to_string());
+    }
+    commit_locks(&staged, locks_dir)?;
     println!("wrote {}", output.display());
+    println!("wrote locks to {}", locks_dir.display());
     Ok(())
+}
+
+/// Default lock output: `<project>/.vibe/build/locks` (local build output;
+/// `.vibe/` belongs in .gitignore and locks are never written to the repo).
+fn default_locks_dir(project: &Path) -> PathBuf {
+    project.join(".vibe").join("build").join("locks")
+}
+
+fn stage_locks(
+    locks_dir: &Path,
+    loaded: &vibe::validate::LoadedProject,
+) -> Result<PathBuf, String> {
+    let parent = locks_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    let name = locks_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "locks".into());
+    let staged = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        for (source, text) in loaded.sources.iter().zip(&loaded.lock_texts) {
+            let Some(text) = text else { continue };
+            let rel = source.rel.trim_end_matches(".md").to_string() + ".lock.md";
+            let path = staged.join(rel);
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir)?;
+            }
+            fs::write(path, text)?;
+        }
+        if let Some(record) = &loaded.build_record {
+            fs::write(staged.join("build-record.json"), record)?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = result {
+        let _ = fs::remove_dir_all(&staged);
+        return Err(format!("writing locks: {err}; nothing was written"));
+    }
+    Ok(staged)
+}
+
+fn commit_locks(staged: &Path, locks_dir: &Path) -> Result<(), String> {
+    if locks_dir.exists() {
+        fs::remove_dir_all(locks_dir).map_err(|err| err.to_string())?;
+    }
+    fs::rename(staged, locks_dir).map_err(|err| err.to_string())
 }
 
 fn print_high_risk(manifest: &manifest::Manifest) {
@@ -440,7 +518,8 @@ fn print_high_risk(manifest: &manifest::Manifest) {
 }
 
 /// Manifest verifying key. Production trusts only the pinned release key
-/// (VIBE_MANIFEST_PUBKEY or one compiled in); the project's
+/// (one compiled in with VIBE_RELEASE_PUBKEY, which VIBE_MANIFEST_PUBKEY
+/// cannot override, else VIBE_MANIFEST_PUBKEY); the project's
 /// `.vibe/signing.pub` is accepted in development only.
 fn manifest_key(
     project: &Path,

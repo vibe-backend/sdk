@@ -101,20 +101,21 @@ const BUILD: &[&str] = &[
     "out/manifest.json",
 ];
 
+const FAIL_CLOSED: &str = "high-risk release builds fail closed";
+
 #[test]
-fn build_writes_a_signed_release_manifest() {
+fn release_build_fails_closed_on_high_risk_even_with_an_approval_string() {
+    // Decision 90/118: approval is the release environment approval (#80),
+    // so no --release-approval value unlocks a high-risk release build.
     let root = copy_shop();
-    let (secret, public) = release_key();
+    let before = tree(&root);
+    let (secret, _) = release_key();
     let (ok, out) = vibe(&root, BUILD, &[("VIBE_RELEASE_SIGNING_KEY", &secret)]);
-    assert!(ok, "{out}");
-    let manifest = vibe::manifest::read_manifest(&root.join("out/manifest.json"), &public)
-        .unwrap_or_else(|err| panic!("{err}"));
-    assert_eq!(manifest.provenance.build_mode, "release");
-    assert_eq!(manifest.provenance.commit, "abc123");
-    assert_eq!(
-        manifest.provenance.release_approval.as_deref(),
-        Some("pr:1")
-    );
+    assert!(!ok, "{out}");
+    assert!(out.contains(FAIL_CLOSED), "{out}");
+    assert!(out.contains("not accepted as approval"), "{out}");
+    assert!(out.contains("nothing was written"), "{out}");
+    assert_eq!(tree(&root), before, "no manifest and no locks");
 }
 
 #[test]
@@ -144,13 +145,18 @@ fn build_validates_before_it_needs_a_key() {
 }
 
 #[test]
-fn build_with_only_warnings_succeeds_and_shows_them() {
+fn release_build_shows_warnings_before_failing_closed() {
     let root = copy_shop();
     let (secret, _) = release_key();
     let (ok, out) = vibe(&root, BUILD, &[("VIBE_RELEASE_SIGNING_KEY", &secret)]);
-    assert!(ok, "{out}");
-    assert!(out.contains("warning"), "warnings are displayed: {out}");
-    assert!(root.join("out/manifest.json").exists());
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("warning: models/product"),
+        "warnings are displayed: {out}"
+    );
+    assert!(out.contains(FAIL_CLOSED), "{out}");
+    assert!(!root.join("out/manifest.json").exists());
+    assert!(!root.join(".vibe/build/locks").exists());
 }
 
 #[tokio::test]
@@ -180,8 +186,8 @@ async fn build_signs_the_validated_content_not_a_later_edit() {
         &loaded,
         &key,
         &vibe::manifest::BuildInfo {
-            release: true,
-            release_approval: Some("pr:1".into()),
+            release: false,
+            release_approval: None,
             commit: String::new(),
         },
     )
@@ -211,6 +217,6 @@ fn build_with_high_risk_items_and_no_approval_writes_nothing() {
         &[("VIBE_RELEASE_SIGNING_KEY", &secret)],
     );
     assert!(!ok, "{out}");
-    assert!(out.contains("no release approval"), "{out}");
+    assert!(out.contains(FAIL_CLOSED), "{out}");
     assert_eq!(tree(&root), before);
 }
