@@ -6,6 +6,8 @@ mod sql;
 
 pub use crud::run_method;
 pub use exec::{etag, ExecError, MemoryExec, PgExec, QueryExec};
-pub use http::{hash_api_secret, router, AppState, AuthConfig, Slug, StoredKey};
+pub use http::{
+    hash_api_secret, resolve_pepper, router, AppState, AuthConfig, RunEnv, Slug, StoredKey,
+};
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
 pub use sql::{bootstrap_statements, Col};

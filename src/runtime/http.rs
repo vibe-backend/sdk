@@ -84,6 +84,79 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new().fallback(handle).with_state(state)
 }
 
+/// Minimum API-key pepper length in production.
+pub const MIN_PEPPER_BYTES: usize = 32;
+
+/// Deployment environment, from `VIBE_ENV` (case-insensitive). This is the
+/// single place that decides "is this production?".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunEnv {
+    Dev,
+    Ci,
+    Production,
+}
+
+impl RunEnv {
+    /// `dev`, `development`, `local` and `test` are development; `ci` is CI;
+    /// anything else (`live`, `production`, `prod`, typos, ...) is production.
+    /// Unset means development only for the in-memory executor and
+    /// production otherwise (fail closed for a real database).
+    pub fn from_var(raw: Option<&str>, memory: bool) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()) {
+            None => {
+                if memory {
+                    RunEnv::Dev
+                } else {
+                    RunEnv::Production
+                }
+            }
+            Some(v) if v.is_empty() => {
+                if memory {
+                    RunEnv::Dev
+                } else {
+                    RunEnv::Production
+                }
+            }
+            Some(v) if matches!(v.as_str(), "dev" | "development" | "local" | "test") => {
+                RunEnv::Dev
+            }
+            Some(v) if v == "ci" => RunEnv::Ci,
+            Some(_) => RunEnv::Production,
+        }
+    }
+
+    pub fn is_dev(self) -> bool {
+        self == RunEnv::Dev
+    }
+}
+
+/// Resolves the API-key pepper. Outside development a missing pepper or one
+/// shorter than [`MIN_PEPPER_BYTES`] bytes is an error; in development the
+/// public dev pepper is used with a warning.
+pub fn resolve_pepper(
+    env: RunEnv,
+    pepper: Option<&str>,
+) -> Result<(Vec<u8>, Option<String>), String> {
+    let strict = !env.is_dev();
+    match pepper {
+        Some(p) if p.len() >= MIN_PEPPER_BYTES => Ok((p.as_bytes().to_vec(), None)),
+        Some(_) if strict => Err(format!(
+            "VIBE_API_KEY_PEPPER must be at least {MIN_PEPPER_BYTES} bytes outside development (generate one with `openssl rand -base64 48`)"
+        )),
+        Some(p) => Ok((
+            p.as_bytes().to_vec(),
+            Some(format!("VIBE_API_KEY_PEPPER is shorter than {MIN_PEPPER_BYTES} bytes")),
+        )),
+        None if strict => Err(
+            "VIBE_API_KEY_PEPPER is required outside development (set VIBE_ENV=dev for local use, or generate one with `openssl rand -base64 48`)".to_string(),
+        ),
+        None => Ok((
+            b"dev-pepper".to_vec(),
+            Some("VIBE_API_KEY_PEPPER is not set; using the public dev pepper".to_string()),
+        )),
+    }
+}
+
 struct Principal {
     tenant_id: String,
     subject: String,
@@ -1097,4 +1170,56 @@ fn empty_response(
     response
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+#[cfg(test)]
+mod pepper_tests {
+    use super::{resolve_pepper, RunEnv};
+
+    #[test]
+    fn env_is_case_insensitive_and_fails_closed() {
+        for raw in [
+            "production",
+            "Production",
+            "PROD",
+            "Live",
+            "live",
+            "staging",
+            "typo",
+        ] {
+            assert_eq!(
+                RunEnv::from_var(Some(raw), true),
+                RunEnv::Production,
+                "{raw}"
+            );
+        }
+        for raw in ["dev", "Development", "LOCAL", "test"] {
+            assert_eq!(RunEnv::from_var(Some(raw), false), RunEnv::Dev, "{raw}");
+        }
+        assert_eq!(RunEnv::from_var(Some("CI"), false), RunEnv::Ci);
+        assert_eq!(RunEnv::from_var(None, true), RunEnv::Dev);
+        assert_eq!(RunEnv::from_var(None, false), RunEnv::Production);
+        assert_eq!(RunEnv::from_var(Some(""), false), RunEnv::Production);
+    }
+
+    #[test]
+    fn non_dev_requires_a_long_pepper() {
+        for env in [RunEnv::Production, RunEnv::Ci] {
+            assert!(resolve_pepper(env, None).is_err());
+            assert!(resolve_pepper(env, Some("short")).is_err());
+        }
+        let long = "x".repeat(32);
+        let (p, warn) = resolve_pepper(RunEnv::Production, Some(&long)).unwrap();
+        assert_eq!(p, long.as_bytes());
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn dev_falls_back_with_warning() {
+        let (p, warn) = resolve_pepper(RunEnv::Dev, None).unwrap();
+        assert_eq!(p, b"dev-pepper");
+        assert!(warn.is_some());
+        let (_, warn) = resolve_pepper(RunEnv::Dev, Some("short")).unwrap();
+        assert!(warn.is_some());
+    }
 }

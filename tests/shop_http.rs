@@ -82,7 +82,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         ],
         env_name: "test".into(),
     };
-    let loaded = vibe::runtime::load_project_slugs(&root).unwrap();
+    let loaded = vibe::runtime::load_project_slugs(&root, true).unwrap();
     assert!(loaded.slugs.contains_key("acme"));
     let mut slugs = loaded.slugs;
     slugs.insert(
