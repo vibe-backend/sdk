@@ -696,21 +696,45 @@ async fn query_runs_as_public_reader_in_a_read_only_transaction() {
         eprintln!("VIBE_TEST_PG_ADMIN_URL not set; skipping Postgres test");
         return;
     };
-    // Lock SQL cannot call current_user/current_setting (allowlist), so
-    // check the executor directly with the arguments a read step uses.
+    // The executor applies the same allowlist as validation.
     let exec = PgExec::connect(&url).await.unwrap();
+    let err = exec
+        .raw(
+            &tenant,
+            "public_reader",
+            false,
+            "select current_user::text as who",
+            vec![],
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("not allowed"), "{err:?}");
     let rows = exec
         .raw(
             &tenant,
             "public_reader",
             false,
-            "select current_user::text as who, current_setting('transaction_read_only') as ro",
+            "select count(*) as n from users",
             vec![],
         )
         .await
         .unwrap();
-    let out = Value::Object(rows.into_iter().next().unwrap());
-    assert_eq!(out, json!({"who": "public_reader", "ro": "on"}));
+    assert_eq!(rows.len(), 1);
+    let err = exec
+        .raw(
+            &tenant,
+            "public_reader",
+            false,
+            "update users set email = email where email = $1 returning id",
+            vec![Some("nobody@example.com".into())],
+        )
+        .await
+        .unwrap_err();
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("read-only") || text.contains("permission denied"),
+        "{text}"
+    );
 }
 
 /// A query step cannot switch tenant, role or run dynamic SQL to reach

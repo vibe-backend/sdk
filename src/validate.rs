@@ -65,6 +65,7 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
     check_orphans(opts.root, &sources, &mut report);
     check_routes(&docs, &mut report);
     check_calls(&docs, &mut report);
+    check_targets(&docs, &mut report);
     check_migrations(&docs, &mut report);
     check_feature_method_writes(&docs, &mut report);
     let env_roles_claim = std::env::var("VIBE_JWT_ROLES_CLAIM").ok();
@@ -935,6 +936,76 @@ fn check_routes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
     }
 }
 
+/// CRUD actions every model provides without a method lock.
+pub const CRUD_ACTIONS: &[&str] = &["create", "get", "list", "update", "delete"];
+
+/// A feature step target must be `object.action`, where the action is a
+/// built-in CRUD action on an existing model or an existing method lock.
+pub fn check_method_target(target: &str, docs: &HashMap<String, LockDoc>) -> Result<(), String> {
+    let target = target.trim();
+    let ident = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    let Some((object, action)) = target.split_once('.') else {
+        return Err(format!(
+            "method target {target} must look like object.action"
+        ));
+    };
+    if !ident(object) || !ident(action) {
+        return Err(format!(
+            "method target {target} must look like object.action"
+        ));
+    }
+    let method = format!("{object}/methods/{action}");
+    if docs
+        .get(&method)
+        .is_some_and(|d| d.meta.kind == Kind::Method)
+    {
+        return Ok(());
+    }
+    let model = docs.get(object).is_some_and(|d| d.meta.kind == Kind::Model);
+    if model && CRUD_ACTIONS.contains(&action) {
+        return Ok(());
+    }
+    if !model
+        && !docs
+            .keys()
+            .any(|id| id.starts_with(&format!("{object}/methods/")))
+    {
+        return Err(format!(
+            "unknown method target {target}: no model or methods named {object}"
+        ));
+    }
+    Err(format!(
+        "unknown method target {target}: {action} is not a CRUD action ({}) or a method lock",
+        CRUD_ACTIONS.join(", ")
+    ))
+}
+
+fn check_targets(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    for doc in docs.values() {
+        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+            continue;
+        }
+        let Some(steps) = find_section(&doc.sections, "Steps") else {
+            continue;
+        };
+        for block in &steps.blocks {
+            if let Some(target) = block.bullets.iter().find(|b| b.key == "target") {
+                if let Err(err) = check_method_target(&target.value, docs) {
+                    report.push(
+                        Diag::error(lock_rel(&doc.meta.source), err)
+                            .at_step(&block.heading)
+                            .at_section("Steps"),
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn check_calls(docs: &HashMap<String, LockDoc>, report: &mut Report) {
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
     for doc in docs.values() {
@@ -1457,6 +1528,95 @@ mod tests {
     fn update_without_where_is_rejected() {
         let problems = sql_problems("update users set name = $1", "[input.name]", false);
         assert!(problems.iter().any(|p| p.contains("WHERE")));
+    }
+
+    fn doc(kind: Kind, scope: Option<Scope>, id: &str, body: &str) -> LockDoc {
+        LockDoc {
+            meta: crate::lock::Meta::pending(kind, scope, id, format!("{id}.md")),
+            sections: crate::lock::parse_sections(body).unwrap(),
+        }
+    }
+
+    fn target_docs() -> HashMap<String, LockDoc> {
+        let mut docs = HashMap::new();
+        docs.insert("product".into(), doc(Kind::Model, None, "product", ""));
+        docs.insert(
+            "product/methods/publish".into(),
+            doc(Kind::Method, None, "product/methods/publish", ""),
+        );
+        docs
+    }
+
+    #[test]
+    fn targets_accept_crud_actions_and_method_locks() {
+        let docs = target_docs();
+        for ok in [
+            "product.list",
+            "product.create",
+            "product.get",
+            "product.publish",
+        ] {
+            assert!(check_method_target(ok, &docs).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn unknown_actions_are_rejected() {
+        let docs = target_docs();
+        let err = check_method_target("product.nonexistent", &docs).unwrap_err();
+        assert!(err.contains("product.nonexistent"), "{err}");
+        for bad in [
+            "product",
+            "product.",
+            ".list",
+            "product.list.x",
+            "order.list",
+            "product.li st",
+        ] {
+            assert!(check_method_target(bad, &docs).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn validate_reports_unknown_feature_targets() {
+        let mut docs = target_docs();
+        let body = "## Steps\n### s1\n- op: method\n- target: product.nonexistent\n";
+        docs.insert(
+            "catalog/v1/x".into(),
+            doc(Kind::Api, Some(Scope::Feature), "api/catalog/v1/x/x", body),
+        );
+        let mut report = Report::new();
+        check_targets(&docs, &mut report);
+        assert!(
+            report
+                .errors()
+                .any(|d| d.message.contains("product.nonexistent")),
+            "{:?}",
+            report.diags
+        );
+    }
+
+    #[test]
+    fn prompt_examples_pass_the_validator() {
+        for (kind, scope, id) in [
+            (Kind::Method, None, "product/methods/create"),
+            (Kind::Api, Some(Scope::Feature), "catalog/v1/list-products"),
+        ] {
+            let prompt = crate::compile::system_prompt(kind, scope);
+            let body = prompt.split_once("LOCK BODY:\n").expect("example").1;
+            let lock = doc(kind, scope, id, body);
+            let names: Vec<&str> = lock.sections.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, section_order(kind, scope), "{id}");
+            let mut report = Report::new();
+            check_sections(&lock, id, &mut report);
+            let errors: Vec<_> = report.errors().collect();
+            assert!(errors.is_empty(), "{id}: {errors:?}");
+            let mut docs = target_docs();
+            docs.insert(id.into(), lock);
+            let mut report = Report::new();
+            check_targets(&docs, &mut report);
+            assert!(report.errors().next().is_none(), "{id}: {:?}", report.diags);
+        }
     }
 
     #[test]
