@@ -57,6 +57,9 @@ vibe manifest --project examples/shop -o manifest.json
 vibe serve --manifest manifest.json --project examples/shop --memory
 ```
 
+**Breaking (#31):** `vibe manifest` without `-o` writes `./manifest.json` relative to the current working directory (same as `-o` / `serve --manifest`), not `<project>/manifest.json`.
+
+
 `--memory` is a dev executor. PostgreSQL uses `VIBE_DATABASE_URL` (or `DATABASE_URL`):
 
 ```bash
