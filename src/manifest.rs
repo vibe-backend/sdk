@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::diag::{Diag, Report};
-use crate::discover;
-use crate::lock::{find_section, parse_lock, Kind, LockDoc, Scope};
+use crate::lock::{find_section, Kind, LockDoc, Scope};
 use crate::security::pipeline_name;
 use crate::sign;
 use crate::validate::{self, ValidateOptions};
@@ -241,8 +240,20 @@ pub struct MigrationSpec {
 }
 
 pub fn manifest_from_project(root: &Path, signing_key: &SigningKey) -> Result<Manifest, Report> {
-    validate::validate_project(&ValidateOptions { root, deploy: true })?;
-    let docs = load_docs(root)?;
+    // Read every lock once; validate and build from the same in-memory text.
+    let loaded = validate::load_project(root)?;
+    manifest_from_loaded(root, &loaded, signing_key)
+}
+
+/// Validates (deploy rules, including the recompile check) and builds the
+/// manifest from exactly the loaded lock texts; nothing is re-read.
+pub fn manifest_from_loaded(
+    root: &Path,
+    loaded: &validate::LoadedProject,
+    signing_key: &SigningKey,
+) -> Result<Manifest, Report> {
+    let (result, docs) = validate::validate_loaded(&ValidateOptions { root, deploy: true }, loaded);
+    result?;
     let mut manifest = build_manifest(&docs)?;
     manifest.signature = String::new();
     let bytes =
@@ -256,7 +267,14 @@ pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), Report> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| single(err.to_string()))?;
     }
-    fs::write(path, json).map_err(|err| single(err.to_string()))
+    // Write to a temp file and rename, so a failure never leaves a partial
+    // manifest behind.
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if let Err(err) = fs::write(&tmp, json).and_then(|_| fs::rename(&tmp, path)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(single(err.to_string()));
+    }
+    Ok(())
 }
 
 pub fn read_manifest(path: &Path, key: &VerifyingKey) -> Result<Manifest, Report> {
@@ -326,27 +344,6 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
         migrations,
         signature: String::new(),
     })
-}
-
-fn load_docs(root: &Path) -> Result<HashMap<String, LockDoc>, Report> {
-    let sources = discover::discover(root)?;
-    let mut docs = HashMap::new();
-    let mut report = Report::new();
-    for source in sources {
-        let path = root.join(source.rel.trim_end_matches(".md").to_string() + ".lock.md");
-        let text = fs::read_to_string(&path).map_err(|err| single(err.to_string()))?;
-        match parse_lock(&text) {
-            Ok(doc) => {
-                docs.insert(doc.meta.id.clone(), doc);
-            }
-            Err(err) => report.push(Diag::error(source.rel, err)),
-        }
-    }
-    if report.has_errors() {
-        Err(report)
-    } else {
-        Ok(docs)
-    }
 }
 
 fn model_from(doc: &LockDoc) -> ModelSpec {

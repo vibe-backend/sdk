@@ -845,3 +845,100 @@ async fn manifest_output_is_relative_to_the_current_directory() {
     assert!(cwd.join("out.json").exists());
     assert!(!root.join("out.json").exists());
 }
+
+const PRODUCT_LOCK: &str = "models/product/product.lock.md";
+
+fn tamper_product_lock(root: &Path) {
+    let lock = root.join(PRODUCT_LOCK);
+    let text = fs::read_to_string(&lock).unwrap();
+    assert!(text.contains("max: 120"), "{text}");
+    fs::write(&lock, text.replacen("max: 120", "max: 100000", 1)).unwrap();
+}
+
+fn deploy_validate(root: &Path) -> Result<vibe::diag::Report, vibe::diag::Report> {
+    vibe::validate::validate_project(&vibe::validate::ValidateOptions { root, deploy: true })
+}
+
+#[tokio::test]
+async fn deploy_validate_rejects_a_hand_edited_lock() {
+    let root = compiled_shop().await;
+    deploy_validate(&root).unwrap_or_else(|err| panic!("{err}"));
+    tamper_product_lock(&root);
+    let text = deploy_validate(&root).unwrap_err().to_string();
+    assert!(text.contains(PRODUCT_LOCK), "{text}");
+    assert!(text.contains("does not match a recompile"), "{text}");
+    // Plain (non-deploy) validation keeps working for local edits.
+    vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+        root: &root,
+        deploy: false,
+    })
+    .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[tokio::test]
+async fn manifest_refuses_a_hand_edited_lock_and_writes_nothing() {
+    let root = compiled_shop().await;
+    tamper_product_lock(&root);
+    let key = sign::generate_key();
+    let err = manifest_from_project(&root, &key).unwrap_err().to_string();
+    assert!(err.contains("does not match a recompile"), "{err}");
+    let out = root.join("out/manifest.json");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_vibe"))
+        .args(["manifest", "--project"])
+        .arg(&root)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    assert!(!out.exists(), "no partial manifest");
+}
+
+#[tokio::test]
+async fn manifest_refuses_locks_that_fail_validation() {
+    let root = compiled_shop().await;
+    let lock = root.join("api/catalog/v1/get-product/get-product.lock.md");
+    let text = fs::read_to_string(&lock).unwrap();
+    fs::write(&lock, text.replace("name: md-logic", "name: hand-edited")).unwrap();
+    let key = sign::generate_key();
+    let err = manifest_from_project(&root, &key).unwrap_err().to_string();
+    assert!(err.contains("compiler name is not md-logic"), "{err}");
+}
+
+#[tokio::test]
+async fn manifest_refuses_stale_locks() {
+    let root = compiled_shop().await;
+    let source = root.join("api/catalog/v1/get-product/get-product.md");
+    let text = fs::read_to_string(&source).unwrap();
+    fs::write(&source, text.replace("timeout: 10s", "timeout: 9s")).unwrap();
+    let key = sign::generate_key();
+    let err = manifest_from_project(&root, &key).unwrap_err().to_string();
+    assert!(err.contains("source-hash does not match"), "{err}");
+}
+
+#[tokio::test]
+async fn manifest_uses_the_validated_text_not_a_later_edit() {
+    // #34: read once; an edit after loading cannot reach the signed output.
+    let root = compiled_shop().await;
+    let loaded = vibe::validate::load_project(&root).unwrap();
+    tamper_product_lock(&root);
+    let key = sign::generate_key();
+    let manifest = vibe::manifest::manifest_from_loaded(&root, &loaded, &key)
+        .unwrap_or_else(|err| panic!("{err}"));
+    let json = serde_json::to_string(&manifest).unwrap();
+    assert!(
+        !json.contains("100000"),
+        "tampered value leaked into the manifest"
+    );
+    assert!(json.contains("120"));
+}
+
+#[tokio::test]
+async fn manifest_with_only_warnings_builds_and_reports_them() {
+    let root = compiled_shop().await;
+    let report = deploy_validate(&root).unwrap_or_else(|err| panic!("{err}"));
+    assert!(report.to_string().contains("no owner-key"), "{report}");
+    assert!(!report.has_errors());
+    let key = sign::generate_key();
+    manifest_from_project(&root, &key).unwrap_or_else(|err| panic!("{err}"));
+}

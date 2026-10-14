@@ -2,7 +2,7 @@
 
 ## 用途
 
-要求 API 定義下的每個 endpoint 都帶有效的 JWT。`auth` 是內置 pipeline（§4），其 lock 由平台提供並簽名；你只需啟用它並傳入參數（`mode`、`roles`，以及選填的 `iss`、`aud`、`jwks-uri`）（§4.1、Decision 44）。在 `_definition.md` 宣告一次，即由所有 version 和 feature 繼承（§3），需要時再按 feature 限制 roles。
+要求 API 定義下的每個 endpoint 都帶有效的 JWT。`auth` 是內置 pipeline（§4），其 lock 由平台提供；你只需啟用它並傳入參數（`mode`、`roles`，以及選填的 `iss`、`aud`、`jwks-uri`）（§4.1、Decision 44）。在 `_definition.md` 宣告一次，即由所有 version 和 feature 繼承（§3），需要時再按 feature 限制 roles。
 
 範例 feature 是 §11.4 的 admin **create-user** endpoint。v1.7 起它不再設定密碼：它建立一個未驗證、沒有密碼的用戶，並寄出**邀請**（Decision 69）。
 
@@ -64,14 +64,7 @@ dependencies:
   - { id: users/v2/_version, kind: api, hash: sha256:0d9e...51 }
 compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
-status: approved
-approval-mode: manual
-approved-by: [jack@example, mei@example]
-approved-at: 2026-10-14T08:10:00+08:00
-approval-ref: pr#122
-approved-commit: a1b2c122
-security-items: [{ item: roles, risk: high, reason: "Only admin may create users", approved-by: [jack@example, mei@example] }]
-signature: MEUCIG...
+security-items: [{ item: roles, risk: high, reason: "Only admin may create users" }]
 ---
 ## Route
 - method: POST

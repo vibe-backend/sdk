@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::Path;
 
 use crate::diag::{Diag, Report};
@@ -29,12 +30,66 @@ pub struct CompileOutput {
 
 pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, Report> {
     let sources = discover::discover(opts.root)?;
+    let (docs, ordered, mut report) = compile_docs(
+        &sources,
+        CompileOptions {
+            root: opts.root,
+            llm: opts.llm,
+            llm_config: opts.llm_config,
+            check: opts.check,
+        },
+        &HashMap::new(),
+    )
+    .await?;
+    write_or_check(opts, &docs, &ordered, &mut report)
+}
+
+/// Recompiles structured sources in memory, without an LLM and without
+/// touching the disk. Natural-language sources cannot be recompiled offline,
+/// so their parsed locks are passed in `natural` and used as-is (they still
+/// feed dependency hashes). CI runs `vibe compile --check` with the LLM for
+/// those.
+pub fn recompile_offline(
+    root: &Path,
+    sources: &[SourceFile],
+    natural: &HashMap<String, LockDoc>,
+) -> Result<HashMap<String, LockDoc>, Report> {
+    let opts = CompileOptions {
+        root,
+        llm: None,
+        llm_config: None,
+        check: true,
+    };
+    let mut fut = std::pin::pin!(compile_docs(sources, opts, natural));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match fut.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(result) => result.map(|(docs, _, _)| docs),
+        // Without an adapter nothing awaits I/O, so this cannot happen.
+        std::task::Poll::Pending => {
+            let mut report = Report::new();
+            report.push(Diag::error(
+                "",
+                "offline recompile unexpectedly needed an LLM",
+            ));
+            Err(report)
+        }
+    }
+}
+
+type Compiled = (HashMap<String, LockDoc>, Vec<String>, Report);
+
+async fn compile_docs(
+    sources: &[SourceFile],
+    opts: CompileOptions<'_>,
+    natural: &HashMap<String, LockDoc>,
+) -> Result<Compiled, Report> {
+    let opts = &opts;
     let mut report = Report::new();
     let stamp = stamp_from(opts.llm_config);
     let mut docs: HashMap<String, LockDoc> = HashMap::new();
     let mut ordered: Vec<String> = Vec::new();
 
-    let mut ranked = sources.clone();
+    let mut ranked = sources.to_vec();
     ranked.sort_by_key(|source| (rank(source), source.rel.clone()));
 
     for source in &ranked {
@@ -51,6 +106,13 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
             continue;
         }
         let structured = is_structured_source(&source.combined_text());
+        if !structured {
+            if let Some(doc) = natural.get(&source.id) {
+                ordered.push(source.id.clone());
+                docs.insert(source.id.clone(), doc.clone());
+                continue;
+            }
+        }
         if !structured && opts.llm.is_none() {
             report.push(Diag::error(
                 &source.rel,
@@ -157,9 +219,17 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
     if report.has_errors() {
         return Err(report);
     }
+    Ok((docs, ordered, report))
+}
 
+fn write_or_check(
+    opts: &CompileOptions<'_>,
+    docs: &HashMap<String, LockDoc>,
+    ordered: &[String],
+    report: &mut Report,
+) -> Result<CompileOutput, Report> {
     let mut files = Vec::new();
-    for id in &ordered {
+    for id in ordered {
         let doc = &docs[id];
         let rel = lock_rel(&doc.meta.source);
         let path = opts.root.join(&rel);
@@ -193,6 +263,7 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         }
         files.push(rel);
     }
+    let report = std::mem::take(report);
     if report.has_errors() {
         return Err(report);
     }

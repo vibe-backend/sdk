@@ -57,15 +57,8 @@ dependencies:
   - { id: user/methods/sign-token, kind: method, hash: sha256:3b90...d4 }
 compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
-status: approved
-approval-mode: manual
-approved-by: [jack@example, mei@example]
-approved-at: 2026-10-14T08:25:00+08:00
-approval-ref: pr#125
-approved-commit: a1b2c125
 security-items:
-  - { item: write-sql, risk: medium, reason: "Records last login time", approved-by: [jack@example] }
-signature: MEUCIQ...
+  - { item: write-sql, risk: medium, reason: "Records last login time" }
 ---
 ## Signature
 - input: { email: { type: string, format: email, required: true }, password: { type: string, min: 1, max: 256, required: true } }
@@ -217,7 +210,7 @@ The model lock marks `last_login_at` `public-writable` and includes `UPDATE(last
 - Exclude soft-deleted users (`deleted_at is null`).
 - **Password hashing** (Decision 46): argon2id m=64 MiB, t=3, p=1; on successful login the platform rehashes automatically if stored PHC parameters differ, using the `credential_rehash` role (§4A.2). Locks do not declare this write.
 - **Refresh token**: returned alongside the access token; stored only as an HMAC hash in `_platform_refresh_tokens` (Decision 45). See [refresh-token-rotation.md](refresh-token-rotation.md).
-- Review highlights: `public: true`, `-auth`, `public-writes: true` (high, two approvers each) plus the write SQL (medium) (§12.8).
+- Review highlights: `public: true`, `-auth`, `public-writes: true` (high) plus the write SQL (medium) (§12.8).
 
 ## Spec gaps
 

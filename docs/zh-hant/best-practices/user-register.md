@@ -87,15 +87,8 @@ dependencies:
   - { id: user, kind: model, hash: sha256:aa41...0f }
 compiler: { name: md-logic, version: 2.0.0, model-snapshot: <model id reported by the provider>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: {} }
 compiler-hash: sha256:c0de...77
-status: approved
-approval-mode: manual
-approved-by: [jack@example, mei@example]
-approved-at: 2026-10-14T15:40:00+08:00
-approval-ref: pr#150
-approved-commit: a1b2c150
 security-items:
-  - { item: write-sql, risk: medium, reason: "Create unverified user or rotate verification token", approved-by: [jack@example] }
-signature: MEYCIQ...
+  - { item: write-sql, risk: medium, reason: "Create unverified user or rotate verification token" }
 ---
 ## Signature
 - input: { email: { type: string, format: email, max: 254, required: true }, name: { type: string, min: 1, max: 50, required: true } }
