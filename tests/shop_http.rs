@@ -150,6 +150,17 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
     assert!(denied.headers.contains_key("www-authenticate"));
 
+    // Unauthenticated callers get 401 before any schema validation.
+    let probe = send(
+        &app,
+        "POST",
+        "/catalog/v1/products",
+        None,
+        Some(json!({"no_such_field": 1})),
+    )
+    .await;
+    assert_eq!(probe.status, StatusCode::UNAUTHORIZED);
+
     let forbidden = send(
         &app,
         "POST",
@@ -160,6 +171,19 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     .await;
     assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
 
+    let array_body = send(
+        &app,
+        "POST",
+        "/catalog/v1/products",
+        Some(staff.clone()),
+        Some(json!([{"sku": "x"}])),
+    )
+    .await;
+    assert_eq!(array_body.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        array_body.json["error"]["message"],
+        "body must be a JSON object"
+    );
     for bad_tenant in [
         "zzzzzzzz, t_tenant0001",
         "TENANT0001",
