@@ -1,16 +1,24 @@
 <header class="page-head reveal"><p class="eyebrow">快速入門</p><h1>你的第一個端點。</h1><p class="lead">依照 <a href="docs/spec.html">規格 v1.5</a>，看看一個 vibe-backend 專案長甚麼樣子。</p></header>
 <section class="prose">
 <h2 class="reveal"><span class="num">1</span>建立專案結構</h2>
-<pre data-lang="plaintext" class="reveal">
+<pre data-tree data-label="專案結構" class="reveal">
 project/
-  providers/main.md                     # 資料庫 provider（預設為 PostgreSQL）
-  pipelines/login-guard.md              # 可重用的請求 pipeline
-  models/user/user.md                   # model 定義
-  models/user/methods/sign-token.md     # model method
-  api/users/_definition.md              # "users" API 的共用設定
-  api/users/v1/_version.md              # v1 版本的設定
-  api/users/v1/login/login.md           # 入口：POST /users/v1/login
+├── providers/
+│   └── main.md  # 資料庫 provider（預設為 PostgreSQL）
+├── pipelines/
+│   └── login-guard.md  # 可重用的請求 pipeline
+├── migrations/main/
+│   └── 0001-create-users.md  # 資料庫 migration（4 位數序號）
+├── models/user/
+│   ├── user.md  # model 定義
+│   └── methods/sign-token.md  # model method
+└── api/users/
+    ├── _definition.md  # 「users」API 的共用設定
+    └── v1/
+        ├── _version.md  # v1 版本的設定
+        └── login/login.md  # 入口：POST /users/v1/login
 </pre>
+<p class="reveal tree-note">編譯後的 <code>.lock.md</code> 會出現在每個 source 檔旁邊，此處從略。</p>
 <p class="reveal">所有名稱一律使用 kebab-case（<code>a-z0-9-</code>）。以 <code>_</code> 開頭的檔案為保留檔，永遠不會被路由。</p>
 <h2 class="reveal"><span class="num">2</span>用自然語言描述功能</h2>
 <p class="reveal">feature 檔說明這個端點要做甚麼。可以加上用途、輸入、輸出、做法、錯誤、權限等小標題，幫助編譯器理解（非必要）。</p>

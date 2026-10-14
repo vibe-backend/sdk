@@ -159,23 +159,34 @@
 
 ```text
 project/
-  providers/{name}.md
-  providers/{name}.lock.md
-  pipelines/{name}.md
-  pipelines/{name}.lock.md
-  migrations/{provider}/{seq}-{name}.md
-  migrations/{provider}/{seq}-{name}.lock.md
-  models/{object}/{object}.md
-  models/{object}/{object}.lock.md
-  models/{object}/methods/{method}.md
-  models/{object}/methods/{method}.lock.md
-  api/{definition}/_definition.md
-  api/{definition}/_definition.lock.md
-  api/{definition}/{version}/_version.md
-  api/{definition}/{version}/_version.lock.md
-  api/{definition}/{version}/{feature}/{feature}.md
-  api/{definition}/{version}/{feature}/{feature}.lock.md
-  api/{definition}/{version}/{feature}/schema.md      # 選填，自然語言欄位補充說明，會併入 feature 嘅 lock
+├── providers/
+│   ├── {name}.md
+│   └── {name}.lock.md
+├── pipelines/
+│   ├── {name}.md
+│   └── {name}.lock.md
+├── migrations/
+│   └── {provider}/
+│       ├── {seq}-{name}.md
+│       └── {seq}-{name}.lock.md
+├── models/
+│   └── {object}/
+│       ├── {object}.md
+│       ├── {object}.lock.md
+│       └── methods/
+│           ├── {method}.md
+│           └── {method}.lock.md
+└── api/
+    └── {definition}/
+        ├── _definition.md
+        ├── _definition.lock.md
+        └── {version}/
+            ├── _version.md
+            ├── _version.lock.md
+            └── {feature}/
+                ├── {feature}.md
+                ├── {feature}.lock.md
+                └── schema.md      # 選填，自然語言欄位補充說明，會併入 feature 嘅 lock
 ```
 
 - 所有名一律用 kebab-case，只准 `a-z0-9-`。
