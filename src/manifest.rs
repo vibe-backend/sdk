@@ -35,6 +35,10 @@ pub struct RouteSpec {
     pub auth_mode: String,
     pub roles: Vec<String>,
     pub scopes: Vec<String>,
+    /// Claim that holds roles for this route (`roles-claim`); empty means the
+    /// runtime default.
+    #[serde(default)]
+    pub roles_claim: String,
     pub rates: Vec<RateSpec>,
     pub body_limit: u64,
     pub request: Vec<ReqField>,
@@ -54,6 +58,80 @@ pub struct RouteSpec {
 pub struct RateSpec {
     pub per_minute: u32,
     pub key: String,
+}
+
+/// Checks a `rate-limit` key against spec §4.3. Supported here: `ip`,
+/// `tenant`, `user` (needs auth), `api-key` (needs api-key auth),
+/// `input.{field}`, and the legacy login-guard `account` (= `input.email`).
+/// `family` needs the platform `token-refresh` pipeline, which this runtime
+/// does not provide, so it is rejected rather than silently keyed by IP.
+/// Rate-limit parameters this runtime does not enforce. They are rejected
+/// rather than silently ignored.
+pub const UNSUPPORTED_RATE_PARAMS: [&str; 3] = ["per-hour", "per-day", "burst"];
+
+pub fn check_rate_params<'a>(keys: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    for key in keys {
+        if UNSUPPORTED_RATE_PARAMS.contains(&key) {
+            return Err(format!(
+                "rate-limit `{key}` is not supported by this runtime (only per-minute); remove it rather than rely on it"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Highest accepted `per-minute` value (bounds per-bucket memory).
+pub const MAX_PER_MINUTE: u32 = 10_000;
+
+/// Route-level rate rules: every limit is within [`MAX_PER_MINUTE`], and an
+/// `input.*`/`account` limit must be paired with an `ip` limit. Otherwise a
+/// client could rotate input values to dodge a per-input limit.
+pub fn check_rate_set(rates: &[RateSpec]) -> Result<(), String> {
+    for rate in rates {
+        if rate.per_minute == 0 || rate.per_minute > MAX_PER_MINUTE {
+            return Err(format!(
+                "rate-limit per-minute must be between 1 and {MAX_PER_MINUTE} (got {})",
+                rate.per_minute
+            ));
+        }
+    }
+    let input_keyed = rates
+        .iter()
+        .any(|r| r.key == "account" || r.key.starts_with("input."));
+    if input_keyed && !rates.iter().any(|r| r.key == "ip") {
+        return Err(
+            "a rate-limit keyed by input.* or account must be paired with an `ip` rate-limit on the same route"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+pub fn check_rate_key(key: &str, auth_removed: bool, auth_mode: &str) -> Result<(), String> {
+    match key {
+        "ip" | "tenant" | "account" => Ok(()),
+        "user" if auth_removed => Err("rate-limit key `user` needs auth".into()),
+        "user" => Ok(()),
+        "api-key" if auth_removed || auth_mode != "api-key" => {
+            Err("rate-limit key `api-key` needs `auth: { mode: api-key }`".into())
+        }
+        "api-key" => Ok(()),
+        "family" => Err(
+            "rate-limit key `family` is only for token-refresh, which is not implemented yet (see #26)"
+                .into(),
+        ),
+        _ => match key.strip_prefix("input.") {
+            Some(field)
+                if !field.is_empty()
+                    && field
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                Ok(())
+            }
+            _ => Err(format!("unknown rate-limit key `{key}`")),
+        },
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -439,6 +517,7 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
     let mut auth_mode = "jwt".to_string();
     let mut roles = Vec::new();
     let mut scopes = Vec::new();
+    let mut roles_claim = String::new();
     let mut rates = Vec::new();
     if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
         for block in &pipes.blocks {
@@ -457,13 +536,30 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
                     auth_mode = mode.value.clone();
                 }
                 if let Some(raw) = block.bullets.iter().find(|b| b.key == "roles") {
-                    roles = crate::lock::parse_string_list(&raw.value).unwrap_or_default();
+                    // A malformed roles list is a build error, never "no roles"
+                    // (which would let any JWT reach role-gated handlers).
+                    roles = crate::lock::parse_string_list(&raw.value).map_err(|err| {
+                        Diag::error(&doc.meta.id, format!("invalid roles: {err}"))
+                            .at_section("Pipelines")
+                    })?;
                 }
                 if let Some(raw) = block.bullets.iter().find(|b| b.key == "scopes") {
-                    scopes = crate::lock::parse_string_list(&raw.value).unwrap_or_default();
+                    // A malformed scopes list is a build error, never "no scopes".
+                    scopes = crate::lock::parse_string_list(&raw.value).map_err(|err| {
+                        Diag::error(&doc.meta.id, format!("invalid scopes: {err}"))
+                            .at_section("Pipelines")
+                    })?;
+                }
+                if let Some(raw) = block.bullets.iter().find(|b| b.key == "roles-claim") {
+                    roles_claim = raw.value.trim().to_string();
+                    if let Some(problem) = roles_claim_problem(&roles_claim) {
+                        return Err(Diag::error(&doc.meta.id, problem).at_section("Pipelines"));
+                    }
                 }
             }
             if name == "rate-limit" {
+                check_rate_params(block.bullets.iter().map(|b| b.key.as_str()))
+                    .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
                 let per_minute = block
                     .bullets
                     .iter()
@@ -494,6 +590,11 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
             }
         }
     }
+    for rate in &rates {
+        check_rate_key(&rate.key, auth_removed, &auth_mode)
+            .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
+    }
+    check_rate_set(&rates).map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
     let body_limit = find_section(&doc.sections, "Limits")
         .and_then(|s| s.get("body"))
         .map(validate::parse_bytes)
@@ -515,6 +616,7 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         auth_mode,
         roles,
         scopes,
+        roles_claim,
         rates,
         body_limit,
         request: request_fields(find_section(&doc.sections, "Request")),
@@ -718,4 +820,150 @@ pub fn method<'a>(manifest: &'a Manifest, target: &str) -> Option<&'a MethodSpec
 
 pub fn json_null() -> Value {
     Value::Null
+}
+
+/// JWT claims that carry identity or token metadata; a roles claim must never
+/// read them, or a token's own `aud`/`scope`/`sub` would become roles.
+pub const RESERVED_JWT_CLAIMS: &[&str] = &[
+    "iss",
+    "sub",
+    "aud",
+    "exp",
+    "nbf",
+    "iat",
+    "jti",
+    "tenant_id",
+    "scope",
+    "scp",
+    "azp",
+    "kid",
+    "alg",
+    "typ",
+    "cnf",
+    "nonce",
+    "auth_time",
+    "acr",
+    "amr",
+    "sid",
+];
+
+/// Why `name` cannot be a roles claim, if it cannot. Dotted paths
+/// (`realm_access.roles`) are allowed and resolved as nested JSON; reserved
+/// claim names (and any path segment that is reserved) are refused.
+pub fn roles_claim_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("roles-claim must not be empty".into());
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some(format!("roles-claim `{name}` must not contain whitespace"));
+    }
+    // URL-style claims (Auth0) are matched as a single key, not a path.
+    if name.contains("://") {
+        if RESERVED_JWT_CLAIMS.contains(&name.to_ascii_lowercase().as_str()) {
+            return Some(format!("roles-claim `{name}` is a reserved JWT claim"));
+        }
+        return None;
+    }
+    for segment in name.split('.') {
+        if segment.is_empty() {
+            return Some(format!("roles-claim `{name}` has an empty path segment"));
+        }
+        if RESERVED_JWT_CLAIMS.contains(&segment.to_ascii_lowercase().as_str()) {
+            return Some(format!(
+                "roles-claim `{name}` must not use reserved claim `{segment}`"
+            ));
+        }
+        if !segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Some(format!(
+                "roles-claim `{name}` path segments must be alphanumeric/_/-"
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod roles_claim_tests {
+    use super::roles_claim_problem;
+
+    #[test]
+    fn reserved_and_dotted_claims_are_refused() {
+        for bad in [
+            "aud",
+            "tenant_id",
+            "scope",
+            "ISS",
+            "sub",
+            "exp",
+            "roles.aud",
+            "",
+        ] {
+            assert!(roles_claim_problem(bad).is_some(), "{bad}");
+        }
+        for ok in [
+            "roles",
+            "groups",
+            "https://example.com/roles",
+            "realm_access.roles",
+        ] {
+            assert!(roles_claim_problem(ok).is_none(), "{ok}");
+        }
+    }
+}
+#[cfg(test)]
+mod roles_list_tests {
+    #[test]
+    fn malformed_roles_list_is_a_build_error() {
+        let err = crate::lock::parse_string_list("staff").unwrap_err();
+        assert!(err.contains("expected a list"), "{err}");
+        // Same path route_from uses: error, never empty vec.
+        assert!(crate::lock::parse_string_list("staff")
+            .map_err(|e| format!("invalid roles: {e}"))
+            .is_err());
+        assert_eq!(
+            crate::lock::parse_string_list("[staff]").unwrap(),
+            vec!["staff"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod rate_key_tests {
+    use super::check_rate_key;
+
+    #[test]
+    fn accepts_spec_keys_and_rejects_others() {
+        for ok in ["ip", "tenant", "user", "input.email", "account"] {
+            assert!(check_rate_key(ok, false, "jwt").is_ok(), "{ok}");
+        }
+        assert!(check_rate_key("api-key", false, "api-key").is_ok());
+        assert!(check_rate_key("api-key", false, "jwt").is_err());
+        assert!(check_rate_key("user", true, "jwt").is_err());
+        let family = check_rate_key("family", false, "jwt").unwrap_err();
+        assert!(
+            family.contains("family is only for token-refresh")
+                || family.contains("`family` is only for token-refresh")
+        );
+        assert!(family.contains("not implemented") && family.contains("#26"));
+        for bad in ["per-hour", "per-day", "burst"] {
+            assert!(super::check_rate_params(["key", bad]).is_err(), "{bad}");
+        }
+        assert!(super::check_rate_params(["key", "per-minute"]).is_ok());
+        let r = |key: &str, per_minute| super::RateSpec {
+            per_minute,
+            key: key.into(),
+        };
+        assert!(super::check_rate_set(&[r("input.email", 5)]).is_err());
+        assert!(super::check_rate_set(&[r("account", 5)]).is_err());
+        assert!(super::check_rate_set(&[r("input.email", 5), r("ip", 10)]).is_ok());
+        assert!(super::check_rate_set(&[r("ip", 0)]).is_err());
+        assert!(super::check_rate_set(&[r("ip", 10_001)]).is_err());
+        assert!(super::check_rate_set(&[r("tenant", 10_000)]).is_ok());
+        for bad in ["family", "req.ip", "input.", "input.a-b", "everyone"] {
+            assert!(check_rate_key(bad, false, "jwt").is_err(), "{bad}");
+        }
+    }
 }

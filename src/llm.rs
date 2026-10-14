@@ -527,6 +527,65 @@ pub struct HttpAdapter {
     client: Client,
 }
 
+/// Masks API keys and common secret query/fragment params. Shared by
+/// `describe_failure` and transport-error paths so secrets are never printed.
+pub fn mask_secrets(text: &str, api_key: &str) -> String {
+    let mut out = text.to_string();
+    if api_key.len() >= 4 {
+        out = out.replace(api_key, "***");
+    }
+    // Query, fragment, and `;`-separated params: key / api_key / token / …
+    static KEY_PARAM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)([?&#;](?:key|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|token|secret|password|auth)=)[^&\s#;]*",
+        )
+        .expect("regex")
+    });
+    KEY_PARAM.replace_all(&out, "${1}***").into_owned()
+}
+
+/// Explains a failed or non-JSON LLM response. Only 401/403 blame the key;
+/// HTML (or a 404) hints at the base URL. The request URL and a short body
+/// excerpt are included, with the API key and secret query values masked.
+pub fn describe_failure(
+    url: &str,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    api_key: &str,
+) -> String {
+    let shown_url = mask_secrets(url, api_key);
+    let raw = String::from_utf8_lossy(body);
+    let excerpt: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Mask the full body first so a key straddling the 200-char cut cannot leak.
+    let excerpt = mask_secrets(&excerpt, api_key);
+    let excerpt: String = excerpt.chars().take(200).collect();
+    let html = content_type.to_ascii_lowercase().contains("text/html")
+        || excerpt
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("<!doctype html")
+        || excerpt
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("<html");
+    let lead = match status {
+        401 | 403 => format!("LLM_API_KEY was rejected (http {status})"),
+        404 => format!("LLM endpoint not found (http {status})"),
+        429 => format!("LLM rate limit or quota exceeded (http {status})"),
+        400 => format!("LLM request rejected (http {status}); check LLM_MODEL and the provider"),
+        s if s >= 500 => format!("LLM provider error (http {s})"),
+        s if (200..300).contains(&s) => "LLM response was not JSON".to_string(),
+        s => format!("LLM request failed (http {s})"),
+    };
+    let hint = if html || status == 404 {
+        "; the response looks like a web page, not an API: check LLM_BASE_URL (OpenAI-compatible endpoints usually end in /v1)"
+    } else {
+        ""
+    };
+    format!("{lead}{hint}. URL: {shown_url}. Response: {excerpt}")
+}
+
 impl HttpAdapter {
     pub fn new(config: LlmConfig) -> Result<Self, String> {
         let client = Client::builder()
@@ -588,25 +647,40 @@ impl HttpAdapter {
             builder = builder.header(key, value);
         }
         let response = builder.send().await.map_err(|err| CallError {
-            message: format!("LLM request failed: {err}"),
+            message: mask_secrets(&format!("LLM request failed: {err}"), &self.config.api_key),
             retryable: true,
         })?;
         let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let bytes = response.bytes().await.map_err(|err| CallError {
-            message: format!("LLM response body: {err}"),
+            message: mask_secrets(&format!("LLM response body: {err}"), &self.config.api_key),
             retryable: true,
         })?;
         if !status.is_success() {
             return Err(CallError {
-                message: format!(
-                    "LLM_API_KEY is missing or invalid (http {})",
-                    status.as_u16()
+                message: describe_failure(
+                    &url,
+                    status.as_u16(),
+                    &content_type,
+                    &bytes,
+                    &self.config.api_key,
                 ),
                 retryable: status.is_server_error() || status.as_u16() == 429,
             });
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| CallError {
-            message: "LLM response was not JSON".into(),
+            message: describe_failure(
+                &url,
+                status.as_u16(),
+                &content_type,
+                &bytes,
+                &self.config.api_key,
+            ),
             retryable: false,
         })?;
         let parsed = match self.config.provider.as_str() {
@@ -937,5 +1011,93 @@ mod tests {
         let adapter = HttpAdapter::new(cfg).expect("adapter");
         assert!(!adapter.capabilities().tools);
         assert!(adapter.capabilities().seed);
+    }
+}
+
+#[cfg(test)]
+mod failure_message_tests {
+    use super::describe_failure;
+
+    #[test]
+    fn only_auth_failures_blame_the_key() {
+        let m = describe_failure(
+            "https://api.x/v1/chat/completions",
+            401,
+            "application/json",
+            b"{}",
+            "sk-secret",
+        );
+        assert!(m.contains("LLM_API_KEY was rejected"));
+        for status in [400, 404, 429, 500] {
+            let m = describe_failure(
+                "https://api.x/v1/chat/completions",
+                status,
+                "application/json",
+                b"{}",
+                "k",
+            );
+            assert!(!m.contains("LLM_API_KEY"), "{status}: {m}");
+            assert!(m.contains(&status.to_string()));
+        }
+    }
+
+    #[test]
+    fn html_hints_at_the_base_url_and_secrets_are_masked() {
+        let m = describe_failure(
+            "https://api.openai.com/chat/completions",
+            200,
+            "text/html; charset=utf-8",
+            b"<!DOCTYPE html><html>sk-secret-value</html>",
+            "sk-secret-value",
+        );
+        assert!(m.contains("not JSON") && m.contains("/v1"), "{m}");
+        assert!(!m.contains("sk-secret-value"), "{m}");
+        let m = describe_failure(
+            "https://g.example/v1beta/models/x:generateContent?key=AIzaSECRET",
+            404,
+            "text/html",
+            b"<html>nope</html>",
+            "AIzaSECRET",
+        );
+        assert!(!m.contains("AIzaSECRET") && m.contains("key=***"), "{m}");
+        assert!(m.contains("LLM_BASE_URL"));
+    }
+
+    #[test]
+    fn mask_runs_before_truncate_so_straddling_keys_do_not_leak() {
+        let key = "sk-STRADDLE-SECRET-KEY-VALUE";
+        // 190 filler chars + key → key straddles the 200-char boundary if we
+        // truncated first; masking first removes it entirely.
+        let filler: String = "x".repeat(190);
+        let body = format!("{filler} {key} trailing");
+        let m = describe_failure(
+            "https://api.example/v1/chat",
+            500,
+            "text/plain",
+            body.as_bytes(),
+            key,
+        );
+        assert!(!m.contains("sk-STRADDLE"), "{m}");
+        assert!(!m.contains(key), "{m}");
+        assert!(m.contains("***"), "{m}");
+    }
+
+    #[test]
+    fn query_and_fragment_tokens_are_masked() {
+        for url in [
+            "https://api.example/v1?access_token=tok123&x=1",
+            "https://api.example/v1?password=s3cret&token=tOk",
+            "https://api.example/v1#api_key=fragsecret",
+            "https://api.example/v1?a=1;secret=s3cret",
+            "https://api.example/v1?apikey=ak1value",
+        ] {
+            let m = describe_failure(url, 400, "text/plain", b"ok", "unused-key-here");
+            assert!(!m.contains("tok123"), "{m}");
+            assert!(!m.contains("fragsecret"), "{m}");
+            assert!(!m.contains("s3cret"), "{m}");
+            assert!(!m.contains("ak1value"), "{m}");
+            assert!(!m.contains("tOk"), "{m}");
+            assert!(m.contains("***"), "{m}");
+        }
     }
 }

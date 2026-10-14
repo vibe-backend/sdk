@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -59,6 +58,7 @@ enum Command {
     Manifest {
         #[arg(long, default_value = ".")]
         project: PathBuf,
+        /// Output path, relative to the current directory (like `serve --manifest`).
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
     },
@@ -324,11 +324,8 @@ fn cmd_approve(
 fn cmd_manifest(project: &Path, output: &Path) -> Result<(), String> {
     let key = sign::load_or_create(project).map_err(|err| err.to_string())?;
     let manifest = manifest::manifest_from_project(project, &key).map_err(|err| err.to_string())?;
-    let path = if output.is_absolute() {
-        output.to_path_buf()
-    } else {
-        project.join(output)
-    };
+    // Relative to the current directory, like `vibe serve --manifest` (#31).
+    let path = output.to_path_buf();
     manifest::write_manifest(&path, &manifest).map_err(|err| err.to_string())?;
     println!("wrote {}", path.display());
     Ok(())
@@ -384,11 +381,12 @@ async fn cmd_serve(
         exec,
         auth,
         slugs: loaded.slugs,
-        rates: std::sync::Mutex::new(HashMap::new()),
-        quotas: std::sync::Mutex::new(HashMap::new()),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
         disabled: load_disabled(project),
         min_override_ms: None,
         honor_test_ip: false,
+        trusted_proxies: trusted_proxies_from_env()?,
         dev_hints: memory,
     });
     let app = router(state);
@@ -396,9 +394,12 @@ async fn cmd_serve(
         .await
         .map_err(|err| err.to_string())?;
     println!("listening on {addr}");
-    axum::serve(listener, app)
-        .await
-        .map_err(|err| err.to_string())
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|err| err.to_string())
 }
 
 async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Result<(), String> {
@@ -446,6 +447,18 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
     let mut auth = AuthConfig::anonymous();
     if let Ok(pem) = std::env::var("VIBE_JWT_PUBLIC_KEY_PEM") {
         auth.public_pem = pem.replace("\\n", "\n");
+        auth.alg = vibe::runtime::detect_jwt_alg(&auth.public_pem)?;
+    }
+    if let Ok(alg) = std::env::var("VIBE_JWT_ALG") {
+        auth.alg = match alg.trim().to_ascii_uppercase().as_str() {
+            "ES256" => jsonwebtoken::Algorithm::ES256,
+            "RS256" => jsonwebtoken::Algorithm::RS256,
+            other => {
+                return Err(format!(
+                    "VIBE_JWT_ALG `{other}`: only ES256 and RS256 are supported"
+                ));
+            }
+        };
     }
     if let Ok(iss) = std::env::var("VIBE_JWT_ISS") {
         auth.iss = iss;
@@ -456,19 +469,64 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
     if let Ok(kid) = std::env::var("VIBE_JWT_KID") {
         auth.kid = kid;
     }
-    let vibe_env = std::env::var("VIBE_ENV")
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase());
     let pepper = std::env::var("VIBE_API_KEY_PEPPER").ok();
     let (pepper, warning) = vibe::runtime::resolve_pepper(run_env, pepper.as_deref())?;
     if let Some(warning) = warning {
         eprintln!("warning: {warning}");
     }
     auth.pepper = pepper;
-    if let Some(env_name) = vibe_env {
-        auth.env_name = env_name;
+    // API keys are `mbk_live_…` in production and `mbk_test_…` elsewhere.
+    auth.env_name = if run_env == vibe::runtime::RunEnv::Production {
+        "live".into()
+    } else {
+        "test".into()
+    };
+    if let Ok(claim) = std::env::var("VIBE_JWT_ROLES_CLAIM") {
+        if !claim.trim().is_empty() {
+            if let Some(problem) = vibe::manifest::roles_claim_problem(claim.trim()) {
+                return Err(format!("VIBE_JWT_ROLES_CLAIM: {problem}"));
+            }
+            auth.roles_claim = claim.trim().to_string();
+        }
+    }
+    let jwks_uri = std::env::var("VIBE_JWT_JWKS_URI")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            // Spec §4.1: default `{iss}/.well-known/jwks.json` when no PEM is pinned.
+            (auth.public_pem.is_empty() && std::env::var("VIBE_JWT_ISS").is_ok())
+                .then(|| format!("{}/.well-known/jwks.json", auth.iss.trim_end_matches('/')))
+        });
+    if jwks_uri.is_some() && !auth.public_pem.is_empty() {
+        return Err("set either VIBE_JWT_PUBLIC_KEY_PEM or VIBE_JWT_JWKS_URI, not both".into());
+    }
+    if let Some(uri) = jwks_uri {
+        let source = vibe::runtime::jwks::HttpsJwks::new(&uri)?;
+        auth.jwks = Some(std::sync::Arc::new(vibe::runtime::jwks::JwksCache::new(
+            std::sync::Arc::new(source),
+        )));
+    }
+    if let Ok(path) = std::env::var("VIBE_API_KEYS_FILE") {
+        auth.api_keys_file = Some(std::sync::Arc::new(vibe::runtime::ApiKeyFile::open(
+            Path::new(&path).to_path_buf(),
+        )?));
     }
     Ok(auth)
+}
+
+/// `VIBE_TRUSTED_PROXIES`: comma-separated proxy IPs or CIDR blocks whose
+/// `X-Forwarded-For` is honoured. Unset = trust no proxy (use the peer).
+fn trusted_proxies_from_env() -> Result<Vec<vibe::runtime::ProxyNet>, String> {
+    let Ok(raw) = std::env::var("VIBE_TRUSTED_PROXIES") else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            vibe::runtime::ProxyNet::parse(s).map_err(|err| format!("VIBE_TRUSTED_PROXIES: {err}"))
+        })
+        .collect()
 }
 
 fn load_disabled(project: &Path) -> std::collections::HashSet<String> {
