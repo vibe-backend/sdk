@@ -107,7 +107,7 @@ fn render_insert(
             continue;
         }
         params.push(json_text(value));
-        placeholders.push(format!("${}::{}", params.len(), cast(&col.ty)));
+        placeholders.push(format!("${}::text::{}", params.len(), cast(&col.ty)));
     }
     let ret = returning
         .iter()
@@ -147,13 +147,13 @@ fn render_select(
     let mut where_sql = vec!["\"deleted_at\" IS NULL".to_string()];
     if let Some(id) = id {
         params.push(Some(id.to_string()));
-        where_sql.push(format!("\"id\" = ${}::uuid", params.len()));
+        where_sql.push(format!("\"id\" = ${}::text::uuid", params.len()));
     }
     for (col, value) in filters {
         params.push(json_text(value));
         let n = params.len();
         where_sql.push(format!(
-            "(${n}::text IS NULL OR {} = ${n}::{})",
+            "(${n}::text IS NULL OR {} = ${n}::text::{})",
             quote(&col.name)?,
             cast(&col.ty)
         ));
@@ -171,7 +171,7 @@ fn render_select(
     params.push(Some(offset.to_string()));
     let offset_n = params.len();
     let sql = format!(
-        "SELECT {cols} FROM {table} WHERE {}{order} LIMIT ${limit_n}::bigint OFFSET ${offset_n}::bigint",
+        "SELECT {cols} FROM {table} WHERE {}{order} LIMIT ${limit_n}::text::bigint OFFSET ${offset_n}::text::bigint",
         where_sql.join(" AND ")
     );
     Ok((sql, params))
@@ -187,7 +187,7 @@ fn render_soft_delete(
     let owner_sql = owner_predicate(owner, &mut params)?;
     Ok((
         format!(
-            "UPDATE {table} SET \"deleted_at\" = now(), \"updated_at\" = now() WHERE \"id\" = $1::uuid AND \"deleted_at\" IS NULL{owner_sql} RETURNING \"id\"::text"
+            "UPDATE {table} SET \"deleted_at\" = now(), \"updated_at\" = now() WHERE \"id\" = $1::text::uuid AND \"deleted_at\" IS NULL{owner_sql} RETURNING \"id\"::text"
         ),
         params,
     ))
@@ -202,7 +202,7 @@ fn owner_predicate(
     };
     params.push(json_text(value));
     Ok(format!(
-        " AND {} = ${}::{}",
+        " AND {} = ${}::text::{}",
         quote(&col.name)?,
         params.len(),
         cast(&col.ty)
@@ -223,7 +223,7 @@ fn render_update(
     for (col, value) in sets {
         params.push(json_text(value));
         assigns.push(format!(
-            "{} = ${}::{}",
+            "{} = ${}::text::{}",
             quote(&col.name)?,
             params.len(),
             cast(&col.ty)
@@ -240,7 +240,7 @@ fn render_update(
         .collect::<Result<Vec<_>, String>>()?
         .join(", ");
     let sql = format!(
-        "UPDATE {table} SET {} WHERE \"id\" = ${id_n}::uuid AND \"updated_at\" = ${ts_n}::timestamptz AND \"deleted_at\" IS NULL{owner_sql} RETURNING {ret}",
+        "UPDATE {table} SET {} WHERE \"id\" = ${id_n}::text::uuid AND \"updated_at\" = ${ts_n}::text::timestamptz AND \"deleted_at\" IS NULL{owner_sql} RETURNING {ret}",
         assigns.join(", ")
     );
     Ok((sql, params))
@@ -280,6 +280,59 @@ fn json_text(value: &Value) -> Option<String> {
     }
 }
 
+/// Grants for the runtime (non-owner) role: schema usage plus SELECT, INSERT
+/// and UPDATE on the table. Never DELETE or TRUNCATE (spec §7.1).
+pub fn runtime_grant_statements(
+    schema: &str,
+    table: &str,
+    role: &str,
+) -> Result<Vec<String>, String> {
+    let schema = quote(schema)?;
+    let qualified = format!("{schema}.{}", quote(table)?);
+    let role = quote(role)?;
+    Ok(vec![
+        format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
+        format!("REVOKE ALL ON {qualified} FROM {role}"),
+        format!("GRANT SELECT, INSERT, UPDATE ON {qualified} TO {role}"),
+    ])
+}
+
+/// Schema-level statements for the runtime role: no CREATE on the tenant
+/// schema (for anyone but the owner), and default privileges so tables that
+/// migrations create later get the same SELECT/INSERT/UPDATE grant.
+pub fn runtime_schema_statements(schema: &str, role: &str) -> Result<Vec<String>, String> {
+    let schema = quote(schema)?;
+    let role = quote(role)?;
+    Ok(vec![
+        format!("REVOKE CREATE ON SCHEMA {schema} FROM PUBLIC"),
+        format!("REVOKE CREATE ON SCHEMA {schema} FROM {role}"),
+        format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
+        format!(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT, INSERT, UPDATE ON TABLES TO {role}"
+        ),
+    ])
+}
+
+/// ENABLE + FORCE row level security and the tenant policy for one table.
+pub fn rls_statements(schema: &str, table: &str) -> Result<Vec<String>, String> {
+    Ok(rls_statements_for(&format!(
+        "{}.{}",
+        quote(schema)?,
+        quote(table)?
+    )))
+}
+
+fn rls_statements_for(qualified: &str) -> Vec<String> {
+    vec![
+        format!("ALTER TABLE {qualified} ENABLE ROW LEVEL SECURITY"),
+        format!("ALTER TABLE {qualified} FORCE ROW LEVEL SECURITY"),
+        format!("DROP POLICY IF EXISTS tenant_isolation ON {qualified}"),
+        format!(
+            "CREATE POLICY tenant_isolation ON {qualified} USING (\"tenant_id\" = current_setting('app.tenant_id', false)) WITH CHECK (\"tenant_id\" = current_setting('app.tenant_id', false))"
+        ),
+    ]
+}
+
 pub fn bootstrap_statements(
     schema: &str,
     table: &str,
@@ -314,14 +367,12 @@ pub fn bootstrap_statements(
     }
     let mut out = vec![
         format!("CREATE SCHEMA IF NOT EXISTS {schema}"),
-        format!("CREATE TABLE IF NOT EXISTS {qualified} ({})", columns.join(", ")),
-        format!("ALTER TABLE {qualified} ENABLE ROW LEVEL SECURITY"),
-        format!("ALTER TABLE {qualified} FORCE ROW LEVEL SECURITY"),
-        format!("DROP POLICY IF EXISTS tenant_isolation ON {qualified}"),
         format!(
-            "CREATE POLICY tenant_isolation ON {qualified} USING (\"tenant_id\" = current_setting('app.tenant_id', false)) WITH CHECK (\"tenant_id\" = current_setting('app.tenant_id', false))"
+            "CREATE TABLE IF NOT EXISTS {qualified} ({})",
+            columns.join(", ")
         ),
     ];
+    out.extend(rls_statements_for(&qualified));
     for unique in uniques {
         let index = quote(&format!("{table}_{unique}_active"))?;
         out.push(format!(
@@ -336,6 +387,18 @@ pub fn bootstrap_statements(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_grants_never_include_delete() {
+        let stmts = runtime_grant_statements("t_acme0001", "products", "vibe_app").unwrap();
+        assert!(stmts
+            .iter()
+            .any(|s| s.contains("GRANT SELECT, INSERT, UPDATE")));
+        assert!(stmts
+            .iter()
+            .all(|s| !s.contains("DELETE") && !s.contains("TRUNCATE")));
+        assert!(runtime_grant_statements("t_x", "products", "bad\"role").is_err());
+    }
     use serde_json::json;
 
     #[test]
