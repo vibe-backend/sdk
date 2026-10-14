@@ -8,7 +8,8 @@ mod slugs;
 mod sql;
 
 pub use crud::{
-    parse_ownership, run_method, when_problem, CallCtx, CallResult, Caller, MethodFail, Ownership,
+    check_expr, check_when, parse_ownership, run_method, when_problem, CallCtx, CallResult, Caller,
+    MethodFail, Ownership,
 };
 pub use exec::{etag, ExecError, MemoryExec, PgExec, QueryExec};
 pub use http::{

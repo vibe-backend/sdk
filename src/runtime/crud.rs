@@ -106,11 +106,7 @@ async fn run_steps(
                 });
             }
             "validate" => {
-                let hit = when_matches(&step.when_expr, &vars).map_err(|err| {
-                    tracing::error!(error = %err, "validate step has an invalid when");
-                    MethodFail::code("INTERNAL", err)
-                })?;
-                if hit {
+                if when_matches(&step.when_expr, &vars) {
                     return Err(MethodFail::code(step.fail.clone(), step.fail.clone()));
                 }
             }
@@ -1066,10 +1062,31 @@ pub fn when_problem(expr: &str) -> Option<String> {
     parse_when(expr).err()
 }
 
-/// Evaluates a `when`. An unparseable condition is an error, never "false":
-/// a validate step must fail closed.
-fn when_matches(expr: &str, vars: &Map<String, Value>) -> Result<bool, String> {
-    Ok(match parse_when(expr)? {
+/// Checks a `when` condition the way the runtime parses it.
+pub fn check_when(expr: &str) -> Result<(), String> {
+    parse_when(expr).map(|_| ())
+}
+
+/// Checks that an expression parses the way the runtime will parse it.
+pub fn check_expr(input: &str) -> Result<(), String> {
+    let (_, rest) = parse_expr(input.trim())?;
+    if !rest.trim().is_empty() {
+        return Err(format!("trailing input in expression {input}"));
+    }
+    Ok(())
+}
+
+/// Evaluates a `when`. An unparseable condition is never "false": it fails
+/// closed (the step's `fail` fires), and `vibe validate` rejects it first.
+pub(crate) fn when_matches(expr: &str, vars: &Map<String, Value>) -> bool {
+    let parsed = match parse_when(expr) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::error!(error = %err, "invalid when condition; failing closed");
+            return true;
+        }
+    };
+    match parsed {
         When::Empty(name, want) => {
             let value = lookup(&name, vars);
             let empty = value.is_null()
@@ -1079,7 +1096,7 @@ fn when_matches(expr: &str, vars: &Map<String, Value>) -> Result<bool, String> {
             empty == want
         }
         When::Eq(name, literal, equal) => (lookup(&name, vars) == literal) == equal,
-    })
+    }
 }
 
 /// `ctx.user` for step expressions: the caller's `sub`, `roles` and `tenant`
@@ -1200,5 +1217,24 @@ mod ownership_tests {
         let (column, value) = owner_eq(&users, caller("u1", &[])).unwrap().unwrap();
         assert_eq!(column.name, "id");
         assert_eq!(value, Value::String("u1".into()));
+    }
+}
+
+#[cfg(test)]
+mod expr_check_tests {
+    use super::{check_expr, check_when, when_matches};
+    use serde_json::Map;
+
+    #[test]
+    fn expressions_and_conditions_are_checked_like_the_runtime() {
+        assert!(check_expr("{sku: req.body.sku, qty: req.body.qty}").is_ok());
+        assert!(check_expr("result").is_ok());
+        assert!(check_expr("{sku: }").is_err());
+        assert!(check_expr("a b").is_err());
+        assert!(check_when("found is empty").is_ok());
+        assert!(check_when("user.verified != true").is_ok());
+        assert!(check_when("qty > 5").is_err());
+        // Unknown conditions fail closed at runtime.
+        assert!(when_matches("qty > 5", &Map::new()));
     }
 }

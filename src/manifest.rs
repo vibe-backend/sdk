@@ -774,12 +774,11 @@ fn parse_challenge(raw: &str) -> (String, String) {
 fn number_rule(rules: &str, key: &str) -> Option<i64> {
     for part in rules.split(',') {
         let part = part.trim();
-        let rest = part.strip_prefix(&format!("{key}:"))?.trim();
-        let number: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '-')
-            .collect();
-        if let Ok(value) = number.parse() {
+        // Skip other rules; `?` here used to drop every rule after the first.
+        let Some(rest) = part.strip_prefix(&format!("{key}:")) else {
+            continue;
+        };
+        if let Ok(value) = rest.trim().parse() {
             return Some(value);
         }
     }
@@ -830,6 +829,20 @@ pub fn method<'a>(manifest: &'a Manifest, target: &str) -> Option<&'a MethodSpec
 
 pub fn json_null() -> Value {
     Value::Null
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::number_rule;
+
+    #[test]
+    fn number_rules_are_found_in_any_position() {
+        assert_eq!(number_rule("min: 1, max: 99", "max"), Some(99));
+        assert_eq!(number_rule("min: 1, max: 99", "min"), Some(1));
+        assert_eq!(number_rule("format: email, max: 120", "max"), Some(120));
+        assert_eq!(number_rule("max: -5", "max"), Some(-5));
+        assert_eq!(number_rule("-", "max"), None);
+    }
 }
 
 /// JWT claims that carry identity or token metadata; a roles claim must never
@@ -923,6 +936,7 @@ mod roles_claim_tests {
         }
     }
 }
+
 #[cfg(test)]
 mod roles_list_tests {
     #[test]

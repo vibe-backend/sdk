@@ -769,7 +769,7 @@ async fn unparseable_when_fails_closed() {
         let err = run(&m, &MemoryExec::new(), json!({"x": 1}))
             .await
             .unwrap_err();
-        assert_eq!(err.0, "INTERNAL", "{when}: must not pass");
+        assert_eq!(err.0, "NOPE", "{when}: must fail closed");
     }
     for when in [
         "ok != true",
