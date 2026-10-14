@@ -14,6 +14,9 @@ export const LOCALES = {
     menu: 'Menu',
     footer: 'vibe-backend SDK · Dual licensed under MIT / Apache-2.0',
     source: 'Source on GitHub',
+    maintainedBy: 'This SDK is maintained by Grok Bot',
+    tokensUsed: 'Tokens used: ',
+    numberLocale: 'en-US',
     docs: {
       title: 'Documentation',
       intro: 'Every page here is generated at build time from the Markdown files in the <code>docs/</code> folder of the SDK repository.',
@@ -42,6 +45,9 @@ export const LOCALES = {
     menu: '選單',
     footer: 'vibe-backend SDK · 採用 MIT / Apache-2.0 雙授權',
     source: '在 GitHub 查看原始碼',
+    maintainedBy: '本 SDK 由 Grok Bot 維護',
+    tokensUsed: '已用 token 數：',
+    numberLocale: 'zh-Hant',
     docs: {
       title: '文件',
       intro: '這裡每一頁都在建置時，由 SDK 儲存庫 <code>docs/</code> 資料夾內的 Markdown 檔自動產生。',

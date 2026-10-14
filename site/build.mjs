@@ -25,6 +25,15 @@ const REPO = 'https://github.com/vibe-backend/sdk';
 const SITE_URL = (process.env.SITE_URL || 'https://vibe-backend.github.io/sdk/').replace(/\/?$/, '/');
 const locales = Object.keys(LOCALES);
 
+// Build-time stats from site/src/data/stats.json. To show the "tokens used" stat, set
+// "tokensUsed" to a non-negative integer (e.g. {"tokensUsed": 123456}) and rebuild.
+// null, a missing key, or anything that is not a non-negative safe integer omits the stat entirely.
+function readStats() {
+  try { return JSON.parse(fs.readFileSync(path.join(here, 'src/data/stats.json'), 'utf8')) || {}; } catch { return {}; }
+}
+const stats = readStats();
+const tokensUsed = Number.isSafeInteger(stats.tokensUsed) && stats.tokensUsed >= 0 ? stats.tokensUsed : null;
+
 const slugify = (s) => s.toLowerCase().trim()
   .replace(/<[^>]+>/g, '').replace(/[`*_~]/g, '')
   .replace(/[^\p{L}\p{N}\s-]/gu, '').replace(/\s+/g, '-') || 'section';
@@ -189,7 +198,7 @@ function layout({ loc, rel, title, body, active, sidebar = '', wide = false }) {
 <button class="theme" type="button" aria-label="${t.theme}" title="${t.theme}">${ICON_THEME}</button></div>
 </div></header>
 <div class="${sidebar ? 'docs-wrap' : wide ? 'page wide' : 'page'}">${sidebar}<main>${body}</main></div>
-<footer><div>${t.footer}</div><a href="${REPO}">${t.source}</a></footer>
+<footer><div>${t.footer}<br><span class="maintainer">${esc(t.maintainedBy)}</span></div>${tokensUsed === null ? '' : `<div class="stat-tokens" data-stat="tokens-used">${esc(t.tokensUsed)}<data value="${tokensUsed}">${new Intl.NumberFormat(t.numberLocale).format(tokensUsed)}</data></div>`}<a href="${REPO}">${t.source}</a></footer>
 </body></html>`;
 }
 
