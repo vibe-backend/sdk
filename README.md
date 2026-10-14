@@ -9,3 +9,8 @@ See [docs/spec-v1.5.md](docs/spec-v1.5.md) for the full specification.
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+## CI/CD
+
+- **CI** (`.github/workflows/ci.yml`, on PRs and pushes to `main`): Markdown lint + local link check; Rust `fmt`/`clippy`/`test` once a `Cargo.toml` exists; Docker build (no push) once a `Dockerfile` exists.
+- **CD** (`.github/workflows/cd.yml`, on pushes to `main` and `v*` tags): builds and pushes `ghcr.io/vibe-backend/sdk`. CD is a no-op until a `Dockerfile` is added at the repo root.
