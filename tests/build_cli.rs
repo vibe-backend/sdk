@@ -214,3 +214,51 @@ fn build_with_high_risk_items_and_no_approval_writes_nothing() {
     assert!(out.contains("no release approval"), "{out}");
     assert_eq!(tree(&root), before);
 }
+
+#[test]
+fn dev_build_signs_with_the_dev_key_and_marks_dev_mode() {
+    let root = copy_shop();
+    let key = sign::create_dev_key(&root).unwrap();
+    let (ok, out) = vibe(&root, &["build", "--dev", "-o", "dev.json"], &[]);
+    assert!(ok, "{out}");
+    let manifest = vibe::manifest::read_manifest(&root.join("dev.json"), &key.verifying_key())
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(manifest.provenance.build_mode, "dev");
+}
+
+#[test]
+fn dev_build_without_a_dev_key_fails_and_creates_none() {
+    let root = copy_shop();
+    let (secret, _) = release_key();
+    let (ok, out) = vibe(
+        &root,
+        &["build", "--dev", "-o", "dev.json"],
+        &[("VIBE_RELEASE_SIGNING_KEY", &secret)],
+    );
+    assert!(!ok, "{out}");
+    assert!(!root.join(".vibe/signing.key").exists());
+    assert!(!root.join("dev.json").exists());
+}
+
+#[test]
+fn release_build_never_uses_the_dev_key() {
+    let root = copy_shop();
+    sign::create_dev_key(&root).unwrap();
+    let (ok, out) = vibe(&root, BUILD, &[]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("no fallback"), "{out}");
+    assert!(!root.join("out/manifest.json").exists());
+}
+
+#[test]
+fn dev_build_rejects_a_release_approval() {
+    let root = copy_shop();
+    sign::create_dev_key(&root).unwrap();
+    let (ok, out) = vibe(
+        &root,
+        &["build", "--dev", "--release-approval", "pr:1"],
+        &[],
+    );
+    assert!(!ok, "{out}");
+    assert!(out.contains("only to release builds"), "{out}");
+}

@@ -57,11 +57,17 @@ enum Command {
         #[arg(long)]
         commit: Option<String>,
     },
-    /// Release build: compile in memory, validate, then sign a manifest from
-    /// the validated content. Writes nothing unless every step succeeds.
+    /// Build a manifest: compile in memory, validate, then sign from the
+    /// validated content. Writes nothing unless every step succeeds.
+    /// Default is a release build (release key only); `--dev` is a local
+    /// development build.
     Build {
         #[arg(long, default_value = ".")]
         project: PathBuf,
+        /// Development build: signs with the local dev key (.vibe/signing.key)
+        /// and marks the manifest `build-mode: dev`. Production refuses it.
+        #[arg(long)]
+        dev: bool,
         /// Output path, relative to the current directory.
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
@@ -182,10 +188,11 @@ async fn run(cli: Cli) -> Result<(), String> {
         } => cmd_manifest(&project, &output, release, release_approval, commit).await,
         Command::Build {
             project,
+            dev,
             output,
             release_approval,
             commit,
-        } => cmd_build(&project, &output, release_approval, commit).await,
+        } => cmd_build(&project, dev, &output, release_approval, commit).await,
         Command::Keygen { project } => {
             sign::create_dev_key(&project)?;
             println!("wrote {}", project.join(".vibe/signing.key").display());
@@ -346,13 +353,20 @@ async fn cmd_manifest(
 /// Reads the release inputs once (sources compiled in memory, never lock
 /// files from disk).
 async fn compile_release(project: &Path) -> Result<vibe::validate::LoadedProject, String> {
+    compile_sources(project, true).await
+}
+
+async fn compile_sources(
+    project: &Path,
+    strict_llm: bool,
+) -> Result<vibe::validate::LoadedProject, String> {
     load_dotenv(project);
     // The release environment provides the compiler key as VIBE_LLM_API_KEY.
     let mut env = llm::env_map_from_process();
     if let Some(key) = env.get("VIBE_LLM_API_KEY").cloned() {
         env.entry("LLM_API_KEY".into()).or_insert(key);
     }
-    let config = llm::load_llm_config(&env, true).ok();
+    let config = llm::load_llm_config(&env, strict_llm).ok();
     let adapter = match &config {
         Some(config) => Some(HttpAdapter::new(config.clone()).map_err(|err| err.to_string())?),
         None => None,
@@ -390,12 +404,16 @@ fn resolve_commit(project: &Path, commit: Option<String>) -> String {
 /// after every step has passed, atomically, so a failure leaves no output.
 async fn cmd_build(
     project: &Path,
+    dev: bool,
     output: &Path,
     release_approval: Option<String>,
     commit: Option<String>,
 ) -> Result<(), String> {
+    if dev && release_approval.is_some() {
+        return Err("--release-approval applies only to release builds; drop --dev".into());
+    }
     let commit = resolve_commit(project, commit);
-    let loaded = compile_release(project).await?;
+    let loaded = compile_sources(project, !dev || ci_or_prod()).await?;
     // Validate first: errors stop the build before any key is used.
     let (result, _) = vibe::validate::validate_loaded(
         &ValidateOptions {
@@ -411,9 +429,14 @@ async fn cmd_build(
             return Err("validation failed; nothing was written".into());
         }
     }
-    let key = sign::load_release_key()?;
+    // A release build never falls back to the dev key (decision 92).
+    let key = if dev {
+        sign::load_dev_key(project)?
+    } else {
+        sign::load_release_key()?
+    };
     let info = manifest::BuildInfo {
-        release: true,
+        release: !dev,
         release_approval,
         commit,
     };
