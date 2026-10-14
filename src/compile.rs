@@ -1336,6 +1336,10 @@ fn semantic_check(
     let Some(source) = sources.iter().find(|source| source.id == doc.meta.id) else {
         return;
     };
+    if let Err(err) = parse_source_frontmatter(&source.text) {
+        report.push(Diag::error(&doc.meta.source, err));
+        return;
+    }
     report.extend(frontmatter_security_check(doc, source));
     // #37 point 1-4: the keyword check is English-only and reads the English
     // normalization of the source (the source itself when already English).
@@ -1405,15 +1409,39 @@ fn source_type_natural(source: &SourceFile) -> bool {
     !is_structured_source(&source.combined_text())
 }
 
-fn strip_source_frontmatter(text: &str) -> &str {
-    let trimmed = text.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("---\n") {
-        if let Some(end) = rest.find("\n---") {
-            let after = &rest[end + 4..];
-            return after.strip_prefix('\n').unwrap_or(after);
+fn strip_source_frontmatter(text: &str) -> std::borrow::Cow<'_, str> {
+    let unified = unify_newlines(text);
+    match split_frontmatter(&unified) {
+        Some((_, body)) => std::borrow::Cow::Owned(body.to_string()),
+        None if matches!(unified, std::borrow::Cow::Borrowed(_)) => {
+            std::borrow::Cow::Borrowed(text)
         }
+        None => std::borrow::Cow::Owned(unified.into_owned()),
     }
-    text
+}
+
+/// Drop a UTF-8 BOM and turn CRLF / CR line ends into LF, so a frontmatter
+/// block written on Windows is parsed, not skipped.
+fn unify_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if text.contains('\r') {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+/// (frontmatter block, body) when the text opens with a `---` line.
+fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
+    let rest = text.trim_start_matches('\n').strip_prefix("---\n")?;
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end() == "---" {
+            return Some((&rest[..offset], &rest[offset + line.len()..]));
+        }
+        offset += line.len();
+    }
+    None
 }
 
 /// #37 point 5 (PM-approved; D16 amendment pending in the next spec PR):
@@ -1526,11 +1554,16 @@ fn declaration_check(doc: &LockDoc, source: &SourceFile, english: &str) -> Vec<D
     out
 }
 
-/// `word` occurs in `text` (lowercased) at least once without a negation
-/// just before it ("not public", "唔公開", "非公開") and not as part of a
-/// longer identifier ("public-writable", "public_reader").
+/// `word` occurs in `text` (lowercased) at least once in a clause that is
+/// not negated, and not as part of a longer identifier ("public-writable").
+/// A clause runs between sentence punctuation (`.;!?`, newline) or "but";
+/// it is negated when an odd number of negators precede the word in it, so
+/// "not a public endpoint", "must never be public" and "do not, under any
+/// circumstances, remove auth" are negated and "not unless ... not" is not.
 pub(crate) fn affirms(text: &str, word: &str) -> bool {
-    const NEGATORS: &[&str] = &["not ", "non-", "non ", "no ", "never ", "isn't ", "n't "];
+    const NEGATORS: &[&str] = &[
+        "not", "no", "never", "without", "cannot", "nor", "neither", "none", "nobody",
+    ];
     let ends_word = word
         .chars()
         .last()
@@ -1547,15 +1580,31 @@ pub(crate) fn affirms(text: &str, word: &str) -> bool {
                 }
             }
         }
-        let mut from = at.saturating_sub(12);
-        while !text.is_char_boundary(from) {
-            from -= 1;
+        let starts_word = word
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+        if starts_word {
+            if let Some(prev) = text[..at].chars().next_back() {
+                if prev.is_ascii_alphanumeric() || prev == '_' {
+                    continue;
+                }
+            }
         }
-        let before = &text[from..at];
-        if NEGATORS
-            .iter()
-            .any(|n| before.trim_end_matches(' ').ends_with(n.trim_end()) || before.ends_with(n))
-        {
+        let head = &text[..at];
+        let clause_start = head
+            .rfind(['.', ';', '!', '?', '\n'])
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let mut clause = &head[clause_start..];
+        if let Some(i) = clause.rfind(" but ") {
+            clause = &clause[i + 5..];
+        }
+        let negations = clause
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '\''))
+            .filter(|w| NEGATORS.contains(w) || w.ends_with("n't") || *w == "non")
+            .count();
+        if negations % 2 == 1 {
             continue;
         }
         return true;
@@ -1574,18 +1623,54 @@ const PINNED_KEYS: &[&str] = &[
     "ownership",
 ];
 
+/// Frontmatter `key: value` pairs. Keys must be lowercase and unique: a
+/// duplicate (`public: false` then `public: true`) or a case variant
+/// (`Public: true`) is an error, never a silent pick.
+pub(crate) fn parse_source_frontmatter(text: &str) -> Result<Vec<(String, String)>, String> {
+    let unified = unify_newlines(text);
+    let trimmed = unified.trim_start_matches('\n');
+    if !trimmed.starts_with("---\n") && trimmed.trim_end() != "---" {
+        return Ok(Vec::new());
+    }
+    let Some((block, _)) = split_frontmatter(&unified) else {
+        return Err("frontmatter opened with `---` is not closed".into());
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in block.lines() {
+        let t = line.trim();
+        // Comments and list continuation lines carry no keys of their own.
+        if t.is_empty() || t.starts_with('#') || line.starts_with([' ', '\t']) || t.starts_with('-')
+        {
+            continue;
+        }
+        let Some((k, v)) = line.split_once(':') else {
+            return Err(format!(
+                "frontmatter line is not `key: value`: {}",
+                prompt_safe(t)
+            ));
+        };
+        let key = k.trim();
+        if key != key.to_ascii_lowercase() {
+            return Err(format!(
+                "frontmatter key `{}` must be lowercase (`{}`)",
+                prompt_safe(key),
+                prompt_safe(&key.to_ascii_lowercase())
+            ));
+        }
+        if out.iter().any(|(seen, _)| seen == key) {
+            return Err(format!(
+                "frontmatter key `{}` is declared twice",
+                prompt_safe(key)
+            ));
+        }
+        out.push((key.to_string(), v.trim().to_string()));
+    }
+    Ok(out)
+}
+
 fn source_frontmatter(text: &str) -> Vec<(String, String)> {
-    let Some(rest) = text.trim_start().strip_prefix("---\n") else {
-        return Vec::new();
-    };
-    let Some(end) = rest.find("\n---") else {
-        return Vec::new();
-    };
-    rest[..end]
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
-        .collect()
+    // semantic_check reports a parse error and stops before this is used.
+    parse_source_frontmatter(text).unwrap_or_default()
 }
 
 fn norm_list(raw: &str) -> Vec<String> {
@@ -2015,6 +2100,102 @@ mod security_tests {
 
     const PUBLIC: &str = "## Access\n- public: true\n## Pipelines\n### -auth\n- removed: true\n";
     const PRIVATE: &str = "## Access\n- public: false\n## Pipelines\n### auth\n- mode: jwt\n";
+
+    #[test]
+    fn affirms_is_clause_scoped() {
+        for (text, word, want) in [
+            ("this is a public endpoint.", "public", true),
+            ("this is not a public endpoint.", "public", false),
+            ("it must never be public.", "public", false),
+            ("it is non-public.", "public", false),
+            ("it isn't public.", "public", false),
+            (
+                "do not, under any circumstances, remove auth.",
+                "remove auth",
+                false,
+            ),
+            ("you must not ever remove auth.", "remove auth", false),
+            ("it is not private; it is public.", "public", true),
+            ("it is not private, but it is public.", "public", true),
+            ("it is not true that it is not public.", "public", true),
+            ("uses the public-writable column.", "public", false),
+            ("republic day.", "public", false),
+        ] {
+            assert_eq!(affirms(text, word), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn crlf_and_bom_frontmatter_is_parsed_not_skipped() {
+        for text in [
+            "---\r\npublic: false\r\nauth: jwt\r\n---\r\nList products.\r\n",
+            "\u{feff}---\npublic: false\nauth: jwt\n---\nList products.\n",
+            "\u{feff}---\r\npublic: false\r\nauth: jwt\r\n---\r\nList products.\r\n",
+        ] {
+            let errs = errors(text, PUBLIC);
+            assert!(
+                errs.iter().any(|e| e.contains("pins public: false")),
+                "{text:?}: {errs:?}"
+            );
+            assert!(errors(text, PRIVATE).is_empty(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn duplicate_and_case_variant_keys_fail_closed() {
+        for (text, want) in [
+            (
+                "---\npublic: false\npublic: true\n---\nList.\n",
+                "declared twice",
+            ),
+            (
+                "---\npublic: false\nPublic: true\n---\nList.\n",
+                "must be lowercase",
+            ),
+            ("---\nPUBLIC: false\n---\nList.\n", "must be lowercase"),
+            ("---\npublic: false\nauth: jwt\nList.\n", "not closed"),
+        ] {
+            let errs = errors(text, PRIVATE);
+            assert!(errs.iter().any(|e| e.contains(want)), "{text:?}: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn declarations_are_checked_against_the_translation() {
+        let (doc, sources) = feature("---\npublic: false\nauth: jwt\n---\n列出商品\n", PRIVATE);
+        let mut english = HashMap::new();
+        english.insert(
+            sources[0].id.clone(),
+            "List products. This is a public endpoint.".into(),
+        );
+        let mut report = Report::new();
+        semantic_check(&doc, &sources, &english, &mut report);
+        let errs: Vec<String> = report.errors().map(|d| d.message.clone()).collect();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`public: false` does not match the source text")),
+            "{errs:?}"
+        );
+        // No declaration at all, translation shows public + auth removal.
+        let (doc, sources) = feature("列出商品\n", PUBLIC);
+        english.insert(
+            sources[0].id.clone(),
+            "Anyone may list products: it is public and requires no login, remove auth.".into(),
+        );
+        let mut report = Report::new();
+        semantic_check(&doc, &sources, &english, &mut report);
+        let errs: Vec<String> = report.errors().map(|d| d.message.clone()).collect();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("missing frontmatter declaration `public: true`")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("missing frontmatter declaration `auth: removed`")),
+            "{errs:?}"
+        );
+    }
 
     #[test]
     fn negated_or_compound_keywords_do_not_authorize() {
