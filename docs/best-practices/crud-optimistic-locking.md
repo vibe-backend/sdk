@@ -16,7 +16,7 @@ Provide get, list and update CRUD. update is a partial update.
 
 ```
 # Update user
-PUT, path /users/v2/{id}, id is a uuid. Requires JWT.
+PUT, path /users/v2/{id}, id is a uuid. Requires JWT; only admin may use it.
 Body: name (1 to 50 characters, optional) and updated_at (timestamp, required — the version the client last read).
 Update the user with user.update and return 200 with id, name and updated_at.
 User not found returns 404 NOT_FOUND. If someone else changed the user in the meantime return 409 CONFLICT.
@@ -49,6 +49,7 @@ User not found returns 404 NOT_FOUND. If someone else changed the user in the me
 ## Pipelines
 ### p1 auth
 - mode: jwt
+- roles: [admin]
 
 ## Limits
 - provider: main
@@ -95,6 +96,9 @@ User not found returns 404 NOT_FOUND. If someone else changed the user in the me
 
 ## Security considerations
 
+- **Same-tenant IDOR**: RLS only isolates tenants. Without a role or ownership check, any authenticated user of the tenant could update any user by id. This example restricts the endpoint to `roles: [admin]` (a high-risk `roles` security item). The spec defines **no row-ownership mechanism** (e.g. "only the owner may update"), see Spec gaps.
+- **PUT with partial semantics**: the injected `update` has PATCH semantics (§12.9), but v1 only supports GET/POST/PUT/DELETE (§0.1), so PUT is used for a partial update. Document this for clients.
+
 - Map `CONFLICT` to **409** in `## Errors`; an unmapped method error becomes 500 `INTERNAL` and raises a warning (§8, §10.9, §12.4).
 - System fields `id`, `tenant_id`, `created_at`, `updated_at`, `deleted_at` cannot be written from input (§12.9). The client-supplied `updated_at` is only the expected version for comparison, not a value written.
 - `password` fields are hashed automatically on update (§12.9).
@@ -107,4 +111,5 @@ User not found returns 404 NOT_FOUND. If someone else changed the user in the me
 - The **input field name** carrying the expected version for the optimistic-lock check is **not specified** (§12.9 only says the check uses `updated_at`). Passing `updated_at` is the obvious reading but is an assumption.
 - Whether `NOT_FOUND` is a declared error of `update` is not stated (it is stated for `get`). Only `CONFLICT` is specified for `update`.
 - The spec's `## CRUD` option `optimistic-lock: updated_at` appears in the §12.8 lock, but §12.9 lists only `partial` as an update option; whether optimistic locking can be disabled is **not specified**.
+- **Row ownership** ("a user may only edit their own record", e.g. comparing `ctx.user` to the row) has no specified CRUD option or lock syntax; injected CRUD has no owner check. Use roles, or override `update` with a custom method and get it reviewed.
 - The `timestamp` request-field type is listed for model fields (§12.2); its use in `## Request` is not shown in spec examples.

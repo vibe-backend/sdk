@@ -19,9 +19,9 @@ All endpoints require JWT authentication.
 ```
 # Create user
 POST. Only admin may use it, at most 30 requests per minute.
-The request body must contain email (valid email) and name (1 to 50 characters).
+The request body must contain email (valid email), name (1 to 50 characters) and password (12 to 256 characters).
 Create the user with user.register; on success return 201 with the new user's id, email and name, plus Location.
-If the email is already taken return 409 EMAIL_TAKEN; validation failure returns 422.
+If the email is already taken return 409 EMAIL_TAKEN; a weak or breached password returns 422 WEAK_PASSWORD; validation failure returns 422.
 ```
 
 ## Compiled lock md example
@@ -94,6 +94,7 @@ signature: MEUCIG...
 |---|---|---|---|
 | body.email | string | format: email | yes |
 | body.name | string | min: 1, max: 50 | yes |
+| body.password | string | min: 12, max: 256 | yes |
 
 ## Response
 | status | schema | headers |
@@ -101,7 +102,7 @@ signature: MEUCIG...
 | 201 | { id, email, name } | Location |
 
 ## Transform
-- in: { email: req.body.email, name: req.body.name }
+- in: { email: req.body.email, name: req.body.name, password: req.body.password }
 - out: { id: u.id, email: u.email, name: u.name }
 
 ## Steps
@@ -123,6 +124,7 @@ signature: MEUCIG...
 | status | code | from |
 |---|---|---|
 | 409 | EMAIL_TAKEN | user.register |
+| 422 | WEAK_PASSWORD | user.register |
 | 422 | VALIDATION_FAILED | platform |
 ````
 
@@ -139,4 +141,5 @@ signature: MEUCIG...
 ## Spec gaps
 
 - The spec shows only `mode: jwt` and `roles` as `auth` parameters. The parameter names for issuer, audience, JWKS URL and JWKS cache TTL in the `auth` pipeline's `## Parameters` schema are **not specified** (the built-in lock is platform-provided). Do not invent them in source; ask the platform for the built-in `auth` parameter schema.
+- The spec's own §11.4 `create-user` example omits `password` even though a user needs one to log in; this page adds it so the call matches `user.register`'s `## Signature` (see [user-register.md](user-register.md)). Whether admin-created users should instead receive a reset link is not specified.
 - How `roles-claim` is overridden (parameter name in lock) is not shown.

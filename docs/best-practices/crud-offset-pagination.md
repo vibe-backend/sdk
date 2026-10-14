@@ -50,7 +50,7 @@ Validation failure returns 422.
 | name | string | max: 50 | no |
 | password | password | argon2id | no |
 | roles | string[] | | no |
-| last_login_at | timestamp | nullable | no |
+| last_login_at | timestamp | nullable, public-writable | no |
 | created_at | timestamp | default: now | yes |
 | updated_at | timestamp | default: now | yes |
 | deleted_at | timestamp | nullable | yes |
@@ -66,8 +66,10 @@ Validation failure returns 422.
 ## Policies
 - rls: enable, force
 - policy: tenant_id = current_setting('app.tenant_id', false)
-- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT]
+- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer [UPDATE(last_login_at)]
 ````
+
+This matches the §12.8 `user` lock: `last_login_at` is publicly writable (by the login endpoint, see [user-login.md](user-login.md)), which is a high-risk `public-writable-column` security item on the model lock.
 
 The injected `user.list` method has its own platform-generated, signed lock (`id: user/crud/list`, `source-type: structured`) (§12.9).
 

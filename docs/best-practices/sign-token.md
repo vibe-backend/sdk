@@ -92,9 +92,12 @@ Callers use it like this (from `user.login`):
 - **Algorithm/key**: JWT only, RS256 or ES256; the private key is a platform secret referenced via `key-ref`, never inline (§12.6, §9B).
 - `capabilities: [sign-token]`, the claim whitelist and token ttl are all **high-risk** security items (two non-author approvers) (§2A.5).
 - Tokens are never logged (§9).
+- ⚠️ **Any caller can sign an arbitrary `sub`**: `user.sign-token` takes `sub` as plain input and does not verify that the caller authenticated that user. Any method or pipeline that can call it can mint a token for any user in the tenant. Keep callers to a minimum (`user.login`, `token-refresh`), review every new `## Calls` edge pointing at it, and watch the "signs token" column of the effective-permission summary (§10.10). The spec has no caller allowlist for capability methods.
 
 ## Spec gaps
 
 - The full platform **custom-claim whitelist** is not listed (only `sid` as an example).
 - `sign-jwt` parameter `platform-claims-source` uses a pseudo-query (`users.roles where id = sub`) that is not otherwise defined.
+- **Caller restriction**: there is no way to restrict which methods/pipelines may call a `sign-token` method.
+- **`tenant_id` source contradiction**: §12.6 says `roles` and `tenant_id` are read by the platform **from the DB** (by `sub`), while the §12.8 lock uses `tenant_id: ctx.tenant_id` (spec owner should resolve).
 - Whether `respond` in a method needs a `status` is not specified (method responds omit it in the spec).

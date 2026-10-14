@@ -10,7 +10,7 @@ Bound request rates per IP, per tenant and per account using the built-in `rate-
 
 ```
 # users v1
-At most 60 requests per minute.
+At most 60 requests per minute. This version is deprecated and will be retired on 2027-06-30.
 ```
 
 `pipelines/login-guard.md` (custom pipeline)
@@ -98,6 +98,10 @@ signature: MEYCIQ...
 - source-lines: 4-4
 ````
 
+> ⚠️ **Privacy:** this spec example (§11.2) audits `req.body.email` in plain form. §12.10 says personal data must never be logged and only pseudonymized ids may be kept. Audit records are not explicitly the same as logs, but treat this as a conflict: prefer not auditing raw email until the spec clarifies (see Spec gaps).
+
+> ⚠️ **Key normalization:** an account key like `req.body.email` should be normalized (e.g. trimmed, lower-cased) before counting, or attackers bypass the per-account limit with case variants. The spec does not define normalization in `rate-limit-check`.
+
 Feature-level IP + tenant limits (excerpt of `## Pipelines`):
 
 ````markdown
@@ -126,3 +130,5 @@ Feature-level IP + tenant limits (excerpt of `## Pipelines`):
 - The default `key` when omitted (e.g. `_version` above has only `per-minute`) is **not specified**.
 - `login-guard` declares `must-run: before-steps` while `auth` uses `must-run: first`; the full set of `## Order` values is not enumerated.
 - Platform maximums for rate limits are not specified.
+- **Privacy conflict**: §11.2 `login-guard` audits `req.body.email` (personal data, `personal: standard` per §12.10) while §12.10 forbids personal data in logs and requires pseudonymized ids in erasure audit. Whether `audit` records count as logs, and whether `audit` supports pseudonymizing a field, is **not specified**; the spec owner should resolve.
+- Normalization of `rate-limit-check` keys (case, whitespace, Unicode) is **not specified**.

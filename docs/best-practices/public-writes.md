@@ -19,7 +19,7 @@ Create the review with review.submit; on success return 201 with id. If the item
 
 ## Compiled lock md example
 
-`api/catalog/v1/submit-review/submit-review.lock.md` (sections only; frontmatter per §2A.1 with `kind: api`, `scope: feature`; security items `public`, `auth-removed`, `public-writes` — all high risk)
+`api/catalog/v1/submit-review/submit-review.lock.md` (sections only; frontmatter per §2A.1 with `kind: api`, `scope: feature`; security items `public`, `auth-removed`, `public-writes` (high risk) plus `write-sql` for the new INSERT in `review.submit` and `output-new-field` for the new response field (medium risk). That is 5 items, exactly the per-PR cap (Decision 34), so ship model changes such as the `untrusted` comment column in a separate PR)
 
 ````markdown
 ## Route

@@ -24,7 +24,7 @@ Provide all CRUD. list defaults to 20 per page, at most 100, can sort by created
 
 ```
 # Delete note
-DELETE, path /notes/v1/{id}, id is a uuid. Requires JWT.
+DELETE, path /notes/v1/{id}, id is a uuid. Requires JWT; only admin may use it.
 Delete the note with note.delete and return 204.
 Note not found returns 404 NOT_FOUND.
 ```
@@ -80,6 +80,7 @@ Note the grants: no runtime role ever has `DELETE` (§7.1).
 ## Pipelines
 ### p1 auth
 - mode: jwt
+- roles: [admin]
 
 ## Limits
 - provider: main
@@ -137,6 +138,8 @@ If you write a custom deletion method, it must be an `UPDATE`, for example:
 
 ## Security considerations
 
+- **Same-tenant IDOR**: RLS isolates tenants only. Without a role/ownership check any authenticated tenant user could delete any note by id. This example uses `roles: [admin]` (high-risk `roles` item). The spec defines **no row-ownership mechanism** for notes owned by a user, see Spec gaps.
+
 - `DELETE` SQL must never appear in any lock; DB roles have no `DELETE`/`TRUNCATE` privilege (§2A.4, §7.1, §10.8). There is no `soft: false` option (§12.9).
 - `deleted_at` is a system field: it cannot be written from request input (§12.9) and is on the public-write blacklist (§7.2).
 - Soft-deleted rows are excluded automatically by injected `get`/`list`. **Custom methods must exclude them themselves** (e.g. `deleted_at is null`, as `user.login` does in §12.8).
@@ -147,5 +150,6 @@ If you write a custom deletion method, it must be an `UPDATE`, for example:
 
 - The `## CRUD` option syntax for `create` and `delete` is **not shown** in any spec lock example (only get/list/update in §12.8). `delete | soft` and an empty `create` row above are illustrative.
 - The output and error set of the injected `delete` (e.g. whether it fails `NOT_FOUND` for an already-deleted id) is **not specified**.
+- **Row ownership** ("users may delete only their own notes") has no specified CRUD option or lock syntax; injected `delete` has no owner check. `owner`/`owner_id`/`created_by` appear on the public-write blacklist (§7.2) but no general owner semantics exist.
 - Whether there is an "undelete/restore" path is **not specified**.
 - Whether `respond` with 204 takes `value` is not shown; omitted here.

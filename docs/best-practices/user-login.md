@@ -213,5 +213,6 @@ The model lock must grant `public_writer [UPDATE(last_login_at)]` and mark `last
 ## Spec gaps
 
 - The spec's login example returns only an access token; it does **not** show issuing a **refresh token** at login, nor how the refresh-token family is created (see [refresh-token-rotation.md](refresh-token-rotation.md)).
+- argon2id parameters and rehash-on-login when parameters change are **not specified** (§12.2) (spec owner).
 - How lockout state / failure counters are stored and how `challenge: captcha-after-3-failures` interacts with steps is platform-internal and not specified in lock terms.
 - `role: public_reader + public_writer` and `challenge: captcha-after-3-failures` are used in §12.8 but are not in the `challenge: captcha | pow` enum from §7.2 — the spec uses them as-is.

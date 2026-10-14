@@ -70,7 +70,7 @@ List orders with order.list and return 200 with items, page, page_size and has_m
 | field | type | rules | required |
 |---|---|---|---|
 | query.page | integer | min: 1 | no |
-| query.page-size | integer | min: 1 | no |
+| query.page-size | integer | min: 1, max: 100 | no |
 
 ## Response
 | status | schema | headers |
@@ -114,4 +114,9 @@ List orders with order.list and return 200 with items, page, page_size and has_m
 - The `auth` parameter value selecting API-key mode, and parameters of the `verify-api-key` op, are **not specified**.
 - How API-key **scopes** are declared in source/lock and how they map to endpoints is **not specified**.
 - Where API keys are issued/managed (UI/CLI/model) is **not specified**.
+- **Hash algorithm**: "only store a hash" (§4) does not name the algorithm; a keyed fast hash such as HMAC-SHA256 (high-entropy keys don't need argon2id) is a reasonable choice but **not specified**.
+- **Transport**: the header name, and whether keys are accepted **only** in a header (never the query string, which leaks into logs), are not specified.
+- **Tenant source**: how `ctx.tenant_id` is derived for an API key (bound at issuance?) is not specified.
+- **Per-key rate limits**: only `ip` and `tenant` rate-limit keys are shown; a per-API-key key is not specified.
+- **401 header**: §8 requires `WWW-Authenticate` per RFC 6750 (Bearer), which may be the wrong scheme for API-key auth.
 - What `ctx.user` contains for an API-key caller is **not specified**.

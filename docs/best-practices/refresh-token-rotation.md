@@ -90,7 +90,8 @@ Platform-enforced rules (§4A.1, Decision 6):
 - **Logout** revokes the current family; "log out of all devices" revokes all of the user's families.
 - Privacy deletion revokes all of the subject's refresh-token families (§12.10).
 - Pipelines cannot run `query` or `call` directly; they reach models only via `method` (§4).
-- Tokens are never logged (§9). Signing goes only through the `sign-token` capability, with claim whitelist and ttl cap (§12.6) — see [sign-token.md](sign-token.md).
+- Tokens are never logged (§9).
+- **Client storage** (general guidance, outside the spec): browsers should keep refresh tokens in an `HttpOnly`, `Secure`, `SameSite` cookie; native apps in the OS keychain/keystore (iOS Keychain, Android Keystore). Never store them in `localStorage`/`sessionStorage`. The spec only shows a body field `refresh_token`; cookie transport is not specified. Signing goes only through the `sign-token` capability, with claim whitelist and ttl cap (§12.6) — see [sign-token.md](sign-token.md).
 
 ## Spec gaps
 
@@ -100,4 +101,6 @@ Platform-enforced rules (§4A.1, Decision 6):
 - **Logout / logout-all endpoints**: required behavior is defined, but no pipeline, op or method for revocation is specified.
 - Whether the refresh endpoint counts as a public write (it mutates token state) and whether it needs `public-writes: true`, quotas or challenge is **not specified**.
 - Whether a refresh endpoint is "login-class" (500ms) or general public (300ms) is not specified; by the §7.2 definition (has a `verify-password` step) it would be 300ms.
+- **10-second grace vs. hash-only storage**: §4A.1 requires returning *the same* new token pair when the old token is reused within 10s, but also that only the hash of refresh tokens is stored. Returning the same plaintext refresh token again requires retaining it (or a reversible form) for 10s, which contradicts hash-only storage (spec owner should resolve).
+- Cookie-based transport of the refresh token is not specified.
 - What a feature lock's `## Steps` contains when a pipeline produces the response is not specified.
