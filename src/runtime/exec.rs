@@ -511,7 +511,8 @@ impl PgExec {
     /// settings). Returned to the pool on drop.
     pub async fn session(&self) -> Result<PgSession, String> {
         Ok(PgSession {
-            client: self.client().await?,
+            client: Some(self.client().await?),
+            in_transaction: false,
         })
     }
 
@@ -549,6 +550,14 @@ impl PgExec {
         }
     }
 
+    /// Runs exactly one SQL command over the extended protocol; the server
+    /// rejects text that contains more than one.
+    pub async fn execute_one(&self, statement: &str) -> Result<(), String> {
+        let client = self.client().await?;
+        client.execute(statement, &[]).await.map_err(pg_error)?;
+        Ok(())
+    }
+
     /// Runs a query returning one text column.
     pub async fn query_texts(&self, sql: &str, param: &str) -> Result<Vec<String>, String> {
         let client = self.client().await?;
@@ -568,23 +577,58 @@ impl PgExec {
 }
 
 /// A single pinned connection from [`PgExec::session`].
+///
+/// While [`in_transaction`](Self::in_transaction) is set (between `BEGIN`
+/// and COMMIT/ROLLBACK), dropping the session — an error path that skipped
+/// ROLLBACK, a panic, or a cancelled future — detaches the connection from
+/// the pool and closes it, so the server rolls back and no half-done
+/// transaction is ever handed out again. Otherwise it returns to the pool,
+/// which also rolls back and resets state on recycle.
 pub struct PgSession {
-    client: deadpool_postgres::Object,
+    client: Option<deadpool_postgres::Object>,
+    in_transaction: bool,
+}
+
+impl Drop for PgSession {
+    fn drop(&mut self) {
+        if self.in_transaction {
+            if let Some(object) = self.client.take() {
+                drop(deadpool_postgres::Object::take(object));
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for PgSession {
+    type Target = deadpool_postgres::Object;
+    fn deref(&self) -> &Self::Target {
+        self.client.as_ref().expect("session client")
+    }
 }
 
 impl PgSession {
+    /// Marks whether a transaction is open on this session (see the type
+    /// docs for what happens on drop).
+    pub fn in_transaction(&mut self, open: bool) {
+        self.in_transaction = open;
+    }
+
+    /// Runs exactly one SQL command over the extended protocol; the server
+    /// rejects text that contains more than one.
+    pub async fn execute_one(&self, statement: &str) -> Result<(), String> {
+        (**self).execute(statement, &[]).await.map_err(pg_error)?;
+        Ok(())
+    }
+
     /// Runs a query returning one text column.
     pub async fn query_texts(&self, sql: &str, param: &str) -> Result<Vec<String>, String> {
-        let rows = self.client.query(sql, &[&param]).await.map_err(pg_error)?;
+        let rows = (**self).query(sql, &[&param]).await.map_err(pg_error)?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
     pub async fn batch(&self, statements: &[String]) -> Result<(), String> {
         for statement in statements {
-            self.client
-                .batch_execute(statement)
-                .await
-                .map_err(pg_error)?;
+            (**self).batch_execute(statement).await.map_err(pg_error)?;
         }
         Ok(())
     }

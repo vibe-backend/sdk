@@ -37,7 +37,10 @@ pub async fn migrate_tenant(
     }
     // The pool hands out a different connection per call; pin one so the
     // transaction covers every statement.
-    let session = exec.session().await?;
+    let mut session = exec.session().await?;
+    // Until COMMIT/ROLLBACK succeeds, dropping the session (error, panic,
+    // cancelled future) closes the connection instead of pooling it.
+    session.in_transaction(true);
     // REPEATABLE READ: the catalog snapshot used for the cross-tenant checks
     // below must not move while other tenants migrate concurrently.
     session
@@ -58,10 +61,13 @@ pub async fn migrate_tenant(
     match result {
         Ok(log) => {
             session.batch(&["COMMIT".to_string()]).await?;
+            session.in_transaction(false);
             Ok(log)
         }
         Err(err) => {
-            let _ = session.batch(&["ROLLBACK".to_string()]).await;
+            if session.batch(&["ROLLBACK".to_string()]).await.is_ok() {
+                session.in_transaction(false);
+            }
             Err(err)
         }
     }
@@ -82,9 +88,10 @@ async fn still_in_transaction(exec: &PgSession, marker: &str) -> Result<(), Stri
     }
 }
 
-/// First keyword of every SQL statement in `sql` that ends, starts or
-/// otherwise controls a transaction. Comments, string literals, quoted
-/// identifiers and dollar-quoted bodies are skipped.
+/// The leading keyword of `sql` if it ends, starts or otherwise controls a
+/// transaction, or switches role. Migration statements run one at a time
+/// over the extended protocol, which the server refuses for more than one
+/// command, so only the first keyword (after leading comments) matters.
 pub fn transaction_control(sql: &str) -> Option<String> {
     const WORDS: &[&str] = &[
         "begin",
@@ -97,56 +104,43 @@ pub fn transaction_control(sql: &str) -> Option<String> {
         "release",
         "prepare",
     ];
-    for statement in split_statements(sql) {
-        let mut words = statement
-            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .filter(|w| !w.is_empty())
-            .map(|w| w.to_ascii_lowercase());
-        let Some(first) = words.next() else { continue };
-        if WORDS.contains(&first.as_str()) {
-            return Some(first.to_uppercase());
-        }
-        // `SET TRANSACTION` / `SET SESSION CHARACTERISTICS` are harmless, but
-        // switching role or session authorization is not allowed either.
-        if first == "set" || first == "reset" {
-            let second = words.next().unwrap_or_default();
-            let third = words.next().unwrap_or_default();
-            let target = if second == "local" || second == "session" {
-                third
-            } else {
-                second
-            };
-            if target == "role" || target == "authorization" {
-                return Some(format!("{} ROLE", first.to_uppercase()));
-            }
+    let mut words = strip_leading_comments(sql)
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_lowercase());
+    let first = words.next()?;
+    if WORDS.contains(&first.as_str()) {
+        return Some(first.to_uppercase());
+    }
+    if first == "set" || first == "reset" {
+        let second = words.next().unwrap_or_default();
+        let third = words.next().unwrap_or_default();
+        let target = if second == "local" || second == "session" {
+            third
+        } else {
+            second
+        };
+        if target == "role" || target == "authorization" {
+            return Some(format!("{} ROLE", first.to_uppercase()));
         }
     }
     None
 }
 
-/// Splits SQL on top-level semicolons, with literals and comments blanked.
-fn split_statements(sql: &str) -> Vec<String> {
-    let chars: Vec<char> = sql.chars().collect();
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        if c == '-' && next == Some('-') {
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            cur.push(' ');
-            continue;
-        }
-        if c == '/' && next == Some('*') {
-            let mut depth = 0;
-            while i < chars.len() {
-                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+fn strip_leading_comments(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(rest) = sql.strip_prefix("--") {
+            sql = rest.split_once('\n').map_or("", |(_, r)| r);
+        } else if sql.starts_with("/*") {
+            // Nested block comments, as in Postgres.
+            let bytes = sql.as_bytes();
+            let (mut i, mut depth) = (0, 0);
+            while i + 1 < bytes.len() {
+                if &bytes[i..i + 2] == b"/*" {
                     depth += 1;
                     i += 2;
-                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                } else if &bytes[i..i + 2] == b"*/" {
                     depth -= 1;
                     i += 2;
                     if depth == 0 {
@@ -156,54 +150,11 @@ fn split_statements(sql: &str) -> Vec<String> {
                     i += 1;
                 }
             }
-            cur.push(' ');
-            continue;
-        }
-        if c == '\'' || c == '"' {
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == c {
-                    if chars.get(i + 1) == Some(&c) {
-                        i += 2;
-                        continue;
-                    }
-                    break;
-                }
-                i += 1;
-            }
-            i += 1;
-            cur.push_str(" x ");
-            continue;
-        }
-        if c == '$' {
-            // $tag$ ... $tag$ (tag may be empty); a `$1` parameter is not one.
-            let mut j = i + 1;
-            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
-                j += 1;
-            }
-            let tag_ok = j < chars.len()
-                && chars[j] == '$'
-                && !chars.get(i + 1).is_some_and(|d| d.is_ascii_digit());
-            if tag_ok {
-                let tag: String = chars[i..=j].iter().collect();
-                let rest: String = chars[j + 1..].iter().collect();
-                match rest.find(&tag) {
-                    Some(end) => i = j + 1 + rest[..end].chars().count() + tag.chars().count(),
-                    None => i = chars.len(),
-                }
-                cur.push_str(" x ");
-                continue;
-            }
-        }
-        if c == ';' {
-            out.push(std::mem::take(&mut cur));
+            sql = if depth == 0 { &sql[i..] } else { "" };
         } else {
-            cur.push(c);
+            return sql;
         }
-        i += 1;
     }
-    out.push(cur);
-    out
 }
 
 async fn migrate_in_tx(
@@ -251,32 +202,44 @@ async fn migrate_in_tx(
     // Migration DDL names tables unqualified; resolve them in the tenant
     // schema; each batch sets it for the migration statements that follow.
     for migration in &manifest.migrations {
-        let mut statements = vec![format!("SET search_path TO {}", quote(&schema)?)];
-        statements.extend(migration.statements.iter().cloned());
-        statements.push("RESET search_path".to_string());
-        exec.batch(&statements).await?;
+        exec.batch(&[format!("SET LOCAL search_path TO {}", quote(&schema)?)])
+            .await?;
+        for statement in &migration.statements {
+            // One command per call (extended protocol): the server rejects a
+            // statement that smuggles `; COMMIT; ...` after the first command.
+            exec.execute_one(statement)
+                .await
+                .map_err(|err| format!("{}: {err}", migration.id))?;
+        }
+        exec.batch(&["RESET search_path".to_string()]).await?;
         log.push(format!("applied {}", migration.id));
     }
     log.extend(protect_schema(exec, &schema).await?);
-    // Any RLS problem in this tenant, or a new one in any other tenant, fails.
-    // Problems that predate this run are reported but left to the operator
-    // (`vibe serve` refuses to start on them).
-    let own_prefix = format!("{schema}.");
-    let mut new_problems = Vec::new();
-    for problem in rls_problems(exec, &schema).await? {
-        if problem.starts_with(&own_prefix) || !problems_before.contains(&problem) {
-            new_problems.push(problem);
-        } else {
-            log.push(format!(
-                "warning: pre-existing problem in another tenant: {problem}"
+    // Fail closed: any RLS problem in any tenant schema fails the migration,
+    // whether this run introduced it or it was already there (for example
+    // left by an earlier, unprotected migration). `vibe serve` refuses to
+    // start on the same problems.
+    let problems = rls_problems(exec, &schema).await?;
+    if !problems.is_empty() {
+        let new: Vec<&String> = problems
+            .iter()
+            .filter(|p| !problems_before.contains(p))
+            .collect();
+        let old: Vec<&String> = problems
+            .iter()
+            .filter(|p| problems_before.contains(p))
+            .collect();
+        let mut msg = format!("row level security check failed after migrating {schema}:");
+        if !new.is_empty() {
+            msg.push_str(&format!(" introduced by this migration: {};", join(&new)));
+        }
+        if !old.is_empty() {
+            msg.push_str(&format!(
+                " already present before this run (fix these tenant schemas first): {};",
+                join(&old)
             ));
         }
-    }
-    if !new_problems.is_empty() {
-        return Err(format!(
-            "row level security check failed after migrating {schema}: {}",
-            new_problems.join("; ")
-        ));
+        return Err(msg.trim_end_matches(';').to_string());
     }
     if others_before != tenant_fingerprint(exec, &schema).await? {
         return Err(format!(
@@ -445,6 +408,27 @@ async fn tenant_fingerprint(exec: &PgSession, own_schema: &str) -> Result<String
                  FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class
                  JOIN s ON s.oid = c.relnamespace
                UNION ALL
+               SELECT 'y ' || s.nspname || '.' || t.typname || ' ' || t.typtype::text || ' '
+                      || t.typowner::regrole::text || ' ' || coalesce(t.typacl::text, '')
+                      || ' ' || format_type(t.typbasetype, t.typtypmod)
+                      || ' ' || coalesce(t.typdefault, '')
+                 FROM pg_type t JOIN s ON s.oid = t.typnamespace
+               UNION ALL
+               SELECT 'k ' || s.nspname || ' ' || con.conname || ' ' || pg_get_constraintdef(con.oid)
+                 FROM pg_constraint con JOIN s ON s.oid = con.connamespace
+               UNION ALL
+               SELECT 'd ' || s.nspname || ' ' || d.defaclrole::regrole::text || ' '
+                      || d.defaclobjtype::text || ' ' || coalesce(d.defaclacl::text, '')
+                 FROM pg_default_acl d JOIN s ON s.oid = d.defaclnamespace
+               UNION ALL
+               SELECT 'e ' || s.nspname || '.' || c.relname || ' ' || coalesce(pg_get_indexdef(c.oid), '')
+                 FROM pg_class c JOIN s ON s.oid = c.relnamespace WHERE c.relkind IN ('i','I')
+               UNION ALL
+               SELECT 'q ' || s.nspname || '.' || c.relname || ' ' || seq.seqincrement::text
+                      || ' ' || seq.seqmin::text || ' ' || seq.seqmax::text
+                 FROM pg_sequence seq JOIN pg_class c ON c.oid = seq.seqrelid
+                 JOIN s ON s.oid = c.relnamespace
+               UNION ALL
                SELECT 'f ' || s.nspname || '.' || p.oid::regprocedure::text || ' '
                       || md5(coalesce(p.prosrc, '')) || ' ' || p.prosecdef::text
                       || ' ' || coalesce(p.proacl::text, '')
@@ -456,6 +440,14 @@ async fn tenant_fingerprint(exec: &PgSession, own_schema: &str) -> Result<String
     Ok(rows.into_iter().next().unwrap_or_default())
 }
 
+fn join(items: &[&String]) -> String {
+    items
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::transaction_control;
@@ -465,7 +457,6 @@ mod tests {
         for sql in [
             "COMMIT",
             "commit;",
-            "CREATE TABLE a (tenant_id text); COMMIT; CREATE TABLE b (x int)",
             "END",
             "rollback",
             "ABORT",

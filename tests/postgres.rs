@@ -78,6 +78,18 @@ struct Setup {
     owner: String,
     app: String,
     tenant: String,
+    _guard: Guard,
+}
+
+/// Migrations fail closed on any RLS problem in any tenant schema, and all
+/// tests share one cluster. Tests that deliberately break RLS take this lock
+/// exclusively (and repair before returning); all others share it.
+static CORRUPTION: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+#[allow(dead_code)]
+enum Guard {
+    Shared(tokio::sync::RwLockReadGuard<'static, ()>),
+    Exclusive(tokio::sync::RwLockWriteGuard<'static, ()>),
 }
 
 /// Catalog-wide DDL (GRANT ON DATABASE, CREATE ROLE) races between parallel
@@ -86,6 +98,16 @@ static SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn setup() -> Option<Setup> {
     let admin_url = admin_url()?;
+    setup_with(admin_url, Guard::Shared(CORRUPTION.read().await)).await
+}
+
+/// For tests that leave RLS broken for a while.
+async fn setup_exclusive() -> Option<Setup> {
+    let admin_url = admin_url()?;
+    setup_with(admin_url, Guard::Exclusive(CORRUPTION.write().await)).await
+}
+
+async fn setup_with(admin_url: String, guard: Guard) -> Option<Setup> {
     let _guard = SETUP.lock().await;
     let admin = connect(&admin_url).await;
     let s = suffix();
@@ -117,6 +139,7 @@ async fn setup() -> Option<Setup> {
         owner,
         app,
         tenant,
+        _guard: guard,
     })
 }
 
@@ -332,7 +355,7 @@ async fn migration_without_tenant_id_or_with_a_view_fails() {
 
 #[tokio::test]
 async fn serve_refuses_tables_without_forced_rls() {
-    let s = require_pg!(setup().await);
+    let s = require_pg!(setup_exclusive().await);
     let schema = format!("t_{}", s.tenant);
     // A table added behind migrate's back inherits the default grants.
     s.admin
@@ -362,6 +385,11 @@ async fn serve_refuses_tables_without_forced_rls() {
         .await
         .unwrap();
     check_as(&s.admin_url, &s.app).await.unwrap();
+    // Leave no RLS problem behind for other tests (it has no policy).
+    s.admin
+        .batch_execute(&format!("DROP TABLE {schema}.later"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -483,7 +511,7 @@ async fn migration_policies_are_refused_and_nothing_is_committed() {
 
 #[tokio::test]
 async fn serve_refuses_extra_or_altered_policies() {
-    let s = require_pg!(setup().await);
+    let s = require_pg!(setup_exclusive().await);
     let schema = format!("t_{}", s.tenant);
     check_as(&s.admin_url, &s.app).await.unwrap();
     // Reproduce the leak first: an extra permissive policy lets the runtime
@@ -583,10 +611,7 @@ async fn migration_cannot_weaken_another_tenant() {
         format!("CREATE POLICY open ON {victim}.audit_notes AS RESTRICTIVE USING (true)"),
         format!("ALTER TABLE {victim}.audit_notes NO FORCE ROW LEVEL SECURITY"),
         format!("ALTER TABLE {victim}.audit_notes DISABLE ROW LEVEL SECURITY"),
-        format!(
-            "DROP POLICY tenant_isolation ON {victim}.audit_notes; \
-             CREATE POLICY tenant_isolation ON {victim}.audit_notes USING (true)"
-        ),
+        format!("ALTER POLICY tenant_isolation ON {victim}.audit_notes USING (true)"),
         format!("CREATE VIEW {victim}.peek AS SELECT * FROM {victim}.audit_notes"),
         format!("ALTER TABLE {victim}.audit_notes ADD COLUMN extra text"),
         format!("GRANT DELETE ON {victim}.audit_notes TO PUBLIC"),
@@ -630,7 +655,6 @@ async fn migration_cannot_end_the_transaction() {
         .await
         .unwrap();
     for attack in [
-        "CREATE TABLE leaky (tenant_id text, x text); COMMIT; BEGIN",
         "COMMIT",
         "END",
         "ROLLBACK",
@@ -737,4 +761,246 @@ async fn pooled_connections_come_back_clean() {
         .await
         .unwrap();
     assert_eq!(got, vec!["true||none".to_string()]);
+}
+
+#[tokio::test]
+async fn smuggled_commit_after_a_dollar_identifier_is_refused() {
+    // Review repro: `$x$` inside identifiers looked like dollar quoting to the
+    // old lexer, hiding a COMMIT and a cross-tenant policy.
+    let s = require_pg!(setup().await);
+    let victim = format!("t_{}", s.tenant);
+    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    for attack in [
+        format!(
+            "CREATE TABLE zq (tenant_id text, a$x$ int); COMMIT; \
+             CREATE POLICY open ON {victim}.audit_notes USING (true); SELECT 1 AS b$x$"
+        ),
+        "CREATE TABLE leaky (tenant_id text, x text); COMMIT; BEGIN".to_string(),
+    ] {
+        let mut m = manifest();
+        m.migrations[0].statements.push(attack.clone());
+        let tenant = format!("td{}", suffix());
+        let err = migrate_tenant(&owner_exec, &m, &tenant, &s.app)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("42601") || err.contains("multiple commands"),
+            "{attack}: {err}"
+        );
+        let left: i64 = s
+            .admin
+            .query_one(
+                "SELECT count(*) FROM pg_namespace WHERE nspname = $1",
+                &[&format!("t_{tenant}")],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(left, 0, "{attack}: nothing may be committed");
+        let policies: i64 = s
+            .admin
+            .query_one(
+                "SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND p.polname = 'open'",
+                &[&victim],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(policies, 0, "{attack}: no cross-tenant policy");
+    }
+}
+
+#[tokio::test]
+async fn migration_cannot_touch_another_tenants_types_or_default_privileges() {
+    let s = require_pg!(setup().await);
+    let victim = format!("t_{}", s.tenant);
+    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    for attack in [
+        format!("ALTER DEFAULT PRIVILEGES IN SCHEMA {victim} GRANT DELETE ON TABLES TO PUBLIC"),
+        format!("CREATE TYPE {victim}.mood AS ENUM ('a')"),
+        format!("CREATE DOMAIN {victim}.d AS text"),
+        format!("CREATE SEQUENCE {victim}.s"),
+        format!("CREATE INDEX ON {victim}.audit_notes (note)"),
+        format!("ALTER TABLE {victim}.audit_notes ADD CONSTRAINT c CHECK (true)"),
+    ] {
+        let mut m = manifest();
+        m.migrations[0].statements.push(attack.clone());
+        let err = migrate_tenant(&owner_exec, &m, &format!("tf{}", suffix()), &s.app)
+            .await
+            .unwrap_err();
+        assert!(err.contains("another tenant"), "{attack}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn existing_rls_problems_fail_every_migration() {
+    let s = require_pg!(setup_exclusive().await);
+    let victim = format!("t_{}", s.tenant);
+    // Left behind outside vibe (e.g. by an older, unprotected migration).
+    s.admin
+        .batch_execute(&format!(
+            "ALTER TABLE {victim}.audit_notes NO FORCE ROW LEVEL SECURITY"
+        ))
+        .await
+        .unwrap();
+    assert!(
+        check_as(&s.admin_url, &s.app).await.is_err(),
+        "serve refuses"
+    );
+    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    let err = migrate_tenant(&owner_exec, &manifest(), &format!("tg{}", suffix()), &s.app)
+        .await
+        .unwrap_err();
+    assert!(err.contains("already present before this run"), "{err}");
+    assert!(err.contains(&victim), "{err}");
+    // Migrating the affected tenant repairs it.
+    migrate_tenant(&owner_exec, &manifest(), &s.tenant, &s.app)
+        .await
+        .unwrap();
+    check_as(&s.admin_url, &s.app).await.unwrap();
+}
+
+const PENDING_ROLE_SPEC: &str =
+    "pending spec PR + PM approval: per-tenant migrate role (SET LOCAL ROLE tenant_<id>, NOINHERIT, own-schema grants only)";
+
+/// Migrates a fresh attacker tenant with `attack` appended; returns its schema.
+async fn attack_data(s: &Setup, attack: &[String]) -> String {
+    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    let mut m = manifest();
+    m.migrations[0].statements.extend(attack.iter().cloned());
+    let tenant = format!("th{}", suffix());
+    let _ = migrate_tenant(&owner_exec, &m, &tenant, &s.app).await;
+    format!("t_{tenant}")
+}
+
+#[tokio::test]
+#[ignore = "pending spec: per-tenant migrate role; see PENDING_ROLE_SPEC"]
+async fn migration_cannot_read_another_tenants_rows() {
+    let s = require_pg!(setup().await);
+    let victim = format!("t_{}", s.tenant);
+    s.admin
+        .batch_execute(&format!(
+            "INSERT INTO {victim}.audit_notes VALUES ('{}', 'secret')",
+            s.tenant
+        ))
+        .await
+        .unwrap();
+    let loot = attack_data(
+        &s,
+        &[
+            format!("SELECT set_config('app.tenant_id', '{}', true)", s.tenant),
+            format!("INSERT INTO audit_notes SELECT 'x', note FROM {victim}.audit_notes"),
+        ],
+    )
+    .await;
+    let copied: i64 = s
+        .admin
+        .query_one(
+            "SELECT count(*) FROM pg_namespace WHERE nspname = $1",
+            &[&loot],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let leaked = if copied == 0 {
+        0
+    } else {
+        s.admin
+            .query_one(
+                &format!("SELECT count(*) FROM {loot}.audit_notes WHERE note = 'secret'"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+    };
+    assert_eq!(leaked, 0, "{PENDING_ROLE_SPEC}");
+}
+
+#[tokio::test]
+#[ignore = "pending spec: per-tenant migrate role; see PENDING_ROLE_SPEC"]
+async fn migration_cannot_write_another_tenants_rows() {
+    let s = require_pg!(setup().await);
+    let victim = format!("t_{}", s.tenant);
+    s.admin
+        .batch_execute(&format!(
+            "INSERT INTO {victim}.audit_notes VALUES ('{}', 'secret')",
+            s.tenant
+        ))
+        .await
+        .unwrap();
+    attack_data(
+        &s,
+        &[
+            format!("SELECT set_config('app.tenant_id', '{}', true)", s.tenant),
+            format!("UPDATE {victim}.audit_notes SET note = 'pwned'"),
+        ],
+    )
+    .await;
+    let mut m = manifest();
+    m.migrations[0].statements.extend([
+        format!("ALTER TABLE {victim}.audit_notes NO FORCE ROW LEVEL SECURITY"),
+        format!("UPDATE {victim}.audit_notes SET note = 'pwned'"),
+        format!("ALTER TABLE {victim}.audit_notes FORCE ROW LEVEL SECURITY"),
+    ]);
+    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    let _ = migrate_tenant(&owner_exec, &m, &format!("ti{}", suffix()), &s.app).await;
+    let note: String = s
+        .admin
+        .query_one(
+            &format!("SELECT note FROM {victim}.audit_notes LIMIT 1"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(note, "secret", "{PENDING_ROLE_SPEC}");
+}
+
+#[tokio::test]
+async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
+    let s = require_pg!(setup().await);
+    let exec = PgExec::connect_with(
+        &url_as(&s.admin_url, &s.owner),
+        vibe::runtime::PgOptions {
+            pool_size: 1,
+            statement_timeout_ms: 30_000,
+            pool_timeout_ms: 5_000,
+        },
+    )
+    .await
+    .unwrap();
+    let mut m = manifest();
+    m.migrations[0].statements.push("SELECT pg_sleep(5)".into());
+    let tenant = format!("tc{}", suffix());
+    // Cancel the migration while it sleeps inside its transaction.
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        migrate_tenant(&exec, &m, &tenant, &s.app),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the migration should still be running");
+    // The pool's only connection was discarded, not reused mid-transaction:
+    // a fresh session sees no open transaction and the schema never existed.
+    let got = exec
+        .query_texts(
+            "SELECT coalesce(txid_current_if_assigned()::text, 'none') || '|' || \
+             (SELECT count(*) FROM pg_namespace WHERE nspname = $1)::text",
+            &format!("t_{tenant}"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got, vec!["none|0".to_string()]);
 }
