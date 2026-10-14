@@ -875,7 +875,21 @@ fn check_targets(docs: &HashMap<String, LockDoc>, report: &mut Report) {
             // Calls.methods is the static call list the runtime binds at deploy.
             if let Some(list) = find_section(&doc.sections, "Calls").and_then(|s| s.get("methods"))
             {
-                for target in crate::lock::parse_string_list(list).unwrap_or_default() {
+                let targets = match crate::lock::parse_string_list(list) {
+                    Ok(targets) => targets,
+                    Err(_) => {
+                        // Fail closed: a malformed list must not skip the check.
+                        report.push(
+                            Diag::error(
+                                lock_rel(&doc.meta.source),
+                                "Calls.methods must be a list like `[object.action, ...]`",
+                            )
+                            .at_section("Calls"),
+                        );
+                        Vec::new()
+                    }
+                };
+                for target in targets {
                     if let Err(err) = check_method_target(&target, docs) {
                         report
                             .push(Diag::error(lock_rel(&doc.meta.source), err).at_section("Calls"));
@@ -1460,6 +1474,27 @@ mod tests {
             "{:?}",
             report.diags
         );
+    }
+
+    #[test]
+    fn malformed_calls_methods_fails_closed() {
+        for list in ["product.publish", "[product.publish", "{ a: b }"] {
+            let mut docs = target_docs();
+            let body = format!("## Calls\n- methods: {list}\n");
+            docs.insert(
+                "product/methods/x".into(),
+                doc(Kind::Method, None, "product/methods/x", &body),
+            );
+            let mut report = Report::new();
+            check_targets(&docs, &mut report);
+            assert!(
+                report
+                    .errors()
+                    .any(|d| d.message.contains("Calls.methods must be a list")),
+                "{list}: {:?}",
+                report.diags
+            );
+        }
     }
 
     #[test]

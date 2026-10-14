@@ -915,7 +915,9 @@ fn dependencies(id: &str, docs: &HashMap<String, LockDoc>) -> Result<Vec<Depende
             }
             if let Some(calls) = find_section(&doc.sections, "Calls") {
                 if let Some(list) = calls.get("methods") {
-                    for target in parse_name_list(list) {
+                    let targets = parse_name_list(list, "Calls.methods")
+                        .map_err(|err| Diag::error(&doc.meta.source, err).at_section("Calls"))?;
+                    for target in targets {
                         if let Err(err) = crate::validate::check_method_target(&target, docs) {
                             return Err(Diag::error(&doc.meta.source, err).at_section("Calls"));
                         }
@@ -930,7 +932,11 @@ fn dependencies(id: &str, docs: &HashMap<String, LockDoc>) -> Result<Vec<Depende
             Some(Scope::Definition) => {
                 if let Some(providers) = find_section(&doc.sections, "Providers") {
                     if let Some(list) = providers.get("allowlist") {
-                        for name in parse_name_list(list) {
+                        let names =
+                            parse_name_list(list, "Providers.allowlist").map_err(|err| {
+                                Diag::error(&doc.meta.source, err).at_section("Providers")
+                            })?;
+                        for name in names {
                             ids.push((name, Kind::Provider));
                         }
                     }
@@ -1129,8 +1135,9 @@ fn render_inline_list(items: &[String]) -> String {
     }
 }
 
-fn parse_name_list(raw: &str) -> Vec<String> {
-    crate::lock::parse_string_list(raw).unwrap_or_default()
+/// Fail closed: a malformed list is an error, never an empty list.
+fn parse_name_list(raw: &str, what: &str) -> Result<Vec<String>, String> {
+    crate::lock::parse_string_list(raw).map_err(|_| format!("{what} must be a list like `[a, b]`"))
 }
 
 #[cfg(test)]
