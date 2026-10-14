@@ -348,9 +348,11 @@ async fn cmd_serve(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
-    let auth = auth_from_env(run_env)?;
+    let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
+    // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
+    auth.add_route_jwks(&manifest.routes)?;
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::new())
     } else {
