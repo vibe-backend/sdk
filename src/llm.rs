@@ -534,6 +534,8 @@ impl HttpAdapter {
     pub fn new(config: LlmConfig) -> Result<Self, String> {
         let client = Client::builder()
             .timeout(config.timeout)
+            // A redirect could lead to a host the endpoint check never saw.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| format!("http client: {err}"))?;
         Ok(Self { config, client })

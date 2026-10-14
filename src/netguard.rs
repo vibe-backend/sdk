@@ -47,6 +47,11 @@ pub fn is_non_public_host(host: &str) -> bool {
     if let Ok(ip) = host.parse::<Ipv6Addr>() {
         return non_public_v6(ip);
     }
+    // After the one trailing dot is stripped, an empty label (`localhost..`,
+    // `a..b`, `.x`) is malformed and refused.
+    if host.split('.').any(str::is_empty) {
+        return true;
+    }
     // Single-label names resolve through local search domains.
     !host.contains('.')
 }
@@ -76,7 +81,12 @@ fn non_public_v6(ip: Ipv6Addr) -> bool {
     if s[..6].iter().all(|&x| x == 0) {
         return true;
     }
-    (s[0] == 0x64 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0)) // 64:ff9b::/96 NAT64
+    // ::ffff:0:0/96 IPv4-translated, e.g. ::ffff:0:7f00:1.
+    if s[..4].iter().all(|&x| x == 0) && s[4] == 0xffff && s[5] == 0 {
+        return true;
+    }
+    (s[0] == 0x100 && s[1..4].iter().all(|&x| x == 0)) // 100::/64 discard
+        || (s[0] == 0x64 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0)) // 64:ff9b::/96 NAT64
         || s[0] == 0x2002 // 2002::/16 6to4
         || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
         || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
@@ -99,6 +109,13 @@ mod tests {
             "foo.local.",
             "Foo.LOCAL",
             "intranet.",
+            "localhost..",
+            "idp.internal..",
+            "metadata.google.internal..",
+            "foo.local..",
+            "a..example.com",
+            ".example.com",
+            "example.com..",
         ] {
             assert!(is_non_public_host(host), "{host}");
         }
@@ -112,6 +129,10 @@ mod tests {
     fn special_ranges_are_blocked() {
         for host in [
             "[::7f00:1]",
+            "[::ffff:0:7f00:1]",
+            "::ffff:0:a9fe:a9fe",
+            "100::1",
+            "100::ffff:1",
             "::7f00:1",
             "[64:ff9b::a9fe:a9fe]",
             "2002:7f00:1::",
@@ -151,6 +172,12 @@ mod url_tests {
             "https://metadata.google.internal./jwks.json",
             "https://foo.local./jwks.json",
             "https://[::7f00:1]/jwks.json",
+            "https://localhost../jwks.json",
+            "https://idp.internal../jwks.json",
+            "https://metadata.google.internal../jwks.json",
+            "https://foo.local../jwks.json",
+            "https://[::ffff:0:7f00:1]/jwks.json",
+            "https://[100::1]/jwks.json",
         ] {
             assert!(crate::runtime::jwks::HttpsJwks::new(uri).is_err(), "{uri}");
             let host = url::Url::parse(uri)
