@@ -33,6 +33,21 @@ pub fn approve_project(opts: &ApproveOptions<'_>) -> Result<Report, Report> {
         return Err(report);
     }
 
+    // Sign only what `vibe validate` accepts (#34). Approval and signatures
+    // are not checked here: they are what this command is about to write.
+    if let Err(problems) = crate::validate::validate_project(&crate::validate::ValidateOptions {
+        root: opts.root,
+        deploy: false,
+        verify_key: None,
+    }) {
+        report.push(Diag::error(
+            "approve",
+            "validation failed; fix these errors (see vibe validate) before approving",
+        ));
+        report.extend(problems.diags);
+        return Err(report);
+    }
+
     let mut prepared = Vec::new();
     for source in sources {
         let path = opts.root.join(lock_rel(&source.rel));

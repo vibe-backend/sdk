@@ -530,6 +530,40 @@ async fn approve_with_one_reviewer_writes_nothing() {
     );
 }
 
+#[tokio::test]
+async fn approve_refuses_locks_that_fail_validation() {
+    // #34: approve must run the validator first and sign nothing on failure.
+    let root = copy_shop();
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|err| panic!("{err}"));
+    let lock = root.join("api/catalog/v1/get-product/get-product.lock.md");
+    let text = fs::read_to_string(&lock).unwrap();
+    assert!(text.contains("name: md-logic"));
+    fs::write(&lock, text.replace("name: md-logic", "name: hand-edited")).unwrap();
+    let before = lock_snapshot(&root);
+    let key = sign::generate_key();
+    let err = approve_project(&ApproveOptions {
+        root: &root,
+        reviewers: &["ada@example.com".into(), "grace@example.com".into()],
+        reason: "local test",
+        approval_ref: "local",
+        commit: "local",
+        now: "2026-10-14T00:00:00Z",
+        signing_key: &key,
+    })
+    .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("validation failed"), "{text}");
+    assert!(text.contains("compiler name is not md-logic"), "{text}");
+    assert_eq!(before, lock_snapshot(&root), "no lock may be signed");
+}
+
 fn lock_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
     let mut files = Vec::new();
     collect_locks(root, root, &mut files);
