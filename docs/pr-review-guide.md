@@ -35,6 +35,8 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - 而家已經有：`vibe secret-scan --fail-on-find`。
 - 而家已經有：`vibe compile --check`（重編比對）同 `vibe validate`。
 - 計劃中（v1.8 實作）：`vibe build --check-determinism`，取代上面兩個。
+- `main` 一定要用 **ruleset**（唔好用舊式 branch protection）開 pull request rule 嘅 **Require approval of the most recent reviewable push**：`vibe build --release-approval` 會用 `GET /repos/{owner}/{repo}/rules/branches/main` 確認，冇就失敗。舊式 branch protection 要 admin 權限先讀到，所以唔接受（spec 2C.3a）。
+- 唔好用 merge queue：高風險 release build 唔支援（spec 2C.3a）。
 - 一定要開 **Require branches to be up to date before merging**：`vibe build --release-approval` 會比較 build commit 同 PR head 嘅 tree，冇開呢個設定就可能唔一樣，release build 會失敗（spec 2C.3a）。
 
 ## 4. 高風險 label 要兩個 approval
@@ -57,7 +59,11 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
 
 - 開一個 `release` environment，設 **Required reviewers**，只准受保護 ref（`main`、受 ruleset 保護嘅 `v*` tag）部署。
 - `release` environment 一定要開 **Prevent self-review**，觸發部署嘅人唔可以自己批准（spec 決定 90）。
-- 高風險 release 要用 `vibe build --release-approval pr:<number>`、`env:<run_id>` 或者 `pr:<number>,env:<run_id>`（計劃中）。Build 會經 GitHub REST API 驗證：build commit 屬於唯一一個 merged PR、批准喺 PR 最後 head SHA 上而且 tree 一樣、批准人有 write 權限、唔係作者、唔係最後 push 嘅人、唔係 bot、高風險路徑要係 CODEOWNER，同埋有 2 個唔同批准人（PR review 同 environment approval 合併計）。
+- `release` environment **唔好開 Allow administrators to bypass configured protection rules**，否則 admin 可以跳過 required reviewers。
+- 改 CODEOWNERS（`.github/`、root、`docs/` 任何一個）一律當高風險，要 2 個批准。
+- CODEOWNERS 用 team（`@org/team`）嘅話，release workflow 要用 GitHub App installation token（organization Members: read，其他只讀），`GITHUB_TOKEN` 查唔到 team 成員；冇就失敗。
+- Machine user（普通帳戶做自動化）SDK 分唔到係唔係真人，唔好畀佢哋 write 權限或者 CODEOWNERS 身份。
+- 高風險 release 要用 `vibe build --release-approval pr:<number>`、`env:<run_id>` 或者 `pr:<number>,env:<run_id>`（計劃中）。Build 會經 GitHub REST API 驗證：build commit 屬於唯一一個 merged PR、批准喺 PR 最後 head SHA 上而且 tree 一樣、批准人有 write 權限、唔係 PR 任何 commit 嘅 author／committer／co-author、唔係 PR 作者或者 env run 觸發者、唔係 bot、高風險路徑要係 CODEOWNER（由 PR base 讀），同埋有 2 個唔同批准人（PR review 同 environment approval 合併計）。
 - Release workflow 嘅 token 權限：
 
   ```yaml
