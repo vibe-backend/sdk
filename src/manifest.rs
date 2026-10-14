@@ -117,6 +117,10 @@ pub fn parse_refresh_block(bullets: &[crate::lock::Bullet]) -> Result<RefreshSpe
         }
     }
     for b in bullets {
+        // `source-lines` is metadata the compiler adds to every block.
+        if b.key == "source-lines" {
+            continue;
+        }
         if ![
             "sign-method",
             "refresh-ttl",
@@ -150,6 +154,21 @@ pub fn parse_refresh_block(bullets: &[crate::lock::Bullet]) -> Result<RefreshSpe
             "reuse-grace",
         )?,
     })
+}
+
+/// Checks that a `token-refresh` `sign-method` names an existing method
+/// with a `sign-jwt` step. A typo here must fail the build, not every
+/// refresh call at runtime.
+pub fn refresh_sign_method_problem(sign_method: &str, methods: &[MethodSpec]) -> Option<String> {
+    match methods.iter().find(|m| m.target == sign_method) {
+        None => Some(format!(
+            "token-refresh sign-method `{sign_method}` is not a known method"
+        )),
+        Some(m) if !m.steps.iter().any(|s| s.op == "sign-jwt") => Some(format!(
+            "token-refresh sign-method `{sign_method}` has no sign-jwt step"
+        )),
+        Some(_) => None,
+    }
 }
 
 /// Parses a `### token-revoke` block.
@@ -447,6 +466,13 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
                 crud_model: model.id.clone(),
                 crud_action: action.clone(),
             });
+        }
+    }
+    for route in &routes {
+        if let Some(spec) = &route.refresh {
+            if let Some(err) = refresh_sign_method_problem(&spec.sign_method, &methods) {
+                report.push(Diag::error(&route.feature_id, err).at_section("Pipelines"));
+            }
         }
     }
     if report.has_errors() {
@@ -1133,5 +1159,59 @@ mod rate_key_tests {
         for bad in ["family", "req.ip", "input.", "input.a-b", "everyone"] {
             assert!(check_rate_key(bad, false, "jwt").is_err(), "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    #[test]
+    fn token_refresh_accepts_compiler_source_lines() {
+        let bullets = vec![
+            crate::lock::Bullet {
+                key: "sign-method".into(),
+                value: "user.sign-token".into(),
+            },
+            crate::lock::Bullet {
+                key: "source-lines".into(),
+                value: "12-18".into(),
+            },
+        ];
+        let spec = parse_refresh_block(&bullets).expect("source-lines is metadata");
+        assert_eq!(spec.sign_method, "user.sign-token");
+    }
+
+    #[test]
+    fn token_refresh_sign_method_typo_is_a_build_error() {
+        let method = |steps: Vec<StepSpec>| MethodSpec {
+            target: "user.sign-token".into(),
+            writes: false,
+            input: Vec::new(),
+            errors: Vec::new(),
+            capabilities: vec!["sign-token".into()],
+            steps,
+            crud_model: String::new(),
+            crud_action: String::new(),
+        };
+        let sign: StepSpec = serde_json::from_value(serde_json::json!({
+            "id": "s", "op": "sign-jwt", "target": "", "args": "", "value": "", "status": 0,
+            "sql": "", "params": [], "out": "", "fail": "", "when_expr": "", "writes": false,
+            "table": "", "opts": {}
+        }))
+        .unwrap();
+        let methods = vec![method(vec![sign])];
+        assert_eq!(
+            refresh_sign_method_problem("user.sign-token", &methods),
+            None
+        );
+        assert!(refresh_sign_method_problem("user.sign-tokn", &methods)
+            .unwrap()
+            .contains("not a known method"));
+        assert!(
+            refresh_sign_method_problem("user.sign-token", &[method(Vec::new())])
+                .unwrap()
+                .contains("no sign-jwt step")
+        );
     }
 }

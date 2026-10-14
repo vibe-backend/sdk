@@ -656,32 +656,26 @@ async fn query_runs_as_public_reader_in_a_read_only_transaction() {
         eprintln!("VIBE_TEST_PG_ADMIN_URL not set; skipping Postgres test");
         return;
     };
+    // Lock SQL cannot call current_user/current_setting (allowlist), so
+    // check the executor directly with the arguments a read step uses.
     let exec = PgExec::connect(&url).await.unwrap();
-    let m = method_manifest(
-        &[],
-        json!([
-            step(
-                "query",
-                "u",
-                json!({"table": "users",
-                "sql": "select current_user::text as who, current_setting('transaction_read_only') as ro"})
-            ),
-            respond("u")
-        ]),
-    );
-    let auth = auth();
-    let out = run_method(&m, &exec, "t.run", &json!({}), ctx(&auth, &tenant), 0)
+    let rows = exec
+        .raw(
+            &tenant,
+            "public_reader",
+            false,
+            "select current_user::text as who, current_setting('transaction_read_only') as ro",
+            vec![],
+        )
         .await
-        .unwrap()
-        .value;
+        .unwrap();
+    let out = Value::Object(rows.into_iter().next().unwrap());
     assert_eq!(out, json!({"who": "public_reader", "ro": "on"}));
 }
 
-/// Cross-tenant read through a query step that rewrites `app.tenant_id`.
-/// Known v1 blocker: the structural fix (per-tenant DB role + SQL parser
-/// allowlist) waits on a pending spec change; un-ignore when it lands.
+/// A query step cannot switch tenant, role or run dynamic SQL to reach
+/// another tenant's rows.
 #[tokio::test]
-#[ignore = "pending spec: per-tenant role isolation for query steps"]
 async fn query_cannot_read_another_tenant() {
     let Some((_app, admin, tenant_a, url)) = pg_app().await else {
         return;
@@ -699,22 +693,29 @@ async fn query_cannot_read_another_tenant() {
         .await
         .unwrap();
     let exec = PgExec::connect(&url).await.unwrap();
-    let sql = format!(
-        "select email from t_{tenant_b}.users where set_config('app.tenant_id', '{tenant_b}', true) is not null"
-    );
-    let m = method_manifest(
-        &[],
-        json!([
-            step("query", "u", json!({"table": "users", "sql": sql})),
-            respond("u")
-        ]),
-    );
     let auth = auth();
-    let out = run_method(&m, &exec, "t.run", &json!({}), ctx(&auth, &tenant_a), 0).await;
-    assert!(
-        !matches!(&out, Ok(r) if r.value.to_string().contains("secret@b.example")),
-        "tenant {tenant_a} read tenant {tenant_b}: {out:?}"
-    );
+    for sql in [
+        format!(
+            "select set_config('app.tenant_id', '{tenant_b}', true), query_to_xml('select email from t_{tenant_b}.users', true, false, '') as x"
+        ),
+        format!("select email from t_{tenant_b}.users"),
+        "select set_config('role', 'none', true) as r".to_string(),
+        format!("select * from query_to_xml('select email from t_' || '{tenant_b}' || '.users', true, false, '')"),
+    ] {
+        let m = method_manifest(
+            &[],
+            json!([
+                step("query", "u", json!({"table": "users", "sql": sql})),
+                respond("u")
+            ]),
+        );
+        let out = run_method(&m, &exec, "t.run", &json!({}), ctx(&auth, &tenant_a), 0).await;
+        assert!(out.is_err(), "not blocked: {sql}: {out:?}");
+        assert!(
+            !format!("{out:?}").contains("secret@b.example"),
+            "tenant {tenant_a} read tenant {tenant_b}"
+        );
+    }
 }
 
 /// The validate step from docs/best-practices/user-login.md, verbatim

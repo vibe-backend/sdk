@@ -65,6 +65,7 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
     check_orphans(opts.root, &sources, &mut report);
     check_routes(&docs, &mut report);
     check_calls(&docs, &mut report);
+    check_refresh_sign_methods(&docs, &mut report);
     check_migrations(&docs, &mut report);
     check_feature_method_writes(&docs, &mut report);
     check_security_items_enriched(&docs, &source_by_id, opts, &mut report);
@@ -462,11 +463,17 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                     .at_step(&block.heading),
                 );
             }
-            if !matches!(block_val(block, "issue-refresh").as_str(), "" | "none") {
+            let issue_refresh = block_val(block, "issue-refresh");
+            if !matches!(
+                issue_refresh.as_str(),
+                "" | "none" | "platform-decided" | "new-family"
+            ) {
                 report.push(
                     Diag::error(
                         file,
-                        "sign-jwt issue-refresh is not supported by this runtime yet",
+                        format!(
+                            "sign-jwt issue-refresh must be none, platform-decided or new-family (got `{issue_refresh}`)"
+                        ),
                     )
                     .at_step(&block.heading),
                 );
@@ -500,6 +507,13 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
             if plain_write(&sql) && block_val(block, "writes") != "true" {
                 report.push(
                     Diag::error(file, "a query step that writes needs writes: true")
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+            }
+            if let Some(problem) = crate::sqlguard::query_problem(&sql) {
+                report.push(
+                    Diag::error(file, problem)
                         .at_step(&block.heading)
                         .at_section("Steps"),
                 );
@@ -877,6 +891,57 @@ fn check_routes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
                 &doc.meta.source,
                 format!("route {key} duplicates {prev}"),
             ));
+        }
+    }
+}
+
+/// Every `token-refresh` `sign-method` must name a method with a `sign-jwt`
+/// step (a typo would otherwise only surface as a failing refresh call).
+fn check_refresh_sign_methods(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    for doc in docs.values() {
+        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+            continue;
+        }
+        let Some(pipes) = find_section(&doc.sections, "Pipelines") else {
+            continue;
+        };
+        for block in &pipes.blocks {
+            if pipeline_name(&block.heading) != "token-refresh" {
+                continue;
+            }
+            let target = block_val(block, "sign-method");
+            let Some((object, method)) = target.split_once('.') else {
+                if !target.is_empty() {
+                    report.push(
+                        Diag::error(
+                            &doc.meta.source,
+                            format!("token-refresh sign-method `{target}` is not a known method"),
+                        )
+                        .at_step(&block.heading),
+                    );
+                }
+                continue;
+            };
+            let id = format!("{object}/methods/{method}");
+            let problem = match docs.get(&id) {
+                None => Some(format!(
+                    "token-refresh sign-method `{target}` is not a known method"
+                )),
+                Some(m) => {
+                    let signs = find_section(&m.sections, "Steps").is_some_and(|steps| {
+                        steps
+                            .blocks
+                            .iter()
+                            .any(|b| block_val(b, "op") == "sign-jwt")
+                    });
+                    (!signs).then(|| {
+                        format!("token-refresh sign-method `{target}` has no sign-jwt step")
+                    })
+                }
+            };
+            if let Some(problem) = problem {
+                report.push(Diag::error(&doc.meta.source, problem).at_step(&block.heading));
+            }
         }
     }
 }
@@ -1417,6 +1482,111 @@ fn lock_rel(source_rel: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock::{Block, Bullet, Meta, Section};
+
+    fn block(heading: &str, pairs: &[(&str, &str)]) -> Block {
+        Block {
+            heading: heading.into(),
+            bullets: pairs
+                .iter()
+                .map(|(k, v)| Bullet {
+                    key: (*k).into(),
+                    value: (*v).into(),
+                })
+                .collect(),
+        }
+    }
+
+    fn doc(
+        kind: Kind,
+        scope: Option<Scope>,
+        id: &str,
+        section: &str,
+        blocks: Vec<Block>,
+    ) -> LockDoc {
+        LockDoc {
+            meta: Meta::pending(kind, scope, id, format!("{id}.md")),
+            sections: vec![Section {
+                name: section.into(),
+                bullets: Vec::new(),
+                table: None,
+                blocks,
+                none: false,
+            }],
+        }
+    }
+
+    fn sign_method(issue_refresh: &str) -> LockDoc {
+        doc(
+            Kind::Method,
+            None,
+            "user/methods/sign-token",
+            "Steps",
+            vec![block(
+                "### s1",
+                &[
+                    ("op", "sign-jwt"),
+                    ("key-ref", "secret:JWT_SIGNING_KEY"),
+                    ("issue-refresh", issue_refresh),
+                    ("source-lines", "3-9"),
+                ],
+            )],
+        )
+    }
+
+    #[test]
+    fn sign_jwt_issue_refresh_is_supported() {
+        for mode in ["platform-decided", "new-family", "none"] {
+            let mut report = Report::new();
+            check_method(&sign_method(mode), "m", &mut report);
+            assert!(
+                !report
+                    .diags
+                    .iter()
+                    .any(|d| d.message.contains("issue-refresh")),
+                "{mode}: {:?}",
+                report.diags
+            );
+        }
+        let mut report = Report::new();
+        check_method(&sign_method("rotate"), "m", &mut report);
+        assert!(report.errors().any(|d| d.message.contains("issue-refresh")));
+    }
+
+    #[test]
+    fn token_refresh_sign_method_must_exist_and_sign() {
+        let route = |target: &str| {
+            doc(
+                Kind::Api,
+                Some(Scope::Feature),
+                "auth/refresh",
+                "Pipelines",
+                vec![block(
+                    "### token-refresh",
+                    &[("sign-method", target), ("source-lines", "1-4")],
+                )],
+            )
+        };
+        let mut docs = HashMap::new();
+        docs.insert(
+            "user/methods/sign-token".into(),
+            sign_method("platform-decided"),
+        );
+        docs.insert("auth/refresh".into(), route("user.sign-token"));
+        let mut report = Report::new();
+        check_refresh_sign_methods(&docs, &mut report);
+        assert!(!report.has_errors(), "{:?}", report.diags);
+        docs.insert("auth/refresh".into(), route("user.sign-tokn"));
+        let mut report = Report::new();
+        check_refresh_sign_methods(&docs, &mut report);
+        assert!(
+            report
+                .errors()
+                .any(|d| d.message.contains("not a known method")),
+            "{:?}",
+            report.diags
+        );
+    }
 
     #[test]
     fn delete_sql_is_rejected() {

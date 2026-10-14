@@ -111,6 +111,10 @@ pub async fn query(
     if step.table.starts_with("_platform") || step.sql.to_ascii_lowercase().contains("_platform_") {
         return Err(internal("platform tables cannot be queried"));
     }
+    // Parser allowlist: one statement, plain tables, allowlisted functions.
+    if let Some(problem) = crate::sqlguard::query_problem(&step.sql) {
+        return Err(internal(problem));
+    }
     let writes = crate::validate::plain_write(&step.sql);
     if writes && !step.writes {
         return Err(internal("query writes but the step is not marked writes"));
@@ -460,6 +464,10 @@ async fn attach_refresh(
         }
     };
     out["refresh_token"] = Value::String(token);
+    // Seconds until this token expires if unused: the smaller of idle-ttl
+    // and the family lifetime (a new family here; the refresh route replaces
+    // it with the remaining value on rotation).
+    out["refresh_expires_in"] = Value::from(spec.idle_ttl_s.min(spec.refresh_ttl_s));
     Ok(())
 }
 
