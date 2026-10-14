@@ -59,7 +59,7 @@ pub struct AuthConfig {
     /// Private keys for `sign-jwt` steps, by `key-ref` (loaded at startup).
     pub signing_keys: HashMap<String, SigningKey>,
     /// Breached-password source for `hash-password` (spec §4A.2).
-    pub breached: Arc<super::breached::BreachedSource>,
+    pub breached: Arc<super::breached::BreachedConfig>,
 }
 
 /// A JWT signing key named by a lock `key-ref`.
@@ -85,7 +85,7 @@ impl AuthConfig {
             jwks: None,
             roles_claim: "roles".into(),
             signing_keys: HashMap::new(),
-            breached: Arc::new(super::breached::BreachedSource::builtin()),
+            breached: Arc::new(super::breached::BreachedConfig::builtin()),
         }
     }
 }
@@ -1639,7 +1639,9 @@ fn public_message(fail: &MethodFail) -> String {
 
 fn platform_status(code: &str) -> StatusCode {
     match code {
-        "VALIDATION_FAILED" | "WEAK_PASSWORD" => StatusCode::UNPROCESSABLE_ENTITY,
+        "VALIDATION_FAILED" | "WEAK_PASSWORD" | "BREACHED_PASSWORD" => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
         "PRECONDITION_REQUIRED" => StatusCode::PRECONDITION_REQUIRED,
         "PRECONDITION_FAILED" => StatusCode::PRECONDITION_FAILED,
         "NOT_FOUND" => StatusCode::NOT_FOUND,

@@ -211,7 +211,9 @@ async fn create(
         }
         let mut value = provided.unwrap_or(Value::Null);
         if field.ty == "password" && value.is_string() {
-            value = Value::String(hash_password(value.as_str().unwrap_or(""))?);
+            value = Value::String(
+                super::ops::hash_new_password(ctx.auth, value.as_str().unwrap_or("")).await?,
+            );
         }
         check_field(field, &value)?;
         if field.unique && !value.is_null() {
@@ -462,7 +464,16 @@ async fn update(
             ));
         }
         check_field(field, value)?;
-        sets.push((col(field), value.clone()));
+        // A password is never stored as given: same floor, breached check
+        // and hashing as on create.
+        let value = if field.ty == "password" && value.is_string() {
+            Value::String(
+                super::ops::hash_new_password(ctx.auth, value.as_str().unwrap_or("")).await?,
+            )
+        } else {
+            value.clone()
+        };
+        sets.push((col(field), value));
     }
     if sets.is_empty() {
         return Err(MethodFail::code(

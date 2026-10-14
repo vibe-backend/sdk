@@ -174,24 +174,25 @@ pub async fn verify_password(
     Ok(Value::Bool(ok && real))
 }
 
-/// `hash-password` with the platform floor: 12..=256 characters and not a
-/// known breached password (spec §4A.2); otherwise WEAK_PASSWORD. When the
-/// breached-password source cannot answer, the step fails closed with 503.
-pub async fn hash_password_op(
-    step: &StepSpec,
-    vars: &Map<String, Value>,
-    ctx: CallCtx<'_>,
-) -> Result<Value, MethodFail> {
-    let plain = eval(opt(step, "plain"), vars)?;
-    let plain = plain.as_str().unwrap_or("").to_string();
+/// Hashes a new password with the platform floor (spec §4A.2): 12..=256
+/// characters (else WEAK_PASSWORD) and not a known breached password (else
+/// BREACHED_PASSWORD, so clients can tell the user why).
+/// When the breached-password source cannot answer, fails closed with 503.
+/// argon2 runs on a blocking thread under the shared 4-slot semaphore. Every
+/// path that stores a password (the `hash-password` op, CRUD create and
+/// update of a `password` field) goes through here.
+pub async fn hash_new_password(
+    auth: &super::http::AuthConfig,
+    plain: &str,
+) -> Result<String, MethodFail> {
     let len = plain.chars().count();
     if (12..=256).contains(&len) {
-        match ctx.auth.breached.is_breached(&plain).await {
+        match auth.breached.is_breached(plain).await {
             Ok(false) => {}
             Ok(true) => {
                 return Err(MethodFail::code(
-                    "WEAK_PASSWORD",
-                    "password does not meet the platform baseline",
+                    "BREACHED_PASSWORD",
+                    "password appears in a known data breach; choose another",
                 ))
             }
             Err(err) => {
@@ -204,10 +205,21 @@ pub async fn hash_password_op(
         }
     }
     let _slot = argon_slot().await?;
-    let hash = tokio::task::spawn_blocking(move || hash_password(&plain))
+    let plain = plain.to_string();
+    tokio::task::spawn_blocking(move || hash_password(&plain))
         .await
-        .map_err(|_| internal("argon2 task failed"))??;
-    Ok(Value::String(hash))
+        .map_err(|_| internal("argon2 task failed"))?
+}
+
+/// `hash-password`: see [`hash_new_password`].
+pub async fn hash_password_op(
+    step: &StepSpec,
+    vars: &Map<String, Value>,
+    ctx: CallCtx<'_>,
+) -> Result<Value, MethodFail> {
+    let plain = eval(opt(step, "plain"), vars)?;
+    let plain = plain.as_str().unwrap_or("").to_string();
+    Ok(Value::String(hash_new_password(ctx.auth, &plain).await?))
 }
 
 /// `random-token`: `{value, hash}`. `value` is 32 random bytes, base64url

@@ -520,7 +520,7 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
             }
             if crate::security::sql_writes(&sql) && block_val(block, "scope").is_empty() {
                 let cleaned = crate::security::strip_sql_noise(&sql).to_ascii_lowercase();
-                if cleaned.contains("update") {
+                if has_update_statement(&cleaned) {
                     report.push(
                         Diag::error(file, "UPDATE needs scope: pk or scope: rls")
                             .at_step(&block.heading),
@@ -1035,10 +1035,9 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
     if !migration && (DDL_SQL.is_match(&cleaned) || SELECT_INTO.is_match(&cleaned)) {
         problems.push("DDL is only allowed in migration locks".into());
     }
-    if crate::security::sql_writes(trimmed)
-        && lower.contains("update")
-        && !lower.contains(" where ")
-    {
+    // A real UPDATE statement (not a column like `updated_at`, not an
+    // upsert's `DO UPDATE`) needs WHERE.
+    if has_update_statement(&lower) && !lower.contains(" where ") {
         problems.push("UPDATE needs a WHERE clause".into());
     }
     // Param hygiene for reads and writes, including WITH … forms.
@@ -1069,6 +1068,15 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
         }
     }
     problems
+}
+
+/// Whether SQL contains an UPDATE statement: the keyword `update` as a word
+/// (so `updated_at` does not count) that is not `ON CONFLICT DO UPDATE`.
+pub fn has_update_statement(sql: &str) -> bool {
+    static UPDATE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\b(do\s+)?update\b").expect("regex"));
+    let clean = crate::security::strip_sql_noise(sql);
+    UPDATE.captures_iter(&clean).any(|cap| cap.get(1).is_none())
 }
 
 /// SQL that writes somewhere other than a leading INSERT/UPDATE, such as
@@ -1341,6 +1349,19 @@ mod tests {
     fn delete_sql_is_rejected() {
         let problems = sql_problems("delete from users where id = $1", "[input.id]", false);
         assert!(problems.iter().any(|p| p.contains("DELETE")));
+    }
+
+    #[test]
+    fn insert_into_a_table_with_updated_at_is_not_an_update() {
+        let sql = "insert into products (name, updated_at) values ($1, now())";
+        assert!(!has_update_statement(sql));
+        assert!(sql_problems(sql, "[input.name]", false).is_empty());
+        let upsert =
+            "insert into t (k, v) values ($1, $2) on conflict (k) do update set v = excluded.v";
+        assert!(!has_update_statement(upsert));
+        assert!(has_update_statement(
+            "WITH x AS (SELECT 1) UPDATE t SET v = 1"
+        ));
     }
 
     #[test]

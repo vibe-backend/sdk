@@ -519,9 +519,16 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
         eprintln!("warning: {warning}");
     }
     auth.pepper = pepper;
-    auth.breached = std::sync::Arc::new(vibe::runtime::breached::BreachedSource::from_env(
+    let breached = vibe::runtime::breached::BreachedConfig::from_env(
         &|name| std::env::var(name).ok(),
-    )?);
+        run_env == vibe::runtime::RunEnv::Production,
+    )?;
+    eprintln!(
+        "breached-password check: {} (min count {})",
+        breached.source.describe(),
+        breached.min_count
+    );
+    auth.breached = std::sync::Arc::new(breached);
     // API keys are `mbk_live_…` in production and `mbk_test_…` elsewhere.
     auth.env_name = if run_env == vibe::runtime::RunEnv::Production {
         "live".into()
