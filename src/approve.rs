@@ -1,11 +1,11 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
 
 use crate::diag::{Diag, Report};
 use crate::discover;
-use crate::lock::{parse_lock, render_lock, ApprovalMode, SourceType, Status};
+use crate::lock::{parse_lock, render_lock, ApprovalMode, LockDoc, SourceType, Status};
 use crate::sign;
 
 pub struct ApproveOptions<'a> {
@@ -18,6 +18,11 @@ pub struct ApproveOptions<'a> {
     pub signing_key: &'a SigningKey,
 }
 
+struct Prepared {
+    path: PathBuf,
+    doc: LockDoc,
+}
+
 pub fn approve_project(opts: &ApproveOptions<'_>) -> Result<Report, Report> {
     let sources = discover::discover(opts.root)?;
     let mut report = Report::new();
@@ -27,14 +32,17 @@ pub fn approve_project(opts: &ApproveOptions<'_>) -> Result<Report, Report> {
     if report.has_errors() {
         return Err(report);
     }
+
+    let mut prepared = Vec::new();
     for source in sources {
         let path = opts.root.join(lock_rel(&source.rel));
-        let text = fs::read_to_string(&path)
-            .map_err(|_| Diag::error(&source.rel, "lock is missing; run vibe compile first"));
-        let text = match text {
+        let text = match fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(diag) => {
-                report.push(diag);
+            Err(_) => {
+                report.push(Diag::error(
+                    &source.rel,
+                    "lock is missing; run vibe compile first",
+                ));
                 continue;
             }
         };
@@ -45,22 +53,24 @@ pub fn approve_project(opts: &ApproveOptions<'_>) -> Result<Report, Report> {
                 continue;
             }
         };
-        let high = doc
+        let high: Vec<&str> = doc
             .meta
             .security_items
             .iter()
-            .any(|item| item.risk == crate::lock::Risk::High);
+            .filter(|item| item.risk == crate::lock::Risk::High)
+            .map(|item| item.item.as_str())
+            .collect();
         let auto =
             doc.meta.source_type == SourceType::Structured && doc.meta.security_items.is_empty();
         if auto {
             doc.meta.approval_mode = ApprovalMode::Auto;
             doc.meta.approved_by = vec!["ci-auto".into()];
         } else {
-            let needed = if high { 2 } else { 1 };
+            let needed = if high.is_empty() { 1 } else { 2 };
             if opts.reviewers.len() < needed {
                 report.push(Diag::error(
                     &source.rel,
-                    format!("this lock needs {needed} reviewers"),
+                    reviewer_error(&high, opts.reviewers.len()),
                 ));
                 continue;
             }
@@ -79,16 +89,49 @@ pub fn approve_project(opts: &ApproveOptions<'_>) -> Result<Report, Report> {
             item.approved_by = approvers.clone();
         }
         doc.meta.signature = "(none)".into();
-        let unsigned = render_lock(&doc);
+        prepared.push(Prepared { path, doc });
+    }
+    if report.has_errors() {
+        return Err(report);
+    }
+    for item in &prepared {
+        let unsigned = render_lock(&item.doc);
         let signed = sign::sign_lock(&unsigned, opts.signing_key);
-        if let Err(err) = fs::write(&path, signed) {
+        if let Err(err) = fs::write(&item.path, signed) {
             report.push(Diag::error(
-                lock_rel(&source.rel),
+                item.path.display().to_string(),
                 format!("cannot write lock: {err}"),
             ));
+            return Err(report);
         }
     }
     report.into_result()
+}
+
+fn reviewer_error(high: &[&str], got: usize) -> String {
+    if high.is_empty() {
+        return format!("this lock needs 1 reviewer, got {got}; pass --reviewer");
+    }
+    let mut labels = Vec::new();
+    for item in high {
+        let label = match *item {
+            "public" | "auth-removed" | "public-writes" | "password-write"
+            | "verification-write" | "external-calls" | "jwt-config" => "public endpoint",
+            "provider-new" => "provider",
+            "migration-ddl" => "migration",
+            "sign-token" | "set-password" | "confirm-verification" => "capability",
+            "external-call" => "external call",
+            "ownership" => "ownership",
+            _ => "high risk",
+        };
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    format!(
+        "high-risk lock ({}) needs 2 reviewers, got {got}; pass --reviewer twice",
+        labels.join(", ")
+    )
 }
 
 fn lock_rel(source_rel: &str) -> String {
