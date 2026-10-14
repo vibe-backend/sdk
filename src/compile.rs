@@ -60,7 +60,12 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         }
         if !structured {
             if let Some(config) = opts.llm_config {
-                if !crate::llm::sampling_registered(&config.provider, &config.model) {
+                if !config.send_sampling {
+                    report.push(Diag::warning(
+                        &source.rel,
+                        "LLM_SEND_SAMPLING=0; sampling parameters were not sent",
+                    ));
+                } else if !crate::llm::sampling_registered(&config.provider, &config.model) {
                     report.push(Diag::warning(
                         &source.rel,
                         "model is not in the capability table; sampling parameters were not sent",
@@ -224,10 +229,11 @@ fn stamp_from(config: Option<&LlmConfig>) -> CompilerStamp {
             endpoint_host: config.endpoint_host.clone(),
             endpoint_private: config.endpoint_private,
             seed: config.seed,
-            sent_params: crate::llm::model_capabilities(
+            sent_params: crate::llm::model_capabilities_with(
                 &config.provider,
                 &config.model,
                 config.seed,
+                config.send_sampling,
             )
             .to_map(),
         },

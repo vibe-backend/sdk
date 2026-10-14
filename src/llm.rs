@@ -79,17 +79,105 @@ impl SentParams {
     }
 }
 
-/// Capability table shipped with this SDK version (spec 2A.8.6, decision 58).
-///
-/// Every supported provider defaults to `temperature: 0` and a pinned `seed`
-/// so natural-language compiles are deterministic (#35). Gemini also gets
-/// topP/topK. OpenAI GPT-5.1 / GPT-5.2 also get `reasoning_effort: none`.
-/// Set `LLM_SEND_SAMPLING=0` to omit sampling parameters for gateways that
-/// reject them.
+/// Which sampling parameters a registered model family accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SamplingCaps {
+    temperature: bool,
+    top_p: bool,
+    top_k: bool,
+    seed: bool,
+    reasoning_none: bool,
+}
+
+/// Explicit capability registry: `(provider, model prefix, caps)`, shipped
+/// with this SDK version (spec 2A.8.6, decision 58, #35). A model gets
+/// sampling parameters only when its lower-cased name starts with a listed
+/// prefix; unknown models and providers get none. Anthropic never gets both
+/// `temperature` and `top_p`.
+const SAMPLING_REGISTRY: &[(&str, &str, SamplingCaps)] = &[
+    (
+        GEMINI,
+        "gemini-",
+        SamplingCaps {
+            temperature: true,
+            top_p: true,
+            top_k: true,
+            seed: true,
+            reasoning_none: false,
+        },
+    ),
+    (
+        OPENAI,
+        "gpt-5.1",
+        SamplingCaps {
+            temperature: true,
+            top_p: true,
+            top_k: false,
+            seed: true,
+            reasoning_none: true,
+        },
+    ),
+    (
+        OPENAI,
+        "gpt-5.2",
+        SamplingCaps {
+            temperature: true,
+            top_p: true,
+            top_k: false,
+            seed: true,
+            reasoning_none: true,
+        },
+    ),
+    (
+        OPENAI,
+        "gpt-4.1",
+        SamplingCaps {
+            temperature: true,
+            top_p: true,
+            top_k: false,
+            seed: true,
+            reasoning_none: false,
+        },
+    ),
+    (
+        OPENAI,
+        "gpt-4o",
+        SamplingCaps {
+            temperature: true,
+            top_p: true,
+            top_k: false,
+            seed: true,
+            reasoning_none: false,
+        },
+    ),
+    (
+        ANTHROPIC,
+        "claude-",
+        SamplingCaps {
+            temperature: true,
+            top_p: false,
+            top_k: false,
+            seed: false,
+            reasoning_none: false,
+        },
+    ),
+];
+
+fn registered_caps(provider: &str, model: &str) -> Option<SamplingCaps> {
+    let model = model.to_ascii_lowercase();
+    SAMPLING_REGISTRY
+        .iter()
+        .find(|(p, prefix, _)| *p == provider && model.starts_with(prefix))
+        .map(|(_, _, caps)| *caps)
+}
+
+/// Sampling parameters for a model with sampling enabled (the default).
 pub fn model_capabilities(provider: &str, model: &str, seed: u64) -> SentParams {
     model_capabilities_with(provider, model, seed, true)
 }
 
+/// Sampling parameters to send. `send_sampling = false` (`LLM_SEND_SAMPLING=0`)
+/// sends none even for registered models.
 pub fn model_capabilities_with(
     provider: &str,
     model: &str,
@@ -99,40 +187,21 @@ pub fn model_capabilities_with(
     if !send_sampling {
         return SentParams::default();
     }
-    let model = model.to_ascii_lowercase();
-    if provider == GEMINI {
-        return SentParams {
-            temperature: Some("0".into()),
-            top_p: Some("1".into()),
-            top_k: Some("1".into()),
-            seed: Some(seed.to_string()),
-            reasoning_effort: None,
-        };
-    }
-    if provider == OPENAI || provider == ANTHROPIC {
-        let reasoning = (provider == OPENAI
-            && (model.contains("gpt-5.1") || model.contains("gpt-5.2")))
-        .then(|| "none".into());
-        return SentParams {
-            temperature: Some("0".into()),
-            top_p: Some("1".into()),
-            top_k: None,
-            seed: Some(seed.to_string()),
-            reasoning_effort: reasoning,
-        };
-    }
-    // Unknown provider tag: still pin temperature/seed when sampling is on.
+    let Some(caps) = registered_caps(provider, model) else {
+        return SentParams::default();
+    };
     SentParams {
-        temperature: Some("0".into()),
-        top_p: None,
-        top_k: None,
-        seed: Some(seed.to_string()),
-        reasoning_effort: None,
+        temperature: caps.temperature.then(|| "0".into()),
+        top_p: caps.top_p.then(|| "1".into()),
+        top_k: caps.top_k.then(|| "1".into()),
+        seed: caps.seed.then(|| seed.to_string()),
+        reasoning_effort: caps.reasoning_none.then(|| "none".into()),
     }
 }
 
+/// True when the model is in the capability registry.
 pub fn sampling_registered(provider: &str, model: &str) -> bool {
-    !model_capabilities(provider, model, 0).is_empty()
+    registered_caps(provider, model).is_some()
 }
 
 #[derive(Clone, Debug)]
@@ -961,12 +1030,12 @@ mod tests {
         };
         let unknown = model_capabilities(OPENAI, &request.model, 0);
         assert!(
-            !unknown.is_empty(),
-            "unlisted OpenAI models still get temperature/seed"
+            unknown.is_empty(),
+            "unregistered models get no sampling params"
         );
         let openai = openai_body(&request, &unknown);
-        assert_eq!(openai["temperature"], 0);
-        assert_eq!(openai["seed"], 0);
+        assert!(openai.get("temperature").is_none());
+        assert!(openai.get("seed").is_none());
         assert!(openai.get("tools").is_none());
         assert!(openai.get("functions").is_none());
         assert!(openai.get("tool_choice").is_none());
@@ -983,12 +1052,44 @@ mod tests {
             &model_capabilities(ANTHROPIC, "claude-sonnet-2026-09-01", 0),
         );
         assert_eq!(anthropic["temperature"], 0);
+        assert!(anthropic.get("top_p").is_none(), "anthropic: not both");
         assert!(anthropic.get("tools").is_none());
-        let gemini = gemini_body(&request, &model_capabilities(GEMINI, &request.model, 0));
+        let gemini = gemini_body(&request, &model_capabilities(GEMINI, "gemini-2.5-pro", 0));
         assert_eq!(gemini["generationConfig"]["temperature"], 0);
         assert_eq!(gemini["generationConfig"]["topK"], 1);
         assert!(gemini.get("tools").is_none());
         assert!(gemini.get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn only_registered_models_get_sampling() {
+        for (provider, model) in [
+            (OPENAI, "gpt-5.5-2026-09-01"),
+            (OPENAI, "gpt-5-2025-08-07"),
+            (OPENAI, "o3-2025-04-16"),
+            (OPENAI, "qwen2.5-coder:32b"),
+            (GEMINI, "vendor-model"),
+            ("mystery", "gpt-4o-2024-08-06"),
+        ] {
+            assert!(
+                model_capabilities(provider, model, 1).is_empty(),
+                "{provider} {model}"
+            );
+            assert!(!sampling_registered(provider, model), "{provider} {model}");
+        }
+        for (provider, model) in [
+            (OPENAI, "gpt-5.1-2025-11-13"),
+            (OPENAI, "GPT-4o-2024-08-06"),
+            (ANTHROPIC, "claude-opus-4-6"),
+            (GEMINI, "gemini-2.5-pro"),
+        ] {
+            assert!(sampling_registered(provider, model), "{provider} {model}");
+            let p = model_capabilities(provider, model, 1);
+            assert_eq!(p.temperature.as_deref(), Some("0"), "{provider} {model}");
+            assert!(model_capabilities_with(provider, model, 1, false).is_empty());
+        }
+        let claude = model_capabilities(ANTHROPIC, "claude-opus-4-6", 1);
+        assert!(claude.top_p.is_none() && claude.seed.is_none());
     }
 
     #[test]
