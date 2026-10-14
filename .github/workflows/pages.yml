@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: pages-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
+  group: sdk-pages-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -26,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 20
@@ -61,7 +63,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Dispatch deploy-docs to vibe-backend.github.io
+      - name: Trigger pages.yml on vibe-backend.github.io
         env:
           GH_TOKEN: ${{ secrets.ORG_PAGES_DISPATCH_TOKEN }}
         run: |
@@ -69,7 +71,6 @@ jobs:
             echo "::error::ORG_PAGES_DISPATCH_TOKEN is not set. Add a fine-grained PAT (Actions: write on vibe-backend/vibe-backend.github.io) as an Actions secret. Daily cron on that repo still rebuilds as a fallback."
             exit 1
           fi
-          gh api repos/vibe-backend/vibe-backend.github.io/dispatches \
-            -f event_type=deploy-docs \
-            -f "client_payload[sha]=${{ github.sha }}" \
-            -f "client_payload[ref]=${{ github.ref }}"
+          # workflow_dispatch needs only Actions: write (repository_dispatch would need Contents: write).
+          gh api -X POST repos/vibe-backend/vibe-backend.github.io/actions/workflows/pages.yml/dispatches \
+            -f ref=main
