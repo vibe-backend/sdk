@@ -223,6 +223,10 @@ pub struct RoleStatus {
     pub owned_types: i64,
     /// Tenant schemas it can own.
     pub owned_schemas: i64,
+    /// Tenant relations the role can read or write that are not tables with
+    /// ENABLE + FORCE row level security (views and RLS-less tables would
+    /// expose every tenant).
+    pub unprotected_relations: Vec<String>,
 }
 
 impl RoleStatus {
@@ -250,6 +254,12 @@ impl RoleStatus {
                 out.push(format!("can own {count} {what}"));
             }
         }
+        if !self.unprotected_relations.is_empty() {
+            out.push(format!(
+                "can access tenant relation(s) without ENABLE + FORCE ROW LEVEL SECURITY ({}); re-run `vibe migrate` or enable RLS on them",
+                self.unprotected_relations.join(", ")
+            ));
+        }
         out
     }
 }
@@ -269,7 +279,12 @@ SELECT current_user::text, \
    WHERE n.nspname LIKE 't\\_%' AND t.typrelid = 0 \
    AND pg_has_role(current_user, t.typowner, 'MEMBER')), \
  (SELECT count(*) FROM pg_namespace n WHERE n.nspname LIKE 't\\_%' \
-   AND pg_has_role(current_user, n.nspowner, 'MEMBER'))";
+   AND pg_has_role(current_user, n.nspowner, 'MEMBER')), \
+ COALESCE((SELECT array_agg(format('%I.%I', n.nspname, c.relname) ORDER BY 1) \
+   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+   WHERE n.nspname LIKE 't\\_%' AND c.relkind IN ('r','p','v','m','f') \
+   AND has_table_privilege(current_user, c.oid, 'SELECT,INSERT,UPDATE,DELETE') \
+   AND NOT (c.relkind IN ('r','p') AND c.relrowsecurity AND c.relforcerowsecurity)), '{}')";
 
 /// Logical caller classes passed as `role` to [`QueryExec::execute`], and the
 /// statements each may run. Enforced by every executor (spec §7.1/§7.2:
@@ -331,6 +346,7 @@ impl PgExec {
             owned_functions: row.get(4),
             owned_types: row.get(5),
             owned_schemas: row.get(6),
+            unprotected_relations: row.get(7),
         };
         let problems = status.problems();
         if problems.is_empty() {
@@ -342,6 +358,16 @@ impl PgExec {
                 problems.join(", ")
             ))
         }
+    }
+
+    /// Runs a query returning one text column.
+    pub async fn query_texts(&self, sql: &str, param: &str) -> Result<Vec<String>, String> {
+        let client = self.client.lock().await;
+        let rows = client
+            .query(sql, &[&param])
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
     pub async fn batch(&self, statements: &[String]) -> Result<(), String> {
@@ -478,9 +504,11 @@ mod role_tests {
             owned_functions: 1,
             owned_types: 1,
             owned_schemas: 1,
+            unprotected_relations: vec!["t_x.later".into()],
         };
         let p = s.problems();
-        assert_eq!(p.len(), 6, "{p:?}");
+        assert_eq!(p.len(), 7, "{p:?}");
+        assert!(p[6].contains("t_x.later"));
         assert!(p[0].contains("postgres"));
         assert!(p[1].contains("etl"));
     }

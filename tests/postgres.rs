@@ -283,3 +283,79 @@ async fn privileged_or_owning_roles_are_rejected() {
     let err = check_as(&s.admin_url, &member).await.unwrap_err();
     assert!(err.contains(&group), "{err}");
 }
+
+#[tokio::test]
+async fn migration_tables_get_forced_rls() {
+    let s = require_pg!(setup().await);
+    let row = s
+        .admin
+        .query_one(
+            "SELECT c.relrowsecurity, c.relforcerowsecurity, \
+             EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = c.oid AND p.polname = 'tenant_isolation') \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = 'audit_notes'",
+            &[&format!("t_{}", s.tenant)],
+        )
+        .await
+        .unwrap();
+    assert!(row.get::<_, bool>(0) && row.get::<_, bool>(1) && row.get::<_, bool>(2));
+    // And the runtime role is still accepted.
+    check_as(&s.admin_url, &s.app).await.unwrap();
+}
+
+#[tokio::test]
+async fn migration_without_tenant_id_or_with_a_view_fails() {
+    let s = require_pg!(setup().await);
+    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    for (stmt, expect) in [
+        (
+            "CREATE TABLE IF NOT EXISTS loose (x text)",
+            "without a tenant_id",
+        ),
+        ("CREATE VIEW v_notes AS SELECT * FROM notes", "views"),
+    ] {
+        let mut m = manifest();
+        m.migrations[0].statements = vec![stmt.to_string()];
+        let tenant = format!("tv{}", suffix());
+        let err = migrate_tenant(&owner_exec, &m, &tenant, &s.app)
+            .await
+            .unwrap_err();
+        assert!(err.contains(expect), "{stmt}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn serve_refuses_tables_without_forced_rls() {
+    let s = require_pg!(setup().await);
+    let schema = format!("t_{}", s.tenant);
+    // A table added behind migrate's back inherits the default grants.
+    s.admin
+        .batch_execute(&format!(
+            "SET ROLE {owner}; CREATE TABLE {schema}.later (tenant_id text); RESET ROLE",
+            owner = s.owner
+        ))
+        .await
+        .unwrap();
+    let err = check_as(&s.admin_url, &s.app).await.unwrap_err();
+    assert!(err.contains(&format!("{schema}.later")), "{err}");
+    s.admin
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.later ENABLE ROW LEVEL SECURITY"
+        ))
+        .await
+        .unwrap();
+    let err = check_as(&s.admin_url, &s.app).await.unwrap_err();
+    assert!(
+        err.contains("later"),
+        "ENABLE without FORCE is not enough: {err}"
+    );
+    s.admin
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.later FORCE ROW LEVEL SECURITY"
+        ))
+        .await
+        .unwrap();
+    check_as(&s.admin_url, &s.app).await.unwrap();
+}

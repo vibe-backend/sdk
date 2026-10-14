@@ -313,6 +313,26 @@ pub fn runtime_schema_statements(schema: &str, role: &str) -> Result<Vec<String>
     ])
 }
 
+/// ENABLE + FORCE row level security and the tenant policy for one table.
+pub fn rls_statements(schema: &str, table: &str) -> Result<Vec<String>, String> {
+    Ok(rls_statements_for(&format!(
+        "{}.{}",
+        quote(schema)?,
+        quote(table)?
+    )))
+}
+
+fn rls_statements_for(qualified: &str) -> Vec<String> {
+    vec![
+        format!("ALTER TABLE {qualified} ENABLE ROW LEVEL SECURITY"),
+        format!("ALTER TABLE {qualified} FORCE ROW LEVEL SECURITY"),
+        format!("DROP POLICY IF EXISTS tenant_isolation ON {qualified}"),
+        format!(
+            "CREATE POLICY tenant_isolation ON {qualified} USING (\"tenant_id\" = current_setting('app.tenant_id', false)) WITH CHECK (\"tenant_id\" = current_setting('app.tenant_id', false))"
+        ),
+    ]
+}
+
 pub fn bootstrap_statements(
     schema: &str,
     table: &str,
@@ -347,14 +367,12 @@ pub fn bootstrap_statements(
     }
     let mut out = vec![
         format!("CREATE SCHEMA IF NOT EXISTS {schema}"),
-        format!("CREATE TABLE IF NOT EXISTS {qualified} ({})", columns.join(", ")),
-        format!("ALTER TABLE {qualified} ENABLE ROW LEVEL SECURITY"),
-        format!("ALTER TABLE {qualified} FORCE ROW LEVEL SECURITY"),
-        format!("DROP POLICY IF EXISTS tenant_isolation ON {qualified}"),
         format!(
-            "CREATE POLICY tenant_isolation ON {qualified} USING (\"tenant_id\" = current_setting('app.tenant_id', false)) WITH CHECK (\"tenant_id\" = current_setting('app.tenant_id', false))"
+            "CREATE TABLE IF NOT EXISTS {qualified} ({})",
+            columns.join(", ")
         ),
     ];
+    out.extend(rls_statements_for(&qualified));
     for unique in uniques {
         let index = quote(&format!("{table}_{unique}_active"))?;
         out.push(format!(
