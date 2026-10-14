@@ -700,11 +700,13 @@ impl HttpAdapter {
         let parsed = match self.config.provider.as_str() {
             ANTHROPIC => parse_anthropic(&value),
             GEMINI => parse_gemini(&value),
-            _ if self.config.api_style == "responses" => parse_openai_responses(&value),
+            _ if self.config.api_style == "responses" => {
+                parse_openai_responses_masked(&value, &self.config.api_key)
+            }
             _ => parse_openai(&value),
         }
         .map_err(|message| CallError {
-            message,
+            message: mask_secrets(&message, &self.config.api_key),
             retryable: false,
         })?;
         if let Some(reported) = &parsed.model_reported {
@@ -877,6 +879,12 @@ fn openai_responses_call(
 /// A response with `status: incomplete`, `failed` or `error`, or a non-null
 /// `error`, is an error even when some text was produced.
 pub fn parse_openai_responses(value: &Value) -> Result<LlmResponse, String> {
+    parse_openai_responses_masked(value, "")
+}
+
+/// Like [`parse_openai_responses`]; provider error messages are masked
+/// (API key, `key=`-style values) before they are cut to 200 characters.
+pub fn parse_openai_responses_masked(value: &Value, api_key: &str) -> Result<LlmResponse, String> {
     let status = value["status"].as_str().unwrap_or("");
     if status == "incomplete" {
         let reason = value["incomplete_details"]["reason"]
@@ -887,12 +895,8 @@ pub fn parse_openai_responses(value: &Value) -> Result<LlmResponse, String> {
     if matches!(status, "failed" | "error") || !value["error"].is_null() {
         let error = &value["error"];
         let code = error["code"].as_str().unwrap_or("unknown");
-        let message: String = error["message"]
-            .as_str()
-            .unwrap_or("no message")
-            .chars()
-            .take(200)
-            .collect();
+        let message = mask_secrets(error["message"].as_str().unwrap_or("no message"), api_key);
+        let message: String = message.chars().take(200).collect();
         return Err(format!(
             "openai responses returned an error ({code}): {message}"
         ));
@@ -1182,6 +1186,67 @@ mod failure_message_tests {
 #[cfg(test)]
 mod responses_tests {
     use super::*;
+
+    #[test]
+    fn error_messages_are_masked_before_truncation() {
+        let key = "sk-test-secret-value-1234567890";
+        let long = format!("{}{key} and api_key=abc123secret", "x".repeat(190));
+        let err = parse_openai_responses_masked(
+            &json!({"status": "failed", "error": {"code": "bad", "message": long}}),
+            key,
+        )
+        .unwrap_err();
+        assert!(!err.contains("sk-test-secret"), "{err}");
+        assert!(!err.contains("sk-test"), "partial key leaked: {err}");
+        assert!(err.contains("***"), "{err}");
+        let err = parse_openai_responses(&json!({
+            "error": {"code": "bad", "message": "see https://x/?api_key=abc123secret"}
+        }))
+        .unwrap_err();
+        assert!(!err.contains("abc123secret"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn responses_http_errors_are_reported_and_masked() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let key = "sk-test-value";
+        for (status, retry) in [
+            (400u16, false),
+            (401, false),
+            (404, false),
+            (429, true),
+            (500, true),
+            (503, true),
+        ] {
+            let body = format!("{{\"error\":{{\"message\":\"bad key {key}\"}}}}");
+            let app = Router::new().route(
+                "/v1/responses",
+                post(move || {
+                    let body = body.clone();
+                    async move { (StatusCode::from_u16(status).unwrap(), body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let model = "gpt-5.1-2026-01-01";
+            let mut config = responses_config(model);
+            config.base_url = format!("http://{addr}/v1");
+            config.max_retries = 0;
+            let adapter = HttpAdapter::new(config).unwrap();
+            let request = LlmRequest {
+                system: "s".into(),
+                input: "i".into(),
+                model: model.into(),
+                seed: 7,
+                timeout: Duration::from_secs(5),
+            };
+            let err = adapter.compile(&request).await.unwrap_err();
+            assert!(err.contains(&status.to_string()), "{status}: {err}");
+            assert!(!err.contains(key), "{status}: {err}");
+            let _ = retry;
+        }
+    }
 
     fn responses_config(model: &str) -> LlmConfig {
         LlmConfig {
