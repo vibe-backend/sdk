@@ -277,7 +277,7 @@ pub fn system_prompt(kind: Kind, scope: Option<Scope>) -> String {
     // Examples follow lock::section_order exactly; every step has source-lines.
     let example = match (kind, scope) {
         (Kind::Method, _) => "\n\nEXAMPLE METHOD LOCK BODY:\n## Signature\n- target: product.create\n- writes: true\n- errors: [NOT_FOUND]\n- capabilities: []\n## Calls\n- methods: []\n## Steps\n### s1 query\n- op: query\n- writes: true\n- sql: `INSERT INTO products (id, tenant_id, name) VALUES ($1, $2, $3)`\n- params: [input.id, auth.tenant_id, input.name]\n- scope: rls\n- out: row\n- source-lines: 3-4\n### s2 respond\n- op: respond\n- value: row\n- source-lines: 5\n",
-        (Kind::Api, Some(Scope::Feature)) => "\n\nEXAMPLE API FEATURE LOCK BODY:\n## Route\n- method: GET\n- path: /catalog/v1/products\n## Access\n- public: true\n- public-writes: false\n- tenant: path\n## Pipelines\n### auth\n- roles: []\n- scopes: []\n## Limits\n- timeout: 5s\n- body: 64kb\n## Request\n## Response\n## Transform\n## Steps\n### s1 method\n- op: method\n- target: product.list\n- args: {}\n- out: rows\n- source-lines: 3\n### s2 respond\n- op: respond\n- value: rows\n- source-lines: 4\n## Errors\n",
+        (Kind::Api, Some(Scope::Feature)) => "\n\nEXAMPLE API FEATURE LOCK BODY:\n## Route\n- method: GET\n- path: /catalog/v1/{slug}/products\n## Access\n- public: true\n- public-writes: false\n- tenant: path.slug\n## Pipelines\n### -auth\n- removed: true\n### rate-limit\n- per-minute: 600\n- key: ip\n## Limits\n- timeout: 5s\n- body: 64kb\n## Request\n| field | type | rules | required |\n| --- | --- | --- | --- |\n| path.slug | string | - | yes |\n## Response\n- status: 200\n## Transform\n## Steps\n### s1 method\n- op: method\n- target: product.list\n- args: {}\n- out: rows\n- source-lines: 3\n### s2 respond\n- op: respond\n- value: rows\n- source-lines: 4\n## Errors\n",
         _ => "\n\nPrefer existing method targets from DEPENDENCIES (object.action).\n",
     };
     format!(
@@ -957,24 +957,20 @@ fn dependencies(id: &str, docs: &HashMap<String, LockDoc>) -> Result<Vec<Depende
                 if let Some(steps) = find_section(&doc.sections, "Steps") {
                     for block in &steps.blocks {
                         if let Some(target) = block.bullets.iter().find(|b| b.key == "target") {
-                            let mut known = false;
+                            if let Err(err) =
+                                crate::validate::check_method_target(&target.value, docs)
+                            {
+                                return Err(Diag::error(&doc.meta.source, err));
+                            }
                             if let Some(dep) = method_id(&target.value) {
                                 if docs.contains_key(&dep) {
                                     ids.push((dep, Kind::Method));
-                                    known = true;
                                 }
                             }
                             if let Some(object) = target.value.split('.').next() {
                                 if docs.contains_key(object) {
                                     ids.push((object.to_string(), Kind::Model));
-                                    known = true;
                                 }
-                            }
-                            if !known {
-                                return Err(Diag::error(
-                                    &doc.meta.source,
-                                    format!("unknown method target {}", target.value),
-                                ));
                             }
                         }
                     }
