@@ -1043,7 +1043,9 @@ async fn query_roles_cannot_inherit_the_runtime_role() {
     let mut migrate = Ok(());
     for statement in &statements {
         if let Err(err) = admin.batch_execute(statement).await {
-            migrate = Err(err.to_string());
+            migrate = Err(err
+                .as_db_error()
+                .map_or_else(|| err.to_string(), |e| e.message().to_string()));
             break;
         }
     }
@@ -1054,9 +1056,6 @@ async fn query_roles_cannot_inherit_the_runtime_role() {
     let startup = startup.expect("startup must refuse");
     assert!(startup.contains("app_rw"), "{startup}");
     let migrate = format!("{:?}", migrate.expect_err("migrate must refuse"));
-    assert!(
-        migrate.contains("re-run migrate") || migrate.contains("db error"),
-        "{migrate}"
-    );
+    assert!(migrate.contains("re-run migrate"), "{migrate}");
     assert!(PgExec::connect(&url).await.is_ok());
 }
