@@ -82,7 +82,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         ],
         env_name: "test".into(),
     };
-    let loaded = vibe::runtime::load_project_slugs(&root).unwrap();
+    let loaded = vibe::runtime::load_project_slugs(&root, true).unwrap();
     assert!(loaded.slugs.contains_key("acme"));
     let mut slugs = loaded.slugs;
     slugs.insert(
@@ -656,4 +656,118 @@ async fn send(
         json,
         headers,
     }
+}
+
+#[tokio::test]
+async fn owner_key_id_is_rejected_outside_users() {
+    let root = copy_shop();
+    let source = root.join("models/cart-item/cart-item.md");
+    let text = fs::read_to_string(&source).unwrap();
+    fs::write(
+        &source,
+        text.replace("- owner-key: user_id", "- owner-key: id"),
+    )
+    .unwrap();
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|err| panic!("{err}"));
+    let report = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+        root: &root,
+        deploy: false,
+        verify_key: None,
+    });
+    let rendered = match report {
+        Ok(report) => report.to_string(),
+        Err(report) => report.to_string(),
+    };
+    assert!(
+        rendered.contains("owner-key: id is only allowed on the users table"),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn admin_without_ownership_role_cannot_touch_other_carts() {
+    let root = copy_shop();
+    let source = root.join("models/cart-item/cart-item.md");
+    let text = fs::read_to_string(&source).unwrap();
+    fs::write(&source, text.replace("- ownership: role(admin)\n", "")).unwrap();
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|err| panic!("{err}"));
+    let key = sign::load_or_create(&root).unwrap();
+    approve_project(&ApproveOptions {
+        root: &root,
+        reviewers: &["ada@example.com".into(), "grace@example.com".into()],
+        reason: "ownership test",
+        approval_ref: "local",
+        commit: "local",
+        now: "2026-10-14T00:00:00Z",
+        signing_key: &key,
+    })
+    .unwrap_or_else(|err| panic!("{err}"));
+    let manifest = manifest_from_project(&root, &key).unwrap_or_else(|err| panic!("{err}"));
+    let cart_model = manifest
+        .models
+        .iter()
+        .find(|m| m.table == "cart_items")
+        .unwrap();
+    assert_eq!(cart_model.ownership, "");
+    let mut auth = AuthConfig::anonymous();
+    auth.public_pem = PUBLIC_PEM.into();
+    auth.alg = Algorithm::ES256;
+    let app = router(Arc::new(AppState {
+        manifest,
+        exec: Arc::new(MemoryExec::new()),
+        auth,
+        slugs: std::collections::HashMap::new(),
+        rates: std::sync::Mutex::new(std::collections::HashMap::new()),
+        quotas: std::sync::Mutex::new(std::collections::HashMap::new()),
+        disabled: std::collections::HashSet::new(),
+        min_override_ms: Some(0),
+        honor_test_ip: true,
+        dev_hints: true,
+    }));
+    let customer = bearer(&token("customer-1", &["customer"], "tenant0001"));
+    let admin = bearer(&token("admin-user", &["admin"], "tenant0001"));
+    let cart = send(
+        &app,
+        "POST",
+        "/shop/v1/cart-items",
+        Some(customer.clone()),
+        Some(json!({"product_id": uuid::Uuid::new_v4().to_string(), "qty": 1})),
+    )
+    .await;
+    assert_eq!(cart.status, StatusCode::CREATED, "{:?}", cart.json);
+    let cart_id = cart.json["id"].as_str().unwrap();
+    let listed = send(
+        &app,
+        "GET",
+        "/shop/v1/cart-items",
+        Some(admin.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(listed.json["items"].as_array().unwrap().len(), 0);
+    let removed = send(
+        &app,
+        "DELETE",
+        &format!("/shop/v1/cart-items/{cart_id}"),
+        Some(admin),
+        None,
+    )
+    .await;
+    assert_eq!(removed.status, StatusCode::NOT_FOUND);
+    let mine = send(&app, "GET", "/shop/v1/cart-items", Some(customer), None).await;
+    assert_eq!(mine.json["items"].as_array().unwrap().len(), 1);
 }
