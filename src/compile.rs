@@ -274,6 +274,11 @@ async fn llm_sections(
 
 pub fn system_prompt(kind: Kind, scope: Option<Scope>) -> String {
     let sections = crate::lock::section_order(kind, scope).join(", ");
+    let example = match (kind, scope) {
+        (Kind::Method, _) => "\n\nEXAMPLE METHOD LOCK BODY:\n## Signature\n- target: product.create\n- writes: true\n- errors: [NOT_FOUND]\n- capabilities: []\n## Steps\n### s1 query\n- op: query\n- writes: true\n- sql: `INSERT INTO products (id, tenant_id, name) VALUES ($1, $2, $3)`\n- params: [input.id, auth.tenant_id, input.name]\n- scope: rls\n- out: row\n### s2 respond\n- op: respond\n- value: row\n",
+        (Kind::Api, Some(Scope::Feature)) => "\n\nEXAMPLE API FEATURE LOCK BODY:\n## Route\n- method: GET\n- path: /catalog/v1/products\n## Access\n- public: true\n- public-writes: false\n- tenant: path\n## Pipelines\n### auth\n- roles: []\n- scopes: []\n## Request\n## Response\n## Steps\n### s1 method\n- op: method\n- target: product.list\n- args: {}\n- out: rows\n### s2 respond\n- op: respond\n- value: rows\n## Limits\n- timeout: 5s\n- body: 64kb\n## Errors\n",
+        _ => "\n\nPrefer existing method targets from DEPENDENCIES (object.action).\n",
+    };
     format!(
         "You are {COMPILER_NAME} {COMPILER_VERSION} prompt {PROMPT_VERSION}. \
 Compile the source into lock markdown sections only. \
@@ -282,17 +287,52 @@ Required sections in order: {sections}. \
 Use `- key: value` bullets, `### sN op` steps, and markdown tables where the section needs them. \
 Allowed method ops: query, validate, call, method, respond, verify-password, hash-password, random-token, hash-token, sign-jwt. \
 Allowed api ops: method, validate, transform, respond. \
+Method targets look like `object.action` (for example `product.list`, `product.create`) and MUST exist in DEPENDENCIES when calling another method. \
 SQL must be a single parameterized statement using $1, $2. \
 Never emit DELETE, TRUNCATE, GRANT, REVOKE, or DDL outside a migration. \
 Do not invent public access, removed auth, writes, token signing, or external calls unless the source says so. \
-Every step needs `op` and `source-lines`."
+Every step needs `op` and `source-lines`.{example}"
     )
 }
 
-fn llm_input(source: &SourceFile, docs: &HashMap<String, LockDoc>) -> String {
+pub(crate) fn llm_input(source: &SourceFile, docs: &HashMap<String, LockDoc>) -> String {
+    // Stable order so prompts do not change between runs (#37).
+    let mut ids: Vec<&String> = docs.keys().collect();
+    ids.sort();
+    let prefix = source.id.split('/').next().unwrap_or("");
+    ids.sort_by_key(|id| (!id.starts_with(prefix), (*id).as_str()));
     let mut deps = String::new();
-    for (id, doc) in docs.iter().take(12) {
-        deps.push_str(&format!("- {id} kind {}\n", doc.meta.kind.as_str()));
+    for id in ids.into_iter().take(24) {
+        let doc = &docs[id];
+        deps.push_str(&format!("- {id} kind {}", doc.meta.kind.as_str()));
+        if let Some(sig) = crate::lock::find_section(&doc.sections, "Signature") {
+            if let Some(target) = sig.get("target") {
+                deps.push_str(&format!(" target={target}"));
+            }
+            if let Some(writes) = sig.get("writes") {
+                deps.push_str(&format!(" writes={writes}"));
+            }
+        }
+        if let Some(fields) = crate::lock::find_section(&doc.sections, "Fields") {
+            if let Some(table) = &fields.table {
+                let names: Vec<&str> = table
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.first().map(String::as_str))
+                    .take(12)
+                    .collect();
+                if !names.is_empty() {
+                    deps.push_str(&format!(" fields=[{}]", names.join(", ")));
+                }
+            }
+        }
+        if doc.meta.kind == Kind::Method {
+            if let Some((_, method)) = id.rsplit_once("/methods/") {
+                let object = id.split('/').next().unwrap_or("");
+                deps.push_str(&format!(" callable={object}.{method}"));
+            }
+        }
+        deps.push('\n');
     }
     format!(
         "PATH: {}\nKIND: {}\nID: {}\nDEPENDENCIES:\n{}\nSOURCE:\n{}",
@@ -1031,4 +1071,25 @@ fn render_inline_list(items: &[String]) -> String {
 
 fn parse_name_list(raw: &str) -> Vec<String> {
     crate::lock::parse_string_list(raw).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::system_prompt;
+    use crate::lock::{Kind, Scope};
+
+    #[test]
+    fn feature_prompt_includes_example_and_ops() {
+        let prompt = system_prompt(Kind::Api, Some(Scope::Feature));
+        assert!(prompt.contains("product.list"), "{prompt}");
+        assert!(prompt.contains("Allowed api ops"));
+        assert!(prompt.contains("EXAMPLE API FEATURE"));
+    }
+
+    #[test]
+    fn method_prompt_includes_example() {
+        let prompt = system_prompt(Kind::Method, None);
+        assert!(prompt.contains("EXAMPLE METHOD"));
+        assert!(prompt.contains("product.create"));
+    }
 }
