@@ -1,12 +1,14 @@
 <header class="page-head reveal"><p class="eyebrow">快速入門</p><h1>你的第一個端點。</h1><p class="lead">依照 <a href="docs/spec.html">規格 v1.5</a>，看看一個 vibe-backend 專案長甚麼樣子。</p></header>
 <section class="prose">
 <h2 class="reveal"><span class="num">1</span>建立專案結構</h2>
-<pre data-tree class="reveal">
+<pre data-tree data-label="專案結構" class="reveal">
 project/
 ├── providers/
 │   └── main.md  # 資料庫 provider（預設為 PostgreSQL）
 ├── pipelines/
 │   └── login-guard.md  # 可重用的請求 pipeline
+├── migrations/main/
+│   └── 0001-create-users.md  # 資料庫 migration（4 位數序號）
 ├── models/user/
 │   ├── user.md  # model 定義
 │   └── methods/sign-token.md  # model method

@@ -41,7 +41,6 @@ export async function fetchActivity(token, now = new Date()) {
 
     const repoList = await paginate(`${API}/orgs/${ORG}/repos?type=all&per_page=100`, token, (d) => d);
     const repos = repoList.map((r) => r.full_name).sort();
-    const firstRepoMs = Math.min(...repoList.map((r) => Date.parse(r.created_at)).filter(Number.isFinite));
     if (!repos.length) throw new Error('no repositories visible');
 
     const q = encodeURIComponent(`org:${ORG} is:pr is:merged merged:>=${since}`);
@@ -65,10 +64,9 @@ export async function fetchActivity(token, now = new Date()) {
       if (!bucket) continue; // merged outside this month (search is inclusive by instant)
       bucket.prs += 1; bucket.additions += pr.additions; bucket.deletions += pr.deletions;
     }
-    // Skip leading days before anything existed: start at the later of the month start and the
-    // earliest of (first repo created, first merged PR this month), in HKT.
-    const firstPrMs = Math.min(...mergedTimes);
-    const originDay = hkDay(Math.min(firstRepoMs, firstPrMs, now.getTime()));
+    // Skip leading zero days: start at the first day (HKT) with a merged PR this month.
+    const inMonth = mergedTimes.filter((ms) => days.has(hkDay(ms)));
+    const originDay = hkDay(inMonth.length ? Math.min(...inMonth) : now.getTime());
     const startDay = [...days.keys()][0] > originDay ? [...days.keys()][0] : originDay;
     const rows = [...days].filter(([day]) => day >= startDay).map(([day, v]) => ({ day, ...v }));
     const totals = rows.reduce((t, r) => ({ prs: t.prs + r.prs, additions: t.additions + r.additions, deletions: t.deletions + r.deletions }), { prs: 0, additions: 0, deletions: 0 });

@@ -243,3 +243,4 @@ footer { border-top: 1px solid var(--line); color: var(--mut); font-size: 12px; 
 .tree .cm { color: var(--mut); }
 .tree-note { color: var(--mut); font-size: 14px; margin-top: -4px; }
 @media (max-width: 740px) { .tree { font-size: 12.5px; } }
+.sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }

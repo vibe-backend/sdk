@@ -158,22 +158,34 @@ const docTitle = (d, loc) => {
 };
 
 // Cache-busting: ?v=<content hash> for every file in src/assets (GitHub Pages caches for 10 minutes).
-const assetVersion = Object.fromEntries(fs.readdirSync(path.join(src, 'assets')).map((f) =>
-  [f, createHash('sha256').update(fs.readFileSync(path.join(src, 'assets', f))).digest('hex').slice(0, 10)]));
+const assetVersion = Object.fromEntries(fs.readdirSync(path.join(src, 'assets'), { recursive: true }).map(String)
+  .filter((f) => fs.statSync(path.join(src, 'assets', f)).isFile())
+  .map((f) => [f.split(path.sep).join('/'), createHash('sha256').update(fs.readFileSync(path.join(src, 'assets', f))).digest('hex').slice(0, 10)]));
 
 // File tree for hand-written pages: "├── name/  # comment" lines -> coloured spans, comments aligned.
 function renderTree(text, attrs = '') {
   const rows = text.split('\n').map((line) => {
     const [, guide, name, comment = ''] = /^([│├└─\s]*)(\S+)(?:\s+#\s*(.*))?$/.exec(line) || [null, '', line];
-    return { guide, name, comment };
+    return { guide, name, comment, depth: Math.round([...guide].length / 4) };
   });
+  const label = (/data-label="([^"]*)"/.exec(attrs) || [])[1] || 'File tree';
+  attrs = attrs.replace(/\s*data-label="[^"]*"/, '');
   const width = Math.max(...rows.map((r) => [...(r.guide + r.name)].length)) + 2;
   const html = rows.map(({ guide, name, comment }) => {
     const pad = ' '.repeat(Math.max(1, width - [...(guide + name)].length));
     const cls = name.endsWith('/') ? 'dir' : 'file';
     return `<span class="g">${esc(guide)}</span><span class="${cls}">${esc(name)}</span>${comment ? `${pad}<span class="cm"># ${esc(comment)}</span>` : ''}`;
   }).join('\n');
-  return `<pre class="tree"${attrs}><code>${html}</code></pre>`;
+  // Screen readers get a plain nested list; the drawn tree is exposed as one labelled image.
+  let list = '', depth = -1;
+  for (const r of rows) {
+    if (r.depth > depth) list += '<ul>'.repeat(r.depth - depth);
+    else list += '</li>' + '</ul></li>'.repeat(depth - r.depth);
+    list += `<li><code>${esc(r.name)}</code>${r.comment ? ` – ${esc(r.comment)}` : ''}`;
+    depth = r.depth;
+  }
+  list += '</li>' + '</ul></li>'.repeat(depth) + '</ul>';
+  return `<pre class="tree"${attrs} role="img" aria-label="${esc(label)}"><code>${html}</code></pre><div class="sr">${list}</div>`;
 }
 
 // ---------- layout ----------
@@ -267,13 +279,14 @@ function activityChart(loc) {
   const maxLines = Math.max(1, ...activity.rows.map((r) => r.additions + r.deletions));
   const maxPrs = Math.max(1, ...activity.rows.map((r) => r.prs));
   // nice ceiling for lines (sqrt scale) and PRs (linear)
-  const niceCeil = (v) => { const p = 10 ** Math.floor(Math.log10(v)); return [1, 2, 2.5, 5, 10].map((m) => m * p).find((x) => x >= v); };
+  const niceCeil = (v) => { const p = 10 ** Math.floor(Math.log10(v)); return Math.max(1, Math.ceil([1, 2, 2.5, 5, 10].map((m) => m * p).find((x) => x >= v))); };
   const topLines = niceCeil(maxLines), topPrs = Math.max(2, Math.ceil(maxPrs * 1.15));
   const yL = (v) => mt + ph - Math.sqrt(v / topLines) * ph;
   const yP = (v) => mt + ph - (v / topPrs) * ph;
   const r1 = (v) => Math.round(v * 10) / 10;
 
-  const ticks = [0, 0.01, 0.1, 0.25, 0.5, 1].map((f) => topLines * f).filter((v, i, a) => a.indexOf(v) === i && (v === 0 || v >= 1));
+  // Integer-only ticks (small maxima would otherwise produce 0.1, 2.5, …).
+  const ticks = [...new Set([0, 0.01, 0.1, 0.25, 0.5, 1].map((f) => topLines * f).filter(Number.isInteger))];
   let svg = '';
   for (const v of ticks) {
     const y = r1(yL(v));
@@ -295,7 +308,7 @@ function activityChart(loc) {
       const top = yL(total), hTot = mt + ph - top;
       const hDel = hTot * (r.deletions / total);
       bars += `<g role="listitem" aria-label="${label}"><title>${label}</title>`
-        + `<rect class="add" fill="#30d158" x="${r1(cx - bw / 2)}" y="${r1(top)}" width="${r1(bw)}" height="${r1(hTot - hDel)}" rx="2"/>`
+        + (hTot - hDel > 0 ? `<rect class="add" fill="#30d158" x="${r1(cx - bw / 2)}" y="${r1(top)}" width="${r1(bw)}" height="${r1(hTot - hDel)}" rx="2"/>` : '')
         + (hDel > 0 ? `<rect class="del" fill="#ff453a" x="${r1(cx - bw / 2)}" y="${r1(mt + ph - hDel)}" width="${r1(bw)}" height="${r1(hDel)}" rx="2"/>` : '')
         + (fullLabels
           ? `<text class="peak" x="${r1(cx)}" y="${r1(top - 8)}" text-anchor="middle"><tspan class="v-add" fill="#1f9d55">+${esc(num(r.additions))}</tspan> <tspan class="v-del" fill="#d93a3a">−${esc(num(r.deletions))}</tspan></text>`
@@ -309,7 +322,7 @@ function activityChart(loc) {
   });
   const busiestRow = activity.rows.reduce((b, r) => (r.additions + r.deletions > (b ? b.additions + b.deletions : 0) ? r : b), null);
   const busiest = busiestRow ? t.busiest(t.day(mo, Number(busiestRow.day.slice(8))), num(busiestRow.additions), num(busiestRow.deletions), num(busiestRow.prs)) : '';
-  const monthName = t.title(yy, mo).split(/[:：]\s*/).pop();
+  const monthName = t.monthName(yy, mo);
   const title = esc(t.chartTitle(monthName));
   const desc = esc(t.chartDesc(num(activity.totals.prs), num(activity.totals.additions), num(activity.totals.deletions), busiest));
   return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-labelledby="act-chart-title act-chart-desc" preserveAspectRatio="xMidYMid meet">`

@@ -1,12 +1,14 @@
 <header class="page-head reveal"><p class="eyebrow">Quick start</p><h1>Your first endpoint.</h1><p class="lead">The shape of a vibe-backend project, as defined in <a href="docs/spec.html">Spec v1.5</a>.</p></header>
 <section class="prose">
 <h2 class="reveal"><span class="num">1</span>Lay out your project</h2>
-<pre data-tree class="reveal">
+<pre data-tree data-label="Project structure" class="reveal">
 project/
 ├── providers/
 │   └── main.md  # database provider (PostgreSQL by default)
 ├── pipelines/
 │   └── login-guard.md  # reusable request pipeline
+├── migrations/main/
+│   └── 0001-create-users.md  # database migration (4-digit sequence)
 ├── models/user/
 │   ├── user.md  # model definition
 │   └── methods/sign-token.md  # model method
