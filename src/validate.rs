@@ -473,6 +473,22 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
             .unwrap_or_else(|| "jwt".into());
         for block in &pipes.blocks {
             if pipeline_name(&block.heading) == "rate-limit" {
+                if let Err(err) =
+                    crate::manifest::check_rate_params(block.bullets.iter().map(|b| b.key.as_str()))
+                {
+                    report.push(Diag::error(file, err).at_section("Pipelines"));
+                }
+                if block.bullets.iter().any(|b| {
+                    (b.key == "key" && b.value == "account") || b.key == "account-per-minute"
+                }) {
+                    report.push(
+                        Diag::warning(
+                            file,
+                            "rate-limit key `account` is deprecated: it now means input.email (it used to share the tenant bucket); write `key: input.email`",
+                        )
+                        .at_section("Pipelines"),
+                    );
+                }
                 if let Some(key) = block.bullets.iter().find(|b| b.key == "key") {
                     if let Err(err) =
                         crate::manifest::check_rate_key(&key.value, auth_removed, &auth_mode)

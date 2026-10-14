@@ -61,6 +61,21 @@ pub struct RateSpec {
 /// `input.{field}`, and the legacy login-guard `account` (= `input.email`).
 /// `family` needs the platform `token-refresh` pipeline, which this runtime
 /// does not provide, so it is rejected rather than silently keyed by IP.
+/// Rate-limit parameters this runtime does not enforce. They are rejected
+/// rather than silently ignored.
+pub const UNSUPPORTED_RATE_PARAMS: [&str; 3] = ["per-hour", "per-day", "burst"];
+
+pub fn check_rate_params<'a>(keys: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    for key in keys {
+        if UNSUPPORTED_RATE_PARAMS.contains(&key) {
+            return Err(format!(
+                "rate-limit `{key}` is not supported by this runtime (only per-minute); remove it rather than rely on it"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn check_rate_key(key: &str, auth_removed: bool, auth_mode: &str) -> Result<(), String> {
     match key {
         "ip" | "tenant" | "account" => Ok(()),
@@ -70,7 +85,10 @@ pub fn check_rate_key(key: &str, auth_removed: bool, auth_mode: &str) -> Result<
             Err("rate-limit key `api-key` needs `auth: { mode: api-key }`".into())
         }
         "api-key" => Ok(()),
-        "family" => Err("rate-limit key `family` is only valid with token-refresh, which this runtime does not support".into()),
+        "family" => Err(
+            "rate-limit key `family` is only for token-refresh, which is not implemented yet (see #26)"
+                .into(),
+        ),
         _ => match key.strip_prefix("input.") {
             Some(field)
                 if !field.is_empty()
@@ -493,6 +511,8 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
                 }
             }
             if name == "rate-limit" {
+                check_rate_params(block.bullets.iter().map(|b| b.key.as_str()))
+                    .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
                 let per_minute = block
                     .bullets
                     .iter()
@@ -765,6 +785,16 @@ mod rate_key_tests {
         assert!(check_rate_key("api-key", false, "api-key").is_ok());
         assert!(check_rate_key("api-key", false, "jwt").is_err());
         assert!(check_rate_key("user", true, "jwt").is_err());
+        let family = check_rate_key("family", false, "jwt").unwrap_err();
+        assert!(
+            family.contains("family is only for token-refresh")
+                || family.contains("`family` is only for token-refresh")
+        );
+        assert!(family.contains("not implemented") && family.contains("#26"));
+        for bad in ["per-hour", "per-day", "burst"] {
+            assert!(super::check_rate_params(["key", bad]).is_err(), "{bad}");
+        }
+        assert!(super::check_rate_params(["key", "per-minute"]).is_ok());
         for bad in ["family", "req.ip", "input.", "input.a-b", "everyone"] {
             assert!(check_rate_key(bad, false, "jwt").is_err(), "{bad}");
         }

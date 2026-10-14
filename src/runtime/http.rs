@@ -20,6 +20,7 @@ use crate::manifest::{Manifest, RouteSpec};
 
 use super::crud::{self, MethodFail};
 use super::exec::QueryExec;
+use super::limiter::{ip_bucket, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -72,13 +73,13 @@ pub struct AppState {
     pub exec: Arc<dyn QueryExec>,
     pub auth: AuthConfig,
     pub slugs: HashMap<String, Slug>,
-    pub rates: Mutex<HashMap<String, Vec<Instant>>>,
-    pub quotas: Mutex<HashMap<String, u32>>,
+    pub rates: Mutex<RateBuckets>,
+    pub quotas: Mutex<QuotaBuckets>,
     pub disabled: HashSet<String>,
     pub min_override_ms: Option<u64>,
     pub honor_test_ip: bool,
     /// Proxies whose `X-Forwarded-For` is trusted. Empty = use the peer address.
-    pub trusted_proxies: Vec<IpAddr>,
+    pub trusted_proxies: Vec<ProxyNet>,
     /// When set, an unknown public slug explains how to register it.
     pub dev_hints: bool,
 }
@@ -878,11 +879,8 @@ fn scope_allows(scopes: &[String], definition: &str, write: bool) -> bool {
     })
 }
 
-/// Maximum number of rate/quota buckets kept in memory. When full, expired
-/// buckets are pruned; if still full, new buckets are refused (fail closed).
-pub const MAX_BUCKETS: usize = 100_000;
-const WINDOW: Duration = Duration::from_secs(60);
-
+/// Shard and bucket for one rate-limit step. Shards are per route and key
+/// type, so flooding one key type cannot evict another's buckets.
 fn rate_bucket(
     key: &str,
     route: &RouteSpec,
@@ -890,18 +888,26 @@ fn rate_bucket(
     principal: &Principal,
     body: &Value,
     pepper: &[u8],
-) -> String {
+) -> (String, String) {
     let tenant = &principal.tenant_id;
     let feature = &route.feature_id;
     let field = match key {
-        "tenant" => return format!("tenant:{tenant}:{feature}"),
-        "user" | "api-key" => return format!("{key}:{tenant}:{}:{feature}", principal.subject),
+        "tenant" => return (format!("{feature}:tenant"), tenant.clone()),
+        "user" | "api-key" => {
+            return (
+                format!("{feature}:{key}"),
+                format!("{tenant}:{}", principal.subject),
+            )
+        }
+        // Deprecated alias (login-guard `account-per-minute`) for input.email.
         "account" => Some("email"),
         _ => key.strip_prefix("input."),
     };
     match field {
         Some(field) => {
             // Normalize, then HMAC so the plaintext is never stored (§4.3).
+            // A missing field normalizes to "" so all requests without it share
+            // one bucket per tenant: omitting the field cannot dodge the limit.
             let raw = body
                 .get(field)
                 .map(|v| match v {
@@ -909,20 +915,13 @@ fn rate_bucket(
                     other => other.to_string(),
                 })
                 .unwrap_or_default();
-            format!(
-                "input:{tenant}:{field}:{}:{feature}",
-                hmac_hex(pepper, &raw)
+            (
+                format!("{feature}:input.{field}"),
+                format!("{tenant}:{}", hmac_hex(pepper, &raw)),
             )
         }
-        None => format!("ip:{ip}:{feature}"),
+        None => (format!("{feature}:ip"), ip.to_string()),
     }
-}
-
-/// Seconds until the oldest hit leaves the window (at least 1).
-fn retry_after(oldest: Instant, now: Instant) -> u64 {
-    let elapsed = now.duration_since(oldest);
-    let remaining = WINDOW.saturating_sub(elapsed);
-    (remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)).max(1)
 }
 
 fn rate_limited(
@@ -935,46 +934,22 @@ fn rate_limited(
     if route.rates.is_empty() {
         return None;
     }
-    let Ok(mut rates) = state.rates.lock() else {
-        return Some("1".into());
-    };
-    let now = Instant::now();
-    let buckets: Vec<(String, u32)> = route
+    let checks: Vec<(String, String, u32)> = route
         .rates
         .iter()
         .map(|rate| {
-            (
-                rate_bucket(&rate.key, route, ip, principal, body, &state.auth.pepper),
-                rate.per_minute,
-            )
+            let (shard, key) =
+                rate_bucket(&rate.key, route, ip, principal, body, &state.auth.pepper);
+            (shard, key, rate.per_minute)
         })
         .collect();
-    let mut worst: Option<u64> = None;
-    for (bucket, limit) in &buckets {
-        if let Some(hits) = rates.get_mut(bucket) {
-            hits.retain(|at| now.duration_since(*at) < WINDOW);
-            if hits.len() as u32 >= *limit {
-                let wait = hits.first().map(|t| retry_after(*t, now)).unwrap_or(1);
-                worst = Some(worst.map_or(wait, |w| w.max(wait)));
-            }
-        }
+    let Ok(mut rates) = state.rates.lock() else {
+        return Some("1".into());
+    };
+    match rates.check(&checks, Instant::now()) {
+        RateDecision::Allow => None,
+        RateDecision::Limited(wait) => Some(wait.to_string()),
     }
-    if let Some(wait) = worst {
-        return Some(wait.to_string());
-    }
-    if rates.len() + buckets.len() > MAX_BUCKETS {
-        rates.retain(|_, hits| {
-            hits.retain(|at| now.duration_since(*at) < WINDOW);
-            !hits.is_empty()
-        });
-        if rates.len() + buckets.len() > MAX_BUCKETS {
-            return Some(WINDOW.as_secs().to_string());
-        }
-    }
-    for (bucket, _) in buckets {
-        rates.entry(bucket).or_default().push(now);
-    }
-    None
 }
 
 fn seconds_until_utc_midnight() -> i64 {
@@ -991,31 +966,22 @@ fn quota_exhausted(state: &AppState, tenant: &str, ip: &str) -> bool {
     let Ok(mut quotas) = state.quotas.lock() else {
         return true;
     };
-    let tenant_key = format!("tenant:{tenant}:{day}");
-    let ip_key = format!("ip:{ip}:{day}");
-    let tenant_count = *quotas.get(&tenant_key).unwrap_or(&0);
-    let ip_count = *quotas.get(&ip_key).unwrap_or(&0);
-    if tenant_count >= 1000 || ip_count >= 50 {
-        return true;
-    }
-    if quotas.len() + 2 > MAX_BUCKETS {
-        let suffix = format!(":{day}");
-        quotas.retain(|key, _| key.ends_with(&suffix));
-        if quotas.len() + 2 > MAX_BUCKETS {
-            return true;
-        }
-    }
-    *quotas.entry(tenant_key).or_insert(0) += 1;
-    *quotas.entry(ip_key).or_insert(0) += 1;
-    false
+    !quotas.check(
+        &day,
+        &[
+            ("tenant", tenant.to_string(), 1000),
+            ("ip", ip.to_string(), 50),
+        ],
+    )
 }
 
-/// Client IP: the peer address, unless the peer is a trusted proxy, in which
-/// case the rightmost `X-Forwarded-For` hop that is not a trusted proxy.
+/// Client IP bucket: the peer address, unless the peer is a trusted proxy, in
+/// which case the rightmost `X-Forwarded-For` hop that is not a trusted proxy.
+/// IPv4-mapped IPv6 becomes IPv4; IPv6 is grouped by /64.
 fn client_ip(
     headers: &BTreeMap<String, String>,
     peer: Option<IpAddr>,
-    trusted: &[IpAddr],
+    trusted: &[ProxyNet],
     honor_test_ip: bool,
 ) -> String {
     if honor_test_ip {
@@ -1023,24 +989,25 @@ fn client_ip(
             return ip.clone();
         }
     }
-    let Some(peer) = peer else {
+    let Some(peer) = peer.map(|p| p.to_canonical()) else {
         return "0.0.0.0".into();
     };
-    if !trusted.contains(&peer) {
-        return peer.to_string();
+    let is_trusted = |ip: IpAddr| trusted.iter().any(|net| net.contains(ip));
+    if !is_trusted(peer) {
+        return ip_bucket(peer);
     }
     let Some(xff) = headers.get("x-forwarded-for") else {
-        return peer.to_string();
+        return ip_bucket(peer);
     };
     let mut last = peer;
     for hop in xff.rsplit(',') {
-        match hop.trim().parse::<IpAddr>() {
-            Ok(ip) if trusted.contains(&ip) => last = ip,
-            Ok(ip) => return ip.to_string(),
-            Err(_) => return last.to_string(),
+        match parse_hop(hop) {
+            Some(ip) if is_trusted(ip) => last = ip,
+            Some(ip) => return ip_bucket(ip),
+            None => break,
         }
     }
-    last.to_string()
+    ip_bucket(last)
 }
 
 fn header_map(headers: &HeaderMap) -> BTreeMap<String, String> {
@@ -1241,11 +1208,11 @@ mod rate_tests {
     }
 
     #[test]
-    fn xff_rightmost_untrusted_hop() {
-        let trusted = [ip("10.0.0.1"), ip("10.0.0.2")];
+    fn xff_rightmost_untrusted_hop_with_cidr_ports_and_mapped() {
+        let trusted = [ProxyNet::parse("10.0.0.0/8").unwrap()];
         let got = client_ip(
-            &xff("6.6.6.6, 5.5.5.5, 10.0.0.2"),
-            Some(ip("10.0.0.1")),
+            &xff("6.6.6.6, 5.5.5.5:4321, [::ffff:10.0.0.2]:80"),
+            Some(ip("::ffff:10.0.0.1")),
             &trusted,
             false,
         );
@@ -1253,20 +1220,15 @@ mod rate_tests {
     }
 
     #[test]
-    fn retry_after_counts_down() {
-        let now = Instant::now();
-        let oldest = now - Duration::from_secs(45);
-        assert_eq!(retry_after(oldest, now), 15);
-        assert_eq!(retry_after(now, now), 60);
-        assert_eq!(retry_after(now - Duration::from_secs(70), now), 1);
+    fn ipv6_clients_share_a_64() {
+        let a = client_ip(&BTreeMap::new(), Some(ip("2001:db8:0:1::a")), &[], false);
+        let b = client_ip(&BTreeMap::new(), Some(ip("2001:db8:0:1::b")), &[], false);
+        assert_eq!(a, b);
     }
 
     #[test]
     fn buckets_follow_the_key() {
-        let route = RouteSpec {
-            feature_id: "f".into(),
-            ..test_route()
-        };
+        let route = test_route();
         let p = Principal {
             tenant_id: "tenant0001".into(),
             subject: "u1".into(),
@@ -1275,8 +1237,13 @@ mod rate_tests {
         };
         let body = json!({"email": " A@X.COM "});
         let pep = b"p";
-        assert!(rate_bucket("user", &route, "1.1.1.1", &p, &body, pep).contains(":u1:"));
-        assert!(rate_bucket("tenant", &route, "1.1.1.1", &p, &body, pep).starts_with("tenant:"));
+        let (shard, key) = rate_bucket("user", &route, "1.1.1.1", &p, &body, pep);
+        assert_eq!(shard, "f:user");
+        assert!(key.ends_with(":u1"));
+        assert_eq!(
+            rate_bucket("tenant", &route, "1.1.1.1", &p, &body, pep).0,
+            "f:tenant"
+        );
         let a = rate_bucket("input.email", &route, "1.1.1.1", &p, &body, pep);
         let b = rate_bucket(
             "input.email",
@@ -1287,9 +1254,35 @@ mod rate_tests {
             pep,
         );
         assert_eq!(a, b, "normalized input key is IP independent");
-        assert!(!a.contains("a@x.com"), "plaintext must not be stored");
+        assert!(!a.1.contains("a@x.com"), "plaintext must not be stored");
         assert_eq!(a, rate_bucket("account", &route, "3.3.3.3", &p, &body, pep));
-        assert!(rate_bucket("ip", &route, "1.1.1.1", &p, &body, pep).starts_with("ip:1.1.1.1"));
+        assert_eq!(
+            rate_bucket("ip", &route, "1.1.1.1", &p, &body, pep),
+            ("f:ip".to_string(), "1.1.1.1".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_input_fields_share_one_empty_bucket() {
+        let route = test_route();
+        let p = Principal {
+            tenant_id: "tenant0001".into(),
+            subject: String::new(),
+            roles: vec![],
+            scopes: vec![],
+        };
+        let a = rate_bucket("input.email", &route, "1.1.1.1", &p, &json!({}), b"p");
+        let b = rate_bucket("input.email", &route, "9.9.9.9", &p, &Value::Null, b"p");
+        let c = rate_bucket(
+            "input.email",
+            &route,
+            "8.8.8.8",
+            &p,
+            &json!({"email": ""}),
+            b"p",
+        );
+        assert_eq!(a, b);
+        assert_eq!(a, c, "missing and empty share the same bucket");
     }
 
     fn test_route() -> RouteSpec {

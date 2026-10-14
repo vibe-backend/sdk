@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -375,8 +374,8 @@ async fn cmd_serve(
         exec,
         auth: auth_from_env(),
         slugs: loaded.slugs,
-        rates: std::sync::Mutex::new(HashMap::new()),
-        quotas: std::sync::Mutex::new(HashMap::new()),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
         disabled: load_disabled(project),
         min_override_ms: None,
         honor_test_ip: false,
@@ -460,9 +459,9 @@ fn auth_from_env() -> AuthConfig {
     auth
 }
 
-/// `VIBE_TRUSTED_PROXIES`: comma-separated proxy IPs whose
+/// `VIBE_TRUSTED_PROXIES`: comma-separated proxy IPs or CIDR blocks whose
 /// `X-Forwarded-For` is honoured. Unset = trust no proxy (use the peer).
-fn trusted_proxies_from_env() -> Result<Vec<std::net::IpAddr>, String> {
+fn trusted_proxies_from_env() -> Result<Vec<vibe::runtime::ProxyNet>, String> {
     let Ok(raw) = std::env::var("VIBE_TRUSTED_PROXIES") else {
         return Ok(Vec::new());
     };
@@ -470,8 +469,7 @@ fn trusted_proxies_from_env() -> Result<Vec<std::net::IpAddr>, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| {
-            s.parse()
-                .map_err(|_| format!("VIBE_TRUSTED_PROXIES: invalid IP {s}"))
+            vibe::runtime::ProxyNet::parse(s).map_err(|err| format!("VIBE_TRUSTED_PROXIES: {err}"))
         })
         .collect()
 }
