@@ -3,15 +3,22 @@ mod exec;
 mod http;
 pub mod jwks;
 mod limiter;
+mod ops;
 mod slugs;
 mod sql;
 
-pub use crud::{parse_ownership, run_method, Ownership};
+pub use crud::{parse_ownership, run_method, CallCtx, CallResult, Caller, MethodFail, Ownership};
 pub use exec::{etag, ExecError, MemoryExec, PgExec, QueryExec};
 pub use http::{
     detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router, ApiKeyFile, AppState,
-    AuthConfig, RunEnv, Slug, StoredKey, REQUEST_TYPES,
+    AuthConfig, RunEnv, SigningKey, Slug, StoredKey, REQUEST_TYPES,
 };
+pub use ops::load_signing_keys;
+
+/// argon2id hash with the platform floor (for seeding test data).
+pub fn hash_password_for_tests(plain: &str) -> String {
+    crud::hash_password(plain).expect("hash")
+}
 pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
 pub use sql::{bootstrap_statements, Col};

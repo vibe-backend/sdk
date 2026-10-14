@@ -56,6 +56,16 @@ pub struct AuthConfig {
     /// Default claim holding the caller's roles (`VIBE_JWT_ROLES_CLAIM`,
     /// default `roles`); a route's `roles-claim` overrides it.
     pub roles_claim: String,
+    /// Private keys for `sign-jwt` steps, by `key-ref` (loaded at startup).
+    pub signing_keys: HashMap<String, SigningKey>,
+}
+
+/// A JWT signing key named by a lock `key-ref`.
+#[derive(Clone)]
+pub struct SigningKey {
+    pub alg: Algorithm,
+    pub kid: String,
+    pub key: jsonwebtoken::EncodingKey,
 }
 
 impl AuthConfig {
@@ -72,6 +82,7 @@ impl AuthConfig {
             env_name: "test".into(),
             jwks: None,
             roles_claim: "roles".into(),
+            signing_keys: HashMap::new(),
         }
     }
 }
@@ -693,6 +704,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     &step.target,
                     &args,
                     crud::CallCtx {
+                        auth: &state.auth,
                         tenant_id: &principal.tenant_id,
                         role,
                         caller: crud::Caller {
@@ -795,7 +807,13 @@ async fn finish(
     response: HttpResponse,
 ) -> HttpResponse {
     let min_ms = state.min_override_ms.unwrap_or(if route.public {
-        route.min_response_ms
+        // Login-class endpoints (a verify-password step) pad to 500 ms so
+        // timing does not reveal whether the account exists.
+        if crud::route_verifies_password(&state.manifest, route) {
+            route.min_response_ms.max(500)
+        } else {
+            route.min_response_ms
+        }
     } else {
         0
     });

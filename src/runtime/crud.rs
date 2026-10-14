@@ -23,6 +23,8 @@ pub struct Caller<'a> {
 
 #[derive(Clone, Copy)]
 pub struct CallCtx<'a> {
+    /// Pepper, issuer/audience and signing keys for platform ops.
+    pub auth: &'a super::http::AuthConfig,
     pub tenant_id: &'a str,
     pub role: &'a str,
     pub caller: Caller<'a>,
@@ -105,6 +107,21 @@ async fn run_steps(
                 if when_matches(&step.when_expr, &vars) {
                     return Err(MethodFail::code(step.fail.clone(), step.fail.clone()));
                 }
+            }
+            "query" | "verify-password" | "hash-password" | "random-token" | "hash-token"
+            | "sign-jwt" => {
+                let value = match step.op.as_str() {
+                    "query" => super::ops::query(exec, step, &vars, ctx).await?,
+                    "verify-password" => super::ops::verify_password(step, &vars).await?,
+                    "hash-password" => super::ops::hash_password_op(step, &vars).await?,
+                    "random-token" => super::ops::random_token(step, ctx)?,
+                    "hash-token" => super::ops::hash_token(step, &vars, ctx)?,
+                    _ => super::ops::sign_jwt(method, step, &vars, ctx)?,
+                };
+                if !step.out.is_empty() && step.out != "(none)" {
+                    vars.insert(step.out.clone(), value.clone());
+                }
+                last = value;
             }
             _ => {
                 return Err(MethodFail::code(
@@ -508,6 +525,26 @@ async fn delete(
         etag: None,
         status: 204,
     })
+}
+
+/// True when a route's steps reach a method with a `verify-password` step
+/// (a login-class endpoint, padded to 500 ms).
+pub fn route_verifies_password(manifest: &Manifest, route: &crate::manifest::RouteSpec) -> bool {
+    fn method_verifies(manifest: &Manifest, target: &str, depth: u32) -> bool {
+        let Some(method) = crate::manifest::method(manifest, target) else {
+            return false;
+        };
+        method.steps.iter().any(|s| {
+            s.op == "verify-password"
+                || (s.op == "method"
+                    && depth < 3
+                    && method_verifies(manifest, &s.target, depth + 1))
+        })
+    }
+    route
+        .steps
+        .iter()
+        .any(|s| s.op == "method" && method_verifies(manifest, &s.target, 0))
 }
 
 fn finish_row(model: &ModelSpec, row: Row, include_sensitive: bool) -> CallResult {

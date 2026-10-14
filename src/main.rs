@@ -348,9 +348,26 @@ async fn cmd_serve(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
-    let auth = auth_from_env(run_env)?;
+    let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
+    // `sign-jwt` key-refs name environment variables holding private PEMs.
+    auth.signing_keys =
+        vibe::runtime::load_signing_keys(&manifest, &|name| std::env::var(name).ok(), &auth.kid)?;
+    if memory {
+        let with_query: Vec<&str> = manifest
+            .methods
+            .iter()
+            .filter(|m| m.steps.iter().any(|s| s.op == "query"))
+            .map(|m| m.target.as_str())
+            .collect();
+        if !with_query.is_empty() {
+            eprintln!(
+                "warning: --memory does not run `query` steps; these methods will fail until you use PostgreSQL: {}",
+                with_query.join(", ")
+            );
+        }
+    }
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::new())
     } else {

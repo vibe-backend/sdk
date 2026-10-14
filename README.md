@@ -15,6 +15,8 @@ curl http://localhost:8080/catalog/v1/acme/items
 
 `vibe dev` will use an in-memory database for development and testing only; all data is lost when the server stops.
 
+**Method ops (#26, part 1).** Method steps `query`, `verify-password`, `hash-password`, `random-token`, `hash-token` and `sign-jwt` now run. `query` runs the lock's parameterised SQL in the tenant schema under row level security, and only on PostgreSQL: with `--memory`, `vibe serve` warns at startup and those methods return 500. `verify-password` uses argon2id (at most four hashes at a time per instance). When the user does not exist (`missing-user: dummy-hash`) it compares against a dummy hash, so timing and the result look the same as a wrong password. Endpoints that reach a `verify-password` step are padded to at least 500 ms. `random-token` returns `{value, hash}`, and `hash-token` is HMAC-SHA-256 with `VIBE_API_KEY_PEPPER` (`normalize: email` trims and lowercases first). `sign-jwt` runs only in methods with `capabilities: [sign-token]`. It reads the private PEM from the environment variable named by `key-ref` (`<key-ref>_KID` sets the kid, default `VIBE_JWT_KID`), and `vibe serve` refuses to start if that variable is missing. The runtime sets `iss`, `aud`, `iat`/`nbf`/`exp` (ttl at most 1 h), `jti`, the roles claim (from the step's `roles` expression) and `tenant_id`. `tenant_id` always comes from the request's tenant, never from input; a method's `claims` cannot name these platform claims. Refresh tokens (`issue-refresh`) are not issued yet.
+
 ## Install
 
 Download `vibe` from [GitHub Releases](https://github.com/vibe-backend/sdk/releases). The CLI is not published to crates.io and it is not published as a container image.

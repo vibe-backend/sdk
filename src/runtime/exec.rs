@@ -20,6 +20,72 @@ pub enum ExecError {
 pub trait QueryExec: Send + Sync {
     async fn execute(&self, tenant_id: &str, role: &str, stmt: Stmt)
         -> Result<Vec<Row>, ExecError>;
+
+    /// Runs a lock `query` step: validated, parameterised SQL in the tenant
+    /// schema under row level security. Params are sent as text and parsed
+    /// by PostgreSQL for whatever type the statement needs. Only PostgreSQL
+    /// implements this.
+    async fn raw(
+        &self,
+        _tenant_id: &str,
+        _sql: &str,
+        _params: Vec<Option<String>>,
+    ) -> Result<Vec<Row>, ExecError> {
+        Err(ExecError::Message(
+            "query steps need PostgreSQL; the --memory executor does not run them".into(),
+        ))
+    }
+}
+
+/// A query parameter sent in text format so PostgreSQL infers its type.
+#[derive(Debug)]
+struct TextParam(Option<String>);
+
+impl tokio_postgres::types::ToSql for TextParam {
+    fn to_sql(
+        &self,
+        _ty: &tokio_postgres::types::Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match &self.0 {
+            Some(text) => {
+                out.extend_from_slice(text.as_bytes());
+                Ok(tokio_postgres::types::IsNull::No)
+            }
+            None => Ok(tokio_postgres::types::IsNull::Yes),
+        }
+    }
+
+    fn accepts(_ty: &tokio_postgres::types::Type) -> bool {
+        true
+    }
+
+    fn encode_format(&self, _ty: &tokio_postgres::types::Type) -> tokio_postgres::types::Format {
+        tokio_postgres::types::Format::Text
+    }
+
+    tokio_postgres::types::to_sql_checked!();
+}
+
+/// Statements whose rows can be read: SELECT/WITH, or a write with RETURNING.
+fn returns_rows(sql: &str) -> bool {
+    // Drop quoted literals so a string containing "returning" cannot flip it.
+    let mut clean = String::new();
+    let mut quoted = false;
+    for c in sql.chars() {
+        if c == '\'' {
+            quoted = !quoted;
+            clean.push(' ');
+        } else if !quoted {
+            clean.push(c.to_ascii_lowercase());
+        }
+    }
+    let head = clean.trim_start();
+    head.starts_with("select")
+        || head.starts_with("with")
+        || clean
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|w| w == "returning")
 }
 
 #[derive(Default)]
@@ -285,6 +351,53 @@ impl QueryExec for PgExec {
             out.push(mapped);
         }
         Ok(out)
+    }
+
+    async fn raw(
+        &self,
+        tenant_id: &str,
+        sql: &str,
+        params: Vec<Option<String>>,
+    ) -> Result<Vec<Row>, ExecError> {
+        if !super::slugs::valid_tenant(tenant_id) {
+            return Err(ExecError::Message("invalid tenant id".into()));
+        }
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|err| ExecError::Message(err.to_string()))?;
+        let schema = format!("\"t_{tenant_id}\"");
+        tx.query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true)",
+            &[&tenant_id, &schema],
+        )
+        .await
+        .map_err(|err| ExecError::Message(err.to_string()))?;
+        let params: Vec<TextParam> = params.into_iter().map(TextParam).collect();
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p as _).collect();
+        let body = sql.trim().trim_end_matches(';');
+        let rows = if returns_rows(body) {
+            // Every column comes back as JSON, whatever its type.
+            let wrapped = format!("WITH q AS ({body}) SELECT row_to_json(q)::text FROM q");
+            tx.query(&wrapped, &refs).await.map_err(map_pg)?
+        } else {
+            tx.execute(body, &refs).await.map_err(map_pg)?;
+            Vec::new()
+        };
+        tx.commit()
+            .await
+            .map_err(|err| ExecError::Message(err.to_string()))?;
+        rows.iter()
+            .map(|row| {
+                let text: String = row.get(0);
+                match serde_json::from_str(&text) {
+                    Ok(Value::Object(map)) => Ok(map),
+                    _ => Err(ExecError::Message("query row is not an object".into())),
+                }
+            })
+            .collect()
     }
 }
 
