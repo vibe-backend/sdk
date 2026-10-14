@@ -155,58 +155,105 @@ const OPENAI_EXCLUDED: &[&str] = &[
     "-tts",
 ];
 
-/// Explicit capability registry: `(provider, model prefix, excluded
-/// substrings, caps)`, shipped with this SDK version (spec 2A.8.6, decision
-/// 58, #35). A model gets sampling parameters only when its lower-cased name
-/// starts with a listed prefix and contains none of the excluded substrings;
-/// unknown models and providers get none.
+/// Gemini variants that share a registered family but are not text models
+/// (speech, image generation, Live API) and must not get sampling parameters.
+const GEMINI_EXCLUDED: &[&str] = &["-tts", "-image", "-live", "-audio"];
+
+/// What may follow a registered id.
+#[derive(Clone, Copy)]
+enum Suffix {
+    /// Nothing, or `-` and any variant (`gemini-2.5-flash-lite`,
+    /// `gpt-4o-mini-2024-07-18`), minus the excluded substrings.
+    Variant,
+    /// Nothing, `-YYYYMMDD`, `-YYYY-MM-DD` or `-latest` only
+    /// (`claude-opus-4-20250514`, `claude-3-5-sonnet-latest`).
+    Dated,
+}
+
+use Suffix::{Dated, Variant};
+
+/// Explicit capability registry: `(provider, model id, allowed suffix,
+/// excluded substrings, caps)`, shipped with this SDK version (spec 2A.8.6,
+/// decision 58, #35). A model gets sampling parameters only when its
+/// lower-cased name is a listed id, optionally followed by an allowed suffix
+/// (there is always a `-` or the end of the name right after the id, so
+/// `gpt-4.10`, `gpt-4oops` and `claude-opus-4-10` do not match), and contains
+/// none of the excluded substrings. Unknown models and providers get none.
 ///
-/// - Gemini 1.5 / 2.x: temperature 0, topP 1, topK 1, seed. Gemini 3 and
-///   later are not listed: Google recommends the default temperature 1.0
-///   (lower values can loop) and newer models deprecate sampling knobs, so
-///   they get none.
+/// - Gemini 1.5 / 2.0 / 2.5 text models (not tts, image, live or audio
+///   variants): temperature 0, topP 1, topK 1, seed. Gemini 3 and later are
+///   not listed: Google recommends the default temperature 1.0 (lower values
+///   can loop) and newer models deprecate sampling knobs, so they get none.
 /// - OpenAI gpt-5.1 / gpt-5.2 (not -pro, -codex, -chat): temperature 0,
 ///   top_p 1, seed, `reasoning_effort: none`. gpt-4.1 / gpt-4o (not search,
 ///   audio, realtime, transcribe, tts): temperature 0, top_p 1, seed.
-/// - Anthropic: `temperature: 0` only (never with top_p) for Claude Opus 4.6,
-///   Sonnet 4.6, Haiku 4.5 and earlier, listed per version. Opus 4.7 and
-///   later, Sonnet 5+, Haiku 5.5 and newer reject non-default sampling
-///   parameters with a 400, so they get none.
-const SAMPLING_REGISTRY: &[(&str, &str, &[&str], SamplingCaps)] = &[
-    (GEMINI, "gemini-1.5-", &[], GEMINI_2),
-    (GEMINI, "gemini-2.0-", &[], GEMINI_2),
-    (GEMINI, "gemini-2.5-", &[], GEMINI_2),
-    (OPENAI, "gpt-5.1", OPENAI_EXCLUDED, GPT_5_NONE),
-    (OPENAI, "gpt-5.2", OPENAI_EXCLUDED, GPT_5_NONE),
-    (OPENAI, "gpt-4.1", OPENAI_EXCLUDED, GPT_4),
-    (OPENAI, "gpt-4o", OPENAI_EXCLUDED, GPT_4),
-    (ANTHROPIC, "claude-opus-4-6", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-opus-4-5", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-opus-4-1", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-opus-4-0", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-opus-4-2025", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-sonnet-4-6", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-sonnet-4-5", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-sonnet-4-0", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-sonnet-4-2025", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-haiku-4-5", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-3-7-sonnet", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-3-5-sonnet", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-3-5-haiku", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-3-opus", &[], CLAUDE_TEMP),
-    (ANTHROPIC, "claude-3-haiku", &[], CLAUDE_TEMP),
+/// - Anthropic: `temperature: 0` only (never with top_p) for exactly these
+///   models: Claude Opus 4, 4.1, 4.5, 4.6; Sonnet 4, 4.5, 4.6; Haiku 4.5;
+///   Claude 3.7 Sonnet, 3.5 Sonnet, 3.5 Haiku, 3 Opus and 3 Haiku. Every
+///   other Claude model (Opus 4.7 and later, Sonnet 5 and later, any newer
+///   Haiku, Claude 2.x) is not listed and gets none.
+const SAMPLING_REGISTRY: &[(&str, &str, Suffix, &[&str], SamplingCaps)] = &[
+    (GEMINI, "gemini-1.5", Variant, GEMINI_EXCLUDED, GEMINI_2),
+    (GEMINI, "gemini-2.0", Variant, GEMINI_EXCLUDED, GEMINI_2),
+    (GEMINI, "gemini-2.5", Variant, GEMINI_EXCLUDED, GEMINI_2),
+    (OPENAI, "gpt-5.1", Variant, OPENAI_EXCLUDED, GPT_5_NONE),
+    (OPENAI, "gpt-5.2", Variant, OPENAI_EXCLUDED, GPT_5_NONE),
+    (OPENAI, "gpt-4.1", Variant, OPENAI_EXCLUDED, GPT_4),
+    (OPENAI, "gpt-4o", Variant, OPENAI_EXCLUDED, GPT_4),
+    (ANTHROPIC, "claude-opus-4-6", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-opus-4-5", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-opus-4-1", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-opus-4-0", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-opus-4", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-sonnet-4-6", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-sonnet-4-5", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-sonnet-4-0", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-sonnet-4", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-haiku-4-5", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-7-sonnet", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-5-sonnet", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-5-haiku", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-opus", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-haiku", Dated, &[], CLAUDE_TEMP),
 ];
+
+/// `-YYYYMMDD`, `-YYYY-MM-DD` or `-latest`.
+fn is_date_or_latest(rest: &str) -> bool {
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    if rest == "latest" {
+        return true;
+    }
+    let b = rest.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    match b.len() {
+        8 => digits(0..8),
+        10 => digits(0..4) && b[4] == b'-' && digits(5..7) && b[7] == b'-' && digits(8..10),
+        _ => false,
+    }
+}
+
+fn id_matches(model: &str, id: &str, suffix: Suffix) -> bool {
+    let Some(rest) = model.strip_prefix(id) else {
+        return false;
+    };
+    match suffix {
+        Variant => rest.is_empty() || rest.starts_with('-'),
+        Dated => rest.is_empty() || is_date_or_latest(rest),
+    }
+}
 
 fn registered_caps(provider: &str, model: &str) -> Option<SamplingCaps> {
     let model = model.to_ascii_lowercase();
     SAMPLING_REGISTRY
         .iter()
-        .find(|(p, prefix, excluded, _)| {
+        .find(|(p, id, suffix, excluded, _)| {
             *p == provider
-                && model.starts_with(prefix)
+                && id_matches(&model, id, *suffix)
                 && !excluded.iter().any(|x| model.contains(x))
         })
-        .map(|(_, _, _, caps)| *caps)
+        .map(|(_, _, _, _, caps)| *caps)
 }
 
 /// Sampling parameters for a model with sampling enabled (the default).
@@ -1225,6 +1272,33 @@ mod tests {
             (ANTHROPIC, "claude-sonnet-5-5"),
             (ANTHROPIC, "claude-haiku-5-5"),
             (ANTHROPIC, "claude-fable-5-1"),
+            // No version boundary after the registered id.
+            (OPENAI, "gpt-5.10"),
+            (OPENAI, "gpt-5.10-2026-01-01"),
+            (OPENAI, "gpt-4.10"),
+            (OPENAI, "gpt-4oops"),
+            (OPENAI, "gpt-5.25"),
+            (ANTHROPIC, "claude-opus-4-10"),
+            (ANTHROPIC, "claude-opus-4-10-20270101"),
+            (ANTHROPIC, "claude-sonnet-4-50"),
+            (ANTHROPIC, "claude-haiku-4-55"),
+            (ANTHROPIC, "claude-opus-4-7-latest"),
+            (ANTHROPIC, "claude-opus-4-20250514-extra"),
+            (ANTHROPIC, "claude-opus-4-2025051"),
+            (ANTHROPIC, "claude-2.1"),
+            (ANTHROPIC, "claude-2-1"),
+            (GEMINI, "gemini-2.50-pro"),
+            // Gemini speech, image and Live variants.
+            (GEMINI, "gemini-2.5-flash-preview-tts"),
+            (GEMINI, "gemini-2.5-pro-preview-tts"),
+            (GEMINI, "gemini-2.5-flash-image"),
+            (GEMINI, "gemini-2.5-flash-image-preview"),
+            (GEMINI, "gemini-2.0-flash-preview-image-generation"),
+            (GEMINI, "gemini-2.0-flash-exp-image-generation"),
+            (GEMINI, "gemini-2.0-flash-live-001"),
+            (GEMINI, "gemini-live-2.5-flash-preview"),
+            (GEMINI, "gemini-2.5-flash-live-preview"),
+            (GEMINI, "gemini-2.5-flash-native-audio-preview-09-2025"),
         ] {
             assert!(
                 model_capabilities(provider, model, 1).is_empty(),
@@ -1241,6 +1315,24 @@ mod tests {
             (OPENAI, "gpt-4.1-mini-2025-04-14"),
             (OPENAI, "gpt-5.2-2025-12-11"),
             (GEMINI, "gemini-2.5-pro"),
+            (GEMINI, "gemini-2.5-flash-lite"),
+            (GEMINI, "gemini-2.0-flash-001"),
+            (GEMINI, "gemini-1.5-pro-002"),
+            (OPENAI, "gpt-5.1"),
+            (OPENAI, "gpt-4o"),
+            (OPENAI, "gpt-4o-mini"),
+            (OPENAI, "gpt-4.1"),
+            (ANTHROPIC, "claude-opus-4-1"),
+            (ANTHROPIC, "claude-opus-4-1-20250805"),
+            (ANTHROPIC, "claude-opus-4-20250514"),
+            (ANTHROPIC, "claude-sonnet-4-20250514"),
+            (ANTHROPIC, "claude-sonnet-4-5-2025-09-29"),
+            (ANTHROPIC, "claude-sonnet-4-0"),
+            (ANTHROPIC, "claude-3-5-sonnet-latest"),
+            (ANTHROPIC, "claude-3-7-sonnet-20250219"),
+            (ANTHROPIC, "claude-3-opus-20240229"),
+            (ANTHROPIC, "claude-3-haiku-20240307"),
+            (ANTHROPIC, "claude-3-5-haiku-latest"),
         ] {
             assert!(sampling_registered(provider, model), "{provider} {model}");
             let p = model_capabilities(provider, model, 1);
