@@ -197,7 +197,7 @@
 | 87 | 11.3 `_version` 同 11.4 create-user 嘅 rate-limit 補 `key`（分別係 `user` 同 `user`），合 4.3 schema；冇 `key` 嘅 rate-limit 係驗證器 error。 | 待產品經理確認 | 11.3、11.4、10.3 |
 | 88 | Admin 建立用戶時遇到自己註冊緊（未驗證、冇密碼）嘅同一個 email：當同一個用戶處理，邀請 token 取代註冊 token（`email_verify_purpose` 變 `invite`），用戶只會收到邀請信。 | 待產品經理確認 | 11.4 |
 | 89 | 產品經理基線 1：release manifest 只可以喺受保護 ref（`main` 或者受 ruleset 保護嘅 `v*` tag）、經有 required reviewers 嘅 GitHub environment（例如 `release`）、用 OIDC 綁定嘅 KMS key 簽；依賴 issue #28（release.yml 加固）完成先可以出第一個 release。 | 待產品經理確認 | 2C.3、9B、9C |
-| 90 | 產品經理基線 2：release build 有高風險 `security-items` 就 fail closed，除非提供 `--release-approval <ref>`（PR review id 或者 environment deployment approval）。驗證：build 經 GitHub API 攞 PR review，或者經 OIDC claims 攞 environment deployment approval；一定要存在、狀態係 APPROVED、綁定正喺 build 嘅 commit SHA（即係最新 push）；批准人唔可以係 PR 作者或者最後 push 嘅人；高風險要 2 個唔同嘅合資格批准人；任何一項唔合就 build 失敗。Release environment 一定要開 **Prevent self-review**。批准參照寫入 manifest 同部署報告（同已移除嘅 lock `approval-ref` 無關）。 | 待產品經理確認 | 2A.5、2C.3、9C |
+| 90 | 產品經理基線 2：release build 有高風險 `security-items` 就 fail closed，除非提供有效嘅 `--release-approval`（`pr:<n>`、`env:<run_id>` 或者兩者合併）。驗證（2C.3a）：搵返 build commit 屬於嘅唯一 merged PR，批准一定要喺 PR 最後 head SHA 上，而 build commit 嘅 tree 要同 PR head 一樣（要開 Require branches to be up to date）；合資格批准人要有 write 權限、唔係作者、唔係最後 push 嘅人、唔係 bot，高風險路徑要係 CODEOWNER；高風險要 2 個唔同批准人（PR review 同 environment approval 合併計）；任何 API 錯誤即失敗。Release environment 一定要開 Prevent self-review。批准參照寫入 manifest 同部署報告（同已移除嘅 lock `approval-ref` 無關）。 | 待產品經理確認 | 2A.5、2C.3a、9C |
 | 91 | 產品經理基線 3：production 一律拒絕 in-memory 資料庫，啟動直接報錯退出；冇任何 override 旗標。Production 定義只睇 build-mode 同環境：manifest 唔係 `build-mode: dev`，或者 `VIBE_ENV=production`。Listen 地址唔係 loopback（例如 Docker 入面 `vibe dev` 綁 `0.0.0.0`）只會警告，唔會拒絕；Docker 入面請明確設 `VIBE_ENV=development`。 | 待產品經理確認 | 2C.4、9C |
 | 92 | 產品經理基線 4：CI release build 攞唔到 KMS key 就失敗，永遠唔 fallback 去 dev key；production runtime 只信任平台 pin 死嘅 release 公鑰，dev key 永遠唔信任。 | 待產品經理確認 | 2C.2、2C.3、9B |
 | 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；`vibe build` release 模式檢查 CODEOWNERS 覆蓋路徑，冇就失敗。 | 待產品經理確認 | 2A.7、9B |
@@ -640,16 +640,49 @@ jobs:
 
 ### 2C.3a `--release-approval` 驗證（決定 90，待產品經理確認）
 
-- 只喺 release build 有高風險 `security-items` 時要求；冇提供或者驗證失敗，build 失敗，冇 override。
-- 參照來源（二揀一）：
-  - PR review：`--release-approval pr:<number>`；build 用 GitHub API（`GET /repos/{owner}/{repo}/pulls/{number}/reviews`）攞 review。
-  - Environment deployment approval：`--release-approval env:<run_id>`；build 讀 OIDC token claims（`environment`、`ref`、`sha`、`run_id`）同 GitHub API 嘅 deployment approval 紀錄。
-- 全部條件一定要成立：
-  1. 參照存在，狀態係 `APPROVED`（之後被 dismiss 或者改成 changes requested 就唔算）。
-  2. 批准綁定正喺 build 嘅 commit SHA（PR 最新 push 嘅 head SHA，或者 OIDC claim 嘅 `sha`），同 `git rev-parse HEAD` 一樣。
-  3. 批准人唔係 PR 作者，亦唔係最後 push 嘅人。
-  4. 高風險要 2 個唔同嘅合資格批准人。
-- 驗證結果（批准人、SHA、時間）寫入 manifest 同部署報告。
+只喺 release build 有高風險 `security-items` 時要求；冇提供或者任何一步失敗，build 失敗，冇 override。以下 API 路徑已經按 docs.github.com（REST API 2026-03-10）核對。
+
+#### 1. 參照格式
+
+- `--release-approval pr:<number>`、`env:<run_id>`，或者兩者合併 `pr:<number>,env:<run_id>`。
+- 高風險要 2 個唔同嘅合資格批准人：PR review 同 environment approval 嘅批准人合併計，按 GitHub user id 去重。
+
+#### 2. 搵返 build 緊嘅 commit 屬於邊個 PR（SHA 綁定）
+
+Release build 喺 `main` 或者 `v*` tag 上跑，build 緊嘅 commit（`B = git rev-parse HEAD`）通常係 merge／squash 之後嘅 commit，唔係 PR head。所以：
+
+1. `GET /repos/{owner}/{repo}/commits/{B}/pulls`：一定要剛好一個 `merged_at` 唔係 null 嘅 PR，而且號碼同 `pr:<number>` 一樣（用咗 `pr:`）；零個或者多過一個就失敗。
+2. 由呢個 PR 攞 `head.sha`（`H`，即係 PR 最後一次 push）同 `user`（PR 作者）。
+3. Tree 相等：`GET /repos/{owner}/{repo}/commits/{B}` 同 `GET /repos/{owner}/{repo}/commits/{H}` 嘅 `commit.tree.sha` 一定要一樣。因為 branch protection 一定要開 **Require branches to be up to date before merging**，PR head 已經包含最新 base，merge commit 或者 squash commit 嘅 tree 會同 `H` 一樣；唔一樣（例如冇開呢個設定、或者 merge 時 base 已經變咗）就失敗。
+4. Rebase merge 會產生新 commit，B 唔係 H 但 tree 照樣要相等；唔相等就失敗。
+
+#### 3. PR review（`pr:`）
+
+- `GET /repos/{owner}/{repo}/pulls/{number}/reviews`，一定要用 `per_page=100` 分頁攞晒。
+- 每個 reviewer 只睇佢最後一個唔係 `COMMENTED` 嘅 review：
+  - 係 `APPROVED` 而且 `commit_id == H` 先算。
+  - 最後一個係 `DISMISSED` 或者 `CHANGES_REQUESTED`，之前嘅 approval 作廢。
+  - `commit_id` 唔係 `H`（即係批准咗舊 push）唔算。
+
+#### 4. Environment approval（`env:`）
+
+- 批准人由 `GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals` 攞（唔用 OIDC claims 判斷批准人）；只算 `state: approved` 而且 `environments` 包括 `release` 嘅紀錄。
+- `GET /repos/{owner}/{repo}/actions/runs/{run_id}`：`head_sha` 一定要等於 `B`。
+- `main`／tag 上嘅 run，PR 作者同最後 push 嘅人用第 2 步搵到嘅 merged PR 判斷。
+
+#### 5. 合資格批准人（全部成立先計）
+
+- 有 write 或以上權限：`GET /repos/{owner}/{repo}/collaborators/{username}/permission` 回 `permission` 係 `write` 或者 `admin`（maintain 會顯示做 write）。
+- 唔係 PR 作者（第 2 步嘅 `user`）。
+- 唔係最後 push 嘅人：REST API 冇直接 pusher 欄位，所以用 `GET /repos/{owner}/{repo}/commits/{H}` 嘅 `author.login` 同 `committer.login`，兩個都排除。
+- 唔係 bot：`user.type` 唔係 `Bot`，login 唔以 `[bot]` 結尾。
+- 高風險 `security-items` 涉及嘅路徑：批准人一定要係嗰啲路徑喺 `CODEOWNERS`（build 緊 commit 入面嘅版本）嘅 owner（直接列名，或者係列名 team 嘅成員）。
+
+#### 6. Token、權限同錯誤處理
+
+- 用 workflow 嘅 `GITHUB_TOKEN`，權限至少：`contents: read`、`pull-requests: read`、`actions: read`（`metadata: read` 係預設）。如果 collaborators permission endpoint 要更高權限而回 403，就失敗；可以改用只有讀權限嘅 GitHub App token。
+- 任何 API 錯誤、404、403、rate limit（429，或者 `x-ratelimit-remaining: 0`）、分頁未讀完、回應格式唔啱，一律當驗證失敗（fail closed），唔會 retry 到放寬。
+- 驗證結果（PR 號碼、`B`、`H`、tree sha、每個批准人嘅 login、id、來源同時間）寫入 manifest 同部署報告。
 - `release` environment 一定要開 **Prevent self-review**（見 [`pr-review-guide.md`](pr-review-guide.md)）。
 
 ### 2C.4 In-memory 執行器（決定 74，待產品經理確認）
@@ -1134,7 +1167,7 @@ migration 放喺 ./migrations/main/。
 - 資料庫層：每個 query 獨立 transaction、`FORCE ROW LEVEL SECURITY`、non-owner role、column grant、冇 DELETE／TRUNCATE／DDL（7.1）。
 - Runtime 限制：只載入簽咗名嘅 manifest、唔解析 md、冇 `LLM_*`、對外 call 白名單、kill switch（9A）、固定最低回應耗時、配額同限流。
 - Manifest 簽名（決定 79、89、92）：release key 只喺受保護 ref 加有 required reviewers 嘅 GitHub environment，經 OIDC 綁定 KMS 使用；CI 冇 key 就失敗，唔 fallback；production 只信 pin 死嘅 release 公鑰，dev key 永遠唔信任。
-- 高風險 fail closed（決定 90）：release build 有高風險安全項目就要有效嘅 `--release-approval`（2 個唔同、非作者、非最後 push 者、綁定同一 commit SHA 嘅 APPROVED 批准），先可以出 release manifest。
+- 高風險 fail closed（決定 90）：release build 有高風險安全項目就要有效嘅 `--release-approval`（2 個唔同嘅合資格批准人，批准喺 PR 最後 head SHA 上，build commit tree 同 PR head 一樣；見 2C.3a），先可以出 release manifest。
 - CODEOWNERS 必須（決定 29、37、93）：release build 檢查覆蓋路徑。
 - Production 一律拒絕 in-memory，冇 override（決定 91）。
 - `/latest/` 永遠唔係草稿（決定 94）。

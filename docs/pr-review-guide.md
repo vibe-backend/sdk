@@ -35,7 +35,7 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - 而家已經有：`vibe secret-scan --fail-on-find`。
 - 而家已經有：`vibe compile --check`（重編比對）同 `vibe validate`。
 - 計劃中（v1.8 實作）：`vibe build --check-determinism`，取代上面兩個。
-- 開 **Require branches to be up to date before merging**。
+- 一定要開 **Require branches to be up to date before merging**：`vibe build --release-approval` 會比較 build commit 同 PR head 嘅 tree，冇開呢個設定就可能唔一樣，release build 會失敗（spec 2C.3a）。
 
 ## 4. 高風險 label 要兩個 approval
 
@@ -57,7 +57,18 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
 
 - 開一個 `release` environment，設 **Required reviewers**，只准受保護 ref（`main`、受 ruleset 保護嘅 `v*` tag）部署。
 - `release` environment 一定要開 **Prevent self-review**，觸發部署嘅人唔可以自己批准（spec 決定 90）。
-- 高風險 release 要用 `vibe build --release-approval pr:<number>` 或者 `env:<run_id>`（計劃中）：build 會經 GitHub API／OIDC 驗證批准係 APPROVED、綁定同一 commit SHA、批准人唔係作者或者最後 push 嘅人、而且有 2 個唔同批准人。
+- 高風險 release 要用 `vibe build --release-approval pr:<number>`、`env:<run_id>` 或者 `pr:<number>,env:<run_id>`（計劃中）。Build 會經 GitHub REST API 驗證：build commit 屬於唯一一個 merged PR、批准喺 PR 最後 head SHA 上而且 tree 一樣、批准人有 write 權限、唔係作者、唔係最後 push 嘅人、唔係 bot、高風險路徑要係 CODEOWNER，同埋有 2 個唔同批准人（PR review 同 environment approval 合併計）。
+- Release workflow 嘅 token 權限：
+
+  ```yaml
+  permissions:
+    contents: read
+    pull-requests: read
+    actions: read
+    id-token: write   # 只畀 OIDC 換 KMS 用
+  ```
+
+- 任何 API 錯誤、404 或者 rate limit，release build 都會失敗（fail closed），唔好加 retry 去繞過。
 - Release manifest 簽名 key 放喺 KMS，用 GitHub OIDC 綁定 `release` environment 同 ref 先可以用；唔好將 key 放做 repository secret。
 - CI release build 攞唔到 KMS key 就失敗，唔可以 fallback 去 dev key。
 - 詳細加固步驟見 issue #28。
