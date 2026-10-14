@@ -1,8 +1,8 @@
-# 認證 pipeline：API key
+# Auth pipeline：API key
 
 ## 用途
 
-以 API key 代替用戶 JWT，認證機器對機器的呼叫方。API key 驗證屬於內建 `auth` pipeline 的一部分：pipeline op 白名單包含 `verify-api-key`（§2A.4），而 §4 定義了 API key 的規則。
+以 API key 而非用戶 JWT 認證機器對機器的呼叫者。API key 模式屬於內置 `auth` pipeline：`auth: { mode: api-key, scopes: [...] }`（§4.2、Decision 43），由 `verify-api-key` pipeline op 驗證（§2A.4）。
 
 ## 自然語言 source 範例
 
@@ -11,21 +11,21 @@
 ```text
 # partners
 Partner integration API. Only uses provider main.
-All endpoints require API key authentication.
+All endpoints require an API key with partners:read scope.
 ```
 
 `api/partners/v1/list-orders/list-orders.md`（路由 `GET /partners/v1/list-orders`）
 
 ```text
 # List partner orders
-GET. Requires an API key. At most 60 requests per minute.
-Query: page (integer, from 1) and page-size (integer).
+GET. Requires an API key with partners:read scope. At most 60 requests per minute per API key.
+Query: page (integer, from 1) and page-size (integer, 1 to 100).
 List orders with order.list and return 200 with items, page, page_size and has_more.
 ```
 
 ## 編譯後的 lock md 範例
 
-`api/partners/_definition.lock.md`（僅列 section；`kind: api`、`scope: definition`）
+`api/partners/_definition.lock.md`（僅列出 section；`kind: api`、`scope: definition`）
 
 ````markdown
 ## Providers
@@ -35,15 +35,14 @@ List orders with order.list and return 200 with items, page, page_size and has_m
 ## Pipelines
 ### p1 auth
 - mode: api-key
+- scopes: [partners:read]
 
 ## Defaults
 - timeout: 10s
 - body: 1MB
 ````
 
-> ⚠️ `mode: api-key` 是一項**假設**：規格只展示了 `mode: jwt`（§11.3）。既然有 `verify-api-key` op（§2A.4），這是順理成章的對應寫法，但確實的值並未規定。編譯器會在這裡附上 `assumption` 註記並發出 warning（§10.9）。
-
-`api/partners/v1/list-orders/list-orders.lock.md`（僅列 section；`kind: api`、`scope: feature`）
+`api/partners/v1/list-orders/list-orders.lock.md`（僅列出 section；`kind: api`、`scope: feature`）
 
 ````markdown
 ## Route
@@ -57,9 +56,11 @@ List orders with order.list and return 200 with items, page, page_size and has_m
 ## Pipelines
 ### p1 auth
 - mode: api-key
+- scopes: [partners:read]
 
 ### p2 rate-limit
 - per-minute: 60
+- key: api-key
 
 ## Limits
 - provider: main
@@ -68,13 +69,13 @@ List orders with order.list and return 200 with items, page, page_size and has_m
 
 ## Request
 | field | type | rules | required |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | query.page | integer | min: 1 | no |
 | query.page-size | integer | min: 1, max: 100 | no |
 
 ## Response
 | status | schema | headers |
-|---|---|---|
+| --- | --- | --- |
 | 200 | { items, page, page_size, has_more } | |
 
 ## Transform
@@ -97,26 +98,28 @@ List orders with order.list and return 200 with items, page, page_size and has_m
 
 ## Errors
 | status | code | from |
-|---|---|---|
+| --- | --- | --- |
 | 422 | VALIDATION_FAILED | platform |
 ````
 
 ## 安全考量
 
-- API key **只以雜湊值儲存**，必須有 **scope**，可以**撤銷**，並且**絕不寫入日誌**（§4、§9）。
-- 次序與預設拒絕規則和 JWT 相同：`auth` 最先執行（`must-run: first`），要移除它必須設定 `public: true`（§3、§4）。
-- 認證成功後，`auth` 會注入 `ctx.tenant_id` 和 `ctx.user`；業務邏輯不能修改它們（§4）。
-- 私隱刪除會撤銷被刪除對象的所有 API key（§12.10 第 5 步）。
-- 認證失敗回傳 401（附 `WWW-Authenticate`），scope／權限不足回傳 403（§8）。
+平台規則（§4.2、Decision 43）：
+
+- **傳送**：只接受 header `X-API-Key: <key>`。key 出現在 query string 或 body 會回 400，而且不寫入 log。
+- **格式**：`mbk_{env}_{key_id}_{secret}`；`env` 為 `live` 或 `test`；`key_id` 為 12 個小寫 base32 字元；`secret` 為 32 byte 隨機值的 base62。`test` key 不可在 live 環境使用。
+- **Scope**：`{definition}:{read|write|admin}` 或 `{definition}:*`；`admin` 包含 `write`，`write` 包含 `read`；不准全域 `*`。修改 API key scope 屬**高風險**安全項目（§2A.5）。
+- **儲存**：只存 `HMAC-SHA-256(pepper, secret)`（pepper 在平台 KMS）；以 `key_id` 查找，再做固定時間比對。
+- **有效期與輪換**：預設 90 日，上限 365 日；每個 client 最多 2 條有效 key；舊 key 與新 key 預設重疊 7 日（上限 30 日），之後失效。
+- **撤銷**：平台 UI／CLI `api-key revoke {key_id}`；30 秒內所有 instance 生效；以 UPDATE `revoked_at` 記錄，絕不 DELETE。
+- 會記錄 `last_used_at`；key 和 secret 永不寫入 log。
+- **Context**：`ctx.tenant_id` 來自 key 綁定的租戶；`ctx.user` 為 `{ type: api-key, key_id, scopes }`（§4.2）。
+- 按 key **限流**使用 `key: api-key`（§4.3）。
+- 私隱刪除會撤銷被刪除主體的所有 API key（§12.10 步驟 5）。
+- 缺少或無效 key → 401；scope 不足 → 403（§8）。
 
 ## 規格缺口
 
-- 用來選擇 API key 模式的 `auth` 參數值，以及 `verify-api-key` op 的參數，**均未規定**。
-- API key 的 **scope** 如何在 source／lock 中宣告、如何對應到端點，**未有規定**。
-- API key 在哪裡簽發和管理（UI／CLI／model），**未有規定**。
-- **雜湊演算法**：「只儲存雜湊值」（§4）沒有指明演算法；使用帶金鑰的快速雜湊（例如 HMAC-SHA256；高熵的 key 不需要 argon2id）是合理選擇，但**未有規定**。
-- **傳輸方式**：header 名稱，以及是否**只**接受放在 header 的 key（絕不接受 query string，因為會洩漏到日誌），均未規定。
-- **租戶來源**：API key 的 `ctx.tenant_id` 如何得出（是否在簽發時綁定？）未有規定。
-- **每個 key 的限流**：規格只展示了以 `ip` 和 `tenant` 為 key 的限流；以 API key 為 key 的限流未有規定。
-- **401 header**：§8 要求依 RFC 6750（Bearer）附上 `WWW-Authenticate`，但這個 scheme 對 API key 認證未必合適。
-- API key 呼叫方的 `ctx.user` 包含甚麼內容，**未有規定**。
+- §8 要求每個 401 都依 RFC 6750 帶 `WWW-Authenticate`（Bearer 方案），這與 API key 認證並不明顯相符；API key 模式的 challenge 值**未有規定**。
+- API key 如何簽發（除 `revoke` 外的 UI／CLI 指令名稱）**未有規定**。
+- `_definition` 與 feature 都宣告 `scopes` 時，繼承（§3）是合併還是覆蓋**未有規定**。

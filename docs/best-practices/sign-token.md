@@ -13,7 +13,7 @@ Centralize JWT issuance in a single model method flagged with `capabilities: [si
 Sign an access token for a user.
 This method is responsible for signing tokens.
 Input: sub (user id, uuid).
-Output: token (string).
+Output: token (access token) and refresh_token.
 The token is valid for 1 hour, uses ES256, and the key is JWT_SIGNING_KEY.
 ```
 
@@ -31,7 +31,7 @@ source-hash: sha256:3b90...d4
 source-type: natural
 dependencies:
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01 }
+compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
 status: approved
 approval-mode: manual
@@ -45,7 +45,7 @@ signature: MEQCIA...
 ---
 ## Signature
 - input: { sub: { type: uuid, required: true } }
-- output: { token: string }
+- output: { token: string, refresh_token: string }
 - errors: []
 - writes: false
 - capabilities: [sign-token]
@@ -63,12 +63,13 @@ signature: MEQCIA...
 - platform-claims-source: { roles: users.roles where id = sub, tenant_id: ctx.tenant_id }
 - ttl: 1h
 - ttl-cap: 1h
+- issue-refresh: platform-decided
 - out: token
 - source-lines: 1-5
 
 ### s2 respond
 - op: respond
-- value: { token: token }
+- value: { token: token.access, refresh_token: token.refresh }
 - source-lines: 4-4
 ````
 
@@ -83,11 +84,13 @@ Callers use it like this (from `user.login`):
 - source-lines: 10-10
 ````
 
+`issue-refresh` is decided by the platform from the call source: `new-family` when called from login, `rotate` when injected by the `token-refresh` pipeline, otherwise `none`; a method can never choose `rotate` itself (§4A.1).
+
 ## Security considerations
 
 - **Explicit capability**: `sign-jwt` is allowed only in a method whose `## Signature` declares `capabilities: [sign-token]`; the name is irrelevant (a method called `sign-token` without the flag is rejected) (§2A.4, §12.6). The capability must be a **model-layer** method (§10.8).
 - Write the capability as its own clear sentence ("This method is responsible for signing tokens") — the semantic-consistency check errors if the lock signs tokens and the source never mentions it (§2A.7, §10.1).
-- **Claim whitelist**: the method may pass only `sub` and platform-allowed custom claims (e.g. `sid`). `roles` and `tenant_id` are read by the platform from the DB at signing time; `iss`, `aud`, `exp`, `nbf`, `iat`, `jti` are added by the platform. Passing any of these is an error (§12.6, §10.8).
+- **Claim whitelist**: the method may pass only `sub` and platform-allowed custom claims (e.g. `sid`). `roles` is read by the platform from the DB (looking up `sub` in the current tenant). `tenant_id` has exactly one source: `ctx.tenant_id`, resolved by the platform from the slug (public) or the verified token (auth); never from the client, the method or the `users` table (Decision 62). `iss`, `aud`, `exp`, `nbf`, `iat`, `jti` are added by the platform. Passing any of these is an error (§12.6, §10.8).
 - **TTL**: access tokens are capped at 1h (§4A.1, §10.8).
 - **Algorithm/key**: JWT only, RS256 or ES256; the private key is a platform secret referenced via `key-ref`, never inline (§12.6, §9B).
 - `capabilities: [sign-token]`, the claim whitelist and token ttl are all **high-risk** security items (two non-author approvers) (§2A.5).
@@ -99,5 +102,4 @@ Callers use it like this (from `user.login`):
 - The full platform **custom-claim whitelist** is not listed (only `sid` as an example).
 - `sign-jwt` parameter `platform-claims-source` uses a pseudo-query (`users.roles where id = sub`) that is not otherwise defined.
 - **Caller restriction**: there is no way to restrict which methods/pipelines may call a `sign-token` method.
-- **`tenant_id` source contradiction**: §12.6 says `roles` and `tenant_id` are read by the platform **from the DB** (by `sub`), while the §12.8 lock uses `tenant_id: ctx.tenant_id` (spec owner should resolve).
 - Whether `respond` in a method needs a `status` is not specified (method responds omit it in the spec).

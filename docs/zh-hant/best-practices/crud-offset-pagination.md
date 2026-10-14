@@ -19,6 +19,10 @@ Fields:
 - password: password.
 - roles: array of strings.
 - last_login_at: timestamp, optional.
+- email_verified_at: email verification time, optional.
+- email_verify_hash: hash of the verification token, unique, optional.
+- email_verify_expires_at: verification token expiry, optional.
+- name and email are filled in by visitors at registration and are untrusted content.
 
 Provide get, list and update CRUD. list defaults to 20 per page, at most 100, can sort by created_at or name, and can filter by email.
 ```
@@ -46,14 +50,19 @@ Validation failure returns 422.
 | name | type | rules | system |
 |---|---|---|---|
 | id | uuid | primary, default: gen | yes |
-| email | string | format: email, unique | no |
-| name | string | max: 50 | no |
-| password | password | argon2id | no |
-| roles | string[] | | no |
+| email | string | format: email, unique, max: 254, untrusted, personal: standard | no |
+| name | string | max: 50, untrusted, personal: standard | no |
+| password | password | argon2id, nullable | no |
+| roles | string[] | default: [], max-items: 20 | no |
 | last_login_at | timestamp | nullable, public-writable | no |
+| email_verified_at | timestamp | nullable, public-writable (confirm-verification) | no |
+| email_verify_hash | bytes | nullable, unique, public-writable | no |
+| email_verify_expires_at | timestamp | nullable, public-writable | no |
+| email_verify_purpose | string | nullable, enum: [register, invite] | no |
 | created_at | timestamp | default: now | yes |
 | updated_at | timestamp | default: now | yes |
 | deleted_at | timestamp | nullable | yes |
+| erased_at | timestamp | nullable | yes |
 | tenant_id | string | platform | yes |
 
 ## CRUD
@@ -61,15 +70,15 @@ Validation failure returns 422.
 |---|---|
 | get | sensitive-output: [] |
 | list | pagination: offset, page-size: 20, max-page-size: 100, sort: [created_at, name], filter: [email] |
-| update | partial: true, optimistic-lock: updated_at |
+| update | partial: true, optimistic-lock: if-match |
 
 ## Policies
 - rls: enable, force
 - policy: tenant_id = current_setting('app.tenant_id', false)
-- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer [UPDATE(last_login_at)]
+- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer [INSERT(email, name, email_verify_hash, email_verify_expires_at, email_verify_purpose), UPDATE(email_verify_hash, email_verify_expires_at, email_verify_purpose, password, email_verified_at, last_login_at)]
 ````
 
-這與 §12.8 的 `user` lock 一致：`last_login_at` 可公開寫入（由登入端點寫入，見 [user-login.md](user-login.md)），在 model lock 上屬於高風險的 `public-writable-column` 安全項目。
+這與 v1.7 §12.8 的 `user` lock 一致。model 層的 `public_writer` 授權是所有公開端點的**聯集**（登入寫入 `last_login_at`；註冊和 verify-email 寫入驗證欄位和密碼）；每個 api 的實際授權只限其本身 lock 用到的欄位（§12.8、§12.11.6、§12.11.7）。可公開寫入的欄位屬於高風險的 `public-writable-column` 安全項目。見 [user-login.md](user-login.md) 和 [user-register.md](user-register.md)。
 
 注入的 `user.list` method 有自己的 lock，由平台產生並簽名（`id: user/crud/list`、`source-type: structured`）（§12.9）。
 
@@ -133,7 +142,7 @@ Validation failure returns 422.
 
 ## 安全考量
 
-- `page` 從 1 開始；`page-size` 不可超過 `max-page-size`，超過時回傳 **422**（§12.9）。`max-page-size` 本身也有平台上限。
+- `page` 從 1 開始；`page-size` 不可超過 `max-page-size`，超過時回傳 **422**（§12.9）。`max-page-size` 預設為 100；平台上限為 **500**：model 可設得更低，但不可更高，超過上限屬 validator 錯誤（Decision 71）。
 - 只有白名單內的欄位可用於 `sort` 和 `filter`（§12.9）。
 - `sensitive: true` 的欄位永遠不會出現在 `list` 的輸出中，也永遠不可用於 filter 或 sort（§12.9）。`password` 欄位不會出現在任何輸出中（§12.2）。
 - 已軟刪除的資料列（已設定 `deleted_at`）會自動從 `get` 和 `list` 中排除（§12.9）。
@@ -147,4 +156,3 @@ Validation failure returns 422.
 - `list` 的 `filter` 輸入的確實形式（物件還是平鋪欄位）**未有規定**。
 - §12.9 中，輸入用 `page-size`（kebab-case），輸出用 `page_size`（snake_case），命名並不一致；本頁照規格原文書寫。
 - `sort` 方向（asc／desc）的語法**未有規定**。
-- `max-page-size` 平台上限的具體數值**未有規定**。

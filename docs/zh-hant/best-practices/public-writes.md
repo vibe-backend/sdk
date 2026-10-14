@@ -2,7 +2,7 @@
 
 ## 用途
 
-在嚴格控制的條件下，允許未經認證的訪客建立或更新資料（例如提交評論）。公開端點可以呼叫 `writes: true` 的 method（Decision 4），但 §7.2 的每一條規則都是強制的（Decisions 21–26、38、39、41）。
+在嚴格控制的條件下，允許未經認證的訪客建立或更新資料（例如提交評論）。公開端點可以呼叫 `writes: true` 的 method（Decision 4），但 §7.2 的每一條規則都是強制的（Decisions 21–26、38、39、41、47、49、53）。
 
 ## 自然語言 source 範例
 
@@ -32,7 +32,7 @@ Create the review with review.submit; on success return 201 with id. If the item
 - public-writes: true
 - role: public_writer
 - writable-columns: { reviews: [item_id, rating, comment] }
-- challenge: captcha
+- challenge: { type: captcha, when: always }
 - external-calls: forbidden
 - daily-write-quota: platform-default
 - audit-log: required
@@ -105,11 +105,13 @@ Create the review with review.submit; on success return 201 with id. If the item
 - **按端點啟用**：在 `## Access` 中設定 `public-writes: true`（高風險）（§7.2）。
 - **角色與授權**：使用獨立的 `public_writer` 角色；授權由 lock 產生，只限於實際用到的資料表、**欄位**和操作（§7.2、§10.7）。
 - **操作**：只允許 `INSERT` 和 `UPDATE`，而且只限 `writable-columns`。`UPDATE` 必須有以主鍵或 RLS 限定的 `WHERE`（§7.2）。
-- **黑名單**：以下欄位永遠不可公開寫入：`role`、`roles`、`permissions`、`is_admin`、`tenant_id`、`owner`、`owner_id`、`created_by`、`approved`、`verified`、`password`（登入類端點經 `hash-password` 除外）、`deleted_at` 及所有系統欄位；物件可以再加入其他欄位（§7.2）。
+- **黑名單**：以下欄位永遠不可公開寫入：`role`、`roles`、`permissions`、`is_admin`、`tenant_id`、`owner`、`owner_id`、`created_by`、`approved`、`verified`、`password`（只有下面的註冊規則允許）、`deleted_at` 及所有系統欄位；物件可以再加入其他欄位（§7.2）。
+- **密碼寫入**（Decision 47）：公開路徑只有在三項條件同時成立時才可寫入密碼欄位：method 具備 `capabilities: [set-password]`（高風險）、寫入值是同一 method 中 `hash-password` 的輸出，以及 api lock 設有 `password-write: allow` 並在 `writable-columns` 列出密碼欄位。v1.7 的公開註冊本身絕不寫入密碼；密碼在驗證步驟設定（Decision 67，見 [user-register.md](user-register.md)）。
+- **電郵驗證寫入**（Decision 53）：`email_verified_at`（屬「verified」類黑名單欄位）只可由具備 `capabilities: [confirm-verification]` 的 method 寫入，並須在單一 UPDATE 中進行：WHERE 以 `hash-token` 輸出比對唯一的 token hash 欄位、檢查有效期和未驗證狀態，並清除 hash；api 需要 `verification-write: allow`（高風險）。
 - **注入租戶**：`tenant_id` 由 slug 得出；body 含有 `tenant_id`、`id` 或 `created_by` 時以 422 拒絕，在 `## Request` 中宣告它們亦屬錯誤（Decision 23、§10.7）。
 - **配額**：預設每個租戶每日 1,000 次公開寫入、每個 IP 每日 50 次；租戶管理員可以調低，調高至最多 10,000 次須向平台申請。配額用完時只會封鎖公開寫入（429 加 `Retry-After`）（Decision 39、Decision 21）。
 - **限流**：IP 及租戶兩種限流都是必須的；`cost: high` 的步驟只有端點上限的一半（§7.2）。
-- **防機械人**：任何含 INSERT 的公開端點都必須宣告 `challenge: captcha | pow`，缺少即屬錯誤。不含 INSERT 的公開寫入不強制要求 challenge（Decision 38）。
+- **防機械人**（Decision 49）：`challenge: { type: none | captcha | pow, when: always | after-failures, after-failures: <n> }`。含 INSERT 的公開端點必須使用 `type: captcha` 或 `pow` 配 `when: always`；登入類端點必須使用 `{ type: captcha, when: after-failures, after-failures: 3 }`；其他不含 INSERT 的公開寫入可用 `type: none`。不含 INSERT 的密碼寫入（例如 verify-email）不需要 captcha，但仍需要 IP 加租戶限流（§7.2）。
 - **審計**：公開寫入端點不可移除 `audit-log`（§10.3）。
 - **不可信內容**：公開寫入的欄位在 model 中標記為 `untrusted: true`；所有輸出（包括已認證的讀取）都按 Content-Type 進行輸出編碼；每個欄位都要有長度上限，陣列要有數量上限（Decision 24）。
 - **對外呼叫**：公開路徑上禁止對外呼叫，除非設定 `external-calls: allow`（高風險）（§7.2）。
@@ -122,4 +124,5 @@ Create the review with review.submit; on success return 201 with id. If the item
 - `daily-write-quota: platform-default` 是唯一展示過的配額語法；租戶調低後的配額會否（以及如何）出現在 lock 中，未有規定（配額在平台 UI 中設定）。
 - `untrusted` 在這裡以 `## Request` 規則出現，在 model 中則是 `untrusted: true`；model lock 的對應語法沒有展示。
 - 物件如何宣告額外的黑名單欄位，未有規定。
-- `challenge: pow` 的參數（難度）未有規定。
+- `challenge: { type: pow }` 的參數（難度）未有規定。
+- model 層的 `public_writer` 授權是所有公開端點的聯集，而每個 api 只取得自己的欄位（§12.8 註解）；平台如何為同一個 role 實現按端點的授權沒有描述。

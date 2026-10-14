@@ -2,7 +2,7 @@
 
 ## 用途
 
-讓 access token 保持短效（≤ 1 小時），同時讓用戶端維持登入狀態，方法是使用附重用偵測的**輪換式 refresh token**（Decision 6、§4A.1）。refresh 流程由平台的**內建 `token-refresh` pipeline** 實作，它透過 `method` op 呼叫帶 `capabilities: [sign-token]` 的 model method（例如 `user.sign-token`）簽發新的 access token。
+讓 access token 保持短效（≤ 1 小時），同時讓用戶端維持登入狀態，方法是使用帶重用偵測的**輪換 refresh token**（Decision 6、§4A.1）。Refresh 由內置 `token-refresh` pipeline 處理（Decision 45）；登出由內置 `token-revoke` pipeline 處理（Decision 65）。第一個 refresh token 在登入時簽發：`sign-jwt` 配 `issue-refresh: new-family`（§4A.1、F10；見 [user-login.md](user-login.md)）。
 
 ## 自然語言 source 範例
 
@@ -11,17 +11,24 @@
 ```text
 # Refresh token
 POST, path /auth/v1/{slug}/refresh.
-Public, no auth (the caller only holds a refresh token), tenant is determined by slug.
-Use the built-in token-refresh pipeline, signing new access tokens with user.sign-token.
-Each IP at most 30 requests per minute.
+This is the refresh token endpoint. Public (the caller only holds a refresh token), no auth, tenant is determined by slug.
+Sign new access tokens with user.sign-token. The refresh token is sent in the body.
 Request body: refresh_token (string, required).
-Return 200 with the new access token and new refresh token.
-An invalid, expired, revoked or reused refresh token returns 401 INVALID_CREDENTIALS.
+Return 200 with the new token and refresh_token.
+```
+
+`api/auth/v1/logout/logout.md`（路由 `POST /auth/v1/logout`）
+
+```text
+# Logout
+POST. Requires JWT. Revokes the refresh token family of the given refresh token.
+Request body: refresh_token (string, required).
+Return 204.
 ```
 
 ## 編譯後的 lock md 範例
 
-`api/auth/v1/refresh/refresh.lock.md`（僅列 section；frontmatter 依 §2A.1，`kind: api`、`scope: feature`；`dependencies` 包含 `token-refresh`（pipeline）及 `user/methods/sign-token`；安全項目為 `public` 和 `auth-removed`，屬高風險）
+`api/auth/v1/refresh/refresh.lock.md`（僅列出 section；frontmatter 依照 §2A.1，`kind: api`、`scope: feature`；安全項目 `public` 和 `auth-removed`，高風險）
 
 ````markdown
 ## Route
@@ -32,8 +39,8 @@ An invalid, expired, revoked or reused refresh token returns 401 INVALID_CREDENT
 - public: true
 - tenant: { from: path, param: slug }
 - public-writes: false
-- role: public_reader
 - external-calls: forbidden
+- min-response: 300ms
 
 ## Pipelines
 ### p1 -auth
@@ -43,8 +50,16 @@ An invalid, expired, revoked or reused refresh token returns 401 INVALID_CREDENT
 - per-minute: 30
 - key: ip
 
-### p3 token-refresh
+### p3 rate-limit
+- per-minute: 10
+- key: family
+
+### p4 token-refresh
 - sign-method: user.sign-token
+- refresh-ttl: 30d
+- idle-ttl: 7d
+- reuse-grace: 10s
+- transport: body
 
 ## Limits
 - provider: main
@@ -53,14 +68,14 @@ An invalid, expired, revoked or reused refresh token returns 401 INVALID_CREDENT
 
 ## Request
 | field | type | rules | required |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | path.slug | string | | yes |
 | body.refresh_token | string | | yes |
 
 ## Response
 | status | schema | headers |
-|---|---|---|
-| 200 | { access_token, refresh_token } | |
+| --- | --- | --- |
+| 200 | { token, refresh_token } | |
 
 ## Transform
 (none)
@@ -70,37 +85,45 @@ An invalid, expired, revoked or reused refresh token returns 401 INVALID_CREDENT
 
 ## Errors
 | status | code | from |
-|---|---|---|
+| --- | --- | --- |
 | 401 | INVALID_CREDENTIALS | token-refresh |
 | 422 | VALIDATION_FAILED | platform |
 ````
 
-> ⚠️ `token-refresh` pipeline 由平台提供，其 `## Parameters` schema **規格中沒有公開**。`sign-method`、回應欄位名稱、`public-writes: false` 以及空白的 `## Steps` 都是用作示意的**假設**。`## Errors` 中的 `INVALID_CREDENTIALS` 是本範例**自行定義的錯誤碼**（沿用登入的錯誤碼）；規格沒有為 `token-refresh` 定義任何錯誤碼。見規格缺口。
+`api/auth/v1/logout/logout.lock.md`（只列 `## Pipelines`）
+
+````markdown
+## Pipelines
+### p1 auth
+- mode: jwt
+
+### p2 token-revoke
+- scope: family
+- token-source: body
+````
+
+> ⚠️ `token-refresh` 和 `token-revoke` 的參數，以及 refresh 的分類（public、每 IP 每分鐘 30 次、每家族每分鐘 10 次、300ms），均來自規格（§4A.1、Decisions 45、65、72）。回應欄位名稱、401 錯誤碼、空的 `## Transform`／`## Steps`，以及省略 `role`，均屬**假設**：這裡的 `INVALID_CREDENTIALS` 是本範例**自行定義的錯誤碼**；規格沒有為 `token-refresh` 定義錯誤碼。
 
 ## 安全考量
 
-由平台強制執行的規則（§4A.1、Decision 6）：
+平台強制規則（§4A.1、Decisions 6、45、60、61、72）：
 
-- **Access token**：JWT，ttl ≤ **1 小時**。
-- **Refresh token**：至少 **256 位元**的不透明隨機值；資料庫只儲存其**雜湊值**。
-- **有效期**：由該家族首次簽發起計，絕對上限為 **30 日**；閒置 **7 日**即失效。
-- **每次使用都輪換**：會簽發新的 refresh token 和新的 access token，舊的 refresh token 即時失效。
-- **家族**：同一次登入產生的所有 refresh token 共用一個 `family_id`。重用已失效的 token 會**撤銷整個家族**，寫入審計紀錄並通知用戶。
-- **重試寬限**：輪換後 **10 秒**內重用同一個舊 token，會回傳同一組新 token，不視為重用。
-- **登出**會撤銷目前的家族；「登出所有裝置」會撤銷該用戶的所有家族。
-- 私隱刪除會撤銷當事人所有的 refresh token 家族（§12.10）。
-- pipeline 不能直接執行 `query` 或 `call`；只能透過 `method` 存取 model（§4）。
-- token 永遠不會寫入日誌（§9）。
-- **用戶端儲存**（一般建議，規格以外）：瀏覽器應把 refresh token 存放在 `HttpOnly`、`Secure`、`SameSite` 的 cookie 中；原生 app 則存放在作業系統的 keychain／keystore（iOS Keychain、Android Keystore）。絕不可存放在 `localStorage`／`sessionStorage`。規格只展示了 body 欄位 `refresh_token`；以 cookie 傳送未有規定。簽發只能經 `sign-token` capability 進行，並受 claim 白名單及 ttl 上限約束（§12.6），見 [sign-token.md](sign-token.md)。
+- **Access token**：JWT，ttl ≤ 1 小時。
+- **Refresh token**：不透明隨機值（≥ 256 bit）；只以 `HMAC-SHA-256(pepper, token)` 存在平台表 `_platform_refresh_tokens`（每個租戶 schema 一張，強制 RLS）；用戶 lock 不可查詢；只有平台 `refresh_store` role 可讀寫。
+- **壽命**：`refresh-ttl` 30d，由家族首次簽發起計的絕對壽命（上限 30d）；`idle-ttl` 7d（上限 7d）。
+- **每次使用都輪換**：發新的 refresh 和 access token；舊 refresh token 即時失效。
+- **家族**：重用已失效的 token 會撤銷整個家族、寫審計記錄並通知用戶。撤銷以 UPDATE `revoked_at`／`revoke_reason` 進行，絕不 DELETE。
+- **寬限期**（Decision 61，`reuse-grace` ≤ 10s）：寬限期內平台**不會**回傳先前的明文（它只有 hash）。它撤銷上一次發出的子 token（`revoke_reason: grace-reissue`），在同一家族發新的子 token，並設定 `grace_reissued_at`；以條件更新 `update ... where grace_reissued_at is null` 確保兩個並發請求只有一個成功。每個舊 token 最多重發一次；第二次使用、超過寬限期使用、或子 token 已再被輪換後使用，都當作重用並撤銷家族。`used_at` 不變，所以寬限期不會延長。
+- **Cookie 傳送**（`transport: cookie`）：一律 `HttpOnly; Secure; SameSite=Strict; Path=/{definition}/{version}/{slug}/refresh`（Decision 60）。
+- **分類**（Decision 72）：`public: true`（沒有 access token），但**不屬**公開寫入：用戶 lock 沒有寫入 step，只有平台寫自己的表，因此不計每日公開寫入配額，亦不需要 captcha；固定限流為每 IP 每分鐘 30 次、每家族每分鐘 10 次；最低回應耗時 300ms。
+- **登出**（`token-revoke`，Decision 65）：必須經 `auth`；`scope: family` 撤銷當前家族（登出），`scope: all` 撤銷該用戶所有家族（全部裝置登出）；只可撤銷呼叫者自己（`sub`）的家族；即使 token 不存在或已撤銷也回 204；cookie 傳送時會清除 cookie（`Max-Age=0`）。
+- **其他撤銷**：電郵驗證成功會撤銷所有家族（`email-verified`，Decision 67）；私隱刪除會撤銷所有家族（`erasure`，§12.10）。
+- **用戶端儲存**（一般建議，規格以外）：瀏覽器優先用 `transport: cookie`；原生 app 應把 token 存在作業系統的 keychain／keystore。絕不要把 refresh token 存在 `localStorage`／`sessionStorage`。
+- Token 永不寫入 log（§9）。簽發只經 `sign-token` capability（§12.6），見 [sign-token.md](sign-token.md)。
 
 ## 規格缺口
 
-- `token-refresh` pipeline 的**參數、回應格式及錯誤碼**均未有規定。
-- **登入時如何簽發第一個 refresh token**（以及由哪個元件建立家族）未有規定；§12.8 的 `user.login` 範例只回傳 access token。
-- refresh token **存放在哪裡**（平台儲存還是 model 資料表）未有規定；pipeline 不能 `query`，也沒有用來產生不透明隨機 token 的 op。
-- **登出／登出全部裝置的端點**：規格定義了應有的行為，但沒有規定用於撤銷的 pipeline、op 或 method。
-- refresh 端點是否算作公開寫入（它會改變 token 狀態），以及是否需要 `public-writes: true`、配額或 challenge，**未有規定**。
-- refresh 端點屬於「登入類」（500ms）還是一般公開端點（300ms）未有規定；按 §7.2 的定義（含有 `verify-password` 步驟才算登入類），應為 300ms。
-- **10 秒寬限與只存雜湊值的矛盾**：§4A.1 要求舊 token 在 10 秒內被重用時回傳*同一組*新 token，但同時規定 refresh token 只儲存雜湊值。要再次回傳同一個明文 refresh token，就必須在 10 秒內保留它（或可還原的形式），這與只存雜湊值互相矛盾（應由規格負責人解決）。
-- 以 cookie 傳送 refresh token 未有規定。
-- 當回應由 pipeline 產生時，feature lock 的 `## Steps` 應包含甚麼，未有規定。
+- `token-refresh` 的錯誤碼和回應欄位名稱**未有規定**。
+- 由 pipeline 產生回應時，feature lock 的 `## Transform`／`## Steps` 應包含甚麼**未有規定**。
+- Decision 72 說固定的 refresh 限流會「用 §4.3 的 schema 寫入 lock」，但沒有展示是以明確的 `rate-limit` step 出現（如本頁所示），還是由 `token-refresh` 隱含。
+- 寬限期內可選的用戶端指紋比對（§4A.1 第 5 點）沒有對應參數。

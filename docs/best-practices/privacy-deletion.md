@@ -62,15 +62,16 @@ subject erase --subject <id> --reason "..."
 |---|---|
 | get | sensitive-output: [] |
 | list | pagination: offset, page-size: 20, max-page-size: 100, sort: [created_at], filter: [] |
-| update | partial: true, optimistic-lock: updated_at |
+| update | partial: true, optimistic-lock: if-match |
 
 ## Policies
 - rls: enable, force
 - policy: tenant_id = current_setting('app.tenant_id', false)
 - grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT]
+- subject-key: user_id
 ````
 
-> ⚠️ The lock syntax for `personal: sensitive | standard`, `subject-key`, and the `erased_at` system field is **not shown in the spec**; it is illustrated here by analogy with the `## Fields` table of §12.8.
+`personal: standard | sensitive` in the field rules follows the v1.7 `user` and `email-outbox` locks (§12.8, §12.11.2). `subject-key` follows the grammar of Decision 65 (§12.10): `subject-key: {column}` or `subject-key: [{column}, ...]` (any match counts), where `{column}` is a `uuid` column pointing to `users.id` (the `users` table uses its own `id`) or `hash:{column}`, a `bytea` column holding `HMAC-SHA-256(pepper, normalize(email))` for rows without a `user_id` (e.g. `email_outbox.recipient_hash`). A model with personal fields but no `subject-key` is a validator error. `erased_at` is a platform system field in v1.7 (F5).
 
 ## Security considerations
 
@@ -80,6 +81,8 @@ subject erase --subject <id> --reason "..."
 - **Deadlines**: completed within 30 days of the request; platform target 24h after trigger.
 - **Audit**: trigger, confirmer, reason, reference, affected tables/columns, record count, completion time — with pseudonymized subject id only (§12.10).
 - **Backups**: shredded fields are unreadable in backups; standard fields disappear when the 35-day backup retention expires; restores replay the erasure ledger before reopening (§12.10).
+- **Email outbox** (Decision 68): `email_outbox` rows carry `recipient_hash` so even rows without `user_id` ("already have an account" notices) are found and anonymized on erasure; 30 days after `sent_at` the mail worker masks the email and nulls the token anyway (§12.11.3).
+- **Audit never stores plaintext email** (HMAC hash or mask only) (Decision 68).
 - **Logs**: personal data must never be logged; logs keep pseudonymized ids only, retained 30 days (§12.10).
 - **No rewrites**: locks may not write personal fields again on erased records (§12.10).
 - Mark sensitive fields also `sensitive: true` to keep them out of `list` output, filter and sort (§12.9).
@@ -88,8 +91,7 @@ subject erase --subject <id> --reason "..."
 
 ## Spec gaps
 
-- Lock syntax for `personal`, `subject-key` and `erased_at` is **not specified**.
-- Whether `sensitive: true` (§12.9) and `personal: sensitive` (§12.10) are the same marker or independent is **ambiguous**.
-- Whether subject records in **other** models are linked via each model's own `subject-key` declaration is implied but not stated.
-- §14 ("Later versions") still lists "formal privacy deletion flow and CLI", which conflicts with §0.4 Decision 42 and §12.10 describing it as finalized. Treat the `subject erase` CLI as possibly not yet available.
-- How erased records interact with `unique` constraints and with `get` (it is soft-deleted, so excluded) for admins is not specified.
+- Whether `sensitive: true` (§12.9, hides fields from list/filter/sort) and `personal: sensitive` (§12.10, crypto-shredding) are the same marker or independent is **ambiguous**; this page sets both.
+- The `subject-key` placement differs between examples: in the migration `## Data` section (§12.11.1), in the model `## Policies` (§12.11.2), and as a field rule (`recipient_hash` row). Which one is authoritative is not stated.
+- How erased records interact with `unique` constraints for later re-use of the same email is not specified.
+- §14 now lists only a data-subject **self-service** submission entry as future work (Decision 50); the tenant-admin `subject erase` CLI flow in §12.10 is the defined path.

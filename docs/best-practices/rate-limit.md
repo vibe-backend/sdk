@@ -36,6 +36,7 @@ At most 5 per minute per IP and at most 100 per minute per tenant.
 ## Pipelines
 ### p1 rate-limit
 - per-minute: 60
+- key: ip
 
 ## Defaults
 (none)
@@ -56,7 +57,7 @@ source: pipelines/login-guard.md
 source-hash: sha256:51bd...07
 source-type: natural
 dependencies: []
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01 }
+compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
 status: approved
 approval-mode: manual
@@ -75,32 +76,30 @@ signature: MEYCIQ...
 
 ## Order
 - must-run: before-steps
-- after: [auth]
 
 ## Steps
 ### s1 rate-limit-check
 - op: rate-limit-check
-- key: req.ip
+- key: ip
 - per-minute: params.ip-per-minute
 - source-lines: 2-2
 
 ### s2 rate-limit-check
 - op: rate-limit-check
-- key: req.body.email
+- key: input.email
 - per-minute: params.account-per-minute
 - source-lines: 2-2
 
 ### s3 audit
 - op: audit
 - event: login-attempt
-- fields: [req.ip, req.body.email]
+- fields: [req.ip]
+- hash: [req.body.email]
 - redact: [req.body.password]
 - source-lines: 4-4
 ````
 
-> ⚠️ **Privacy:** this spec example (§11.2) audits `req.body.email` in plain form. §12.10 says personal data must never be logged and only pseudonymized ids may be kept. Audit records are not explicitly the same as logs, but treat this as a conflict: prefer not auditing raw email until the spec clarifies (see Spec gaps).
->
-> ⚠️ **Key normalization:** an account key like `req.body.email` should be normalized (e.g. trimmed, lower-cased) before counting, or attackers bypass the per-account limit with case variants. The spec does not define normalization in `rate-limit-check`.
+The account key `input.email` is normalized (trim, lowercase) and then HMAC'd; the plaintext is never stored (§4.3). The audit step records only an HMAC of the email, never the plaintext (Decision 68).
 
 Feature-level IP + tenant limits (excerpt of `## Pipelines`):
 
@@ -114,6 +113,19 @@ Feature-level IP + tenant limits (excerpt of `## Pipelines`):
 - key: tenant
 ````
 
+## Parameter schema (§4.3, Decision 65)
+
+| Parameter | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `per-minute` / `per-hour` / `per-day` | positive integer | exactly one | one window per step |
+| `key` | `ip` \| `tenant` \| `user` \| `api-key` \| `family` \| `input.{field}` | yes | `user` needs `auth`; `family` only with `token-refresh`; `input.{field}` is normalized then HMAC'd |
+| `burst` | positive integer | no | defaults to the window limit, cannot exceed it |
+| `fail` | error code | no | default `RATE_LIMITED` (429 + `Retry-After`) |
+
+Counting uses a sliding window stored per `tenant_id`. `key: ip` uses the IP resolved from the platform's trusted-proxy settings, never client-supplied headers. An endpoint may have several `rate-limit` steps; exceeding any of them rejects the request.
+
+`## Order` in a pipeline lock takes exactly one `must-run:` value: `first` (only `auth` or a platform pipeline replacing it), `before-steps`, `after-steps`, `last` or `any` (§4.4).
+
 ## Security considerations
 
 - Exceeding a limit returns **429** with `Retry-After` (added by the platform) (§8).
@@ -126,9 +138,6 @@ Feature-level IP + tenant limits (excerpt of `## Pipelines`):
 
 ## Spec gaps
 
-- The built-in `rate-limit` pipeline's full parameter schema is not published; only `per-minute` and `key` (`ip`, `tenant`) appear in examples. Per-second/per-hour windows and burst settings are **not specified**.
-- The default `key` when omitted (e.g. `_version` above has only `per-minute`) is **not specified**.
-- `login-guard` declares `must-run: before-steps` while `auth` uses `must-run: first`; the full set of `## Order` values is not enumerated.
-- Platform maximums for rate limits are not specified.
-- **Privacy conflict**: §11.2 `login-guard` audits `req.body.email` (personal data, `personal: standard` per §12.10) while §12.10 forbids personal data in logs and requires pseudonymized ids in erasure audit. Whether `audit` records count as logs, and whether `audit` supports pseudonymizing a field, is **not specified**; the spec owner should resolve.
-- Normalization of `rate-limit-check` keys (case, whitespace, Unicode) is **not specified**.
+- The spec's own `_version` example (§11.3) writes `rate-limit` with only `per-minute` and no `key`, although §4.3 makes `key` required; this page adds `key: ip`.
+- Platform maximums for the window limits are **not specified** (only `login-guard`'s own `## Parameters` min/max are shown).
+- Whether `input.{field}` in a pipeline refers to the request body or to the called method's input is not spelled out (§11.2 uses `input.email` with a `req.body.email` request).
