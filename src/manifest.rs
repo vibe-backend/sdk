@@ -76,6 +76,33 @@ pub fn check_rate_params<'a>(keys: impl IntoIterator<Item = &'a str>) -> Result<
     Ok(())
 }
 
+/// Highest accepted `per-minute` value (bounds per-bucket memory).
+pub const MAX_PER_MINUTE: u32 = 10_000;
+
+/// Route-level rate rules: every limit is within [`MAX_PER_MINUTE`], and an
+/// `input.*`/`account` limit must be paired with an `ip` limit. Otherwise a
+/// client could rotate input values to dodge a per-input limit.
+pub fn check_rate_set(rates: &[RateSpec]) -> Result<(), String> {
+    for rate in rates {
+        if rate.per_minute == 0 || rate.per_minute > MAX_PER_MINUTE {
+            return Err(format!(
+                "rate-limit per-minute must be between 1 and {MAX_PER_MINUTE} (got {})",
+                rate.per_minute
+            ));
+        }
+    }
+    let input_keyed = rates
+        .iter()
+        .any(|r| r.key == "account" || r.key.starts_with("input."));
+    if input_keyed && !rates.iter().any(|r| r.key == "ip") {
+        return Err(
+            "a rate-limit keyed by input.* or account must be paired with an `ip` rate-limit on the same route"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 pub fn check_rate_key(key: &str, auth_removed: bool, auth_mode: &str) -> Result<(), String> {
     match key {
         "ip" | "tenant" | "account" => Ok(()),
@@ -547,6 +574,7 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         check_rate_key(&rate.key, auth_removed, &auth_mode)
             .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
     }
+    check_rate_set(&rates).map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
     let body_limit = find_section(&doc.sections, "Limits")
         .and_then(|s| s.get("body"))
         .map(validate::parse_bytes)
@@ -795,6 +823,16 @@ mod rate_key_tests {
             assert!(super::check_rate_params(["key", bad]).is_err(), "{bad}");
         }
         assert!(super::check_rate_params(["key", "per-minute"]).is_ok());
+        let r = |key: &str, per_minute| super::RateSpec {
+            per_minute,
+            key: key.into(),
+        };
+        assert!(super::check_rate_set(&[r("input.email", 5)]).is_err());
+        assert!(super::check_rate_set(&[r("account", 5)]).is_err());
+        assert!(super::check_rate_set(&[r("input.email", 5), r("ip", 10)]).is_ok());
+        assert!(super::check_rate_set(&[r("ip", 0)]).is_err());
+        assert!(super::check_rate_set(&[r("ip", 10_001)]).is_err());
+        assert!(super::check_rate_set(&[r("tenant", 10_000)]).is_ok());
         for bad in ["family", "req.ip", "input.", "input.a-b", "everyone"] {
             assert!(check_rate_key(bad, false, "jwt").is_err(), "{bad}");
         }

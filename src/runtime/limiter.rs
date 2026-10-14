@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 /// Buckets per `(route, key type)` shard.
 pub const SHARD_CAPACITY: usize = 10_000;
 pub const WINDOW: Duration = Duration::from_secs(60);
+/// Pinned entries examined per eviction before refusing a new key.
+const EVICT_SCAN: usize = 64;
 
 /// A map with a fixed capacity and least-recently-used eviction.
 pub struct BoundedMap<V> {
@@ -46,11 +48,25 @@ impl<V> BoundedMap<V> {
     /// Returns the entry for `key`, inserting `make()` (and evicting the least
     /// recently used entry if full). Marks the entry as most recently used.
     pub fn touch(&mut self, key: &str, make: impl FnOnce() -> V) -> &mut V {
+        self.touch_pinned(key, make, |_| true)
+            .expect("every entry is evictable")
+    }
+
+    /// Like [`touch`](Self::touch), but entries for which `evictable` is false
+    /// are never evicted. When the map is full and no evictable entry is found
+    /// within a bounded scan, a *new* key is refused (`None`); existing keys
+    /// always succeed.
+    pub fn touch_pinned(
+        &mut self,
+        key: &str,
+        make: impl FnOnce() -> V,
+        evictable: impl Fn(&V) -> bool,
+    ) -> Option<&mut V> {
         self.generation += 1;
         let generation = self.generation;
         if !self.entries.contains_key(key) {
-            while self.entries.len() >= self.capacity {
-                self.evict_one();
+            if self.entries.len() >= self.capacity && !self.evict_one(&evictable) {
+                return None;
             }
             self.entries.insert(key.to_string(), (generation, make()));
         }
@@ -64,27 +80,59 @@ impl<V> BoundedMap<V> {
         }
         let entry = self.entries.get_mut(key).expect("present");
         entry.0 = generation;
-        &mut entry.1
+        Some(&mut entry.1)
     }
 
-    fn evict_one(&mut self) {
+    /// Evicts the least recently used evictable entry. Pinned entries met on
+    /// the way are moved to the back; the scan is bounded (`EVICT_SCAN`) so a
+    /// full, pinned shard costs O(1) per request, not O(n).
+    fn evict_one(&mut self, evictable: &impl Fn(&V) -> bool) -> bool {
+        let mut pinned_seen = 0;
         while let Some((key, generation)) = self.order.pop_front() {
-            if self
-                .entries
-                .get(&key)
-                .is_some_and(|(g, _)| *g == generation)
-            {
+            let Some((g, value)) = self.entries.get(&key) else {
+                continue;
+            };
+            if *g != generation {
+                continue;
+            }
+            if evictable(value) {
                 self.entries.remove(&key);
-                return;
+                return true;
+            }
+            self.order.push_back((key, generation));
+            pinned_seen += 1;
+            if pinned_seen >= EVICT_SCAN {
+                return false;
             }
         }
+        false
     }
 }
 
 /// Sliding one-minute windows, sharded by `(route, key type)`.
 #[derive(Default)]
 pub struct RateBuckets {
-    shards: HashMap<String, BoundedMap<Vec<Instant>>>,
+    shards: HashMap<String, BoundedMap<RateWindow>>,
+}
+
+/// Hits in the current window plus the limit they are counted against.
+pub struct RateWindow {
+    limit: u32,
+    hits: Vec<Instant>,
+}
+
+impl RateWindow {
+    /// A bucket at its limit whose window is still open must not be evicted:
+    /// evicting it would reset the counter and let a client rotate junk keys
+    /// to bypass its own limit.
+    fn evictable(&self, now: Instant) -> bool {
+        let live = self
+            .hits
+            .iter()
+            .filter(|at| now.duration_since(**at) < WINDOW)
+            .count();
+        (live as u32) < self.limit
+    }
 }
 
 /// Outcome of a rate check.
@@ -106,7 +154,18 @@ impl RateBuckets {
             if map.get(key).is_none() {
                 continue;
             }
-            let hits = map.touch(key, Vec::new);
+            let window = map
+                .touch_pinned(
+                    key,
+                    || RateWindow {
+                        limit: *limit,
+                        hits: Vec::new(),
+                    },
+                    |w| w.evictable(now),
+                )
+                .expect("existing key");
+            window.limit = *limit;
+            let hits = &mut window.hits;
             hits.retain(|at| now.duration_since(*at) < WINDOW);
             if hits.len() as u32 >= *limit {
                 let wait = hits.first().map(|t| retry_after(*t, now)).unwrap_or(1);
@@ -116,12 +175,33 @@ impl RateBuckets {
         if let Some(wait) = worst {
             return RateDecision::Limited(wait);
         }
-        for (shard, key, _) in checks {
-            self.shards
+        // Make room first: a new key in a shard whose buckets are all pinned
+        // is refused (that key type only) without counting anything.
+        for (shard, key, limit) in checks {
+            let map = self
+                .shards
                 .entry(shard.clone())
-                .or_insert_with(|| BoundedMap::new(SHARD_CAPACITY))
-                .touch(key, Vec::new)
-                .push(now);
+                .or_insert_with(|| BoundedMap::new(SHARD_CAPACITY));
+            let made = map.touch_pinned(
+                key,
+                || RateWindow {
+                    limit: *limit,
+                    hits: Vec::new(),
+                },
+                |w| w.evictable(now),
+            );
+            if made.is_none() {
+                return RateDecision::Limited(WINDOW.as_secs());
+            }
+        }
+        for (shard, key, _) in checks {
+            if let Some(w) = self
+                .shards
+                .get_mut(shard)
+                .and_then(|m| m.entries.get_mut(key))
+            {
+                w.1.hits.push(now);
+            }
         }
         RateDecision::Allow
     }
@@ -282,6 +362,51 @@ mod tests {
         assert!(matches!(
             rates.check(&normal, now),
             RateDecision::Limited(_)
+        ));
+    }
+
+    #[test]
+    fn rotating_junk_keys_cannot_reset_a_limited_bucket() {
+        let mut rates = RateBuckets::default();
+        let now = Instant::now();
+        let shard = "login:input.email".to_string();
+        let victim = [(shard.clone(), "victim@x".to_string(), 3)];
+        for _ in 0..3 {
+            assert!(matches!(rates.check(&victim, now), RateDecision::Allow));
+        }
+        assert!(matches!(
+            rates.check(&victim, now),
+            RateDecision::Limited(_)
+        ));
+        for i in 0..(SHARD_CAPACITY * 2) {
+            rates.check(&[(shard.clone(), format!("junk{i}"), 3)], now);
+        }
+        assert!(
+            matches!(rates.check(&victim, now), RateDecision::Limited(_)),
+            "the at-limit bucket must survive eviction"
+        );
+        // After the window it is free again.
+        assert!(matches!(
+            rates.check(&victim, now + WINDOW + Duration::from_secs(1)),
+            RateDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn full_pinned_shard_refuses_only_new_keys_in_that_shard() {
+        let mut rates = RateBuckets::default();
+        let now = Instant::now();
+        let shard = "login:input.email".to_string();
+        for i in 0..SHARD_CAPACITY {
+            rates.check(&[(shard.clone(), format!("k{i}"), 1)], now);
+        }
+        assert!(matches!(
+            rates.check(&[(shard.clone(), "new".into(), 1)], now),
+            RateDecision::Limited(_)
+        ));
+        assert!(matches!(
+            rates.check(&[("login:ip".into(), "1.2.3.4".into(), 10)], now),
+            RateDecision::Allow
         ));
     }
 

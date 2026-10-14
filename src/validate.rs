@@ -471,6 +471,37 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
             .find_map(|block| block.bullets.iter().find(|b| b.key == "mode"))
             .map(|b| b.value.clone())
             .unwrap_or_else(|| "jwt".into());
+        let mut declared_rates = Vec::new();
+        for block in &pipes.blocks {
+            if pipeline_name(&block.heading) == "rate-limit" {
+                let get = |k: &str| block.bullets.iter().find(|b| b.key == k);
+                declared_rates.push(crate::manifest::RateSpec {
+                    per_minute: get("per-minute")
+                        .and_then(|b| b.value.parse().ok())
+                        .unwrap_or(60),
+                    key: get("key")
+                        .map(|b| b.value.clone())
+                        .unwrap_or_else(|| "ip".into()),
+                });
+            }
+            for (name, key) in [
+                ("ip-per-minute", "ip"),
+                ("account-per-minute", "account"),
+                ("tenant-per-minute", "tenant"),
+            ] {
+                if let Some(v) = block.bullets.iter().find(|b| b.key == name) {
+                    if let Ok(per_minute) = v.value.parse() {
+                        declared_rates.push(crate::manifest::RateSpec {
+                            per_minute,
+                            key: key.into(),
+                        });
+                    }
+                }
+            }
+        }
+        if let Err(err) = crate::manifest::check_rate_set(&declared_rates) {
+            report.push(Diag::error(file, err).at_section("Pipelines"));
+        }
         for block in &pipes.blocks {
             if pipeline_name(&block.heading) == "rate-limit" {
                 if let Err(err) =
