@@ -96,7 +96,6 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
     validate_project(&ValidateOptions {
         root: &root,
         deploy: false,
-        verify_key: None,
     })
     .unwrap_or_else(|err| panic!("{err}"));
 }

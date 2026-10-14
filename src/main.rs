@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use vibe::approve::{approve_project, ApproveOptions};
 use vibe::compile::{compile_project, CompileOptions};
 use vibe::discover;
 use vibe::llm::{self, HttpAdapter, LlmAdapter};
@@ -36,25 +35,11 @@ enum Command {
     Validate {
         #[arg(long, default_value = ".")]
         project: PathBuf,
-        /// Also require approval and a valid signature.
+        /// Also apply deploy-only checks (e.g. no locks compiled against a private LLM endpoint).
         #[arg(long)]
         deploy: bool,
     },
-    /// Record local approval and sign locks.
-    ///
-    /// Production approval is a platform review. This command is the local stand-in.
-    Approve {
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// Repeatable. High-risk locks (public endpoints, providers, and migrations) need two reviewers: `--reviewer a --reviewer b`.
-        #[arg(long = "reviewer")]
-        reviewers: Vec<String>,
-        #[arg(long)]
-        reason: String,
-        #[arg(long, default_value = "local")]
-        approval_ref: String,
-    },
-    /// Build a signed manifest from approved locks.
+    /// Build a signed manifest from validated locks.
     Manifest {
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -152,12 +137,6 @@ async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Compile { project, check } => cmd_compile(&project, check).await,
         Command::Validate { project, deploy } => cmd_validate(&project, deploy),
-        Command::Approve {
-            project,
-            reviewers,
-            reason,
-            approval_ref,
-        } => cmd_approve(&project, &reviewers, &reason, &approval_ref),
         Command::Manifest { project, output } => cmd_manifest(&project, &output),
         Command::Serve {
             manifest,
@@ -267,76 +246,13 @@ async fn cmd_compile(project: &Path, check: bool) -> Result<(), String> {
 }
 
 fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
-    // A missing key is one more finding, not a reason to stop before
-    // reporting everything else.
-    let mut key_problem = None;
-    let key = if deploy {
-        match sign::load_public(project) {
-            Ok(key) => Some(key),
-            Err(err) => {
-                key_problem = Some(vibe::Diag::error(
-                    ".vibe/signing.pub",
-                    format!("cannot load the signing key: {err}"),
-                ));
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let result = validate_project(&ValidateOptions {
+    let report = validate_project(&ValidateOptions {
         root: project,
         deploy,
-        verify_key: key.as_ref(),
-    });
-    let report = match (result, key_problem) {
-        (Ok(report), None) => report,
-        (Ok(mut report) | Err(mut report), Some(problem)) => {
-            report.diags.insert(0, problem);
-            return Err(report.to_string());
-        }
-        (Err(report), None) => return Err(report.to_string()),
-    };
-    print_report(&report);
-    if deploy {
-        println!("validation ok");
-    } else {
-        println!("validation ok; approval and signatures are checked only with --deploy");
-    }
-    Ok(())
-}
-
-fn cmd_approve(
-    project: &Path,
-    reviewers: &[String],
-    reason: &str,
-    approval_ref: &str,
-) -> Result<(), String> {
-    let key = sign::load_or_create(project).map_err(|err| err.to_string())?;
-    let commit = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "local".into());
-    let now = chrono::Utc::now().to_rfc3339();
-    let report = approve_project(&ApproveOptions {
-        root: project,
-        reviewers,
-        reason,
-        approval_ref,
-        commit: &commit,
-        now: &now,
-        signing_key: &key,
     })
     .map_err(|err| err.to_string())?;
     print_report(&report);
-    println!(
-        "approved locks with {}",
-        hex::encode(key.verifying_key().to_bytes())
-    );
+    println!("validation ok");
     Ok(())
 }
 

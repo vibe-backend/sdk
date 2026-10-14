@@ -8,7 +8,6 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tower::ServiceExt;
-use vibe::approve::{approve_project, ApproveOptions};
 use vibe::compile::{compile_project, CompileOptions};
 use vibe::manifest::manifest_from_project;
 use vibe::runtime::{hash_api_secret, router, AppState, AuthConfig, MemoryExec, Slug, StoredKey};
@@ -48,17 +47,6 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     .unwrap_or_else(|err| panic!("{err}"));
 
     let key = sign::load_or_create(&root).unwrap();
-    approve_project(&ApproveOptions {
-        root: &root,
-        reviewers: &["ada@example.com".into(), "grace@example.com".into()],
-        reason: "sample shop locks",
-        approval_ref: "local",
-        commit: "local",
-        now: "2026-10-14T00:00:00Z",
-        signing_key: &key,
-    })
-    .unwrap_or_else(|err| panic!("{err}"));
-
     let manifest = manifest_from_project(&root, &key).unwrap_or_else(|err| panic!("{err}"));
     assert!(manifest.routes.iter().any(|route| route.public));
     assert!(manifest
@@ -489,84 +477,44 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
 }
 
 #[tokio::test]
-async fn approve_with_one_reviewer_writes_nothing() {
-    let root = copy_shop();
-    compile_project(&CompileOptions {
-        root: &root,
-        llm: None,
-        llm_config: None,
-        check: false,
-    })
-    .await
-    .unwrap_or_else(|err| panic!("{err}"));
-    let before = lock_snapshot(&root);
-    let key = sign::generate_key();
-    let err = approve_project(&ApproveOptions {
-        root: &root,
-        reviewers: &["jack".into()],
-        reason: "local test",
-        approval_ref: "local",
-        commit: "local",
-        now: "2026-10-14T00:00:00Z",
-        signing_key: &key,
-    })
-    .unwrap_err();
-    let text = err.to_string();
+async fn legacy_approval_fields_are_ignored_with_a_warning() {
+    // v1.8: locks carry no approval metadata or signature. Older locks that
+    // still have them validate (with warnings) and build a manifest.
+    let root = compiled_shop().await;
+    let lock = root.join("api/catalog/v1/get-product/get-product.lock.md");
+    let text = fs::read_to_string(&lock).unwrap();
+    let front = text.split("\n---\n").next().unwrap();
     assert!(
-        text.contains("high-risk lock") && text.contains("needs 2 reviewers"),
-        "{text}"
+        !front.contains("status:") && !front.contains("signature:"),
+        "{front}"
     );
-    assert!(text.contains("pass --reviewer twice"), "{text}");
-    assert!(
-        text.contains("public endpoint") || text.contains("provider") || text.contains("migration"),
-        "{text}"
+    let legacy = text.replacen(
+        "security-items:",
+        "status: approved\napproval-mode: manual\napproved-by: [a@x, b@x]\napproved-at: 2026-10-14T00:00:00Z\napproval-ref: local\napproved-commit: local\nsecurity-items:",
+        1,
     );
-    assert_eq!(before, lock_snapshot(&root));
-
-    let validate_err = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+    let legacy = legacy.replacen("reason: \"\" }", "reason: \"\", approved-by: [a@x] }", 1);
+    let legacy = legacy.replacen("\n---\n", "\nsignature: abc123\n---\n", 1);
+    fs::write(&lock, &legacy).unwrap();
+    let report = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
         root: &root,
         deploy: true,
-        verify_key: Some(&key.verifying_key()),
     })
-    .unwrap_err();
-    let validate_text = validate_err.to_string();
-    assert!(
-        validate_text.contains("lock is not approved"),
-        "{validate_text}"
-    );
-    assert!(
-        !validate_text.contains("missing a signature"),
-        "{validate_text}"
-    );
-}
-
-fn lock_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
-    let mut files = Vec::new();
-    collect_locks(root, root, &mut files);
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    files
-}
-
-fn collect_locks(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_locks(&path, root, out);
-            continue;
-        }
-        if path.extension().and_then(|ext| ext.to_str()) == Some("md")
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".lock.md"))
-        {
-            let rel = path.strip_prefix(root).unwrap().display().to_string();
-            out.push((rel, fs::read(&path).unwrap()));
-        }
+    .unwrap_or_else(|err| panic!("{err}"));
+    let text = report.to_string();
+    for field in [
+        "status",
+        "approved-by",
+        "signature",
+        "security-items approved-by",
+    ] {
+        assert!(
+            text.contains(&format!("`{field}` is no longer used")),
+            "{field}: {text}"
+        );
     }
+    let key = sign::generate_key();
+    manifest_from_project(&root, &key).unwrap_or_else(|err| panic!("{err}"));
 }
 
 fn copy_shop() -> PathBuf {
@@ -715,7 +663,6 @@ async fn owner_key_id_is_rejected_outside_users() {
     let report = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
         root: &root,
         deploy: false,
-        verify_key: None,
     });
     let rendered = match report {
         Ok(report) => report.to_string(),
@@ -742,16 +689,6 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
     .await
     .unwrap_or_else(|err| panic!("{err}"));
     let key = sign::load_or_create(&root).unwrap();
-    approve_project(&ApproveOptions {
-        root: &root,
-        reviewers: &["ada@example.com".into(), "grace@example.com".into()],
-        reason: "ownership test",
-        approval_ref: "local",
-        commit: "local",
-        now: "2026-10-14T00:00:00Z",
-        signing_key: &key,
-    })
-    .unwrap_or_else(|err| panic!("{err}"));
     let manifest = manifest_from_project(&root, &key).unwrap_or_else(|err| panic!("{err}"));
     let cart_model = manifest
         .models
@@ -826,7 +763,6 @@ fn validate_text(root: &Path) -> String {
     match vibe::validate::validate_project(&vibe::validate::ValidateOptions {
         root,
         deploy: false,
-        verify_key: None,
     }) {
         Ok(r) | Err(r) => r.to_string(),
     }
@@ -892,17 +828,6 @@ async fn validator_reports_every_broken_file_at_once() {
 #[tokio::test]
 async fn manifest_output_is_relative_to_the_current_directory() {
     let root = compiled_shop().await;
-    let key = sign::load_or_create(&root).unwrap();
-    approve_project(&ApproveOptions {
-        root: &root,
-        reviewers: &["ada@example.com".into(), "grace@example.com".into()],
-        reason: "cli path test",
-        approval_ref: "local",
-        commit: "local",
-        now: "2026-10-14T00:00:00Z",
-        signing_key: &key,
-    })
-    .unwrap_or_else(|err| panic!("{err}"));
     let cwd = std::env::temp_dir().join(format!("vibe-cwd-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&cwd).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_vibe"))

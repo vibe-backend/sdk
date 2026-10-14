@@ -7,6 +7,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Breaking
 
+- **Lock approval removed (spec v1.8):** `vibe approve` is gone, and locks no longer carry `status`, `approval-mode`, `approved-by`, `approved-at`, `approval-ref`, `approved-commit` or `signature`, nor a per-item `approved-by` under `security-items`. Older locks that still have these fields validate with a warning and the fields are ignored; recompile to drop them. `vibe validate` no longer takes a verify key. Review moves to pull requests. Manifest signing is unchanged.
 - **Ownership (#53):** The implicit admin ownership bypass is removed. Models that need admin-wide access must declare `ownership: role(admin)`. `owner-key: id` is only allowed on user-like models.
 - **Environment / slugs / pepper (#52):** Unknown `VIBE_ENV` values are treated as production. With PostgreSQL, unset `VIBE_ENV` is production. `--memory` is refused outside development. Outside development, `VIBE_API_KEY_PEPPER` is required (≥ 32 bytes). Missing, empty, or malformed `.vibe/slugs.json` fails closed (only `--memory` falls back to `slugs.example.json`).
 - **Manifest path (#62):** `vibe manifest` without `-o` writes `./manifest.json` in the current working directory, not `<project>/manifest.json`.

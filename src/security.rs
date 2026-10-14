@@ -345,7 +345,6 @@ fn push(items: &mut Vec<SecurityItem>, item: &str, risk: Risk) {
         item: item.into(),
         risk,
         reason: String::new(),
-        approved_by: Vec::new(),
     });
 }
 

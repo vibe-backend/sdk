@@ -10,11 +10,10 @@ use crate::discover::{self, SourceFile};
 use crate::hashutil::source_hash;
 use crate::lock::{
     compiler_hash, find_section, parse_lock, section_order, Kind, LockDoc, Scope, Section,
-    SourceType, Status, LOCK_VERSION,
+    SourceType, LOCK_VERSION,
 };
 use crate::scan;
 use crate::security::{self, pipeline_name};
-use crate::sign;
 
 static FORBIDDEN_SQL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(delete|truncate|grant|revoke)\b").expect("regex"));
@@ -26,7 +25,6 @@ static PARAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$([1-9][0-9]*)").
 pub struct ValidateOptions<'a> {
     pub root: &'a Path,
     pub deploy: bool,
-    pub verify_key: Option<&'a ed25519_dalek::VerifyingKey>,
 }
 
 pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
@@ -68,9 +66,6 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
     check_migrations(&docs, &mut report);
     check_feature_method_writes(&docs, &mut report);
     check_security_items_enriched(&docs, &source_by_id, opts, &mut report);
-    if opts.deploy {
-        check_approval_set(&docs, &source_by_id, opts, &mut report);
-    }
     report.into_result()
 }
 
@@ -149,7 +144,6 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
                 item: "prompt-injection".into(),
                 risk: crate::lock::Risk::Medium,
                 reason: String::new(),
-                approved_by: Vec::new(),
             });
         }
         if !security::same_items(&expected, &doc.meta.security_items) {
@@ -160,17 +154,11 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
         }
     }
     check_sections(doc, &file, report);
-    if doc.meta.status == Status::Approved {
-        if doc.meta.signature == "(none)" {
-            if opts.deploy {
-                report.push(Diag::error(&file, "approved lock is missing a signature"));
-            }
-        } else if let Some(key) = opts.verify_key {
-            let text = fs::read_to_string(opts.root.join(&file)).unwrap_or_default();
-            if !sign::verify_lock(&text, key) {
-                report.push(Diag::error(&file, "signature verification failed"));
-            }
-        }
+    for field in &doc.meta.legacy_fields {
+        report.push(Diag::warning(
+            &file,
+            format!("`{field}` is no longer used (v1.8 has no lock approval or lock signature) and is ignored; recompile to drop it"),
+        ));
     }
 }
 
@@ -878,63 +866,6 @@ fn check_migrations(docs: &HashMap<String, LockDoc>, report: &mut Report) {
     }
 }
 
-fn check_approval_set(
-    docs: &HashMap<String, LockDoc>,
-    sources: &HashMap<String, SourceFile>,
-    opts: &ValidateOptions<'_>,
-    report: &mut Report,
-) {
-    for doc in docs.values() {
-        let file = lock_rel(&doc.meta.source);
-        if doc.meta.status != Status::Approved {
-            report.push(Diag::error(&file, "lock is not approved"));
-            continue;
-        }
-        if doc.meta.approved_by.is_empty()
-            || doc.meta.approved_at == "(none)"
-            || doc.meta.approved_commit == "(none)"
-        {
-            report.push(Diag::error(&file, "approval metadata is incomplete"));
-        }
-        let auto_ok =
-            doc.meta.source_type == SourceType::Structured && doc.meta.security_items.is_empty();
-        if doc.meta.approval_mode == crate::lock::ApprovalMode::Auto && !auto_ok {
-            report.push(Diag::error(
-                &file,
-                "automatic approval is only for structured locks with no security items",
-            ));
-        }
-        for item in &doc.meta.security_items {
-            if item.reason.trim().is_empty() {
-                report.push(Diag::error(
-                    &file,
-                    format!("security item {} needs a reason", item.item),
-                ));
-            }
-            let needed = if item.risk == crate::lock::Risk::High {
-                2
-            } else {
-                1
-            };
-            if item.approved_by.len() < needed {
-                report.push(Diag::error(
-                    &file,
-                    format!("security item {} needs {needed} approvers", item.item),
-                ));
-            }
-        }
-        if let Some(source) = sources.get(&doc.meta.id) {
-            let _ = source;
-        }
-        if opts.verify_key.is_none() {
-            report.push(Diag::error(
-                &file,
-                "deploy validation needs the manifest public key",
-            ));
-        }
-    }
-}
-
 fn check_orphans(root: &Path, sources: &[SourceFile], report: &mut Report) {
     let expected: HashSet<String> = sources.iter().map(|source| lock_rel(&source.rel)).collect();
     for dir in ["providers", "pipelines", "migrations", "models", "api"] {
@@ -1260,7 +1191,6 @@ fn check_security_items_enriched(
                 item: "prompt-injection".into(),
                 risk: crate::lock::Risk::Medium,
                 reason: String::new(),
-                approved_by: Vec::new(),
             });
         }
         expected.sort_by(|a, b| a.item.cmp(&b.item));

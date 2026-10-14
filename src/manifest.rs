@@ -241,12 +241,7 @@ pub struct MigrationSpec {
 }
 
 pub fn manifest_from_project(root: &Path, signing_key: &SigningKey) -> Result<Manifest, Report> {
-    let verify = signing_key.verifying_key();
-    validate::validate_project(&ValidateOptions {
-        root,
-        deploy: true,
-        verify_key: Some(&verify),
-    })?;
+    validate::validate_project(&ValidateOptions { root, deploy: true })?;
     let docs = load_docs(root)?;
     let mut manifest = build_manifest(&docs)?;
     manifest.signature = String::new();

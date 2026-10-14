@@ -1,25 +1,5 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
-pub fn sign_lock(text_with_none: &str, key: &SigningKey) -> String {
-    let signature = hex::encode(key.sign(text_with_none.as_bytes()).to_bytes());
-    text_with_none.replacen("signature: (none)", &format!("signature: {signature}"), 1)
-}
-
-pub fn verify_lock(text: &str, key: &VerifyingKey) -> bool {
-    let Some(signature) = text
-        .lines()
-        .find(|line| line.starts_with("signature: "))
-        .map(|line| line.trim_start_matches("signature: ").trim())
-    else {
-        return false;
-    };
-    if signature == "(none)" || signature.is_empty() {
-        return false;
-    }
-    let payload = text.replacen(&format!("signature: {signature}"), "signature: (none)", 1);
-    verify_bytes(payload.as_bytes(), signature, key)
-}
-
 pub fn sign_bytes(bytes: &[u8], key: &SigningKey) -> String {
     hex::encode(key.sign(bytes).to_bytes())
 }

@@ -1,18 +1,10 @@
 # Sample shop
 
-Structured markdown for a small catalog and cart. `vibe compile` turns these files into lock files without calling an LLM. Approve the locks, build a manifest, then serve it.
+Structured markdown for a small catalog and cart. `vibe compile` turns these files into lock files without calling an LLM. Validate them, build a manifest, then serve it.
 
 Public catalog reads use `/{slug}` and no auth. Staff product writes use a JWT with the `staff` role. Cart routes accept any valid JWT. Product import and export use API keys scoped to `catalog`.
 
-High-risk locks (public endpoints, the provider, and the migration) need two reviewers:
-
-```bash
-vibe approve --project examples/shop \
-  --reviewer ada@example.com --reviewer grace@example.com \
-  --reason "sample shop locks"
-```
-
-`--reviewer` is repeatable. One reviewer leaves every lock pending.
+Review lock changes in a pull request; `vibe` does not record approvals in locks.
 
 Public routes resolve `{slug}` from `.vibe/slugs.json`. This example ships [slugs.example.json](slugs.example.json) with slug `acme` and tenant `acme0001`. `vibe serve` uses that file when `.vibe/slugs.json` is absent, and prints a warning. Register another slug with:
 

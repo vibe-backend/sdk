@@ -115,7 +115,6 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                 item: "prompt-injection".into(),
                 risk: crate::lock::Risk::Medium,
                 reason: String::new(),
-                approved_by: Vec::new(),
             });
         }
         ordered.push(source.id.clone());
@@ -147,7 +146,6 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                 item: "prompt-injection".into(),
                 risk: crate::lock::Risk::Medium,
                 reason: String::new(),
-                approved_by: Vec::new(),
             });
         }
         items.sort_by(|a, b| a.item.cmp(&b.item));
