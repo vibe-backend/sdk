@@ -1,0 +1,207 @@
+//! Allowlist check for lock SQL run by `query` steps, using a real
+//! PostgreSQL parser: one SELECT/INSERT/UPDATE/DELETE, unqualified plain
+//! table names, no table functions, no data-modifying WITH and only
+//! allowlisted functions (so no session/role/setting changes and no
+//! dynamic SQL).
+
+use std::ops::ControlFlow;
+
+use sqlparser::ast::{Expr, ObjectName, Query, SetExpr, Statement, TableFactor, Visit, Visitor};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
+
+/// Functions lock SQL may call. Anything else is rejected.
+pub const ALLOWED_FUNCTIONS: &[&str] = &[
+    "abs",
+    "array_agg",
+    "array_length",
+    "avg",
+    "btrim",
+    "cardinality",
+    "ceil",
+    "char_length",
+    "coalesce",
+    "count",
+    "date_trunc",
+    "floor",
+    "gen_random_uuid",
+    "greatest",
+    "json_agg",
+    "json_build_object",
+    "jsonb_agg",
+    "jsonb_build_object",
+    "least",
+    "length",
+    "lower",
+    "max",
+    "min",
+    "now",
+    "nullif",
+    "round",
+    "sum",
+    "to_json",
+    "to_jsonb",
+    "trim",
+    "upper",
+];
+
+fn plain_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn table_problem(name: &ObjectName) -> Option<String> {
+    if name.0.len() != 1 {
+        return Some(format!("table {name} must not be schema-qualified"));
+    }
+    let ident = &name.0[0];
+    let value = ident.value.to_ascii_lowercase();
+    if !(plain_name(&value) && (ident.quote_style.is_none() || plain_name(&ident.value))) {
+        return Some(format!("table {name} must be a plain lowercase name"));
+    }
+    if value.starts_with("_platform") || value.starts_with("pg_") || value == "information_schema" {
+        return Some(format!("table {name} is not allowed"));
+    }
+    None
+}
+
+struct Guard(Option<String>);
+
+impl Guard {
+    fn fail(&mut self, problem: String) -> ControlFlow<()> {
+        self.0 = Some(problem);
+        ControlFlow::Break(())
+    }
+}
+
+impl Visitor for Guard {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                if !matches!(
+                    *cte.query.body,
+                    SetExpr::Select(_)
+                        | SetExpr::Values(_)
+                        | SetExpr::SetOperation { .. }
+                        | SetExpr::Query(_)
+                ) {
+                    return self.fail("data-modifying WITH queries are not allowed".into());
+                }
+            }
+        }
+        if matches!(*query.body, SetExpr::Insert(_) | SetExpr::Update(_)) && query.with.is_some() {
+            return self.fail("data-modifying WITH queries are not allowed".into());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+        match factor {
+            TableFactor::Table { name, args, .. } => {
+                if args.is_some() {
+                    return self.fail(format!("table function {name} is not allowed"));
+                }
+                match table_problem(name) {
+                    Some(problem) => self.fail(problem),
+                    None => ControlFlow::Continue(()),
+                }
+            }
+            TableFactor::Derived { .. } | TableFactor::NestedJoin { .. } => {
+                ControlFlow::Continue(())
+            }
+            _ => self.fail("only plain tables and subqueries may appear in FROM".into()),
+        }
+    }
+
+    fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<()> {
+        match table_problem(name) {
+            Some(problem) => self.fail(problem),
+            None => ControlFlow::Continue(()),
+        }
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if let Expr::Function(func) = expr {
+            let ok = func.name.0.len() == 1 && {
+                let ident = &func.name.0[0];
+                ident.quote_style.is_none()
+                    && ALLOWED_FUNCTIONS.contains(&ident.value.to_ascii_lowercase().as_str())
+            };
+            if !ok {
+                return self.fail(format!("function {} is not allowed in lock SQL", func.name));
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Why `sql` may not run as a `query` step, or None when it may.
+pub fn query_problem(sql: &str) -> Option<String> {
+    let statements = match Parser::parse_sql(&PostgreSqlDialect {}, sql) {
+        Ok(s) => s,
+        Err(err) => return Some(format!("SQL does not parse: {err}")),
+    };
+    let [statement] = statements.as_slice() else {
+        return Some("exactly one SQL statement is allowed".into());
+    };
+    if !matches!(
+        statement,
+        Statement::Query(_)
+            | Statement::Insert(_)
+            | Statement::Update { .. }
+            | Statement::Delete(_)
+    ) {
+        return Some("only SELECT, INSERT, UPDATE and DELETE are allowed".into());
+    }
+    let mut guard = Guard(None);
+    let _ = statement.visit(&mut guard);
+    guard.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::query_problem;
+
+    #[test]
+    fn ordinary_lock_sql_passes() {
+        for sql in [
+            "select id, email from users where email = $1",
+            "insert into users (email, updated_at) values ($1, now()) returning id",
+            "update users set name = $2 where id = $1::uuid",
+            "delete from sessions where user_id = $1",
+            "with x as (select id from users) select count(*) from x",
+            "select u.id from users u join orders o on o.user_id = u.id where o.id = $1",
+        ] {
+            assert_eq!(query_problem(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn session_role_setting_and_dynamic_sql_are_rejected() {
+        for sql in [
+            "select set_config('role', 'none', true)",
+            "select set_config('app.tenant_id', 'b', true), query_to_xml('select 1', true, false, '')",
+            "select email from users where set_config('app.tenant_id','b',true) is not null",
+            "select current_setting('app.tenant_id')",
+            "select * from query_to_xml('select 1', true, false, '')",
+            "select pg_catalog.lower('x')",
+            "set role vibe_app",
+            "set session authorization vibe_app",
+            "reset role",
+            "select 1; select 2",
+            "select email from t_b.users",
+            "select * from pg_catalog.pg_roles",
+            "select * from _platform_refresh_tokens",
+            "select * from U&\"\\005fplatform_refresh_tokens\"",
+            "with d as (update users set name = 'x' returning id) select * from d",
+            "with d as (delete from users returning id) select * from d",
+            "do $$ begin end $$",
+            "copy users to stdout",
+        ] {
+            assert!(query_problem(sql).is_some(), "accepted: {sql}");
+        }
+    }
+}
