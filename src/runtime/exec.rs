@@ -26,9 +26,15 @@ pub trait QueryExec: Send + Sync {
     /// schema under row level security. Params are sent as text and parsed
     /// by PostgreSQL for whatever type the statement needs. Only PostgreSQL
     /// implements this.
+    ///
+    /// `role` is `public_reader` or `public_writer` (spec §12.8): the statement
+    /// runs under `SET LOCAL ROLE`, and in a READ ONLY transaction unless
+    /// `writes`.
     async fn raw(
         &self,
         _tenant_id: &str,
+        _role: &str,
+        _writes: bool,
         _sql: &str,
         _params: Vec<Option<String>>,
     ) -> Result<Vec<Row>, ExecError> {
@@ -68,6 +74,32 @@ pub trait QueryExec: Send + Sync {
         tenant_id: &str,
         token_hash: &str,
     ) -> Result<Option<String>, ExecError>;
+
+    /// Platform lookup for `sign-jwt`: `users.roles` of the user whose `id`
+    /// is `user_id`; `None` when there is no such user.
+    async fn user_roles(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, ExecError>;
+}
+
+/// Database roles a `query` step may run as.
+pub const QUERY_ROLES: [&str; 2] = ["public_reader", "public_writer"];
+
+fn roles_from(value: Option<&Value>) -> Result<Vec<String>, ExecError> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| ExecError::Message("users.roles must be text[]".into()))
+            })
+            .collect(),
+        Some(_) => Err(ExecError::Message("users.roles must be text[]".into())),
+    }
 }
 
 /// A query parameter sent in text format so PostgreSQL infers its type.
@@ -132,10 +164,35 @@ impl MemoryExec {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Adds a row to a tenant table directly (dev data and tests).
+    pub fn seed(&self, tenant_id: &str, table: &str, row: Row) {
+        if let Ok(mut tables) = self.tables.lock() {
+            tables.entry(key(tenant_id, table)).or_default().push(row);
+        }
+    }
 }
 
 #[async_trait]
 impl QueryExec for MemoryExec {
+    async fn user_roles(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, ExecError> {
+        let tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        let Some(row) = tables.get(&key(tenant_id, "users")).and_then(|rows| {
+            rows.iter()
+                .find(|r| r.get("id").and_then(Value::as_str) == Some(user_id))
+        }) else {
+            return Ok(None);
+        };
+        roles_from(row.get("roles")).map(Some)
+    }
+
     async fn refresh_family(
         &self,
         tenant_id: &str,
@@ -473,8 +530,10 @@ impl QueryExec for PgExec {
         token_hash: &str,
     ) -> Result<Option<String>, ExecError> {
         let rows = self
-            .raw(
+            .run_tx(
                 tenant_id,
+                None,
+                false,
                 "SELECT family_id::text AS family_id FROM _platform_refresh_tokens WHERE token_hash = $1",
                 vec![Some(token_hash.to_string())],
             )
@@ -494,8 +553,10 @@ impl QueryExec for PgExec {
     ) -> Result<String, ExecError> {
         let family = uuid::Uuid::new_v4().to_string();
         let id = uuid::Uuid::new_v4().to_string();
-        self.raw(
+        self.run_tx(
             tenant_id,
+            None,
+            true,
             "INSERT INTO _platform_refresh_tokens (id, tenant_id, family_id, user_id, token_hash, created_at, family_expires_at, idle_expires_at) \
              VALUES ($1::text::uuid, $2, $3::text::uuid, $4, $5, now(), now() + make_interval(secs => $6::double precision), now() + make_interval(secs => $7::double precision))",
             vec![
@@ -537,7 +598,7 @@ impl QueryExec for PgExec {
                 "SELECT id::text, family_id::text, user_id, revoke_reason, revoked_at IS NOT NULL, \
                  (now() >= family_expires_at OR now() >= idle_expires_at), \
                  used_at IS NOT NULL, \
-                 (used_at IS NOT NULL AND now() - used_at <= make_interval(secs => $2::double precision) AND grace_reissued_at IS NULL), \
+                 (used_at IS NOT NULL AND now() - used_at < make_interval(secs => $2::double precision) AND grace_reissued_at IS NULL), \
                  replaced_by::text \
                  FROM _platform_refresh_tokens WHERE token_hash = $1 FOR UPDATE",
                 &[&token_hash, &(policy.grace as f64)],
@@ -556,11 +617,14 @@ impl QueryExec for PgExec {
         let used: bool = row.get(6);
         let in_grace: bool = row.get(7);
         let old_child: Option<String> = row.get(8);
-        let revoke_family = "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'reuse' \
+        let revoke_family =
+            "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'reuse' \
                              WHERE family_id = $1::text::uuid AND revoked_at IS NULL";
         if revoked {
             if reason.as_deref() == Some("grace-reissue") {
-                tx.execute(revoke_family, &[&family]).await.map_err(map_pg)?;
+                tx.execute(revoke_family, &[&family])
+                    .await
+                    .map_err(map_pg)?;
                 tx.commit().await.map_err(map_pg)?;
                 return Ok(Rotated::Reuse { family_id: family });
             }
@@ -570,7 +634,9 @@ impl QueryExec for PgExec {
             return Ok(Rotated::Invalid);
         }
         if used && !in_grace {
-            tx.execute(revoke_family, &[&family]).await.map_err(map_pg)?;
+            tx.execute(revoke_family, &[&family])
+                .await
+                .map_err(map_pg)?;
             tx.commit().await.map_err(map_pg)?;
             return Ok(Rotated::Reuse { family_id: family });
         }
@@ -631,13 +697,54 @@ impl QueryExec for PgExec {
                 vec![Some(user.to_string())],
             ),
         };
-        let rows = self.raw(tenant_id, sql, params).await?;
+        let rows = self.run_tx(tenant_id, None, true, sql, params).await?;
         Ok(rows.len() as u64)
     }
 
     async fn raw(
         &self,
         tenant_id: &str,
+        role: &str,
+        writes: bool,
+        sql: &str,
+        params: Vec<Option<String>>,
+    ) -> Result<Vec<Row>, ExecError> {
+        if !QUERY_ROLES.contains(&role) {
+            return Err(ExecError::Message(format!("query cannot run as {role}")));
+        }
+        self.run_tx(tenant_id, Some(role), writes, sql, params)
+            .await
+    }
+
+    async fn user_roles(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, ExecError> {
+        let rows = self
+            .run_tx(
+                tenant_id,
+                None,
+                false,
+                "SELECT roles FROM users WHERE id::text = $1",
+                vec![Some(user_id.to_string())],
+            )
+            .await?;
+        match rows.first() {
+            None => Ok(None),
+            Some(row) => roles_from(row.get("roles")).map(Some),
+        }
+    }
+}
+
+impl PgExec {
+    /// One transaction in the tenant schema; `role` switches to a query role
+    /// with `SET LOCAL ROLE`; without `writes` it is READ ONLY.
+    async fn run_tx(
+        &self,
+        tenant_id: &str,
+        role: Option<&str>,
+        writes: bool,
         sql: &str,
         params: Vec<Option<String>>,
     ) -> Result<Vec<Row>, ExecError> {
@@ -649,6 +756,11 @@ impl QueryExec for PgExec {
             .transaction()
             .await
             .map_err(|err| ExecError::Message(err.to_string()))?;
+        if !writes {
+            tx.batch_execute("SET TRANSACTION READ ONLY")
+                .await
+                .map_err(|err| ExecError::Message(err.to_string()))?;
+        }
         let schema = format!("\"t_{tenant_id}\"");
         tx.query(
             "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true)",
@@ -656,6 +768,12 @@ impl QueryExec for PgExec {
         )
         .await
         .map_err(|err| ExecError::Message(err.to_string()))?;
+        if let Some(role) = role {
+            // `role` is one of QUERY_ROLES (checked by the caller).
+            tx.batch_execute(&format!("SET LOCAL ROLE {role}"))
+                .await
+                .map_err(|err| ExecError::Message(format!("SET ROLE {role}: {err}")))?;
+        }
         let params: Vec<TextParam> = params.into_iter().map(TextParam).collect();
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p as _).collect();

@@ -7,6 +7,7 @@ use crate::manifest::{FieldSpec, Manifest, MethodSpec, ModelSpec};
 use super::exec::{etag, ExecError, QueryExec, Row};
 use super::sql::{Col, Sort, Stmt};
 
+#[derive(Debug)]
 pub struct CallResult {
     pub value: Value,
     pub etag: Option<String>,
@@ -74,6 +75,7 @@ async fn run_steps(
 ) -> Result<CallResult, MethodFail> {
     let mut vars = Map::new();
     vars.insert("input".into(), input.clone());
+    vars.insert("ctx".into(), ctx_var(&ctx));
     let mut last = Value::Null;
     for step in &method.steps {
         match step.op.as_str() {
@@ -1011,18 +1013,106 @@ fn lookup(path: &str, vars: &Map<String, Value>) -> Value {
     current
 }
 
-fn when_matches(expr: &str, vars: &Map<String, Value>) -> bool {
-    let expr = expr.trim();
-    if let Some(name) = expr.strip_suffix(" is empty") {
-        let value = lookup(name.trim(), vars);
-        return value.is_null()
-            || value.as_array().is_some_and(Vec::is_empty)
-            || value.as_object().is_some_and(|m| m.is_empty());
+/// A parsed `when` condition. Forms: `X is empty`, `X is not empty`,
+/// `X == v`, `X != v` with `v` one of true, false, null. Surrounding
+/// backticks (lock code spans) are stripped.
+enum When {
+    Empty(String, bool),
+    Eq(String, Value, bool),
+}
+
+fn parse_when(expr: &str) -> Result<When, String> {
+    let expr = expr.trim().trim_matches('`').trim();
+    let path_ok = |p: &str| {
+        !p.is_empty()
+            && p.split('.').all(|seg| {
+                !seg.is_empty()
+                    && seg
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            })
+    };
+    if let Some(name) = expr.strip_suffix(" is not empty") {
+        let name = name.trim();
+        if path_ok(name) {
+            return Ok(When::Empty(name.to_string(), false));
+        }
+    } else if let Some(name) = expr.strip_suffix(" is empty") {
+        let name = name.trim();
+        if path_ok(name) {
+            return Ok(When::Empty(name.to_string(), true));
+        }
     }
-    if let Some(name) = expr.strip_suffix(" != true") {
-        return lookup(name.trim(), vars) != Value::Bool(true);
+    for (op, equal) in [("!=", false), ("==", true)] {
+        if let Some((left, right)) = expr.split_once(op) {
+            let left = left.trim();
+            let literal = match right.trim() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                "null" => Value::Null,
+                _ => break,
+            };
+            if path_ok(left) {
+                return Ok(When::Eq(left.to_string(), literal, equal));
+            }
+        }
     }
-    false
+    Err(format!("unsupported when condition `{expr}`"))
+}
+
+/// Why a `when` condition cannot run, if it cannot (validate uses this).
+pub fn when_problem(expr: &str) -> Option<String> {
+    parse_when(expr).err()
+}
+
+/// Checks a `when` condition the way the runtime parses it.
+pub fn check_when(expr: &str) -> Result<(), String> {
+    parse_when(expr).map(|_| ())
+}
+
+/// Checks that an expression parses the way the runtime will parse it.
+pub fn check_expr(input: &str) -> Result<(), String> {
+    let (_, rest) = parse_expr(input.trim())?;
+    if !rest.trim().is_empty() {
+        return Err(format!("trailing input in expression {input}"));
+    }
+    Ok(())
+}
+
+/// Evaluates a `when`. An unparseable condition is never "false": it fails
+/// closed (the step's `fail` fires), and `vibe validate` rejects it first.
+pub(crate) fn when_matches(expr: &str, vars: &Map<String, Value>) -> bool {
+    let parsed = match parse_when(expr) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::error!(error = %err, "invalid when condition; failing closed");
+            return true;
+        }
+    };
+    match parsed {
+        When::Empty(name, want) => {
+            let value = lookup(&name, vars);
+            let empty = value.is_null()
+                || value.as_array().is_some_and(Vec::is_empty)
+                || value.as_object().is_some_and(|m| m.is_empty())
+                || value.as_str().is_some_and(str::is_empty);
+            empty == want
+        }
+        When::Eq(name, literal, equal) => (lookup(&name, vars) == literal) == equal,
+    }
+}
+
+/// `ctx.user` for step expressions: the caller's `sub`, `roles` and `tenant`
+/// (`sub` is null on unauthenticated routes).
+pub fn ctx_var(ctx: &CallCtx<'_>) -> Value {
+    let sub = if ctx.caller.subject.is_empty() {
+        Value::Null
+    } else {
+        Value::String(ctx.caller.subject.to_string())
+    };
+    serde_json::json!({
+        "user": {"sub": sub, "roles": ctx.caller.roles, "tenant": ctx.tenant_id}
+    })
 }
 
 pub fn req_var(
@@ -1130,5 +1220,24 @@ mod ownership_tests {
         let (column, value) = owner_eq(&users, caller("u1", &[])).unwrap().unwrap();
         assert_eq!(column.name, "id");
         assert_eq!(value, Value::String("u1".into()));
+    }
+}
+
+#[cfg(test)]
+mod expr_check_tests {
+    use super::{check_expr, check_when, when_matches};
+    use serde_json::Map;
+
+    #[test]
+    fn expressions_and_conditions_are_checked_like_the_runtime() {
+        assert!(check_expr("{sku: req.body.sku, qty: req.body.qty}").is_ok());
+        assert!(check_expr("result").is_ok());
+        assert!(check_expr("{sku: }").is_err());
+        assert!(check_expr("a b").is_err());
+        assert!(check_when("found is empty").is_ok());
+        assert!(check_when("user.verified != true").is_ok());
+        assert!(check_when("qty > 5").is_err());
+        // Unknown conditions fail closed at runtime.
+        assert!(when_matches("qty > 5", &Map::new()));
     }
 }

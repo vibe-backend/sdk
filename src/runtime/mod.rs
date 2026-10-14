@@ -8,13 +8,16 @@ pub mod refresh;
 mod slugs;
 mod sql;
 
-pub use crud::{parse_ownership, run_method, CallCtx, CallResult, Caller, MethodFail, Ownership};
+pub use crud::{
+    check_expr, check_when, parse_ownership, run_method, when_problem, CallCtx, CallResult, Caller,
+    MethodFail, Ownership,
+};
 pub use exec::{etag, ExecError, MemoryExec, PgExec, QueryExec};
 pub use http::{
     detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router, ApiKeyFile, AppState,
     AuthConfig, RunEnv, SigningKey, Slug, StoredKey, REQUEST_TYPES,
 };
-pub use ops::load_signing_keys;
+pub use ops::{custom_claim_problem, load_signing_keys};
 
 /// argon2id hash with the platform floor (for seeding test data).
 pub fn hash_password_for_tests(plain: &str) -> String {
@@ -22,4 +25,4 @@ pub fn hash_password_for_tests(plain: &str) -> String {
 }
 pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
-pub use sql::{bootstrap_statements, Col};
+pub use sql::{bootstrap_statements, quote as quote_ident, Col};

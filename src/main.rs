@@ -267,17 +267,36 @@ async fn cmd_compile(project: &Path, check: bool) -> Result<(), String> {
 }
 
 fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
+    // A missing key is one more finding, not a reason to stop before
+    // reporting everything else.
+    let mut key_problem = None;
     let key = if deploy {
-        Some(sign::load_public(project).map_err(|err| err.to_string())?)
+        match sign::load_public(project) {
+            Ok(key) => Some(key),
+            Err(err) => {
+                key_problem = Some(vibe::Diag::error(
+                    ".vibe/signing.pub",
+                    format!("cannot load the signing key: {err}"),
+                ));
+                None
+            }
+        }
     } else {
         None
     };
-    let report = validate_project(&ValidateOptions {
+    let result = validate_project(&ValidateOptions {
         root: project,
         deploy,
         verify_key: key.as_ref(),
-    })
-    .map_err(|err| err.to_string())?;
+    });
+    let report = match (result, key_problem) {
+        (Ok(report), None) => report,
+        (Ok(mut report) | Err(mut report), Some(problem)) => {
+            report.diags.insert(0, problem);
+            return Err(report.to_string());
+        }
+        (Err(report), None) => return Err(report.to_string()),
+    };
     print_report(&report);
     if deploy {
         println!("validation ok");
@@ -458,8 +477,16 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
             .await?;
         println!("bootstrapped {schema}._platform_refresh_tokens");
     }
+    // Migrations run in the tenant schema, never `public`.
+    let quoted = vibe::runtime::quote_ident(&schema)?;
     for migration in &manifest.migrations {
-        exec.batch(&migration.statements).await?;
+        let mut statements = vec![
+            format!("CREATE SCHEMA IF NOT EXISTS {quoted}"),
+            format!("SET search_path TO {quoted}"),
+        ];
+        statements.extend(migration.statements.iter().cloned());
+        statements.push("RESET search_path".into());
+        exec.batch(&statements).await?;
         println!("applied {}", migration.id);
     }
     Ok(())

@@ -91,10 +91,13 @@ fn bullet<'a>(bullets: &'a [crate::lock::Bullet], key: &str) -> Option<&'a str> 
 
 fn secs(raw: Option<&str>, default: i64, max: i64, name: &str) -> Result<i64, String> {
     let Some(raw) = raw else { return Ok(default) };
-    let ms = crate::llm::parse_duration_ms(raw).ok_or_else(|| format!("token-refresh {name}: bad duration `{raw}`"))?;
+    let ms = crate::llm::parse_duration_ms(raw)
+        .ok_or_else(|| format!("token-refresh {name}: bad duration `{raw}`"))?;
     let s = (ms / 1000) as i64;
     if s <= 0 || s > max {
-        return Err(format!("token-refresh {name} must be between 1s and {max}s"));
+        return Err(format!(
+            "token-refresh {name} must be between 1s and {max}s"
+        ));
     }
     Ok(s)
 }
@@ -114,15 +117,38 @@ pub fn parse_refresh_block(bullets: &[crate::lock::Bullet]) -> Result<RefreshSpe
         }
     }
     for b in bullets {
-        if !["sign-method", "refresh-ttl", "idle-ttl", "reuse-grace", "transport"].contains(&b.key.as_str()) {
+        if ![
+            "sign-method",
+            "refresh-ttl",
+            "idle-ttl",
+            "reuse-grace",
+            "transport",
+        ]
+        .contains(&b.key.as_str())
+        {
             return Err(format!("unknown token-refresh option `{}`", b.key));
         }
     }
     Ok(RefreshSpec {
         sign_method,
-        refresh_ttl_s: secs(bullet(bullets, "refresh-ttl"), MAX_REFRESH_TTL_S, MAX_REFRESH_TTL_S, "refresh-ttl")?,
-        idle_ttl_s: secs(bullet(bullets, "idle-ttl"), MAX_IDLE_TTL_S, MAX_IDLE_TTL_S, "idle-ttl")?,
-        reuse_grace_s: secs(bullet(bullets, "reuse-grace"), 10, MAX_REUSE_GRACE_S, "reuse-grace")?,
+        refresh_ttl_s: secs(
+            bullet(bullets, "refresh-ttl"),
+            MAX_REFRESH_TTL_S,
+            MAX_REFRESH_TTL_S,
+            "refresh-ttl",
+        )?,
+        idle_ttl_s: secs(
+            bullet(bullets, "idle-ttl"),
+            MAX_IDLE_TTL_S,
+            MAX_IDLE_TTL_S,
+            "idle-ttl",
+        )?,
+        reuse_grace_s: secs(
+            bullet(bullets, "reuse-grace"),
+            10,
+            MAX_REUSE_GRACE_S,
+            "reuse-grace",
+        )?,
     })
 }
 
@@ -130,7 +156,9 @@ pub fn parse_refresh_block(bullets: &[crate::lock::Bullet]) -> Result<RefreshSpe
 pub fn parse_revoke_block(bullets: &[crate::lock::Bullet]) -> Result<RevokeSpec, String> {
     let scope = bullet(bullets, "scope").unwrap_or("family");
     if scope != "family" && scope != "all" {
-        return Err(format!("token-revoke scope must be family or all (got `{scope}`)"));
+        return Err(format!(
+            "token-revoke scope must be family or all (got `{scope}`)"
+        ));
     }
     Ok(RevokeSpec {
         scope: scope.to_string(),
@@ -222,9 +250,7 @@ pub fn check_rate_key(key: &str, auth_removed: bool, auth_mode: &str) -> Result<
         _ => match key.strip_prefix("input.") {
             Some(field)
                 if !field.is_empty()
-                    && field
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                    && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
             {
                 Ok(())
             }
@@ -628,14 +654,16 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         for block in &pipes.blocks {
             let name = pipeline_name(&block.heading);
             if name == "token-refresh" {
-                refresh = Some(parse_refresh_block(&block.bullets).map_err(|err| {
-                    Diag::error(&doc.meta.id, err).at_section("Pipelines")
-                })?);
+                refresh = Some(
+                    parse_refresh_block(&block.bullets)
+                        .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?,
+                );
             }
             if name == "token-revoke" {
-                revoke = Some(parse_revoke_block(&block.bullets).map_err(|err| {
-                    Diag::error(&doc.meta.id, err).at_section("Pipelines")
-                })?);
+                revoke = Some(
+                    parse_revoke_block(&block.bullets)
+                        .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?,
+                );
             }
             if name == "-auth"
                 || (name == "auth"
@@ -891,12 +919,11 @@ fn parse_challenge(raw: &str) -> (String, String) {
 fn number_rule(rules: &str, key: &str) -> Option<i64> {
     for part in rules.split(',') {
         let part = part.trim();
-        let rest = part.strip_prefix(&format!("{key}:"))?.trim();
-        let number: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '-')
-            .collect();
-        if let Ok(value) = number.parse() {
+        // Skip other rules; `?` here used to drop every rule after the first.
+        let Some(rest) = part.strip_prefix(&format!("{key}:")) else {
+            continue;
+        };
+        if let Ok(value) = rest.trim().parse() {
             return Some(value);
         }
     }
@@ -947,6 +974,20 @@ pub fn method<'a>(manifest: &'a Manifest, target: &str) -> Option<&'a MethodSpec
 
 pub fn json_null() -> Value {
     Value::Null
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::number_rule;
+
+    #[test]
+    fn number_rules_are_found_in_any_position() {
+        assert_eq!(number_rule("min: 1, max: 99", "max"), Some(99));
+        assert_eq!(number_rule("min: 1, max: 99", "min"), Some(1));
+        assert_eq!(number_rule("format: email, max: 120", "max"), Some(120));
+        assert_eq!(number_rule("max: -5", "max"), Some(-5));
+        assert_eq!(number_rule("-", "max"), None);
+    }
 }
 
 /// JWT claims that carry identity or token metadata; a roles claim must never
@@ -1040,6 +1081,7 @@ mod roles_claim_tests {
         }
     }
 }
+
 #[cfg(test)]
 mod roles_list_tests {
     #[test]
@@ -1071,10 +1113,9 @@ mod rate_key_tests {
         assert!(check_rate_key("user", true, "jwt").is_err());
         let family = check_rate_key("family", false, "jwt").unwrap_err();
         assert!(
-            family.contains("family is only for token-refresh")
-                || family.contains("`family` is only for token-refresh")
+            family.contains("only allowed on token-refresh routes"),
+            "{family}"
         );
-        assert!(family.contains("not implemented") && family.contains("#26"));
         for bad in ["per-hour", "per-day", "burst"] {
             assert!(super::check_rate_params(["key", bad]).is_err(), "{bad}");
         }

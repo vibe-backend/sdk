@@ -18,10 +18,10 @@ use subtle::ConstantTimeEq;
 
 use crate::manifest::{Manifest, RouteSpec};
 
-use super::refresh::{RevokeTarget, Rotated};
 use super::crud::{self, MethodFail};
 use super::exec::QueryExec;
 use super::limiter::{ip_bucket, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision};
+use super::refresh::{RevokeTarget, Rotated};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -111,6 +111,7 @@ pub struct AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    super::ops::warm_up();
     Router::new().fallback(handle).with_state(state)
 }
 
@@ -591,9 +592,16 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         .await;
     }
     if let Some(spec) = &found.route.refresh {
-        let response =
-            refresh_response(&state, found.route, spec, &principal.tenant_id, &ip, &body, &request_id)
-                .await;
+        let response = refresh_response(
+            &state,
+            found.route,
+            spec,
+            &principal.tenant_id,
+            &ip,
+            &body,
+            &request_id,
+        )
+        .await;
         return finish(found.route, &state, started, response).await;
     }
     if let Some(spec) = &found.route.revoke {
@@ -662,6 +670,19 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     let req_value = crud::req_var(body, query_values, found.params.clone(), header_values);
     let mut vars = Map::new();
     vars.insert("req".into(), req_value);
+    vars.insert(
+        "ctx".into(),
+        crud::ctx_var(&crud::CallCtx {
+            auth: &state.auth,
+            tenant_id: &principal.tenant_id,
+            role: "",
+            caller: crud::Caller {
+                subject: &principal.subject,
+                roles: &principal.roles,
+            },
+            refresh_token: None,
+        }),
+    );
     let input = match crud::eval_expr(&found.route.transform_in, &vars) {
         Ok(value) => value,
         Err(err) => {
@@ -768,7 +789,29 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     status = StatusCode::from_u16(step.status).unwrap_or(StatusCode::OK);
                 }
             }
-            "validate" | "transform" => {}
+            "validate" => {
+                vars.insert("input".into(), input.clone());
+                if crud::when_matches(&step.when_expr, &vars) {
+                    let code = if step.fail.is_empty() {
+                        "VALIDATION_FAILED".to_string()
+                    } else {
+                        step.fail.clone()
+                    };
+                    let mapped = found.route.errors.iter().find(|e| e.from == code);
+                    let status = mapped
+                        .and_then(|e| StatusCode::from_u16(e.status).ok())
+                        .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+                    let public_code = mapped.map(|e| e.code.clone()).unwrap_or(code);
+                    return finish(
+                        found.route,
+                        &state,
+                        started,
+                        error_response(status, &public_code, "Invalid request", &request_id, &[]),
+                    )
+                    .await;
+                }
+            }
+            "transform" => {}
             _ => {
                 return finish(
                     found.route,
@@ -1425,10 +1468,12 @@ fn rate_limited(
         .rates
         .iter()
         .filter(|rate| rate.key != "family")
-        .map(|rate| {
+        .enumerate()
+        .map(|(index, rate)| {
             let (shard, key) =
                 rate_bucket(&rate.key, route, ip, principal, body, &state.auth.pepper);
-            (shard, key, rate.per_minute)
+            // Each block is its own limit, even when two share a key.
+            (format!("{shard}#{index}"), key, rate.per_minute)
         })
         .collect();
     let Ok(mut rates) = state.rates.lock() else {
@@ -1808,6 +1853,7 @@ fn platform_status(code: &str) -> StatusCode {
         "FORBIDDEN" => StatusCode::FORBIDDEN,
         "UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
         "BAD_REQUEST" => StatusCode::BAD_REQUEST,
+        "SERVICE_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
