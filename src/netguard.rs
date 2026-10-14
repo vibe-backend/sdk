@@ -1,10 +1,14 @@
 //! One host classifier for outbound fetches (LLM endpoints, JWKS).
 //!
 //! Hosts are normalized first: brackets removed, one trailing dot stripped,
-//! lower-cased. This checks the literal host only; a public name that resolves
-//! to a private address is not caught here.
+//! lower-cased. [`is_non_public_host`] checks the literal host; a public name
+//! that resolves to a private address (DNS rebinding) is caught at connect
+//! time by [`PublicOnlyResolver`], which every guarded reqwest client uses: it
+//! fails the lookup if any resolved address is non-public, so the client only
+//! ever connects to addresses that were checked.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 /// Brackets removed, one trailing dot stripped, ASCII lower-cased.
 pub fn normalize_host(host: &str) -> String {
@@ -56,6 +60,81 @@ pub fn is_non_public_host(host: &str) -> bool {
     !host.contains('.')
 }
 
+/// True for a non-public address (see [`is_non_public_host`]).
+pub fn is_non_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => non_public_v4(v4),
+        IpAddr::V6(v6) => non_public_v6(v6),
+    }
+}
+
+type LookupFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+type Lookup = dyn Fn(String) -> LookupFuture + Send + Sync;
+
+/// reqwest DNS resolver that refuses a name if any address it resolves to is
+/// non-public. reqwest connects only to the addresses returned here, so a
+/// rebinding answer cannot slip in between the check and the connect.
+#[derive(Clone)]
+pub struct PublicOnlyResolver {
+    lookup: Arc<Lookup>,
+}
+
+impl Default for PublicOnlyResolver {
+    fn default() -> Self {
+        Self::with_lookup(|name| {
+            Box::pin(
+                async move { Ok(tokio::net::lookup_host((name.as_str(), 0)).await?.collect()) },
+            )
+        })
+    }
+}
+
+impl PublicOnlyResolver {
+    /// A resolver over a custom lookup (tests use a fake DNS).
+    pub fn with_lookup(lookup: impl Fn(String) -> LookupFuture + Send + Sync + 'static) -> Self {
+        Self {
+            lookup: Arc::new(lookup),
+        }
+    }
+}
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let name = name.as_str().to_string();
+        let fut = (self.lookup)(name.clone());
+        Box::pin(async move {
+            let addrs = fut.await?;
+            if addrs.is_empty() {
+                return Err(format!("{name} did not resolve").into());
+            }
+            if let Some(bad) = addrs.iter().find(|a| is_non_public_ip(a.ip())) {
+                return Err(format!(
+                    "{name} resolves to non-public address {}; refusing to connect",
+                    bad.ip()
+                )
+                .into());
+            }
+            let addrs: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+/// Applies the outbound guard to a client builder: every hostname is resolved
+/// through [`PublicOnlyResolver`] and proxies are disabled (a proxy would do
+/// its own, unchecked, DNS lookup).
+pub fn guard_client(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    guard_client_with(builder, PublicOnlyResolver::default())
+}
+
+pub fn guard_client_with(
+    builder: reqwest::ClientBuilder,
+    resolver: PublicOnlyResolver,
+) -> reqwest::ClientBuilder {
+    builder.no_proxy().dns_resolver(Arc::new(resolver))
+}
+
 fn non_public_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     ip.is_private()
@@ -65,7 +144,11 @@ fn non_public_v4(ip: Ipv4Addr) -> bool {
         || o[0] == 0
         || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
         || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
+        || (o[0] == 192 && o[1] == 0 && o[2] == 2) // 192.0.2.0/24 TEST-NET-1
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99) // 192.88.99.0/24 6to4 relay
         || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100) // 198.51.100.0/24 TEST-NET-2
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113) // 203.0.113.0/24 TEST-NET-3
         || o[0] >= 224 // 224.0.0.0/3: multicast, reserved, broadcast
 }
 
@@ -87,6 +170,9 @@ fn non_public_v6(ip: Ipv6Addr) -> bool {
     }
     (s[0] == 0x100 && s[1..4].iter().all(|&x| x == 0)) // 100::/64 discard
         || (s[0] == 0x64 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0)) // 64:ff9b::/96 NAT64
+        || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1) // 64:ff9b:1::/48 local NAT64
+        || (s[0] == 0x2001 && s[1] == 0) // 2001::/32 Teredo
+        || (s[0] == 0x2001 && s[1] == 0xdb8) // 2001:db8::/32 documentation
         || s[0] == 0x2002 // 2002::/16 6to4
         || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
         || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
@@ -158,6 +244,111 @@ mod tests {
         for host in ["8.8.8.8", "198.20.0.1", "192.0.1.1", "2001:4860:4860::8888"] {
             assert!(!is_non_public_host(host), "{host}");
         }
+    }
+
+    #[test]
+    fn nat64_teredo_documentation_and_relay_ranges_are_blocked() {
+        for host in [
+            "64:ff9b:1::1",
+            "64:ff9b:1:ffff::a9fe:a9fe",
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:db8::1",
+            "2001:db8:ffff::1",
+            "192.0.2.1",
+            "192.0.2.255",
+            "192.88.99.1",
+            "192.88.99.255",
+            "198.51.100.7",
+            "203.0.113.9",
+        ] {
+            assert!(is_non_public_host(host), "{host}");
+        }
+        // Neighbours stay public.
+        for host in [
+            "64:ff9b:2::1",
+            "2001:1::1",
+            "2001:db9::1",
+            "192.0.3.1",
+            "192.88.98.1",
+            "192.88.100.1",
+        ] {
+            assert!(!is_non_public_host(host), "{host}");
+        }
+    }
+
+    fn fake_dns(ip: IpAddr) -> PublicOnlyResolver {
+        PublicOnlyResolver::with_lookup(move |_name| {
+            Box::pin(async move { Ok(vec![SocketAddr::new(ip, 0)]) })
+        })
+    }
+
+    #[tokio::test]
+    async fn resolver_refuses_names_that_resolve_to_non_public_addresses() {
+        use reqwest::dns::Resolve;
+        for ip in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "10.0.0.1",
+            "::1",
+            "2001:db8::1",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            let name: reqwest::dns::Name = "rebind.example.com".parse().unwrap();
+            assert!(fake_dns(ip).resolve(name).await.is_err(), "{ip}");
+        }
+        // Mixed answers fail too: one bad address is enough.
+        let mixed = PublicOnlyResolver::with_lookup(|_| {
+            Box::pin(async {
+                Ok(vec![
+                    "93.184.216.34:0".parse().unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                ])
+            })
+        });
+        let name: reqwest::dns::Name = "rebind.example.com".parse().unwrap();
+        assert!(mixed.resolve(name).await.is_err());
+        let name: reqwest::dns::Name = "ok.example.com".parse().unwrap();
+        let got: Vec<_> = fake_dns("93.184.216.34".parse().unwrap())
+            .resolve(name)
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(got, vec!["93.184.216.34:0".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn real_localhost_lookup_is_refused() {
+        use reqwest::dns::Resolve;
+        let name: reqwest::dns::Name = "localhost".parse().unwrap();
+        assert!(PublicOnlyResolver::default().resolve(name).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn guarded_client_never_connects_to_a_rebound_name() {
+        // A public-looking name whose DNS answer is 127.0.0.1, pointed at a
+        // live local listener: the request must fail without connecting.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = tokio::spawn(async move { listener.accept().await.is_ok() });
+        let client = guard_client_with(
+            reqwest::Client::builder(),
+            fake_dns("127.0.0.1".parse().unwrap()),
+        )
+        .build()
+        .unwrap();
+        let err = client
+            .get(format!("http://rebind.example.com:{port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_connect() || err.to_string().contains("error"),
+            "{err}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!accepted.is_finished(), "the client connected to 127.0.0.1");
+        accepted.abort();
     }
 }
 

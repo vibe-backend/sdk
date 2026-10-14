@@ -575,10 +575,16 @@ pub fn describe_failure(
 
 impl HttpAdapter {
     pub fn new(config: LlmConfig) -> Result<Self, String> {
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .timeout(config.timeout)
             // A redirect could lead to a host the endpoint check never saw.
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::none());
+        if !config.endpoint_private {
+            // A public endpoint must not resolve to a private address (DNS
+            // rebinding); every resolved address is checked before connecting.
+            builder = crate::netguard::guard_client(builder);
+        }
+        let client = builder
             .build()
             .map_err(|err| format!("http client: {err}"))?;
         Ok(Self { config, client })

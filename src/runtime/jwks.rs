@@ -61,11 +61,14 @@ impl HttpsJwks {
                 "jwks-uri host {host} is loopback, private or link-local; use a public https host"
             ));
         }
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|err| err.to_string())?;
+            .redirect(reqwest::redirect::Policy::none());
+        if !allow_private {
+            // Also check every address the name resolves to (DNS rebinding).
+            builder = crate::netguard::guard_client(builder);
+        }
+        let client = builder.build().map_err(|err| err.to_string())?;
         Ok(Self {
             uri: uri.to_string(),
             client,
