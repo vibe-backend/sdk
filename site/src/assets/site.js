@@ -11,7 +11,8 @@
   });
 
   document.querySelectorAll('[data-lang]').forEach(function (a) {
-    a.addEventListener('click', function () { store('vb-lang', a.getAttribute('data-lang')); a.href += location.hash; });
+    var base = a.href.split('#')[0];
+    a.addEventListener('click', function () { store('vb-lang', a.getAttribute('data-lang')); a.href = base + location.hash; });
   });
 
   var menu = document.querySelector('.menu');

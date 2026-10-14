@@ -4,12 +4,12 @@
 
 The compiler turns natural-language source `.md` into lock md using an LLM (§2.1, §2A.6). Initializing a project and running a compile therefore need an **OpenAI-compatible base URL and API key**. This page shows how to supply them safely and lists ready-made settings for common providers.
 
-> ⚠️ **Spec status.** The merged spec (`docs/spec-v1.5.md`) does **not** define how the compiler endpoint or key is configured; it only requires a pinned model snapshot, `compiler-hash`, deterministic settings and a sandbox with no network or secrets (§2A.6, §2A.7). The variable names below follow the architect's **proposed** spec v1.7 (open PR #5, Decision 57, §2A.8), which is **not merged yet** and may change:
+> ⚠️ **Spec status.** Spec v1.5 (`docs/spec-v1.5.md`) does **not** define how the compiler endpoint or key is configured; it only requires a pinned model snapshot, `compiler-hash`, deterministic settings and a sandbox with no network or secrets (§2A.6, §2A.7). The variable names below follow **spec v1.7** ([`docs/spec-v1.7.md`](../spec-v1.7.md), Decision 57, §2A.8), which is now merged. This page was written against the v1.7 draft and has not yet been re-checked against the final text (for example, Decisions 58–59 refine deterministic parameters and request paths); where they differ, the spec wins:
 >
 > - Neutral names `LLM_PROVIDER` (default `openai`), `LLM_BASE_URL`, `LLM_API_KEY` (required), `LLM_MODEL` (required, pinned snapshot).
 > - `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` are accepted as **aliases** only when `LLM_PROVIDER=openai`; `LLM_*` wins, and conflicting values are an error.
 >
-> The v1.7 draft supports three providers via `LLM_PROVIDER`: `openai` (default; covers OpenAI and every OpenAI-compatible endpoint, Bearer auth), `anthropic` and `gemini`. The OpenAI-compatible examples use the `OPENAI_*` aliases; Anthropic and Gemini must use `LLM_*`.
+> Spec v1.7 supports three providers via `LLM_PROVIDER`: `openai` (default; covers OpenAI and every OpenAI-compatible endpoint, Bearer auth), `anthropic` and `gemini`. The OpenAI-compatible examples use the `OPENAI_*` aliases; Anthropic and Gemini must use `LLM_*`.
 
 ## Natural-language source example
 
@@ -53,7 +53,7 @@ compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01 }
 compiler-hash: sha256:c0de...77
 ````
 
-Proposed v1.7 (PR #5, unmerged) also records the provider and endpoint host (host only, never the key):
+Spec v1.7 also records the provider and endpoint host (host only, never the key):
 
 ````markdown
 compiler: { name: md-logic, version: 2.0.0, model-snapshot: <model id reported by the provider>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: { temperature: 0, top_p: 1, seed: 0 } }
@@ -71,13 +71,13 @@ OPENAI_API_KEY=sk-...your-key...
 OPENAI_MODEL=gpt-4.1-2025-04-14
 ```
 
-- Auth: `Authorization: Bearer {key}` on `POST {base}/chat/completions` (v1.7 draft §2A.8.2). Every OpenAI-compatible provider on this page uses the same Bearer header.
+- Auth: `Authorization: Bearer {key}` on `POST {base}/chat/completions` (v1.7 §2A.8.2). Every OpenAI-compatible provider on this page uses the same Bearer header.
 - Use a dated snapshot, not an undated alias such as `gpt-4.1`.
 - OpenAI documents `seed` as beta / best-effort; determinism is not guaranteed.
 
 ### Anthropic
 
-The Anthropic and Gemini sections use `LLM_*` names: the `OPENAI_*` aliases are accepted **only** with `LLM_PROVIDER=openai`, and setting them with another provider is an error (v1.7 draft §2A.8.3).
+The Anthropic and Gemini sections use `LLM_*` names: the `OPENAI_*` aliases are accepted **only** with `LLM_PROVIDER=openai`, and setting them with another provider is an error (v1.7 §2A.8.3).
 
 ```dotenv
 LLM_PROVIDER=anthropic
@@ -86,8 +86,8 @@ LLM_API_KEY=sk-ant-...your-key...
 LLM_MODEL=claude-sonnet-4-6
 ```
 
-- Request: `POST {base}/v1/messages` with headers `x-api-key: {key}`, `anthropic-version: 2023-06-01` (not Bearer). The base URL has **no** `/v1`; the path adds it (v1.7 draft §2A.8.2).
-- The v1.7 draft accepts undated ids that Anthropic documents as fixed snapshots (4.6 generation onward); never use `*-latest` aliases.
+- Request: `POST {base}/v1/messages` with headers `x-api-key: {key}`, `anthropic-version: 2023-06-01` (not Bearer). The base URL has **no** `/v1`; the path adds it (v1.7 §2A.8.2).
+- Spec v1.7 accepts undated ids that Anthropic documents as fixed snapshots (4.6 generation onward); never use `*-latest` aliases.
 - Newer models accept only `temperature: 1` and have no seed, so outputs are not guaranteed deterministic; CI recompile mismatches block deploys.
 
 ### Gemini
@@ -99,7 +99,7 @@ LLM_API_KEY=your-gemini-api-key
 LLM_MODEL=gemini-2.5-pro
 ```
 
-- Request: `POST {base}/models/{LLM_MODEL}:generateContent` with header `x-goog-api-key: {key}`. Never put the key in the `?key=` query string, because it ends up in logs (v1.7 draft §2A.8.2).
+- Request: `POST {base}/models/{LLM_MODEL}:generateContent` with header `x-goog-api-key: {key}`. Never put the key in the `?key=` query string, because it ends up in logs (v1.7 §2A.8.2).
 - Use a stable model id, not `-latest` or `-preview` names.
 - `seed` is accepted but only best-effort.
 
@@ -113,7 +113,7 @@ OPENAI_MODEL=your-deployment-name
 
 - Uses Azure's v1 API (no `api-version` parameter); `*.services.ai.azure.com/openai/v1/` also works.
 - `OPENAI_MODEL` is your **deployment name**; pin the model version on the deployment and disable auto-upgrade, otherwise the model behind the name can change.
-- ⚠️ Proposed v1.7 lists Azure OpenAI as **out of v1 scope**. Treat it as unsupported until the spec says otherwise.
+- ⚠️ Spec v1.7 lists Azure OpenAI as **out of v1 scope**. Treat it as unsupported until the spec says otherwise.
 
 ### OpenRouter
 
@@ -147,7 +147,7 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 
 - No key is needed; use any placeholder.
 - Use a full tag, never `:latest`.
-- Local-only: plain `http` works only on loopback. Locks compiled against a local endpoint are for development; CI/production compiles should use an `https` public host (proposed v1.7 forbids deploying locally compiled locks).
+- Local-only: plain `http` works only on loopback. Locks compiled against a local endpoint are for development; CI/production compiles should use an `https` public host (v1.7 forbids deploying locally compiled locks).
 
 ### LM Studio (local)
 
@@ -174,18 +174,18 @@ OPENAI_MODEL=Qwen/Qwen2.5-Coder-32B-Instruct
 
 ## Security considerations
 
-- **Never commit the key**: not in source, lock, manifest, logs, deploy reports, PR comments or error messages (§9B; proposed v1.7 Decision 57). Commit only `.env.example`.
+- **Never commit the key**: not in source, lock, manifest, logs, deploy reports, PR comments or error messages (§9B; v1.7 Decision 57). Commit only `.env.example`.
 - Keep `.env` in `.gitignore`; in CI use encrypted secrets scoped to the compile job, and do not echo them.
-- The compiler key is a **compile-time** secret only. Runtime must not need it; proposed v1.7 makes the deploy fail if any `LLM_*`/`OPENAI_*` variable is present at runtime.
-- The compiler sandbox has no network except (in proposed v1.7) the configured endpoint host; v1.5 says the compiler has **no network at all** (§2A.7), which conflicts with calling a hosted LLM — see Spec gaps.
+- The compiler key is a **compile-time** secret only. Runtime must not need it; v1.7 makes the deploy fail if any `LLM_*`/`OPENAI_*` variable is present at runtime.
+- The compiler sandbox has no network except (in v1.7) the configured endpoint host; v1.5 says the compiler has **no network at all** (§2A.7), which conflicts with calling a hosted LLM — see Spec gaps.
 - Pin the model snapshot (§2A.6). Changing provider, host or model changes `compiler-hash` and forces a full recompile and re-approval.
 - Do not paste source containing secrets into prompts; the compiler already errors on plaintext credentials in provider source (§5).
 - Rotate keys if they ever appear in a log or commit, and enable secret scanning.
 
 ## Spec gaps
 
-- v1.5 does **not** specify how the compiler LLM endpoint, key or model are configured; all variable names here come from **unmerged** PR #5 (v1.7 draft).
-- v1.5 §2A.7 says the compiler has "no network", which contradicts calling a remote LLM API; v1.7 draft relaxes this to "egress only to the endpoint host".
+- v1.5 does **not** specify how the compiler LLM endpoint, key or model are configured; all variable names here come from spec v1.7 (Decision 57).
+- v1.5 §2A.7 says the compiler has "no network", which contradicts calling a remote LLM API; v1.7 relaxes this to "egress only to the endpoint host".
 - v1.5 requires deterministic compilation (temperature 0, fixed seed, fixed snapshot), but most hosted providers (OpenAI, Groq, OpenRouter) only offer best-effort determinism, which interacts badly with "CI recompile mismatch blocks deploy with no override" (§2A.6).
 - The SDK init/compile CLI commands are not specified.
-- Azure OpenAI and OpenRouter provider routing are not addressed by v1.5; the v1.7 draft puts Azure out of scope.
+- Azure OpenAI and OpenRouter provider routing are not addressed by v1.5; v1.7 puts Azure out of scope.
