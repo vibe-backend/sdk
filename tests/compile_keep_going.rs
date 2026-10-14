@@ -115,7 +115,9 @@ async fn bad_gateway_is_retried_with_backoff() {
 #[tokio::test]
 async fn retries_are_bounded() {
     let adapter = HttpAdapter::new(config(&flaky_server().await, 0)).unwrap();
-    let err = adapter.compile(&request()).await.err().expect("no retry");
+    let Err(err) = adapter.compile(&request()).await else {
+        panic!("no retry expected");
+    };
     assert!(err.contains("502"), "{err}");
 }
 
