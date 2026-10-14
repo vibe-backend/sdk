@@ -80,7 +80,10 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
             stored_key("catalogreadx", read_secret, &pepper, &["catalog:read"]),
             stored_key("catalogwrite", write_secret, &pepper, &["catalog:write"]),
         ],
+        api_keys_file: None,
         env_name: "test".into(),
+        jwks: None,
+        roles_claim: "roles".into(),
     };
     let loaded = vibe::runtime::load_project_slugs(&root, true).unwrap();
     assert!(loaded.slugs.contains_key("acme"));
@@ -114,11 +117,12 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         exec: Arc::new(MemoryExec::new()),
         auth,
         slugs,
-        rates: std::sync::Mutex::new(std::collections::HashMap::new()),
-        quotas: std::sync::Mutex::new(std::collections::HashMap::new()),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
         disabled: std::collections::HashSet::new(),
         min_override_ms: Some(0),
         honor_test_ip: true,
+        trusted_proxies: Vec::new(),
         dev_hints: true,
     });
     let app = router(state);
@@ -146,6 +150,17 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
     assert!(denied.headers.contains_key("www-authenticate"));
 
+    // Unauthenticated callers get 401 before any schema validation.
+    let probe = send(
+        &app,
+        "POST",
+        "/catalog/v1/products",
+        None,
+        Some(json!({"no_such_field": 1})),
+    )
+    .await;
+    assert_eq!(probe.status, StatusCode::UNAUTHORIZED);
+
     let forbidden = send(
         &app,
         "POST",
@@ -155,6 +170,42 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     )
     .await;
     assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+    let array_body = send(
+        &app,
+        "POST",
+        "/catalog/v1/products",
+        Some(staff.clone()),
+        Some(json!([{"sku": "x"}])),
+    )
+    .await;
+    assert_eq!(array_body.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        array_body.json["error"]["message"],
+        "body must be a JSON object"
+    );
+    for bad_tenant in [
+        "zzzzzzzz, t_tenant0001",
+        "TENANT0001",
+        "short",
+        "tenant0001\"",
+        "",
+    ] {
+        let bad = bearer(&token("staff-user", &["staff"], bad_tenant));
+        let rejected = send(
+            &app,
+            "POST",
+            "/catalog/v1/products",
+            Some(bad),
+            Some(product("sku-bad", "Bad", 1)),
+        )
+        .await;
+        assert_eq!(
+            rejected.status,
+            StatusCode::UNAUTHORIZED,
+            "tenant claim {bad_tenant:?} must be rejected"
+        );
+    }
 
     let created = send(
         &app,
@@ -706,8 +757,9 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
         exec: Arc::new(MemoryExec::new()),
         auth,
         slugs: std::collections::HashMap::new(),
-        rates: std::sync::Mutex::new(std::collections::HashMap::new()),
-        quotas: std::sync::Mutex::new(std::collections::HashMap::new()),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
+        trusted_proxies: Vec::new(),
         disabled: std::collections::HashSet::new(),
         min_override_ms: Some(0),
         honor_test_ip: true,
