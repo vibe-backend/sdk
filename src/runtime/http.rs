@@ -550,7 +550,29 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     status = StatusCode::from_u16(step.status).unwrap_or(StatusCode::OK);
                 }
             }
-            "validate" | "transform" => {}
+            "validate" => {
+                vars.insert("input".into(), input.clone());
+                if crud::when_matches(&step.when_expr, &vars) {
+                    let code = if step.fail.is_empty() {
+                        "VALIDATION_FAILED".to_string()
+                    } else {
+                        step.fail.clone()
+                    };
+                    let mapped = found.route.errors.iter().find(|e| e.from == code);
+                    let status = mapped
+                        .and_then(|e| StatusCode::from_u16(e.status).ok())
+                        .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+                    let public_code = mapped.map(|e| e.code.clone()).unwrap_or(code);
+                    return finish(
+                        found.route,
+                        &state,
+                        started,
+                        error_response(status, &public_code, "Invalid request", &request_id, &[]),
+                    )
+                    .await;
+                }
+            }
+            "transform" => {}
             _ => {
                 return finish(
                     found.route,

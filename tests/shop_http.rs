@@ -380,6 +380,16 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     )
     .await;
     assert_eq!(cart.status, StatusCode::CREATED);
+    // #30: the second rule (`max: 99`) is enforced too.
+    let too_many = send(
+        &app,
+        "POST",
+        "/shop/v1/cart-items",
+        Some(customer.clone()),
+        Some(json!({"product_id": product_id, "qty": 5000})),
+    )
+    .await;
+    assert_eq!(too_many.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(cart.json["user_id"], "customer-1");
     let cart_id = cart.json["id"].as_str().unwrap();
 
@@ -745,4 +755,84 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
     assert_eq!(removed.status, StatusCode::NOT_FOUND);
     let mine = send(&app, "GET", "/shop/v1/cart-items", Some(customer), None).await;
     assert_eq!(mine.json["items"].as_array().unwrap().len(), 1);
+}
+
+async fn compiled_shop() -> PathBuf {
+    let root = copy_shop();
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|err| panic!("{err}"));
+    root
+}
+
+fn validate_text(root: &Path) -> String {
+    match vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+        root,
+        deploy: false,
+        verify_key: None,
+    }) {
+        Ok(r) | Err(r) => r.to_string(),
+    }
+}
+
+fn edit(root: &Path, rel: &str, from: &str, to: &str) {
+    let path = root.join(rel);
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains(from), "{rel} lacks {from:?}");
+    fs::write(&path, text.replacen(from, to, 1)).unwrap();
+}
+
+#[tokio::test]
+async fn validator_rejects_steps_the_runtime_cannot_run() {
+    let root = compiled_shop().await;
+    let lock = "api/catalog/v1/create-product/create-product.lock.md";
+    edit(
+        &root,
+        lock,
+        "- target: product.create",
+        "- method: product.create",
+    );
+    edit(&root, lock, "- in: {", "- in: {sku: ,");
+    let text = validate_text(&root);
+    assert!(
+        text.contains("unknown key `method` for op method (use `target:`)"),
+        "{text}"
+    );
+    assert!(text.contains("method step needs `target`"), "{text}");
+    assert!(text.contains("(s1)"), "errors name the step: {text}");
+    assert!(
+        text.contains("[Transform]") && text.contains("transform in"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn validator_reports_every_broken_file_at_once() {
+    let root = compiled_shop().await;
+    edit(
+        &root,
+        "api/catalog/v1/create-product/create-product.lock.md",
+        "- value: transform.out\n- status: 201",
+        "- value: transform.out\n- status: 9999",
+    );
+    edit(
+        &root,
+        "api/shop/v1/add-cart-item/add-cart-item.lock.md",
+        "- target: cart-item.create",
+        "- target: cart-item.create\n- bogus: 1",
+    );
+    let text = validate_text(&root);
+    assert!(
+        text.contains("create-product.lock.md") && text.contains("9999"),
+        "{text}"
+    );
+    assert!(
+        text.contains("add-cart-item.lock.md") && text.contains("bogus"),
+        "{text}"
+    );
 }

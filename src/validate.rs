@@ -355,6 +355,31 @@ fn check_model(doc: &LockDoc, file: &str, report: &mut Report) {
 }
 
 fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
+    if let Some(steps) = find_section(&doc.sections, "Steps") {
+        for block in &steps.blocks {
+            let sql = block_val(block, "sql");
+            if crate::security::sql_writes(sql.trim_matches('`'))
+                && block_val(block, "writes") != "true"
+            {
+                report.push(
+                    Diag::error(file, "step SQL writes but is not marked `writes: true`")
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+            }
+            if block_val(block, "op") == "validate" {
+                if let Some(w) = block.bullets.iter().find(|b| b.key == "when") {
+                    if let Err(err) = crate::runtime::check_when(&w.value) {
+                        report.push(
+                            Diag::error(file, format!("when: {err}"))
+                                .at_step(&block.heading)
+                                .at_section("Steps"),
+                        );
+                    }
+                }
+            }
+        }
+    }
     let caps = find_section(&doc.sections, "Signature")
         .and_then(|section| section.get("capabilities"))
         .unwrap_or("");
@@ -505,6 +530,25 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
                     report.push(
                         Diag::error(file, "method targets cannot include a version")
                             .at_step(&block.heading),
+                    );
+                }
+            }
+            for problem in api_step_problems(block, &op) {
+                report.push(
+                    Diag::error(file, problem)
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+            }
+        }
+    }
+    if let Some(transform) = find_section(&doc.sections, "Transform") {
+        for key in ["in", "out"] {
+            if let Some(expr) = transform.get(key) {
+                if let Err(err) = crate::runtime::check_expr(expr) {
+                    report.push(
+                        Diag::error(file, format!("transform {key}: {err}"))
+                            .at_section("Transform"),
                     );
                 }
             }
@@ -875,6 +919,72 @@ fn rule_number(rules: &str, key: &str) -> Option<i64> {
         }
     }
     None
+}
+
+/// What the runtime would fail on for an API feature step: unknown keys
+/// (e.g. `method:` instead of `target:`), a missing target, expressions it
+/// cannot parse, a validate step without `when`/`fail`, a bad status.
+fn api_step_problems(block: &crate::lock::Block, op: &str) -> Vec<String> {
+    let allowed: &[&str] = match op {
+        "method" => &["target", "args", "out"],
+        "validate" => &["when", "fail"],
+        "respond" => &["value", "status"],
+        "transform" => &[],
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for bullet in &block.bullets {
+        let key = bullet.key.as_str();
+        if key != "op" && key != "source-lines" && !allowed.contains(&key) {
+            let hint = if key == "method" && op == "method" {
+                " (use `target:`)"
+            } else {
+                ""
+            };
+            out.push(format!("unknown key `{key}` for op {op}{hint}"));
+        }
+    }
+    let get = |k: &str| block_val(block, k);
+    match op {
+        "method" => {
+            if get("target").trim().is_empty() {
+                out.push("method step needs `target`".into());
+            }
+            let args = get("args");
+            if !args.is_empty() && args != "transform.in" {
+                if let Err(err) = crate::runtime::check_expr(&args) {
+                    out.push(format!("args: {err}"));
+                }
+            }
+        }
+        "validate" => {
+            match block.bullets.iter().find(|b| b.key == "when") {
+                Some(w) => {
+                    if let Err(err) = crate::runtime::check_when(&w.value) {
+                        out.push(format!("when: {err}"));
+                    }
+                }
+                None => out.push("validate step needs `when`".into()),
+            }
+            if get("fail").trim().is_empty() {
+                out.push("validate step needs a `fail` error code".into());
+            }
+        }
+        "respond" => {
+            let value = get("value");
+            if !value.is_empty() && value != "transform.out" {
+                if let Err(err) = crate::runtime::check_expr(&value) {
+                    out.push(format!("value: {err}"));
+                }
+            }
+            let status = get("status");
+            if !status.is_empty() && !status.parse::<u16>().is_ok_and(|s| (100..600).contains(&s)) {
+                out.push(format!("status `{status}` is not an HTTP status"));
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 fn block_val(block: &crate::lock::Block, key: &str) -> String {

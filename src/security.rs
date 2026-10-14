@@ -50,11 +50,8 @@ fn extract_method(sections: &[Section], items: &mut Vec<SecurityItem>) {
             if op == "call" {
                 push(items, "external-call", Risk::High);
             }
-            let sql = block_value(block, "sql").to_ascii_lowercase();
-            if block_value(block, "writes") == "true"
-                || sql.starts_with("insert")
-                || sql.starts_with("update")
-            {
+            let sql = block_value(block, "sql");
+            if block_value(block, "writes") == "true" || sql_writes(&sql) {
                 push(items, "write-sql", Risk::Medium);
             }
         }
@@ -150,6 +147,19 @@ pub fn pipeline_name(heading: &str) -> String {
         .to_string()
 }
 
+/// Whether SQL writes anywhere in the statement, not just at its start
+/// (leading whitespace, comments, `WITH … INSERT`, `(…)` all count).
+/// Comments and string literals are ignored.
+pub fn sql_writes(sql: &str) -> bool {
+    static WRITE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b(insert|update|merge|upsert|delete|truncate)\b").expect("regex")
+    });
+    static NOISE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?s)--[^\n]*|/\*.*?\*/|'(?:[^']|'')*'").expect("regex")
+    });
+    WRITE.is_match(&NOISE.replace_all(sql, " "))
+}
+
 fn block_value(block: &crate::lock::Block, key: &str) -> String {
     block
         .bullets
@@ -183,4 +193,30 @@ pub fn same_items(expected: &[SecurityItem], actual: &[SecurityItem]) -> bool {
     a.sort();
     b.sort();
     a == b
+}
+
+#[cfg(test)]
+mod sql_write_tests {
+    use super::sql_writes;
+
+    #[test]
+    fn writes_are_found_anywhere() {
+        for sql in [
+            "UPDATE products SET price_cents = $1",
+            "  update products set x = 1",
+            "/* bump */ UPDATE products SET x = 1",
+            "WITH p AS (SELECT id FROM products) UPDATE products SET x = 1",
+            "(INSERT INTO t VALUES (1))",
+            "INSERT INTO t SELECT 1 ON CONFLICT DO NOTHING",
+        ] {
+            assert!(sql_writes(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM products WHERE note = 'update me'",
+            "SELECT 1 -- insert later",
+            "SELECT updated_at FROM products",
+        ] {
+            assert!(!sql_writes(sql), "{sql}");
+        }
+    }
 }
