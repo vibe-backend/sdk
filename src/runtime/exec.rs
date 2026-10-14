@@ -390,6 +390,9 @@ impl QueryExec for PgExec {
         role: &str,
         stmt: Stmt,
     ) -> Result<Vec<Row>, ExecError> {
+        if !super::slugs::valid_tenant(tenant_id) {
+            return Err(ExecError::Message("invalid tenant id".into()));
+        }
         // `role` is the logical caller class. It limits which statements may
         // run; the database additionally enforces the non-owner connection
         // role (checked by `check_runtime_role`) and its migrate-time grants.
@@ -401,7 +404,7 @@ impl QueryExec for PgExec {
             .transaction()
             .await
             .map_err(|err| ExecError::Message(err.to_string()))?;
-        let schema = format!("t_{tenant_id}");
+        let schema = format!("\"t_{tenant_id}\"");
         tx.query(
             "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true)",
             &[&tenant_id, &schema],

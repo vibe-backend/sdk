@@ -1,6 +1,7 @@
 mod crud;
 mod exec;
 mod http;
+mod limiter;
 mod migrate;
 mod slugs;
 mod sql;
@@ -10,6 +11,7 @@ pub use exec::{etag, role_allows, ExecError, MemoryExec, PgExec, QueryExec, Role
 pub use http::{
     hash_api_secret, resolve_pepper, router, AppState, AuthConfig, RunEnv, Slug, StoredKey,
 };
+pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
 pub use migrate::migrate_tenant;
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
 pub use sql::{
