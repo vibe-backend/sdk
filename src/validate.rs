@@ -1022,7 +1022,7 @@ mod tests {
 
     fn doc(kind: Kind, scope: Option<Scope>, id: &str, body: &str) -> LockDoc {
         LockDoc {
-            meta: crate::lock::Meta::pending(kind, scope, id, &format!("{id}.md")),
+            meta: crate::lock::Meta::pending(kind, scope, id, format!("{id}.md")),
             sections: crate::lock::parse_sections(body).unwrap(),
         }
     }
