@@ -5,7 +5,8 @@
 //   en/...          English pages
 //   zh-hant/...     Traditional Chinese pages
 //
-// Docs are generated at build time from docs/spec-v1.5.md and docs/best-practices/*.md.
+// Docs are generated at build time from every docs/spec-v*.md (one page per version, plus
+// docs/spec/latest/ = newest) and docs/best-practices/*.md.
 // Translations live in a mirrored tree: docs/<locale>/<same relative path>, for example
 // docs/zh-hant/best-practices/rate-limit.md. When a locale has no translation, the original
 // is shown with a notice banner in that locale.
@@ -67,7 +68,7 @@ const canonicalPath = (repoPath) => {
 };
 
 // md files with a generated page -> that page (same locale); other repo paths -> GitHub blob URL.
-function rewriteLink(href, sourcePath) {
+function rewriteLink(href, sourcePath, fromRel) {
   if (!href || href.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('//')) return href;
   const [p, frag = ''] = href.split(/(?=#)/);
   const repoPath = p.startsWith('/')
@@ -75,11 +76,11 @@ function rewriteLink(href, sourcePath) {
     : path.posix.normalize(path.posix.join(path.posix.dirname(sourcePath), p));
   if (repoPath.startsWith('..')) return href;
   const page = pageBySource.get(canonicalPath(repoPath));
-  if (page) return `${page}.html${frag}`;
+  if (page) return relHref(fromRel, page) + frag;
   return `${REPO}/blob/main/${repoPath}${frag}`;
 }
 
-function render(md, sourcePath) {
+function render(md, sourcePath, fromRel) {
   const toc = [];
   const seen = new Map();
   const marked = new Marked({
@@ -98,7 +99,7 @@ function render(md, sourcePath) {
         return `<h${depth} id="${id}"><a class="anchor" href="#${id}">#</a>${inner}</h${depth}>\n`;
       },
       link({ href, title, tokens }) {
-        const h = rewriteLink(href || '', sourcePath);
+        const h = rewriteLink(href || '', sourcePath, fromRel);
         return `<a href="${esc(h)}"${title ? ` title="${esc(title)}"` : ''}>${this.parser.parseInline(tokens)}</a>`;
       },
     },
@@ -123,7 +124,15 @@ function detectLang(md) {
 const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8');
 const exists = (rel) => fs.existsSync(path.join(root, rel));
 const docs = [];
-if (exists('docs/spec-v1.5.md')) docs.push({ slug: 'spec', group: 'spec', source: 'docs/spec-v1.5.md' });
+// Spec versions: docs/spec-vX.Y(.Z).md, newest first (numeric semver sort).
+const semver = (v) => v.split('.').map(Number);
+const cmpVer = (a, b) => { const x = semver(a), y = semver(b); for (let i = 0; i < Math.max(x.length, y.length); i++) { const d = (y[i] || 0) - (x[i] || 0); if (d) return d; } return 0; };
+const specVersions = fs.readdirSync(path.join(root, 'docs')).map((f) => /^spec-v(\d+(?:\.\d+){0,2})\.md$/.exec(f)).filter(Boolean)
+  .map((m) => m[1]).sort(cmpVer);
+const LATEST = specVersions[0];
+for (const v of specVersions) {
+  docs.push({ slug: `spec-v${v}`, rel: `docs/spec/v${v}/index.html`, group: 'spec', version: v, isLatest: v === LATEST, source: `docs/spec-v${v}.md` });
+}
 if (exists('docs/best-practices')) {
   const files = fs.readdirSync(path.join(root, 'docs/best-practices')).filter((f) => f.endsWith('.md'));
   // README.md is the best-practices index page and is listed first.
@@ -136,9 +145,9 @@ if (exists('docs/best-practices')) {
     });
   }
 }
-const used = new Set(['index']);
+const used = new Set(['index', 'spec']);
 for (const d of docs) {
-  let s = d.slug, i = 2; while (used.has(s)) s = `${d.slug}-${i++}`; d.slug = s; used.add(s);
+  if (!d.rel) { let s = d.slug, i = 2; while (used.has(s)) s = `${d.slug}-${i++}`; d.slug = s; used.add(s); d.rel = `docs/${s}.html`; }
   d.md = read(d.source);
   d.lang = detectLang(d.md);
   d.variants = {};
@@ -148,11 +157,14 @@ for (const d of docs) {
     else d.variants[loc] = { source: d.source, md: d.md, translated: d.lang === loc };
   }
 }
-const pageBySource = new Map(docs.map((d) => [d.source, d.slug]));
+const pageBySource = new Map(docs.map((d) => [d.source, d.rel]));
+const LATEST_REL = 'docs/spec/latest/index.html';
+// Relative href between two page paths under a locale root.
+const relHref = (from, to) => path.posix.relative(path.posix.dirname(from), to) || path.posix.basename(to);
 
 const docTitle = (d, loc) => {
   const t = LOCALES[loc].docs;
-  if (d.group === 'spec') return t.specTitle;
+  if (d.group === 'spec') return `${t.specTitle} v${d.version}`;
   if (d.isIndex) return t.overview;
   return titleOf(d.variants[loc].md, d.slug);
 };
@@ -193,7 +205,7 @@ const NAV = [['index.html', 'home'], ['features.html', 'features'], ['quick-star
 const THEME_BOOT = "try{var t=localStorage.getItem('vb-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}document.documentElement.classList.add('js')";
 const ICON_THEME = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>';
 
-function layout({ loc, rel, title, body, active, sidebar = '', wide = false }) {
+function layout({ loc, rel, title, body, active, sidebar = '', wide = false, canonicalRel = rel }) {
   const t = LOCALES[loc];
   const depth = rel.split('/').length - 1;
   const toRoot = '../'.repeat(depth + 1);       // dist/
@@ -209,7 +221,7 @@ function layout({ loc, rel, title, body, active, sidebar = '', wide = false }) {
 <title>${esc(title)} · vibe-backend</title>
 <meta name="description" content="${esc(t.description)}">
 <meta name="color-scheme" content="light dark">
-<link rel="canonical" href="${SITE_URL}${loc}/${rel}">${alternates}
+<link rel="canonical" href="${SITE_URL}${loc}/${canonicalRel.replace(/(^|\/)index\.html$/, "$1")}">${alternates}
 <script>${THEME_BOOT}</script>
 <link rel="stylesheet" href="${toRoot}assets/style.css?v=${assetVersion['style.css']}">
 <script defer src="${toRoot}assets/site.js?v=${assetVersion['site.js']}"></script>
@@ -242,15 +254,40 @@ location.replace('${up}'+p+'/${rel}'+location.search+location.hash)})()`;
 <p>vibe-backend — ${links}</p></body></html>`;
 }
 
-function docsSidebar(loc, current) {
+// Sidebar: one "Spec" entry (-> latest; older versions via the version picker) + other doc groups.
+function docsSidebar(loc, fromRel, current) {
   const t = LOCALES[loc].docs;
   const groups = {};
-  for (const d of docs) (groups[d.group] ||= []).push(d);
-  let s = `<aside class="sidebar"><a href="index.html"${current === 'index' ? ' aria-current="page"' : ''}>${t.home}</a>`;
+  for (const d of docs) if (d.group !== 'spec' || d.isLatest) (groups[d.group] ||= []).push(d);
+  let s = `<aside class="sidebar"><a href="${relHref(fromRel, 'docs/index.html')}"${current === 'index' ? ' aria-current="page"' : ''}>${t.home}</a>`;
   for (const [g, items] of Object.entries(groups)) {
-    s += `<h4>${esc(t[g])}</h4>` + items.map((d) => `<a href="${d.slug}.html"${d.slug === current ? ' aria-current="page"' : ''}>${esc(docTitle(d, loc))}</a>`).join('');
+    s += `<h4>${esc(t[g])}</h4>` + items.map((d) => {
+      const isCur = d.group === 'spec' ? current?.group === 'spec' : d === current;
+      const href = d.group === 'spec' ? relHref(fromRel, LATEST_REL) : relHref(fromRel, d.rel);
+      return `<a href="${href}"${isCur ? ' aria-current="page"' : ''}>${esc(docTitle(d, loc))}</a>`;
+    }).join('');
   }
   return s + '</aside>';
+}
+
+// Spec version picker (segmented control) + latest/older banner.
+function specChrome(loc, fromRel, d) {
+  const t = LOCALES[loc].docs;
+  const specs = docs.filter((x) => x.group === 'spec');
+  const seg = specs.map((x) => x === d
+    ? `<span class="cur" aria-current="page">v${esc(x.version)}${x.isLatest ? ` <em>${esc(t.latest)}</em>` : ''}</span>`
+    : `<a href="${relHref(fromRel, x.isLatest ? LATEST_REL : x.rel)}">v${esc(x.version)}${x.isLatest ? ` <em>${esc(t.latest)}</em>` : ''}</a>`).join('');
+  const picker = `<nav class="versions" aria-label="${esc(t.versions)}">${seg}</nav>`;
+  const banner = d.isLatest ? '' : `<div class="notice old" role="note"><strong>${esc(t.olderVersion)}</strong> ${esc(t.olderText(d.version, LATEST))} <a href="${relHref(fromRel, LATEST_REL)}">${esc(t.goLatest(LATEST))}</a></div>`;
+  return picker + banner;
+}
+
+// Locale-level redirect page (e.g. old docs/spec.html -> docs/spec/latest/).
+function redirectPage(fromRel, toRel) {
+  const href = relHref(fromRel, toRel);
+  return `<!doctype html><html><head><meta charset="utf-8"><title>vibe-backend</title><meta http-equiv="refresh" content="0; url=${href}">`
+    + `<link rel="canonical" href="${href}"><script>location.replace(${JSON.stringify(href)}+location.hash)</script></head>`
+    + `<body><p><a href="${href}">${href}</a></p></body></html>`;
 }
 
 // ---------- development activity (omitted when unavailable) ----------
@@ -360,7 +397,7 @@ fs.cpSync(path.join(src, 'assets'), path.join(out, 'assets'), { recursive: true 
 fs.writeFileSync(path.join(out, '.nojekyll'), '');
 
 const handPages = [['index.html', 'index', 'home'], ['features.html', 'features', 'features'], ['quick-start.html', 'quick-start', 'quickStart']];
-const allRels = [...handPages.map(([f]) => f), 'docs/index.html', ...docs.map((d) => `docs/${d.slug}.html`)];
+const allRels = [...handPages.map(([f]) => f), 'docs/index.html', 'docs/spec.html', ...(LATEST ? [LATEST_REL] : []), ...docs.map((d) => d.rel)];
 let count = 0;
 
 for (const loc of locales) {
@@ -374,24 +411,26 @@ for (const loc of locales) {
     count++;
   }
 
-  const cards = docs.map((d) => `<a class="card" href="${d.slug}.html"><small>${esc(t.docs[d.group])}</small><h3>${esc(docTitle(d, loc))}</h3><p><code>${esc(d.variants[loc].source)}</code></p></a>`).join('');
+  const cards = docs.map((d) => `<a class="card" href="${relHref('docs/index.html', d.isLatest ? LATEST_REL : d.rel)}"><small>${esc(t.docs[d.group])}${d.isLatest ? ` · ${esc(t.docs.latest)}` : d.group === 'spec' ? ` · ${esc(t.docs.olderVersion)}` : ''}</small><h3>${esc(docTitle(d, loc))}</h3><p><code>${esc(d.variants[loc].source)}</code></p></a>`).join('');
   write(`${loc}/docs/index.html`, layout({
-    loc, rel: 'docs/index.html', title: t.docs.title, active: 'docs', sidebar: docsSidebar(loc, 'index'),
+    loc, rel: 'docs/index.html', title: t.docs.title, active: 'docs', sidebar: docsSidebar(loc, 'docs/index.html', 'index'),
     body: `<h1>${t.docs.title}</h1><p class="lead">${t.docs.intro}</p>${docs.length ? `<div class="cards">${cards}</div>` : `<p>${t.docs.empty}</p>`}`,
   }));
   count++;
 
-  for (const d of docs) {
+  const docPages = docs.flatMap((d) => (d.isLatest ? [[d, d.rel], [d, LATEST_REL]] : [[d, d.rel]]));
+  for (const [d, rel] of docPages) {
     const v = d.variants[loc];
-    const { html, toc } = render(v.md, v.source);
+    const { html, toc } = render(v.md, v.source, rel);
     const notice = v.translated ? '' : `<div class="notice" role="note">${esc(t.docs.fallback[d.lang] || Object.values(t.docs.fallback)[0])}</div>`;
     const tocHtml = toc.length ? `<nav class="toc"><strong>${t.docs.onThisPage}</strong>${toc.map((x) => `<a class="d${x.depth}" href="#${x.id}">${esc(x.text)}</a>`).join('')}</nav>` : '';
-    write(`${loc}/docs/${d.slug}.html`, layout({
-      loc, rel: `docs/${d.slug}.html`, title: docTitle(d, loc), active: 'docs', sidebar: docsSidebar(loc, d.slug),
-      body: `<p class="src">${t.docs.sourceLabel}: <a href="${REPO}/blob/main/${v.source}"><code>${v.source}</code></a></p>${notice}<article class="md"${v.translated ? '' : ` lang="${LOCALES[d.lang].htmlLang}"`}>${html}</article>${tocHtml}`,
+    write(`${loc}/${rel}`, layout({
+      loc, rel, canonicalRel: d.rel, title: docTitle(d, loc), active: 'docs', sidebar: docsSidebar(loc, rel, d),
+      body: `${d.group === 'spec' ? specChrome(loc, rel, d) : ''}<p class="src">${t.docs.sourceLabel}: <a href="${REPO}/blob/main/${v.source}"><code>${v.source}</code></a></p>${notice}<article class="md"${v.translated ? '' : ` lang="${LOCALES[d.lang].htmlLang}"`}>${html}</article>${tocHtml}`,
     }));
     count++;
   }
+  if (LATEST) write(`${loc}/docs/spec.html`, redirectPage('docs/spec.html', LATEST_REL));
 }
 for (const rel of allRels) write(rel, picker(rel));
 
