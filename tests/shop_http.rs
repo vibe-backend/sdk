@@ -572,7 +572,7 @@ fn collect_locks(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
 
 fn copy_shop() -> PathBuf {
     let root = std::env::temp_dir().join(format!("vibe-shop-{}", uuid::Uuid::new_v4()));
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/shop");
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shop");
     copy_dir(&src, &root);
     root
 }

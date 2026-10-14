@@ -511,6 +511,13 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                         .at_section("Steps"),
                 );
             }
+            if let Some(problem) = crate::sqlguard::query_problem(&sql) {
+                report.push(
+                    Diag::error(file, problem)
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+            }
             if writable_cte(&sql) {
                 report.push(
                     Diag::error(file, "data-modifying WITH queries are not allowed")

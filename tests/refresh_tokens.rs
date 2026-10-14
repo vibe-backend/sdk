@@ -795,3 +795,16 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
         assert!(!row.get::<_, bool>(0), "{app_role}");
     }
 }
+
+#[test]
+fn app_sql_cannot_reach_the_refresh_table() {
+    for sql in [
+        "SELECT token_hash FROM _platform_refresh_tokens",
+        "SELECT token_hash FROM \"_platform_refresh_tokens\"",
+        "SELECT token_hash FROM t_tenant0001._platform_refresh_tokens",
+        "UPDATE _platform_refresh_tokens SET revoked_at = NULL WHERE id = $1",
+        "SELECT id FROM users WHERE id IN (SELECT user_id FROM _platform_refresh_tokens)",
+    ] {
+        assert!(vibe::sqlguard::query_problem(sql).is_some(), "{sql}");
+    }
+}
