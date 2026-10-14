@@ -126,7 +126,9 @@ fn valid_slug(slug: &str) -> bool {
         && !slug.contains("--")
 }
 
-pub(crate) fn valid_tenant(tenant: &str) -> bool {
+/// Tenant ids must match `^[a-z0-9]{8,32}$` wherever they come from (slug
+/// file, JWT claim, API-key record) before they reach SQL session settings.
+pub fn valid_tenant(tenant: &str) -> bool {
     (8..=32).contains(&tenant.len())
         && tenant
             .chars()
@@ -136,6 +138,21 @@ pub(crate) fn valid_tenant(tenant: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_ids_are_strictly_validated() {
+        assert!(valid_tenant("tenant0001"));
+        for bad in [
+            "zzzzzzzz, t_tenant0001",
+            "TENANT0001",
+            "short",
+            "tenant0001\"",
+            "",
+            "a b c d e f",
+        ] {
+            assert!(!valid_tenant(bad), "{bad:?}");
+        }
+    }
 
     #[test]
     fn empty_or_broken_runtime_slugs_fail() {

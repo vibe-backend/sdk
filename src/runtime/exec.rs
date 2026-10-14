@@ -227,6 +227,10 @@ pub struct RoleStatus {
     /// ENABLE + FORCE row level security (views and RLS-less tables would
     /// expose every tenant).
     pub unprotected_relations: Vec<String>,
+    /// Policies on tenant tables other than the canonical `tenant_isolation`
+    /// (permissive policies are OR-combined, so any extra one widens access),
+    /// plus a `tenant_isolation` whose definition was altered.
+    pub foreign_policies: Vec<String>,
 }
 
 impl RoleStatus {
@@ -260,6 +264,12 @@ impl RoleStatus {
                 self.unprotected_relations.join(", ")
             ));
         }
+        if !self.foreign_policies.is_empty() {
+            out.push(format!(
+                "tenant table(s) carry policies other than the canonical tenant_isolation ({}); permissive policies are OR-combined and would let rows leak across tenants; drop them and re-run `vibe migrate`",
+                self.foreign_policies.join(", ")
+            ));
+        }
         out
     }
 }
@@ -284,7 +294,15 @@ SELECT current_user::text, \
    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
    WHERE n.nspname LIKE 't\\_%' AND c.relkind IN ('r','p','v','m','f') \
    AND has_table_privilege(current_user, c.oid, 'SELECT,INSERT,UPDATE,DELETE') \
-   AND NOT (c.relkind IN ('r','p') AND c.relrowsecurity AND c.relforcerowsecurity)), '{}')";
+   AND NOT (c.relkind IN ('r','p') AND c.relrowsecurity AND c.relforcerowsecurity)), '{}'), \
+ COALESCE((SELECT array_agg(format('%I.%I:%I', n.nspname, c.relname, p.polname) ORDER BY 1) \
+   FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
+   JOIN pg_namespace n ON n.oid = c.relnamespace \
+   WHERE n.nspname LIKE 't\\_%' AND NOT ( \
+     p.polname = 'tenant_isolation' AND p.polpermissive AND p.polcmd = '*' \
+     AND p.polroles = '{0}'::oid[] \
+     AND pg_get_expr(p.polqual, p.polrelid) = '(tenant_id = current_setting(''app.tenant_id''::text, false))' \
+     AND pg_get_expr(p.polwithcheck, p.polrelid) = '(tenant_id = current_setting(''app.tenant_id''::text, false))')), '{}')";
 
 /// Logical caller classes passed as `role` to [`QueryExec::execute`], and the
 /// statements each may run. Enforced by every executor (spec §7.1/§7.2:
@@ -485,6 +503,14 @@ impl PgExec {
         self.pool.get().await.map_err(|err| err.to_string())
     }
 
+    /// One pooled connection held for several calls (transactions, session
+    /// settings). Returned to the pool on drop.
+    pub async fn session(&self) -> Result<PgSession, String> {
+        Ok(PgSession {
+            client: self.client().await?,
+        })
+    }
+
     /// Refuses a connection role that can bypass row-level security: a
     /// superuser, a role with BYPASSRLS, or a role that owns (directly or via
     /// membership) any tenant schema or table. Spec §7.1: the connection role
@@ -505,6 +531,7 @@ impl PgExec {
             owned_types: row.get(5),
             owned_schemas: row.get(6),
             unprotected_relations: row.get(7),
+            foreign_policies: row.get(8),
         };
         let problems = status.problems();
         if problems.is_empty() {
@@ -542,6 +569,33 @@ impl PgExec {
     }
 }
 
+/// A single pinned connection from [`PgExec::session`].
+pub struct PgSession {
+    client: deadpool_postgres::Object,
+}
+
+impl PgSession {
+    /// Runs a query returning one text column.
+    pub async fn query_texts(&self, sql: &str, param: &str) -> Result<Vec<String>, String> {
+        let rows = self
+            .client
+            .query(sql, &[&param])
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    pub async fn batch(&self, statements: &[String]) -> Result<(), String> {
+        for statement in statements {
+            self.client
+                .batch_execute(statement)
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl QueryExec for PgExec {
     async fn execute(
@@ -550,6 +604,9 @@ impl QueryExec for PgExec {
         role: &str,
         stmt: Stmt,
     ) -> Result<Vec<Row>, ExecError> {
+        if !super::slugs::valid_tenant(tenant_id) {
+            return Err(ExecError::Message("invalid tenant id".into()));
+        }
         // `role` is the logical caller class. It limits which statements may
         // run; the database additionally enforces the non-owner connection
         // role (checked by `check_runtime_role`) and its migrate-time grants.
@@ -564,7 +621,7 @@ impl QueryExec for PgExec {
             .transaction()
             .await
             .map_err(|err| ExecError::Message(err.to_string()))?;
-        let schema = format!("t_{tenant_id}");
+        let schema = format!("\"t_{tenant_id}\"");
         tx.query(
             "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), \
              set_config('statement_timeout', $3, true)",
@@ -673,10 +730,12 @@ mod role_tests {
             owned_types: 1,
             owned_schemas: 1,
             unprotected_relations: vec!["t_x.later".into()],
+            foreign_policies: vec!["t_x.notes:open".into()],
         };
         let p = s.problems();
-        assert_eq!(p.len(), 7, "{p:?}");
+        assert_eq!(p.len(), 8, "{p:?}");
         assert!(p[6].contains("t_x.later"));
+        assert!(p[7].contains("t_x.notes:open") && p[7].contains("OR-combined"));
         assert!(p[0].contains("postgres"));
         assert!(p[1].contains("etl"));
     }
