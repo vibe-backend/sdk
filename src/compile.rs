@@ -1362,7 +1362,8 @@ fn semantic_check(
         }
     };
     require(&["public"], "public");
-    require(AUTH_REMOVAL_WORDS, "auth-removed");
+    // `### -auth` is checked against the mandatory `auth:` declaration in
+    // declaration_check, not accepted on a keyword (D16 as amended).
     // API features have no SQL of their own: `write-sql` on a feature is
     // inherited from the methods it calls, whose own locks carry the check.
     if doc.meta.kind != Kind::Api {
@@ -1387,7 +1388,6 @@ fn semantic_check(
 
 const AUTH_REMOVAL_WORDS: &[&str] = &[
     "-auth",
-    "no auth",
     "without auth",
     "remove auth",
     "removes auth",
@@ -1396,7 +1396,6 @@ const AUTH_REMOVAL_WORDS: &[&str] = &[
     "without authentication",
     "no login",
     "without login",
-    "public",
 ];
 
 const WRITE_WORDS: &[&str] = &[
@@ -1459,7 +1458,7 @@ fn declaration_check(doc: &LockDoc, source: &SourceFile, english: &str) -> Vec<D
             checks.push((
                 "auth",
                 has_item("auth-removed"),
-                says(&AUTH_REMOVAL_WORDS[..AUTH_REMOVAL_WORDS.len() - 1]),
+                says(AUTH_REMOVAL_WORDS),
                 "removed",
             ));
             checks.push(("writes", has_item("write-sql"), false, "true"));
@@ -2123,6 +2122,31 @@ mod security_tests {
         ] {
             assert_eq!(affirms(text, word), want, "{text}");
         }
+    }
+
+    #[test]
+    fn auth_removal_needs_a_matching_declaration() {
+        const REMOVED: &str =
+            "## Access\n- public: false\n## Pipelines\n### -auth\n- removed: true\n";
+        for (text, want) in [
+            (
+                "It is public, no auth.\n",
+                "missing frontmatter declaration `auth: removed`",
+            ),
+            (
+                "---\npublic: false\nauth: jwt\n---\nList.\n",
+                "does not match the lock",
+            ),
+            (
+                "---\npublic: false\n---\nPublic list, no auth bypass allowed.\n",
+                "missing frontmatter declaration `auth: removed`",
+            ),
+        ] {
+            let errs = errors(text, REMOVED);
+            assert!(errs.iter().any(|e| e.contains(want)), "{text:?}: {errs:?}");
+        }
+        let ok = "---\npublic: false\nauth: removed\n---\nAn internal health check.\n";
+        assert!(errors(ok, REMOVED).is_empty(), "{:?}", errors(ok, REMOVED));
     }
 
     #[test]
