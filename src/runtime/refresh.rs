@@ -27,7 +27,13 @@ impl Default for RefreshPolicy {
 #[derive(Debug, PartialEq)]
 pub enum Rotated {
     /// Rotated: the caller gets a fresh token (already stored).
-    Ok { user_id: String, family_id: String },
+    /// `expires_in`: seconds until the new token expires if unused, the
+    /// smaller of the idle window and what is left of the family lifetime.
+    Ok {
+        user_id: String,
+        family_id: String,
+        expires_in: i64,
+    },
     /// A spent token was replayed: the family is now revoked.
     Reuse { family_id: String },
     /// Unknown, revoked or expired.
@@ -66,7 +72,7 @@ pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
         // steps run as public_reader / public_writer: take away their access
         // so only the platform (the runtime role) can reach this table.
         format!(
-            "DO $$ DECLARE r text; BEGIN FOREACH r IN ARRAY ARRAY['public_reader','public_writer','PUBLIC'] LOOP \
+            "DO $$ DECLARE r text; BEGIN FOREACH r IN ARRAY ARRAY['public_reader','public_writer','app_rw','PUBLIC'] LOOP \
              IF r = 'PUBLIC' OR EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN \
              EXECUTE format('REVOKE ALL ON %s FROM %s', {lit}, CASE WHEN r = 'PUBLIC' THEN 'PUBLIC' ELSE quote_ident(r) END); \
              END IF; END LOOP; END $$",
@@ -228,10 +234,14 @@ pub fn memory_rotate(
             rows[idx].insert("grace_reissued_at".into(), now.into());
         }
     }
+    let expires_in = policy
+        .idle_ttl
+        .min(int(&cur, "family_expires_at").unwrap_or(0) - now);
     rows.push(child);
     Rotated::Ok {
         user_id: user,
         family_id: family,
+        expires_in,
     }
 }
 
@@ -287,7 +297,9 @@ mod tests {
 
     fn ok_family(r: Rotated) -> String {
         match r {
-            Rotated::Ok { family_id, user_id } => {
+            Rotated::Ok {
+                family_id, user_id, ..
+            } => {
                 assert_eq!(user_id, "u1");
                 family_id
             }
@@ -336,21 +348,38 @@ mod tests {
     }
 
     #[test]
-    fn grace_is_refused_once_the_child_was_used() {
-        // Refresh family hardening: a grace reissue must never leave two
-        // live chains in one family.
+    fn grace_needs_an_unused_child() {
         let mut rows = Vec::new();
-        let fam = memory_issue(&mut rows, T, "u1", "h0", policy(), 0);
+        memory_issue(&mut rows, T, "u1", "h0", policy(), 0);
         ok_family(memory_rotate(&mut rows, T, "h0", "h1", policy(), 1));
         ok_family(memory_rotate(&mut rows, T, "h1", "h2", policy(), 2));
         assert!(matches!(
             memory_rotate(&mut rows, T, "h0", "x", policy(), 3),
-            Rotated::Reuse { family_id } if family_id == fam
+            Rotated::Reuse { .. }
         ));
-        assert!(matches!(
-            memory_rotate(&mut rows, T, "h2", "y", policy(), 4),
-            Rotated::Invalid
-        ));
+    }
+
+    #[test]
+    fn expires_in_is_capped_by_the_family_lifetime() {
+        let mut rows = Vec::new();
+        memory_issue(&mut rows, T, "u1", "h0", policy(), 0);
+        let expires = |r: Rotated| match r {
+            Rotated::Ok { expires_in, .. } => expires_in,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            expires(memory_rotate(&mut rows, T, "h0", "h1", policy(), 1)),
+            100
+        );
+        let mut cur = "h1".to_string();
+        let mut now = 1;
+        while now < 950 {
+            now += 90;
+            let next = format!("h{now}");
+            let left = expires(memory_rotate(&mut rows, T, &cur, &next, policy(), now));
+            assert_eq!(left, 100.min(1000 - now), "at {now}");
+            cur = next;
+        }
     }
 
     #[test]

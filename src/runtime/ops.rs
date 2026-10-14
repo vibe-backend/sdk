@@ -454,9 +454,10 @@ async fn attach_refresh(
         }
     };
     out["refresh_token"] = Value::String(token);
-    // Seconds until the token expires if unused (idle-ttl). The family as a
-    // whole also ends refresh-ttl after login, whichever comes first.
-    out["refresh_expires_in"] = Value::from(spec.idle_ttl_s);
+    // Seconds until this token expires if unused: the smaller of idle-ttl
+    // and the family lifetime (a new family here; the refresh route replaces
+    // it with the remaining value on rotation).
+    out["refresh_expires_in"] = Value::from(spec.idle_ttl_s.min(spec.refresh_ttl_s));
     Ok(())
 }
 

@@ -624,7 +624,8 @@ impl QueryExec for PgExec {
                  used_at IS NOT NULL, \
                  (used_at IS NOT NULL AND now() - used_at < make_interval(secs => $2::double precision) AND grace_reissued_at IS NULL \
                   AND EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = t.replaced_by AND c.used_at IS NULL AND c.revoked_at IS NULL)), \
-                 replaced_by::text \
+                 replaced_by::text, \
+                 floor(extract(epoch FROM family_expires_at - now()))::bigint \
                  FROM _platform_refresh_tokens t WHERE token_hash = $1 FOR UPDATE",
                 &[&token_hash, &(policy.grace as f64)],
             )
@@ -642,6 +643,7 @@ impl QueryExec for PgExec {
         let used: bool = row.get(6);
         let in_grace: bool = row.get(7);
         let old_child: Option<String> = row.get(8);
+        let family_left: i64 = row.get(9);
         let revoke_family =
             "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'reuse' \
                              WHERE family_id = $1::text::uuid AND revoked_at IS NULL";
@@ -704,6 +706,7 @@ impl QueryExec for PgExec {
         Ok(Rotated::Ok {
             user_id: user,
             family_id: family,
+            expires_in: policy.idle_ttl.min(family_left),
         })
     }
 
@@ -712,22 +715,60 @@ impl QueryExec for PgExec {
         tenant_id: &str,
         target: RevokeTarget<'_>,
     ) -> Result<u64, ExecError> {
-        let (sql, params) = match target {
-            RevokeTarget::FamilyOf { hash, user } => (
-                "WITH f AS (SELECT family_id FROM _platform_refresh_tokens WHERE token_hash = $1 AND user_id = $2), \
-                 l AS (SELECT pg_advisory_xact_lock(hashtext('vibe-refresh:' || family_id::text)) FROM f) \
-                 UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'logout' \
-                 WHERE revoked_at IS NULL AND family_id = (SELECT family_id FROM f) AND (SELECT count(*) FROM l) > 0 RETURNING id",
-                vec![Some(hash.to_string()), Some(user.to_string())],
-            ),
-            RevokeTarget::User(user) => (
+        if !super::slugs::valid_tenant(tenant_id) {
+            return Err(ExecError::Message("invalid tenant id".into()));
+        }
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await.map_err(map_pg)?;
+        let schema = format!("\"t_{tenant_id}\"");
+        tx.query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true)",
+            &[&tenant_id, &schema],
+        )
+        .await
+        .map_err(map_pg)?;
+        // Take the same per-family lock as rotation for every affected family
+        // (sorted, so concurrent revokes cannot deadlock), then revoke in a
+        // new statement: under READ COMMITTED it sees children committed by
+        // a rotation that held the lock before us.
+        let families = match target {
+            RevokeTarget::FamilyOf { hash, user } => {
+                tx.query(
+                    "SELECT DISTINCT family_id::text FROM _platform_refresh_tokens \
+                     WHERE token_hash = $1 AND user_id = $2 ORDER BY 1",
+                    &[&hash, &user],
+                )
+                .await
+            }
+            RevokeTarget::User(user) => {
+                tx.query(
+                    "SELECT DISTINCT family_id::text FROM _platform_refresh_tokens \
+                     WHERE user_id = $1 AND revoked_at IS NULL ORDER BY 1",
+                    &[&user],
+                )
+                .await
+            }
+        }
+        .map_err(map_pg)?;
+        let families: Vec<String> = families.iter().map(|r| r.get(0)).collect();
+        for family in &families {
+            tx.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('vibe-refresh:' || $1))",
+                &[family],
+            )
+            .await
+            .map_err(map_pg)?;
+        }
+        let n = tx
+            .execute(
                 "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'logout' \
-                 WHERE revoked_at IS NULL AND user_id = $1 RETURNING id",
-                vec![Some(user.to_string())],
-            ),
-        };
-        let rows = self.run_tx(tenant_id, None, true, sql, params).await?;
-        Ok(rows.len() as u64)
+                 WHERE revoked_at IS NULL AND family_id::text = ANY($1)",
+                &[&families],
+            )
+            .await
+            .map_err(map_pg)?;
+        tx.commit().await.map_err(map_pg)?;
+        Ok(n)
     }
 
     async fn raw(

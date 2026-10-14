@@ -472,11 +472,6 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
         exec.batch(&statements).await?;
         println!("bootstrapped {}.{}", schema, model.table);
     }
-    if manifest.routes.iter().any(|r| r.refresh.is_some()) {
-        exec.batch(&vibe::runtime::refresh::table_statements(&schema)?)
-            .await?;
-        println!("bootstrapped {schema}._platform_refresh_tokens");
-    }
     // Migrations run in the tenant schema, never `public`.
     let quoted = vibe::runtime::quote_ident(&schema)?;
     for migration in &manifest.migrations {
@@ -488,6 +483,13 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
         statements.push("RESET search_path".into());
         exec.batch(&statements).await?;
         println!("applied {}", migration.id);
+    }
+    // Last, so the privilege revoke also overrides any schema-wide grant
+    // (`GRANT ... ON ALL TABLES IN SCHEMA`) made earlier in this run.
+    if manifest.routes.iter().any(|r| r.refresh.is_some()) {
+        exec.batch(&vibe::runtime::refresh::table_statements(&schema)?)
+            .await?;
+        println!("bootstrapped {schema}._platform_refresh_tokens");
     }
     Ok(())
 }

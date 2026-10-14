@@ -1572,7 +1572,11 @@ async fn refresh_response(
         .refresh_rotate(tenant, &hash, &new_hash, policy)
         .await
     {
-        Ok(Rotated::Ok { user_id, .. }) => {
+        Ok(Rotated::Ok {
+            user_id,
+            expires_in,
+            ..
+        }) => {
             let input = serde_json::json!({ "user_id": user_id });
             let result = crud::run_method(
                 &state.manifest,
@@ -1596,7 +1600,7 @@ async fn refresh_response(
                 Ok(result) if result.value.get("access_token").is_some() => {
                     let mut value = result.value;
                     value["refresh_token"] = Value::String(new_token);
-                    value["refresh_expires_in"] = Value::from(spec.idle_ttl_s);
+                    value["refresh_expires_in"] = Value::from(expires_in);
                     json_response(StatusCode::OK, value, request_id, &[])
                 }
                 Ok(_) => {

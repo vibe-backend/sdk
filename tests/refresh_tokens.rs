@@ -548,7 +548,8 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
         ok,
         Rotated::Ok {
             user_id: "u1".into(),
-            family_id: fam.clone()
+            family_id: fam.clone(),
+            expires_in: 600
         }
     );
     // Within grace: one reissue, which kills the lost child h1.
@@ -728,16 +729,60 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
         assert_eq!(live.get::<_, i64>(0), 0, "round {round}");
     }
 
-    // App query roles cannot reach the table.
-    for app_role in ["public_reader", "public_writer"] {
+    // logout-all racing rotations on another connection: afterwards no
+    // live token of the user may remain.
+    for round in 0..20 {
+        let user = format!("la{round}");
+        let mut tokens = Vec::new();
+        for f in 0..3 {
+            let t = format!("la{round}_{f}_0");
+            exec.refresh_issue(&tenant, &user, &t, policy)
+                .await
+                .unwrap();
+            tokens.push(t);
+        }
+        let rotate = async {
+            for t in &tokens {
+                let _ = exec2
+                    .refresh_rotate(&tenant, t, &format!("{t}n"), policy)
+                    .await
+                    .unwrap();
+            }
+        };
+        let (_, n) = tokio::join!(
+            rotate,
+            exec.refresh_revoke(&tenant, RevokeTarget::User(&user))
+        );
+        n.unwrap();
+        let live = admin
+            .query_one(
+                &format!(
+                    "SELECT count(*) FROM {schema}._platform_refresh_tokens \
+                     WHERE user_id = '{user}' AND revoked_at IS NULL"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(live.get::<_, i64>(0), 0, "round {round}");
+    }
+
+    // App roles cannot reach the table, even after a schema-wide grant.
+    for app_role in ["public_reader", "public_writer", "app_rw"] {
         let _ = admin
             .batch_execute(&format!("CREATE ROLE {app_role} NOLOGIN"))
             .await;
+        admin
+            .batch_execute(&format!(
+                "GRANT ALL ON ALL TABLES IN SCHEMA {schema} TO {app_role}"
+            ))
+            .await
+            .unwrap();
     }
     for stmt in vibe::runtime::refresh::table_statements(&schema).unwrap() {
         admin.batch_execute(&stmt).await.unwrap();
     }
-    for app_role in ["public_reader", "public_writer"] {
+    for app_role in ["public_reader", "public_writer", "app_rw"] {
         let row = admin
             .query_one(
                 &format!(
