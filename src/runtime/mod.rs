@@ -16,10 +16,10 @@ pub use http::{
     AuthConfig, RunEnv, Slug, StoredKey, REQUEST_TYPES,
 };
 pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
-pub use memory::MemoryExec;
+pub use memory::{MemoryExec, MEMORY_UNSUPPORTED_SQL};
 pub use migrate::migrate_tenant;
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
 pub use sql::{
     bootstrap_statements, quote as sql_quote, runtime_grant_statements, runtime_schema_statements,
-    Col, Stmt,
+    Col, Sort, Stmt,
 };

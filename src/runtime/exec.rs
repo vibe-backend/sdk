@@ -10,7 +10,29 @@ pub enum ExecError {
     NotFound,
     Conflict,
     Precondition,
+    /// The database refused the statement for the role: a missing table or
+    /// column privilege, or a row-level security violation (SQLSTATE 42501).
+    /// The message is for logs only.
+    Denied(String),
     Message(String),
+}
+
+/// Rejects a caller-supplied `tenant_id` before any executor runs the
+/// statement (spec §2C.4): the executor sets it from the request tenant, so
+/// even the caller's own tenant id is refused. The errors match what
+/// PostgreSQL reports for the same statement under RLS + FORCE.
+pub fn reject_tenant_input(stmt: &Stmt) -> Result<(), ExecError> {
+    match stmt {
+        Stmt::Insert { table, values, .. } if values.iter().any(|(c, _)| c.name == "tenant_id") => {
+            Err(ExecError::Denied(format!(
+                "new row violates row-level security policy for table \"{table}\""
+            )))
+        }
+        Stmt::Update { table, sets, .. } if sets.iter().any(|(c, _)| c.name == "tenant_id") => Err(
+            ExecError::Denied(format!("permission denied for table {table}")),
+        ),
+        _ => Ok(()),
+    }
 }
 
 #[async_trait]
@@ -89,6 +111,15 @@ impl RoleStatus {
     }
 }
 
+/// Runtime roles (`app_rw`, `public_reader`, `public_writer`) that do not
+/// exist or that the connection role cannot `SET ROLE` to.
+pub const MISSING_ROLES_SQL: &str = "\
+SELECT r FROM unnest($1::text[]) AS r
+WHERE CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r)
+           THEN NOT pg_has_role(current_user, r, 'MEMBER')
+           ELSE true END
+ORDER BY r";
+
 /// Catalog query behind [`PgExec::check_runtime_role`].
 pub const ROLE_STATUS_SQL: &str = "\
 SELECT current_user::text, \
@@ -108,17 +139,31 @@ SELECT current_user::text, \
  COALESCE((SELECT array_agg(format('%I.%I', n.nspname, c.relname) ORDER BY 1) \
    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
    WHERE n.nspname LIKE 't\\_%' AND c.relkind IN ('r','p','v','m','f') \
-   AND has_table_privilege(current_user, c.oid, 'SELECT,INSERT,UPDATE,DELETE') \
+   AND EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER') \
+     AND (has_table_privilege(m.oid, c.oid, 'SELECT,INSERT,UPDATE,DELETE') \
+       OR has_any_column_privilege(m.oid, c.oid, 'SELECT,INSERT,UPDATE'))) \
    AND NOT (c.relkind IN ('r','p') AND c.relrowsecurity AND c.relforcerowsecurity)), '{}'), \
  COALESCE((SELECT array_agg(format('%I.%I:%I', n.nspname, c.relname, p.polname) ORDER BY 1) \
    FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
    JOIN pg_namespace n ON n.oid = c.relnamespace \
    WHERE n.nspname LIKE 't\\_%' \
-   AND has_table_privilege(current_user, c.oid, 'SELECT,INSERT,UPDATE,DELETE') AND NOT ( \
+   AND EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER') \
+     AND (has_table_privilege(m.oid, c.oid, 'SELECT,INSERT,UPDATE,DELETE') \
+       OR has_any_column_privilege(m.oid, c.oid, 'SELECT,INSERT,UPDATE'))) AND NOT ( \
      p.polname = 'tenant_isolation' AND p.polpermissive AND p.polcmd = '*' \
      AND p.polroles = '{0}'::oid[] \
      AND pg_get_expr(p.polqual, p.polrelid) = '(tenant_id = current_setting(''app.tenant_id''::text, false))' \
      AND pg_get_expr(p.polwithcheck, p.polrelid) = '(tenant_id = current_setting(''app.tenant_id''::text, false))')), '{}')";
+
+/// A statement kind the role may never run is a permission error (403); an
+/// unknown role is a bug.
+pub fn role_error(message: String) -> ExecError {
+    if message.starts_with("unknown executor role") {
+        ExecError::Message(message)
+    } else {
+        ExecError::Denied(message)
+    }
+}
 
 /// Logical caller classes passed as `role` to [`QueryExec::execute`], and the
 /// statements each may run. Enforced by every executor (spec §7.1/§7.2:
@@ -171,6 +216,17 @@ impl PgExec {
             .query_one(ROLE_STATUS_SQL, &[])
             .await
             .map_err(pg_error)?;
+        let roles: Vec<String> = super::grants::RUNTIME_ROLES
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+        let missing: Vec<String> = client
+            .query(MISSING_ROLES_SQL, &[&roles])
+            .await
+            .map_err(pg_error)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
         drop(client);
         let status = RoleStatus {
             name: row.get(0),
@@ -183,12 +239,18 @@ impl PgExec {
             unprotected_relations: row.get(7),
             foreign_policies: row.get(8),
         };
-        let problems = status.problems();
+        let mut problems = status.problems();
+        if !missing.is_empty() {
+            problems.push(format!(
+                "cannot SET ROLE to {} (create them NOLOGIN and GRANT them to the runtime login)",
+                missing.join(", ")
+            ));
+        }
         if problems.is_empty() {
             Ok(())
         } else {
             Err(format!(
-                "refusing to serve: database role `{}` {}; connect with a non-owner role without BYPASSRLS (use VIBE_MIGRATE_DATABASE_URL for `vibe migrate`)",
+                "refusing to serve: database role `{}` {}; connect with a non-owner role without BYPASSRLS that can SET ROLE to app_rw, public_reader and public_writer (use VIBE_MIGRATE_DATABASE_URL for `vibe migrate`)",
                 status.name,
                 problems.join(", ")
             ))
@@ -233,8 +295,23 @@ impl QueryExec for PgExec {
         // `role` is the logical caller class. It limits which statements may
         // run; the database additionally enforces the non-owner connection
         // role (checked by `check_runtime_role`) and its migrate-time grants.
-        role_allows(role, &stmt).map_err(ExecError::Message)?;
+        role_allows(role, &stmt).map_err(role_error)?;
+        reject_tenant_input(&stmt)?;
+        let mut stmt = stmt;
+        if let Stmt::Insert { values, .. } = &mut stmt {
+            values.push((
+                Col {
+                    name: "tenant_id".into(),
+                    ty: "string".into(),
+                },
+                Value::String(tenant_id.into()),
+            ));
+        }
         let (sql, params) = sql::render(&stmt).map_err(ExecError::Message)?;
+        let set_role = format!(
+            "SET LOCAL ROLE {}",
+            sql::quote(role).map_err(ExecError::Message)?
+        );
         let returning = returning_cols(&stmt);
         let mut client = self.client.lock().await;
         let tx = client
@@ -248,6 +325,9 @@ impl QueryExec for PgExec {
         )
         .await
         .map_err(|err| ExecError::Message(pg_error(err)))?;
+        // Statements run as the logical role (a NOLOGIN role the runtime
+        // login is a member of), so its table and column grants apply.
+        tx.batch_execute(&set_role).await.map_err(map_pg)?;
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p as _).collect();
         let rows = tx.query(&sql, &refs).await.map_err(map_pg)?;
@@ -311,6 +391,8 @@ fn map_pg(err: tokio_postgres::Error) -> ExecError {
     let code = err.code().map(|code| code.code());
     if code == Some("23505") {
         ExecError::Conflict
+    } else if code == Some("42501") {
+        ExecError::Denied(pg_error(err))
     } else {
         ExecError::Message(pg_error(err))
     }

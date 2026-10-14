@@ -447,6 +447,10 @@ fn normalize_provider(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<
     Ok(())
 }
 
+/// Grants for a model whose source declares none.
+pub const DEFAULT_GRANTS: &str =
+    "app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer []";
+
 fn normalize_model(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Diag>> {
     let mut diags = Vec::new();
     let fields = find_section(&doc.sections, "Fields").and_then(|section| section.table.clone());
@@ -541,6 +545,22 @@ fn normalize_model(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Dia
     if find_section(&doc.sections, "CRUD").is_none() {
         doc.sections.push(Section::none("CRUD"));
     }
+    // Grants written in the source (`## Policies` `- grants:`) are kept;
+    // only a model that declares none gets the platform default.
+    let declared = find_section(&doc.sections, "Policies")
+        .and_then(|s| s.get("grants"))
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .map(str::to_string);
+    if let Some(grants) = &declared {
+        if let Err(err) = crate::runtime::grants::parse_grants(grants) {
+            diags.push(
+                Diag::error(&source.rel, format!("invalid grants: {err}")).at_section("Policies"),
+            );
+            return Err(diags);
+        }
+    }
+    let grants = declared.unwrap_or_else(|| DEFAULT_GRANTS.to_string());
     let policies = Section {
         name: "Policies".into(),
         bullets: vec![
@@ -554,8 +574,7 @@ fn normalize_model(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Dia
             },
             Bullet {
                 key: "grants".into(),
-                value: "app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer []"
-                    .into(),
+                value: grants,
             },
         ],
         table: None,

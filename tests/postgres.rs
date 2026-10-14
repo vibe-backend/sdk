@@ -42,6 +42,28 @@ async fn check_as(admin_url: &str, user: &str) -> Result<(), String> {
     exec.check_runtime_role().await
 }
 
+/// Grants of the test model: full access for `app_rw`, column-limited
+/// public roles.
+const GRANTS: &str =
+    "app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT(body)], public_writer [INSERT(body)]";
+
+/// Runtime roles (cluster-wide, NOLOGIN). Every runtime login is granted
+/// all three and runs each statement after `SET LOCAL ROLE`.
+const RUNTIME_ROLES: [&str; 3] = ["app_rw", "public_reader", "public_writer"];
+
+async fn create_runtime_roles(admin: &Client, login: &str) {
+    for role in RUNTIME_ROLES {
+        admin
+            .batch_execute(&format!(
+                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') \
+                 THEN CREATE ROLE {role} NOLOGIN; END IF; END $$; \
+                 GRANT {role} TO {login} WITH INHERIT FALSE, SET TRUE"
+            ))
+            .await
+            .unwrap();
+    }
+}
+
 fn manifest() -> Manifest {
     serde_json::from_value(json!({
         "manifest_version": 1,
@@ -51,6 +73,9 @@ fn manifest() -> Manifest {
         "models": [{
             "id": "note", "provider": "main", "table": "notes",
             "crud": [], "sensitive_output": [], "ownership": "",
+            "grants": GRANTS,
+            "rls": "enable, force",
+            "policy": "tenant_id = current_setting('app.tenant_id', false)",
             "list": {"page_size": 20, "max_page_size": 100, "sort": [], "filter": []},
             "fields": [
                 field("id", "uuid"), field("tenant_id", "string"), field("body", "string"),
@@ -115,6 +140,7 @@ async fn setup_with(admin_url: String, guard: Guard) -> Option<Setup> {
     let app = format!("app_{s}");
     create_login(&admin, &owner, "").await;
     create_login(&admin, &app, "").await;
+    create_runtime_roles(&admin, &app).await;
     admin
         .batch_execute(&format!(
             "GRANT CREATE ON DATABASE {} TO {owner}",
@@ -131,6 +157,12 @@ async fn setup_with(admin_url: String, guard: Guard) -> Option<Setup> {
     let tenant = format!("tn{s}");
     let owner_exec = PgExec::connect(&url_as(&admin_url, &owner)).await.unwrap();
     migrate_tenant(&owner_exec, &manifest(), &tenant, &app)
+        .await
+        .unwrap();
+    // `visible_rows` reads the migration table as app_rw; the runtime only
+    // ever touches model tables, so migrate grants nothing on it.
+    admin
+        .batch_execute(&format!("GRANT SELECT ON t_{tenant}.audit_notes TO app_rw"))
         .await
         .unwrap();
     Some(Setup {
@@ -183,8 +215,28 @@ async fn non_owner_runtime_role_is_accepted_and_limited() {
     let flags: Vec<bool> = (0..7).map(|i| row.get(i)).collect();
     assert_eq!(
         flags,
-        vec![true, true, true, false, false, false, true],
-        "select/insert/update only, no create, migration tables covered by default privileges"
+        vec![false, false, false, false, false, false, false],
+        "the login itself has no table privileges and no CREATE"
+    );
+    // Its statements run as app_rw, which has exactly the model grants.
+    let row = s
+        .admin
+        .query_one(
+            "SELECT has_table_privilege('app_rw', $1, 'SELECT'), has_table_privilege('app_rw', $1, 'INSERT'), \
+             has_table_privilege('app_rw', $1, 'UPDATE'), has_table_privilege('app_rw', $1, 'DELETE'), \
+             has_table_privilege('app_rw', $1, 'TRUNCATE'), \
+             has_column_privilege('public_reader', $1, 'body', 'SELECT'), \
+             has_column_privilege('public_reader', $1, 'tenant_id', 'SELECT'), \
+             has_column_privilege('public_writer', $1, 'body', 'SELECT')",
+            &[&format!("{schema}.notes")],
+        )
+        .await
+        .unwrap();
+    let flags: Vec<bool> = (0..8).map(|i| row.get(i)).collect();
+    assert_eq!(
+        flags,
+        vec![true, true, false, false, false, true, false, false],
+        "table-wide UPDATE is narrowed to columns (never id/tenant_id/created_at)"
     );
 }
 
@@ -218,7 +270,6 @@ async fn rls_isolates_tenants_for_the_runtime_role() {
                     },
                     json!(id),
                 ),
-                (cols(&["tenant_id"])[0].clone(), json!(s.tenant)),
                 (cols(&["body"])[0].clone(), json!("secret")),
                 (
                     Col {
@@ -247,7 +298,7 @@ async fn rls_isolates_tenants_for_the_runtime_role() {
     let schema = format!("t_{}", s.tenant);
     let forged = admin
         .batch_execute(&format!(
-            "SET ROLE {app}; BEGIN; SELECT set_config('app.tenant_id', 'othertenant1', true); \
+            "SET ROLE {app}; BEGIN; SET LOCAL ROLE app_rw; SELECT set_config('app.tenant_id', 'othertenant1', true); \
              INSERT INTO {schema}.notes (id, tenant_id, created_at, updated_at) \
              VALUES (gen_random_uuid(), '{t}', now(), now()); COMMIT;",
             app = s.app,
@@ -367,10 +418,12 @@ async fn migration_without_tenant_id_or_with_a_view_fails() {
 async fn serve_refuses_tables_without_forced_rls() {
     let s = require_pg!(setup_exclusive().await);
     let schema = format!("t_{}", s.tenant);
-    // A table added behind migrate's back inherits the default grants.
+    // A table added behind migrate's back gets no grants by default; one
+    // that a runtime role was granted (even a single column) is refused.
     s.admin
         .batch_execute(&format!(
-            "SET ROLE {owner}; CREATE TABLE {schema}.later (tenant_id text); RESET ROLE",
+            "SET ROLE {owner}; CREATE TABLE {schema}.later (tenant_id text); RESET ROLE; \
+             GRANT SELECT (tenant_id) ON {schema}.later TO public_reader",
             owner = s.owner
         ))
         .await
@@ -456,7 +509,7 @@ async fn serve_refuses_extra_or_altered_policies() {
     let leaked = s
         .admin
         .batch_execute(&format!(
-            "SET ROLE {app}; BEGIN; SELECT set_config('app.tenant_id', '{t}', true); \
+            "SET ROLE {app}; BEGIN; SET LOCAL ROLE app_rw; SELECT set_config('app.tenant_id', '{t}', true); \
              DO $$ BEGIN IF (SELECT count(*) FROM {schema}.audit_notes) = 0 THEN RAISE EXCEPTION 'none'; END IF; END $$; \
              COMMIT; RESET ROLE",
             app = s.app,
@@ -509,7 +562,9 @@ async fn serve_refuses_extra_or_altered_policies() {
 /// Count of rows the runtime role sees in `table` while acting as `tenant`.
 async fn visible_rows(s: &Setup, table: &str, tenant: &str) -> i64 {
     let app = connect(&url_as(&s.admin_url, &s.app)).await;
-    app.batch_execute("BEGIN").await.unwrap();
+    app.batch_execute("BEGIN; SET LOCAL ROLE app_rw")
+        .await
+        .unwrap();
     app.query("SELECT set_config('app.tenant_id', $1, true)", &[&tenant])
         .await
         .unwrap();
@@ -860,4 +915,341 @@ async fn migration_cannot_write_another_tenants_rows() {
         .unwrap()
         .get(0);
     assert_eq!(note, "secret", "{PENDING_ROLE_SPEC}");
+}
+
+/// Outcome class of a statement, comparable across executors.
+fn outcome(
+    result: Result<Vec<serde_json::Map<String, Value>>, vibe::runtime::ExecError>,
+) -> String {
+    use vibe::runtime::ExecError;
+    match result {
+        Ok(rows) => format!("ok:{}", rows.len()),
+        Err(ExecError::Denied(_)) => "denied".into(),
+        Err(ExecError::NotFound) => "not_found".into(),
+        Err(ExecError::Precondition) => "precondition".into(),
+        Err(ExecError::Conflict) => "conflict".into(),
+        Err(ExecError::Message(_)) => "error".into(),
+    }
+}
+
+fn pcol(name: &str) -> Col {
+    let ty = match name {
+        "id" => "uuid",
+        "created_at" | "updated_at" | "deleted_at" => "timestamp",
+        _ => "string",
+    };
+    Col {
+        name: name.into(),
+        ty: ty.into(),
+    }
+}
+
+fn pcols(names: &[&str]) -> Vec<Col> {
+    names.iter().map(|n| pcol(n)).collect()
+}
+
+fn p_insert(id: &str, extra: &[(&str, &str)], returning: &[&str]) -> Stmt {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut values = vec![
+        (pcol("id"), json!(id)),
+        (pcol("created_at"), json!(now)),
+        (pcol("updated_at"), json!(now)),
+    ];
+    for (c, v) in extra {
+        values.push((pcol(c), json!(v)));
+    }
+    Stmt::Insert {
+        table: "notes".into(),
+        values,
+        returning: pcols(returning),
+    }
+}
+
+fn p_select(columns: &[&str], filter: Option<(&str, &str)>, sort: Option<&str>) -> Stmt {
+    Stmt::Select {
+        table: "notes".into(),
+        columns: pcols(columns),
+        id: None,
+        filters: filter
+            .map(|(c, v)| vec![(pcol(c), json!(v))])
+            .unwrap_or_default(),
+        sort: sort.map(|c| vibe::runtime::Sort {
+            column: c.into(),
+            desc: false,
+        }),
+        limit: 100,
+        offset: 0,
+    }
+}
+
+fn p_update(id: &str, column: &str, expected: &str) -> Stmt {
+    Stmt::Update {
+        table: "notes".into(),
+        id: id.into(),
+        sets: vec![(pcol(column), json!("x"))],
+        expected_updated_at: expected.into(),
+        touched_at: chrono::Utc::now().to_rfc3339(),
+        returning: pcols(&["id"]),
+        owner: None,
+    }
+}
+
+/// Runs the same statements through the in-memory executor and PostgreSQL
+/// (as the real runtime login, with `SET LOCAL ROLE`) and requires the same
+/// outcome class for each.
+#[tokio::test]
+async fn memory_and_postgres_agree() {
+    let s = require_pg!(setup().await);
+    let other = format!("to{}", suffix());
+    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    migrate_tenant(&owner_exec, &manifest(), &other, &s.app)
+        .await
+        .unwrap();
+    let pg = PgExec::connect(&url_as(&s.admin_url, &s.app))
+        .await
+        .unwrap();
+    pg.check_runtime_role().await.unwrap();
+    let mem = vibe::runtime::MemoryExec::from_manifest(&manifest()).unwrap();
+    let t = s.tenant.clone();
+    let row1 = uuid::Uuid::new_v4().to_string();
+    let missing = uuid::Uuid::new_v4().to_string();
+    let w1 = uuid::Uuid::new_v4().to_string();
+    let w2 = uuid::Uuid::new_v4().to_string();
+    let w3 = uuid::Uuid::new_v4().to_string();
+    let r1 = uuid::Uuid::new_v4().to_string();
+    // (name, tenant, role, statement, expected outcome)
+    let cases: Vec<(&str, &str, &str, Stmt, &str)> = vec![
+        (
+            "rw insert",
+            &t,
+            "app_rw",
+            p_insert(&row1, &[("body", "b")], &["id", "body"]),
+            "ok:1",
+        ),
+        (
+            "rw select",
+            &t,
+            "app_rw",
+            p_select(&["id", "body"], None, Some("created_at")),
+            "ok:1",
+        ),
+        (
+            "other tenant sees nothing",
+            &other,
+            "app_rw",
+            p_select(&["id"], None, None),
+            "ok:0",
+        ),
+        (
+            "other tenant cannot update",
+            &other,
+            "app_rw",
+            p_update(&row1, "body", "2000-01-01T00:00:00Z"),
+            "precondition",
+        ),
+        (
+            "writer insert returning an unreadable column",
+            &t,
+            "public_writer",
+            p_insert(&w1, &[("body", "b")], &["id", "body"]),
+            "denied",
+        ),
+        (
+            "writer insert returning readable columns",
+            &t,
+            "public_writer",
+            p_insert(&w2, &[("body", "b")], &["id", "updated_at"]),
+            "ok:1",
+        ),
+        (
+            "writer insert with tenant_id",
+            &t,
+            "public_writer",
+            p_insert(&w3, &[("tenant_id", &t)], &["id"]),
+            "denied",
+        ),
+        (
+            "writer cannot update",
+            &t,
+            "public_writer",
+            p_update(&row1, "body", "2000-01-01T00:00:00Z"),
+            "denied",
+        ),
+        (
+            "writer cannot select",
+            &t,
+            "public_writer",
+            p_select(&["body"], None, None),
+            "denied",
+        ),
+        (
+            "rw update tenant_id",
+            &t,
+            "app_rw",
+            p_update(&row1, "tenant_id", "2000-01-01T00:00:00Z"),
+            "denied",
+        ),
+        (
+            "rw stale update",
+            &t,
+            "app_rw",
+            p_update(&row1, "body", "2000-01-01T00:00:00Z"),
+            "precondition",
+        ),
+        (
+            "rw update missing row",
+            &t,
+            "app_rw",
+            p_update(&missing, "body", "2000-01-01T00:00:00Z"),
+            "precondition",
+        ),
+        (
+            "rw soft delete missing row",
+            &t,
+            "app_rw",
+            Stmt::SoftDelete {
+                table: "notes".into(),
+                id: missing.clone(),
+                touched_at: "2000-01-01T00:00:00Z".into(),
+                owner: None,
+            },
+            "not_found",
+        ),
+        (
+            "reader select granted column",
+            &t,
+            "public_reader",
+            p_select(&["body"], Some(("body", "b")), None),
+            "ok:2",
+        ),
+        (
+            "reader select ungranted column",
+            &t,
+            "public_reader",
+            p_select(&["tenant_id"], None, None),
+            "denied",
+        ),
+        (
+            "reader sort by ungranted column",
+            &t,
+            "public_reader",
+            p_select(&["body"], None, Some("created_at")),
+            "denied",
+        ),
+        (
+            "reader cannot insert",
+            &t,
+            "public_reader",
+            p_insert(&r1, &[("body", "b")], &["id"]),
+            "denied",
+        ),
+        (
+            "writer cannot soft delete",
+            &t,
+            "public_writer",
+            Stmt::SoftDelete {
+                table: "notes".into(),
+                id: row1.clone(),
+                touched_at: "2000-01-01T00:00:00Z".into(),
+                owner: None,
+            },
+            "denied",
+        ),
+        (
+            "invalid tenant",
+            "",
+            "app_rw",
+            p_select(&["id"], None, None),
+            "error",
+        ),
+        (
+            "rw soft delete",
+            &t,
+            "app_rw",
+            Stmt::SoftDelete {
+                table: "notes".into(),
+                id: row1.clone(),
+                touched_at: "2000-01-01T00:00:00Z".into(),
+                owner: None,
+            },
+            "ok:1",
+        ),
+        (
+            "deleted rows are hidden",
+            &t,
+            "app_rw",
+            p_select(&["id"], None, None),
+            "ok:1",
+        ),
+    ];
+    let mut mismatches = Vec::new();
+    for (name, tenant, role, stmt, expected) in cases {
+        let got_mem = outcome(mem.execute(tenant, role, stmt.clone()).await);
+        let got_pg = outcome(pg.execute(tenant, role, stmt).await);
+        if got_mem != expected || got_pg != expected {
+            mismatches.push(format!(
+                "{name}: expected {expected}, memory {got_mem}, postgres {got_pg}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    // A real update with the current version succeeds in both.
+    for (label, exec) in [("memory", &mem as &dyn QueryExec), ("postgres", &pg)] {
+        let current = exec
+            .execute(
+                &t,
+                "app_rw",
+                p_select(&["updated_at"], Some(("body", "b")), None),
+            )
+            .await
+            .unwrap();
+        let ts = current[0]["updated_at"].as_str().unwrap().to_string();
+        let id_rows = exec
+            .execute(&t, "app_rw", p_select(&["id"], Some(("body", "b")), None))
+            .await
+            .unwrap();
+        let id = id_rows[0]["id"].as_str().unwrap().to_string();
+        let got = outcome(exec.execute(&t, "app_rw", p_update(&id, "body", &ts)).await);
+        assert_eq!(got, "ok:1", "{label}");
+    }
+}
+
+/// What PostgreSQL itself does when a statement runs without the tenant
+/// setting. The executors never do this (they refuse an invalid tenant up
+/// front); the test documents the database-level behaviour on a pooled
+/// connection, where an earlier transaction already defined the setting.
+#[tokio::test]
+async fn missing_tenant_setting_in_postgres() {
+    let s = require_pg!(setup().await);
+    let schema = format!("t_{}", s.tenant);
+    let app = connect(&url_as(&s.admin_url, &s.app)).await;
+    // Fresh session: the setting was never defined, so the policy errors.
+    let fresh = app
+        .batch_execute(&format!(
+            "BEGIN; SET LOCAL ROLE app_rw; SELECT count(*) FROM {schema}.notes"
+        ))
+        .await;
+    app.batch_execute("ROLLBACK").await.unwrap();
+    assert!(fresh.is_err(), "a fresh session must error");
+    // Reused session: `set_config(.., true)` left the setting defined as
+    // '' after commit, so the same query matches no tenant and returns 0
+    // rows instead of failing.
+    app.batch_execute(&format!(
+        "BEGIN; SELECT set_config('app.tenant_id', '{}', true); COMMIT",
+        s.tenant
+    ))
+    .await
+    .unwrap();
+    app.batch_execute("BEGIN; SET LOCAL ROLE app_rw")
+        .await
+        .unwrap();
+    let n: i64 = app
+        .query_one(&format!("SELECT count(*) FROM {schema}.notes"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    app.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(n, 0);
 }

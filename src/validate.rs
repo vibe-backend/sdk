@@ -369,12 +369,17 @@ fn check_model(doc: &LockDoc, file: &str, report: &mut Report) {
                     .at_section("Policies"),
             );
         }
-        let grants = policies.get("grants").unwrap_or("").to_ascii_lowercase();
-        if grants.contains("delete") || grants.contains("truncate") {
-            report.push(
-                Diag::error(file, "runtime grants cannot include DELETE or TRUNCATE")
-                    .at_section("Policies"),
-            );
+        // Parsed structurally: only SELECT/INSERT/UPDATE exist, so DELETE,
+        // TRUNCATE or anything else is refused, while a column such as
+        // `deleted_at` inside `UPDATE(...)` is fine.
+        if let Err(err) = crate::runtime::grants::parse_grants(policies.get("grants").unwrap_or(""))
+        {
+            let msg = if err.contains("unsupported privilege") {
+                format!("runtime grants cannot include DELETE or TRUNCATE ({err})")
+            } else {
+                format!("invalid grants: {err}")
+            };
+            report.push(Diag::error(file, msg).at_section("Policies"));
         }
     }
 }

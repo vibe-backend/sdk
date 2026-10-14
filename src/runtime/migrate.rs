@@ -1,6 +1,7 @@
 use crate::manifest::Manifest;
 
 use super::exec::PgExec;
+use super::grants::{parse_grants, pg_grant_statements};
 use super::slugs::valid_tenant;
 use super::sql::{
     bootstrap_statements, quote, rls_statements, runtime_grant_statements,
@@ -202,6 +203,15 @@ async fn migrate_in_tx(
         log.push(format!("applied {}", migration.id));
     }
     exec.batch(&["RESET search_path".to_string()]).await?;
+    // The runtime roles get exactly the effective grants from the lock, on
+    // every run (a changed grant is applied by the next migrate).
+    for model in &manifest.models {
+        let grants = parse_grants(&model.grants)
+            .map_err(|err| format!("model {}: grants: {err}", model.id))?;
+        exec.batch(&pg_grant_statements(&schema, model, &grants)?)
+            .await?;
+        log.push(format!("granted {schema}.{}", model.table));
+    }
     log.extend(protect_schema(exec, &schema).await?);
     // Fail closed: any RLS problem in any tenant schema fails the migration,
     // whether this run introduced it or it was already there (for example

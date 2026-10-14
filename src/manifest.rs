@@ -187,6 +187,12 @@ pub struct ModelSpec {
     /// Raw `## Policies` `grants:` line (role and column grants).
     #[serde(default)]
     pub grants: String,
+    /// Raw `## Policies` `rls:` and `policy:` lines. Omitted from the JSON
+    /// when empty, so manifests signed before these fields existed verify.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rls: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub policy: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -275,7 +281,9 @@ pub fn read_manifest(path: &Path, key: &VerifyingKey) -> Result<Manifest, Report
     manifest.signature.clear();
     let canonical = serde_json::to_vec(&manifest).map_err(|err| single(err.to_string()))?;
     if !sign::verify_bytes(&canonical, &signature, key) {
-        return Err(single("manifest signature is invalid".into()));
+        return Err(single(
+            "manifest signature is invalid: the file was changed after signing, signed with another key, or built by a different vibe version (rebuild it with `vibe build`)".into(),
+        ));
     }
     manifest.signature = signature;
     Ok(manifest)
@@ -454,11 +462,18 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
         sensitive_output,
         owner_key,
         ownership,
-        grants: find_section(&doc.sections, "Policies")
-            .and_then(|s| s.get("grants"))
-            .unwrap_or("")
-            .to_string(),
+        grants: policy_line(doc, "grants"),
+        rls: policy_line(doc, "rls"),
+        policy: policy_line(doc, "policy"),
     }
+}
+
+fn policy_line(doc: &LockDoc, key: &str) -> String {
+    find_section(&doc.sections, "Policies")
+        .and_then(|s| s.get(key))
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 fn method_from(doc: &LockDoc) -> MethodSpec {

@@ -114,6 +114,12 @@ fn render_insert(
         .map(|col| Ok(format!("{}::text", quote(&col.name)?)))
         .collect::<Result<Vec<_>, String>>()?
         .join(", ");
+    // An empty list (no readable column) still needs one expression.
+    let ret = if ret.is_empty() {
+        "NULL".to_string()
+    } else {
+        ret
+    };
     let sql = format!(
         "INSERT INTO {table} ({}) VALUES ({}) RETURNING {ret}",
         cols.join(", "),
@@ -143,6 +149,12 @@ fn render_select(
         })
         .collect::<Result<Vec<_>, String>>()?
         .join(", ");
+    // An empty list (no readable column) still needs one expression.
+    let cols = if cols.is_empty() {
+        "NULL".to_string()
+    } else {
+        cols
+    };
     let mut params = Vec::new();
     let mut where_sql = vec!["\"deleted_at\" IS NULL".to_string()];
     if let Some(id) = id {
@@ -239,6 +251,12 @@ fn render_update(
         .map(|col| Ok(format!("{}::text", quote(&col.name)?)))
         .collect::<Result<Vec<_>, String>>()?
         .join(", ");
+    // An empty list (no readable column) still needs one expression.
+    let ret = if ret.is_empty() {
+        "NULL".to_string()
+    } else {
+        ret
+    };
     let sql = format!(
         "UPDATE {table} SET {} WHERE \"id\" = ${id_n}::text::uuid AND \"updated_at\" = ${ts_n}::text::timestamptz AND \"deleted_at\" IS NULL{owner_sql} RETURNING {ret}",
         assigns.join(", ")
@@ -280,8 +298,10 @@ fn json_text(value: &Value) -> Option<String> {
     }
 }
 
-/// Grants for the runtime (non-owner) role: schema usage plus SELECT, INSERT
-/// and UPDATE on the table. Never DELETE or TRUNCATE (spec §7.1).
+/// Table statements for the runtime login itself: schema usage and no
+/// direct table privileges. Every statement runs after `SET LOCAL ROLE` as
+/// one of the runtime roles, which get their grants from
+/// [`super::grants::pg_grant_statements`]. Never DELETE or TRUNCATE (spec §7.1).
 pub fn runtime_grant_statements(
     schema: &str,
     table: &str,
@@ -293,13 +313,12 @@ pub fn runtime_grant_statements(
     Ok(vec![
         format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
         format!("REVOKE ALL ON {qualified} FROM {role}"),
-        format!("GRANT SELECT, INSERT, UPDATE ON {qualified} TO {role}"),
     ])
 }
 
 /// Schema-level statements for the runtime role: no CREATE on the tenant
-/// schema (for anyone but the owner), and default privileges so tables that
-/// migrations create later get the same SELECT/INSERT/UPDATE grant.
+/// schema (for anyone but the owner). Tables get no default privileges; the
+/// runtime roles' grants are applied per model after every migration.
 pub fn runtime_schema_statements(schema: &str, role: &str) -> Result<Vec<String>, String> {
     let schema = quote(schema)?;
     let role = quote(role)?;
@@ -307,9 +326,7 @@ pub fn runtime_schema_statements(schema: &str, role: &str) -> Result<Vec<String>
         format!("REVOKE CREATE ON SCHEMA {schema} FROM PUBLIC"),
         format!("REVOKE CREATE ON SCHEMA {schema} FROM {role}"),
         format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
-        format!(
-            "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT, INSERT, UPDATE ON TABLES TO {role}"
-        ),
+        format!("ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} REVOKE ALL ON TABLES FROM {role}"),
     ])
 }
 
@@ -391,9 +408,8 @@ mod tests {
     #[test]
     fn runtime_grants_never_include_delete() {
         let stmts = runtime_grant_statements("t_acme0001", "products", "vibe_app").unwrap();
-        assert!(stmts
-            .iter()
-            .any(|s| s.contains("GRANT SELECT, INSERT, UPDATE")));
+        assert!(stmts.iter().any(|s| s.starts_with("REVOKE ALL")));
+        assert!(stmts.iter().all(|s| !s.contains("GRANT SELECT")));
         assert!(stmts
             .iter()
             .all(|s| !s.contains("DELETE") && !s.contains("TRUNCATE")));
