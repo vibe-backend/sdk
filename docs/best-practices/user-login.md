@@ -39,6 +39,8 @@ Wrong credentials return 401 INVALID_CREDENTIALS; validation failure returns 422
 
 `models/user/methods/login.lock.md`
 
+> **Note:** `INVALID_CREDENTIALS` is a **self-defined error code**, declared by the `user.login` method in its `## Signature` `errors` and mapped to 401 in the api lock. It is not a platform-reserved code, though the spec reuses the same name for lockout responses (§4A.3).
+
 ````markdown
 ---
 lock-version: 1
@@ -196,6 +198,8 @@ signature: MEUCIQ...
 | 401 | INVALID_CREDENTIALS | user.login |
 | 422 | VALIDATION_FAILED | platform |
 ````
+
+`INVALID_CREDENTIALS` above is the self-defined code from `user.login` (see the note before the method lock).
 
 The model lock must grant `public_writer [UPDATE(last_login_at)]` and mark `last_login_at` `public-writable` (§12.8) — itself a high-risk `public-writable-column` item.
 

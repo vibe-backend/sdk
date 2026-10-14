@@ -2,6 +2,8 @@
 
 This directory collects best-practice patterns for writing Markdown-driven backend definitions. Every page is derived **strictly** from [`docs/spec-v1.5.md`](../spec-v1.5.md) (the finalized v1.5 spec). Section references such as "§7.2" or "Decision 30" point to that spec.
 
+> **Spec version note:** this directory is written against **spec v1.5**. Spec v1.7 (PR #5, not yet merged) will supersede it. When v1.7 lands, these pages will be updated accordingly, in particular the optimistic locking page, the login page (v1.7 requires a verified email before login) and the registration flow pages (v1.7 sets the password at the verification step instead of at registration).
+
 Each page has the same structure:
 
 1. **Purpose** – what the pattern is for and when to use it.

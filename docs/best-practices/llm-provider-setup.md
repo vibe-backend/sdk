@@ -9,7 +9,7 @@ The compiler turns natural-language source `.md` into lock md using an LLM (§2.
 > - Neutral names `LLM_PROVIDER` (default `openai`), `LLM_BASE_URL`, `LLM_API_KEY` (required), `LLM_MODEL` (required, pinned snapshot).
 > - `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` are accepted as **aliases** only when `LLM_PROVIDER=openai`; `LLM_*` wins, and conflicting values are an error.
 >
-> This page uses `OPENAI_BASE_URL` / `OPENAI_API_KEY` (plus `OPENAI_MODEL`) because every provider below is reached through the OpenAI-compatible adapter. You can use the `LLM_*` names instead.
+> The v1.7 draft supports three providers via `LLM_PROVIDER`: `openai` (default; covers OpenAI and every OpenAI-compatible endpoint, Bearer auth), `anthropic` and `gemini`. The OpenAI-compatible examples use the `OPENAI_*` aliases; Anthropic and Gemini must use `LLM_*`.
 
 ## Natural-language source example
 
@@ -36,7 +36,7 @@ In CI, set the values as **CI secrets** (e.g. GitHub Actions `secrets.OPENAI_API
 - name: Compile locks
   env:
     LLM_PROVIDER: openai
-    OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+    OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}   # not secret: repository variable
     OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     OPENAI_MODEL: gpt-4.1-2025-04-14
   run: echo "run the SDK compile command here"
@@ -71,8 +71,37 @@ OPENAI_API_KEY=sk-...your-key...
 OPENAI_MODEL=gpt-4.1-2025-04-14
 ```
 
+- Auth: `Authorization: Bearer {key}` on `POST {base}/chat/completions` (v1.7 draft §2A.8.2). Every OpenAI-compatible provider on this page uses the same Bearer header.
 - Use a dated snapshot, not an undated alias such as `gpt-4.1`.
 - OpenAI documents `seed` as beta / best-effort; determinism is not guaranteed.
+
+### Anthropic
+
+The Anthropic and Gemini sections use `LLM_*` names: the `OPENAI_*` aliases are accepted **only** with `LLM_PROVIDER=openai`, and setting them with another provider is an error (v1.7 draft §2A.8.3).
+
+```dotenv
+LLM_PROVIDER=anthropic
+LLM_BASE_URL=https://api.anthropic.com
+LLM_API_KEY=sk-ant-...your-key...
+LLM_MODEL=claude-sonnet-4-6
+```
+
+- Request: `POST {base}/v1/messages` with headers `x-api-key: {key}`, `anthropic-version: 2023-06-01` (not Bearer). The base URL has **no** `/v1`; the path adds it (v1.7 draft §2A.8.2).
+- The v1.7 draft accepts undated ids that Anthropic documents as fixed snapshots (4.6 generation onward); never use `*-latest` aliases.
+- Newer models accept only `temperature: 1` and have no seed, so outputs are not guaranteed deterministic; CI recompile mismatches block deploys.
+
+### Gemini
+
+```dotenv
+LLM_PROVIDER=gemini
+LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta
+LLM_API_KEY=your-gemini-api-key
+LLM_MODEL=gemini-2.5-pro
+```
+
+- Request: `POST {base}/models/{LLM_MODEL}:generateContent` with header `x-goog-api-key: {key}`. Never put the key in the `?key=` query string, because it ends up in logs (v1.7 draft §2A.8.2).
+- Use a stable model id, not `-latest` or `-preview` names.
+- `seed` is accepted but only best-effort.
 
 ### Azure OpenAI
 
@@ -91,9 +120,10 @@ OPENAI_MODEL=your-deployment-name
 ```dotenv
 OPENAI_BASE_URL=https://openrouter.ai/api/v1
 OPENAI_API_KEY=sk-or-...your-key...
-OPENAI_MODEL=openai/gpt-4.1
+OPENAI_MODEL=openai/gpt-4o-2024-11-20
 ```
 
+- Use a dated slug (here `openai/gpt-4o-2024-11-20`), consistent with the dated OpenAI snapshot above. Undated slugs such as `openai/gpt-4.1` are floating aliases; check the catalog (`GET https://openrouter.ai/api/v1/models`) for a dated slug of the model you want, and don't use OpenRouter for deployable locks if none exists.
 - OpenRouter can route one model slug to different upstream providers and offers `~...-latest` aliases. Both break determinism: never use `latest` aliases, and pin the upstream provider if you must use it for compiling.
 
 ### Groq
