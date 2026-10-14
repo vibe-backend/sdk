@@ -78,10 +78,20 @@ fn config() -> LlmConfig {
         seed: 0,
         endpoint_host: "api.openai.com".into(),
         endpoint_private: false,
+        api_style: "chat".into(),
     }
 }
 
 fn responder(request: &LlmRequest) -> Result<String, String> {
+    // The keyword check reads an English translation (#37); answer it.
+    if request.system == vibe::compile::TRANSLATE_PROMPT {
+        return Ok(if request.input.contains("cart_id") {
+            "# cart-item\n\nCart item. Fields: cart_id (uuid, required), product_id (uuid, required), qty (integer, 1 to 99).\ncart_id and product_id are unique together (one cart cannot have two rows for the same product).\nProvides create and list.\n"
+        } else {
+            "# product\n\nProduct. Fields: sku (string, required, unique, at most 40 chars), name (string, required, at most 80 chars), price_cents (integer, required, at least 0).\nProvides get and list.\n"
+        }
+        .into());
+    }
     assert!(request.system.contains("最長/最多/不超過 N 字"));
     if request.input.contains("ID: product\n") {
         Ok(PRODUCT_DRIFT.into())
