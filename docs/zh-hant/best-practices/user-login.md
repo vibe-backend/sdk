@@ -55,7 +55,7 @@ dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
   - { id: user/methods/sign-token, kind: method, hash: sha256:3b90...d4 }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01 }
+compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
 status: approved
 approval-mode: manual
@@ -69,7 +69,7 @@ signature: MEUCIQ...
 ---
 ## Signature
 - input: { email: { type: string, format: email, required: true }, password: { type: string, min: 1, max: 256, required: true } }
-- output: { user: { id, email, name, roles }, token: string }
+- output: { user: { id, email, name, roles }, token: string, refresh_token: string }
 - errors: [INVALID_CREDENTIALS]
 - writes: true
 
@@ -82,7 +82,7 @@ signature: MEUCIQ...
 - op: query
 - provider: main
 - table: users
-- sql: `select id, email, name, roles, password from users where email = $1 and deleted_at is null`
+- sql: `select id, email, name, roles, password from users where email = $1 and deleted_at is null and email_verified_at is not null`
 - params: [input.email]
 - writes: false
 - out: u
@@ -124,7 +124,7 @@ signature: MEUCIQ...
 
 ### s6 respond
 - op: respond
-- value: { user: { id: u.id, email: u.email, name: u.name, roles: u.roles }, token: t.token }
+- value: { user: { id: u.id, email: u.email, name: u.name, roles: u.roles }, token: t.token, refresh_token: t.refresh_token }
 - source-lines: 10-10
 ````
 
@@ -141,7 +141,7 @@ signature: MEUCIQ...
 - public-writes: true
 - role: public_reader + public_writer
 - writable-columns: { users: [last_login_at] }
-- challenge: captcha-after-3-failures   # 4A.3
+- challenge: { type: captcha, when: after-failures, after-failures: 3 }   # 4A.3
 - min-response: 500ms
 - external-calls: forbidden
 - daily-write-quota: platform-default
@@ -174,11 +174,11 @@ signature: MEUCIQ...
 ## Response
 | status | schema | headers |
 |---|---|---|
-| 200 | { token, user: { id, email, name, roles } } | |
+| 200 | { token, refresh_token, user: { id, email, name, roles } } | |
 
 ## Transform
 - in: { email: req.body.email, password: req.body.password }
-- out: { token: result.token, user: result.user }
+- out: { token: result.token, refresh_token: result.refresh_token, user: result.user }
 
 ## Steps
 ### s1 method

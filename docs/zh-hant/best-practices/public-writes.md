@@ -32,7 +32,7 @@ Create the review with review.submit; on success return 201 with id. If the item
 - public-writes: true
 - role: public_writer
 - writable-columns: { reviews: [item_id, rating, comment] }
-- challenge: captcha
+- challenge: { type: captcha, when: always }
 - external-calls: forbidden
 - daily-write-quota: platform-default
 - audit-log: required

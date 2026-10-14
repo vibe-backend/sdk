@@ -62,12 +62,13 @@ subject erase --subject <id> --reason "..."
 |---|---|
 | get | sensitive-output: [] |
 | list | pagination: offset, page-size: 20, max-page-size: 100, sort: [created_at], filter: [] |
-| update | partial: true, optimistic-lock: updated_at |
+| update | partial: true, optimistic-lock: if-match |
 
 ## Policies
 - rls: enable, force
 - policy: tenant_id = current_setting('app.tenant_id', false)
 - grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT]
+- subject-key: user_id
 ````
 
 欄位規則中的 `personal: standard | sensitive` 依照 v1.7 的 `user` 和 `email-outbox` lock（§12.8、§12.11.2）。`subject-key` 依照 Decision 65 的語法（§12.10）：`subject-key: {column}` 或 `subject-key: [{column}, ...]`（任一符合即算），其中 `{column}` 是指向 `users.id` 的 `uuid` 欄位（`users` 表用其本身的 `id`），或 `hash:{column}`，即存放 `HMAC-SHA-256(pepper, normalize(email))` 的 `bytea` 欄位，供沒有 `user_id` 的資料列使用（例如 `email_outbox.recipient_hash`）。有個人欄位但沒有 `subject-key` 的 model 屬 validator 錯誤。`erased_at` 在 v1.7 是平台系統欄位（F5）。

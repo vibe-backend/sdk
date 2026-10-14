@@ -31,7 +31,7 @@ source-hash: sha256:3b90...d4
 source-type: natural
 dependencies:
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01 }
+compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
 status: approved
 approval-mode: manual
@@ -45,7 +45,7 @@ signature: MEQCIA...
 ---
 ## Signature
 - input: { sub: { type: uuid, required: true } }
-- output: { token: string }
+- output: { token: string, refresh_token: string }
 - errors: []
 - writes: false
 - capabilities: [sign-token]
@@ -63,12 +63,13 @@ signature: MEQCIA...
 - platform-claims-source: { roles: users.roles where id = sub, tenant_id: ctx.tenant_id }
 - ttl: 1h
 - ttl-cap: 1h
+- issue-refresh: platform-decided
 - out: token
 - source-lines: 1-5
 
 ### s2 respond
 - op: respond
-- value: { token: token }
+- value: { token: token.access, refresh_token: token.refresh }
 - source-lines: 4-4
 ````
 

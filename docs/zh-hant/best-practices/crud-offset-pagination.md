@@ -50,14 +50,19 @@ Validation failure returns 422.
 | name | type | rules | system |
 |---|---|---|---|
 | id | uuid | primary, default: gen | yes |
-| email | string | format: email, unique | no |
-| name | string | max: 50 | no |
-| password | password | argon2id | no |
-| roles | string[] | | no |
+| email | string | format: email, unique, max: 254, untrusted, personal: standard | no |
+| name | string | max: 50, untrusted, personal: standard | no |
+| password | password | argon2id, nullable | no |
+| roles | string[] | default: [], max-items: 20 | no |
 | last_login_at | timestamp | nullable, public-writable | no |
+| email_verified_at | timestamp | nullable, public-writable (confirm-verification) | no |
+| email_verify_hash | bytes | nullable, unique, public-writable | no |
+| email_verify_expires_at | timestamp | nullable, public-writable | no |
+| email_verify_purpose | string | nullable, enum: [register, invite] | no |
 | created_at | timestamp | default: now | yes |
 | updated_at | timestamp | default: now | yes |
 | deleted_at | timestamp | nullable | yes |
+| erased_at | timestamp | nullable | yes |
 | tenant_id | string | platform | yes |
 
 ## CRUD
@@ -65,12 +70,12 @@ Validation failure returns 422.
 |---|---|
 | get | sensitive-output: [] |
 | list | pagination: offset, page-size: 20, max-page-size: 100, sort: [created_at, name], filter: [email] |
-| update | partial: true, optimistic-lock: updated_at |
+| update | partial: true, optimistic-lock: if-match |
 
 ## Policies
 - rls: enable, force
 - policy: tenant_id = current_setting('app.tenant_id', false)
-- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer [UPDATE(last_login_at)]
+- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer [INSERT(email, name, email_verify_hash, email_verify_expires_at, email_verify_purpose), UPDATE(email_verify_hash, email_verify_expires_at, email_verify_purpose, password, email_verified_at, last_login_at)]
 ````
 
 這與 v1.7 §12.8 的 `user` lock 一致。model 層的 `public_writer` 授權是所有公開端點的**聯集**（登入寫入 `last_login_at`；註冊和 verify-email 寫入驗證欄位和密碼）；每個 api 的實際授權只限其本身 lock 用到的欄位（§12.8、§12.11.6、§12.11.7）。可公開寫入的欄位屬於高風險的 `public-writable-column` 安全項目。見 [user-login.md](user-login.md) 和 [user-register.md](user-register.md)。

@@ -36,6 +36,7 @@ At most 5 per minute per IP and at most 100 per minute per tenant.
 ## Pipelines
 ### p1 rate-limit
 - per-minute: 60
+- key: ip
 
 ## Defaults
 (none)
@@ -56,7 +57,7 @@ source: pipelines/login-guard.md
 source-hash: sha256:51bd...07
 source-type: natural
 dependencies: []
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01 }
+compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
 status: approved
 approval-mode: manual
@@ -75,25 +76,25 @@ signature: MEYCIQ...
 
 ## Order
 - must-run: before-steps
-- after: [auth]
 
 ## Steps
 ### s1 rate-limit-check
 - op: rate-limit-check
-- key: req.ip
+- key: ip
 - per-minute: params.ip-per-minute
 - source-lines: 2-2
 
 ### s2 rate-limit-check
 - op: rate-limit-check
-- key: req.body.email
+- key: input.email
 - per-minute: params.account-per-minute
 - source-lines: 2-2
 
 ### s3 audit
 - op: audit
 - event: login-attempt
-- fields: [req.ip, req.body.email]
+- fields: [req.ip]
+- hash: [req.body.email]
 - redact: [req.body.password]
 - source-lines: 4-4
 ````

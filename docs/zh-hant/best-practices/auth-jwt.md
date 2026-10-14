@@ -167,4 +167,3 @@ signature: MEUCIG...
 - §11.4 的 lock 省略了其 source 描述的 `user.invite` step（lock 比 source 少）。本頁已補上。
 - 規格沒有提供 `user.register`（admin）或 `user.invite` 的 lock；它們的 `## Signature`（例如邀請的輸入）**未有規定**。
 - §11.4 的 `p2 rate-limit` 沒有 `key`，但 §4.3 規定 `key` 必填。本頁的 `key: user` 屬假設。
-- 未規定邀請排入失敗時 create-user 是否仍回 201，亦未規定兩個 step 是否原子（v1 沒有 transaction 區塊，§14）。

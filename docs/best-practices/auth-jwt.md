@@ -167,4 +167,3 @@ signature: MEUCIG...
 - §11.4's lock omits the `user.invite` step that its own source describes (lock contains less than source). This page adds it.
 - No lock is given for `user.register` (admin) or `user.invite`; their `## Signature` (e.g. the invite input) is **not specified**.
 - §11.4 `p2 rate-limit` has no `key`, but §4.3 makes `key` required. `key: user` here is an assumption.
-- It is not specified whether create-user should still return 201 if the invite enqueue fails, or whether the two steps are atomic (v1 has no transaction block, §14).

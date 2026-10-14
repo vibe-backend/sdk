@@ -38,6 +38,7 @@ Note not found returns 404 NOT_FOUND.
 ## Table
 - provider: main
 - table: notes
+- owner-key: user_id
 
 ## Fields
 | name | type | rules | system |
@@ -45,9 +46,11 @@ Note not found returns 404 NOT_FOUND.
 | id | uuid | primary, default: gen | yes |
 | title | string | min: 1, max: 200 | no |
 | body | string | max: 10000 | no |
+| user_id | uuid | | no |
 | created_at | timestamp | default: now | yes |
 | updated_at | timestamp | default: now | yes |
 | deleted_at | timestamp | nullable | yes |
+| erased_at | timestamp | nullable | yes |
 | tenant_id | string | platform | yes |
 
 ## CRUD
@@ -56,7 +59,7 @@ Note not found returns 404 NOT_FOUND.
 | create | |
 | get | sensitive-output: [] |
 | list | pagination: offset, page-size: 20, max-page-size: 100, sort: [created_at], filter: [] |
-| update | partial: true, optimistic-lock: updated_at |
+| update | partial: true, optimistic-lock: if-match |
 | delete | soft |
 
 ## Policies
@@ -81,7 +84,6 @@ Note not found returns 404 NOT_FOUND.
 ## Pipelines
 ### p1 auth
 - mode: jwt
-- roles: [admin]
 
 ## Limits
 - provider: main
@@ -128,8 +130,8 @@ Note not found returns 404 NOT_FOUND.
 - op: query
 - provider: main
 - table: notes
-- sql: `update notes set deleted_at = now() where id = $1 and deleted_at is null`
-- params: [input.id]
+- sql: `update notes set deleted_at = now() where id = $1 and user_id = $2 and deleted_at is null`
+- params: [input.id, ctx.user.id]
 - writes: true
 - scope: pk
 - columns: [deleted_at]
