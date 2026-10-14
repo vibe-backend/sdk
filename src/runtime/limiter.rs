@@ -20,6 +20,15 @@ use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+/// New keys refused because a shard was saturated, since process start.
+/// Read with [`saturation_refusals`]; see docs/release-hardening.md.
+static SATURATION_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total new keys refused because a rate-limit shard was saturated.
+pub fn saturation_refusals() -> u64 {
+    SATURATION_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Buckets per `(route, key type)` shard.
 pub const SHARD_CAPACITY: usize = 10_000;
 pub const WINDOW: Duration = Duration::from_secs(60);
@@ -165,6 +174,8 @@ struct RateShard {
     owner_keys: HashMap<String, VecDeque<String>>,
     /// Last time saturation was logged for this shard.
     saturated_logged: Option<Instant>,
+    /// Refusals since the last saturation log line.
+    refused_since_log: u64,
 }
 
 impl RateShard {
@@ -174,6 +185,7 @@ impl RateShard {
             owned: HashMap::new(),
             owner_keys: HashMap::new(),
             saturated_logged: None,
+            refused_since_log: 0,
         }
     }
 
@@ -275,6 +287,8 @@ impl RateShard {
     }
 
     fn log_saturation(&mut self, shard: &str, reason: &'static str, now: Instant) {
+        SATURATION_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.refused_since_log += 1;
         if self
             .saturated_logged
             .is_some_and(|at| now.duration_since(at) < WINDOW)
@@ -282,13 +296,18 @@ impl RateShard {
             return;
         }
         self.saturated_logged = Some(now);
+        // Stable target and fields for alerting (docs/release-hardening.md).
         tracing::warn!(
+            target: "vibe::rate_limit_saturation",
             shard,
             reason,
             buckets = self.map.entries.len(),
             owners = self.owned.len(),
+            refused = self.refused_since_log,
+            refused_total = saturation_refusals(),
             "rate-limit shard saturated; refusing new keys"
         );
+        self.refused_since_log = 0;
     }
 }
 
@@ -709,6 +728,24 @@ mod tests {
             Some("1.2.3.4".parse().unwrap())
         );
         assert_eq!(parse_hop("garbage"), None);
+    }
+
+    #[test]
+    fn saturation_refusals_are_counted() {
+        let mut rates = RateBuckets::default();
+        let now = Instant::now();
+        let shard = "signup:input.email".to_string();
+        let before = saturation_refusals();
+        let mut refused = 0u64;
+        for i in 0..(OWNER_CAP + 10) {
+            match rates.check(&[(shard.clone(), format!("k{i}"), 1)], "1.2.3.4", now) {
+                RateDecision::Allow => {}
+                RateDecision::Limited(_) => refused += 1,
+            }
+        }
+        assert_eq!(refused, 10);
+        // Other tests may refuse concurrently; the counter only grows.
+        assert!(saturation_refusals() >= before + refused);
     }
 
     #[test]
