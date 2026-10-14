@@ -25,7 +25,7 @@ const root = path.resolve(here, '..');
 const out = path.join(here, 'dist');
 const src = path.join(here, 'src');
 const REPO = 'https://github.com/vibe-backend/sdk';
-const SITE_URL = (process.env.SITE_URL || 'https://vibe-backend.github.io/sdk/').replace(/\/?$/, '/');
+const SITE_URL = (process.env.SITE_URL || 'https://vibe-backend.github.io/').replace(/\/?$/, '/');
 const locales = Object.keys(LOCALES);
 
 const slugify = (s) => s.toLowerCase().trim()
@@ -206,7 +206,7 @@ function renderTree(text, attrs = '') {
 }
 
 // ---------- layout ----------
-const NAV = [['index.html', 'home'], ['features.html', 'features'], ['quick-start.html', 'quickStart'], ['docs/index.html', 'docs']];
+const NAV = [['index.html', 'home'], ['features.html', 'features'], ['quick-start.html', 'quickStart'], ['samples.html', 'samples'], ['docs/index.html', 'docs']];
 const THEME_BOOT = "try{var t=localStorage.getItem('vb-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}document.documentElement.classList.add('js')";
 const ICON_THEME = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>';
 
@@ -407,7 +407,7 @@ fs.mkdirSync(out, { recursive: true });
 fs.cpSync(path.join(src, 'assets'), path.join(out, 'assets'), { recursive: true });
 fs.writeFileSync(path.join(out, '.nojekyll'), '');
 
-const handPages = [['index.html', 'index', 'home'], ['features.html', 'features', 'features'], ['quick-start.html', 'quick-start', 'quickStart']];
+const handPages = [['index.html', 'index', 'home'], ['features.html', 'features', 'features'], ['quick-start.html', 'quick-start', 'quickStart'], ['samples.html', 'samples', 'samples']];
 const allRels = [...handPages.map(([f]) => f), 'docs/index.html', 'docs/spec.html', ...(LATEST ? [LATEST_REL] : []), ...docs.map((d) => d.rel)];
 let count = 0;
 
