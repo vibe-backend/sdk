@@ -1,6 +1,7 @@
 mod crud;
 mod exec;
 mod http;
+mod limiter;
 mod slugs;
 mod sql;
 
@@ -10,5 +11,6 @@ pub use http::{
     hash_api_secret, resolve_pepper, router, AppState, AuthConfig, RunEnv, Slug, StoredKey,
     REQUEST_TYPES,
 };
+pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
 pub use sql::{bootstrap_statements, Col};
