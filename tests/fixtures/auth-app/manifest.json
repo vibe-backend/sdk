@@ -484,7 +484,7 @@
           "args": "",
           "value": "",
           "status": 0,
-          "sql": "insert into email_outbox (user_id, email, recipient_hash, template, token) values ($1, $2, $4, case when $1::uuid is null then 'already-registered' when $5 = 'invite' then 'invite' else 'verify-email' end, case when $1::uuid is null then null else convert_to($3, 'UTF8') end)",
+          "sql": "insert into email_outbox (user_id, email, recipient_hash, template, token) values ($1, $2, $4, case when $1::uuid is null then 'already-registered' when $5 = 'invite' then 'invite' else 'verify-email' end, case when $1::uuid is null then null else $3::bytea end)",
           "params": [
             "input.user_id",
             "input.email",

@@ -419,3 +419,30 @@ fn credential_columns_need_their_capability() {
     );
     assert!(credential_write_problem(register, &[]).is_none());
 }
+
+/// Every query in the auth fixture passes the lock SQL allowlist.
+#[test]
+fn fixture_sql_passes_the_allowlist() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/auth-app/manifest.json")).unwrap();
+    fn walk(v: &serde_json::Value, seen: &mut usize) {
+        match v {
+            serde_json::Value::Object(o) => {
+                for (k, x) in o {
+                    match (k.as_str(), x.as_str()) {
+                        ("sql", Some(sql)) if !sql.is_empty() => {
+                            *seen += 1;
+                            assert_eq!(vibe::sqlguard::query_problem(sql), None, "{sql}");
+                        }
+                        _ => walk(x, seen),
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, seen)),
+            _ => {}
+        }
+    }
+    let mut seen = 0;
+    walk(&manifest, &mut seen);
+    assert!(seen >= 5);
+}
