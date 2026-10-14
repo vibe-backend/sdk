@@ -6,10 +6,15 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "serve": "npx --yes serve dist"
+    "check-links": "node check-links.mjs",
+    "serve": "npx --yes serve@14.2.6 dist"
   },
   "dependencies": {
     "highlight.js": "^11.10.0",
-    "marked": "^14.1.0"
+    "marked": "^14.1.0",
+    "sanitize-html": "^2.18.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
