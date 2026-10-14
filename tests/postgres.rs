@@ -995,13 +995,63 @@ async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
     let mut m = manifest();
     m.migrations[0].statements.push("SELECT pg_sleep(5)".into());
     let tenant = format!("tc{}", suffix());
-    // Cancel the migration while it sleeps inside its transaction.
-    let cancelled = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        migrate_tenant(&exec, &m, &tenant, &s.app),
-    )
-    .await;
-    assert!(cancelled.is_err(), "the migration should still be running");
+    // Cancel the migration while it sleeps inside its transaction, after
+    // reading the pid of the backend running it from pg_stat_activity.
+    let find_pid = async {
+        loop {
+            let rows = s
+                .admin
+                .query(
+                    "SELECT pid FROM pg_stat_activity WHERE usename = $1 \
+                     AND state = 'active' AND query LIKE 'SELECT pg_sleep(5)%'",
+                    &[&s.owner],
+                )
+                .await
+                .unwrap();
+            if let Some(row) = rows.first() {
+                return row.get::<_, i32>(0);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    let migration = migrate_tenant(&exec, &m, &tenant, &s.app);
+    let sleeping_pid = tokio::select! {
+        pid = tokio::time::timeout(std::time::Duration::from_secs(4), find_pid) => {
+            pid.expect("the migration's pg_sleep never showed up in pg_stat_activity")
+        }
+        done = migration => panic!("the migration should still be running: {done:?}"),
+    };
+    // The cancelled future is dropped here. The next query must not wait for
+    // that backend or reuse it: the pool hands out a different backend while
+    // the old one is still sleeping in its transaction.
+    let started = std::time::Instant::now();
+    let pid = exec
+        .query_texts("SELECT pg_backend_pid()::text || $1::text", "")
+        .await
+        .unwrap();
+    assert_ne!(
+        pid,
+        vec![sleeping_pid.to_string()],
+        "the connection was returned to the pool mid-transaction"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "the next query waited for the cancelled transaction"
+    );
+    let old_state = s
+        .admin
+        .query(
+            "SELECT state FROM pg_stat_activity WHERE pid = $1",
+            &[&sleeping_pid],
+        )
+        .await
+        .unwrap();
+    assert!(
+        old_state
+            .first()
+            .is_none_or(|r| r.get::<_, Option<String>>(0).as_deref() != Some("idle")),
+        "the old backend went back to the pool as idle"
+    );
     // The pool's only connection was discarded, not reused mid-transaction:
     // a fresh session sees no open transaction and the schema never existed.
     let got = exec
