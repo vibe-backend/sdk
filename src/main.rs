@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -59,6 +58,7 @@ enum Command {
     Manifest {
         #[arg(long, default_value = ".")]
         project: PathBuf,
+        /// Output path, relative to the current directory (like `serve --manifest`).
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
     },
@@ -324,11 +324,8 @@ fn cmd_approve(
 fn cmd_manifest(project: &Path, output: &Path) -> Result<(), String> {
     let key = sign::load_or_create(project).map_err(|err| err.to_string())?;
     let manifest = manifest::manifest_from_project(project, &key).map_err(|err| err.to_string())?;
-    let path = if output.is_absolute() {
-        output.to_path_buf()
-    } else {
-        project.join(output)
-    };
+    // Relative to the current directory, like `vibe serve --manifest` (#31).
+    let path = output.to_path_buf();
     manifest::write_manifest(&path, &manifest).map_err(|err| err.to_string())?;
     println!("wrote {}", path.display());
     Ok(())
@@ -384,11 +381,12 @@ async fn cmd_serve(
         exec,
         auth,
         slugs: loaded.slugs,
-        rates: std::sync::Mutex::new(HashMap::new()),
-        quotas: std::sync::Mutex::new(HashMap::new()),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
         disabled: load_disabled(project),
         min_override_ms: None,
         honor_test_ip: false,
+        trusted_proxies: trusted_proxies_from_env()?,
         dev_hints: memory,
     });
     let app = router(state);
@@ -396,9 +394,12 @@ async fn cmd_serve(
         .await
         .map_err(|err| err.to_string())?;
     println!("listening on {addr}");
-    axum::serve(listener, app)
-        .await
-        .map_err(|err| err.to_string())
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|err| err.to_string())
 }
 
 async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Result<(), String> {
@@ -511,6 +512,21 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
         )?));
     }
     Ok(auth)
+}
+
+/// `VIBE_TRUSTED_PROXIES`: comma-separated proxy IPs or CIDR blocks whose
+/// `X-Forwarded-For` is honoured. Unset = trust no proxy (use the peer).
+fn trusted_proxies_from_env() -> Result<Vec<vibe::runtime::ProxyNet>, String> {
+    let Ok(raw) = std::env::var("VIBE_TRUSTED_PROXIES") else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            vibe::runtime::ProxyNet::parse(s).map_err(|err| format!("VIBE_TRUSTED_PROXIES: {err}"))
+        })
+        .collect()
 }
 
 fn load_disabled(project: &Path) -> std::collections::HashSet<String> {
