@@ -38,7 +38,7 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - 計劃中（v1.8 實作）：`vibe build --check-determinism`，取代上面兩個。
 - `main` 一定要用 **ruleset**（唔好用舊式 branch protection）開 pull request rule 嘅 **Require approval of the most recent reviewable push**：`vibe build --release-approval` 會用 `GET /repos/{owner}/{repo}/rules/branches/main` 確認，冇就失敗。舊式 branch protection 要 admin 權限先讀到，所以唔接受（spec 2C.3a）。
 - 唔好用 merge queue：高風險 release build 唔支援（spec 2C.3a）。
-- 一定要開 **Require branches to be up to date before merging**：`vibe build --release-approval` 會比較 build commit 同 PR head 嘅 tree，冇開呢個設定就可能唔一樣，release build 會失敗（spec 2C.3a）。
+- 一定要喺 ruleset 嘅 **Require status checks to pass** 入面開 **Require branches to be up to date before merging**（`strict_required_status_checks_policy`，最少要有一個 required status check 先生效）：`vibe build --release-approval` 會比較 build commit 同 PR head 嘅 tree，冇開呢個設定就可能唔一樣，release build 會失敗（spec 2C.3a）。
 
 ## 4. 高風險 label 要兩個 approval
 

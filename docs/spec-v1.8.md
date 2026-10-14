@@ -56,7 +56,7 @@
 | 5 | `sign-token` 放喺 model 層做 method（例如 `user.sign-token`）；`auth` 類 pipeline 透過呼叫 model method 做嘢。 | 4、12.6、12.8 |
 | 9 | api 層都可以用自然語言寫。 | 2 |
 | 10 | （v1.8 由決定 77 修訂，待產品經理確認）SDK 唔再分自動／人手確認；所有 lock（structured 或者 natural）通過驗證器同 CI 重編就可以 build 同部署。「係咪 structured」照樣由 deterministic parser 判斷，只影響使唔使 call LLM。 | 2A.5 |
-| 11 | （v1.8 由決定 77 修訂，待產品經理確認）SDK 冇確認角色；邊個可以 merge 由 Git 平台 branch protection 決定（見 9C 同 [`pr-review-guide.md`](pr-review-guide.md)）。 | 2A.5 |
+| 11 | （v1.8 由決定 77 修訂，待產品經理確認）SDK 冇確認角色；邊個可以 merge 由 Git 平台 rulesets（分支規則） 決定（見 9C 同 [`pr-review-guide.md`](pr-review-guide.md)）。 | 2A.5 |
 | 12 | 單一職責上限係 warning。 | 12.3a、10 |
 | 13 | 軟刪除永遠唔會實際刪除資料，冇 purge。 | 12.9 |
 | 14 | CRUD 嘅 list 用 offset 分頁（保留 page-size 上限）。 | 12.9 |
@@ -91,7 +91,7 @@
 | 6 | Refresh token 每次使用都輪換；重用舊 token 會撤銷成個 token 家族；登出可以 revoke。refresh token ttl 上限 30 日（家族絕對壽命），閒置 7 日失效；access token 上限 1 小時。 | 4A |
 | 7 | 平台密碼底線：最少 12 個字元，加洩漏密碼檢查；物件只可以收緊，唔可以放寬。 | 4A |
 | 8 | 15 分鐘內失敗 5 次就鎖帳戶 15 分鐘，另加 IP 限流。防惡意鎖帳戶：同一帳戶 15 分鐘內失敗 3 次之後要 captcha；鎖定期間經 email 連結重設密碼可以即時解鎖；鎖定期間回應同密碼錯完全一樣。 | 4A |
-| 33 | （v1.8 由決定 77 取代，待產品經理確認）SDK 冇雙人確認，細團隊規則唔再適用；需要雙人 review 由 branch protection 設定。 | 2A.5 |
+| 33 | （v1.8 由決定 77 取代，待產品經理確認）SDK 冇雙人確認，細團隊規則唔再適用；需要雙人 review 由 rulesets（分支規則） 設定。 | 2A.5 |
 | 34 | （v1.8 由決定 78 取代，待產品經理確認）取消每個 PR 安全項目上限。 | 2A.5 |
 | 35 | Model snapshot：平台承諾 snapshot 喺宣布淘汰之後最少保留 12 個月，項目有 90 日遷移窗口；窗口內舊 lock 照常有效。Golden corpus 由平台編譯器團隊維護（最少 500 個案例），項目可以加自己嘅案例。 | 2A.6 |
 | 36 | Public 最低回應耗時：一般 300ms，login 類 500ms；實際超過只出 warning，唔係 error。 | 7.2、10.9 |
@@ -190,7 +190,7 @@
 | 80 | 建議 `*.lock.md` 同 source 一齊 commit，令 PR diff 睇到編譯結果；CI 重編決定性檢查保留，唔一致照樣封鎖部署，冇 override。 | 待產品經理確認 | 2A.6、2C.3 |
 | 81 | CLI 所有指令嘅 `--project` 預設係目前目錄（cwd）。 | 待產品經理確認 | 2C.1 |
 | 82 | README 快速開始簡化做兩行：`vibe dev` 加一個 `curl`。 | 待產品經理確認 | 2C.1 |
-| 83 | 接受「未經人手 review 嘅 LLM 輸出可以直接部署」嘅剩餘風險（見 9C）；人手 review 由用戶喺 Git 平台用 branch protection 自行設定（指引見 [`pr-review-guide.md`](pr-review-guide.md)）；但 release 層面仍然有決定 89–93 嘅硬性要求（受保護 environment、高風險要 approval 參照、CODEOWNERS）。 | 待產品經理確認 | 9C |
+| 83 | 接受「未經人手 review 嘅 LLM 輸出可以直接部署」嘅剩餘風險（見 9C）；人手 review 由用戶喺 Git 平台用 rulesets（分支規則） 自行設定（指引見 [`pr-review-guide.md`](pr-review-guide.md)）；但 release 層面仍然有決定 89–93 嘅硬性要求（受保護 environment、高風險要 approval 參照、CODEOWNERS）。 | 待產品經理確認 | 9C |
 | 84 | Admin `user.register` 保留 409 `EMAIL_TAKEN`：只限 admin、已認證、有限流同審計，admin 本身已經可以列出租戶用戶，所以唔當 enumeration 洩漏。 | 待產品經理確認 | 11.4、12.11 |
 | 85 | `create-user` 可以安全重試：`user.register` 用「insert CTE + SELECT」一個 statement，以明確 `created` 欄位分 201／200（唔靠 `xmax`）；對「已存在、未驗證、冇密碼」嘅用戶唔報錯，回原有 id（200），再由 `user.invite` 重新寄邀請；已驗證或者有密碼先回 409。解決 7.1 每個 query 獨立 commit 時「建立咗用戶但邀請失敗」嘅狀況。 | 待產品經理確認 | 11.4、11.4a |
 | 86 | 新增 re-invite endpoint `POST /users/v2/{id}/invite`（admin），用 `user.invite` 重新寄邀請；用戶已驗證回 409 `ALREADY_ACTIVE`（決定 69 延伸）。 | 待產品經理確認 | 11.4b |
@@ -379,7 +379,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 
 - SDK 唔再有確認步驟：冇 `vibe approve`、冇 `pending`／`approved` 狀態、冇 commit hash 綁定、冇確認人資格檢查。通過驗證器（2A.7、第 10 節）同 CI 重編決定性檢查（2A.6）嘅 lock 就可以 `vibe build` 同部署。
 - 「係咪 structured」照樣由平台 deterministic parser 判斷（決定 20），只決定編譯使唔使 call LLM。
-- 建議 lock 同 source 一齊 commit（決定 80），PR 一定睇到 lock diff；人手 review 由用戶喺 Git 平台設定 branch protection（見 9C 同 [`pr-review-guide.md`](pr-review-guide.md)）。
+- 建議 lock 同 source 一齊 commit（決定 80），PR 一定睇到 lock diff；人手 review 由用戶喺 Git 平台設定 rulesets（分支規則）（見 9C 同 [`pr-review-guide.md`](pr-review-guide.md)）。
 
 **安全項目**（驗證器由 lock deterministic 抽出，唔靠 source 文字或者 LLM）：
 
@@ -400,7 +400,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 | output 新增欄位 | 中 |
 | source 出現似指令句子（見 2A.7） | 中 |
 
-- 安全項目係資訊性（決定 78）：驗證器寫入 lock `security-items`、`vibe build` 輸出、部署報告；`vibe build --labels` 可以輸出建議 PR label（例如 `security:high`），俾 branch protection 用（見 [`pr-review-guide.md`](pr-review-guide.md)）。
+- 安全項目係資訊性（決定 78）：驗證器寫入 lock `security-items`、`vibe build` 輸出、部署報告；`vibe build --labels` 可以輸出建議 PR label（例如 `security:high`），俾 rulesets（分支規則） 用（見 [`pr-review-guide.md`](pr-review-guide.md)）。
 - 唔再要求逐項確認人、原因簽核、兩個非作者確認，亦冇每個 PR 上限（決定 19、34 由決定 78 修訂）。
 - PR 同部署報告顯示**有效權限摘要**：每個 endpoint 最終係咪公開、用咩 role、可以讀寫邊啲表同欄位、會唔會簽 token、有冇對外 call、限流同配額。
 - Lock 過時（source 或者依賴 hash 唔一致）或者驗證唔通過，就唔可以 build release manifest。
@@ -653,7 +653,7 @@ Release build 喺 `main` 或者 `v*` tag 上跑，build 緊嘅 commit（`B = git
 
 1. `GET /repos/{owner}/{repo}/commits/{B}/pulls`：一定要剛好一個 `merged_at` 唔係 null 嘅 PR，而且號碼同 `pr:<number>` 一樣（用咗 `pr:`）；零個或者多過一個就失敗。
 2. 由呢個 PR 攞 `head.sha`（`H`，即係 PR 最後一次 push）、`base.sha`（`P`，merge 前受保護 `main` 嘅 commit）同 `user`（PR 作者）。
-3. Tree 相等：`GET /repos/{owner}/{repo}/commits/{B}` 同 `GET /repos/{owner}/{repo}/commits/{H}` 嘅 `commit.tree.sha` 一定要一樣。因為 branch protection 一定要開 **Require branches to be up to date before merging**，merge commit 或者 squash commit 嘅 tree 會同 `H` 一樣；唔一樣就失敗。Rebase merge 都一樣要 tree 相等。
+3. Tree 相等：`GET /repos/{owner}/{repo}/commits/{B}` 同 `GET /repos/{owner}/{repo}/commits/{H}` 嘅 `commit.tree.sha` 一定要一樣。因為 `main` 嘅 rulesets（分支規則）一定要開 **Require branches to be up to date before merging**（ruleset `required_status_checks` rule 嘅 `parameters.strict_required_status_checks_policy: true`，而且最少有一個 required status check，否則呢個設定唔生效；見第 7 節），merge commit 或者 squash commit 嘅 tree 會同 `H` 一樣；唔一樣就失敗。Rebase merge 都一樣要 tree 相等。
 4. Tag build：`B` 一定要喺 `main` 上。`GET /repos/{owner}/{repo}/compare/main...{B}` 嘅 `status` 一定要係 `identical` 或者 `behind`；`ahead` 或者 `diverged` 就失敗。
 5. **唔支援 merge queue**：merge queue 會喺 `gh-readonly-queue/*` 砌新 commit，同上面嘅 tree 規則對唔上。用 merge queue 嘅 repo，高風險 release build 一律失敗（待產品經理確認）。
 
@@ -715,6 +715,7 @@ Release build 喺 `main` 或者 `v*` tag 上跑，build 緊嘅 commit（`B = git
 Branch rule 檢查（`main`）：
 
 - 用 `GET /repos/{owner}/{repo}/rules/branches/main`（rulesets，有 `metadata: read` 就讀到），一定要有 active 嘅 `pull_request` rule，而且 `parameters.require_last_push_approval` 係 `true`。
+- 同一個回應一定要有 active 嘅 `required_status_checks` rule，`parameters.strict_required_status_checks_policy` 係 `true`，而且 `parameters.required_status_checks` 唔係空 array（GitHub 規定要最少一個 status check 呢個設定先生效）；冇就失敗。
 - 我哋揀 **rulesets 做唯一接受嘅來源**：舊式 branch protection（`GET /repos/{owner}/{repo}/branches/{branch}/protection`）要 repo admin 權限先讀到，release workflow 唔應該攞 admin。所以呢個設定一定要用 ruleset 開；rulesets 搵唔到就失敗（待產品經理確認）。
 - **Bypass actors（已知限制）**：`rules/branches/main` 唔會回 `bypass_actors`。每條 rule 有 `ruleset_id`，SDK 會試 `GET /repos/{owner}/{repo}/rulesets/{ruleset_id}`：token 讀到 `bypass_actors`（GitHub 只會畀對 ruleset 有寫權限嘅人睇）而且唔係空，高風險 release build 就失敗；回應冇 `bypass_actors`（權限唔夠）就只記錄喺部署報告。
 
@@ -1213,7 +1214,7 @@ migration 放喺 ./migrations/main/。
 - Production 一律拒絕 in-memory，冇 override（決定 91）。
 - `/latest/` 永遠唔係草稿（決定 94）。
 
-建議（SDK 外，見 [`pr-review-guide.md`](pr-review-guide.md)）：開 branch protection、required PR review、CODEOWNERS（必須，覆蓋 `api/`、`models/`、`migrations/`、`providers/`、`pipelines/`、`.github/`、`*.lock.md`）、required CI status（`vibe build --check-determinism`）、`security:high` label 要兩個 reviewer。
+建議（SDK 外，見 [`pr-review-guide.md`](pr-review-guide.md)）：開 rulesets（分支規則）、required PR review、CODEOWNERS（必須，覆蓋 `api/`、`models/`、`migrations/`、`providers/`、`pipelines/`、`.github/`、`*.lock.md`）、required CI status（`vibe build --check-determinism`）、`security:high` label 要兩個 reviewer。
 
 ## 10. 部署驗證（全部喺 lock 層檢查；每個 error 都會報 lock 檔名、section、step id、對應 source 行數同原因）
 
@@ -2597,7 +2598,7 @@ security-items:
 | 422 | VALIDATION_FAILED | platform |
 ````
 
-- PR review 會逐項高亮：`public: true`、`-auth`、`public-writes: true`（以上高風險；v1.8 起係資訊性高亮，review 要求由 branch protection 決定）、新增寫入 sql（`user.login` s4，中風險）。
+- PR review 會逐項高亮：`public: true`、`-auth`、`public-writes: true`（以上高風險；v1.8 起係資訊性高亮，review 要求由 rulesets（分支規則） 決定）、新增寫入 sql（`user.login` s4，中風險）。
 - 有效權限摘要：`POST /auth/v1/{slug}/login` → public；role public_reader + public_writer；讀 users；寫 users.last_login_at；間接簽 token（經 `user.sign-token`）；冇對外 call；IP 10/min、帳戶 5/min、租戶 300/min；有每日配額。
 
 ### 12.9 CRUD
