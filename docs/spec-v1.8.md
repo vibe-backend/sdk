@@ -2086,7 +2086,7 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 寄邀請" }]
 ## Response
 | status | schema | headers |
 | --- | --- | --- |
-| 204 | (none) | |
+| 202 | { invite_status } | |
 
 ## Transform
 - in: { user_id: req.path.id }
@@ -2102,7 +2102,7 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 寄邀請" }]
 
 ### s2 respond
 - op: respond
-- status: 204
+- status: 202   # 決定 95：invite_status = invite_pending
 - source-lines: 3-3
 
 ## Errors
