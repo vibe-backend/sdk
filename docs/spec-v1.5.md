@@ -7,7 +7,9 @@
 > v1.5 定稿：refresh token 輪換、密碼底線、帳戶鎖定、固定回應耗時 300ms／500ms、私隱刪除（crypto-shredding 加匿名化）同所有營運數值全部定案。
 
 ## 0. 範圍同決定
+
 ### 0.1 範圍
+
 - v1 只支援 HTTP API 入口，method 限 GET／POST／PUT／DELETE；排程、queue、webhook 入口唔喺 v1 範圍內。
 - `{definition}` 代表 domain；`{version}` 代表 API 版本。
 - 主檔用 `{feature}/{feature}.md`，唔用 `index.md`。
@@ -19,8 +21,9 @@
 - 冷啟動 p95 目標係少過 1 秒。
 
 ### 0.2 已確認決定（v1.3 定案）
+
 | # | 決定 | 影響章節 |
-|---|---|---|
+| --- | --- | --- |
 | 1 | 物件欄位唔分 version，靠 migration 管理。 | 12.2、12.5 |
 | 2 | method 只有單一版本：取消 `@v2` 同「同名 version 綁定」；取消 `models/{object}/{version}/` 資料夾，改為 `models/{object}/methods/{method}.md`。唔同 api version 之間嘅差異，由 api 層嘅 input／output 轉換（`## Transform`）處理。 | 1、2、12 |
 | 3 | 寫入其他物件一定要經嗰個物件自己嘅 method。 | 12.3、12.3a |
@@ -35,8 +38,9 @@
 | 15 | 編譯器 major version 升級會強制重新編譯所有 lock；minor 升級唔會。 | 2A.6 |
 
 ### 0.3 已確認決定（v1.4 定案）
+
 | # | 決定 | 影響章節 |
-|---|---|---|
+| --- | --- | --- |
 | 16 | 安全設定照用自然語言寫，**唔強制**結構化 frontmatter；防線係獨立驗證器加人手 review。唔設結構化強制。 | 2.2、2A.5、2A.7 |
 | 17 | 編譯器輸出一定要通過獨立、deterministic 嘅驗證器（唔靠 LLM 自律）；編譯器冇網絡、冇任何工具權限；source 入面似指令嘅句子（prompt injection 模式）出 warning 並喺 PR 高亮。 | 2A.7、10.9 |
 | 18 | 編譯用嘅 model pin 死 snapshot；compiler-hash（model snapshot + prompt + 編譯器版本）寫入 lock；CI 重編同 lock 唔一致就封鎖部署，冇 override；會改變輸出嘅 minor 升級當 major 處理。 | 2A.1、2A.6 |
@@ -56,8 +60,9 @@
 | 32 | Public 最低回應耗時由 p95 改為固定值（數值見決定 36）。 | 0.1、7.2 |
 
 ### 0.4 已確認決定（v1.5 定稿）
+
 | # | 決定 | 影響章節 |
-|---|---|---|
+| --- | --- | --- |
 | 6 | Refresh token 每次使用都輪換；重用舊 token 會撤銷成個 token 家族；登出可以 revoke。refresh token ttl 上限 30 日（家族絕對壽命），閒置 7 日失效；access token 上限 1 小時。 | 4A |
 | 7 | 平台密碼底線：最少 12 個字元，加洩漏密碼檢查；物件只可以收緊，唔可以放寬。 | 4A |
 | 8 | 15 分鐘內失敗 5 次就鎖帳戶 15 分鐘，另加 IP 限流。防惡意鎖帳戶：同一帳戶 15 分鐘內失敗 3 次之後要 captcha；鎖定期間經 email 連結重設密碼可以即時解鎖；鎖定期間回應同密碼錯完全一樣。 | 4A |
@@ -73,7 +78,8 @@
 | 42 | 私隱刪除：敏感個人欄位用 crypto-shredding，其他個人欄位匿名化；DELETE 照樣禁止。流程見 12.10。 | 12.10 |
 
 ## 1. 目錄同命名
-```
+
+```text
 project/
   providers/{name}.md
   providers/{name}.lock.md
@@ -91,6 +97,7 @@ project/
   api/{definition}/{version}/{feature}/{feature}.lock.md
   api/{definition}/{version}/{feature}/schema.md      # 選填，自然語言欄位補充說明，會併入 feature 嘅 lock
 ```
+
 - 所有名一律用 kebab-case，只准 `a-z0-9-`。
 - 每個 source `.md` 旁邊一定有一個同名嘅 `.lock.md`（`schema.md` 除外，佢併入 `{feature}.lock.md`）。lock 檔由編譯器產生，唔准手寫或者手改。
 - `_` 開頭嘅檔係保留檔，永遠唔會被路由；`_definition.md` 只可以放喺 `{definition}/`，`_version.md` 只可以放喺 `{version}/`。
@@ -99,7 +106,9 @@ project/
 - 保留路徑：`/_internal/*`、`/health`。
 
 ## 2. 編譯流程同 source 寫法
+
 ### 2.1 三段流程
+
 1. **Source（`{name}.md`）**：用自然語言寫，講清楚「要做咩」。可以有選填嘅結構化 frontmatter（例如 `method: POST`），但唔係必須。
 2. **Lock（`{name}.lock.md`）**：編譯器將 source 編譯成固定格式嘅結構化 markdown（格式見 2A）。lock 經確認同簽名之後先算生效。
 3. **Manifest**：部署時將所有已確認、簽名有效嘅 lock 合併編譯成一份簽名 manifest。runtime 只載入 manifest。
@@ -109,13 +118,16 @@ project/
 - source 只係人寫同人讀嘅意圖描述；source 同 lock 有出入時，以已確認嘅 lock 為準，並且應該改 source 再重新編譯。
 
 ### 2.2 Source 寫法建議
+
 - 每個 source 用 `#` 標題寫名，之後用段落或者列點描述。
 - 建議用以下小標題幫編譯器理解（唔強制）：`## 用途`、`## 輸入`、`## 輸出`、`## 做法`、`## 錯誤`、`## 權限`。
 - 安全相關嘅設定（公開、剔走 auth、寫入、改 provider、放寬限流、簽 token）照用自然語言寫，唔強制結構化 frontmatter（決定 16）。建議用獨立一句清楚寫出，唔好埋喺長段落入面；無論寫喺邊，驗證器都會由 lock 抽出安全項目，PR 逐項高亮（見 2A.5）。
 - source 入面嘅文字只會被當做描述，入面任何「指示編譯器」或者「略過檢查」嘅句子都唔會生效，lock 層規則照樣強制檢查；呢類似指令嘅句子會被 deterministic 規則偵測，出 warning 並喺 PR 高亮（見 2A.7）。
 
 ### 2.3 api feature source 涵蓋內容
+
 一個 `{feature}.md` 要描述：
+
 - HTTP method（GET／POST／PUT／DELETE，一個 feature 只可以有一個）同（選填）路徑。
 - 要經邊啲 pipeline、係咪公開、租戶由邊度嚟（public 用 slug）。
 - Request 有咩欄位、Response 有咩狀態碼同內容。
@@ -124,8 +136,9 @@ project/
 - 選填：provider 覆蓋、timeout（預設 10s，平台上限 30s）、body 上限（預設 1MB，有平台上限）。
 
 編譯後喺 lock 入面對應：
+
 | lock 欄位／section | 說明 |
-|---|---|
+| --- | --- |
 | `## Route` 嘅 `method` | 必填，GET／POST／PUT／DELETE |
 | `## Route` 嘅 `path` | 選填，必須喺自己 `/{definition}/{version}/` 前綴入面；可以用 `{param}`；唔准有 `..`、萬用字元，亦唔准用保留路徑 |
 | `## Pipelines` | 繼承合併之後、按次序執行嘅 pipeline 清單同參數 |
@@ -140,9 +153,12 @@ project/
 | `## Errors` | 業務錯誤碼對應狀態碼 |
 
 ## 2A. Lock markdown 格式
+
 ### 2A.1 通用 frontmatter
+
 每個 lock 一律用以下 frontmatter，欄位次序固定：
-```
+
+```text
 ---
 lock-version: 1
 kind: method                       # provider | pipeline | model | method | api
@@ -166,6 +182,7 @@ security-items:                    # 驗證器由 lock 抽出嘅安全項目，�
 signature: <平台對成份 lock 正規化內容（除 signature 欄位外）嘅簽名>
 ---
 ```
+
 - `source-hash`：source 先正規化（統一換行、去行尾空白、去 BOM、合併多餘空行），再計 sha256。淨係改排版而正規化內容唔變，hash 就唔變，**唔會重新編譯**。
 - `dependencies`：lock 用到嘅所有其他定義（例如 method 依賴 model 同 provider、api 依賴 method、`_definition`、`_version` 同 pipeline）。任何一個依賴嘅 hash 變咗，lock 都當過時，要重新編譯。
 - `source-type: structured` 只限 source 完全由結構化 frontmatter 同結構化列點組成、冇自由文字；判斷由平台嘅 deterministic parser 做，唔由 LLM 編譯器判斷（決定 20）。
@@ -175,6 +192,7 @@ signature: <平台對成份 lock 正規化內容（除 signature 欄位外）嘅
 - `signature` 由平台簽名 key 簽；簽名覆蓋 frontmatter（除 signature 本身）同全部 section。
 
 ### 2A.2 通用 section 規則
+
 - section 用 `##` 標題，名稱同次序按 kind 固定（見 2A.3）；唔准有額外 section，缺 section 用 `(none)` 表示。
 - 每個 step 用 `### s{n} {op}` 做標題，下面用 `- key: value` 列點，key 次序固定：`op`、（op 專用參數）、`out`、`source-lines`。
 - 變數參照一律用 `input.x`、`ctx.x`、`req.x`、或者之前 step 嘅 `out` 名；唔准參照未定義變數。
@@ -182,8 +200,9 @@ signature: <平台對成份 lock 正規化內容（除 signature 欄位外）嘅
 - `source-lines` 指返 source `.md` 嘅行數，方便 review 對照。
 
 ### 2A.3 各 kind 嘅固定 section
+
 | kind | section（按次序） |
-|---|---|
+| --- | --- |
 | provider | `## Connection`、`## Isolation`、`## Access`、`## Limits`、`## Migrations` |
 | pipeline | `## Parameters`、`## Order`、`## Steps` |
 | model | `## Table`、`## Fields`、`## CRUD`、`## Policies` |
@@ -195,8 +214,9 @@ signature: <平台對成份 lock 正規化內容（除 signature 欄位外）嘅
 api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature`。
 
 ### 2A.4 op 白名單
+
 | 層 | 准用 op |
-|---|---|
+| --- | --- |
 | api feature | `method`、`validate`、`transform`、`respond` |
 | method | `query`、`validate`、`call`、`method`、`respond`、`verify-password`、`hash-password`、`sign-jwt`（`sign-jwt` 只准喺 `## Signature` 標咗 `capabilities: [sign-token]` 嘅 method 入面用，唔靠 method 名推斷） |
 | pipeline | `verify-jwt`、`verify-api-key`、`rate-limit-check`、`audit`、`validate`、`inject-ctx`、`method` |
@@ -209,6 +229,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - `UPDATE` 一定要有 `WHERE`，而且要用主鍵（或者唯一鍵）限定，或者明確依賴 RLS 範圍（lock 寫 `scope: pk` 或者 `scope: rls`）；冇 WHERE 嘅 UPDATE 一律 error。
 
 ### 2A.5 確認（approval）
+
 - 新編譯出嚟嘅 lock 一律係 `status: pending`。
 - 「係咪 structured」由平台 deterministic parser 判斷（決定 20）：
   - `source-type: structured` 而且 `security-items: []` 嘅 lock 由 CI 自動確認，`approval-mode: auto`、`approved-by: [ci-auto]`。
@@ -219,8 +240,9 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - PR 一定要顯示 lock diff（唔係淨係 source diff）。
 
 **安全項目**（驗證器由 lock deterministic 抽出，唔靠 source 文字或者 LLM）：
+
 | 項目 | 風險級別 |
-|---|---|
+| --- | --- |
 | `public` 變 true、剔走 `auth` | 高 |
 | `public-writes: true`、public 可寫欄位改動 | 高 |
 | `capabilities: [sign-token]`、claim 白名單、token ttl | 高 |
@@ -240,6 +262,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - 新 lock 未確認之前，舊嘅已確認 lock（如果 hash 依賴仍然有效）繼續生效；新定義未確認就唔可以部署。
 
 ### 2A.6 重新編譯規則
+
 - 只有 `source-hash` 或者任何 `dependencies` hash 變咗先會重新編譯；source 改咗但正規化 hash 唔變就唔會重新編譯。
 - 編譯用嘅 model 一定 pin 死 snapshot（唔准用會浮動嘅別名）；model snapshot、prompt 版本、編譯器版本合埋計 `compiler-hash`，寫入每個 lock（決定 18）。
 - 編譯器 major version 升級（例如 1.x → 2.0）、或者 model snapshot／prompt 改咗：所有 lock 強制重新編譯，即使 source hash 冇變；natural lock 同觸及安全項目嘅 lock 要重新人手確認，確認前唔可以部署。建議用獨立 PR 做升級。
@@ -250,6 +273,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - 唔准手改 lock：要改就改 source 再重新編譯同確認，手改會令簽名驗證失敗。
 
 ### 2A.7 獨立驗證器同編譯器隔離
+
 - 編譯器（LLM）嘅輸出唔可信：所有 lock 一定要通過**獨立、deterministic 嘅驗證器**（普通程式、唔用 LLM），第 10 節所有規則都由驗證器執行，唔靠編譯器自律（決定 17）。
 - 驗證器版本同編譯器分開管理、分開 pin，同樣受 CODEOWNERS 保護。
 - 編譯器喺沙盒行：冇網絡、冇檔案系統寫權限（只輸出 lock 文字）、冇任何工具或者 function calling、冇 secret。輸入只有 source、依賴 lock 同平台 prompt。
@@ -259,6 +283,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - 驗證器亦會做語意一致性檢查：source 冇提及寫入，lock 卻有寫入 sql；source 冇提及公開，lock 卻有 `public: true`；呢類「lock 多過 source」嘅情況出 error（決定 37）；誤報就改 source 寫清楚，冇豁免。
 
 ## 3. 繼承
+
 - 次序由外到內：`_definition` → `_version` → `{feature}`；繼承喺編譯 feature lock 時解析，結果寫死喺 `{feature}.lock.md` 嘅 `## Pipelines` 同 `## Limits`，`dependencies` 會列埋上層 lock 嘅 hash。
 - `pipelines` 會合併；內層可以用 `-name` 剔走外層嘅 pipeline（自然語言寫「唔使 auth」會編譯成 `-auth`）。
 - 剔走 `auth` 一定要同時 `public: true`。
@@ -268,6 +293,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - `_version` 可以宣告 `deprecated: true` 同 `sunset: <ISO 日期>`（寫入 `## Lifecycle`）；設咗之後，回應會帶 `Deprecation` 同 `Sunset` header。
 
 ## 4. Pipeline 同認證
+
 - 內置 pipeline：`auth`、`validate`、`rate-limit`、`audit-log`；佢哋嘅 lock 由平台提供同簽名。用戶可以喺 `pipelines/{name}.md` 用自然語言自訂，一樣編譯成 `pipelines/{name}.lock.md`。
 - 每個 pipeline lock 都有 `## Parameters` schema；未知參數或者類型錯就報 error。
 - 預設拒絕：所有 endpoint 預設都要經過 `auth`。
@@ -281,7 +307,9 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - token 簽發一律經 model 層標咗 `capabilities: [sign-token]` 嘅 method（例如 `user.sign-token`）；簽發規則見 12.6。
 
 ## 4A. 帳戶安全：Token、密碼同鎖定
+
 ### 4A.1 Access token 同 refresh token（決定 6）
+
 - Access token：JWT，ttl 上限 1 小時。
 - Refresh token：不透明隨機值（最少 256 bit），DB 只存 hash；ttl 上限 30 日（由家族第一次簽發計，絕對壽命），閒置 7 日冇用就失效。
 - 每次用 refresh token 都輪換：發新 refresh token 同新 access token，舊 refresh token 即時失效。
@@ -291,12 +319,14 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - refresh 流程由平台內置 `token-refresh` pipeline 實現，用 `method` op 呼叫標咗 `capabilities: [sign-token]` 嘅 model method 簽新 access token。
 
 ### 4A.2 密碼政策（決定 7）
+
 - 平台底線：最少 12 個字元，最多 256 個字元；冇強制複雜度規則；一定做洩漏密碼檢查。
 - 洩漏密碼檢查用平台維護嘅洩漏密碼清單，以 k-anonymity 方式查（只送 hash 前綴），明文同完整 hash 唔會離開平台。
 - `hash-password` op 喺 hash 之前強制檢查底線；唔合就 fail `WEAK_PASSWORD`（422）。
 - 物件只可以收緊（例如 `min: 16`），唔可以放寬；lock 寫低過底線就 error。
 
 ### 4A.3 帳戶鎖定同限流（決定 8、38）
+
 - 同一帳戶 15 分鐘內登入失敗 5 次，鎖 15 分鐘。
 - 同一帳戶或者同一 IP 15 分鐘內失敗 3 次之後，之後嘅登入一定要 captcha（防止被人用嚟惡意鎖死帳戶）。
 - 鎖定期間，用戶可以經 email 重設密碼連結即時解鎖；鎖定同解鎖都寫審計記錄並通知用戶。
@@ -304,17 +334,21 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - 另加 IP 限流：每個 IP 每分鐘 10 次登入（見 11.2 `login-guard`）。
 
 ## 5. 資料庫提供者 `providers/{name}.md`
+
 source 用自然語言描述，例如：
-```
+
+```text
 # main
 主資料庫，用 PostgreSQL，每個租戶一個 schema。
 連線資料用 secret PG_MAIN。唔共用。
 每個租戶連線池最多 5 條，每條 statement 最多行 5 秒。
 migration 放喺 ./migrations/main/。
 ```
+
 編譯後嘅 lock 欄位：
+
 | 欄位 | 說明 |
-|---|---|
+| --- | --- |
 | `type` | 平台登記嘅 driver；v1 預設 `postgres`，可以替換 |
 | `isolation` | `schema` 或者 `database` |
 | `connection.secret` | 只可以引用本 project namespace 嘅 secret |
@@ -333,13 +367,16 @@ migration 放喺 ./migrations/main/。
   - 部署報告會列出所有用緊 shared provider 嘅 endpoint。
 
 ## 6. 引用 provider
+
 - `_definition` 宣告 provider allowlist 同預設 provider（lock `## Providers`）。
 - `_version` 同個別 feature 只可以喺 allowlist 入面揀 provider。
 - method 入面嘅 `query` 用邊個 provider，由物件 lock 嘅 `## Table` 靜態決定，寫死喺 method lock 每個 query step 嘅 `provider`；唔可以用變數，亦唔可以由 request 決定。
 - 有 query 嘅 endpoint（包括經 method 間接）一定要解析到一個 provider，而且要喺嗰個 endpoint 嘅 allowlist 入面。
 
 ## 7. 租戶隔離
+
 ### 7.1 通用規則
+
 - 每次 query 都喺自己嘅 transaction 入面執行：先 `BEGIN`，再 `SET LOCAL app.tenant_id`，然後執行 query，最後 `COMMIT`。就算用 PgBouncer transaction mode 都唔會漏。
 - 每張表都一定要有 `tenant_id` 欄位，要 `ENABLE` 同 `FORCE ROW LEVEL SECURITY`。
 - RLS policy 一律用 `tenant_id = current_setting('app.tenant_id', false)`；冇設定 tenant 嘅話，query 會直接報錯，唔會回空結果。
@@ -352,6 +389,7 @@ migration 放喺 ./migrations/main/。
 - 以上全部由平台產生，記錄喺 model lock 嘅 `## Policies`；source 唔可以改。
 
 ### 7.2 Public endpoint
+
 - 租戶要自己開啟 `public_access`（opt-in）；冇開啟嘅租戶，所有 public 請求都回 404。
 - 租戶來源寫成 `tenant: { from: path, param: slug }`。slug 係平台發出嘅不透明值，唔係 `tenant_id`，而且可以輪換。
 - 租戶唔存在、冇開 `public_access`、或者冇資料，都一律回同一個 404 body；回應時間會補到固定最低值（一般 public endpoint 300ms，login 類 500ms；login 類即係有 `verify-password` step 嘅 endpoint），等人唔能夠靠耗時分辨；如果實際處理超過呢個值就照實際時間回，部署報告會列出 p95 超過固定值嘅 public endpoint，只出 warning（決定 36）。
@@ -374,6 +412,7 @@ migration 放喺 ./migrations/main/。
   - 部署報告列出所有 public 寫入 endpoint 同佢哋嘅可寫欄位，並出 warning。
 
 ### 7.3 schema 升級去 database（離線遷移，CLI `tenant migrate`）
+
 1. 平台發出一個臨時遷移 role，全程寫入審計記錄。
 2. 凍結該租戶寫入：寫入請求回 503 同 `Retry-After`，讀取照常。
 3. 複製資料，然後喺新 DB 重新驗證 RLS、FORCE、權限同資料筆數。
@@ -383,8 +422,9 @@ migration 放喺 ./migrations/main/。
 7. 舊 schema 改為唯讀，保留 30 日；保留期內可以回退，之後自動刪除，並且寫入審計記錄。（呢個係平台遷移流程，同業務資料嘅軟刪除無關。）
 
 ## 8. 狀態碼同錯誤
+
 | 狀態碼 | 用途 |
-|---|---|
+| --- | --- |
 | 200 | 成功 |
 | 201 | 建立咗資源，要帶 `Location` |
 | 204 | 成功但冇內容 |
@@ -408,6 +448,7 @@ migration 放喺 ./migrations/main/。
 - 資源 ID 建議用 UUID，防止被逐個試出嚟。
 
 ## 9. Log 同 Manifest
+
 - log 記錄 request id、狀態碼、耗時同 stack；stack 只會寫入 log，唔會放喺回應。token、key 同 secret 一律唔會記錄。
 - `audit-log` pipeline 會記錄邊個做咗咩操作。
 - 部署時將所有 lock 編譯成 manifest，入面有 routes、pipelines、steps、provider 對應、公開 endpoint 清單、public 寫入 endpoint 清單，同埋每個 lock 嘅 id、hash 同簽名。
@@ -415,6 +456,7 @@ migration 放喺 ./migrations/main/。
 - 編譯 manifest 前會逐個驗證 lock 嘅簽名同 hash；任何一個 lock 唔合格，成個部署失敗。
 
 ## 9A. 緊急 Kill Switch
+
 - 用途：發現漏洞、濫用或者錯誤邏輯時，即時停用個別 endpoint，唔使重新部署（決定 31）。
 - 邊個可以觸發：project owner、maintainer，同平台 on-call 安全團隊；租戶 admin 只可以停用自己租戶嘅 public endpoint（只影響自己租戶）。
 - 點觸發：平台 UI 或者 CLI `endpoint disable {definition}/{version}/{feature} --reason "..."`；一定要寫原因。
@@ -428,13 +470,16 @@ migration 放喺 ./migrations/main/。
 - 部署報告列出所有停用緊嘅 endpoint。
 
 ## 9B. 供應鏈同設定保護
+
 - CI workflow 檔、編譯器版本設定（包括 model snapshot、prompt 版本）、驗證器版本設定、安全項目上限設定，全部受 CODEOWNERS 保護，改動要 owner 確認，而且屬高風險（要兩人）（決定 29）。
 - 簽名 key 只存在平台（KMS／HSM），CI 同開發者都攞唔到；CI 只係將通過驗證嘅 lock 交平台簽名。
 - 平台簽名前會自己再跑一次驗證器同確認檢查，唔信 CI 報告。
 - 業務 secret（DB 連線、JWT 私鑰）只用引用名，永遠唔會出現喺 source、lock、manifest 或者 log。
 
 ## 10. 部署驗證（全部喺 lock 層檢查；每個 error 都會報 lock 檔名、section、step id、對應 source 行數同原因）
+
 ### 10.1 Lock 完整性（error）
+
 - 過時：`source-hash` 同而家 source 正規化 hash 唔一致；或者任何 `dependencies` hash 唔一致。
 - 缺失：有 source 冇 lock，或者有 lock 冇 source（孤兒 lock）。
 - 未確認：`status` 唔係 `approved`；冇 `approved-by`、`approved-at`、`approval-ref` 或者 `approved-commit`。
@@ -451,31 +496,37 @@ migration 放喺 ./migrations/main/。
 - 語意一致性：lock 有 source 冇提及嘅寫入、公開、剔走 auth、簽 token 或者對外 call。
 
 ### 10.2 結構同路由（error）
+
 - 目錄深度唔係啱啱好 `api/{definition}/{version}/{feature}/{feature}.md`；models 唔合 `models/{object}/{object}.md` 或者 `models/{object}/methods/{method}.md`；檔名同資料夾名唔一致；version 名唔合規則；`_` 開頭檔放錯位置；出現已取消嘅 `models/{object}/{version}/` 資料夾。
 - `## Route` 嘅 method 唔喺支援範圍；normalize 之後 method 加 path 重複（normalize 包括轉細楷、去尾斜線、解 % 編碼，同埋統一 `:id` 同 `{id}`）；path 越出自己前綴、用咗保留路徑，或者有 `..` 或萬用字元。
 
 ### 10.3 Pipeline 同 auth（error）
+
 - 引用唔存在嘅 pipeline；pipeline 參數唔合 `## Parameters` schema；auth 次序錯；剔走 auth 但冇 `public: true`；`roles: []`。
 - pipeline lock 用咗白名單以外嘅 op，或者直接寫 `query`／`call`。
 - JWT alg 唔喺 RS256／ES256，或者冇驗 `iss`、`aud`、`exp`、`nbf`。
 - public 寫入 endpoint 剔走咗 `audit-log`。
 
 ### 10.4 api feature 內容（error）
+
 - `## Steps` 用咗 `method`、`validate`、`transform`、`respond` 以外嘅 op（包括 `query` 或者 `call`）。
 - 缺少 `## Request` 或者 `## Response`；`## Transform` 參照未宣告嘅 request 欄位或者 method output 冇嘅欄位。
 - timeout 或者 limits 超過平台上限。
 - `## Errors` 嘅狀態碼同 RFC 語意唔一致。
 
 ### 10.5 Provider（error）
+
 - type 未登記；isolation 唔係 schema 或者 database；connection 唔係 secret 引用；secret 唔喺本 project namespace；secret 名嵌咗 `{tenant_id}`；引用嘅 secret 唔存在；source 出現明文憑證。
 - 用咗 allowlist 以外嘅 provider；query 嘅 provider 唔係靜態決定；有 query 但解析唔到 provider。
 - shared provider 冇 `allowed-endpoints`；名單以外嘅 endpoint（直接或者經 method）用咗佢；喺佢上面有非 SELECT sql。
 
 ### 10.6 RLS 同 DB 權限（error）
+
 - 有表冇 `tenant_id`、冇 ENABLE 或者 FORCE RLS；policy 唔係用 `current_setting(..., false)`；`public` schema 仍然有 CREATE 權限；`## Policies` 同平台產生嘅唔一致。
 - 任何 runtime role 有 `DELETE`、`TRUNCATE` 或者 DDL 權限。
 
 ### 10.7 Public（error）
+
 - public endpoint 用到 query（包括經 method）但冇 `tenant: { from: path }`，或者 path 冇 `{slug}`。
 - public endpoint 經 method 有寫入 sql，但冇 `public-writes: true`，或者冇 IP 加租戶兩層限流，或者冇每日配額。
 - public 寫入用咗 `INSERT`／`UPDATE` 以外嘅操作；寫咗 `writable-columns` 以外嘅欄位；寫咗黑名單欄位。
@@ -487,6 +538,7 @@ migration 放喺 ./migrations/main/。
 - `public_writer` grant 超出 lock 實際用到嘅表、欄位同操作。
 
 ### 10.8 Model 同 method（error）
+
 - 物件冇 provider 或者冇 table；provider 未登記；用 shared provider 嘅物件有寫入 method；物件自己宣告咗 `tenant_id`；欄位 type 未知。
 - method 用咗白名單以外嘅 op。
 - sql 唔係參數化（字串拼接、`$n` 冇對應 param、param 冇用到）；sql 有多個 statement。
@@ -506,6 +558,7 @@ migration 放喺 ./migrations/main/。
   - alg 唔係 RS256／ES256，或者 key 唔係 `key-ref` 引用。
 
 ### 10.9 Warning
+
 - 缺少 `## Errors`（內容係 `(none)`）。
 - 有公開 endpoint；有 public 寫入 endpoint。
 - deprecated 嘅 version 冇寫 sunset。
@@ -517,21 +570,27 @@ migration 放喺 ./migrations/main/。
 - public 路徑有 `cost: high` step。
 
 ### 10.10 部署報告
+
 - 列出公開 endpoint、public 寫入 endpoint 同可寫欄位、用緊 shared provider 嘅 endpoint、每個 endpoint 用緊邊個 provider、被覆蓋咗嘅 CRUD method、今次重新編譯同等緊確認（pending）嘅 lock、每個 lock 嘅確認人同 commit、停用緊嘅 endpoint。
 - **有效權限摘要**：每個 endpoint 一行，列出公開與否、role、可讀表、可寫表同欄位、會唔會簽 token、對外 call、限流、配額、challenge；同上次部署比較，標出變咗嘅地方。
 
 ## 11. 完整範例（api、provider、pipeline）
+
 ### 11.1 Provider
+
 `providers/main.md`
-```
+
+```text
 # main
 主資料庫，用 PostgreSQL，每個租戶一個 schema。
 連線用 secret PG_MAIN。
 每個租戶連線池最多 5 條，statement 最多 5 秒。
 migration 放 ./migrations/main/。
 ```
+
 `providers/main.lock.md`
-````
+
+````text
 ---
 lock-version: 1
 kind: provider
@@ -570,23 +629,29 @@ signature: MEUCIQ...
 ## Migrations
 - path: ./migrations/main/
 ````
+
 `providers/enterprise.md`
-```
+
+```text
 # enterprise
 企業客戶用，每個租戶一個獨立 database，用 PostgreSQL。
 連線用 secret PG_ENTERPRISE，每個租戶實際憑證由平台對照表決定。
 ```
+
 （lock：`type: postgres`、`mode: database`、`secret: PG_ENTERPRISE`、`shared: false`，格式同上。）
 
 `providers/geo.md`
-```
+
+```text
 # geo
 共用嘅地區資料庫，PostgreSQL，schema 隔離，只讀。
 連線用 secret PG_GEO。
 只准 catalog/v1/list-items 用。
 ```
+
 `providers/geo.lock.md`（節錄 section，frontmatter 格式同上）
-````
+
+````text
 ## Connection
 - type: postgres
 - secret: PG_GEO
@@ -609,15 +674,19 @@ signature: MEUCIQ...
 ````
 
 ### 11.2 Pipeline
+
 `pipelines/login-guard.md`
-```
+
+```text
 # login-guard
 登入用嘅防護：每個 IP 每分鐘最多 10 次，每個 email 每分鐘最多 5 次。
 參數：ip-per-minute（整數，預設 10）、account-per-minute（整數，預設 5）。
 要喺所有 method 之前行，並且記低審計記錄（唔記密碼）。
 ```
+
 `pipelines/login-guard.lock.md`
-````
+
+````text
 ---
 lock-version: 1
 kind: pipeline
@@ -669,14 +738,18 @@ signature: MEYCIQ...
 ````
 
 ### 11.3 api 定義同版本
+
 `api/users/_definition.md`
-```
+
+```text
 # users
 用戶管理 API。可用 provider：main 同 enterprise，預設 main。
 所有 endpoint 都要 JWT 認證。
 ```
+
 `api/users/_definition.lock.md`（節錄 section；frontmatter 有 `kind: api`、`scope: definition`）
-````
+
+````text
 ## Providers
 - allowlist: [main, enterprise]
 - default: main
@@ -689,13 +762,17 @@ signature: MEYCIQ...
 - timeout: 10s
 - body: 1MB
 ````
+
 `api/users/v1/_version.md`
-```
+
+```text
 # users v1
 每分鐘限 60 次。呢個版本已經 deprecated，2027-06-30 停用。
 ```
+
 `api/users/v1/_version.lock.md`（節錄；`scope: version`）
-````
+
+````text
 ## Pipelines
 ### p1 rate-limit
 - per-minute: 60
@@ -709,15 +786,18 @@ signature: MEYCIQ...
 ````
 
 ### 11.4 `api/users/v2/create-user/create-user.md`（路由 `POST /users/v2/create-user`）
-```
+
+```text
 # 建立用戶
 POST。只有 admin 可以用，每分鐘最多 30 次。
 請求 body 要有 email（合法 email）同 name（1 至 50 字）。
 用 user.register 建立用戶，成功回 201 同新用戶嘅 id、email、name，並帶 Location。
 email 已經有人用就回 409 EMAIL_TAKEN；驗證唔通過回 422。
 ```
+
 `api/users/v2/create-user/create-user.lock.md`
-````
+
+````text
 ---
 lock-version: 1
 kind: api
@@ -800,14 +880,17 @@ signature: MEUCIG...
 ````
 
 ### 11.5 `api/users/v2/get-user/get-user.md`（路由 `GET /users/v2/{id}`）
-```
+
+```text
 # 攞用戶
 GET，路徑 /users/v2/{id}，id 係 uuid。
 用 user.get 攞用戶，回 200 同 id、email、name；搵唔到回 404 NOT_FOUND。
 v2 嘅 name 欄位叫 display_name。
 ```
+
 `get-user.lock.md`（節錄 section；frontmatter 格式同 11.4，`dependencies` 包括 `user/crud/get`）
-````
+
+````text
 ## Route
 - method: GET
 - path: /users/v2/{id}
@@ -858,16 +941,21 @@ v2 嘅 name 欄位叫 display_name。
 |---|---|---|
 | 404 | NOT_FOUND | user.get |
 ````
+
 - 呢個例子示範決定 2：`user.get` 只有一個版本，v2 嘅 `display_name` 改名由 api 層 `## Transform` 處理。
 
 ### 11.6 Public 讀取：`api/catalog/v1/list-items/list-items.md`（路由 `GET /catalog/v1/{slug}/items`）
+
 `api/catalog/_definition.md`
-```
+
+```text
 # catalog
 貨品目錄。可用 provider：main 同 geo，預設 main。
 ```
+
 `list-items.md`
-```
+
+```text
 # 公開貨品清單
 GET，路徑 /catalog/v1/{slug}/items，公開，唔使 auth，租戶由 slug 決定。
 每個 IP 每分鐘最多 120 次。
@@ -875,8 +963,10 @@ query 要有 region（2 個字元）。
 用 item.list-public 攞公開貨品，再用 region.find-by-code 搵地區；
 回 200 同 items（id、name、price）同 region。地區搵唔到回 404 NOT_FOUND。
 ```
+
 `list-items.lock.md`（節錄 section）
-````
+
+````text
 ## Route
 - method: GET
 - path: /catalog/v1/{slug}/items
@@ -944,7 +1034,8 @@ query 要有 region（2 個字元）。
 ````
 
 ### 11.7 Public 建立資料：`api/catalog/v1/submit-review/submit-review.md`（路由 `POST /catalog/v1/{slug}/reviews`）
-```
+
+```text
 # 提交評論
 POST，路徑 /catalog/v1/{slug}/reviews，公開，唔使 auth，租戶由 slug 決定。
 訪客可以留評論，所以會寫入資料，要 captcha。
@@ -952,8 +1043,10 @@ POST，路徑 /catalog/v1/{slug}/reviews，公開，唔使 auth，租戶由 slug
 body：item_id（uuid）、rating（1 至 5）、comment（1 至 500 字）。
 用 review.submit 建立評論，成功回 201 同 id。貨品唔存在回 404 NOT_FOUND。
 ```
+
 `submit-review.lock.md`（節錄 section）
-````
+
+````text
 ## Route
 - method: POST
 - path: /catalog/v1/{slug}/reviews
@@ -1028,31 +1121,38 @@ body：item_id（uuid）、rating（1 至 5）、comment（1 至 500 字）。
 | 422 | VALIDATION_FAILED | platform |
 | 429 | QUOTA_EXCEEDED | platform |
 ````
+
 - body 有 `tenant_id`、`id` 或者 `created_by` 會即刻 422；`tenant_id` 由平台按 slug 注入。
 - `review.submit` 透過 `item.get` 檢查貨品存在（寫入其他物件／讀其他物件都經佢自己 method），然後一個參數化 `INSERT INTO reviews (item_id, rating, comment) VALUES ($1, $2, $3)`；`comment` 喺 `review` model 標 `untrusted: true, max: 500`，所有輸出做 encoding。
 
 相關 method：
+
 - `models/user/methods/register.md`：「如果 email 已經有人用就 fail EMAIL_TAKEN，否則建立用戶，回傳 id、email、name。」編譯成 1 個 SELECT 檢查、1 個參數化 INSERT（`writes: true`）。
 - `models/item/item.md` 用 provider `main`、table `items`；`models/item/methods/list-public.md`（`writes: false`）負責揀 `is_public = true` 嘅項目。
 - `models/region/region.md` 用 shared provider `geo`、table `regions`；`models/region/methods/find-by-code.md`（`writes: false`）負責按 code 搵地區，冇結果就 fail NOT_FOUND。
 
 ## 12. Models 層
+
 ### 12.1 目錄同命名
-```
+
+```text
 models/{object}/{object}.md                   # 物件定義（自然語言）：欄位、provider、表、CRUD
 models/{object}/{object}.lock.md
 models/{object}/methods/{method}.md           # method 定義（自然語言），單一版本
 models/{object}/methods/{method}.lock.md
 ```
+
 - `{object}` 用單數 kebab-case（例如 `user`、`order-item`）；`{method}` 用 kebab-case 動詞（例如 `login`、`reset-password`、`sign-token`）。
 - 檔名必須等於資料夾名。
 - models 唔分 version（決定 1、2）；唔存在 `models/{object}/{version}/`。
 - models 永遠唔會被路由，只可以由 api 或者 pipeline 嘅 `method` step、或者其他 method 呼叫。
 
 ### 12.2 物件 `{object}.md`
+
 source 用自然語言描述欄位，例如「email 係唯一嘅合法 email」。編譯成 lock 嘅 `## Fields` 表：
+
 | 欄位屬性 | 說明 |
-|---|---|
+| --- | --- |
 | `type` | uuid、string、string[]、integer、number、boolean、timestamp、password、json |
 | `primary`、`unique`、`default` | 約束同預設值（`gen`、`now`） |
 | `format`、`min`、`max` | 驗證規則 |
@@ -1066,18 +1166,22 @@ source 用自然語言描述欄位，例如「email 係唯一嘅合法 email」�
 - 欄位唔分 version（決定 1）；改欄位要經 migration，migration 改咗會令 model lock 嘅依賴 hash 失效。
 
 ### 12.3 Method `{method}.md`
+
 source 用自然語言描述輸入、輸出、錯誤同做法。編譯成 lock 嘅：
+
 - `## Signature`：`input`、`output`、`errors`、`writes`；部署時編譯成 schema，未宣告嘅 input 一律拒絕。
 - `## Calls`：呢個 method 會呼叫嘅其他 method 同對外 call 目標（靜態清單）。
 - `## Steps`：只准 2A.4 method 白名單 op。
 
 規則：
+
 - `query` 只可以用自己物件嘅 provider 同表。
 - 寫入其他物件一定要用 `method` op 呼叫嗰個物件自己嘅 method（決定 3）；讀取其他物件都一樣要經佢嘅 method。
 - 錯誤用 `validate` 嘅 `fail: CODE` 拋出，CODE 一定要喺 `errors` 入面。
 - method 只有一個版本；唔准寫 `@v1`、`@v2`（決定 2）。要改 method 簽名而唔想影響舊 api version，應該喺舊 api 嘅 `## Transform` 做轉換；真係唔兼容就開一個新名嘅 method（例如 `register-with-phone`）。
 
 ### 12.3a 三層分工同單一職責
+
 - model 係「係咩」：欄位、表、provider、CRUD 宣告。
 - method 係「點做」：一個 method 只做一件事，所有 query 同對外 call 都喺呢度。
 - api 係「對外」：路由、pipeline、Request、Response、Transform；Steps 只准 `method`、`validate`、`transform`、`respond`。
@@ -1085,25 +1189,30 @@ source 用自然語言描述輸入、輸出、錯誤同做法。編譯成 lock �
 - 單一職責：每個 method 最多 1 個寫入 sql，而且最多只寫一張表；超出出 warning，建議拆開（決定 12）。
 
 ### 12.4 喺 api 呼叫 method
+
 api source 寫「用 user.login 驗證帳戶密碼」，編譯成：
-````
+
+````text
 ### s1 method
 - op: method
 - target: user.login
 - args: transform.in
 - out: result
 ````
+
 - `target` 只可以係 `{object}.{method}`，部署時靜態綁定，唔可以由 request 決定，冇版本後綴。
 - method 拋出嘅錯誤，喺 api lock 嘅 `## Errors` 對應狀態碼（例如 `| 401 | INVALID_CREDENTIALS | user.login |`）；冇對應嘅錯誤一律回 500 INTERNAL。
 - 唔同 api version call 同一個 method，差異由各自 `## Transform` 處理。
 - 呼叫深度上限 3 層，唔准循環呼叫。
 
 ### 12.5 版本同繼承
+
 - 物件定義（欄位同表）唔分 version，改欄位要經 migration。
 - method 只有單一版本，冇 version 資料夾，冇 method 層嘅 deprecated／sunset；deprecation 只喺 api `_version` 做。
 - method 唔會繼承 api 嘅 pipelines。auth 只喺 api／pipeline 層執行，method 會收到 `ctx.tenant_id` 同 `ctx.user`，但係唔可以修改。
 
 ### 12.6 安全
+
 - method 一樣行 7.1 嘅租戶隔離：每個 query 都喺有 `SET LOCAL app.tenant_id` 嘅 transaction 入面執行，RLS 強制生效。
 - 由 public endpoint call 嘅 method：
   - tenant 由 slug 解析，平台注入。
@@ -1122,7 +1231,9 @@ api source 寫「用 user.login 驗證帳戶密碼」，編譯成：
 - login 類 endpoint 一定同時按 IP 同帳戶限流（例如 11.2 嘅 `login-guard`），並跟 4A.3 嘅鎖定同 captcha 規則。
 
 ### 12.7 驗證規則
+
 models 層嘅所有檢查都喺 lock 層做，完整清單見 10.1 同 10.8。重點：
+
 - 結構：路徑唔合 `models/{object}/{object}.md` 或者 `models/{object}/methods/{method}.md`；檔名唔等於資料夾名。
 - 物件：冇 provider 或者 table；provider 未登記；shared provider 物件有寫入 method；自己宣告 `tenant_id`；欄位 type 未知。
 - method：白名單以外 op；query 去咗其他表或者 provider；`writes: false` 有寫入 sql；有 `DELETE` sql；sql 唔參數化；`fail` 用咗未宣告錯誤碼；output 有 password 欄位；揀咗 password 欄位但唔係畀 `verify-password` 用；`sign-jwt` 喺冇 `capabilities: [sign-token]` 嘅 method 出現；有 DDL、TRUNCATE，或者 UPDATE 冇用主鍵／RLS 限定。
@@ -1130,8 +1241,10 @@ models 層嘅所有檢查都喺 lock 層做，完整清單見 10.1 同 10.8。�
 - Warning：method 錯誤碼喺 api 冇對應狀態碼；單一職責超出。
 
 ### 12.8 完整範例（user model、user.sign-token、user.login、login api）
+
 `models/user/user.md`
-```
+
+```text
 # user
 用戶資料，放喺 provider main 嘅 users 表。
 
@@ -1145,8 +1258,10 @@ models 層嘅所有檢查都喺 lock 層做，完整清單見 10.1 同 10.8。�
 
 提供 get、list、update 三個 CRUD。list 每頁預設 20，最多 100，可以按 created_at 或者 name 排序，可以按 email 篩選。
 ```
+
 `models/user/user.lock.md`
-````
+
+````text
 ---
 lock-version: 1
 kind: model
@@ -1201,7 +1316,8 @@ signature: MEUCIQ...
 ````
 
 `models/user/methods/sign-token.md`
-```
+
+```text
 # sign-token
 幫用戶簽一張 access token。
 呢個 method 負責簽 token。
@@ -1209,8 +1325,10 @@ signature: MEUCIQ...
 輸出：token（字串）。
 token 有效 1 小時，用 ES256，key 用 JWT_SIGNING_KEY。
 ```
+
 `models/user/methods/sign-token.lock.md`
-````
+
+````text
 ---
 lock-version: 1
 kind: method
@@ -1262,7 +1380,8 @@ signature: MEQCIA...
 ````
 
 `models/user/methods/login.md`
-```
+
+```text
 # login
 用 email 同密碼登入。
 輸入：email（合法 email，必填）、password（1 至 256 字，必填）。
@@ -1274,8 +1393,10 @@ signature: MEQCIA...
 3. 成功就記低最後登入時間。
 4. 用 user.sign-token 簽 token，回傳 user 同 token。
 ```
+
 `models/user/methods/login.lock.md`
-````
+
+````text
 ---
 lock-version: 1
 kind: method
@@ -1359,15 +1480,19 @@ signature: MEUCIQ...
 - value: { user: { id: u.id, email: u.email, name: u.name, roles: u.roles }, token: t.token }
 - source-lines: 10-10
 ````
+
 - s4 係寫入，所以 `writes: true`；login 係 public endpoint，s4 用 `public_writer` 執行，grant 只有 `UPDATE(last_login_at)`（決定 4 令呢個情況變得可行）。
 
 `api/auth/_definition.md`
-```
+
+```text
 # auth
 認證 API，只用 provider main。
 ```
+
 `api/auth/v1/login/login.md`（路由 `POST /auth/v1/{slug}/login`）
-```
+
+```text
 # 登入
 POST，路徑 /auth/v1/{slug}/login。
 公開，唔使 auth，租戶由 slug 決定。
@@ -1378,8 +1503,10 @@ POST，路徑 /auth/v1/{slug}/login。
 用 user.login 登入，成功回 200 同 token 同 user（id、email、name、roles）。
 帳戶密碼錯回 401 INVALID_CREDENTIALS；驗證唔通過回 422。
 ```
+
 `api/auth/v1/login/login.lock.md`
-````
+
+````text
 ---
 lock-version: 1
 kind: api
@@ -1475,10 +1602,12 @@ signature: MEYCIQ...
 | 401 | INVALID_CREDENTIALS | user.login |
 | 422 | VALIDATION_FAILED | platform |
 ````
+
 - PR review 會逐項高亮：`public: true`、`-auth`、`public-writes: true`（以上高風險，要兩個非作者確認並寫原因）、新增寫入 sql（`user.login` s4，中風險）。
 - 有效權限摘要：`POST /auth/v1/{slug}/login` → public；role public_reader + public_writer；讀 users；寫 users.last_login_at；間接簽 token（經 `user.sign-token`）；冇對外 call；IP 10/min、帳戶 5/min、租戶 300/min；有每日配額。
 
 ### 12.9 CRUD
+
 - 預設唔會自動生成任何 CRUD。model source 要明確講（例如「提供 get、list、update」或者「提供全部 CRUD」），lock 嘅 `## CRUD` 列咗邊樣就注入邊樣。
 - CRUD 選項（喺 source 用自然語言講，編譯成 `## CRUD` 表）：
   - `list`：`page-size`（預設 20）、`max-page-size`（預設 100，平台有上限）、`sort` 白名單、`filter` 白名單。
@@ -1502,6 +1631,7 @@ signature: MEYCIQ...
 - 範例：`models/user/user.md` 寫「提供 get、list、update」，api 就可以 call `user.get`、`user.list`、`user.update`。
 
 ### 12.10 私隱刪除（crypto-shredding 同匿名化）
+
 - 欄位分類：model 欄位可以標 `personal: sensitive`（例如身份證號碼、電話、地址、出生日期）或者 `personal: standard`（例如 name、email、評論內容）。
 - 加密（sensitive）：每筆紀錄每個 sensitive 欄位有自己嘅 data key（DEK），用 AES-256-GCM 加密；DEK 用租戶 key（KEK，喺平台 KMS）包住，存喺平台 key store，唔同業務資料放埋一齊，唔入 DB 備份。加解密由平台自動做，lock 唔會見到 key。
 - 觸發：
@@ -1520,9 +1650,11 @@ signature: MEYCIQ...
 - 匿名化欄位喺 public 寫入黑名單（7.2）之外另有保護：erased 紀錄唔准再由 lock 寫入個人欄位。
 
 ## 13. 待確認
+
 私隱法（PDPO、GDPR）部分嘅建議請法律意見覆核。
 
 ## 14. 後續版本
+
 - 排程、queue、webhook 入口。
 - 線上（唔凍結寫入）嘅 schema 升級去 database 遷移。
 - 除咗 PostgreSQL 以外嘅 provider type。
