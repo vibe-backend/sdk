@@ -1607,7 +1607,7 @@ fn platform_status(code: &str) -> StatusCode {
         "PRECONDITION_REQUIRED" => StatusCode::PRECONDITION_REQUIRED,
         "PRECONDITION_FAILED" => StatusCode::PRECONDITION_FAILED,
         "NOT_FOUND" => StatusCode::NOT_FOUND,
-        "CONFLICT" => StatusCode::CONFLICT,
+        "CONFLICT" | "UNIQUE_VIOLATION" => StatusCode::CONFLICT,
         "FORBIDDEN" => StatusCode::FORBIDDEN,
         "UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
         "BAD_REQUEST" => StatusCode::BAD_REQUEST,
@@ -2334,5 +2334,15 @@ mod request_validation_tests {
             assert!(check_type(&f, &good).is_ok(), "{ty} good");
             assert!(check_type(&f, &bad).is_err(), "{ty} bad");
         }
+    }
+}
+
+#[cfg(test)]
+mod unique_violation_tests {
+    use super::*;
+
+    #[test]
+    fn unique_violation_is_409() {
+        assert_eq!(platform_status("UNIQUE_VIOLATION"), StatusCode::CONFLICT);
     }
 }

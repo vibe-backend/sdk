@@ -67,6 +67,7 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
     check_calls(&docs, &mut report);
     check_targets(&docs, &mut report);
     check_migrations(&docs, &mut report);
+    check_unique_indexes(&docs, &mut report);
     check_feature_method_writes(&docs, &mut report);
     check_security_items_enriched(&docs, &source_by_id, opts, &mut report);
     if opts.deploy {
@@ -133,7 +134,14 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
         .iter()
         .map(|section| section.name.as_str())
         .collect();
-    if names != order {
+    // Optional sections (D107 `## Constraints`) may appear in their slot.
+    let full = crate::lock::full_section_order(doc.meta.kind, doc.meta.scope);
+    let expected: Vec<&str> = full
+        .iter()
+        .copied()
+        .filter(|name| order.contains(name) || names.contains(name))
+        .collect();
+    if names != expected {
         report.push(Diag::error(
             &file,
             format!("sections must be exactly {}", order.join(", ")),
@@ -289,6 +297,28 @@ fn check_model(doc: &LockDoc, file: &str, report: &mut Report) {
     }
     if !saw_tenant {
         report.push(Diag::error(file, "model is missing tenant_id").at_section("Fields"));
+    }
+    match crate::lock::model_unique_constraints(&doc.sections) {
+        Ok(constraints) => {
+            for cols in constraints {
+                for c in &cols {
+                    if !table.rows.iter().any(|row| row.first() == Some(c)) {
+                        report.push(
+                            Diag::error(
+                                file,
+                                format!("unique constraint column {c} is not a field"),
+                            )
+                            .at_section("Constraints"),
+                        );
+                    }
+                }
+            }
+        }
+        Err(errors) => {
+            for err in errors {
+                report.push(Diag::error(file, err).at_section("Constraints"));
+            }
+        }
     }
     match find_section(&doc.sections, "Table").and_then(|section| section.get("owner-key")) {
         Some(key) if !key.is_empty() && key != "(none)" => {
@@ -915,6 +945,86 @@ fn check_calls(docs: &HashMap<String, LockDoc>, report: &mut Report) {
     }
 }
 
+/// D107: every `## Constraints` `- unique: [a, b]` needs a migration lock on
+/// the same provider that creates a unique index on the model's table over
+/// exactly `(tenant_id, a, b)`. Missing index fails the build.
+fn check_unique_indexes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    let mut indexes: Vec<(String, String, Vec<String>)> = Vec::new();
+    for doc in docs.values() {
+        if doc.meta.kind != Kind::Migration {
+            continue;
+        }
+        let provider = find_section(&doc.sections, "Target")
+            .and_then(|s| s.get("provider"))
+            .unwrap_or("")
+            .to_string();
+        let Some(up) = find_section(&doc.sections, "Up") else {
+            continue;
+        };
+        for block in &up.blocks {
+            let sql = block_val(block, "sql");
+            if let Some((table, cols)) = unique_index_of(sql.trim_matches('`')) {
+                indexes.push((provider.clone(), table, cols));
+            }
+        }
+    }
+    let mut ids: Vec<&String> = docs.keys().collect();
+    ids.sort();
+    for id in ids {
+        let doc = &docs[id];
+        if doc.meta.kind != Kind::Model {
+            continue;
+        }
+        let Ok(constraints) = crate::lock::model_unique_constraints(&doc.sections) else {
+            continue;
+        };
+        let table_section = find_section(&doc.sections, "Table");
+        let provider = table_section.and_then(|s| s.get("provider")).unwrap_or("");
+        let table = table_section.and_then(|s| s.get("table")).unwrap_or("");
+        for cols in constraints {
+            let want = crate::lock::effective_unique_columns(&cols);
+            let found = indexes
+                .iter()
+                .any(|(p, t, c)| p == provider && t == table && *c == want);
+            if !found {
+                report.push(
+                    Diag::error(
+                        lock_rel(&doc.meta.source),
+                        format!(
+                            "unique [{}] has no migration that creates a unique index on {table} ({})",
+                            cols.join(", "),
+                            want.join(", ")
+                        ),
+                    )
+                    .at_section("Constraints"),
+                );
+            }
+        }
+    }
+}
+
+/// `CREATE UNIQUE INDEX [CONCURRENTLY] [IF NOT EXISTS] [name] ON [ONLY] t (a, b) ...`
+/// → (table without schema or quotes, plain column names).
+pub fn unique_index_of(sql: &str) -> Option<(String, Vec<String>)> {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?is)^\s*create\s+unique\s+index\s+(?:concurrently\s+)?(?:if\s+not\s+exists\s+)?(?:[\w."]+\s+)?on\s+(?:only\s+)?([\w."]+)\s*(?:using\s+\w+\s*)?\(([^)]*)\)"#,
+        )
+        .expect("regex")
+    });
+    let caps = RE.captures(sql)?;
+    let unquote = |s: &str| s.trim().trim_matches('"').to_string();
+    let table = caps[1].rsplit('.').next().map(unquote)?;
+    let cols: Vec<String> = caps[2].split(',').map(unquote).collect();
+    if cols
+        .iter()
+        .any(|c| c.is_empty() || !c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
+    {
+        return None;
+    }
+    Some((table, cols))
+}
+
 fn check_migrations(docs: &HashMap<String, LockDoc>, report: &mut Report) {
     let mut by_provider: HashMap<String, Vec<u32>> = HashMap::new();
     for doc in docs.values() {
@@ -1352,6 +1462,31 @@ fn lock_rel(source_rel: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unique_index_sql_is_recognized() {
+        let cols = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            unique_index_of("CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ix ON public.\"cart_items\" (tenant_id, \"cart_id\", product_id) WHERE deleted_at IS NULL"),
+            Some(("cart_items".into(), cols(&["tenant_id", "cart_id", "product_id"])))
+        );
+        assert_eq!(
+            unique_index_of("create unique index on t (tenant_id, a)"),
+            Some(("t".into(), cols(&["tenant_id", "a"])))
+        );
+        assert_eq!(
+            unique_index_of("CREATE INDEX CONCURRENTLY ix ON t (tenant_id, a)"),
+            None
+        );
+        assert_eq!(
+            unique_index_of("CREATE UNIQUE INDEX ix ON t (lower(a))"),
+            None
+        );
+        assert_eq!(
+            unique_index_of("CREATE UNIQUE INDEX ix ON t (a DESC)"),
+            None
+        );
+    }
 
     #[test]
     fn delete_sql_is_rejected() {

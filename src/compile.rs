@@ -439,7 +439,7 @@ pub(crate) fn check_llm_output(
 ) -> Result<Vec<Section>, Vec<String>> {
     let sections =
         crate::lock::parse_sections(text).map_err(|err| vec![sanitize_parse_error(&err)])?;
-    let order = crate::lock::section_order(kind, scope);
+    let order = crate::lock::full_section_order(kind, scope);
     let mut errors = Vec::new();
     let mut seen = std::collections::HashSet::new();
     // Never echo model-controlled text (section names) back into the prompt.
@@ -1191,7 +1191,10 @@ fn reorder(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Diag>> {
             .at_section(*name)]);
         }
     }
-    doc.sections = reorder_named(&doc.sections, order);
+    doc.sections = reorder_named(
+        &doc.sections,
+        &crate::lock::full_section_order(source.kind, source.scope),
+    );
     Ok(())
 }
 
@@ -1391,7 +1394,19 @@ fn semantic_check(
         ],
         "ownership",
     );
-    if mentions_composite_unique(&text) {
+    if doc.meta.kind == Kind::Model && mentions_composite_unique(&text) {
+        let declared = crate::lock::model_unique_constraints(&doc.sections)
+            .map(|c| c.iter().any(|cols| cols.len() >= 2))
+            .unwrap_or(false);
+        if !declared {
+            report.push(
+                Diag::error(
+                    &doc.meta.source,
+                    "the source describes a composite unique, but the lock has no `## Constraints` entry `- unique: [col_a, col_b]` (D107)",
+                )
+                .at_section("Constraints"),
+            );
+        }
         let uniques: Vec<&str> = find_section(&doc.sections, "Fields")
             .and_then(|s| s.table.as_ref())
             .map(|t| {
@@ -1420,7 +1435,8 @@ fn semantic_check(
     }
 }
 
-/// Runs on the English text (the translation for non-English sources).
+/// Runs on the English text only (the translation for non-English sources);
+/// there are deliberately no non-English phrases here (D107/D108).
 fn mentions_composite_unique(text: &str) -> bool {
     const PHRASES: &[&str] = &[
         "composite unique",

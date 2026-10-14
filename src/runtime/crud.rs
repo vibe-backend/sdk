@@ -216,10 +216,7 @@ async fn create(
                 .await
                 .map_err(db)?;
             if !existing.is_empty() {
-                return Err(MethodFail::code(
-                    "CONFLICT",
-                    format!("{} already exists", field.name),
-                ));
+                return Err(unique_violation(std::slice::from_ref(&field.name)));
             }
         }
         row_values.push((col(field), value));
@@ -230,6 +227,46 @@ async fn create(
                 "VALIDATION_FAILED",
                 format!("unknown field {key}"),
             ));
+        }
+    }
+    // D107: composite unique keys, scoped by tenant (the executor always
+    // filters by the caller's tenant). The migration's unique index is the
+    // real guarantee; a race there maps 23505 to the same error.
+    for cols in &model.uniques {
+        let mut filters = Vec::new();
+        for name in cols {
+            match row_values.iter().find(|(c, _)| c.name == *name) {
+                Some((c, v)) if !v.is_null() => filters.push((c.clone(), v.clone())),
+                _ => {
+                    filters.clear();
+                    break;
+                }
+            }
+        }
+        if filters.is_empty() {
+            continue;
+        }
+        let existing = exec
+            .execute(
+                tenant_id,
+                role,
+                Stmt::Select {
+                    table: model.table.clone(),
+                    columns: vec![Col {
+                        name: "id".into(),
+                        ty: "uuid".into(),
+                    }],
+                    id: None,
+                    filters,
+                    sort: None,
+                    limit: 1,
+                    offset: 0,
+                },
+            )
+            .await
+            .map_err(db)?;
+        if !existing.is_empty() {
+            return Err(unique_violation(cols));
         }
     }
     let returning = output_cols(model, false);
@@ -821,10 +858,23 @@ fn int_field(input: &Value, key: &str) -> Option<i64> {
     }
 }
 
+/// 409 `UNIQUE_VIOLATION` naming the constraint's columns only; field values
+/// are never echoed (D107).
+pub fn unique_violation(cols: &[String]) -> MethodFail {
+    MethodFail::code(
+        "UNIQUE_VIOLATION",
+        format!("unique constraint ({}) violated", cols.join(", ")),
+    )
+}
+
 fn db(err: ExecError) -> MethodFail {
     match err {
         ExecError::NotFound => MethodFail::code("NOT_FOUND", "not found"),
-        ExecError::Conflict => MethodFail::code("CONFLICT", "conflict"),
+        // SQLSTATE 23505. The database message carries the duplicate values,
+        // so it is never passed through (D107).
+        ExecError::Conflict => {
+            MethodFail::code("UNIQUE_VIOLATION", "a unique constraint was violated")
+        }
         ExecError::Precondition => MethodFail::code("PRECONDITION_FAILED", "precondition failed"),
         ExecError::Message(message) => MethodFail::code("INTERNAL", message),
     }
@@ -1062,6 +1112,7 @@ mod ownership_tests {
             sensitive_output: vec![],
             owner_key: owner_key.map(str::to_string),
             ownership: ownership.into(),
+            uniques: vec![],
         }
     }
 
@@ -1137,5 +1188,118 @@ mod expr_check_tests {
         assert!(check_when("qty > 5").is_err());
         // Unknown conditions fail closed at runtime.
         assert!(when_matches("qty > 5", &Map::new()));
+    }
+}
+
+#[cfg(test)]
+mod unique_tests {
+    use super::*;
+    use crate::manifest::{FieldSpec, ListOpts, ModelSpec};
+    use crate::runtime::exec::MemoryExec;
+
+    fn field(name: &str, unique: bool) -> FieldSpec {
+        FieldSpec {
+            name: name.into(),
+            ty: "string".into(),
+            required: true,
+            unique,
+            primary: false,
+            system: false,
+            sensitive: false,
+            nullable: false,
+            min: None,
+            max: None,
+            format: String::new(),
+        }
+    }
+
+    fn model() -> ModelSpec {
+        ModelSpec {
+            id: "cart-item".into(),
+            provider: "main".into(),
+            table: "cart_items".into(),
+            fields: vec![
+                field("cart_id", false),
+                field("product_id", false),
+                field("sku", true),
+            ],
+            crud: vec!["create".into()],
+            list: ListOpts::default(),
+            sensitive_output: vec![],
+            owner_key: None,
+            ownership: "tenant-wide".into(),
+            uniques: vec![vec!["cart_id".into(), "product_id".into()]],
+        }
+    }
+
+    async fn add(exec: &MemoryExec, tenant: &str, input: Value) -> Result<CallResult, MethodFail> {
+        let roles: Vec<String> = vec![];
+        create(
+            exec,
+            &model(),
+            &input,
+            CallCtx {
+                tenant_id: tenant,
+                role: "app_rw",
+                caller: Caller {
+                    subject: "u1",
+                    roles: &roles,
+                },
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn composite_unique_violation_is_409_without_values() {
+        let exec = MemoryExec::new();
+        let row = |cart: &str, product: &str, sku: &str| serde_json::json!({ "cart_id": cart, "product_id": product, "sku": sku });
+        add(&exec, "t1", row("cart-secret-1", "prod-secret-9", "s1"))
+            .await
+            .unwrap_or_else(|f| panic!("{}: {}", f.code, f.message));
+        // Same cart, other product; same product, other cart: allowed.
+        assert!(add(&exec, "t1", row("cart-secret-1", "prod-2", "s2"))
+            .await
+            .is_ok());
+        assert!(add(&exec, "t1", row("cart-2", "prod-secret-9", "s3"))
+            .await
+            .is_ok());
+        // tenant_id is part of the key: another tenant may reuse the pair.
+        assert!(
+            add(&exec, "t2", row("cart-secret-1", "prod-secret-9", "s1"))
+                .await
+                .is_ok()
+        );
+
+        let fail = match add(&exec, "t1", row("cart-secret-1", "prod-secret-9", "s4")).await {
+            Ok(_) => panic!("duplicate (cart_id, product_id) must fail"),
+            Err(fail) => fail,
+        };
+        assert_eq!(fail.code, "UNIQUE_VIOLATION");
+        assert_eq!(
+            fail.message,
+            "unique constraint (cart_id, product_id) violated"
+        );
+        assert!(!fail.message.contains("secret"), "{}", fail.message);
+    }
+
+    #[tokio::test]
+    async fn single_column_unique_uses_the_same_code() {
+        let exec = MemoryExec::new();
+        let row = |cart: &str, sku: &str| serde_json::json!({ "cart_id": cart, "product_id": "p", "sku": sku });
+        assert!(add(&exec, "t1", row("c1", "sku-secret")).await.is_ok());
+        let fail = match add(&exec, "t1", row("c2", "sku-secret")).await {
+            Ok(_) => panic!("duplicate sku must fail"),
+            Err(fail) => fail,
+        };
+        assert_eq!(fail.code, "UNIQUE_VIOLATION");
+        assert!(!fail.message.contains("sku-secret"), "{}", fail.message);
+    }
+
+    #[test]
+    fn database_unique_violation_maps_to_unique_violation() {
+        let fail = db(ExecError::Conflict);
+        assert_eq!(fail.code, "UNIQUE_VIOLATION");
+        assert_eq!(fail.message, "a unique constraint was violated");
     }
 }

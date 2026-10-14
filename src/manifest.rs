@@ -184,6 +184,10 @@ pub struct ModelSpec {
     /// Explicit relaxation: `tenant-wide` or `role(admin)`.
     #[serde(default)]
     pub ownership: String,
+    /// D107 composite unique keys from `## Constraints`, as declared (the
+    /// platform scopes every one of them by tenant_id).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uniques: Vec<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -311,6 +315,7 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
                 errors: vec![
                     "NOT_FOUND".into(),
                     "CONFLICT".into(),
+                    "UNIQUE_VIOLATION".into(),
                     "PRECONDITION_FAILED".into(),
                 ],
                 capabilities: Vec::new(),
@@ -451,6 +456,7 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
         sensitive_output,
         owner_key,
         ownership,
+        uniques: crate::lock::model_unique_constraints(&doc.sections).unwrap_or_default(),
     }
 }
 

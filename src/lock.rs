@@ -349,6 +349,99 @@ pub fn section_order(kind: Kind, scope: Option<Scope>) -> &'static [&'static str
     }
 }
 
+/// Optional sections, allowed in addition to `section_order`, each placed
+/// right after the named section (D107: `## Constraints` after `## Fields`).
+pub fn optional_sections(kind: Kind) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        Kind::Model => &[("Constraints", "Fields")],
+        _ => &[],
+    }
+}
+
+/// `section_order` with the optional sections inserted where they belong.
+pub fn full_section_order(kind: Kind, scope: Option<Scope>) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for name in section_order(kind, scope) {
+        out.push(*name);
+        for (optional, after) in optional_sections(kind) {
+            if after == name {
+                out.push(*optional);
+            }
+        }
+    }
+    out
+}
+
+/// D107: composite unique keys declared in a model lock's `## Constraints`
+/// section as `- unique: [col_a, col_b]`. Returned as written; the platform
+/// prepends `tenant_id` (see `effective_unique_columns`). Errors never quote
+/// anything but column names.
+pub fn model_unique_constraints(sections: &[Section]) -> Result<Vec<Vec<String>>, Vec<String>> {
+    let Some(section) = sections.iter().find(|s| s.name == "Constraints") else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut errors = Vec::new();
+    if section.table.is_some() || !section.blocks.is_empty() {
+        errors.push("## Constraints takes only `- unique: [col_a, col_b]` bullets".to_string());
+    }
+    for (idx, bullet) in section.bullets.iter().enumerate() {
+        let n = idx + 1;
+        if bullet.key != "unique" {
+            errors.push(format!(
+                "## Constraints entry {n}: unknown key (only `unique` is allowed)"
+            ));
+            continue;
+        }
+        let cols = match parse_string_list(&bullet.value) {
+            Ok(cols) => cols,
+            Err(_) => {
+                errors.push(format!(
+                    "## Constraints entry {n}: value must be a list like `[col_a, col_b]`"
+                ));
+                continue;
+            }
+        };
+        if cols.is_empty() {
+            errors.push(format!(
+                "## Constraints entry {n}: list at least one column"
+            ));
+            continue;
+        }
+        if cols.iter().any(|c| c == "tenant_id") {
+            errors.push(format!(
+                "## Constraints entry {n}: do not list tenant_id; the platform prepends it"
+            ));
+            continue;
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !cols.iter().all(|c| seen.insert(c.as_str())) {
+            errors.push(format!(
+                "## Constraints entry {n}: a column is listed twice"
+            ));
+            continue;
+        }
+        if out.contains(&cols) {
+            errors.push(format!("## Constraints entry {n}: duplicate constraint"));
+            continue;
+        }
+        out.push(cols);
+    }
+    if errors.is_empty() {
+        Ok(out)
+    } else {
+        Err(errors)
+    }
+}
+
+/// The columns the unique index must cover: `tenant_id` first, then the
+/// declared columns in order (D107).
+pub fn effective_unique_columns(cols: &[String]) -> Vec<String> {
+    let mut out = vec!["tenant_id".to_string()];
+    out.extend(cols.iter().cloned());
+    out
+}
+
 /// Canonical compiler-hash from spec 2A.1: sorted-key JSON, UTF-8, no whitespace.
 pub fn compiler_hash(stamp: &CompilerStamp) -> String {
     let mut root = BTreeMap::new();
@@ -1007,6 +1100,60 @@ pub fn signing_payload(rendered_with_none: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn constraints(body: &str) -> Result<Vec<Vec<String>>, Vec<String>> {
+        let sections = parse_sections(&format!("## Constraints\n{body}")).expect("parse");
+        model_unique_constraints(&sections)
+    }
+
+    #[test]
+    fn constraints_section_parses_unique_keys() {
+        assert_eq!(
+            constraints("- unique: [a, b]\n- unique: [c]\n").unwrap(),
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string()]
+            ]
+        );
+        assert_eq!(
+            model_unique_constraints(&[]).unwrap(),
+            Vec::<Vec<String>>::new()
+        );
+        assert_eq!(
+            effective_unique_columns(&["a".into(), "b".into()]),
+            ["tenant_id", "a", "b"]
+        );
+    }
+
+    #[test]
+    fn constraints_section_rejects_bad_entries() {
+        for (body, want) in [
+            ("- unique: [tenant_id, a]\n", "platform prepends"),
+            ("- unique: []\n", "at least one column"),
+            ("- unique: [a, a]\n", "listed twice"),
+            (
+                "- unique: [a, b]\n- unique: [a, b]\n",
+                "duplicate constraint",
+            ),
+            ("- primary: [a, b]\n", "unknown key"),
+            ("- unique: a\n", "must be a list"),
+        ] {
+            let errs = constraints(body).unwrap_err();
+            assert!(errs.iter().any(|e| e.contains(want)), "{body}: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn model_section_order_allows_constraints_after_fields() {
+        assert_eq!(
+            full_section_order(Kind::Model, None),
+            ["Table", "Fields", "Constraints", "CRUD", "Policies"]
+        );
+        assert_eq!(
+            full_section_order(Kind::Method, None),
+            section_order(Kind::Method, None)
+        );
+    }
 
     #[test]
     fn roundtrip_frontmatter() {

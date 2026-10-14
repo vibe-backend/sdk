@@ -22,7 +22,7 @@ MODEL KEYS:
 - ## Fields table header is exactly `| name | type | rules | system |`. One row per user field; do NOT add id, tenant_id, created_at, updated_at, deleted_at, erased_at (the platform adds them). system is `no`.
 - type is one of: uuid, string, string[], integer, number, boolean, timestamp, password, json, bytes.
 - rules is a comma-separated list from: required, nullable, unique, primary, default: <value|gen|now>, format: email, min: <int>, max: <int>, enum: [a, b], sensitive, untrusted, personal: <standard|sensitive>, public-writable. For strings min/max are character lengths (\"at most 80 characters\" is `max: 80`; there is no max_length/min_length/maxLength key). For integers/numbers min/max are values.
-- `unique` is per column only. A uniqueness over several columns together cannot be expressed in Fields: do NOT mark each column unique; leave the columns without `unique` (it needs a migration with a composite unique index).
+- `unique` is per column only. A uniqueness over several columns together is NOT expressed in Fields: do NOT mark each column unique. Instead add an optional `## Constraints` section right after `## Fields` with one bullet per key, e.g. `- unique: [cart_id, product_id]`. Never list tenant_id (the platform prepends it). A migration must create the matching unique index on (tenant_id, cart_id, product_id).
 - ## CRUD table header is exactly `| method | options |`; rows only for actions the source asks for: create, get, list, update, delete. list options: page-size: N, max-page-size: N (<= 500), sort: [fields], filter: [fields]. update options: optimistic-lock: if-match. delete options: soft: true. No options: `-`.
 - ## Policies: write `(none)`; the platform generates RLS and grants.
 ";
@@ -88,7 +88,7 @@ const CJK_GUIDE: &str = "\
 NON-ENGLISH SOURCES (e.g. Chinese): keys, section names, table headers and types stay in English exactly as above; only string values may be Chinese.
 - 最長/最多/不超過 N 字 → `max: N`; 至少 N 字 → `min: N`; N 至 M 字 → `min: N, max: M` (never max_length/min_length).
 - 必填 → `required`; 可以冇/可選/可為空 → `nullable`; 唯一 → `unique` on that one column.
-- 組合唯一/聯合唯一 (several columns unique together) → do NOT put `unique` on those columns.
+- Several columns unique together → no per-column `unique`; use `## Constraints` `- unique: [col_a, col_b]` (see MODEL KEYS).
 - 移除 auth/唔使 auth/免登入/不需要登入 → `### -auth` with `- removed: true` and nothing else for auth; never add `### auth`, jwt, or token settings.
 - Use ASCII `|` in tables, never full-width `｜`.
 ";

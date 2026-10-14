@@ -152,3 +152,190 @@ async fn composite_unique_is_not_compiled_as_per_column_unique() {
     assert!(text.contains("composite unique"), "{text}");
     assert!(text.contains("cart_id, product_id"), "{text}");
 }
+
+// ---- D107: composite unique through `## Constraints` ----
+
+const CART_CONSTRAINTS: &str = "## Table
+- provider: main
+- table: cart_items
+## Fields
+| name | type | rules | system |
+| --- | --- | --- | --- |
+| cart_id | uuid | required | no |
+| product_id | uuid | required | no |
+| qty | integer | min: 1, max: 99 | no |
+## Constraints
+- unique: [cart_id, product_id]
+## CRUD
+| method | options |
+| --- | --- |
+| create | - |
+## Policies
+(none)
+";
+
+const CART_NO_CONSTRAINTS: &str = "## Table
+- provider: main
+- table: cart_items
+## Fields
+| name | type | rules | system |
+| --- | --- | --- | --- |
+| cart_id | uuid | required | no |
+| product_id | uuid | required | no |
+| qty | integer | min: 1, max: 99 | no |
+## CRUD
+| method | options |
+| --- | --- |
+| create | - |
+## Policies
+(none)
+";
+
+const PRODUCT_OK: &str = "## Table
+- provider: main
+- table: products
+## Fields
+| name | type | rules | system |
+| --- | --- | --- | --- |
+| sku | string | required, unique, max: 40 | no |
+| name | string | required, max: 80 | no |
+| price_cents | integer | required, min: 0 | no |
+## CRUD
+| method | options |
+| --- | --- |
+| get | - |
+| list | page-size: 20 |
+## Policies
+(none)
+";
+
+const UNIQUE_MIGRATION: &str = "# cart items unique
+
+## Target
+
+- provider: main
+- seq: 0001
+
+## Up
+
+### s1
+
+- sql: CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS cart_items_cart_product ON cart_items (tenant_id, cart_id, product_id)
+
+## Verify
+
+(none)
+
+## Data
+
+(none)
+";
+
+fn d107_responder(request: &LlmRequest, cart: &'static str) -> Result<String, String> {
+    if request.system == vibe::compile::TRANSLATE_PROMPT {
+        return responder(request);
+    }
+    Ok(if request.input.contains("ID: product\n") {
+        PRODUCT_OK
+    } else {
+        cart
+    }
+    .into())
+}
+
+fn with_constraints(request: &LlmRequest) -> Result<String, String> {
+    d107_responder(request, CART_CONSTRAINTS)
+}
+
+fn without_constraints(request: &LlmRequest) -> Result<String, String> {
+    d107_responder(request, CART_NO_CONSTRAINTS)
+}
+
+fn validate(root: &Path) -> Result<(), String> {
+    vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+        root,
+        deploy: false,
+        verify_key: None,
+    })
+    .map(|_| ())
+    .map_err(|report| report.to_string())
+}
+
+#[tokio::test]
+async fn composite_unique_compiles_to_constraints_and_needs_a_unique_index_migration() {
+    let root = fixture();
+    let adapter = FakeAdapter {
+        responder: with_constraints,
+    };
+    let config = config();
+    let opts = CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&config),
+        check: false,
+    };
+    compile_project(&opts)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+    let raw = fs::read_to_string(root.join("models/cart-item/cart-item.lock.md")).unwrap();
+    assert!(
+        raw.contains("## Constraints\n- unique: [cart_id, product_id]\n"),
+        "{raw}"
+    );
+    let doc = parse_lock(&raw).unwrap();
+    let constraints = vibe::lock::model_unique_constraints(&doc.sections).unwrap();
+    assert_eq!(constraints, vec![vec!["cart_id", "product_id"]]);
+    assert_eq!(
+        vibe::lock::effective_unique_columns(&constraints[0]),
+        ["tenant_id", "cart_id", "product_id"]
+    );
+
+    // No migration creating the index: the build fails.
+    let err = validate(&root).unwrap_err();
+    assert!(
+        err.contains("unique [cart_id, product_id] has no migration")
+            && err.contains("(tenant_id, cart_id, product_id)"),
+        "{err}"
+    );
+
+    // An index without tenant_id first does not match either.
+    let dir = root.join("migrations/main");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("0001-cart-items-unique.md"),
+        UNIQUE_MIGRATION.replace("(tenant_id, cart_id, product_id)", "(cart_id, product_id)"),
+    )
+    .unwrap();
+    compile_project(&opts)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert!(validate(&root).unwrap_err().contains("has no migration"));
+
+    // The matching migration makes the build pass.
+    fs::write(dir.join("0001-cart-items-unique.md"), UNIQUE_MIGRATION).unwrap();
+    compile_project(&opts)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+    validate(&root).unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[tokio::test]
+async fn composite_unique_in_the_english_text_requires_a_constraints_entry() {
+    let root = fixture();
+    let adapter = FakeAdapter {
+        responder: without_constraints,
+    };
+    let config = config();
+    let Err(report) = compile_project(&CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&config),
+        check: false,
+    })
+    .await
+    else {
+        panic!("a composite unique without ## Constraints must be rejected");
+    };
+    let text = report.to_string();
+    assert!(text.contains("## Constraints"), "{text}");
+}
