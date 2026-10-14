@@ -16,6 +16,7 @@ There is no source `.md` for this: the endpoint is configuration, not a definiti
 | `LLM_MODEL` | yes | a model id / snapshot id the provider documents as **non-floating** (Decision 58) |
 | `LLM_TIMEOUT` | no | default 60s, max 300s |
 | `LLM_MAX_RETRIES` | no | network retries, default 2, max 5 |
+| `LLM_FORMAT_RETRIES` | no | re-prompts with the validator errors when the LLM output is not valid lock markdown, default 2, max 5 |
 | `LLM_SEED` | no | sent only if the model supports seed; default `0`; counted in `compiler-hash` either way |
 | `LLM_ALLOW_PRIVATE_HOST` | no | default `false`; local development only |
 
