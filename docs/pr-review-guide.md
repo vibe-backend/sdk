@@ -37,7 +37,6 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 /migrations/     @your-org/backend-owners @your-org/dba
 /providers/      @your-org/backend-owners
 /pipelines/      @your-org/backend-owners
-**/*.lock.md     @your-org/backend-owners
 /.compiler/      @your-org/platform-owners
 /.github/        @your-org/platform-owners
 /CODEOWNERS      @your-org/platform-owners
@@ -46,13 +45,13 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - CODEOWNERS 入面嘅用戶或者 team 一定要對 repo 有 **write** 權限，否則 GitHub 唔會當佢係 code owner，required review 會失效。
 - `.compiler/injection-allowlist` 喺 `/.compiler/` 之下，一定受保護（決定 37）。
 - 計劃中：`vibe build` release 模式會檢查 CODEOWNERS 覆蓋晒以上路徑，冇就失敗（決定 93）。
-- 一定要將 lock 同 source 一齊 commit（決定 80），reviewer 先睇到 LLM 實際編譯咗乜。
+- Lock 係 build 輸出，**唔 commit**（`*.lock.md` 加入 `.gitignore`，spec 決定 117）。Review 重點係 source 嘅 frontmatter 高風險宣告（`writes`、`public`、`auth`、`secrets`，決定 112）；產生嘅 SQL 由決定 114 policy 檢查，release summary 列出變化。
 
 ## 3. Required status checks
 
 - 而家已經有：`vibe secret-scan --fail-on-find`。
-- 而家已經有：`vibe compile --check`（重編比對）同 `vibe validate`。
-- 計劃中（v1.8 實作）：`vibe build --check-determinism`，取代上面兩個。
+- `vibe compile --check`：喺 CI 由 source build 一次，驗證結果同決定 114 policy（唔同 commit 咗嘅 lock 比較，因為 lock 唔 commit；spec 決定 117）。
+- 而家已經有：`vibe validate`。
 - `main` 一定要用 **ruleset**（唔好用舊式 branch protection）開 pull request rule 嘅 **Require approval of the most recent reviewable push**：`vibe build --release-approval` 會用 `GET /repos/{owner}/{repo}/rules/branches/main` 確認，冇就失敗。舊式 branch protection 要 admin 權限先讀到，所以唔接受（spec 2C.3a）。
 - 唔好用 merge queue：高風險 release build 唔支援（spec 2C.3a）。
 - 一定要喺 ruleset 嘅 **Require status checks to pass** 入面開 **Require branches to be up to date before merging**（`strict_required_status_checks_policy`，最少要有一個 required status check 先生效）：`vibe build --release-approval` 會比較 build commit 同 PR head 嘅 tree，冇開呢個設定就可能唔一樣，release build 會失敗（spec 2C.3a）。
