@@ -589,6 +589,24 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
     {
         report.push(Diag::error(file, "feature locks need Request and Response"));
     }
+    if let Some(table) = find_section(&doc.sections, "Request").and_then(|s| s.table.as_ref()) {
+        for row in &table.rows {
+            if let (Some(name), Some(ty)) = (row.first(), row.get(1)) {
+                if !crate::runtime::REQUEST_TYPES.contains(&ty.as_str()) {
+                    report.push(
+                        Diag::error(
+                            file,
+                            format!(
+                                "request field {name} has unsupported type {ty} (use one of: {})",
+                                crate::runtime::REQUEST_TYPES.join(", ")
+                            ),
+                        )
+                        .at_section("Request"),
+                    );
+                }
+            }
+        }
+    }
     if let Some(limits) = find_section(&doc.sections, "Limits") {
         if let Some(ms) = limits
             .get("timeout")
