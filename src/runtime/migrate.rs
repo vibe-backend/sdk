@@ -53,14 +53,16 @@ pub async fn migrate_tenant(
         .await?;
         log.push(format!("bootstrapped {schema}.{}", model.table));
     }
-    // Migration DDL names tables unqualified; resolve them in the tenant schema.
-    exec.batch(&[format!("SET search_path TO {}", quote(&schema)?)])
-        .await?;
+    // Migration DDL names tables unqualified; resolve them in the tenant
+    // schema. `batch` keeps one connection for the whole slice, so the SET
+    // applies to the migration statements that follow it.
     for migration in &manifest.migrations {
-        exec.batch(&migration.statements).await?;
+        let mut statements = vec![format!("SET search_path TO {}", quote(&schema)?)];
+        statements.extend(migration.statements.iter().cloned());
+        statements.push("RESET search_path".to_string());
+        exec.batch(&statements).await?;
         log.push(format!("applied {}", migration.id));
     }
-    exec.batch(&["RESET search_path".to_string()]).await?;
     log.extend(protect_schema(exec, &schema).await?);
     Ok(log)
 }

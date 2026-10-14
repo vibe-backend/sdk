@@ -362,7 +362,7 @@ async fn cmd_serve(
             .map_err(|_| {
                 "set VIBE_DATABASE_URL or pass --memory for the dev executor".to_string()
             })?;
-        let pg = PgExec::connect(&url).await?;
+        let pg = PgExec::connect_with(&url, vibe::runtime::PgOptions::from_env()?).await?;
         pg.check_runtime_role().await?;
         Arc::new(pg)
     };

@@ -359,3 +359,82 @@ async fn serve_refuses_tables_without_forced_rls() {
         .unwrap();
     check_as(&s.admin_url, &s.app).await.unwrap();
 }
+
+#[tokio::test]
+async fn slow_queries_time_out_and_do_not_block_other_requests() {
+    let s = require_pg!(setup().await);
+    let exec = std::sync::Arc::new(
+        PgExec::connect_with(
+            &url_as(&s.admin_url, &s.app),
+            vibe::runtime::PgOptions {
+                pool_size: 4,
+                statement_timeout_ms: 300,
+                pool_timeout_ms: 2_000,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    // A request statement over the timeout is cancelled by the server: a
+    // trigger makes inserts into this tenant's notes table sleep for 5s.
+    let schema = format!("t_{}", s.tenant);
+    s.admin
+        .batch_execute(&format!(
+            "CREATE FUNCTION {schema}.slow() RETURNS trigger LANGUAGE plpgsql AS \
+             $$BEGIN PERFORM pg_sleep(5); RETURN NEW; END$$; \
+             CREATE TRIGGER slow BEFORE INSERT ON {schema}.notes \
+             FOR EACH ROW EXECUTE FUNCTION {schema}.slow()"
+        ))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let err = exec
+        .execute(
+            &s.tenant,
+            "app_rw",
+            vibe::runtime::Stmt::Insert {
+                table: "notes".into(),
+                values: vec![
+                    (col("id", "uuid"), json!(uuid::Uuid::new_v4().to_string())),
+                    (col("tenant_id", "string"), json!(s.tenant)),
+                    (col("body", "string"), json!("slow")),
+                ],
+                returning: vec![col("id", "uuid")],
+            },
+        )
+        .await;
+    assert!(err.is_err(), "the insert should be cancelled");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    // While one connection is busy, requests on others still complete.
+    let busy = {
+        let exec = exec.clone();
+        tokio::spawn(async move { exec.batch(&["SELECT pg_sleep(1)".into()]).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let quick = std::time::Instant::now();
+    let rows = exec
+        .execute(
+            &s.tenant,
+            "app_rw",
+            vibe::runtime::Stmt::Select {
+                table: "notes".into(),
+                columns: vec![col("id", "uuid")],
+                id: None,
+                filters: vec![],
+                sort: None,
+                limit: 1,
+                offset: 0,
+            },
+        )
+        .await;
+    assert!(rows.is_ok(), "{rows:?}");
+    assert!(quick.elapsed() < std::time::Duration::from_millis(800));
+    busy.await.unwrap().unwrap();
+}
+
+fn col(name: &str, ty: &str) -> vibe::runtime::Col {
+    vibe::runtime::Col {
+        name: name.into(),
+        ty: ty.into(),
+    }
+}

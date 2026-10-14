@@ -6,7 +6,9 @@ mod slugs;
 mod sql;
 
 pub use crud::{parse_ownership, run_method, Ownership};
-pub use exec::{etag, role_allows, ExecError, MemoryExec, PgExec, QueryExec, RoleStatus};
+pub use exec::{
+    etag, role_allows, ExecError, MemoryExec, PgExec, PgOptions, QueryExec, RoleStatus,
+};
 pub use http::{
     hash_api_secret, resolve_pepper, router, AppState, AuthConfig, RunEnv, Slug, StoredKey,
 };
