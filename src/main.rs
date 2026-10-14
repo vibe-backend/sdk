@@ -446,6 +446,18 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
     let mut auth = AuthConfig::anonymous();
     if let Ok(pem) = std::env::var("VIBE_JWT_PUBLIC_KEY_PEM") {
         auth.public_pem = pem.replace("\\n", "\n");
+        auth.alg = vibe::runtime::detect_jwt_alg(&auth.public_pem)?;
+    }
+    if let Ok(alg) = std::env::var("VIBE_JWT_ALG") {
+        auth.alg = match alg.trim().to_ascii_uppercase().as_str() {
+            "ES256" => jsonwebtoken::Algorithm::ES256,
+            "RS256" => jsonwebtoken::Algorithm::RS256,
+            other => {
+                return Err(format!(
+                    "VIBE_JWT_ALG `{other}`: only ES256 and RS256 are supported"
+                ));
+            }
+        };
     }
     if let Ok(iss) = std::env::var("VIBE_JWT_ISS") {
         auth.iss = iss;
@@ -456,16 +468,12 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
     if let Ok(kid) = std::env::var("VIBE_JWT_KID") {
         auth.kid = kid;
     }
-    let vibe_env = std::env::var("VIBE_ENV")
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase());
     let pepper = std::env::var("VIBE_API_KEY_PEPPER").ok();
     let (pepper, warning) = vibe::runtime::resolve_pepper(run_env, pepper.as_deref())?;
     if let Some(warning) = warning {
         eprintln!("warning: {warning}");
     }
     auth.pepper = pepper;
-    let _ = vibe_env;
     // API keys are `mbk_live_…` in production and `mbk_test_…` elsewhere.
     auth.env_name = if run_env == vibe::runtime::RunEnv::Production {
         "live".into()
@@ -474,6 +482,9 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
     };
     if let Ok(claim) = std::env::var("VIBE_JWT_ROLES_CLAIM") {
         if !claim.trim().is_empty() {
+            if let Some(problem) = vibe::manifest::roles_claim_problem(claim.trim()) {
+                return Err(format!("VIBE_JWT_ROLES_CLAIM: {problem}"));
+            }
             auth.roles_claim = claim.trim().to_string();
         }
     }
@@ -485,6 +496,9 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
             (auth.public_pem.is_empty() && std::env::var("VIBE_JWT_ISS").is_ok())
                 .then(|| format!("{}/.well-known/jwks.json", auth.iss.trim_end_matches('/')))
         });
+    if jwks_uri.is_some() && !auth.public_pem.is_empty() {
+        return Err("set either VIBE_JWT_PUBLIC_KEY_PEM or VIBE_JWT_JWKS_URI, not both".into());
+    }
     if let Some(uri) = jwks_uri {
         let source = vibe::runtime::jwks::HttpsJwks::new(&uri)?;
         auth.jwks = Some(std::sync::Arc::new(vibe::runtime::jwks::JwksCache::new(
@@ -492,7 +506,9 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
         )));
     }
     if let Ok(path) = std::env::var("VIBE_API_KEYS_FILE") {
-        auth.api_keys = vibe::runtime::load_api_keys(Path::new(&path))?;
+        auth.api_keys_file = Some(std::sync::Arc::new(vibe::runtime::ApiKeyFile::open(
+            Path::new(&path).to_path_buf(),
+        )?));
     }
     Ok(auth)
 }

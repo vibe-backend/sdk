@@ -44,6 +44,9 @@ pub struct AuthConfig {
     pub aud: String,
     pub pepper: Vec<u8>,
     pub api_keys: Vec<StoredKey>,
+    /// When set, keys come from this file (reloaded on change) instead of
+    /// `api_keys`.
+    pub api_keys_file: Option<Arc<ApiKeyFile>>,
     pub env_name: String,
     /// When set, JWT keys come from this JWKS (spec §4.1) instead of
     /// `public_pem`/`kid`.
@@ -63,6 +66,7 @@ impl AuthConfig {
             aud: "shop".into(),
             pepper: b"dev-pepper".to_vec(),
             api_keys: Vec::new(),
+            api_keys_file: None,
             env_name: "test".into(),
             jwks: None,
             roles_claim: "roles".into(),
@@ -96,6 +100,88 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 /// Minimum API-key pepper length in production.
 pub const MIN_PEPPER_BYTES: usize = 32;
+
+/// An API key file that is re-read when its mtime changes (checked at most
+/// once a second), so revocations apply without a restart. A reload that
+/// fails (bad JSON, bad mode) keeps the previous key set and logs a warning.
+pub struct ApiKeyFile {
+    path: std::path::PathBuf,
+    state: std::sync::Mutex<ApiKeyFileState>,
+}
+
+struct ApiKeyFileState {
+    mtime: Option<std::time::SystemTime>,
+    checked: std::time::Instant,
+    keys: Arc<Vec<StoredKey>>,
+}
+
+impl ApiKeyFile {
+    /// Loads the file; a bad file at startup is an error.
+    pub fn open(path: std::path::PathBuf) -> Result<Self, String> {
+        let keys = load_api_keys(&path)?;
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        Ok(Self {
+            path,
+            state: std::sync::Mutex::new(ApiKeyFileState {
+                mtime,
+                checked: std::time::Instant::now(),
+                keys: Arc::new(keys),
+            }),
+        })
+    }
+
+    /// The current key set, reloading first if the file changed.
+    pub fn keys(&self) -> Arc<Vec<StoredKey>> {
+        self.keys_at(std::time::Instant::now())
+    }
+
+    fn keys_at(&self, now: std::time::Instant) -> Arc<Vec<StoredKey>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if now.duration_since(state.checked) >= std::time::Duration::from_secs(1) {
+            state.checked = now;
+            self.reload_if_changed(&mut state);
+        }
+        state.keys.clone()
+    }
+
+    /// Forces a re-read now (tests, signals), ignoring the mtime throttle.
+    pub fn reload(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.checked = std::time::Instant::now();
+        let mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
+        match load_api_keys(&self.path) {
+            Ok(keys) => {
+                state.keys = Arc::new(keys);
+                state.mtime = mtime;
+            }
+            Err(err) => {
+                tracing::warn!(%err, "API key reload failed; keeping previous keys");
+                // Remember the bad mtime so the periodic path does not spin.
+                if mtime.is_some() {
+                    state.mtime = mtime;
+                }
+            }
+        }
+    }
+
+    fn reload_if_changed(&self, state: &mut ApiKeyFileState) {
+        let mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime.is_some() && mtime == state.mtime {
+            return;
+        }
+        match load_api_keys(&self.path) {
+            Ok(keys) => {
+                state.keys = Arc::new(keys);
+                state.mtime = mtime;
+            }
+            Err(err) => tracing::warn!(%err, "API key reload failed; keeping previous keys"),
+        }
+    }
+}
 
 /// Loads stored API keys from a JSON array of [`StoredKey`] records (secrets
 /// are HMAC hashes, never plaintext). The file must not be writable by group
@@ -956,25 +1042,64 @@ fn verify_jwt(
         return Err(AuthError::unauthorized("Bearer"));
     }
     // A present but malformed roles claim is rejected, not treated as "no roles".
-    let roles = match data.claims.extra.get(roles_claim) {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|v| v.as_str().map(str::to_string))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| AuthError::unauthorized("Bearer"))?,
-        Some(_) => return Err(AuthError::unauthorized("Bearer")),
-    };
-    let scopes = match data.claims.extra.get("scope") {
-        Some(Value::String(s)) => s.split_whitespace().map(str::to_string).collect(),
-        _ => Vec::new(),
-    };
+    let roles = roles_from_claims(&data.claims.extra, roles_claim)?;
+    let scopes = scopes_from_claims(&data.claims.extra);
     Ok(Principal {
         tenant_id: data.claims.tenant_id,
         subject: data.claims.sub,
         roles,
         scopes,
     })
+}
+
+/// Walks a dotted path (`realm_access.roles`) or a URL-style claim key.
+fn claim_value<'a>(extra: &'a HashMap<String, Value>, path: &str) -> Option<&'a Value> {
+    if path.contains("://") {
+        return extra.get(path);
+    }
+    let mut parts = path.split('.');
+    let first = parts.next()?;
+    let mut cur = extra.get(first)?;
+    for part in parts {
+        cur = cur.as_object()?.get(part)?;
+    }
+    Some(cur)
+}
+
+fn roles_from_claims(
+    extra: &HashMap<String, Value>,
+    roles_claim: &str,
+) -> Result<Vec<String>, AuthError> {
+    match claim_value(extra, roles_claim) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| AuthError::unauthorized("Bearer")),
+        Some(_) => Err(AuthError::unauthorized("Bearer")),
+    }
+}
+
+/// OAuth-style `scope` (space-separated string) or `scp` (array or string).
+fn scopes_from_claims(extra: &HashMap<String, Value>) -> Vec<String> {
+    let from = |v: &Value| -> Option<Vec<String>> {
+        match v {
+            Value::String(s) => Some(s.split_whitespace().map(str::to_string).collect()),
+            Value::Array(items) => items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>(),
+            _ => None,
+        }
+    };
+    if let Some(v) = extra.get("scope").and_then(from) {
+        return v;
+    }
+    if let Some(v) = extra.get("scp").and_then(from) {
+        return v;
+    }
+    Vec::new()
 }
 
 fn verify_api_key(auth: &AuthConfig, token: &str) -> Result<Principal, AuthError> {
@@ -999,7 +1124,9 @@ fn verify_api_key(auth: &AuthConfig, token: &str) -> Result<Principal, AuthError
         return Err(AuthError::unauthorized("ApiKey"));
     }
     let hash = hmac_hex(&auth.pepper, secret);
-    let Some(record) = auth.api_keys.iter().find(|key| key.key_id == key_id) else {
+    let current = auth.api_keys_file.as_ref().map(|file| file.keys());
+    let keys: &[StoredKey] = current.as_deref().map_or(&auth.api_keys, |k| k.as_slice());
+    let Some(record) = keys.iter().find(|key| key.key_id == key_id) else {
         return Err(AuthError::unauthorized("ApiKey"));
     };
     if !ct_eq(&record.secret_hash, &hash) || record.revoked || record.env != env {
@@ -1029,6 +1156,17 @@ fn ct_eq(left: &str, right: &str) -> bool {
         return false;
     }
     left.ct_eq(right).into()
+}
+
+/// Picks ES256 or RS256 from a public PEM. `VIBE_JWT_ALG` can override this.
+pub fn detect_jwt_alg(pem: &str) -> Result<Algorithm, String> {
+    if DecodingKey::from_rsa_pem(pem.as_bytes()).is_ok() {
+        return Ok(Algorithm::RS256);
+    }
+    if DecodingKey::from_ec_pem(pem.as_bytes()).is_ok() {
+        return Ok(Algorithm::ES256);
+    }
+    Err("VIBE_JWT_PUBLIC_KEY_PEM is not a usable RSA or EC public key".into())
 }
 
 pub fn hash_api_secret(pepper: &[u8], secret: &str) -> String {
@@ -1185,16 +1323,29 @@ struct Claims {
 
 struct AuthError {
     scheme: String,
+    /// Operator-facing reason; never sent to the client.
+    reason: &'static str,
 }
 
 impl AuthError {
     fn unauthorized(scheme: &str) -> Self {
+        Self::fail(scheme, "unauthorized")
+    }
+
+    fn fail(scheme: &str, reason: &'static str) -> Self {
         Self {
             scheme: scheme.into(),
+            reason,
         }
     }
 
     fn with_request(self, request_id: &str) -> HttpResponse {
+        tracing::debug!(
+            request_id,
+            scheme = %self.scheme,
+            reason = self.reason,
+            "auth rejected"
+        );
         let header = format!("{} realm=\"vibe\"", self.scheme);
         error_response(
             StatusCode::UNAUTHORIZED,
@@ -1522,5 +1673,139 @@ RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
             std::fs::write(&path, bad.to_string()).unwrap();
             assert!(load_api_keys(&path).is_err(), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn jwt_rejects_alg_mismatch_hs256_wrong_aud_iss_and_expired() {
+        let auth = jwks_auth();
+        let r = route(json!({}));
+        // Wrong kid / missing key → 401.
+        assert!(authenticate(&auth, &r, &bearer(&token("nope", json!({}))))
+            .await
+            .is_err());
+        // Expired.
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = json!({
+            "sub": "u1", "exp": now - 120, "iat": now - 600, "nbf": now - 600,
+            "iss": "https://auth.localhost/shop", "aud": "shop", "tenant_id": "tenant0001",
+            "roles": ["staff"]
+        });
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some("k1".into());
+        let expired = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(authenticate(&auth, &r, &bearer(&expired)).await.is_err());
+        // Wrong aud.
+        claims["exp"] = json!(now + 600);
+        claims["iat"] = json!(now);
+        claims["nbf"] = json!(now);
+        claims["aud"] = json!("other");
+        let bad_aud = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(authenticate(&auth, &r, &bearer(&bad_aud)).await.is_err());
+        // Wrong iss.
+        claims["aud"] = json!("shop");
+        claims["iss"] = json!("https://evil.example/");
+        let bad_iss = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(authenticate(&auth, &r, &bearer(&bad_iss)).await.is_err());
+        // HS256 header with EC key in JWKS must fail (alg pin).
+        let mut hs = Header::new(Algorithm::HS256);
+        hs.kid = Some("k1".into());
+        let hs_token =
+            jsonwebtoken::encode(&hs, &claims, &EncodingKey::from_secret(b"not-the-jwks-key"))
+                .unwrap();
+        assert!(authenticate(&auth, &r, &bearer(&hs_token)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn nested_roles_claim_and_scp_scopes_are_read() {
+        let mut auth = jwks_auth();
+        auth.roles_claim = "realm_access.roles".into();
+        let r = route(json!({"scopes": ["catalog:read"]}));
+        let t = token(
+            "k1",
+            json!({
+                "realm_access": {"roles": ["staff"]},
+                "scp": ["catalog:read", "orders:read"]
+            }),
+        );
+        let p = authenticate(&auth, &r, &bearer(&t)).await.ok().unwrap();
+        assert_eq!(p.roles, vec!["staff"]);
+        assert_eq!(p.scopes, vec!["catalog:read", "orders:read"]);
+        // scope string still works when scp is absent.
+        let t2 = token("k1", json!({"scope": "catalog:read other:x"}));
+        let p2 = authenticate(&auth, &r, &bearer(&t2)).await.ok().unwrap();
+        assert_eq!(p2.scopes, vec!["catalog:read", "other:x"]);
+    }
+
+    #[tokio::test]
+    async fn empty_route_scopes_are_opt_in() {
+        let auth = jwks_auth();
+        let r = route(json!({"scopes": []}));
+        let t = token("k1", json!({"scope": "catalog:read"}));
+        assert!(authenticate(&auth, &r, &bearer(&t)).await.is_ok());
+        // Case sensitivity: Catalog:read does not satisfy catalog:read.
+        let need = vec!["catalog:read".into()];
+        assert!(!route_scopes_allow(&["Catalog:read".into()], &need));
+        assert!(!route_scopes_allow(&["other:*".into()], &need));
+        assert!(route_scopes_allow(&["catalog:*".into()], &need));
+    }
+
+    #[test]
+    fn api_key_file_reloads_on_mtime_and_keeps_old_on_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vibe-keys-reload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys.json");
+        let rec = |id: &str| {
+            json!({
+                "key_id": id, "secret_hash": "a".repeat(64), "env": "live",
+                "tenant_id": "tenant0001", "scopes": ["catalog:read"], "expires_unix": 4102444800i64
+            })
+        };
+        std::fs::write(&path, json!([rec("abcdefghijk2")]).to_string()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let file = ApiKeyFile::open(path.clone()).unwrap();
+        assert_eq!(file.keys().len(), 1);
+        // Corrupt the file: reload keeps the previous set.
+        std::fs::write(&path, "{not-json").unwrap();
+        file.reload();
+        assert_eq!(file.keys().len(), 1, "bad reload must keep previous keys");
+        // Valid replacement (write updates mtime).
+        std::fs::write(
+            &path,
+            json!([rec("abcdefghijk2"), rec("bcdefghijkl3")]).to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        file.reload();
+        assert_eq!(file.keys().len(), 2);
+    }
+
+    #[test]
+    fn detect_jwt_alg_picks_ec_and_rsa() {
+        assert_eq!(
+            detect_jwt_alg(
+                "-----BEGIN PUBLIC KEY-----\n\
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0mqNqll14aIJEhYqCiRLWJX63Ty6\n\
+Q0UxBzbmJ2wI9FMVJLw4XEhuIJFqIdA/P6b6ozSNGyOUZK7OjIfGKtpNYw==\n\
+-----END PUBLIC KEY-----\n"
+            )
+            .unwrap(),
+            Algorithm::ES256
+        );
     }
 }

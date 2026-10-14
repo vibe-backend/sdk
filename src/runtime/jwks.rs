@@ -17,6 +17,10 @@ use tokio::sync::Mutex;
 pub const FRESH_FOR: Duration = Duration::from_secs(600);
 pub const REFETCH_GAP: Duration = Duration::from_secs(60);
 pub const STALE_LIMIT: Duration = Duration::from_secs(3600);
+/// Largest JWKS document read.
+pub const MAX_JWKS_BYTES: usize = 64 * 1024;
+/// Most keys kept from one document.
+pub const MAX_KEYS: usize = 32;
 
 /// Where the JWKS document comes from.
 #[async_trait]
@@ -60,7 +64,15 @@ impl JwksSource for HttpsJwks {
         if !resp.status().is_success() {
             return Err(format!("jwks fetch returned {}", resp.status()));
         }
-        resp.json().await.map_err(|err| err.to_string())
+        let mut resp = resp;
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|err| err.to_string())? {
+            body.extend_from_slice(&chunk);
+            if body.len() > MAX_JWKS_BYTES {
+                return Err(format!("jwks response exceeds {MAX_JWKS_BYTES} bytes"));
+            }
+        }
+        serde_json::from_slice(&body).map_err(|err| err.to_string())
     }
 }
 
@@ -74,6 +86,8 @@ struct State {
     keys: HashMap<String, JwkKey>,
     fetched_at: Option<Instant>,
     last_attempt: Option<Instant>,
+    /// A fetch is running; others keep using the current cache meanwhile.
+    in_flight: bool,
 }
 
 pub struct JwksCache {
@@ -89,6 +103,7 @@ impl JwksCache {
                 keys: HashMap::new(),
                 fetched_at: None,
                 last_attempt: None,
+                in_flight: false,
             }),
         }
     }
@@ -98,18 +113,31 @@ impl JwksCache {
     }
 
     /// `key` with an explicit clock, for tests.
+    ///
+    /// Single-flight: the cache lock is never held across the network call.
+    /// One caller fetches; concurrent callers answer from the current cache.
     pub async fn key_at(&self, kid: &str, now: Instant) -> Option<JwkKey> {
-        let mut state = self.state.lock().await;
-        let fresh = state
-            .fetched_at
-            .is_some_and(|at| now.duration_since(at) < FRESH_FOR);
-        let known = state.keys.contains_key(kid);
-        let may_refetch = state
-            .last_attempt
-            .is_none_or(|at| now.duration_since(at) >= REFETCH_GAP);
-        if (!fresh || !known) && may_refetch {
-            state.last_attempt = Some(now);
-            match self.source.fetch().await {
+        let fetch = {
+            let mut state = self.state.lock().await;
+            let fresh = state
+                .fetched_at
+                .is_some_and(|at| now.duration_since(at) < FRESH_FOR);
+            let known = state.keys.contains_key(kid);
+            let may_refetch = state
+                .last_attempt
+                .is_none_or(|at| now.duration_since(at) >= REFETCH_GAP);
+            let go = (!fresh || !known) && may_refetch && !state.in_flight;
+            if go {
+                state.last_attempt = Some(now);
+                state.in_flight = true;
+            }
+            go
+        };
+        if fetch {
+            let result = self.source.fetch().await;
+            let mut state = self.state.lock().await;
+            state.in_flight = false;
+            match result {
                 Ok(doc) => {
                     state.keys = parse_jwks(&doc);
                     state.fetched_at = Some(now);
@@ -117,6 +145,7 @@ impl JwksCache {
                 Err(err) => tracing::warn!(%err, "JWKS fetch failed"),
             }
         }
+        let state = self.state.lock().await;
         let usable = state
             .fetched_at
             .is_some_and(|at| now.duration_since(at) < STALE_LIMIT);
@@ -167,16 +196,49 @@ pub fn parse_jwks(doc: &Value) -> HashMap<String, JwkKey> {
             _ => None,
         };
         if let Some(key) = parsed {
+            if out.len() >= MAX_KEYS {
+                break;
+            }
             out.insert(kid.to_string(), key);
         }
     }
     out
 }
 
-/// Modulus size in bits from a base64url `n`.
+/// Modulus size in bits: `n` decoded (base64url), leading zero bytes and
+/// leading zero bits not counted.
 fn rsa_bits(n: &str) -> usize {
-    let bytes = n.trim_end_matches('=').len() * 6 / 8;
-    bytes * 8
+    let Some(bytes) = b64url_decode(n.trim_end_matches('=')) else {
+        return 0;
+    };
+    let Some(first) = bytes.iter().position(|b| *b != 0) else {
+        return 0;
+    };
+    (bytes.len() - first) * 8 - bytes[first].leading_zeros() as usize
+}
+
+fn b64url_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for c in input.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -270,6 +332,60 @@ mod tests {
             {"kty": "oct", "kid": "hmac", "k": "c2VjcmV0"}
         ]}));
         assert_eq!(keys.keys().collect::<Vec<_>>(), vec!["ok"]);
+    }
+
+    #[test]
+    fn rsa_size_is_measured_from_the_decoded_modulus() {
+        let enc = |bytes: &[u8]| {
+            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let n =
+                    chunk.iter().fold(0u32, |a, b| (a << 8) | *b as u32) << (8 * (3 - chunk.len()));
+                for i in 0..=chunk.len() {
+                    out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                }
+            }
+            out
+        };
+        let mut k2048 = vec![0x80u8];
+        k2048.extend(vec![1u8; 255]);
+        assert_eq!(rsa_bits(&enc(&k2048)), 2048);
+        let mut k2047 = vec![0x40u8];
+        k2047.extend(vec![1u8; 255]);
+        assert_eq!(rsa_bits(&enc(&k2047)), 2047);
+        let mut padded = vec![0u8];
+        padded.extend(&k2047);
+        assert_eq!(
+            rsa_bits(&enc(&padded)),
+            2047,
+            "leading zero bytes do not count"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_does_not_hold_the_cache_lock() {
+        struct Slow(std::sync::Arc<tokio::sync::Notify>);
+        #[async_trait]
+        impl JwksSource for Slow {
+            async fn fetch(&self) -> Result<Value, String> {
+                self.0.notified().await;
+                Ok(doc(&["a"]))
+            }
+        }
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cache = std::sync::Arc::new(JwksCache::new(std::sync::Arc::new(Slow(gate.clone()))));
+        let t0 = Instant::now();
+        let first = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.key_at("a", t0).await.is_some() })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // While the first fetch is blocked, another caller returns at once.
+        let other = tokio::time::timeout(Duration::from_millis(200), cache.key_at("a", t0)).await;
+        assert!(other.is_ok(), "second caller must not wait for the fetch");
+        gate.notify_one();
+        assert!(first.await.unwrap());
     }
 
     #[test]

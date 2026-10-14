@@ -462,7 +462,12 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
                     auth_mode = mode.value.clone();
                 }
                 if let Some(raw) = block.bullets.iter().find(|b| b.key == "roles") {
-                    roles = crate::lock::parse_string_list(&raw.value).unwrap_or_default();
+                    // A malformed roles list is a build error, never "no roles"
+                    // (which would let any JWT reach role-gated handlers).
+                    roles = crate::lock::parse_string_list(&raw.value).map_err(|err| {
+                        Diag::error(&doc.meta.id, format!("invalid roles: {err}"))
+                            .at_section("Pipelines")
+                    })?;
                 }
                 if let Some(raw) = block.bullets.iter().find(|b| b.key == "scopes") {
                     // A malformed scopes list is a build error, never "no scopes".
@@ -473,6 +478,9 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
                 }
                 if let Some(raw) = block.bullets.iter().find(|b| b.key == "roles-claim") {
                     roles_claim = raw.value.trim().to_string();
+                    if let Some(problem) = roles_claim_problem(&roles_claim) {
+                        return Err(Diag::error(&doc.meta.id, problem).at_section("Pipelines"));
+                    }
                 }
             }
             if name == "rate-limit" {
@@ -731,4 +739,112 @@ pub fn method<'a>(manifest: &'a Manifest, target: &str) -> Option<&'a MethodSpec
 
 pub fn json_null() -> Value {
     Value::Null
+}
+
+/// JWT claims that carry identity or token metadata; a roles claim must never
+/// read them, or a token's own `aud`/`scope`/`sub` would become roles.
+pub const RESERVED_JWT_CLAIMS: &[&str] = &[
+    "iss",
+    "sub",
+    "aud",
+    "exp",
+    "nbf",
+    "iat",
+    "jti",
+    "tenant_id",
+    "scope",
+    "scp",
+    "azp",
+    "kid",
+    "alg",
+    "typ",
+    "cnf",
+    "nonce",
+    "auth_time",
+    "acr",
+    "amr",
+    "sid",
+];
+
+/// Why `name` cannot be a roles claim, if it cannot. Dotted paths
+/// (`realm_access.roles`) are allowed and resolved as nested JSON; reserved
+/// claim names (and any path segment that is reserved) are refused.
+pub fn roles_claim_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("roles-claim must not be empty".into());
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some(format!("roles-claim `{name}` must not contain whitespace"));
+    }
+    // URL-style claims (Auth0) are matched as a single key, not a path.
+    if name.contains("://") {
+        if RESERVED_JWT_CLAIMS.contains(&name.to_ascii_lowercase().as_str()) {
+            return Some(format!("roles-claim `{name}` is a reserved JWT claim"));
+        }
+        return None;
+    }
+    for segment in name.split('.') {
+        if segment.is_empty() {
+            return Some(format!("roles-claim `{name}` has an empty path segment"));
+        }
+        if RESERVED_JWT_CLAIMS.contains(&segment.to_ascii_lowercase().as_str()) {
+            return Some(format!(
+                "roles-claim `{name}` must not use reserved claim `{segment}`"
+            ));
+        }
+        if !segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Some(format!(
+                "roles-claim `{name}` path segments must be alphanumeric/_/-"
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod roles_claim_tests {
+    use super::roles_claim_problem;
+
+    #[test]
+    fn reserved_and_dotted_claims_are_refused() {
+        for bad in [
+            "aud",
+            "tenant_id",
+            "scope",
+            "ISS",
+            "sub",
+            "exp",
+            "roles.aud",
+            "",
+        ] {
+            assert!(roles_claim_problem(bad).is_some(), "{bad}");
+        }
+        for ok in [
+            "roles",
+            "groups",
+            "https://example.com/roles",
+            "realm_access.roles",
+        ] {
+            assert!(roles_claim_problem(ok).is_none(), "{ok}");
+        }
+    }
+}
+#[cfg(test)]
+mod roles_list_tests {
+    #[test]
+    fn malformed_roles_list_is_a_build_error() {
+        let err = crate::lock::parse_string_list("staff").unwrap_err();
+        assert!(err.contains("expected a list"), "{err}");
+        // Same path route_from uses: error, never empty vec.
+        assert!(crate::lock::parse_string_list("staff")
+            .map_err(|e| format!("invalid roles: {e}"))
+            .is_err());
+        assert_eq!(
+            crate::lock::parse_string_list("[staff]").unwrap(),
+            vec!["staff"]
+        );
+    }
 }
