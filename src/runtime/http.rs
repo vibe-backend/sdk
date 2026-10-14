@@ -200,15 +200,6 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             }
         }
     };
-    if let Err(fail) = validate_request(found.route, &body, &query, &found.params) {
-        return finish(
-            found.route,
-            &state,
-            started,
-            fail_response(found.route, fail, &request_id),
-        )
-        .await;
-    }
     let principal = if found.route.public && found.route.auth_removed {
         let slug = found.params.get("slug").cloned().unwrap_or_default();
         match state.slugs.get(&slug) {
@@ -313,6 +304,17 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
     }
+    // Validate only after authentication and authorization, so unauthenticated
+    // callers cannot probe the request schema of protected endpoints.
+    if let Err(fail) = validate_request(found.route, &body, &query, &found.params, &headers) {
+        return finish(
+            found.route,
+            &state,
+            started,
+            fail_response(found.route, fail, &request_id),
+        )
+        .await;
+    }
     if found.route.public_writes && quota_exhausted(&state, &principal.tenant_id, &ip) {
         return finish(
             found.route,
@@ -372,18 +374,16 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     let input = match crud::eval_expr(&found.route.transform_in, &vars) {
         Ok(value) => value,
         Err(err) => {
-            return finish(
-                found.route,
-                &state,
-                started,
+            return finish(found.route, &state, started, {
+                tracing::warn!(%request_id, error = %err, "transform.in failed");
                 error_response(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "VALIDATION_FAILED",
-                    &err,
+                    "Invalid request",
                     &request_id,
                     &[],
-                ),
-            )
+                )
+            })
             .await;
         }
     };
@@ -409,18 +409,16 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     match crud::eval_expr(&step.args, &vars) {
                         Ok(value) => value,
                         Err(err) => {
-                            return finish(
-                                found.route,
-                                &state,
-                                started,
+                            return finish(found.route, &state, started, {
+                                tracing::warn!(%request_id, error = %err, "step args failed");
                                 error_response(
                                     StatusCode::UNPROCESSABLE_ENTITY,
                                     "VALIDATION_FAILED",
-                                    &err,
+                                    "Invalid request",
                                     &request_id,
                                     &[],
-                                ),
-                            )
+                                )
+                            })
                             .await;
                         }
                     }
@@ -615,7 +613,19 @@ fn validate_request(
     body: &Value,
     query: &BTreeMap<String, String>,
     path: &BTreeMap<String, String>,
+    headers: &BTreeMap<String, String>,
 ) -> Result<(), MethodFail> {
+    let has_body_fields = route.request.iter().any(|field| field.location == "body");
+    if !body.is_null() && !body.is_object() {
+        return Err(MethodFail::code(
+            "VALIDATION_FAILED",
+            if has_body_fields {
+                "body must be a JSON object"
+            } else {
+                "body is not allowed"
+            },
+        ));
+    }
     if let Some(obj) = body.as_object() {
         for key in obj.keys() {
             if !route
@@ -650,10 +660,10 @@ fn validate_request(
             }
             "query" => query.contains_key(&field.name),
             "path" => path.contains_key(&field.name),
-            "header" => true,
+            "header" => headers.contains_key(&field.name.to_ascii_lowercase()),
             _ => false,
         };
-        if field.required && field.location != "header" && !present {
+        if field.required && !present {
             return Err(MethodFail::code(
                 "VALIDATION_FAILED",
                 format!("{} is required", field.name),
@@ -718,6 +728,33 @@ fn check_type(field: &crate::manifest::ReqField, value: &Value) -> Result<(), Me
                 return Err(MethodFail::code(
                     "VALIDATION_FAILED",
                     format!("{} must be an email", field.name),
+                ));
+            }
+        }
+        "number" => {
+            if !value.is_number() {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be a number", field.name),
+                ));
+            }
+        }
+        "boolean" => {
+            if !value.is_boolean() {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be a boolean", field.name),
+                ));
+            }
+        }
+        "uuid" => {
+            if !value
+                .as_str()
+                .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+            {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be a uuid", field.name),
                 ));
             }
         }
