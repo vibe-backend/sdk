@@ -102,13 +102,14 @@ const BUILD: &[&str] = &[
 ];
 
 #[test]
-fn build_writes_a_signed_release_manifest() {
+fn build_writes_a_keyless_release_manifest() {
     let root = copy_shop();
-    let (secret, public) = release_key();
-    let (ok, out) = vibe(&root, BUILD, &[("VIBE_RELEASE_SIGNING_KEY", &secret)]);
+    let (ok, out) = vibe(&root, BUILD, &[]);
     assert!(ok, "{out}");
-    let manifest = vibe::manifest::read_manifest(&root.join("out/manifest.json"), &public)
-        .unwrap_or_else(|err| panic!("{err}"));
+    let manifest: vibe::Manifest =
+        serde_json::from_slice(&fs::read(root.join("out/manifest.json")).unwrap()).unwrap();
+    // No key signature: the release job attests the file with Sigstore.
+    assert_eq!(manifest.signature, vibe::attest::SIGSTORE_SIGNATURE);
     assert_eq!(manifest.provenance.build_mode, "release");
     assert_eq!(manifest.provenance.commit, "abc123");
     assert_eq!(
@@ -122,8 +123,7 @@ fn build_with_a_validation_error_writes_nothing() {
     let root = copy_shop();
     break_migration(&root);
     let before = tree(&root);
-    let (secret, _) = release_key();
-    let (ok, out) = vibe(&root, BUILD, &[("VIBE_RELEASE_SIGNING_KEY", &secret)]);
+    let (ok, out) = vibe(&root, BUILD, &[]);
     assert!(!ok, "{out}");
     assert!(
         out.contains("0001-products-name"),
@@ -146,8 +146,7 @@ fn build_validates_before_it_needs_a_key() {
 #[test]
 fn build_with_only_warnings_succeeds_and_shows_them() {
     let root = copy_shop();
-    let (secret, _) = release_key();
-    let (ok, out) = vibe(&root, BUILD, &[("VIBE_RELEASE_SIGNING_KEY", &secret)]);
+    let (ok, out) = vibe(&root, BUILD, &[]);
     assert!(ok, "{out}");
     assert!(out.contains("warning"), "warnings are displayed: {out}");
     assert!(root.join("out/manifest.json").exists());
@@ -191,11 +190,13 @@ async fn build_signs_the_validated_content_not_a_later_edit() {
 }
 
 #[test]
-fn build_without_the_release_key_fails_and_writes_nothing() {
+fn release_build_refuses_the_env_signing_key_and_writes_nothing() {
     let root = copy_shop();
     let before = tree(&root);
-    let (ok, out) = vibe(&root, BUILD, &[]);
+    let (secret, _) = release_key();
+    let (ok, out) = vibe(&root, BUILD, &[("VIBE_RELEASE_SIGNING_KEY", &secret)]);
     assert!(!ok, "{out}");
+    assert!(out.contains("not accepted for release builds"), "{out}");
     assert!(out.contains("VIBE_RELEASE_SIGNING_KEY"), "{out}");
     assert_eq!(tree(&root), before);
 }
@@ -204,12 +205,7 @@ fn build_without_the_release_key_fails_and_writes_nothing() {
 fn build_with_high_risk_items_and_no_approval_writes_nothing() {
     let root = copy_shop();
     let before = tree(&root);
-    let (secret, _) = release_key();
-    let (ok, out) = vibe(
-        &root,
-        &["build", "-o", "out/manifest.json"],
-        &[("VIBE_RELEASE_SIGNING_KEY", &secret)],
-    );
+    let (ok, out) = vibe(&root, &["build", "-o", "out/manifest.json"], &[]);
     assert!(!ok, "{out}");
     assert!(out.contains("no release approval"), "{out}");
     assert_eq!(tree(&root), before);
@@ -243,11 +239,13 @@ fn dev_build_without_a_dev_key_fails_and_creates_none() {
 #[test]
 fn release_build_never_uses_the_dev_key() {
     let root = copy_shop();
-    sign::create_dev_key(&root).unwrap();
+    let key = sign::create_dev_key(&root).unwrap();
     let (ok, out) = vibe(&root, BUILD, &[]);
-    assert!(!ok, "{out}");
-    assert!(out.contains("no fallback"), "{out}");
-    assert!(!root.join("out/manifest.json").exists());
+    assert!(ok, "{out}");
+    let err = vibe::manifest::read_manifest(&root.join("out/manifest.json"), &key.verifying_key())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("signature is invalid"), "{err}");
 }
 
 #[test]

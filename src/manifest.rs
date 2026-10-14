@@ -315,6 +315,34 @@ pub fn build_signed(
     signing_key: &SigningKey,
     info: &BuildInfo,
 ) -> Result<Manifest, Report> {
+    let mut manifest = build_unsigned(root, loaded, info)?;
+    let bytes =
+        serde_json::to_vec(&manifest).map_err(|err| single(format!("manifest json: {err}")))?;
+    manifest.signature = sign::sign_bytes(&bytes, signing_key);
+    Ok(manifest)
+}
+
+/// Official release manifest: no key signature. Its signature is the
+/// Sigstore keyless attestation the release job creates for the written file
+/// (decisions 113, 118); `signature` only marks that.
+pub fn build_release(
+    root: &Path,
+    loaded: &validate::LoadedProject,
+    info: &BuildInfo,
+) -> Result<Manifest, Report> {
+    if !info.release {
+        return Err(single("build_release needs a release BuildInfo".into()));
+    }
+    let mut manifest = build_unsigned(root, loaded, info)?;
+    manifest.signature = crate::attest::SIGSTORE_SIGNATURE.into();
+    Ok(manifest)
+}
+
+fn build_unsigned(
+    root: &Path,
+    loaded: &validate::LoadedProject,
+    info: &BuildInfo,
+) -> Result<Manifest, Report> {
     let (result, docs) = validate::validate_loaded(&ValidateOptions { root, deploy: true }, loaded);
     result?;
     let mut manifest = build_manifest(&docs)?;
@@ -366,9 +394,6 @@ pub fn build_signed(
         }
     }
     manifest.signature = String::new();
-    let bytes =
-        serde_json::to_vec(&manifest).map_err(|err| single(format!("manifest json: {err}")))?;
-    manifest.signature = sign::sign_bytes(&bytes, signing_key);
     Ok(manifest)
 }
 
@@ -412,6 +437,40 @@ pub fn read_manifest(path: &Path, key: &VerifyingKey) -> Result<Manifest, Report
     }
     manifest.signature = signature;
     Ok(manifest)
+}
+
+/// Reads a release manifest and verifies its Sigstore bundle (keyless
+/// signature, certificate identity, Rekor entry) against `policy`. Fails
+/// closed on any problem, including a missing bundle.
+pub fn read_release_manifest(
+    path: &Path,
+    bundle: &Path,
+    policy: &crate::attest::Policy,
+) -> Result<(Manifest, crate::attest::Identity), Report> {
+    let bytes = fs::read(path).map_err(|err| single(format!("cannot read manifest: {err}")))?;
+    let bundle_bytes = fs::read(bundle).map_err(|err| {
+        single(format!(
+            "cannot read the Sigstore bundle {}: {err}; release manifests are verified only with their keyless attestation",
+            bundle.display()
+        ))
+    })?;
+    let identity = crate::attest::verify_bundle(&bytes, &bundle_bytes, policy).map_err(single)?;
+    let manifest: Manifest =
+        serde_json::from_slice(&bytes).map_err(|err| single(format!("manifest json: {err}")))?;
+    if manifest.signature != crate::attest::SIGSTORE_SIGNATURE
+        || manifest.provenance.build_mode != "release"
+    {
+        return Err(single(
+            "attested manifest is not a keyless release manifest".into(),
+        ));
+    }
+    if !manifest.provenance.commit.is_empty() && manifest.provenance.commit != identity.commit {
+        return Err(single(format!(
+            "manifest commit {} is not the attested commit {}",
+            manifest.provenance.commit, identity.commit
+        )));
+    }
+    Ok((manifest, identity))
 }
 
 pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Report> {

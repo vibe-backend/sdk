@@ -82,22 +82,20 @@ pub fn load_dev_key(dir: &std::path::Path) -> Result<SigningKey, String> {
     Ok(SigningKey::from_bytes(&decode_key(&text, "signing key")?))
 }
 
-/// Release signing key: only from `VIBE_RELEASE_SIGNING_KEY` (hex), set as a
-/// secret of the protected `release` environment. There is no fallback to a
-/// file or a generated key.
-pub fn load_release_key() -> Result<SigningKey, String> {
-    let text = std::env::var("VIBE_RELEASE_SIGNING_KEY").map_err(|_| {
-        "release builds need VIBE_RELEASE_SIGNING_KEY (the release environment secret); there is no fallback".to_string()
-    })?;
-    Ok(SigningKey::from_bytes(&decode_key(
-        &text,
-        "VIBE_RELEASE_SIGNING_KEY",
-    )?))
+/// Official release builds are never signed with a key from the
+/// environment: they are signed keyless with Sigstore by the release job
+/// (decisions 113, 118). `VIBE_RELEASE_SIGNING_KEY` is refused outright so a
+/// stale secret cannot produce something that looks like a release.
+pub fn refuse_env_key_for_release() -> Result<(), String> {
+    if std::env::var_os("VIBE_RELEASE_SIGNING_KEY").is_some() {
+        return Err("VIBE_RELEASE_SIGNING_KEY is not accepted for release builds: releases are signed keyless with Sigstore (GitHub OIDC, Fulcio, Rekor) by the release workflow; unset it".into());
+    }
+    Ok(())
 }
 
-/// The pinned release public key: `VIBE_MANIFEST_PUBKEY` (hex) from the
-/// runtime configuration, else one compiled into the binary with
-/// `VIBE_RELEASE_PUBKEY` at build time.
+/// A pinned ed25519 manifest key: `VIBE_MANIFEST_PUBKEY` (hex), else one
+/// compiled in with `VIBE_RELEASE_PUBKEY`. Development only: release
+/// manifests are verified with their Sigstore bundle, never with a key.
 pub fn pinned_public_key() -> Result<Option<VerifyingKey>, String> {
     let raw = std::env::var("VIBE_MANIFEST_PUBKEY")
         .ok()

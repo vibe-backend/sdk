@@ -46,8 +46,8 @@ enum Command {
         /// Output path, relative to the current directory (like `serve --manifest`).
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
-        /// Release build: signs with VIBE_RELEASE_SIGNING_KEY only and fails on
-        /// high-risk items without --release-approval.
+        /// Release build: no key (the release job signs the output keyless
+        /// with Sigstore); fails on high-risk items without --release-approval.
         #[arg(long)]
         release: bool,
         /// Reference to the approval of this release's high-risk items.
@@ -59,7 +59,7 @@ enum Command {
     },
     /// Build a manifest: compile in memory, validate, then sign from the
     /// validated content. Writes nothing unless every step succeeds.
-    /// Default is a release build (release key only); `--dev` is a local
+    /// Default is a release build (unsigned here, signed keyless by the release job); `--dev` is a local
     /// development build.
     Build {
         #[arg(long, default_value = ".")]
@@ -325,9 +325,10 @@ async fn cmd_manifest(
     commit: Option<String>,
 ) -> Result<(), String> {
     let key = if release {
-        sign::load_release_key()?
+        sign::refuse_env_key_for_release()?;
+        None
     } else {
-        sign::load_dev_key(project)?
+        Some(sign::load_dev_key(project)?)
     };
     let commit = resolve_commit(project, commit);
     let loaded = if release {
@@ -340,8 +341,11 @@ async fn cmd_manifest(
         release_approval,
         commit,
     };
-    let manifest =
-        manifest::build_signed(project, &loaded, &key, &info).map_err(|err| err.to_string())?;
+    let manifest = match &key {
+        Some(key) => manifest::build_signed(project, &loaded, key, &info),
+        None => manifest::build_release(project, &loaded, &info),
+    }
+    .map_err(|err| err.to_string())?;
     print_high_risk(&manifest);
     // Relative to the current directory, like `vibe serve --manifest` (#31).
     let path = output.to_path_buf();
@@ -430,18 +434,24 @@ async fn cmd_build(
         }
     }
     // A release build never falls back to the dev key (decision 92).
+    // Release builds take no key: the release job signs the written
+    // manifest keyless with Sigstore (decisions 113, 118).
     let key = if dev {
-        sign::load_dev_key(project)?
+        Some(sign::load_dev_key(project)?)
     } else {
-        sign::load_release_key()?
+        sign::refuse_env_key_for_release()?;
+        None
     };
     let info = manifest::BuildInfo {
         release: !dev,
         release_approval,
         commit,
     };
-    let manifest = manifest::build_signed(project, &loaded, &key, &info)
-        .map_err(|err| format!("{err}\nnothing was written"))?;
+    let manifest = match &key {
+        Some(key) => manifest::build_signed(project, &loaded, key, &info),
+        None => manifest::build_release(project, &loaded, &info),
+    }
+    .map_err(|err| format!("{err}\nnothing was written"))?;
     print_high_risk(&manifest);
     manifest::write_manifest(output, &manifest).map_err(|err| err.to_string())?;
     println!("wrote {}", output.display());
@@ -462,21 +472,43 @@ fn print_high_risk(manifest: &manifest::Manifest) {
     }
 }
 
-/// Manifest verifying key. Production trusts only the pinned release key
-/// (VIBE_MANIFEST_PUBKEY or one compiled in); the project's
-/// `.vibe/signing.pub` is accepted in development only.
-fn manifest_key(
+/// Loads and verifies the manifest. Outside development only a keyless
+/// release manifest with a valid Sigstore bundle (`VIBE_MANIFEST_BUNDLE`, or
+/// `<manifest>.sigstore.json`) is accepted, bound to `VIBE_RELEASE_REPO`,
+/// `VIBE_RELEASE_WORKFLOW` and a `refs/tags/v*` ref. No key is trusted
+/// there. In development a manifest without a bundle is verified with a
+/// pinned key or `.vibe/signing.pub`.
+fn load_manifest(
+    manifest_path: &Path,
     project: &Path,
     run_env: vibe::runtime::RunEnv,
-) -> Result<ed25519_dalek::VerifyingKey, String> {
-    if let Some(key) = sign::pinned_public_key()? {
-        return Ok(key);
+) -> Result<manifest::Manifest, String> {
+    let bundle = std::env::var_os("VIBE_MANIFEST_BUNDLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| vibe::attest::default_bundle_path(manifest_path));
+    if !run_env.is_dev() || bundle.exists() {
+        let policy = vibe::attest::Policy::from_env();
+        let (manifest, identity) = manifest::read_release_manifest(manifest_path, &bundle, &policy)
+            .map_err(|err| err.to_string())?;
+        tracing::info!(
+            repo = %identity.repo,
+            source_ref = %identity.source_ref,
+            commit = %identity.commit,
+            rekor_log_index = %identity.rekor_log_index,
+            "release manifest attestation verified"
+        );
+        return Ok(manifest);
     }
-    if !run_env.is_dev() {
-        return Err("no pinned manifest key: set VIBE_MANIFEST_PUBKEY to the release public key (the project's .vibe/signing.pub is not trusted outside development)".into());
-    }
-    eprintln!("warning: verifying the manifest with the development key in .vibe/signing.pub");
-    sign::load_dev_public(project)
+    let key = match sign::pinned_public_key()? {
+        Some(key) => key,
+        None => {
+            eprintln!(
+                "warning: verifying the manifest with the development key in .vibe/signing.pub"
+            );
+            sign::load_dev_public(project)?
+        }
+    };
+    read_manifest(manifest_path, &key).map_err(|err| err.to_string())
 }
 
 fn check_deployable(
@@ -512,8 +544,7 @@ async fn cmd_serve(
         ));
     }
     let auth = auth_from_env(run_env)?;
-    let key = manifest_key(project, run_env)?;
-    let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
+    let manifest = load_manifest(manifest_path, project, run_env)?;
     check_deployable(&manifest, run_env)?;
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::new())
@@ -577,8 +608,7 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
         return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
     }
     let run_env = vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), false);
-    let key = manifest_key(project, run_env)?;
-    let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
+    let manifest = load_manifest(manifest_path, project, run_env)?;
     check_deployable(&manifest, run_env)?;
     // Migrations need the table-owner role; serving must not use it.
     let url = std::env::var("VIBE_MIGRATE_DATABASE_URL").map_err(|_| {

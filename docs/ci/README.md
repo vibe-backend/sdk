@@ -10,38 +10,53 @@ Locks are build output. They are not committed (`*.lock.md` is in
    compiles in memory and runs the deterministic policy, then writes the
    result to the job summary. It is informational and never deployed. It uses
    `VIBE_LLM_API_KEY_PREVIEW`.
-2. **Build once.** After the merge to protected `main`, `release-build` runs in
-   the `release` environment: `vibe manifest --release` compiles every source
-   in memory, validates the in-memory locks (policy, dependency hashes, SQL
-   allowlist, inherited auth), records per-lock hashes and the commit in the
-   signed manifest, and fails closed on high-risk items without
-   `--release-approval`. Lock files on disk are not read. The manifest is
-   attested with `actions/attest-build-provenance`.
-3. **Promote only.** `deploy` checks the digest, runs
-   `gh attestation verify --repo --signer-workflow --source-ref refs/heads/main`
-   (fail closed), and deploys the same file to staging and then production.
-4. **Run.** Outside development, `vibe serve` / `vibe migrate` verify the
-   manifest with the pinned release public key only (`VIBE_MANIFEST_PUBKEY`,
-   or one compiled in with `VIBE_RELEASE_PUBKEY`) and run only
-   `build_mode: release` manifests. `.vibe/signing.pub` is ignored there.
+2. **Build once, on a `v*` tag.** `release-build` runs in the `release`
+   environment (Jack approves the run): `vibe build` compiles every source in
+   memory, validates the in-memory locks (policy, dependency hashes, SQL
+   allowlist, inherited auth), records per-lock hashes and the commit, and
+   fails closed on high-risk items without `--release-approval`. It takes
+   **no signing key** and refuses `VIBE_RELEASE_SIGNING_KEY`.
+3. **Sign keyless.** The same job attests `manifest.json` with
+   `actions/attest-build-provenance`: Sigstore keyless signing with the
+   job's GitHub OIDC token, a short-lived Fulcio certificate and a Rekor
+   transparency log entry. The bundle is shipped as
+   `manifest.json.sigstore.json`. This is the only job with `id-token: write`.
+4. **Promote only.** `deploy` checks the digest and runs
+   `gh attestation verify --bundle --repo --signer-workflow --source-ref
+   --source-digest --deny-self-hosted-runners` (fail closed), then deploys the
+   same two files to staging and then production.
+5. **Run.** Outside development, `vibe serve` / `vibe migrate` accept only a
+   keyless release manifest whose bundle passes the identity check (see
+   [sigstore-release.md](sigstore-release.md)). No key is trusted there;
+   `VIBE_MANIFEST_PUBKEY` and `.vibe/signing.pub` are development only.
+
+Details, what is verified where, and what is deferred:
+[sigstore-release.md](sigstore-release.md).
 
 ## Setup (done by a repo admin, not by the SDK)
 
-- `release` environment: required reviewers, deployment branch `main` only.
-- Secrets in the `release` environment (not repo level):
-  `VIBE_LLM_API_KEY`, `VIBE_RELEASE_SIGNING_KEY` (hex ed25519 seed).
+- `release` environment: required reviewers, deployments limited to `v*`
+  tags.
+- Tag ruleset on `refs/tags/v*` (no update, deletion or force push).
+- Secret in the `release` environment (not repo level): `VIBE_LLM_API_KEY`.
+  No signing secret is needed. An existing `VIBE_RELEASE_SIGNING_KEY` secret
+  is no longer read by release builds (and makes them fail if passed in);
+  whether to delete it is Jack's call.
 - Repo or PR-scoped secret `VIBE_LLM_API_KEY_PREVIEW` (low quota, cannot reach
   release secrets).
 - Optional environment variable `VIBE_RELEASE_APPROVAL` (reference recorded
   for high-risk items).
 - `staging` and `production` environments for the deploy job.
-- Runtime configuration: `VIBE_MANIFEST_PUBKEY` = hex public key matching
-  `VIBE_RELEASE_SIGNING_KEY`.
+- Runtime configuration: ship `manifest.json.sigstore.json` next to the
+  manifest (or set `VIBE_MANIFEST_BUNDLE`). Set `VIBE_RELEASE_REPO` /
+  `VIBE_RELEASE_WORKFLOW` only if they differ from `vibe-backend/sdk` /
+  `.github/workflows/vibe-release.yml`.
 - Make `preview` a required status check on `main`.
 
 ## Local development
 
-`vibe keygen` creates `.vibe/signing.key` (mode 0600). `vibe compile` writes
-locks and `.vibe/build-record.json`; `vibe validate --deploy` and `vibe
-manifest` refuse locks that differ from that record. The record is a local
-tripwire, not a trust root; only the attested release artifact is deployable.
+`vibe keygen` creates `.vibe/signing.key` (mode 0600). `vibe build --dev`
+signs with it and marks the manifest `build-mode: dev`; production refuses
+dev manifests. `vibe compile` writes locks and `.vibe/build-record.json`;
+the record is a local tripwire, not a trust root; only the attested release
+artifact is deployable.

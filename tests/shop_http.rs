@@ -1028,6 +1028,9 @@ fn vibe_cli(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> (bool, String)
         "VIBE_ENV",
         "VIBE_MANIFEST_PUBKEY",
         "VIBE_RELEASE_SIGNING_KEY",
+        "VIBE_MANIFEST_BUNDLE",
+        "VIBE_RELEASE_REPO",
+        "VIBE_RELEASE_WORKFLOW",
         "GITHUB_SHA",
         "LLM_API_KEY",
         "VIBE_LLM_API_KEY",
@@ -1094,11 +1097,17 @@ async fn approve_is_gone_with_a_pointer_to_its_replacement() {
 }
 
 #[tokio::test]
-async fn release_build_without_its_key_fails() {
+async fn release_build_refuses_the_env_signing_key() {
     let root = copy_shop();
-    let (ok, out) = vibe_cli(&root, &["manifest", "--project", ".", "--release"], &[]);
+    let (secret, _) = release_key_hex();
+    let (ok, out) = vibe_cli(
+        &root,
+        &["manifest", "--project", ".", "--release"],
+        &[("VIBE_RELEASE_SIGNING_KEY", &secret)],
+    );
     assert!(!ok);
-    assert!(out.contains("VIBE_RELEASE_SIGNING_KEY"), "{out}");
+    assert!(out.contains("not accepted for release builds"), "{out}");
+    assert!(!root.join("manifest.json").exists());
 }
 
 fn release_key_hex() -> (String, String) {
@@ -1116,7 +1125,6 @@ async fn release_build_ignores_lock_files_in_the_repo() {
     let root = compiled_shop().await;
     tamper_product_lock(&root);
     rerecord(&root);
-    let (secret, public) = release_key_hex();
     let (ok, out) = vibe_cli(
         &root,
         &[
@@ -1131,13 +1139,12 @@ async fn release_build_ignores_lock_files_in_the_repo() {
             "-o",
             "release.json",
         ],
-        &[("VIBE_RELEASE_SIGNING_KEY", &secret)],
+        &[],
     );
     assert!(ok, "{out}");
-    let key =
-        ed25519_dalek::VerifyingKey::from_bytes(&hex::decode(&public).unwrap().try_into().unwrap())
-            .unwrap();
-    let manifest = vibe::manifest::read_manifest(&root.join("release.json"), &key).unwrap();
+    let manifest: vibe::Manifest =
+        serde_json::from_slice(&fs::read(root.join("release.json")).unwrap()).unwrap();
+    assert_eq!(manifest.signature, vibe::attest::SIGSTORE_SIGNATURE);
     let json = serde_json::to_string(&manifest.routes).unwrap()
         + &serde_json::to_string(&manifest.models).unwrap();
     assert!(
@@ -1265,7 +1272,7 @@ async fn production_serve_ignores_the_project_public_key() {
         ],
     );
     assert!(!ok);
-    assert!(out.contains("no pinned manifest key"), "{out}");
+    assert!(out.contains("Sigstore bundle"), "{out}");
     // With the dev key pinned, the dev manifest is still refused.
     let public = fs::read_to_string(root.join(".vibe/signing.pub")).unwrap();
     let (ok, out) = vibe_cli(
@@ -1282,5 +1289,113 @@ async fn production_serve_ignores_the_project_public_key() {
         ],
     );
     assert!(!ok);
-    assert!(out.contains("only release manifests"), "{out}");
+    assert!(out.contains("Sigstore bundle"), "{out}");
+}
+
+#[path = "support/sigstore_fixture.rs"]
+mod sigstore_fixture;
+
+/// Writes a keyless release manifest of the shop and returns its path.
+async fn release_manifest(root: &Path) -> PathBuf {
+    let (loaded, _) = vibe::compile::compile_in_memory(root, None, None)
+        .await
+        .unwrap();
+    let manifest = vibe::manifest::build_release(
+        root,
+        &loaded,
+        &vibe::manifest::BuildInfo {
+            release: true,
+            release_approval: Some("pr:1".into()),
+            commit: "abc123".into(),
+        },
+    )
+    .unwrap_or_else(|err| panic!("{err}"));
+    let path = root.join("manifest.json");
+    vibe::manifest::write_manifest(&path, &manifest).unwrap();
+    path
+}
+
+fn production_serve(root: &Path, extra: &[(&str, &str)]) -> (bool, String) {
+    let mut envs = vec![
+        ("VIBE_ENV", "production"),
+        (
+            "VIBE_API_KEY_PEPPER",
+            "0123456789abcdef0123456789abcdef0123",
+        ),
+        ("VIBE_DATABASE_URL", "postgres://invalid.invalid/x"),
+    ];
+    envs.extend_from_slice(extra);
+    vibe_cli(
+        root,
+        &["serve", "--project", ".", "--addr", "127.0.0.1:0"],
+        &envs,
+    )
+}
+
+#[tokio::test]
+async fn production_serve_verifies_the_sigstore_bundle() {
+    let root = copy_shop();
+    let path = release_manifest(&root).await;
+    let bytes = fs::read(&path).unwrap();
+    let bundle = vibe::attest::default_bundle_path(&path);
+    // Missing bundle: refused.
+    let (ok, out) = production_serve(&root, &[]);
+    assert!(!ok);
+    assert!(out.contains("cannot read the Sigstore bundle"), "{out}");
+    // Wrong identities: refused before any database work.
+    for (fixture, needle) in [
+        (
+            sigstore_fixture::Fixture {
+                repo: "attacker/sdk".into(),
+                ..Default::default()
+            },
+            "repository",
+        ),
+        (
+            sigstore_fixture::Fixture {
+                workflow: ".github/workflows/ci.yml".into(),
+                ..Default::default()
+            },
+            "signer workflow",
+        ),
+        (
+            sigstore_fixture::Fixture {
+                source_ref: "refs/heads/main".into(),
+                ..Default::default()
+            },
+            "release tag",
+        ),
+        (
+            sigstore_fixture::Fixture {
+                tlog: false,
+                ..Default::default()
+            },
+            "no Rekor",
+        ),
+        (
+            sigstore_fixture::Fixture {
+                commit: "def456".into(),
+                ..Default::default()
+            },
+            "is not the attested commit",
+        ),
+    ] {
+        fs::write(&bundle, fixture.bundle(&bytes)).unwrap();
+        let (ok, out) = production_serve(&root, &[]);
+        assert!(!ok);
+        assert!(out.contains(needle), "{needle}: {out}");
+    }
+    // Valid bundle: the manifest is accepted; serve then fails on the
+    // unreachable database, not on the manifest.
+    fs::write(&bundle, sigstore_fixture::Fixture::default().bundle(&bytes)).unwrap();
+    let (ok, out) = production_serve(&root, &[]);
+    assert!(!ok);
+    assert!(!out.contains("bundle"), "{out}");
+    assert!(!out.contains("manifest"), "{out}");
+    // A pinned key does not replace the bundle.
+    fs::remove_file(&bundle).unwrap();
+    let (_, public) = release_key_hex();
+    let (ok, out) = production_serve(&root, &[("VIBE_MANIFEST_PUBKEY", &public)]);
+    assert!(!ok);
+    assert!(out.contains("Sigstore bundle"), "{out}");
 }

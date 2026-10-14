@@ -1,29 +1,44 @@
-# Reference workflow for a vibe project (copy to .github/workflows/vibe-release.yml).
+# Reference workflow for a vibe release (copy to .github/workflows/vibe-release.yml).
 #
 # - pull_request: informational build preview + policy report in the job
 #   summary. Never a deploy source. Uses the low-quota preview LLM key.
-# - push to main: build ONCE in the protected `release` environment, attest
-#   the manifest (actions/attest-build-provenance), upload it.
-# - deploy: verify the attestation (fail closed), then promote the same
-#   digest to staging and production without rebuilding.
+# - push of a v* tag: build ONCE in the protected `release` environment and
+#   sign the manifest keyless with Sigstore (GitHub OIDC -> short-lived
+#   Fulcio certificate -> Rekor transparency log) via
+#   actions/attest-build-provenance. No signing key exists anywhere.
+# - deploy: verify the bundle (fail closed) bound to the repo, this workflow
+#   path and the tag ref, then promote the same digest to staging and
+#   production without rebuilding. `vibe serve` / `vibe migrate` check the
+#   bundle again at startup.
+#
+# Every action is pinned to a full commit SHA. Only `release-build` gets
+# `id-token: write`.
 name: vibe release
 
 on:
   pull_request:
   push:
-    branches: [main]
+    tags: ["v*"]
 
 permissions:
   contents: read
 
+env:
+  # The identity a release must carry. Keep in sync with the runtime's
+  # VIBE_RELEASE_REPO / VIBE_RELEASE_WORKFLOW (defaults shown).
+  VIBE_RELEASE_REPO: vibe-backend/sdk
+  VIBE_RELEASE_WORKFLOW: .github/workflows/vibe-release.yml
+
 jobs:
   preview:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       VIBE_LLM_API_KEY: ${{ secrets.VIBE_LLM_API_KEY_PREVIEW }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Install vibe
         run: cargo install --locked --git https://github.com/vibe-backend/sdk vibe
       - name: Build preview and policy report (informational)
@@ -37,41 +52,56 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   release-build:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
     environment: release
     permissions:
       contents: read
-      id-token: write
+      id-token: write # Sigstore keyless signing (Fulcio certificate from the GitHub OIDC token)
       attestations: write
     outputs:
       digest: ${{ steps.digest.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Tag commit is on main
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$GITHUB_REF_NAME is not on main"; exit 1; }
       - name: Install vibe
         run: cargo install --locked --git https://github.com/vibe-backend/sdk vibe
-      - name: Release build (compile in memory, policy, sign)
+      - name: Release build (compile in memory, policy; no signing key)
         env:
           VIBE_LLM_API_KEY: ${{ secrets.VIBE_LLM_API_KEY }}
-          VIBE_RELEASE_SIGNING_KEY: ${{ secrets.VIBE_RELEASE_SIGNING_KEY }}
         run: |
-          vibe manifest --project . --release \
+          # A release build refuses VIBE_RELEASE_SIGNING_KEY; do not pass it.
+          LLM_API_KEY="$VIBE_LLM_API_KEY" vibe build --project . \
             --commit "$GITHUB_SHA" \
             ${{ vars.VIBE_RELEASE_APPROVAL && format('--release-approval {0}', vars.VIBE_RELEASE_APPROVAL) || '' }} \
             -o manifest.json 2> >(tee -a "$GITHUB_STEP_SUMMARY" >&2)
       - id: digest
         run: echo "sha256=$(sha256sum manifest.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-      - uses: actions/attest-build-provenance@v2
+      - name: Sign keyless (Sigstore via GitHub attestation)
+        id: attest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: manifest.json
-      - uses: actions/upload-artifact@v4
+      - name: Keep the Sigstore bundle next to the manifest
+        run: cp "${{ steps.attest.outputs.bundle-path }}" manifest.json.sigstore.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: manifest
-          path: manifest.json
+          path: |
+            manifest.json
+            manifest.json.sigstore.json
+          if-no-files-found: error
 
   deploy:
     needs: release-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       max-parallel: 1
       matrix:
@@ -79,21 +109,25 @@ jobs:
     environment: ${{ matrix.target }}
     permissions:
       contents: read
-      attestations: read
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: manifest
       - name: Same digest as the release build
         run: echo "${{ needs.release-build.outputs.digest }}  manifest.json" | sha256sum -c -
-      - name: Verify attestation (fail closed)
+      - name: Verify Sigstore bundle (signature, Fulcio identity, Rekor entry; fail closed)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh attestation verify manifest.json \
-            --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/vibe-release.yml" \
-            --source-ref refs/heads/main \
+            --bundle manifest.json.sigstore.json \
+            --repo "$VIBE_RELEASE_REPO" \
+            --signer-workflow "$VIBE_RELEASE_REPO/$VIBE_RELEASE_WORKFLOW" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --cert-oidc-issuer https://token.actions.githubusercontent.com \
+            --predicate-type https://slsa.dev/provenance/v1 \
             --deny-self-hosted-runners
+          case "$GITHUB_REF" in refs/tags/v?*) ;; *) echo "::error::not a v* tag"; exit 1;; esac
       - name: Deploy
-        run: echo "deploy manifest.json to ${{ matrix.target }} (runtime pins VIBE_MANIFEST_PUBKEY)"
+        run: echo "deploy manifest.json + manifest.json.sigstore.json to ${{ matrix.target }} (vibe serve re-checks the bundle)"
