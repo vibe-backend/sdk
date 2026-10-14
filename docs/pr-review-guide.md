@@ -10,7 +10,12 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - 開 **Dismiss stale pull request approvals when new commits are pushed**（取代 v1.7 嘅「確認綁定 commit hash」）。
 - 開 **Require approval of the most recent reviewable push**，最後 push 嘅人唔可以自己批准。
 - 開 **Require review from Code Owners**。
-- **Bypass list 留空**，admin 都唔例外（release build 讀到 bypass actors 唔係空就會失敗）。
+- **Bypass list 一定要留空**，admin 都唔例外。高風險 release build 會讀每個相關 ruleset 嘅 `bypass_actors`，讀唔到或者唔係空就失敗；唔設白名單（spec 決定 96，待產品經理確認）。
+- 為咗讀到 `bypass_actors`，要開一個專用 GitHub App，只裝喺呢個 repo，喺 release workflow 嘅 `release` environment job 入面 mint installation token：
+  - GitHub 只會將 `bypass_actors` 回畀對 ruleset 有寫權限嘅 caller。先試 repository **Administration: read**；實測讀唔到就要 **Administration: write**（呢個權限可以改 repo 設定，要產品經理確認）。
+  - 加 **Metadata: read**（預設）；唔好加其他權限。
+  - App private key 放 `release` environment secret；mint token 時收窄到呢個 repo；token 唔好印出嚟。
+  - 冇呢個 App 嘅話，高風險 release build 會失敗；普通 build 只記錄。
 
 ## 2. CODEOWNERS（必須，spec 決定 29、37）
 

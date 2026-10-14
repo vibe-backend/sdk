@@ -203,6 +203,7 @@
 | 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；`vibe build` release 模式檢查 CODEOWNERS 覆蓋路徑，冇就失敗。 | 待產品經理確認 | 2A.7、9B |
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 待產品經理確認 | 文件標頭、網站 |
 | 95 | create-user 邀請失敗：`user.invite` 嘅 enqueue（s4）失敗時，create-user 回 503 `INVITE_DELIVERY_FAILED`（只帶 `Retry-After`，body 唔帶 `user_id`），唔回 201／200；因為 s2 已經輪換咗 token 但信冇寄出，用戶手上冇有效連結，恢復方法係重試 create-user（決定 85）或者 re-invite（決定 86），兩者都會發新 token 同新信。同 issue #26（auth flow 實作）相關。 | 待產品經理確認 | 11.4、11.4a |
+| 96 | Ruleset bypass 驗證：高風險 release build 用專用 GitHub App installation token 讀 `GET /repos/{owner}/{repo}/rulesets/{ruleset_id}`，`main` 相關 ruleset 嘅 `bypass_actors` 一定要讀到而且係空，否則失敗；唔設白名單。所需權限以實測為準（文件顯示要 Administration: write 先睇到 `bypass_actors`）。普通 build 只記錄。 | 待產品經理確認 | 2C.3a、[`pr-review-guide.md`](pr-review-guide.md) |
 
 ## 1. 目錄同命名
 
@@ -697,7 +698,7 @@ Release build 喺 `main` 或者 `v*` tag 上跑，build 緊嘅 commit（`B = git
 5. **GitHub 嘅 CODEOWNERS 語法例外**（SDK 自己實作 GitHub 嘅 CODEOWNERS 規則，唔係直接用通用 gitignore library）：
    - 唔支援 `\#` escape（`#` 開頭一定係註解）、唔支援 `!` 否定、唔支援 `[ ]` 字元範圍；有呢啲嘅行當無效，跳過同記錄。
    - 路徑分大小寫。
-   - 其他無效嘅行都好似 GitHub 咁跳過同記錄；成個檔無效（唔係 UTF-8，或者一行有效規則都冇）就失敗。
+   - 其他無效嘅行都好似 GitHub 咁跳過同記錄；成個檔無效（唔係 UTF-8、檔案大過或者等於 3 MB、或者一行有效規則都冇）就失敗。GitHub 文件（[About code owners](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners#codeowners-file-size)）講明 CODEOWNERS 一定要細過 3 MB，超過就唔會載入，即係冇 code owner；GitHub 文件冇講 `codeowners/errors` 會唔會報呢個情況，所以 SDK 喺 `P` 自己檢查檔案大小，唔靠 errors API。
    - 另外 call `GET /repos/{owner}/{repo}/codeowners/errors?ref=<P>`：`errors` 唔係空 array 就失敗（同時記錄每個 error 嘅 `line`、`kind`）；呢個 call 只係用嚟檢查錯誤，owner 配對仍然由 SDK 自己計。
    - **Email owner**（`user@example.com`）當冇 owner：一條高風險路徑嘅 owner 如果全部都係 email，就當冇 owner，build 失敗。
 6. **Owner 判斷**：
@@ -717,11 +718,20 @@ Branch rule 檢查（`main`）：
 - 用 `GET /repos/{owner}/{repo}/rules/branches/main`（rulesets，有 `metadata: read` 就讀到），一定要有 active 嘅 `pull_request` rule，而且 `parameters.require_last_push_approval` 係 `true`。
 - 同一個回應一定要有 active 嘅 `required_status_checks` rule，`parameters.strict_required_status_checks_policy` 係 `true`，而且 `parameters.required_status_checks` 唔係空 array（GitHub 規定要最少一個 status check 呢個設定先生效）；冇就失敗。
 - 我哋揀 **rulesets 做唯一接受嘅來源**：舊式 branch protection（`GET /repos/{owner}/{repo}/branches/{branch}/protection`）要 repo admin 權限先讀到，release workflow 唔應該攞 admin。所以呢個設定一定要用 ruleset 開；rulesets 搵唔到就失敗（待產品經理確認）。
-- **Bypass actors（已知限制）**：`rules/branches/main` 唔會回 `bypass_actors`。每條 rule 有 `ruleset_id`，SDK 會試 `GET /repos/{owner}/{repo}/rulesets/{ruleset_id}`：token 讀到 `bypass_actors`（GitHub 只會畀對 ruleset 有寫權限嘅人睇）而且唔係空，高風險 release build 就失敗；回應冇 `bypass_actors`（權限唔夠）就只記錄喺部署報告。
+- **Bypass actors（決定 96，待產品經理確認）**：`rules/branches/main` 唔會回 `bypass_actors`；ruleset bypass list 有 admin 嘅話，rule 照樣顯示 active，但 admin 可以直接 push 去 `main`。所以：
+  1. 由 `rules/branches/main` 每條相關 rule（`pull_request`、`required_status_checks`）攞 `ruleset_id`，去重。
+  2. 用專用 GitHub App 嘅 installation token（見第 8 節）逐個 call `GET /repos/{owner}/{repo}/rulesets/{ruleset_id}`。
+  3. 高風險 release build：每個 ruleset 嘅回應一定要有 `bypass_actors`，而且係空 array。冇呢個欄位（即係 token 權限唔夠）、唔係空、或者冇 App token，一律失敗（fail closed）。唔設白名單：就算係審核過嘅 actor 都唔接受。
+  4. 其他 build：只記錄 `bypass_actors` 內容或者「讀唔到」。
+  5. Organization 層級 ruleset（`source_type: Organization`）用 repo endpoint 讀，`includes_parents` 預設係 `true`；讀唔到一樣當失敗。
 
 #### 8. Token、權限同錯誤處理
 
 - `GITHUB_TOKEN` 權限：`contents: read`、`pull-requests: read`、`actions: read`（`metadata: read` 係預設）。如果 collaborators permission endpoint 回 403，就失敗；可以改用只有讀權限嘅 GitHub App token。
+- **Ruleset App token（決定 96）**：高風險 release build 一定要有一個專用、只裝喺呢個 repo 嘅 GitHub App，喺 release workflow 入面 mint installation token，只用嚟讀 ruleset。
+  - GitHub 文件：`GET /repos/{owner}/{repo}/rulesets/{ruleset_id}` 本身只要 repository **Metadata: read**，但係 `bypass_actors` 只會回畀對 ruleset 有寫權限嘅 caller。而 ruleset 嘅寫入 endpoint（`POST`／`PUT`／`DELETE`）要 repository **Administration: write**；文件冇列任何 **Administration: read** 嘅 ruleset endpoint，所以 Administration: read 好大機會唔夠睇 `bypass_actors`。
+  - 實作前一定要喺測試 repo 實測：先試 Administration: read；讀唔到就要用 Administration: write（待產品經理確認，因為呢個 token 有能力改 repo 設定）。
+  - 減低風險：mint token 時用 `repositories` 同 `permissions` 參數收窄到呢個 repo 同最少權限；token 只喺 `release` environment 嘅 job 入面 mint，用完唔寫 log、唔寫入 manifest；App private key 放 environment secret。
 - 有 team owner 時要另外一個 GitHub App installation token（repo：Contents、Pull requests、Actions、Metadata read；organization：Members read），唔可以有寫權限。
 - 任何 API 錯誤、404（除咗第 6 節 team membership 嘅 404 代表「唔係成員」）、403、rate limit（429，或者 `x-ratelimit-remaining: 0`）、分頁未讀完、回應格式唔啱，一律當驗證失敗（fail closed），唔會 retry 到放寬。
 - 驗證結果（PR 號碼、`B`、`H`、`P`、tree sha、用咗邊個 CODEOWNERS 檔、排除名單、對唔到嘅 co-author email、每個批准人嘅 login、id、來源同時間）寫入 manifest 同部署報告。
@@ -3281,7 +3291,7 @@ security-items:
 
 私隱法（PDPO、GDPR）部分嘅建議請法律意見覆核。
 
-另外，0.10 嘅決定 73–95 全部待產品經理確認；確認之前 v1.7 定稿照樣有效。
+另外，0.10 嘅決定 73–96 全部待產品經理確認；確認之前 v1.7 定稿照樣有效。
 
 ## 14. 後續版本
 
