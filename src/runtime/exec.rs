@@ -768,25 +768,39 @@ impl QueryExec for PgExec {
         token_hash: &str,
         policy: RefreshPolicy,
     ) -> Result<String, ExecError> {
+        if !super::slugs::valid_tenant(tenant_id) {
+            return Err(ExecError::Message("invalid tenant id".into()));
+        }
         let family = uuid::Uuid::new_v4().to_string();
         let id = uuid::Uuid::new_v4().to_string();
-        self.run_tx(
-            tenant_id,
-            None,
-            true,
-            "INSERT INTO _platform_refresh_tokens (id, tenant_id, family_id, user_id, token_hash, created_at, family_expires_at, idle_expires_at) \
-             VALUES ($1::text::uuid, $2, $3::text::uuid, $4, $5, now(), now() + make_interval(secs => $6::double precision), now() + make_interval(secs => $7::double precision))",
-            vec![
-                Some(id),
-                Some(tenant_id.to_string()),
-                Some(family.clone()),
-                Some(user_id.to_string()),
-                Some(token_hash.to_string()),
-                Some(policy.family_ttl.to_string()),
-                Some(policy.idle_ttl.to_string()),
-            ],
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await.map_err(map_pg)?;
+        let schema = format!("\"t_{tenant_id}\"");
+        tx.query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true)",
+            &[&tenant_id, &schema],
         )
-        .await?;
+        .await
+        .map_err(map_pg)?;
+        // Per-user lock shared with logout-all, so a new family is either
+        // committed before logout-all lists the user's families or created
+        // after it finishes.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('vibe-refresh-user:' || $1))",
+            &[&user_id],
+        )
+        .await
+        .map_err(map_pg)?;
+        let family_ttl = policy.family_ttl as f64;
+        let idle_ttl = policy.idle_ttl as f64;
+        tx.execute(
+            "INSERT INTO _platform_refresh_tokens (id, tenant_id, family_id, user_id, token_hash, created_at, family_expires_at, idle_expires_at) \
+             VALUES ($1::text::uuid, $2, $3::text::uuid, $4, $5, now(), now() + make_interval(secs => $6), now() + make_interval(secs => $7))",
+            &[&id, &tenant_id, &family, &user_id, &token_hash, &family_ttl, &idle_ttl],
+        )
+        .await
+        .map_err(map_pg)?;
+        tx.commit().await.map_err(map_pg)?;
         Ok(family)
     }
 
@@ -955,6 +969,14 @@ impl QueryExec for PgExec {
                 .await
             }
             RevokeTarget::User(user) => {
+                // Same per-user lock as refresh_issue: a login running at the
+                // same time is either listed here or starts after this commit.
+                tx.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext('vibe-refresh-user:' || $1))",
+                    &[&user],
+                )
+                .await
+                .map_err(map_pg)?;
                 tx.query(
                     "SELECT DISTINCT family_id::text FROM _platform_refresh_tokens \
                      WHERE user_id = $1 AND revoked_at IS NULL ORDER BY 1",

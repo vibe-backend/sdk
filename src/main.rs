@@ -461,8 +461,9 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
     for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant, &runtime_role).await? {
         println!("{line}");
     }
-    // Last, so the privilege revoke also overrides any schema-wide grant
-    // (`GRANT ... ON ALL TABLES IN SCHEMA`) made earlier in this run.
+    // Last: the revoke is table-level (on `_platform_refresh_tokens` only).
+    // `GRANT ... ON ALL TABLES IN SCHEMA` in a migration expands to per-table
+    // grants when it runs, so revoking afterwards removes those as well.
     exec.check_role_separation_for(Some(&runtime_role)).await?;
     if manifest.routes.iter().any(|r| r.refresh.is_some()) {
         let schema = format!("t_{tenant}");

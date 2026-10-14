@@ -970,6 +970,57 @@ fn check_routes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
     }
 }
 
+/// Every `token-refresh` `sign-method` must name a method with a `sign-jwt`
+/// step (a typo would otherwise only surface as a failing refresh call).
+fn check_refresh_sign_methods(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    for doc in docs.values() {
+        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+            continue;
+        }
+        let Some(pipes) = find_section(&doc.sections, "Pipelines") else {
+            continue;
+        };
+        for block in &pipes.blocks {
+            if pipeline_name(&block.heading) != "token-refresh" {
+                continue;
+            }
+            let target = block_val(block, "sign-method");
+            let Some((object, method)) = target.split_once('.') else {
+                if !target.is_empty() {
+                    report.push(
+                        Diag::error(
+                            &doc.meta.source,
+                            format!("token-refresh sign-method `{target}` is not a known method"),
+                        )
+                        .at_step(&block.heading),
+                    );
+                }
+                continue;
+            };
+            let id = format!("{object}/methods/{method}");
+            let problem = match docs.get(&id) {
+                None => Some(format!(
+                    "token-refresh sign-method `{target}` is not a known method"
+                )),
+                Some(m) => {
+                    let signs = find_section(&m.sections, "Steps").is_some_and(|steps| {
+                        steps
+                            .blocks
+                            .iter()
+                            .any(|b| block_val(b, "op") == "sign-jwt")
+                    });
+                    (!signs).then(|| {
+                        format!("token-refresh sign-method `{target}` has no sign-jwt step")
+                    })
+                }
+            };
+            if let Some(problem) = problem {
+                report.push(Diag::error(&doc.meta.source, problem).at_step(&block.heading));
+            }
+        }
+    }
+}
+
 /// CRUD actions every model provides without a method lock.
 pub const CRUD_ACTIONS: &[&str] = &["create", "get", "list", "update", "delete"];
 
@@ -1035,57 +1086,6 @@ fn check_targets(docs: &HashMap<String, LockDoc>, report: &mut Report) {
                             .at_section("Steps"),
                     );
                 }
-            }
-        }
-    }
-}
-
-/// Every `token-refresh` `sign-method` must name a method with a `sign-jwt`
-/// step (a typo would otherwise only surface as a failing refresh call).
-fn check_refresh_sign_methods(docs: &HashMap<String, LockDoc>, report: &mut Report) {
-    for doc in docs.values() {
-        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
-            continue;
-        }
-        let Some(pipes) = find_section(&doc.sections, "Pipelines") else {
-            continue;
-        };
-        for block in &pipes.blocks {
-            if pipeline_name(&block.heading) != "token-refresh" {
-                continue;
-            }
-            let target = block_val(block, "sign-method");
-            let Some((object, method)) = target.split_once('.') else {
-                if !target.is_empty() {
-                    report.push(
-                        Diag::error(
-                            &doc.meta.source,
-                            format!("token-refresh sign-method `{target}` is not a known method"),
-                        )
-                        .at_step(&block.heading),
-                    );
-                }
-                continue;
-            };
-            let id = format!("{object}/methods/{method}");
-            let problem = match docs.get(&id) {
-                None => Some(format!(
-                    "token-refresh sign-method `{target}` is not a known method"
-                )),
-                Some(m) => {
-                    let signs = find_section(&m.sections, "Steps").is_some_and(|steps| {
-                        steps
-                            .blocks
-                            .iter()
-                            .any(|b| block_val(b, "op") == "sign-jwt")
-                    });
-                    (!signs).then(|| {
-                        format!("token-refresh sign-method `{target}` has no sign-jwt step")
-                    })
-                }
-            };
-            if let Some(problem) = problem {
-                report.push(Diag::error(&doc.meta.source, problem).at_step(&block.heading));
             }
         }
     }
@@ -1699,7 +1699,7 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("WHERE")));
     }
 
-    fn body_doc(kind: Kind, scope: Option<Scope>, id: &str, body: &str) -> LockDoc {
+    fn parsed_doc(kind: Kind, scope: Option<Scope>, id: &str, body: &str) -> LockDoc {
         LockDoc {
             meta: crate::lock::Meta::pending(kind, scope, id, format!("{id}.md")),
             sections: crate::lock::parse_sections(body).unwrap(),
@@ -1708,10 +1708,13 @@ mod tests {
 
     fn target_docs() -> HashMap<String, LockDoc> {
         let mut docs = HashMap::new();
-        docs.insert("product".into(), body_doc(Kind::Model, None, "product", ""));
+        docs.insert(
+            "product".into(),
+            parsed_doc(Kind::Model, None, "product", ""),
+        );
         docs.insert(
             "product/methods/publish".into(),
-            body_doc(Kind::Method, None, "product/methods/publish", ""),
+            parsed_doc(Kind::Method, None, "product/methods/publish", ""),
         );
         docs
     }
@@ -1752,7 +1755,7 @@ mod tests {
         let body = "## Steps\n### s1\n- op: method\n- target: product.nonexistent\n";
         docs.insert(
             "catalog/v1/x".into(),
-            body_doc(Kind::Api, Some(Scope::Feature), "api/catalog/v1/x/x", body),
+            parsed_doc(Kind::Api, Some(Scope::Feature), "api/catalog/v1/x/x", body),
         );
         let mut report = Report::new();
         check_targets(&docs, &mut report);
@@ -1773,7 +1776,7 @@ mod tests {
         ] {
             let prompt = crate::compile::system_prompt(kind, scope);
             let body = prompt.split_once("LOCK BODY:\n").expect("example").1;
-            let lock = body_doc(kind, scope, id, body);
+            let lock = parsed_doc(kind, scope, id, body);
             let names: Vec<&str> = lock.sections.iter().map(|s| s.name.as_str()).collect();
             assert_eq!(names, section_order(kind, scope), "{id}");
             let mut report = Report::new();
