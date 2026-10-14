@@ -453,6 +453,11 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
         exec.batch(&statements).await?;
         println!("bootstrapped {}.{}", schema, model.table);
     }
+    if manifest.routes.iter().any(|r| r.refresh.is_some()) {
+        exec.batch(&vibe::runtime::refresh::table_statements(&schema)?)
+            .await?;
+        println!("bootstrapped {schema}._platform_refresh_tokens");
+    }
     for migration in &manifest.migrations {
         exec.batch(&migration.statements).await?;
         println!("applied {}", migration.id);

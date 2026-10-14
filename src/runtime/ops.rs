@@ -1,6 +1,6 @@
 //! Executable method ops (spec §12.8, decisions 52/55/62): `query`,
 //! `verify-password`, `hash-password`, `random-token`, `hash-token` and
-//! `sign-jwt`. Refresh tokens (`issue-refresh`) come in a later change.
+//! `sign-jwt` (with platform refresh tokens via `issue-refresh`).
 
 use std::sync::OnceLock;
 
@@ -208,7 +208,9 @@ const PLATFORM_CLAIMS: &[&str] = &[
 /// `sign-jwt`: only in methods with `capabilities: [sign-token]`. `tenant_id`
 /// is always the request's tenant (decision 62); iss/aud come from the
 /// runtime; ttl is capped at 1 h.
-pub fn sign_jwt(
+pub async fn sign_jwt(
+    manifest: &crate::manifest::Manifest,
+    exec: &dyn QueryExec,
     method: &MethodSpec,
     step: &StepSpec,
     vars: &Map<String, Value>,
@@ -218,7 +220,7 @@ pub fn sign_jwt(
         return Err(internal("sign-jwt requires capabilities: [sign-token]"));
     }
     match opt(step, "issue-refresh") {
-        "" | "none" | "platform-decided" => {}
+        "" | "none" | "platform-decided" | "new-family" => {}
         other => {
             return Err(internal(format!(
                 "issue-refresh {other} is not supported yet"
@@ -256,7 +258,12 @@ pub fn sign_jwt(
             claims.insert(name, eval(&expr, vars)?);
         }
     }
-    let sub = claims.get("sub").and_then(Value::as_str).unwrap_or("");
+    let sub = claims
+        .get("sub")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let sub = sub.as_str();
     if sub.is_empty() {
         return Err(internal("sign-jwt needs a sub claim"));
     }
@@ -282,11 +289,84 @@ pub fn sign_jwt(
     header.kid = Some(key.kid.clone());
     let token = jsonwebtoken::encode(&header, &Value::Object(claims), &key.key)
         .map_err(|err| internal(format!("sign-jwt: {err}")))?;
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "access_token": token,
         "token_type": "Bearer",
         "expires_in": ttl,
-    }))
+    });
+    attach_refresh(manifest, exec, method, step, &mut out, sub, ctx).await?;
+    Ok(out)
+}
+
+/// A fresh opaque refresh token and its stored HMAC.
+pub fn new_refresh_token(pepper: &[u8]) -> (String, String) {
+    let mut buf = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut buf);
+    let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
+    let hash = hmac_hex(pepper, &value);
+    (value, hash)
+}
+
+pub fn refresh_hash(pepper: &[u8], value: &str) -> String {
+    hmac_hex(pepper, value)
+}
+
+/// The rotation route whose `sign-method` is `target`, if any.
+pub fn refresh_route_for<'a>(
+    manifest: &'a crate::manifest::Manifest,
+    target: &str,
+) -> Option<&'a crate::manifest::RefreshSpec> {
+    manifest
+        .routes
+        .iter()
+        .filter_map(|r| r.refresh.as_ref())
+        .find(|spec| spec.sign_method == target)
+}
+
+pub fn policy_of(spec: &crate::manifest::RefreshSpec) -> super::refresh::RefreshPolicy {
+    super::refresh::RefreshPolicy {
+        family_ttl: spec.refresh_ttl_s,
+        idle_ttl: spec.idle_ttl_s,
+        grace: spec.reuse_grace_s,
+    }
+}
+
+/// `issue-refresh`: on a rotation call the token was already stored by the
+/// refresh route; otherwise (login) a new family starts. `platform-decided`
+/// issues only when a `token-refresh` route signs with this method.
+async fn attach_refresh(
+    manifest: &crate::manifest::Manifest,
+    exec: &dyn QueryExec,
+    method: &MethodSpec,
+    step: &StepSpec,
+    out: &mut Value,
+    sub: &str,
+    ctx: CallCtx<'_>,
+) -> Result<(), MethodFail> {
+    let mode = opt(step, "issue-refresh");
+    if mode.is_empty() || mode == "none" {
+        return Ok(());
+    }
+    let token = match ctx.refresh_token {
+        Some(token) => token.to_string(),
+        None => {
+            let Some(spec) = refresh_route_for(manifest, &method.target) else {
+                if mode == "new-family" {
+                    return Err(internal(
+                        "issue-refresh new-family needs a token-refresh route that signs with this method",
+                    ));
+                }
+                return Ok(());
+            };
+            let (value, hash) = new_refresh_token(&ctx.auth.pepper);
+            exec.refresh_issue(ctx.tenant_id, sub, &hash, policy_of(spec))
+                .await
+                .map_err(|err| internal(format!("refresh token: {err:?}")))?;
+            value
+        }
+    };
+    out["refresh_token"] = Value::String(token);
+    Ok(())
 }
 
 /// Startup: every `sign-jwt` key-ref must be loadable from the environment

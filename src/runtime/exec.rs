@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
+use super::refresh::{RefreshPolicy, RevokeTarget, Rotated};
 use super::sql::{self, Col, Stmt};
 
 pub type Row = Map<String, Value>;
@@ -35,6 +36,38 @@ pub trait QueryExec: Send + Sync {
             "query steps need PostgreSQL; the --memory executor does not run them".into(),
         ))
     }
+
+    /// Stores a new refresh family; returns the family id.
+    async fn refresh_issue(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        token_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<String, ExecError>;
+
+    /// Presents a refresh token (by hash) and atomically rotates it to
+    /// `new_hash` (see [`super::refresh`]).
+    async fn refresh_rotate(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<Rotated, ExecError>;
+
+    async fn refresh_revoke(
+        &self,
+        tenant_id: &str,
+        target: RevokeTarget<'_>,
+    ) -> Result<u64, ExecError>;
+
+    /// Family id of a stored refresh token hash (for the per-family limit).
+    async fn refresh_family(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError>;
 }
 
 /// A query parameter sent in text format so PostgreSQL infers its type.
@@ -88,6 +121,8 @@ fn returns_rows(sql: &str) -> bool {
             .any(|w| w == "returning")
 }
 
+const REFRESH_TABLE: &str = "_platform_refresh_tokens";
+
 #[derive(Default)]
 pub struct MemoryExec {
     tables: Mutex<BTreeMap<String, Vec<Row>>>,
@@ -101,6 +136,85 @@ impl MemoryExec {
 
 #[async_trait]
 impl QueryExec for MemoryExec {
+    async fn refresh_family(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        let tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        Ok(tables.get(&key(tenant_id, REFRESH_TABLE)).and_then(|rows| {
+            rows.iter()
+                .find(|r| r.get("token_hash").and_then(Value::as_str) == Some(token_hash))
+                .and_then(|r| r.get("family_id").and_then(Value::as_str))
+                .map(str::to_string)
+        }))
+    }
+
+    async fn refresh_issue(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        token_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<String, ExecError> {
+        let mut tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        let rows = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+        Ok(super::refresh::memory_issue(
+            rows,
+            tenant_id,
+            user_id,
+            token_hash,
+            policy,
+            chrono::Utc::now().timestamp(),
+        ))
+    }
+
+    async fn refresh_rotate(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<Rotated, ExecError> {
+        let mut tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        let rows = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+        Ok(super::refresh::memory_rotate(
+            rows,
+            tenant_id,
+            token_hash,
+            new_hash,
+            policy,
+            chrono::Utc::now().timestamp(),
+        ))
+    }
+
+    async fn refresh_revoke(
+        &self,
+        tenant_id: &str,
+        target: RevokeTarget<'_>,
+    ) -> Result<u64, ExecError> {
+        let mut tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        let rows = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+        Ok(super::refresh::memory_revoke(
+            rows,
+            tenant_id,
+            &target,
+            chrono::Utc::now().timestamp(),
+        ))
+    }
+
     async fn execute(
         &self,
         tenant_id: &str,
@@ -351,6 +465,174 @@ impl QueryExec for PgExec {
             out.push(mapped);
         }
         Ok(out)
+    }
+
+    async fn refresh_family(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        let rows = self
+            .raw(
+                tenant_id,
+                "SELECT family_id::text AS family_id FROM _platform_refresh_tokens WHERE token_hash = $1",
+                vec![Some(token_hash.to_string())],
+            )
+            .await?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.get("family_id").and_then(Value::as_str))
+            .map(str::to_string))
+    }
+
+    async fn refresh_issue(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        token_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<String, ExecError> {
+        let family = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::new_v4().to_string();
+        self.raw(
+            tenant_id,
+            "INSERT INTO _platform_refresh_tokens (id, tenant_id, family_id, user_id, token_hash, created_at, family_expires_at, idle_expires_at) \
+             VALUES ($1::text::uuid, $2, $3::text::uuid, $4, $5, now(), now() + make_interval(secs => $6::double precision), now() + make_interval(secs => $7::double precision))",
+            vec![
+                Some(id),
+                Some(tenant_id.to_string()),
+                Some(family.clone()),
+                Some(user_id.to_string()),
+                Some(token_hash.to_string()),
+                Some(policy.family_ttl.to_string()),
+                Some(policy.idle_ttl.to_string()),
+            ],
+        )
+        .await?;
+        Ok(family)
+    }
+
+    async fn refresh_rotate(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<Rotated, ExecError> {
+        if !super::slugs::valid_tenant(tenant_id) {
+            return Err(ExecError::Message("invalid tenant id".into()));
+        }
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await.map_err(map_pg)?;
+        let schema = format!("\"t_{tenant_id}\"");
+        tx.query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true)",
+            &[&tenant_id, &schema],
+        )
+        .await
+        .map_err(map_pg)?;
+        // Row lock: concurrent presentations of one token serialise here.
+        let row = tx
+            .query_opt(
+                "SELECT id::text, family_id::text, user_id, revoke_reason, revoked_at IS NOT NULL, \
+                 (now() >= family_expires_at OR now() >= idle_expires_at), \
+                 used_at IS NOT NULL, \
+                 (used_at IS NOT NULL AND now() - used_at <= make_interval(secs => $2::double precision) AND grace_reissued_at IS NULL), \
+                 replaced_by::text \
+                 FROM _platform_refresh_tokens WHERE token_hash = $1 FOR UPDATE",
+                &[&token_hash, &(policy.grace as f64)],
+            )
+            .await
+            .map_err(map_pg)?;
+        let Some(row) = row else {
+            return Ok(Rotated::Invalid);
+        };
+        let id: String = row.get(0);
+        let family: String = row.get(1);
+        let user: String = row.get(2);
+        let reason: Option<String> = row.get(3);
+        let revoked: bool = row.get(4);
+        let expired: bool = row.get(5);
+        let used: bool = row.get(6);
+        let in_grace: bool = row.get(7);
+        let old_child: Option<String> = row.get(8);
+        let revoke_family = "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'reuse' \
+                             WHERE family_id = $1::text::uuid AND revoked_at IS NULL";
+        if revoked {
+            if reason.as_deref() == Some("grace-reissue") {
+                tx.execute(revoke_family, &[&family]).await.map_err(map_pg)?;
+                tx.commit().await.map_err(map_pg)?;
+                return Ok(Rotated::Reuse { family_id: family });
+            }
+            return Ok(Rotated::Invalid);
+        }
+        if expired {
+            return Ok(Rotated::Invalid);
+        }
+        if used && !in_grace {
+            tx.execute(revoke_family, &[&family]).await.map_err(map_pg)?;
+            tx.commit().await.map_err(map_pg)?;
+            return Ok(Rotated::Reuse { family_id: family });
+        }
+        let child = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO _platform_refresh_tokens (id, tenant_id, family_id, user_id, token_hash, parent_id, created_at, family_expires_at, idle_expires_at) \
+             SELECT $1::text::uuid, tenant_id, family_id, user_id, $2, id, now(), family_expires_at, now() + make_interval(secs => $3::double precision) \
+             FROM _platform_refresh_tokens WHERE id = $4::text::uuid",
+            &[&child, &new_hash, &(policy.idle_ttl as f64), &id],
+        )
+        .await
+        .map_err(map_pg)?;
+        if used {
+            if let Some(old) = old_child {
+                tx.execute(
+                    "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'grace-reissue' \
+                     WHERE id = $1::text::uuid AND revoked_at IS NULL",
+                    &[&old],
+                )
+                .await
+                .map_err(map_pg)?;
+            }
+            tx.execute(
+                "UPDATE _platform_refresh_tokens SET replaced_by = $1::text::uuid, grace_reissued_at = now() WHERE id = $2::text::uuid",
+                &[&child, &id],
+            )
+            .await
+            .map_err(map_pg)?;
+        } else {
+            tx.execute(
+                "UPDATE _platform_refresh_tokens SET replaced_by = $1::text::uuid, used_at = now() WHERE id = $2::text::uuid",
+                &[&child, &id],
+            )
+            .await
+            .map_err(map_pg)?;
+        }
+        tx.commit().await.map_err(map_pg)?;
+        Ok(Rotated::Ok {
+            user_id: user,
+            family_id: family,
+        })
+    }
+
+    async fn refresh_revoke(
+        &self,
+        tenant_id: &str,
+        target: RevokeTarget<'_>,
+    ) -> Result<u64, ExecError> {
+        let (sql, params) = match target {
+            RevokeTarget::FamilyOf { hash, user } => (
+                "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'logout' \
+                 WHERE revoked_at IS NULL AND family_id = (SELECT family_id FROM _platform_refresh_tokens WHERE token_hash = $1 AND user_id = $2) RETURNING id",
+                vec![Some(hash.to_string()), Some(user.to_string())],
+            ),
+            RevokeTarget::User(user) => (
+                "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'logout' \
+                 WHERE revoked_at IS NULL AND user_id = $1 RETURNING id",
+                vec![Some(user.to_string())],
+            ),
+        };
+        let rows = self.raw(tenant_id, sql, params).await?;
+        Ok(rows.len() as u64)
     }
 
     async fn raw(

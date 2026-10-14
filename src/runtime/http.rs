@@ -18,6 +18,7 @@ use subtle::ConstantTimeEq;
 
 use crate::manifest::{Manifest, RouteSpec};
 
+use super::refresh::{RevokeTarget, Rotated};
 use super::crud::{self, MethodFail};
 use super::exec::QueryExec;
 use super::limiter::{ip_bucket, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision};
@@ -589,6 +590,21 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
     }
+    if let Some(spec) = &found.route.refresh {
+        let response =
+            refresh_response(&state, found.route, spec, &principal.tenant_id, &ip, &body, &request_id)
+                .await;
+        return finish(found.route, &state, started, response).await;
+    }
+    if let Some(spec) = &found.route.revoke {
+        if let Err(response) = revoke_tokens(&state, spec, &principal, &body, &request_id).await {
+            return finish(found.route, &state, started, response).await;
+        }
+        if found.route.steps.is_empty() {
+            let response = empty_response(StatusCode::NO_CONTENT, &request_id, &[]);
+            return finish(found.route, &state, started, response).await;
+        }
+    }
     if found.route.public_writes && quota_exhausted(&state, &principal.tenant_id, &ip) {
         let retry = seconds_until_utc_midnight().to_string();
         return finish(
@@ -711,6 +727,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                             subject: &principal.subject,
                             roles: &principal.roles,
                         },
+                        refresh_token: None,
                     },
                     1,
                 )
@@ -817,6 +834,12 @@ async fn finish(
     } else {
         0
     });
+    // Refresh rotation always pads to 300 ms (decision 72).
+    let min_ms = if route.refresh.is_some() {
+        min_ms.max(300)
+    } else {
+        min_ms
+    };
     let elapsed = started.elapsed();
     if min_ms > 0 {
         let min = Duration::from_millis(min_ms);
@@ -1397,9 +1420,11 @@ fn rate_limited(
     if route.rates.is_empty() {
         return None;
     }
+    // `family` limits are applied by the refresh handler once the family is known.
     let checks: Vec<(String, String, u32)> = route
         .rates
         .iter()
+        .filter(|rate| rate.key != "family")
         .map(|rate| {
             let (shard, key) =
                 rate_bucket(&rate.key, route, ip, principal, body, &state.auth.pepper);
@@ -1413,6 +1438,182 @@ fn rate_limited(
         RateDecision::Allow => None,
         RateDecision::Limited(wait) => Some(wait.to_string()),
     }
+}
+
+fn limit_check(state: &AppState, checks: &[(String, String, u32)]) -> Option<String> {
+    let Ok(mut rates) = state.rates.lock() else {
+        return Some("1".into());
+    };
+    match rates.check(checks, Instant::now()) {
+        RateDecision::Allow => None,
+        RateDecision::Limited(wait) => Some(wait.to_string()),
+    }
+}
+
+/// Platform ceilings for refresh routes (decision 72).
+const REFRESH_IP_PER_MINUTE: u32 = 30;
+const REFRESH_FAMILY_PER_MINUTE: u32 = 10;
+
+fn invalid_refresh(request_id: &str) -> HttpResponse {
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "INVALID_REFRESH_TOKEN",
+        "Invalid refresh token",
+        request_id,
+        &[],
+    )
+}
+
+fn rate_limited_response(request_id: &str, retry: &str) -> HttpResponse {
+    error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "RATE_LIMITED",
+        "Too many requests",
+        request_id,
+        &[("retry-after", retry)],
+    )
+}
+
+/// `token-refresh`: rotate the presented token, then sign a new access token
+/// with the route's `sign-method`. Every failure is the same 401.
+async fn refresh_response(
+    state: &AppState,
+    route: &RouteSpec,
+    spec: &crate::manifest::RefreshSpec,
+    tenant: &str,
+    ip: &str,
+    body: &Value,
+    request_id: &str,
+) -> HttpResponse {
+    let ip_check = [(
+        format!("{}:refresh-ip", route.feature_id),
+        ip.to_string(),
+        REFRESH_IP_PER_MINUTE,
+    )];
+    if let Some(retry) = limit_check(state, &ip_check) {
+        return rate_limited_response(request_id, &retry);
+    }
+    let Some(token) = body
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty() && t.len() <= 256)
+    else {
+        return invalid_refresh(request_id);
+    };
+    let hash = super::ops::refresh_hash(&state.auth.pepper, token);
+    if let Ok(Some(family)) = state.exec.refresh_family(tenant, &hash).await {
+        let per_minute = route
+            .rates
+            .iter()
+            .filter(|r| r.key == "family")
+            .map(|r| r.per_minute)
+            .min()
+            .unwrap_or(REFRESH_FAMILY_PER_MINUTE)
+            .min(REFRESH_FAMILY_PER_MINUTE);
+        let family_check = [(format!("{}:family", route.feature_id), family, per_minute)];
+        if let Some(retry) = limit_check(state, &family_check) {
+            return rate_limited_response(request_id, &retry);
+        }
+    }
+    let (new_token, new_hash) = super::ops::new_refresh_token(&state.auth.pepper);
+    let policy = super::ops::policy_of(spec);
+    match state
+        .exec
+        .refresh_rotate(tenant, &hash, &new_hash, policy)
+        .await
+    {
+        Ok(Rotated::Ok { user_id, .. }) => {
+            let input = serde_json::json!({ "user_id": user_id });
+            let result = crud::run_method(
+                &state.manifest,
+                state.exec.as_ref(),
+                &spec.sign_method,
+                &input,
+                crud::CallCtx {
+                    auth: &state.auth,
+                    tenant_id: tenant,
+                    role: "public_reader",
+                    caller: crud::Caller {
+                        subject: &user_id,
+                        roles: &[],
+                    },
+                    refresh_token: Some(&new_token),
+                },
+                1,
+            )
+            .await;
+            match result {
+                Ok(result) if result.value.get("access_token").is_some() => {
+                    let mut value = result.value;
+                    value["refresh_token"] = Value::String(new_token);
+                    json_response(StatusCode::OK, value, request_id, &[])
+                }
+                Ok(_) => {
+                    tracing::error!(%request_id, method = %spec.sign_method, "sign-method returned no access_token");
+                    invalid_refresh(request_id)
+                }
+                Err(fail) => {
+                    tracing::info!(%request_id, code = %fail.code, "refresh sign-method failed");
+                    invalid_refresh(request_id)
+                }
+            }
+        }
+        Ok(Rotated::Reuse { family_id }) => {
+            tracing::warn!(%request_id, %tenant, family = %family_id, "refresh token replayed; family revoked");
+            invalid_refresh(request_id)
+        }
+        Ok(Rotated::Invalid) => invalid_refresh(request_id),
+        Err(err) => {
+            tracing::error!(%request_id, error = ?err, "refresh rotation failed");
+            invalid_refresh(request_id)
+        }
+    }
+}
+
+/// `token-revoke`: `family` revokes the presented token's family (only the
+/// caller's own); `all` revokes every family of the caller.
+async fn revoke_tokens(
+    state: &AppState,
+    spec: &crate::manifest::RevokeSpec,
+    principal: &Principal,
+    body: &Value,
+    request_id: &str,
+) -> Result<(), HttpResponse> {
+    let hash;
+    let target = if spec.scope == "all" {
+        RevokeTarget::User(&principal.subject)
+    } else {
+        let Some(token) = body.get("refresh_token").and_then(Value::as_str) else {
+            return Err(error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "VALIDATION_FAILED",
+                "refresh_token is required",
+                request_id,
+                &[],
+            ));
+        };
+        hash = super::ops::refresh_hash(&state.auth.pepper, token);
+        RevokeTarget::FamilyOf {
+            hash: &hash,
+            user: &principal.subject,
+        }
+    };
+    // Unknown tokens revoke nothing; the response is the same either way.
+    if let Err(err) = state
+        .exec
+        .refresh_revoke(&principal.tenant_id, target)
+        .await
+    {
+        tracing::error!(%request_id, error = ?err, "refresh revoke failed");
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "Internal error",
+            request_id,
+            &[],
+        ));
+    }
+    Ok(())
 }
 
 fn seconds_until_utc_midnight() -> i64 {

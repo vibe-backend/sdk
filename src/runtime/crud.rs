@@ -28,6 +28,9 @@ pub struct CallCtx<'a> {
     pub tenant_id: &'a str,
     pub role: &'a str,
     pub caller: Caller<'a>,
+    /// Set by the refresh route: the already-stored rotated refresh token
+    /// that `sign-jwt issue-refresh` hands back instead of a new family.
+    pub refresh_token: Option<&'a str>,
 }
 
 pub async fn run_method(
@@ -116,7 +119,7 @@ async fn run_steps(
                     "hash-password" => super::ops::hash_password_op(step, &vars).await?,
                     "random-token" => super::ops::random_token(step, ctx)?,
                     "hash-token" => super::ops::hash_token(step, &vars, ctx)?,
-                    _ => super::ops::sign_jwt(method, step, &vars, ctx)?,
+                    _ => super::ops::sign_jwt(manifest, exec, method, step, &vars, ctx).await?,
                 };
                 if !step.out.is_empty() && step.out != "(none)" {
                     vars.insert(step.out.clone(), value.clone());

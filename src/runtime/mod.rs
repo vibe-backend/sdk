@@ -4,6 +4,7 @@ mod http;
 pub mod jwks;
 mod limiter;
 mod ops;
+pub mod refresh;
 mod slugs;
 mod sql;
 

@@ -53,6 +53,107 @@ pub struct RouteSpec {
     pub challenge_when: String,
     pub deprecated: bool,
     pub sunset: String,
+    /// `### token-refresh` pipeline: this route rotates refresh tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<RefreshSpec>,
+    /// `### token-revoke` pipeline: revoke refresh tokens before the steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoke: Option<RevokeSpec>,
+}
+
+/// Platform refresh-token rotation (spec 4A.1).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RefreshSpec {
+    /// Method that signs the new access token (needs `sign-token`).
+    pub sign_method: String,
+    pub refresh_ttl_s: i64,
+    pub idle_ttl_s: i64,
+    pub reuse_grace_s: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RevokeSpec {
+    /// `family` (the presented refresh token's family) or `all` (every
+    /// family of the caller).
+    pub scope: String,
+}
+
+pub const MAX_REFRESH_TTL_S: i64 = 30 * 86_400;
+pub const MAX_IDLE_TTL_S: i64 = 7 * 86_400;
+pub const MAX_REUSE_GRACE_S: i64 = 60;
+
+fn bullet<'a>(bullets: &'a [crate::lock::Bullet], key: &str) -> Option<&'a str> {
+    bullets
+        .iter()
+        .find(|b| b.key == key)
+        .map(|b| b.value.trim())
+}
+
+fn secs(raw: Option<&str>, default: i64, max: i64, name: &str) -> Result<i64, String> {
+    let Some(raw) = raw else { return Ok(default) };
+    let ms = crate::llm::parse_duration_ms(raw).ok_or_else(|| format!("token-refresh {name}: bad duration `{raw}`"))?;
+    let s = (ms / 1000) as i64;
+    if s <= 0 || s > max {
+        return Err(format!("token-refresh {name} must be between 1s and {max}s"));
+    }
+    Ok(s)
+}
+
+/// Parses a `### token-refresh` block.
+pub fn parse_refresh_block(bullets: &[crate::lock::Bullet]) -> Result<RefreshSpec, String> {
+    let sign_method = bullet(bullets, "sign-method").unwrap_or("").to_string();
+    if sign_method.is_empty() {
+        return Err("token-refresh needs sign-method".into());
+    }
+    match bullet(bullets, "transport") {
+        None | Some("body") => {}
+        Some(other) => {
+            return Err(format!(
+                "token-refresh transport `{other}` is not supported by this runtime (only body)"
+            ))
+        }
+    }
+    for b in bullets {
+        if !["sign-method", "refresh-ttl", "idle-ttl", "reuse-grace", "transport"].contains(&b.key.as_str()) {
+            return Err(format!("unknown token-refresh option `{}`", b.key));
+        }
+    }
+    Ok(RefreshSpec {
+        sign_method,
+        refresh_ttl_s: secs(bullet(bullets, "refresh-ttl"), MAX_REFRESH_TTL_S, MAX_REFRESH_TTL_S, "refresh-ttl")?,
+        idle_ttl_s: secs(bullet(bullets, "idle-ttl"), MAX_IDLE_TTL_S, MAX_IDLE_TTL_S, "idle-ttl")?,
+        reuse_grace_s: secs(bullet(bullets, "reuse-grace"), 10, MAX_REUSE_GRACE_S, "reuse-grace")?,
+    })
+}
+
+/// Parses a `### token-revoke` block.
+pub fn parse_revoke_block(bullets: &[crate::lock::Bullet]) -> Result<RevokeSpec, String> {
+    let scope = bullet(bullets, "scope").unwrap_or("family");
+    if scope != "family" && scope != "all" {
+        return Err(format!("token-revoke scope must be family or all (got `{scope}`)"));
+    }
+    Ok(RevokeSpec {
+        scope: scope.to_string(),
+    })
+}
+
+/// Route-shape rules for the refresh pipelines.
+pub fn check_refresh_route(
+    refresh: Option<&RefreshSpec>,
+    revoke: Option<&RevokeSpec>,
+    public: bool,
+    auth_removed: bool,
+) -> Result<(), String> {
+    if refresh.is_some() && revoke.is_some() {
+        return Err("a route cannot have both token-refresh and token-revoke".into());
+    }
+    if refresh.is_some() && !(public && auth_removed) {
+        return Err("token-refresh routes must be public with auth removed (the refresh token is the credential)".into());
+    }
+    if revoke.is_some() && auth_removed {
+        return Err("token-revoke needs auth".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -117,10 +218,7 @@ pub fn check_rate_key(key: &str, auth_removed: bool, auth_mode: &str) -> Result<
             Err("rate-limit key `api-key` needs `auth: { mode: api-key }`".into())
         }
         "api-key" => Ok(()),
-        "family" => Err(
-            "rate-limit key `family` is only for token-refresh, which is not implemented yet (see #26)"
-                .into(),
-        ),
+        "family" => Err("rate-limit key `family` is only allowed on token-refresh routes".into()),
         _ => match key.strip_prefix("input.") {
             Some(field)
                 if !field.is_empty()
@@ -524,9 +622,21 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
     let mut scopes = Vec::new();
     let mut roles_claim = String::new();
     let mut rates = Vec::new();
+    let mut refresh = None;
+    let mut revoke = None;
     if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
         for block in &pipes.blocks {
             let name = pipeline_name(&block.heading);
+            if name == "token-refresh" {
+                refresh = Some(parse_refresh_block(&block.bullets).map_err(|err| {
+                    Diag::error(&doc.meta.id, err).at_section("Pipelines")
+                })?);
+            }
+            if name == "token-revoke" {
+                revoke = Some(parse_revoke_block(&block.bullets).map_err(|err| {
+                    Diag::error(&doc.meta.id, err).at_section("Pipelines")
+                })?);
+            }
             if name == "-auth"
                 || (name == "auth"
                     && block
@@ -595,7 +705,12 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
             }
         }
     }
+    check_refresh_route(refresh.as_ref(), revoke.as_ref(), public, auth_removed)
+        .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
     for rate in &rates {
+        if rate.key == "family" && refresh.is_some() {
+            continue;
+        }
         check_rate_key(&rate.key, auth_removed, &auth_mode)
             .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
     }
@@ -641,6 +756,8 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         challenge_when,
         deprecated,
         sunset,
+        refresh,
+        revoke,
     })
 }
 

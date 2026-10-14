@@ -493,6 +493,29 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
             .find_map(|block| block.bullets.iter().find(|b| b.key == "mode"))
             .map(|b| b.value.clone())
             .unwrap_or_else(|| "jwt".into());
+        let mut refresh = None;
+        let mut revoke = None;
+        for block in &pipes.blocks {
+            let name = pipeline_name(&block.heading);
+            let parsed = match name.as_str() {
+                "token-refresh" => crate::manifest::parse_refresh_block(&block.bullets)
+                    .map(|spec| refresh = Some(spec)),
+                "token-revoke" => crate::manifest::parse_revoke_block(&block.bullets)
+                    .map(|spec| revoke = Some(spec)),
+                _ => Ok(()),
+            };
+            if let Err(err) = parsed {
+                report.push(Diag::error(file, err).at_step(&block.heading));
+            }
+        }
+        if let Err(err) = crate::manifest::check_refresh_route(
+            refresh.as_ref(),
+            revoke.as_ref(),
+            public,
+            auth_removed,
+        ) {
+            report.push(Diag::error(file, err).at_section("Pipelines"));
+        }
         let mut declared_rates = Vec::new();
         for block in &pipes.blocks {
             if pipeline_name(&block.heading) == "rate-limit" {
@@ -542,7 +565,11 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
                         .at_section("Pipelines"),
                     );
                 }
-                if let Some(key) = block.bullets.iter().find(|b| b.key == "key") {
+                if let Some(key) = block
+                    .bullets
+                    .iter()
+                    .find(|b| b.key == "key" && !(b.value == "family" && refresh.is_some()))
+                {
                     if let Err(err) =
                         crate::manifest::check_rate_key(&key.value, auth_removed, &auth_mode)
                     {

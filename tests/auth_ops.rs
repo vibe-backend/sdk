@@ -55,6 +55,7 @@ fn ctx<'a>(auth: &'a AuthConfig, tenant: &'a str) -> CallCtx<'a> {
             subject: "",
             roles: &[],
         },
+        refresh_token: None,
     }
 }
 
