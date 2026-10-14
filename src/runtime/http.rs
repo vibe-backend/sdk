@@ -748,9 +748,9 @@ fn check_type(field: &crate::manifest::ReqField, value: &Value) -> Result<(), Me
             }
         }
         "uuid" => {
-            if !value
+            if value
                 .as_str()
-                .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+                .is_none_or(|s| uuid::Uuid::parse_str(s).is_err())
             {
                 return Err(MethodFail::code(
                     "VALIDATION_FAILED",
