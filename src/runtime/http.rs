@@ -1135,3 +1135,79 @@ fn empty_response(
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
+
+#[cfg(test)]
+mod request_validation_tests {
+    use super::*;
+    use crate::manifest::ReqField;
+    use serde_json::json;
+
+    fn field(location: &str, name: &str, ty: &str, required: bool) -> ReqField {
+        ReqField {
+            location: location.into(),
+            name: name.into(),
+            ty: ty.into(),
+            required,
+            min: None,
+            max: None,
+            format: String::new(),
+        }
+    }
+
+    fn route(request: Vec<ReqField>) -> RouteSpec {
+        let mut value = json!({
+            "method": "POST", "path": "/x", "feature_id": "f", "public": false,
+            "auth_removed": false, "auth_mode": "jwt", "roles": [], "scopes": [],
+            "rates": [], "body_limit": 0, "request": [], "transform_in": "",
+            "transform_out": "", "steps": [], "errors": [], "min_response_ms": 0,
+            "public_writes": false, "challenge_type": "", "challenge_when": "",
+            "deprecated": false, "sunset": ""
+        });
+        value["request"] = serde_json::to_value(request).unwrap();
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn check(route: &RouteSpec, body: Value, headers: &[(&str, &str)]) -> Result<(), MethodFail> {
+        let headers = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        validate_request(route, &body, &BTreeMap::new(), &BTreeMap::new(), &headers)
+    }
+
+    #[test]
+    fn required_headers_are_enforced_case_insensitively() {
+        let r = route(vec![field("header", "Idempotency-Key", "string", true)]);
+        assert!(check(&r, Value::Null, &[]).is_err());
+        assert!(check(&r, Value::Null, &[("idempotency-key", "k")]).is_ok());
+    }
+
+    #[test]
+    fn non_object_bodies_are_rejected() {
+        let r = route(vec![field("body", "sku", "string", false)]);
+        for body in [json!([{"sku": "x"}]), json!("x"), json!(1), json!(true)] {
+            assert!(check(&r, body.clone(), &[]).is_err(), "{body}");
+        }
+        assert!(check(&r, json!({"sku": "x"}), &[]).is_ok());
+    }
+
+    #[test]
+    fn every_type_is_checked() {
+        let cases = [
+            ("number", json!(1.5), json!("1.5")),
+            ("boolean", json!(true), json!("true")),
+            (
+                "uuid",
+                json!("6f1c1e7e-8a4b-4c55-9b0e-2b8f6f0f2a11"),
+                json!("not-a-uuid"),
+            ),
+            ("integer", json!(3), json!(3.5)),
+            ("string", json!("s"), json!(1)),
+        ];
+        for (ty, good, bad) in cases {
+            let f = field("body", "v", ty, true);
+            assert!(check_type(&f, &good).is_ok(), "{ty} good");
+            assert!(check_type(&f, &bad).is_err(), "{ty} bad");
+        }
+    }
+}
