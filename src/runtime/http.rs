@@ -435,7 +435,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                         role,
                         caller: crud::Caller {
                             subject: &principal.subject,
-                            admin: principal.roles.iter().any(|role| role == "admin"),
+                            roles: &principal.roles,
                         },
                     },
                     1,

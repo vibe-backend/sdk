@@ -283,6 +283,13 @@ fn check_model(doc: &LockDoc, file: &str, report: &mut Report) {
             "model has no owner-key; rows are shared inside the tenant",
         )),
     }
+    if let Some(ownership) =
+        find_section(&doc.sections, "Table").and_then(|section| section.get("ownership"))
+    {
+        if let Err(err) = crate::runtime::parse_ownership(ownership) {
+            report.push(Diag::error(file, err).at_section("Table"));
+        }
+    }
     if let Some(crud) = find_section(&doc.sections, "CRUD") {
         if let Some(table) = &crud.table {
             for row in &table.rows {

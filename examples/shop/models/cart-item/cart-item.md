@@ -5,6 +5,7 @@
 - provider: main
 - table: cart_items
 - owner-key: user_id
+- ownership: role(admin)
 
 ## Fields
 

@@ -22,4 +22,4 @@ vibe slug add shop --tenant tenant0001 --project examples/shop
 
 Then `curl http://127.0.0.1:8080/catalog/v1/acme/products` lists the public catalog for that tenant.
 
-Cart items declare `owner-key: user_id`. Create stores the JWT `sub` in `user_id`. List, get, update, and delete only return that caller's rows, unless the JWT role is `admin`. A client-supplied `user_id` is rejected.
+Cart items declare `owner-key: user_id`. Create stores the JWT `sub` in `user_id`. List, get, update, and delete only return that caller's rows, unless the JWT role is `admin`, which the model allows explicitly with `ownership: role(admin)`. Without that line no role bypasses the owner filter. A client-supplied `user_id` is rejected.
