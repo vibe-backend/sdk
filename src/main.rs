@@ -465,8 +465,34 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
         eprintln!("warning: {warning}");
     }
     auth.pepper = pepper;
-    if let Some(env_name) = vibe_env {
-        auth.env_name = env_name;
+    let _ = vibe_env;
+    // API keys are `mbk_live_…` in production and `mbk_test_…` elsewhere.
+    auth.env_name = if run_env == vibe::runtime::RunEnv::Production {
+        "live".into()
+    } else {
+        "test".into()
+    };
+    if let Ok(claim) = std::env::var("VIBE_JWT_ROLES_CLAIM") {
+        if !claim.trim().is_empty() {
+            auth.roles_claim = claim.trim().to_string();
+        }
+    }
+    let jwks_uri = std::env::var("VIBE_JWT_JWKS_URI")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            // Spec §4.1: default `{iss}/.well-known/jwks.json` when no PEM is pinned.
+            (auth.public_pem.is_empty() && std::env::var("VIBE_JWT_ISS").is_ok())
+                .then(|| format!("{}/.well-known/jwks.json", auth.iss.trim_end_matches('/')))
+        });
+    if let Some(uri) = jwks_uri {
+        let source = vibe::runtime::jwks::HttpsJwks::new(&uri)?;
+        auth.jwks = Some(std::sync::Arc::new(vibe::runtime::jwks::JwksCache::new(
+            std::sync::Arc::new(source),
+        )));
+    }
+    if let Ok(path) = std::env::var("VIBE_API_KEYS_FILE") {
+        auth.api_keys = vibe::runtime::load_api_keys(Path::new(&path))?;
     }
     Ok(auth)
 }

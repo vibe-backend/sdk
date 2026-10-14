@@ -22,7 +22,8 @@ use super::exec::QueryExec;
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredKey {
     pub key_id: String,
     pub secret_hash: String,
@@ -30,6 +31,7 @@ pub struct StoredKey {
     pub tenant_id: String,
     pub scopes: Vec<String>,
     pub expires_unix: i64,
+    #[serde(default)]
     pub revoked: bool,
 }
 
@@ -43,6 +45,12 @@ pub struct AuthConfig {
     pub pepper: Vec<u8>,
     pub api_keys: Vec<StoredKey>,
     pub env_name: String,
+    /// When set, JWT keys come from this JWKS (spec §4.1) instead of
+    /// `public_pem`/`kid`.
+    pub jwks: Option<Arc<super::jwks::JwksCache>>,
+    /// Default claim holding the caller's roles (`VIBE_JWT_ROLES_CLAIM`,
+    /// default `roles`); a route's `roles-claim` overrides it.
+    pub roles_claim: String,
 }
 
 impl AuthConfig {
@@ -56,6 +64,8 @@ impl AuthConfig {
             pepper: b"dev-pepper".to_vec(),
             api_keys: Vec::new(),
             env_name: "test".into(),
+            jwks: None,
+            roles_claim: "roles".into(),
         }
     }
 }
@@ -86,6 +96,63 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 /// Minimum API-key pepper length in production.
 pub const MIN_PEPPER_BYTES: usize = 32;
+
+/// Loads stored API keys from a JSON array of [`StoredKey`] records (secrets
+/// are HMAC hashes, never plaintext). The file must not be writable by group
+/// or others, nor readable by others, and every record must be well formed.
+pub fn load_api_keys(path: &std::path::Path) -> Result<Vec<StoredKey>, String> {
+    let shown = path.display();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|err| format!("VIBE_API_KEYS_FILE {shown}: {err}"))?
+            .permissions()
+            .mode();
+        if mode & 0o026 != 0 {
+            return Err(format!(
+                "VIBE_API_KEYS_FILE {shown} has mode {:o}; it must not be group/other writable or other readable (chmod 600)",
+                mode & 0o777
+            ));
+        }
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("VIBE_API_KEYS_FILE {shown}: {err}"))?;
+    let keys: Vec<StoredKey> =
+        serde_json::from_str(&text).map_err(|err| format!("VIBE_API_KEYS_FILE {shown}: {err}"))?;
+    let tenant_ok = |t: &str| {
+        (8..=32).contains(&t.len())
+            && t.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    };
+    let mut seen = HashSet::new();
+    for key in &keys {
+        let ok_id = key.key_id.len() == 12
+            && key
+                .key_id
+                .chars()
+                .all(|c| matches!(c, 'a'..='z' | '2'..='7'));
+        let ok_hash =
+            key.secret_hash.len() == 64 && key.secret_hash.chars().all(|c| c.is_ascii_hexdigit());
+        if !ok_id
+            || !ok_hash
+            || !matches!(key.env.as_str(), "live" | "test")
+            || !tenant_ok(&key.tenant_id)
+        {
+            return Err(format!(
+                "VIBE_API_KEYS_FILE {shown}: invalid record for key_id {:?}",
+                key.key_id
+            ));
+        }
+        if !seen.insert(key.key_id.clone()) {
+            return Err(format!(
+                "VIBE_API_KEYS_FILE {shown}: duplicate key_id {}",
+                key.key_id
+            ));
+        }
+    }
+    Ok(keys)
+}
 
 /// Deployment environment, from `VIBE_ENV` (case-insensitive). This is the
 /// single place that decides "is this production?".
@@ -318,7 +385,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             }
         }
     } else {
-        match authenticate(&state.auth, found.route, &headers) {
+        match authenticate(&state.auth, found.route, &headers).await {
             Ok(principal) => principal,
             Err(response) => {
                 return finish(
@@ -352,24 +419,28 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
     }
-    if found.route.auth_mode == "api-key" {
+    let scope_ok = if found.route.auth_mode == "api-key" {
         let definition = found.route.feature_id.split('/').next().unwrap_or("");
         let write = found.route.method != "GET";
-        if !scope_allows(&principal.scopes, definition, write) {
-            return finish(
-                found.route,
-                &state,
-                started,
-                error_response(
-                    StatusCode::FORBIDDEN,
-                    "FORBIDDEN",
-                    "Forbidden",
-                    &request_id,
-                    &[],
-                ),
-            )
-            .await;
-        }
+        scope_allows(&principal.scopes, definition, write)
+    } else {
+        true
+    };
+    // Declared route scopes: the caller must hold every one of them.
+    if !scope_ok || !route_scopes_allow(&principal.scopes, &found.route.scopes) {
+        return finish(
+            found.route,
+            &state,
+            started,
+            error_response(
+                StatusCode::FORBIDDEN,
+                "FORBIDDEN",
+                "Forbidden",
+                &request_id,
+                &[],
+            ),
+        )
+        .await;
     }
     if let Some(retry) = rate_limited(&state, found.route, &ip, &principal.tenant_id) {
         return finish(
@@ -816,7 +887,7 @@ fn coerce(raw: &str, ty: &str) -> Value {
     }
 }
 
-fn authenticate(
+async fn authenticate(
     auth: &AuthConfig,
     route: &RouteSpec,
     headers: &BTreeMap<String, String>,
@@ -825,47 +896,84 @@ fn authenticate(
         let key = headers
             .get("x-api-key")
             .cloned()
-            .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+            .ok_or_else(|| AuthError::unauthorized("ApiKey"))?;
         return verify_api_key(auth, &key);
     }
     let header = headers.get("authorization").cloned().unwrap_or_default();
     let token = header
         .strip_prefix("Bearer ")
         .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
-    verify_jwt(auth, token)
+    let roles_claim = if route.roles_claim.is_empty() {
+        auth.roles_claim.as_str()
+    } else {
+        route.roles_claim.as_str()
+    };
+    let jwt_header =
+        jsonwebtoken::decode_header(token).map_err(|_| AuthError::unauthorized("Bearer"))?;
+    let kid = jwt_header
+        .kid
+        .clone()
+        .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+    let (alg, key) = if let Some(jwks) = &auth.jwks {
+        let found = jwks
+            .key(&kid)
+            .await
+            .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+        (found.alg, found.key)
+    } else {
+        if auth.public_pem.is_empty() || kid != auth.kid {
+            return Err(AuthError::unauthorized("Bearer"));
+        }
+        let key = if auth.alg == Algorithm::RS256 {
+            DecodingKey::from_rsa_pem(auth.public_pem.as_bytes())
+        } else {
+            DecodingKey::from_ec_pem(auth.public_pem.as_bytes())
+        }
+        .map_err(|_| AuthError::unauthorized("Bearer"))?;
+        (auth.alg, key)
+    };
+    if jwt_header.alg != alg {
+        return Err(AuthError::unauthorized("Bearer"));
+    }
+    verify_jwt(auth, token, alg, &key, roles_claim)
 }
 
-fn verify_jwt(auth: &AuthConfig, token: &str) -> Result<Principal, AuthError> {
-    if auth.public_pem.is_empty() {
-        return Err(AuthError::unauthorized("Bearer"));
-    }
-    let header =
-        jsonwebtoken::decode_header(token).map_err(|_| AuthError::unauthorized("Bearer"))?;
-    if header.kid.as_deref() != Some(auth.kid.as_str()) || header.alg != auth.alg {
-        return Err(AuthError::unauthorized("Bearer"));
-    }
-    let mut validation = Validation::new(auth.alg);
+fn verify_jwt(
+    auth: &AuthConfig,
+    token: &str,
+    alg: Algorithm,
+    key: &DecodingKey,
+    roles_claim: &str,
+) -> Result<Principal, AuthError> {
+    let mut validation = Validation::new(alg);
     validation.set_issuer(&[&auth.iss]);
     validation.set_audience(&[&auth.aud]);
     validation.leeway = 60;
     validation.validate_nbf = true;
-    let key = if auth.alg == Algorithm::RS256 {
-        DecodingKey::from_rsa_pem(auth.public_pem.as_bytes())
-            .map_err(|_| AuthError::unauthorized("Bearer"))?
-    } else {
-        DecodingKey::from_ec_pem(auth.public_pem.as_bytes())
-            .map_err(|_| AuthError::unauthorized("Bearer"))?
-    };
-    let data = jsonwebtoken::decode::<Claims>(token, &key, &validation)
+    let data = jsonwebtoken::decode::<Claims>(token, key, &validation)
         .map_err(|_| AuthError::unauthorized("Bearer"))?;
     if data.claims.exp.saturating_sub(data.claims.iat) > 3600 {
         return Err(AuthError::unauthorized("Bearer"));
     }
+    // A present but malformed roles claim is rejected, not treated as "no roles".
+    let roles = match data.claims.extra.get(roles_claim) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| AuthError::unauthorized("Bearer"))?,
+        Some(_) => return Err(AuthError::unauthorized("Bearer")),
+    };
+    let scopes = match data.claims.extra.get("scope") {
+        Some(Value::String(s)) => s.split_whitespace().map(str::to_string).collect(),
+        _ => Vec::new(),
+    };
     Ok(Principal {
         tenant_id: data.claims.tenant_id,
         subject: data.claims.sub,
-        roles: data.claims.roles,
-        scopes: Vec::new(),
+        roles,
+        scopes,
     })
 }
 
@@ -925,6 +1033,24 @@ fn ct_eq(left: &str, right: &str) -> bool {
 
 pub fn hash_api_secret(pepper: &[u8], secret: &str) -> String {
     hmac_hex(pepper, secret)
+}
+
+/// Every scope declared on the route must be held, exactly or through a
+/// `definition:*` / `definition:admin` grant (and `:write` covers `:read`).
+fn route_scopes_allow(have: &[String], required: &[String]) -> bool {
+    required.iter().all(|need| {
+        have.iter().any(|h| {
+            if h == need {
+                return true;
+            }
+            match (h.split_once(':'), need.split_once(':')) {
+                (Some((hd, ha)), Some((nd, na))) if hd == nd => {
+                    matches!(ha, "*" | "admin") || (ha == "write" && na == "read")
+                }
+                _ => false,
+            }
+        })
+    })
 }
 
 fn scope_allows(scopes: &[String], definition: &str, write: bool) -> bool {
@@ -1052,8 +1178,9 @@ struct Claims {
     #[allow(dead_code)]
     nbf: Option<i64>,
     tenant_id: String,
-    #[serde(default)]
-    roles: Vec<String>,
+    /// All other claims, including the configured roles claim and `scope`.
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
 }
 
 struct AuthError {
@@ -1221,5 +1348,179 @@ mod pepper_tests {
         assert!(warn.is_some());
         let (_, warn) = resolve_pepper(RunEnv::Dev, Some("short")).unwrap();
         assert!(warn.is_some());
+    }
+}
+
+#[cfg(test)]
+mod auth_wiring_tests {
+    use super::*;
+    use jsonwebtoken::{EncodingKey, Header};
+
+    const PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgxoRRfBXmTDDBak37\n\
+e7KiA/uL9uVmC6SjFqNA0iA3/eChRANCAATSao2qWXXhogkSFioKJEtYlfrdPLpD\n\
+RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
+-----END PRIVATE KEY-----\n";
+    const X: &str = "0mqNqll14aIJEhYqCiRLWJX63Ty6Q0UxBzbmJ2wI9FM";
+    const Y: &str = "FSS8OFxIbiCRaiHQPz-m-qM0jRsjlGSuzoyHxiraTWM";
+
+    struct Doc(Value);
+    #[async_trait::async_trait]
+    impl super::super::jwks::JwksSource for Doc {
+        async fn fetch(&self) -> Result<Value, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn route(json_patch: Value) -> RouteSpec {
+        let mut v = json!({
+            "method": "GET", "path": "/x", "feature_id": "catalog/x", "public": false,
+            "auth_removed": false, "auth_mode": "jwt", "roles": [], "scopes": [],
+            "rates": [], "body_limit": 0, "request": [], "transform_in": "",
+            "transform_out": "", "steps": [], "errors": [], "min_response_ms": 0,
+            "public_writes": false, "challenge_type": "", "challenge_when": "",
+            "deprecated": false, "sunset": ""
+        });
+        for (k, val) in json_patch.as_object().unwrap() {
+            v[k] = val.clone();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn token(kid: &str, extra: Value) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = json!({
+            "sub": "u1", "exp": now + 600, "iat": now, "nbf": now,
+            "iss": "https://auth.localhost/shop", "aud": "shop", "tenant_id": "tenant0001"
+        });
+        for (k, val) in extra.as_object().unwrap() {
+            claims[k] = val.clone();
+        }
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(kid.into());
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn bearer(t: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([("authorization".to_string(), format!("Bearer {t}"))])
+    }
+
+    fn jwks_auth() -> AuthConfig {
+        let mut auth = AuthConfig::anonymous();
+        auth.jwks = Some(Arc::new(super::super::jwks::JwksCache::new(Arc::new(Doc(
+            json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "k1", "x": X, "y": Y}]}),
+        )))));
+        auth
+    }
+
+    #[tokio::test]
+    async fn jwks_keys_verify_tokens_and_unknown_kids_fail() {
+        let auth = jwks_auth();
+        let r = route(json!({}));
+        let p = authenticate(
+            &auth,
+            &r,
+            &bearer(&token("k1", json!({"roles": ["staff"]}))),
+        )
+        .await
+        .ok()
+        .unwrap();
+        assert_eq!(p.roles, vec!["staff"]);
+        assert!(authenticate(&auth, &r, &bearer(&token("nope", json!({}))))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn roles_claim_is_configurable_and_malformed_claims_fail() {
+        let mut auth = jwks_auth();
+        auth.roles_claim = "https://example.com/roles".into();
+        let r = route(json!({}));
+        let t = token(
+            "k1",
+            json!({"https://example.com/roles": ["admin"], "roles": ["x"]}),
+        );
+        let p = authenticate(&auth, &r, &bearer(&t)).await.ok().unwrap();
+        assert_eq!(p.roles, vec!["admin"]);
+        // Route-level override.
+        let r2 = route(json!({"roles_claim": "groups"}));
+        let t = token("k1", json!({"groups": ["ops"]}));
+        assert_eq!(
+            authenticate(&auth, &r2, &bearer(&t))
+                .await
+                .ok()
+                .unwrap()
+                .roles,
+            vec!["ops"]
+        );
+        let bad = token("k1", json!({"groups": "ops"}));
+        assert!(authenticate(&auth, &r2, &bearer(&bad)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_api_key_challenges_with_apikey_scheme() {
+        let auth = AuthConfig::anonymous();
+        let r = route(json!({"auth_mode": "api-key"}));
+        let err = authenticate(&auth, &r, &BTreeMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.scheme, "ApiKey");
+    }
+
+    #[test]
+    fn route_scopes_must_all_be_held() {
+        let have = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let need = have(&["catalog:read", "orders:read"]);
+        assert!(!route_scopes_allow(&have(&["catalog:read"]), &need));
+        assert!(route_scopes_allow(
+            &have(&["catalog:write", "orders:*"]),
+            &need
+        ));
+        assert!(!route_scopes_allow(
+            &have(&["catalog:read", "orders:readx"]),
+            &need
+        ));
+        assert!(route_scopes_allow(&[], &[]));
+        assert!(!route_scopes_allow(
+            &have(&["catalog:read"]),
+            &have(&["catalog:write"])
+        ));
+    }
+
+    #[test]
+    fn api_keys_file_is_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vibe-keys-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys.json");
+        let good = json!([{
+            "key_id": "abcdefghijk2", "secret_hash": "a".repeat(64), "env": "live",
+            "tenant_id": "tenant0001", "scopes": ["catalog:read"], "expires_unix": 4102444800i64
+        }]);
+        std::fs::write(&path, good.to_string()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_api_keys(&path).err().unwrap().contains("chmod 600"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(load_api_keys(&path).unwrap().len(), 1);
+        for bad in [
+            json!([{"key_id": "short", "secret_hash": "a".repeat(64), "env": "live",
+                    "tenant_id": "tenant0001", "scopes": [], "expires_unix": 0}]),
+            json!([{"key_id": "abcdefghijk2", "secret_hash": "plaintext", "env": "live",
+                    "tenant_id": "tenant0001", "scopes": [], "expires_unix": 0}]),
+            json!([{"key_id": "abcdefghijk2", "secret_hash": "a".repeat(64), "env": "live",
+                    "tenant_id": "x, t_victim", "scopes": [], "expires_unix": 0}]),
+            json!([{"key_id": "abcdefghijk2", "secret": "s", "secret_hash": "a".repeat(64),
+                    "env": "live", "tenant_id": "tenant0001", "scopes": [], "expires_unix": 0}]),
+            json!([good[0].clone(), good[0].clone()]),
+        ] {
+            std::fs::write(&path, bad.to_string()).unwrap();
+            assert!(load_api_keys(&path).is_err(), "{bad}");
+        }
     }
 }

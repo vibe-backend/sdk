@@ -35,6 +35,10 @@ pub struct RouteSpec {
     pub auth_mode: String,
     pub roles: Vec<String>,
     pub scopes: Vec<String>,
+    /// Claim that holds roles for this route (`roles-claim`); empty means the
+    /// runtime default.
+    #[serde(default)]
+    pub roles_claim: String,
     pub rates: Vec<RateSpec>,
     pub body_limit: u64,
     pub request: Vec<ReqField>,
@@ -439,6 +443,7 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
     let mut auth_mode = "jwt".to_string();
     let mut roles = Vec::new();
     let mut scopes = Vec::new();
+    let mut roles_claim = String::new();
     let mut rates = Vec::new();
     if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
         for block in &pipes.blocks {
@@ -460,7 +465,14 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
                     roles = crate::lock::parse_string_list(&raw.value).unwrap_or_default();
                 }
                 if let Some(raw) = block.bullets.iter().find(|b| b.key == "scopes") {
-                    scopes = crate::lock::parse_string_list(&raw.value).unwrap_or_default();
+                    // A malformed scopes list is a build error, never "no scopes".
+                    scopes = crate::lock::parse_string_list(&raw.value).map_err(|err| {
+                        Diag::error(&doc.meta.id, format!("invalid scopes: {err}"))
+                            .at_section("Pipelines")
+                    })?;
+                }
+                if let Some(raw) = block.bullets.iter().find(|b| b.key == "roles-claim") {
+                    roles_claim = raw.value.trim().to_string();
                 }
             }
             if name == "rate-limit" {
@@ -515,6 +527,7 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         auth_mode,
         roles,
         scopes,
+        roles_claim,
         rates,
         body_limit,
         request: request_fields(find_section(&doc.sections, "Request")),
