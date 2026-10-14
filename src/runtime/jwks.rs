@@ -36,28 +36,10 @@ pub struct HttpsJwks {
 
 /// True for hosts a JWKS fetch must not reach: loopback, private, link-local
 /// (cloud metadata), CGNAT, unspecified, single-label and `.local`/
-/// `.internal`/`.localhost` names (SSRF).
+/// `.internal`/`.localhost` names (SSRF). Uses the shared
+/// [`crate::netguard`] classifier (trailing dots and case normalized).
 pub fn non_public_host(host: &str) -> bool {
-    let bare = host.trim_matches(['[', ']']);
-    if crate::llm::is_private_host(bare) {
-        return true;
-    }
-    if let Ok(ip) = bare.parse::<std::net::Ipv4Addr>() {
-        let o = ip.octets();
-        return ip.is_unspecified()
-            || ip.is_broadcast()
-            || o[0] == 0
-            || (o[0] == 100 && (o[1] & 0xc0) == 64);
-    }
-    if let Ok(ip) = bare.parse::<std::net::Ipv6Addr>() {
-        if ip.is_unspecified() {
-            return true;
-        }
-        if let Some(v4) = ip.to_ipv4_mapped() {
-            return non_public_host(&v4.to_string());
-        }
-    }
-    false
+    crate::netguard::is_non_public_host(host)
 }
 
 impl HttpsJwks {
