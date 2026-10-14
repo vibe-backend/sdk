@@ -1,6 +1,7 @@
 mod crud;
 mod exec;
 mod http;
+pub mod jwks;
 mod limiter;
 mod slugs;
 mod sql;
@@ -8,8 +9,8 @@ mod sql;
 pub use crud::{parse_ownership, run_method, Ownership};
 pub use exec::{etag, ExecError, MemoryExec, PgExec, QueryExec};
 pub use http::{
-    hash_api_secret, resolve_pepper, router, AppState, AuthConfig, RunEnv, Slug, StoredKey,
-    REQUEST_TYPES,
+    detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router, ApiKeyFile, AppState,
+    AuthConfig, RunEnv, Slug, StoredKey, REQUEST_TYPES,
 };
 pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
