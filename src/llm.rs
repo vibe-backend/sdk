@@ -587,6 +587,8 @@ impl LlmAdapter for HttpAdapter {
             match self.compile_once(request).await {
                 Ok(response) => return Ok(response),
                 Err(err) if err.retryable && attempt < max => {
+                    // 429/5xx/timeouts: exponential backoff with jitter (#83).
+                    tokio::time::sleep(retry_delay(attempt)).await;
                     attempt += 1;
                 }
                 Err(err) => {
@@ -595,6 +597,14 @@ impl LlmAdapter for HttpAdapter {
             }
         }
     }
+}
+
+/// Delay before retry `attempt` (0-based): 1s, 2s, 4s, ... capped at 16s,
+/// plus up to 25% jitter so parallel runs do not retry in lockstep.
+pub fn retry_delay(attempt: u32) -> std::time::Duration {
+    let base_ms = 1_000u64.saturating_mul(1 << attempt.min(4));
+    let jitter = (uuid::Uuid::new_v4().as_u128() % (base_ms as u128 / 4 + 1)) as u64;
+    std::time::Duration::from_millis(base_ms + jitter)
 }
 
 struct CallError {
@@ -637,7 +647,7 @@ impl HttpAdapter {
                     &bytes,
                     &self.config.api_key,
                 ),
-                retryable: status.is_server_error() || status.as_u16() == 429,
+                retryable: status.is_server_error() || matches!(status.as_u16(), 408 | 429),
             });
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| CallError {

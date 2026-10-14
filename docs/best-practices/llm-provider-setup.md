@@ -15,7 +15,7 @@ There is no source `.md` for this: the endpoint is configuration, not a definiti
 | `LLM_API_KEY` | yes | only via environment, `.env` (gitignored) or CI secret; any placeholder for local APIs that need no key |
 | `LLM_MODEL` | yes | a model id / snapshot id the provider documents as **non-floating** (Decision 58) |
 | `LLM_TIMEOUT` | no | default 60s, max 300s |
-| `LLM_MAX_RETRIES` | no | network retries, default 2, max 5 |
+| `LLM_MAX_RETRIES` | no | retries for network errors, timeouts, 408, 429 and 5xx with exponential backoff (1s, 2s, 4s, … capped at 16s, plus jitter), default 2, max 5 |
 | `LLM_SEED` | no | sent only if the model supports seed; default `0`; counted in `compiler-hash` either way |
 | `LLM_ALLOW_PRIVATE_HOST` | no | default `false`; local development only |
 

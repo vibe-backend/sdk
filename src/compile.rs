@@ -122,15 +122,15 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         docs.insert(source.id.clone(), doc);
     }
 
-    if report.has_errors() {
-        return Err(report);
-    }
-
+    // #83: one failing source no longer blocks the others. Sources that
+    // failed above are not in `docs`; failures below are tracked per id.
+    let mut failed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for id in &ordered {
         let deps = match dependencies(id, &docs) {
             Ok(deps) => deps,
             Err(diag) => {
                 report.push(diag);
+                failed.insert(id.clone());
                 continue;
             }
         };
@@ -153,15 +153,18 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         items.sort_by(|a, b| a.item.cmp(&b.item));
         items.dedup_by(|a, b| a.item == b.item);
         doc.meta.security_items = items;
+        let before = report.errors().count();
         semantic_check(&docs[id], &ranked, &mut report);
-    }
-
-    if report.has_errors() {
-        return Err(report);
+        if report.errors().count() > before {
+            failed.insert(id.clone());
+        }
     }
 
     let mut files = Vec::new();
     for id in &ordered {
+        if failed.contains(id) {
+            continue;
+        }
         let doc = &docs[id];
         let rel = lock_rel(&doc.meta.source);
         let path = opts.root.join(&rel);
@@ -190,15 +193,38 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                 }
                 Err(_) => report.push(Diag::error(&rel, "lock is missing for determinism check")),
             }
-        } else if let Err(err) = fs::write(&path, &text) {
+        } else if let Err(err) = write_atomic(&path, &text) {
             report.push(Diag::error(&rel, format!("cannot write lock: {err}")));
+            continue;
         }
         files.push(rel);
     }
     if report.has_errors() {
+        let mut bad: std::collections::BTreeSet<String> =
+            report.errors().map(|diag| diag.file.clone()).collect();
+        bad.retain(|file| !files.contains(file));
+        let verb = if opts.check { "checked" } else { "wrote" };
+        report.push(Diag::warning(
+            "compile",
+            format!(
+                "{verb} {} lock(s); {} file(s) failed: {}",
+                files.len(),
+                bad.len(),
+                bad.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
         return Err(report);
     }
     Ok(CompileOutput { files, report })
+}
+
+/// Write via a temp file and rename so a crash never leaves a half lock.
+fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("md.tmp-{}", std::process::id()));
+    fs::write(&tmp, text)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 fn rank(source: &SourceFile) -> u8 {
