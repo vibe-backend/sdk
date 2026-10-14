@@ -720,8 +720,8 @@ Branch rule 檢查（`main`）：
 - 我哋揀 **rulesets 做唯一接受嘅來源**：舊式 branch protection（`GET /repos/{owner}/{repo}/branches/{branch}/protection`）要 repo admin 權限先讀到，release workflow 唔應該攞 admin。所以呢個設定一定要用 ruleset 開；rulesets 搵唔到就失敗（待產品經理確認）。
 - **`main` 嘅 `bypass_actors` 唔再檢查（決定 96 修訂，待產品經理確認）**：`main` ruleset 可以保留 OrganizationAdmin bypass（例如 ruleset 25057946），日常 `--admin` merge 唔變。上面兩條係**一定要有嘅設定**，但 SDK 唔會讀 `main` ruleset 嘅 `bypass_actors`，有 bypass 都唔會令 build 失敗。點解仍然安全：
   - `--release-approval`（計劃中、**未實作**；實作之前呢點唔成立）自己驗證 PR review：批准一定要喺 PR 最後 head `H` 上、由合資格批准人做、高風險要 2 個（第 2–7 節）。Admin 用 bypass merge 而冇合資格批准，release build 照樣失敗，出唔到高風險 release。
-  - CODEOWNERS 照樣由 PR `base.sha` 讀（第 6 節），admin bypass 改唔到今次驗證用嘅 owner。
-  - 剩餘風險：admin bypass 可以跳過 up-to-date 規則（PR 冇 rebase 就 merge）。呢個情況下 merge commit 嘅 tree 通常同 `H` 唔一樣，第 2 節嘅 `tree(B) == tree(H)` 檢查會失敗，所以都出唔到高風險 release；代價係要重新開 PR 再批准。
+  - CODEOWNERS 照樣由 PR `base.sha` 讀（第 6 節），admin bypass 改唔到今次驗證用嘅 owner（`--release-approval` 未實作，實作之前唔成立，今日冇保護）。
+  - 剩餘風險：admin bypass 可以跳過 up-to-date 規則（PR 冇 rebase 就 merge）。呢個情況下 merge commit 嘅 tree 通常同 `H` 唔一樣，第 2 節嘅 `tree(B) == tree(H)` 檢查會失敗，所以都出唔到高風險 release；代價係要重新開 PR 再批准。呢個緩解靠 `tree(B) == tree(H)` 檢查，而呢個檢查係 `--release-approval` 嘅一部分，同樣未實作，實作之前唔成立，今日冇保護。
 
 Release ruleset 檢查（`v*` tag，決定 96）：
 
@@ -1238,7 +1238,7 @@ migration 放喺 ./migrations/main/。
 - Runtime 限制：只載入簽咗名嘅 manifest、唔解析 md、冇 `LLM_*`、對外 call 白名單、kill switch（9A）、固定最低回應耗時、配額同限流。
 - Manifest 簽名（決定 79、89、92、96）：release 只由受專用 release ruleset（bypass 一定要空）保護嘅 `v*` tag 出；release key 只喺受保護 tag 加有 required reviewers 嘅 GitHub environment，經 OIDC 綁定 KMS 使用；CI 冇 key 就失敗，唔 fallback；production 只信 pin 死嘅 release 公鑰，dev key 永遠唔信任。
 - 高風險 fail closed（決定 90）：release build 有高風險安全項目就要有效嘅 `--release-approval`（2 個唔同嘅合資格批准人，批准喺 PR 最後 head SHA 上，build commit tree 同 PR head 一樣，批准人唔喺作者／committer／co-author 排除名單，高風險路徑係 PR base CODEOWNERS 嘅 owner；見 2C.3a），先可以出 release manifest。
-- `main` ruleset 可以有 admin bypass（決定 96 修訂）：日常 `--admin` merge 唔受影響；高風險 release 照樣要 `--release-approval` 獨立驗證 PR review 同 tree 相等，admin bypass merge 出唔到高風險 release。
+- `main` ruleset 可以有 admin bypass（決定 96 修訂）：日常 `--admin` merge 唔受影響；`--release-approval` 實作之後，高風險 release 先會獨立驗證 PR review 同 tree 相等，令 admin bypass merge 出唔到高風險 release（`--release-approval` 未實作，實作之前唔成立，今日冇保護）。
 - CODEOWNERS 必須（決定 29、37、93）：release build 檢查覆蓋路徑。
 - Production 一律拒絕 in-memory，冇 override（決定 91）。
 - `/latest/` 永遠唔係草稿（決定 94）。
