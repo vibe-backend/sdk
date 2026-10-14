@@ -2,7 +2,7 @@
 
 Before the first `v*` tag. Items 1–2 are repository settings decided by the product manager; this PR does not change them:
 
-1. **Tag ruleset** — In the GitHub repo (or org) rulesets, protect tags matching `v*`: block force-push and deletion; limit who can create tags (admins / release bot only).
+1. **Release tag ruleset (decision in #70)** — A separate ruleset dedicated to release tags: target **tags** matching `v*`, `bypass_actors: []` (empty, nobody can bypass, not even organization admins), block force-push and deletion, and restrict tag creation to the release maintainers. The existing `main` ruleset (25057946, "main protection") is left unchanged, including its current `bypass_actors`; that bypass does not apply to `v*` tags because tags are governed only by the release ruleset. Create this ruleset before the first `v*` tag.
 2. **Environment `release`** — Settings → Environments → `release` with required reviewers. The release job in `.github/workflows/release.yml` uses this environment.
 3. **Pinned actions and runners** — `release.yml` pins `actions/checkout`, `upload-artifact`, `download-artifact`, `attest-build-provenance`, and `dtolnay/rust-toolchain` to full commit SHAs; runners are pinned images (no `*-latest`); checkout uses `persist-credentials: false`.
 4. **No clobber** — Existing GitHub Releases are never overwritten (`gh release upload --clobber` removed).
