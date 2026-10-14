@@ -43,6 +43,13 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
             return Err(report);
         }
     };
+    let _run_lock = match crate::lockcommit::RunLock::acquire(opts.root) {
+        Ok(lock) => lock,
+        Err(err) => {
+            report.push(Diag::error("compile", err.to_string()));
+            return Err(report);
+        }
+    };
     if let Err(err) = crate::lockcommit::recover(opts.root) {
         report.push(Diag::error(
             "compile",
@@ -252,10 +259,12 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         return Err(report);
     }
     if let Err(err) = crate::lockcommit::commit_journaled(opts.root, &writes) {
-        report.push(Diag::error(
-            "compile",
-            format!("cannot write locks (none changed): {err}"),
-        ));
+        let message = if err.committed {
+            format!("locks were written, but cleanup failed: {err}; the next run finishes it")
+        } else {
+            format!("cannot write locks (none changed): {err}")
+        };
+        report.push(Diag::error("compile", message));
         return Err(report);
     }
     Ok(CompileOutput { files, report })
@@ -365,8 +374,7 @@ async fn llm_sections(
         timeout: config.timeout,
         budget: Some(budget.clone()),
     };
-    let response = adapter
-        .compile(&request)
+    let response = crate::llm::call_budgeted(adapter, &request)
         .await
         .map_err(|err| Diag::error(&source.rel, err))?;
     let sections = crate::lock::parse_sections(&strip_fence(&response.text)).map_err(|err| {
