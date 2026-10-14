@@ -1,54 +1,36 @@
-// Static site builder for the vibe-backend product site.
-// Docs are generated at build time from ../docs/spec-v1.5.md and ../docs/best-practices/*.md.
+// Static site builder for the vibe-backend product site (English + Traditional Chinese).
+//
+// Output layout (site/dist):
+//   index.html, features.html, ...   language pickers: choose /en/ or /zh-hant/ from localStorage or the browser language
+//   en/...          English pages
+//   zh-hant/...     Traditional Chinese pages
+//
+// Docs are generated at build time from docs/spec-v1.5.md and docs/best-practices/*.md.
+// Translations live in a mirrored tree: docs/<locale>/<same relative path>, for example
+// docs/zh-hant/best-practices/rate-limit.md. When a locale has no translation, the original
+// is shown with a notice banner in that locale.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Marked } from 'marked';
 import hljs from 'highlight.js';
 import sanitizeHtml from 'sanitize-html';
+import { LOCALES, DEFAULT_LOCALE } from './src/i18n.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
 const out = path.join(here, 'dist');
 const src = path.join(here, 'src');
 const REPO = 'https://github.com/vibe-backend/sdk';
+const SITE_URL = (process.env.SITE_URL || 'https://vibe-backend.github.io/sdk/').replace(/\/?$/, '/');
+const locales = Object.keys(LOCALES);
 
 const slugify = (s) => s.toLowerCase().trim()
   .replace(/<[^>]+>/g, '').replace(/[`*_~]/g, '')
   .replace(/[^\p{L}\p{N}\s-]/gu, '').replace(/\s+/g, '-') || 'section';
-const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-function render(md, sourcePath) {
-  const toc = [];
-  const seen = new Map();
-  const marked = new Marked({
-    gfm: true,
-    renderer: {
-      code({ text, lang }) {
-        const l = (lang || '').split(/\s/)[0];
-        const html = highlight(text, l);
-        return `<pre><code class="hljs${l ? ' language-' + esc(l) : ''}">${html}</code></pre>\n`;
-      },
-      heading({ tokens, depth }) {
-        const inner = this.parser.parseInline(tokens);
-        let id = slugify(inner);
-        const n = seen.get(id) || 0; seen.set(id, n + 1);
-        if (n) id += '-' + n;
-        if (depth >= 2 && depth <= 3) toc.push({ depth, id, text: inner.replace(/<[^>]+>/g, '') });
-        return `<h${depth} id="${id}"><a class="anchor" href="#${id}">#</a>${inner}</h${depth}>\n`;
-      },
-      link({ href, title, tokens }) {
-        // Rewrite links between docs (*.md) to generated pages.
-        const h = rewriteLink(href || '', sourcePath);
-        return `<a href="${esc(h)}"${title ? ` title="${esc(title)}"` : ''}>${this.parser.parseInline(tokens)}</a>`;
-      },
-    },
-  });
-  const html = sanitize(marked.parse(md));
-  return { html, toc };
-}
-
-
+// ---------- markdown ----------
 function highlight(text, lang) {
   if (lang && hljs.getLanguage(lang)) {
     try { return hljs.highlight(text, { language: lang, ignoreIllegals: true }).value; } catch { /* fall through */ }
@@ -76,7 +58,13 @@ function sanitize(html) {
   });
 }
 
-// Map links between repo files: md files with a generated page -> that page; other relative paths -> GitHub blob URL.
+// docs/<locale>/x.md is a translation of docs/x.md: both map to the same page.
+const canonicalPath = (repoPath) => {
+  const m = /^docs\/([a-z-]+)\/(.+)$/.exec(repoPath);
+  return m && LOCALES[m[1]] ? `docs/${m[2]}` : repoPath;
+};
+
+// md files with a generated page -> that page (same locale); other repo paths -> GitHub blob URL.
 function rewriteLink(href, sourcePath) {
   if (!href || href.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('//')) return href;
   const [p, frag = ''] = href.split(/(?=#)/);
@@ -84,9 +72,36 @@ function rewriteLink(href, sourcePath) {
     ? path.posix.normalize(p).replace(/^\/+/, '') // repo-root-relative, e.g. /README.md
     : path.posix.normalize(path.posix.join(path.posix.dirname(sourcePath), p));
   if (repoPath.startsWith('..')) return href;
-  const page = pageBySource.get(repoPath);
+  const page = pageBySource.get(canonicalPath(repoPath));
   if (page) return `${page}.html${frag}`;
   return `${REPO}/blob/main/${repoPath}${frag}`;
+}
+
+function render(md, sourcePath) {
+  const toc = [];
+  const seen = new Map();
+  const marked = new Marked({
+    gfm: true,
+    renderer: {
+      code({ text, lang }) {
+        const l = (lang || '').split(/\s/)[0];
+        return `<pre><code class="hljs${l ? ' language-' + esc(l) : ''}">${highlight(text, l)}</code></pre>\n`;
+      },
+      heading({ tokens, depth }) {
+        const inner = this.parser.parseInline(tokens);
+        let id = slugify(inner);
+        const n = seen.get(id) || 0; seen.set(id, n + 1);
+        if (n) id += '-' + n;
+        if (depth >= 2 && depth <= 3) toc.push({ depth, id, text: inner.replace(/<[^>]+>/g, '') });
+        return `<h${depth} id="${id}"><a class="anchor" href="#${id}">#</a>${inner}</h${depth}>\n`;
+      },
+      link({ href, title, tokens }) {
+        const h = rewriteLink(href || '', sourcePath);
+        return `<a href="${esc(h)}"${title ? ` title="${esc(title)}"` : ''}>${this.parser.parseInline(tokens)}</a>`;
+      },
+    },
+  });
+  return { html: sanitize(marked.parse(md)), toc };
 }
 
 function titleOf(md, fallback) {
@@ -94,92 +109,157 @@ function titleOf(md, fallback) {
   return m ? m[1].replace(/[`*_]/g, '').trim() : fallback;
 }
 
-// ---- collect docs ----
-const docs = [];
-const specPath = path.join(root, 'docs', 'spec-v1.5.md');
-if (fs.existsSync(specPath)) {
-  const md = fs.readFileSync(specPath, 'utf8');
-  docs.push({ slug: 'spec', group: 'Specification', title: 'Spec v1.5', fullTitle: titleOf(md, 'Spec v1.5'), md, source: 'docs/spec-v1.5.md' });
+// Rough language detection for untranslated originals: mostly CJK text -> zh-hant.
+function detectLang(md) {
+  const text = md.replace(/```[\s\S]*?```/g, '').replace(/`[^`]*`/g, '');
+  const cjk = (text.match(/[\u3400-\u9fff]/g) || []).length;
+  const latin = (text.match(/[A-Za-z]+/g) || []).length;
+  return cjk > latin ? 'zh-hant' : 'en';
 }
-const bpDir = path.join(root, 'docs', 'best-practices');
-if (fs.existsSync(bpDir)) {
-  const files = fs.readdirSync(bpDir).filter((f) => f.endsWith('.md'));
+
+// ---------- collect docs ----------
+const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8');
+const exists = (rel) => fs.existsSync(path.join(root, rel));
+const docs = [];
+if (exists('docs/spec-v1.5.md')) docs.push({ slug: 'spec', group: 'spec', source: 'docs/spec-v1.5.md' });
+if (exists('docs/best-practices')) {
+  const files = fs.readdirSync(path.join(root, 'docs/best-practices')).filter((f) => f.endsWith('.md'));
   // README.md is the best-practices index page and is listed first.
   files.sort((a, b) => (b.toLowerCase() === 'readme.md') - (a.toLowerCase() === 'readme.md') || a.localeCompare(b));
   for (const f of files) {
-    const md = fs.readFileSync(path.join(bpDir, f), 'utf8');
     const isIndex = f.toLowerCase() === 'readme.md';
-    const slug = isIndex ? 'best-practices' : f.replace(/\.md$/, '').toLowerCase().replace(/[^a-z0-9-]+/g, '-');
-    const t = isIndex ? 'Overview' : titleOf(md, slug);
-    docs.push({ slug, group: 'Best practices', title: t, fullTitle: titleOf(md, t), md, source: `docs/best-practices/${f}` });
+    docs.push({
+      slug: isIndex ? 'best-practices' : f.replace(/\.md$/, '').toLowerCase().replace(/[^a-z0-9-]+/g, '-'),
+      group: 'bestPractices', isIndex, source: `docs/best-practices/${f}`,
+    });
   }
 }
-// Ensure unique slugs (reserved: index) and build source -> page map for link rewriting.
 const used = new Set(['index']);
-for (const d of docs) { let s = d.slug, i = 2; while (used.has(s)) s = `${d.slug}-${i++}`; d.slug = s; used.add(s); }
+for (const d of docs) {
+  let s = d.slug, i = 2; while (used.has(s)) s = `${d.slug}-${i++}`; d.slug = s; used.add(s);
+  d.md = read(d.source);
+  d.lang = detectLang(d.md);
+  d.variants = {};
+  for (const loc of locales) {
+    const tr = d.source.replace(/^docs\//, `docs/${loc}/`);
+    if (exists(tr)) d.variants[loc] = { source: tr, md: read(tr), translated: true };
+    else d.variants[loc] = { source: d.source, md: d.md, translated: d.lang === loc };
+  }
+}
 const pageBySource = new Map(docs.map((d) => [d.source, d.slug]));
 
-// ---- layout ----
-const nav = [
-  ['index.html', 'Home'], ['features.html', 'Features'], ['quick-start.html', 'Quick start'], ['docs/index.html', 'Docs'],
-];
-function layout({ title, body, depth = 0, active, sidebar = '' }) {
-  const pre = depth ? '../'.repeat(depth) : '';
-  const links = nav.map(([h, t]) => `<a href="${pre}${h}"${active === t ? ' class="active"' : ''}>${t}</a>`).join('');
+const docTitle = (d, loc) => {
+  const t = LOCALES[loc].docs;
+  if (d.group === 'spec') return t.specTitle;
+  if (d.isIndex) return t.overview;
+  return titleOf(d.variants[loc].md, d.slug);
+};
+
+// ---------- layout ----------
+const NAV = [['index.html', 'home'], ['features.html', 'features'], ['quick-start.html', 'quickStart'], ['docs/index.html', 'docs']];
+const THEME_BOOT = "try{var t=localStorage.getItem('vb-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}document.documentElement.classList.add('js')";
+const ICON_THEME = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>';
+
+function layout({ loc, rel, title, body, active, sidebar = '', wide = false }) {
+  const t = LOCALES[loc];
+  const depth = rel.split('/').length - 1;
+  const toRoot = '../'.repeat(depth + 1);       // dist/
+  const toLoc = '../'.repeat(depth);            // dist/<loc>/
+  const links = NAV.map(([h, k]) => `<a href="${toLoc}${h}"${active === k ? ' aria-current="page"' : ''}>${t.nav[k]}</a>`).join('');
+  const alternates = locales.map((l) => `<link rel="alternate" hreflang="${LOCALES[l].hreflang}" href="${SITE_URL}${l}/${rel}">`).join('')
+    + `<link rel="alternate" hreflang="x-default" href="${SITE_URL}${rel === 'index.html' ? '' : rel}">`;
+  const switcher = locales.map((l) => l === loc
+    ? `<span class="cur" aria-current="true">${LOCALES[l].short}</span>`
+    : `<a href="${toRoot}${l}/${rel}" hreflang="${LOCALES[l].hreflang}" lang="${LOCALES[l].htmlLang}" data-lang="${l}" title="${LOCALES[l].name}">${LOCALES[l].short}</a>`).join('');
   return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="${t.htmlLang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(title)} · vibe-backend</title>
-<meta name="description" content="vibe-backend: a Markdown-driven serverless backend SDK.">
-<link rel="stylesheet" href="${pre}assets/style.css"><link rel="stylesheet" href="${pre}assets/hljs.css">
+<meta name="description" content="${esc(t.description)}">
+<meta name="color-scheme" content="light dark">
+<link rel="canonical" href="${SITE_URL}${loc}/${rel}">${alternates}
+<script>${THEME_BOOT}</script>
+<link rel="stylesheet" href="${toRoot}assets/style.css">
+<script defer src="${toRoot}assets/site.js"></script>
 </head><body>
-<header class="top"><a class="brand" href="${pre}index.html">vibe<span>-backend</span></a><nav>${links}<a href="${REPO}">GitHub</a></nav></header>
-<div class="${sidebar ? 'docs-wrap' : 'wrap'}">${sidebar}<main>${body}</main></div>
-<footer>vibe-backend SDK · dual licensed MIT / Apache-2.0 · <a href="${REPO}">Source on GitHub</a></footer>
+<header class="top"><div class="bar">
+<a class="brand" href="${toLoc}index.html">vibe<span>-backend</span></a>
+<button class="menu" aria-expanded="false" aria-controls="nav" aria-label="${t.menu}"><span></span><span></span></button>
+<nav id="nav">${links}<a href="${REPO}">${t.nav.github}</a></nav>
+<div class="tools"><div class="lang" role="group" aria-label="${t.switchTo}">${switcher}</div>
+<button class="theme" type="button" aria-label="${t.theme}" title="${t.theme}">${ICON_THEME}</button></div>
+</div></header>
+<div class="${sidebar ? 'docs-wrap' : wide ? 'page wide' : 'page'}">${sidebar}<main>${body}</main></div>
+<footer><div>${t.footer}</div><a href="${REPO}">${t.source}</a></footer>
 </body></html>`;
 }
 
-function docsSidebar(current) {
+// Root-level pickers for every page path: localStorage choice > navigator.languages > en.
+function picker(rel) {
+  const depth = rel.split('/').length - 1;
+  const up = '../'.repeat(depth);
+  const links = locales.map((l) => `<a href="${up}${l}/${rel}" hreflang="${LOCALES[l].hreflang}">${LOCALES[l].name}</a>`).join(' · ');
+  const alternates = locales.map((l) => `<link rel="alternate" hreflang="${LOCALES[l].hreflang}" href="${SITE_URL}${l}/${rel}">`).join('');
+  const js = `(function(){var L=${JSON.stringify(locales)},p=null;try{p=localStorage.getItem('vb-lang')}catch(e){}
+if(L.indexOf(p)<0){p='${DEFAULT_LOCALE}';var n=navigator.languages||[navigator.language||''];for(var i=0;i<n.length;i++){var x=String(n[i]).toLowerCase();
+if(/^zh(-hant|-tw|-hk|-mo)?(\\b|-|$)/.test(x)&&!/^zh-(hans|cn|sg)/.test(x)){p='zh-hant';break}if(/^en\\b/.test(x)){break}}}
+location.replace('${up}'+p+'/${rel}'+location.search+location.hash)})()`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vibe-backend</title>${alternates}<link rel="alternate" hreflang="x-default" href="${SITE_URL}${rel === 'index.html' ? '' : rel}">
+<script>${js}</script></head><body style="font-family:system-ui,sans-serif;padding:2rem">
+<p>vibe-backend — ${links}</p></body></html>`;
+}
+
+function docsSidebar(loc, current) {
+  const t = LOCALES[loc].docs;
   const groups = {};
   for (const d of docs) (groups[d.group] ||= []).push(d);
-  let s = '<aside class="sidebar"><a href="index.html" class="' + (current === 'index' ? 'cur' : '') + '">Docs home</a>';
+  let s = `<aside class="sidebar"><a href="index.html"${current === 'index' ? ' aria-current="page"' : ''}>${t.home}</a>`;
   for (const [g, items] of Object.entries(groups)) {
-    s += `<h4>${esc(g)}</h4>` + items.map((d) => `<a href="${d.slug}.html"${d.slug === current ? ' class="cur"' : ''}>${esc(d.title)}</a>`).join('');
+    s += `<h4>${esc(t[g])}</h4>` + items.map((d) => `<a href="${d.slug}.html"${d.slug === current ? ' aria-current="page"' : ''}>${esc(docTitle(d, loc))}</a>`).join('');
   }
   return s + '</aside>';
 }
 
-// ---- write ----
+// ---------- write ----------
+const write = (rel, html) => { const f = path.join(out, rel); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, html); };
 fs.rmSync(out, { recursive: true, force: true });
-fs.mkdirSync(path.join(out, 'docs'), { recursive: true });
+fs.mkdirSync(out, { recursive: true });
 fs.cpSync(path.join(src, 'assets'), path.join(out, 'assets'), { recursive: true });
-fs.copyFileSync(path.join(here, 'node_modules/highlight.js/styles/github-dark.css'), path.join(out, 'assets/hljs.css'));
 fs.writeFileSync(path.join(out, '.nojekyll'), '');
 
-for (const [file, title, active] of [
-  ['index.html', 'Markdown-driven serverless backend', 'Home'],
-  ['features.html', 'Features', 'Features'],
-  ['quick-start.html', 'Quick start', 'Quick start'],
-]) {
-  let body = fs.readFileSync(path.join(src, 'pages', file), 'utf8');
-  // Allow ```code``` fences in hand-written pages to be highlighted too.
-  body = body.replace(/<pre data-lang="(\w+)">([\s\S]*?)<\/pre>/g, (_, l, c) =>
-    `<pre><code class="hljs">${highlight(c.replace(/^\n/, ''), l)}</code></pre>`);
-  fs.writeFileSync(path.join(out, file), layout({ title, body, active }));
-}
+const handPages = [['index.html', 'index', 'home'], ['features.html', 'features', 'features'], ['quick-start.html', 'quick-start', 'quickStart']];
+const allRels = [...handPages.map(([f]) => f), 'docs/index.html', ...docs.map((d) => `docs/${d.slug}.html`)];
+let count = 0;
 
-const cards = docs.map((d) => `<a class="card" href="${d.slug}.html"><small>${esc(d.group)}</small><h3>${esc(d.title)}</h3><p><code>${esc(d.source)}</code></p></a>`).join('');
-fs.writeFileSync(path.join(out, 'docs/index.html'), layout({
-  title: 'Docs', depth: 1, active: 'Docs', sidebar: docsSidebar('index'),
-  body: `<h1>Documentation</h1><p>These pages are generated at build time from the Markdown files in <code>docs/</code> of the SDK repository. The specification is currently authored in Cantonese (Traditional Chinese) and is rendered as written.</p>${docs.length ? `<div class="cards">${cards}</div>` : '<p>No documents found.</p>'}`,
-}));
+for (const loc of locales) {
+  const t = LOCALES[loc];
+  for (const [file, key, active] of handPages) {
+    let body = fs.readFileSync(path.join(src, 'pages', loc, file), 'utf8');
+    body = body.replace(/<pre data-lang="([\w-]+)"([^>]*)>([\s\S]*?)<\/pre>/g, (_, l, attrs, c) =>
+      `<pre${attrs}><code class="hljs language-${l}">${highlight(c.replace(/^\n/, '').replace(/\n$/, ''), l)}</code></pre>`);
+    write(`${loc}/${file}`, layout({ loc, rel: file, title: t.pages[key], body, active, wide: key === 'index' }));
+    count++;
+  }
 
-for (const d of docs) {
-  const { html, toc } = render(d.md, d.source);
-  const tocHtml = toc.length ? `<nav class="toc"><strong>On this page</strong>${toc.map((t) => `<a class="d${t.depth}" href="#${t.id}">${esc(t.text)}</a>`).join('')}</nav>` : '';
-  fs.writeFileSync(path.join(out, 'docs', d.slug + '.html'), layout({
-    title: d.title, depth: 1, active: 'Docs', sidebar: docsSidebar(d.slug),
-    body: `<p class="src">Source: <a href="${REPO}/blob/main/${d.source}"><code>${d.source}</code></a></p><article class="md">${html}</article>${tocHtml}`,
+  const cards = docs.map((d) => `<a class="card" href="${d.slug}.html"><small>${esc(t.docs[d.group])}</small><h3>${esc(docTitle(d, loc))}</h3><p><code>${esc(d.variants[loc].source)}</code></p></a>`).join('');
+  write(`${loc}/docs/index.html`, layout({
+    loc, rel: 'docs/index.html', title: t.docs.title, active: 'docs', sidebar: docsSidebar(loc, 'index'),
+    body: `<h1>${t.docs.title}</h1><p class="lead">${t.docs.intro}</p>${docs.length ? `<div class="cards">${cards}</div>` : `<p>${t.docs.empty}</p>`}`,
   }));
-}
+  count++;
 
-console.log(`Built ${3 + 1 + docs.length} pages (${docs.length} docs) into ${path.relative(root, out)}/`);
+  for (const d of docs) {
+    const v = d.variants[loc];
+    const { html, toc } = render(v.md, v.source);
+    const notice = v.translated ? '' : `<div class="notice" role="note">${esc(t.docs.fallback[d.lang] || Object.values(t.docs.fallback)[0])}</div>`;
+    const tocHtml = toc.length ? `<nav class="toc"><strong>${t.docs.onThisPage}</strong>${toc.map((x) => `<a class="d${x.depth}" href="#${x.id}">${esc(x.text)}</a>`).join('')}</nav>` : '';
+    write(`${loc}/docs/${d.slug}.html`, layout({
+      loc, rel: `docs/${d.slug}.html`, title: docTitle(d, loc), active: 'docs', sidebar: docsSidebar(loc, d.slug),
+      body: `<p class="src">${t.docs.sourceLabel}: <a href="${REPO}/blob/main/${v.source}"><code>${v.source}</code></a></p>${notice}<article class="md"${v.translated ? '' : ` lang="${LOCALES[d.lang].htmlLang}"`}>${html}</article>${tocHtml}`,
+    }));
+    count++;
+  }
+}
+for (const rel of allRels) write(rel, picker(rel));
+
+console.log(`Built ${count} pages in ${locales.length} locales (${docs.length} docs each) + ${allRels.length} language pickers into ${path.relative(root, out)}/`);
