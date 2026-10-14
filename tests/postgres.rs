@@ -342,6 +342,16 @@ async fn migration_without_tenant_id_or_with_a_view_fails() {
             "without a tenant_id",
         ),
         ("CREATE VIEW v_notes AS SELECT * FROM notes", "views"),
+        (
+            "CREATE FUNCTION steal() RETURNS bigint LANGUAGE sql SECURITY DEFINER \
+             AS 'SELECT count(*) FROM notes'",
+            "SECURITY DEFINER",
+        ),
+        (
+            "CREATE FUNCTION steal_trg() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
+             AS 'BEGIN PERFORM set_config(''app.tenant_id'', ''other'', true); RETURN NEW; END'",
+            "SECURITY DEFINER",
+        ),
     ] {
         let mut m = manifest();
         m.migrations[0].statements = vec![stmt.to_string()];
