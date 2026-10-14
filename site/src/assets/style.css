@@ -183,7 +183,39 @@ footer { border-top: 1px solid var(--line); color: var(--mut); font-size: 12px; 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } }
 
 /* development activity */
-.activity .table-wrap { overflow-x: auto; background: var(--card); border: 1px solid var(--line); border-radius: 22px; padding: 8px 18px; }
+.activity { --add: #30d158; --del: #ff453a; --prs: var(--accent); }
+.act-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 28px !important; text-align: center; }
+.act-stats b { display: block; font-size: clamp(36px, 6vw, 64px); letter-spacing: -.035em; line-height: 1.05; font-variant-numeric: tabular-nums; }
+.act-stats span { color: var(--mut); font-size: 15px; }
+.act-stats .add b { color: var(--add); }
+.act-stats .del b { color: var(--del); }
+.chart-card { margin-top: 0; margin-bottom: 0; background: var(--card); border: 1px solid var(--line); border-radius: 22px; padding: 22px 18px 18px; }
+.chart { display: block; width: 100%; height: auto; color: var(--mut); overflow: visible; }
+.chart text { fill: currentColor; font: 11px var(--font); font-variant-numeric: tabular-nums; }
+.chart .grid { stroke: var(--line); stroke-width: 1; stroke-dasharray: 2 4; }
+.chart .base { stroke: var(--line); stroke-width: 1; }
+.chart .add { fill: var(--add); }
+.chart .del { fill: var(--del); }
+.chart .empty { fill: var(--line); }
+.chart .prs { fill: var(--card); stroke: var(--prs); stroke-width: 2.5; }
+.chart .prs-tick, .chart .prs-val { fill: var(--prs); }
+.chart .prs-val { font-weight: 600; }
+.chart .peak { fill: var(--fg); font-weight: 600; }
+.chart .val { font-size: 10px; }
+.chart .v-add { fill: #1f9d55; }
+.chart .v-del { fill: #d93a3a; }
+:root[data-theme="dark"] .chart .v-add { fill: var(--add); } :root[data-theme="dark"] .chart .v-del { fill: var(--del); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .chart .v-add { fill: var(--add); } :root:not([data-theme="light"]) .chart .v-del { fill: var(--del); } }
+.chart .day.today { fill: var(--fg); font-weight: 700; }
+.chart-card figcaption { display: flex; flex-wrap: wrap; gap: 8px 20px; justify-content: center; margin-top: 14px; font-size: 13px; color: var(--mut); }
+.chart-card figcaption small { flex-basis: 100%; text-align: center; font-size: 12px; }
+.lg::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.lg.add::before { background: var(--add); }
+.lg.del::before { background: var(--del); }
+.lg.prs::before { border-radius: 50%; border: 2.5px solid var(--prs); width: 6px; height: 6px; }
+.act-table { margin-top: 18px !important; }
+.act-table summary { cursor: pointer; color: var(--accent); font-size: 15px; text-align: center; list-style-position: inside; }
+.act-table .table-wrap { margin-top: 14px; overflow-x: auto; background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 8px 18px; }
 .activity-table { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
 .activity-table th, .activity-table td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
 .activity-table tbody tr:last-child > * { border-bottom: 0; }
@@ -193,14 +225,12 @@ footer { border-top: 1px solid var(--line); color: var(--mut); font-size: 12px; 
 .activity-table .add { color: #1f9d55; }
 .activity-table .del { color: #d93a3a; }
 .activity-table tr.zero td, .activity-table tr.zero th { color: var(--mut); opacity: .55; }
-.activity-table .bar { width: 40%; min-width: 80px; }
-.activity-table .bar span { display: inline-block; vertical-align: middle; height: 8px; border-radius: 4px; margin-right: 2px; }
-.activity-table .bar .a { background: #30d158; }
-.activity-table .bar .d { background: #ff453a; }
-.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 @media (max-width: 740px) {
-  .activity .table-wrap { padding: 4px 8px; border-radius: 16px; }
-  .activity-table { font-size: 13px; }
-  .activity-table th, .activity-table td { padding: 6px; }
-  .activity-table .bar { display: none; }
+  .act-stats { gap: 8px; }
+  .act-stats span { font-size: 12px; }
+  .chart-card { padding: 14px 6px 12px; border-radius: 16px; }
+  .chart text { font-size: 22px; }
+  .chart .day.minor { display: none; }
+  .chart .prs { stroke-width: 3.5; }
+  .act-table .table-wrap { padding: 4px 8px; }
 }

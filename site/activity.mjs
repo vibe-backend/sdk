@@ -39,8 +39,9 @@ export async function fetchActivity(token, now = new Date()) {
     const startUtc = Date.UTC(y, m - 1, 1) - TZ_OFFSET_H * 3600e3;
     const since = new Date(startUtc).toISOString().replace(/\.\d+Z$/, 'Z');
 
-    const repos = (await paginate(`${API}/orgs/${ORG}/repos?type=all&per_page=100`, token, (d) => d))
-      .map((r) => r.full_name).sort();
+    const repoList = await paginate(`${API}/orgs/${ORG}/repos?type=all&per_page=100`, token, (d) => d);
+    const repos = repoList.map((r) => r.full_name).sort();
+    const firstRepoMs = Math.min(...repoList.map((r) => Date.parse(r.created_at)).filter(Number.isFinite));
     if (!repos.length) throw new Error('no repositories visible');
 
     const q = encodeURIComponent(`org:${ORG} is:pr is:merged merged:>=${since}`);
@@ -49,6 +50,7 @@ export async function fetchActivity(token, now = new Date()) {
       return d.items;
     });
 
+    const mergedTimes = [];
     const days = new Map();
     for (let d = 1; ; d++) {
       const key = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
@@ -58,15 +60,21 @@ export async function fetchActivity(token, now = new Date()) {
     for (const hit of hits) {
       const { data: pr } = await gh(hit.pull_request.url, token);
       if (!pr.merged_at || !isCount(pr.additions) || !isCount(pr.deletions)) throw new Error(`unexpected PR data for ${hit.html_url}`);
+      mergedTimes.push(Date.parse(pr.merged_at));
       const bucket = days.get(hkDay(Date.parse(pr.merged_at)));
       if (!bucket) continue; // merged outside this month (search is inclusive by instant)
       bucket.prs += 1; bucket.additions += pr.additions; bucket.deletions += pr.deletions;
     }
-    const rows = [...days].map(([day, v]) => ({ day, ...v }));
+    // Skip leading days before anything existed: start at the later of the month start and the
+    // earliest of (first repo created, first merged PR this month), in HKT.
+    const firstPrMs = Math.min(...mergedTimes);
+    const originDay = hkDay(Math.min(firstRepoMs, firstPrMs, now.getTime()));
+    const startDay = [...days.keys()][0] > originDay ? [...days.keys()][0] : originDay;
+    const rows = [...days].filter(([day]) => day >= startDay).map(([day, v]) => ({ day, ...v }));
     const totals = rows.reduce((t, r) => ({ prs: t.prs + r.prs, additions: t.additions + r.additions, deletions: t.deletions + r.deletions }), { prs: 0, additions: 0, deletions: 0 });
     if (![totals.prs, totals.additions, totals.deletions].every(isCount)) throw new Error('totals overflow');
     console.log(`[activity] generated: ${totals.prs} merged PRs, +${totals.additions}/-${totals.deletions} across ${repos.length} repos (${repos.join(', ')}), ${rows.length} days of ${today.slice(0, 7)}.`);
-    return { org: ORG, repos, month: today.slice(0, 7), today, rows, totals, generatedAt: now.toISOString() };
+    return { org: ORG, repos, month: today.slice(0, 7), today, startDay: rows[0].day, rows, totals, generatedAt: now.toISOString() };
   } catch (err) {
     console.warn(`[activity] omitting activity section: ${err.message}`);
     return null;
