@@ -117,11 +117,12 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         exec: Arc::new(MemoryExec::new()),
         auth,
         slugs,
-        rates: std::sync::Mutex::new(std::collections::HashMap::new()),
-        quotas: std::sync::Mutex::new(std::collections::HashMap::new()),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
         disabled: std::collections::HashSet::new(),
         min_override_ms: Some(0),
         honor_test_ip: true,
+        trusted_proxies: Vec::new(),
         dev_hints: true,
     });
     let app = router(state);
@@ -149,6 +150,17 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
     assert!(denied.headers.contains_key("www-authenticate"));
 
+    // Unauthenticated callers get 401 before any schema validation.
+    let probe = send(
+        &app,
+        "POST",
+        "/catalog/v1/products",
+        None,
+        Some(json!({"no_such_field": 1})),
+    )
+    .await;
+    assert_eq!(probe.status, StatusCode::UNAUTHORIZED);
+
     let forbidden = send(
         &app,
         "POST",
@@ -158,6 +170,42 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     )
     .await;
     assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+    let array_body = send(
+        &app,
+        "POST",
+        "/catalog/v1/products",
+        Some(staff.clone()),
+        Some(json!([{"sku": "x"}])),
+    )
+    .await;
+    assert_eq!(array_body.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        array_body.json["error"]["message"],
+        "body must be a JSON object"
+    );
+    for bad_tenant in [
+        "zzzzzzzz, t_tenant0001",
+        "TENANT0001",
+        "short",
+        "tenant0001\"",
+        "",
+    ] {
+        let bad = bearer(&token("staff-user", &["staff"], bad_tenant));
+        let rejected = send(
+            &app,
+            "POST",
+            "/catalog/v1/products",
+            Some(bad),
+            Some(product("sku-bad", "Bad", 1)),
+        )
+        .await;
+        assert_eq!(
+            rejected.status,
+            StatusCode::UNAUTHORIZED,
+            "tenant claim {bad_tenant:?} must be rejected"
+        );
+    }
 
     let created = send(
         &app,
@@ -719,8 +767,9 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
         exec: Arc::new(MemoryExec::new()),
         auth,
         slugs: std::collections::HashMap::new(),
-        rates: std::sync::Mutex::new(std::collections::HashMap::new()),
-        quotas: std::sync::Mutex::new(std::collections::HashMap::new()),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
+        trusted_proxies: Vec::new(),
         disabled: std::collections::HashSet::new(),
         min_override_ms: Some(0),
         honor_test_ip: true,
@@ -838,4 +887,36 @@ async fn validator_reports_every_broken_file_at_once() {
         text.contains("add-cart-item.lock.md") && text.contains("bogus"),
         "{text}"
     );
+}
+
+#[tokio::test]
+async fn manifest_output_is_relative_to_the_current_directory() {
+    let root = compiled_shop().await;
+    let key = sign::load_or_create(&root).unwrap();
+    approve_project(&ApproveOptions {
+        root: &root,
+        reviewers: &["ada@example.com".into(), "grace@example.com".into()],
+        reason: "cli path test",
+        approval_ref: "local",
+        commit: "local",
+        now: "2026-10-14T00:00:00Z",
+        signing_key: &key,
+    })
+    .unwrap_or_else(|err| panic!("{err}"));
+    let cwd = std::env::temp_dir().join(format!("vibe-cwd-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&cwd).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_vibe"))
+        .args(["manifest", "--project"])
+        .arg(&root)
+        .args(["-o", "out.json"])
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(cwd.join("out.json").exists());
+    assert!(!root.join("out.json").exists());
 }

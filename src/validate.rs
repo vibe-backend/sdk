@@ -545,6 +545,80 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
         }
     }
     if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
+        let auth_removed = pipes.blocks.iter().any(|block| {
+            let name = pipeline_name(&block.heading);
+            name == "-auth"
+                || (name == "auth"
+                    && block
+                        .bullets
+                        .iter()
+                        .any(|b| b.key == "removed" && b.value == "true"))
+        });
+        let auth_mode = pipes
+            .blocks
+            .iter()
+            .filter(|block| pipeline_name(&block.heading) == "auth")
+            .find_map(|block| block.bullets.iter().find(|b| b.key == "mode"))
+            .map(|b| b.value.clone())
+            .unwrap_or_else(|| "jwt".into());
+        let mut declared_rates = Vec::new();
+        for block in &pipes.blocks {
+            if pipeline_name(&block.heading) == "rate-limit" {
+                let get = |k: &str| block.bullets.iter().find(|b| b.key == k);
+                declared_rates.push(crate::manifest::RateSpec {
+                    per_minute: get("per-minute")
+                        .and_then(|b| b.value.parse().ok())
+                        .unwrap_or(60),
+                    key: get("key")
+                        .map(|b| b.value.clone())
+                        .unwrap_or_else(|| "ip".into()),
+                });
+            }
+            for (name, key) in [
+                ("ip-per-minute", "ip"),
+                ("account-per-minute", "account"),
+                ("tenant-per-minute", "tenant"),
+            ] {
+                if let Some(v) = block.bullets.iter().find(|b| b.key == name) {
+                    if let Ok(per_minute) = v.value.parse() {
+                        declared_rates.push(crate::manifest::RateSpec {
+                            per_minute,
+                            key: key.into(),
+                        });
+                    }
+                }
+            }
+        }
+        if let Err(err) = crate::manifest::check_rate_set(&declared_rates) {
+            report.push(Diag::error(file, err).at_section("Pipelines"));
+        }
+        for block in &pipes.blocks {
+            if pipeline_name(&block.heading) == "rate-limit" {
+                if let Err(err) =
+                    crate::manifest::check_rate_params(block.bullets.iter().map(|b| b.key.as_str()))
+                {
+                    report.push(Diag::error(file, err).at_section("Pipelines"));
+                }
+                if block.bullets.iter().any(|b| {
+                    (b.key == "key" && b.value == "account") || b.key == "account-per-minute"
+                }) {
+                    report.push(
+                        Diag::warning(
+                            file,
+                            "rate-limit key `account` is deprecated: it now means input.email (it used to share the tenant bucket); write `key: input.email`",
+                        )
+                        .at_section("Pipelines"),
+                    );
+                }
+                if let Some(key) = block.bullets.iter().find(|b| b.key == "key") {
+                    if let Err(err) =
+                        crate::manifest::check_rate_key(&key.value, auth_removed, &auth_mode)
+                    {
+                        report.push(Diag::error(file, err).at_section("Pipelines"));
+                    }
+                }
+            }
+        }
         for block in &pipes.blocks {
             let name = pipeline_name(&block.heading);
             if name == "auth" {
@@ -601,6 +675,24 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
         || find_section(&doc.sections, "Response").is_none()
     {
         report.push(Diag::error(file, "feature locks need Request and Response"));
+    }
+    if let Some(table) = find_section(&doc.sections, "Request").and_then(|s| s.table.as_ref()) {
+        for row in &table.rows {
+            if let (Some(name), Some(ty)) = (row.first(), row.get(1)) {
+                if !crate::runtime::REQUEST_TYPES.contains(&ty.as_str()) {
+                    report.push(
+                        Diag::error(
+                            file,
+                            format!(
+                                "request field {name} has unsupported type {ty} (use one of: {})",
+                                crate::runtime::REQUEST_TYPES.join(", ")
+                            ),
+                        )
+                        .at_section("Request"),
+                    );
+                }
+            }
+        }
     }
     if let Some(limits) = find_section(&doc.sections, "Limits") {
         if let Some(ms) = limits

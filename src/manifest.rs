@@ -60,6 +60,80 @@ pub struct RateSpec {
     pub key: String,
 }
 
+/// Checks a `rate-limit` key against spec §4.3. Supported here: `ip`,
+/// `tenant`, `user` (needs auth), `api-key` (needs api-key auth),
+/// `input.{field}`, and the legacy login-guard `account` (= `input.email`).
+/// `family` needs the platform `token-refresh` pipeline, which this runtime
+/// does not provide, so it is rejected rather than silently keyed by IP.
+/// Rate-limit parameters this runtime does not enforce. They are rejected
+/// rather than silently ignored.
+pub const UNSUPPORTED_RATE_PARAMS: [&str; 3] = ["per-hour", "per-day", "burst"];
+
+pub fn check_rate_params<'a>(keys: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    for key in keys {
+        if UNSUPPORTED_RATE_PARAMS.contains(&key) {
+            return Err(format!(
+                "rate-limit `{key}` is not supported by this runtime (only per-minute); remove it rather than rely on it"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Highest accepted `per-minute` value (bounds per-bucket memory).
+pub const MAX_PER_MINUTE: u32 = 10_000;
+
+/// Route-level rate rules: every limit is within [`MAX_PER_MINUTE`], and an
+/// `input.*`/`account` limit must be paired with an `ip` limit. Otherwise a
+/// client could rotate input values to dodge a per-input limit.
+pub fn check_rate_set(rates: &[RateSpec]) -> Result<(), String> {
+    for rate in rates {
+        if rate.per_minute == 0 || rate.per_minute > MAX_PER_MINUTE {
+            return Err(format!(
+                "rate-limit per-minute must be between 1 and {MAX_PER_MINUTE} (got {})",
+                rate.per_minute
+            ));
+        }
+    }
+    let input_keyed = rates
+        .iter()
+        .any(|r| r.key == "account" || r.key.starts_with("input."));
+    if input_keyed && !rates.iter().any(|r| r.key == "ip") {
+        return Err(
+            "a rate-limit keyed by input.* or account must be paired with an `ip` rate-limit on the same route"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+pub fn check_rate_key(key: &str, auth_removed: bool, auth_mode: &str) -> Result<(), String> {
+    match key {
+        "ip" | "tenant" | "account" => Ok(()),
+        "user" if auth_removed => Err("rate-limit key `user` needs auth".into()),
+        "user" => Ok(()),
+        "api-key" if auth_removed || auth_mode != "api-key" => {
+            Err("rate-limit key `api-key` needs `auth: { mode: api-key }`".into())
+        }
+        "api-key" => Ok(()),
+        "family" => Err(
+            "rate-limit key `family` is only for token-refresh, which is not implemented yet (see #26)"
+                .into(),
+        ),
+        _ => match key.strip_prefix("input.") {
+            Some(field)
+                if !field.is_empty()
+                    && field
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                Ok(())
+            }
+            _ => Err(format!("unknown rate-limit key `{key}`")),
+        },
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ReqField {
     pub location: String,
@@ -484,6 +558,8 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
                 }
             }
             if name == "rate-limit" {
+                check_rate_params(block.bullets.iter().map(|b| b.key.as_str()))
+                    .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
                 let per_minute = block
                     .bullets
                     .iter()
@@ -514,6 +590,11 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
             }
         }
     }
+    for rate in &rates {
+        check_rate_key(&rate.key, auth_removed, &auth_mode)
+            .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
+    }
+    check_rate_set(&rates).map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
     let body_limit = find_section(&doc.sections, "Limits")
         .and_then(|s| s.get("body"))
         .map(validate::parse_bytes)
@@ -852,6 +933,7 @@ mod roles_list_tests {
     fn malformed_roles_list_is_a_build_error() {
         let err = crate::lock::parse_string_list("staff").unwrap_err();
         assert!(err.contains("expected a list"), "{err}");
+        // Same path route_from uses: error, never empty vec.
         assert!(crate::lock::parse_string_list("staff")
             .map_err(|e| format!("invalid roles: {e}"))
             .is_err());
@@ -859,5 +941,43 @@ mod roles_list_tests {
             crate::lock::parse_string_list("[staff]").unwrap(),
             vec!["staff"]
         );
+    }
+}
+
+#[cfg(test)]
+mod rate_key_tests {
+    use super::check_rate_key;
+
+    #[test]
+    fn accepts_spec_keys_and_rejects_others() {
+        for ok in ["ip", "tenant", "user", "input.email", "account"] {
+            assert!(check_rate_key(ok, false, "jwt").is_ok(), "{ok}");
+        }
+        assert!(check_rate_key("api-key", false, "api-key").is_ok());
+        assert!(check_rate_key("api-key", false, "jwt").is_err());
+        assert!(check_rate_key("user", true, "jwt").is_err());
+        let family = check_rate_key("family", false, "jwt").unwrap_err();
+        assert!(
+            family.contains("family is only for token-refresh")
+                || family.contains("`family` is only for token-refresh")
+        );
+        assert!(family.contains("not implemented") && family.contains("#26"));
+        for bad in ["per-hour", "per-day", "burst"] {
+            assert!(super::check_rate_params(["key", bad]).is_err(), "{bad}");
+        }
+        assert!(super::check_rate_params(["key", "per-minute"]).is_ok());
+        let r = |key: &str, per_minute| super::RateSpec {
+            per_minute,
+            key: key.into(),
+        };
+        assert!(super::check_rate_set(&[r("input.email", 5)]).is_err());
+        assert!(super::check_rate_set(&[r("account", 5)]).is_err());
+        assert!(super::check_rate_set(&[r("input.email", 5), r("ip", 10)]).is_ok());
+        assert!(super::check_rate_set(&[r("ip", 0)]).is_err());
+        assert!(super::check_rate_set(&[r("ip", 10_001)]).is_err());
+        assert!(super::check_rate_set(&[r("tenant", 10_000)]).is_ok());
+        for bad in ["family", "req.ip", "input.", "input.a-b", "everyone"] {
+            assert!(check_rate_key(bad, false, "jwt").is_err(), "{bad}");
+        }
     }
 }
