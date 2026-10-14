@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Allow unauthenticated visitors to create or update data (e.g. submitting a review) under tightly controlled conditions. Public endpoints may call `writes: true` methods (Decision 4), but every rule in §7.2 is mandatory (Decisions 21–26, 38, 39, 41).
+Allow unauthenticated visitors to create or update data (e.g. submitting a review) under tightly controlled conditions. Public endpoints may call `writes: true` methods (Decision 4), but every rule in §7.2 is mandatory (Decisions 21–26, 38, 39, 41, 47, 49, 53).
 
 ## Natural-language source example
 
@@ -32,7 +32,7 @@ Create the review with review.submit; on success return 201 with id. If the item
 - public-writes: true
 - role: public_writer
 - writable-columns: { reviews: [item_id, rating, comment] }
-- challenge: captcha
+- challenge: { type: captcha, when: always }
 - external-calls: forbidden
 - daily-write-quota: platform-default
 - audit-log: required
@@ -105,11 +105,13 @@ Create the review with review.submit; on success return 201 with id. If the item
 - **Per-endpoint opt-in**: `public-writes: true` in `## Access` (high risk) (§7.2).
 - **Role and grants**: separate `public_writer` role; grants generated from the lock, limited to the exact tables, **columns** and operations used (§7.2, §10.7).
 - **Operations**: only `INSERT` and `UPDATE`, only on `writable-columns`. `UPDATE` must have `WHERE` with primary key or RLS (§7.2).
-- **Blacklist**: never writable publicly: `role`, `roles`, `permissions`, `is_admin`, `tenant_id`, `owner`, `owner_id`, `created_by`, `approved`, `verified`, `password` (except login-class via `hash-password`), `deleted_at`, all system fields; objects may add more (§7.2).
+- **Blacklist**: never writable publicly: `role`, `roles`, `permissions`, `is_admin`, `tenant_id`, `owner`, `owner_id`, `created_by`, `approved`, `verified`, `password` (only the registration rule below allows it), `deleted_at`, all system fields; objects may add more (§7.2).
+- **Password writes** (Decision 47): a public path may write a password column only if all three hold: the method has `capabilities: [set-password]` (high risk), the written value is the output of `hash-password` in the same method, and the api lock has `password-write: allow` with the password column listed in `writable-columns`. Public registration itself never writes a password in v1.7; it is set at the verification step (Decision 67, see [user-register.md](user-register.md)).
+- **Email verification writes** (Decision 53): `email_verified_at` (a "verified"-class blacklisted column) may only be written by a method with `capabilities: [confirm-verification]`, in a single UPDATE whose WHERE matches the `hash-token` output against the unique token-hash column, checks expiry and unverified state, and clears the hash; the api needs `verification-write: allow` (high risk).
 - **Tenant injection**: `tenant_id` comes from the slug; a body containing `tenant_id`, `id` or `created_by` is rejected with 422, and declaring them in `## Request` is an error (Decision 23, §10.7).
 - **Quota**: default 1,000 public writes per tenant per day and 50 per IP per day; tenant admins may lower, raising up to 10,000 needs a platform request. When exhausted only public writes are blocked (429 + `Retry-After`) (Decision 39, Decision 21).
 - **Rate limits**: IP + tenant both mandatory; `cost: high` steps get half the endpoint limit (§7.2).
-- **Bot protection**: any public endpoint with INSERT must declare `challenge: captcha | pow`; missing is an error. Public writes without INSERT don't require a challenge (Decision 38).
+- **Bot protection** (Decision 49): `challenge: { type: none | captcha | pow, when: always | after-failures, after-failures: <n> }`. Public endpoints with INSERT must use `type: captcha` or `pow` with `when: always`; login-class endpoints must use `{ type: captcha, when: after-failures, after-failures: 3 }`; other public writes without INSERT may use `type: none`. A password write without INSERT (e.g. verify-email) does not need captcha but still needs IP + tenant limits (§7.2).
 - **Audit**: `audit-log` cannot be removed from public-write endpoints (§10.3).
 - **Untrusted content**: public-written fields are `untrusted: true` in the model; all outputs (including authenticated reads) are output-encoded per Content-Type; every field needs a length cap and arrays a count cap (Decision 24).
 - **External calls**: forbidden on public paths unless `external-calls: allow` (high risk) (§7.2).
@@ -122,4 +124,5 @@ Create the review with review.submit; on success return 201 with id. If the item
 - `daily-write-quota: platform-default` is the only quota syntax shown; how a lowered tenant quota appears (if at all) in the lock is not specified (quota is set in the platform UI).
 - `untrusted` appears as a `## Request` rule here and as `untrusted: true` in the model; the model lock syntax for it is not shown.
 - How objects declare additional blacklist fields is not specified.
-- `challenge: pow` parameters (difficulty) are not specified.
+- `challenge: { type: pow }` parameters (difficulty) are not specified.
+- The model-level `public_writer` grant is the union over all public endpoints while each api gets only its own columns (§12.8 comment); how the platform materializes per-endpoint grants for one role is not described.

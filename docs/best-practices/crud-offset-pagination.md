@@ -19,6 +19,10 @@ Fields:
 - password: password.
 - roles: array of strings.
 - last_login_at: timestamp, optional.
+- email_verified_at: email verification time, optional.
+- email_verify_hash: hash of the verification token, unique, optional.
+- email_verify_expires_at: verification token expiry, optional.
+- name and email are filled in by visitors at registration and are untrusted content.
 
 Provide get, list and update CRUD. list defaults to 20 per page, at most 100, can sort by created_at or name, and can filter by email.
 ```
@@ -46,14 +50,19 @@ Validation failure returns 422.
 | name | type | rules | system |
 |---|---|---|---|
 | id | uuid | primary, default: gen | yes |
-| email | string | format: email, unique | no |
-| name | string | max: 50 | no |
-| password | password | argon2id | no |
-| roles | string[] | | no |
+| email | string | format: email, unique, max: 254, untrusted, personal: standard | no |
+| name | string | max: 50, untrusted, personal: standard | no |
+| password | password | argon2id, nullable | no |
+| roles | string[] | default: [], max-items: 20 | no |
 | last_login_at | timestamp | nullable, public-writable | no |
+| email_verified_at | timestamp | nullable, public-writable (confirm-verification) | no |
+| email_verify_hash | bytes | nullable, unique, public-writable | no |
+| email_verify_expires_at | timestamp | nullable, public-writable | no |
+| email_verify_purpose | string | nullable, enum: [register, invite] | no |
 | created_at | timestamp | default: now | yes |
 | updated_at | timestamp | default: now | yes |
 | deleted_at | timestamp | nullable | yes |
+| erased_at | timestamp | nullable | yes |
 | tenant_id | string | platform | yes |
 
 ## CRUD
@@ -61,15 +70,15 @@ Validation failure returns 422.
 |---|---|
 | get | sensitive-output: [] |
 | list | pagination: offset, page-size: 20, max-page-size: 100, sort: [created_at, name], filter: [email] |
-| update | partial: true, optimistic-lock: updated_at |
+| update | partial: true, optimistic-lock: if-match |
 
 ## Policies
 - rls: enable, force
 - policy: tenant_id = current_setting('app.tenant_id', false)
-- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer [UPDATE(last_login_at)]
+- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT], public_writer [INSERT(email, name, email_verify_hash, email_verify_expires_at, email_verify_purpose), UPDATE(email_verify_hash, email_verify_expires_at, email_verify_purpose, password, email_verified_at, last_login_at)]
 ````
 
-This matches the §12.8 `user` lock: `last_login_at` is publicly writable (by the login endpoint, see [user-login.md](user-login.md)), which is a high-risk `public-writable-column` security item on the model lock.
+This matches the v1.7 §12.8 `user` lock. The `public_writer` grant at model level is the **union** of all public endpoints (login writes `last_login_at`; register and verify-email write the verification columns and password); each api's effective grant is limited to the columns its own lock uses (§12.8, §12.11.6, §12.11.7). Public-writable columns are high-risk `public-writable-column` security items. See [user-login.md](user-login.md) and [user-register.md](user-register.md).
 
 The injected `user.list` method has its own platform-generated, signed lock (`id: user/crud/list`, `source-type: structured`) (§12.9).
 
@@ -133,7 +142,7 @@ The injected `user.list` method has its own platform-generated, signed lock (`id
 
 ## Security considerations
 
-- `page` starts at 1; `page-size` may not exceed `max-page-size` — exceeding it returns **422** (§12.9). `max-page-size` itself has a platform cap.
+- `page` starts at 1; `page-size` may not exceed `max-page-size` — exceeding it returns **422** (§12.9). `max-page-size` defaults to 100; the platform cap is **500**: a model may set it lower, never higher, and exceeding the cap is a validator error (Decision 71).
 - Only whitelisted fields may be used for `sort` and `filter` (§12.9).
 - `sensitive: true` fields never appear in `list` output and can never be used for filter or sort (§12.9). `password` fields never appear in any output (§12.2).
 - Soft-deleted rows (`deleted_at` set) are automatically excluded from `get` and `list` (§12.9).
@@ -147,4 +156,3 @@ The injected `user.list` method has its own platform-generated, signed lock (`id
 - The exact shape of the `filter` input to `list` (object vs. flat fields) is **not specified**.
 - Naming differs between input `page-size` (kebab-case) and output `page_size` (snake_case) in §12.9; this page follows the spec literally.
 - The `sort` direction (asc/desc) syntax is **not specified**.
-- The value of the platform cap on `max-page-size` is **not specified**.
