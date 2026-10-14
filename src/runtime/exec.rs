@@ -461,7 +461,10 @@ impl PgExec {
     pub async fn connect_with(url: &str, options: PgOptions) -> Result<Self, String> {
         let config = pg_config(url)?;
         let manager_config = deadpool_postgres::ManagerConfig {
-            recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+            // A connection can come back mid-transaction (a dropped session, a
+            // cancelled request). Roll back and reset session state before
+            // reuse; a connection where this fails is discarded.
+            recycling_method: deadpool_postgres::RecyclingMethod::Custom(RECYCLE_SQL.into()),
         };
         let manager = match tls_mode(url)? {
             TlsMode::Disable => deadpool_postgres::Manager::from_config(
@@ -496,12 +499,12 @@ impl PgExec {
             .build()
             .map_err(|err| err.to_string())?;
         // Fail at startup, not on the first request.
-        drop(pool.get().await.map_err(|err| err.to_string())?);
+        drop(pool.get().await.map_err(pool_error)?);
         Ok(Self { pool, options })
     }
 
     async fn client(&self) -> Result<deadpool_postgres::Object, String> {
-        self.pool.get().await.map_err(|err| err.to_string())
+        self.pool.get().await.map_err(pool_error)
     }
 
     /// One pooled connection held for several calls (transactions, session
@@ -521,7 +524,7 @@ impl PgExec {
         let row = client
             .query_one(ROLE_STATUS_SQL, &[])
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(pg_error)?;
         drop(client);
         let status = RoleStatus {
             name: row.get(0),
@@ -549,10 +552,7 @@ impl PgExec {
     /// Runs a query returning one text column.
     pub async fn query_texts(&self, sql: &str, param: &str) -> Result<Vec<String>, String> {
         let client = self.client().await?;
-        let rows = client
-            .query(sql, &[&param])
-            .await
-            .map_err(|err| err.to_string())?;
+        let rows = client.query(sql, &[&param]).await.map_err(pg_error)?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
@@ -561,10 +561,7 @@ impl PgExec {
     pub async fn batch(&self, statements: &[String]) -> Result<(), String> {
         let client = self.client().await?;
         for statement in statements {
-            client
-                .batch_execute(statement)
-                .await
-                .map_err(|err| err.to_string())?;
+            client.batch_execute(statement).await.map_err(pg_error)?;
         }
         Ok(())
     }
@@ -578,11 +575,7 @@ pub struct PgSession {
 impl PgSession {
     /// Runs a query returning one text column.
     pub async fn query_texts(&self, sql: &str, param: &str) -> Result<Vec<String>, String> {
-        let rows = self
-            .client
-            .query(sql, &[&param])
-            .await
-            .map_err(|err| err.to_string())?;
+        let rows = self.client.query(sql, &[&param]).await.map_err(pg_error)?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
@@ -591,7 +584,7 @@ impl PgSession {
             self.client
                 .batch_execute(statement)
                 .await
-                .map_err(|err| err.to_string())?;
+                .map_err(pg_error)?;
         }
         Ok(())
     }
@@ -621,7 +614,7 @@ impl QueryExec for PgExec {
         let tx = client
             .transaction()
             .await
-            .map_err(|err| ExecError::Message(err.to_string()))?;
+            .map_err(|err| ExecError::Message(pg_error(err)))?;
         let schema = format!("\"t_{tenant_id}\"");
         tx.query(
             "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), \
@@ -633,13 +626,13 @@ impl QueryExec for PgExec {
             ],
         )
         .await
-        .map_err(|err| ExecError::Message(err.to_string()))?;
+        .map_err(|err| ExecError::Message(pg_error(err)))?;
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p as _).collect();
         let rows = tx.query(&sql, &refs).await.map_err(map_pg)?;
         tx.commit()
             .await
-            .map_err(|err| ExecError::Message(err.to_string()))?;
+            .map_err(|err| ExecError::Message(pg_error(err)))?;
         if rows.is_empty() {
             return match stmt {
                 Stmt::SoftDelete { .. } => Err(ExecError::NotFound),
@@ -653,7 +646,7 @@ impl QueryExec for PgExec {
             for (idx, col) in returning.iter().enumerate() {
                 let text: Option<String> = row
                     .try_get(idx)
-                    .map_err(|err| ExecError::Message(err.to_string()))?;
+                    .map_err(|err| ExecError::Message(pg_error(err)))?;
                 mapped.insert(col.name.clone(), parse_cell(text, &col.ty));
             }
             out.push(mapped);
@@ -698,8 +691,43 @@ fn map_pg(err: tokio_postgres::Error) -> ExecError {
     if code == Some("23505") {
         ExecError::Conflict
     } else {
-        ExecError::Message(err.to_string())
+        ExecError::Message(pg_error(err))
     }
+}
+
+/// Run on every connection before it is handed out again.
+const RECYCLE_SQL: &str = "ROLLBACK; CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; \
+     UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
+
+/// A pool error; connection failures keep the server's detail.
+fn pool_error(err: deadpool_postgres::PoolError) -> String {
+    match err {
+        deadpool_postgres::PoolError::Backend(err) => pg_error(err),
+        other => other.to_string(),
+    }
+}
+
+/// A Postgres error with the server's message, detail, hint and SQLSTATE
+/// (tokio-postgres's `Display` only says "db error"). For logs and the CLI;
+/// HTTP responses never include it.
+pub fn pg_error(err: tokio_postgres::Error) -> String {
+    let Some(db) = err.as_db_error() else {
+        return err.to_string();
+    };
+    let mut out = format!("{}: {} ({})", db.severity(), db.message(), db.code().code());
+    if let Some(detail) = db.detail() {
+        out.push_str(&format!("; detail: {detail}"));
+    }
+    if let Some(hint) = db.hint() {
+        out.push_str(&format!("; hint: {hint}"));
+    }
+    if let Some(schema) = db.schema() {
+        out.push_str(&format!("; schema: {schema}"));
+    }
+    if let Some(table) = db.table() {
+        out.push_str(&format!("; table: {table}"));
+    }
+    out
 }
 
 pub fn etag(id: &str, updated_at: &str) -> String {

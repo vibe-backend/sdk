@@ -1,6 +1,6 @@
 //! Real PostgreSQL tests. They run when `VIBE_TEST_PG_ADMIN_URL` points at a
-//! superuser connection (CI sets it via a service container) and are skipped
-//! otherwise.
+//! superuser connection (CI sets it via a service container). Outside CI they
+//! are skipped with a SKIPPED note; in CI (`CI` set) a missing URL fails.
 
 use serde_json::{json, Value};
 use tokio_postgres::{Client, NoTls};
@@ -125,7 +125,11 @@ macro_rules! require_pg {
         match $e {
             Some(v) => v,
             None => {
-                eprintln!("VIBE_TEST_PG_ADMIN_URL not set; skipping Postgres test");
+                // CI must run these tests; a missing database is a failure there.
+                if std::env::var_os("CI").is_some() {
+                    panic!("VIBE_TEST_PG_ADMIN_URL is not set in CI; the Postgres tests cannot be skipped");
+                }
+                eprintln!("SKIPPED: VIBE_TEST_PG_ADMIN_URL not set; skipping Postgres test");
                 return;
             }
         }
@@ -542,4 +546,195 @@ async fn serve_refuses_extra_or_altered_policies() {
         .await
         .unwrap();
     check_as(&s.admin_url, &s.app).await.unwrap();
+}
+
+/// Count of rows the runtime role sees in `table` while acting as `tenant`.
+async fn visible_rows(s: &Setup, table: &str, tenant: &str) -> i64 {
+    let app = connect(&url_as(&s.admin_url, &s.app)).await;
+    app.batch_execute("BEGIN").await.unwrap();
+    app.query("SELECT set_config('app.tenant_id', $1, true)", &[&tenant])
+        .await
+        .unwrap();
+    let n: i64 = app
+        .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    app.batch_execute("ROLLBACK").await.unwrap();
+    n
+}
+
+#[tokio::test]
+async fn migration_cannot_weaken_another_tenant() {
+    let s = require_pg!(setup().await);
+    let victim = format!("t_{}", s.tenant);
+    s.admin
+        .batch_execute(&format!(
+            "INSERT INTO {victim}.audit_notes VALUES ('{t}', 'secret')",
+            t = s.tenant
+        ))
+        .await
+        .unwrap();
+    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    let attacks = [
+        format!("CREATE POLICY open ON {victim}.audit_notes USING (true)"),
+        format!("CREATE POLICY open ON {victim}.audit_notes AS RESTRICTIVE USING (true)"),
+        format!("ALTER TABLE {victim}.audit_notes NO FORCE ROW LEVEL SECURITY"),
+        format!("ALTER TABLE {victim}.audit_notes DISABLE ROW LEVEL SECURITY"),
+        format!(
+            "DROP POLICY tenant_isolation ON {victim}.audit_notes; \
+             CREATE POLICY tenant_isolation ON {victim}.audit_notes USING (true)"
+        ),
+        format!("CREATE VIEW {victim}.peek AS SELECT * FROM {victim}.audit_notes"),
+        format!("ALTER TABLE {victim}.audit_notes ADD COLUMN extra text"),
+        format!("GRANT DELETE ON {victim}.audit_notes TO PUBLIC"),
+    ];
+    for attack in attacks {
+        let mut m = manifest();
+        m.migrations[0].statements.push(attack.clone());
+        let tenant = format!("ta{}", suffix());
+        let err = migrate_tenant(&owner_exec, &m, &tenant, &s.app)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("row level security check failed") || err.contains("another tenant"),
+            "{attack}: {err}"
+        );
+        // Nothing was committed: the attacker's schema does not exist and
+        // the victim is unchanged.
+        let left: i64 = s
+            .admin
+            .query_one(
+                "SELECT count(*) FROM pg_namespace WHERE nspname = $1",
+                &[&format!("t_{tenant}")],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(left, 0, "{attack}");
+        assert_eq!(
+            visible_rows(&s, &format!("{victim}.audit_notes"), "othertenant1").await,
+            0,
+            "{attack}: victim rows must stay hidden from other tenants"
+        );
+        check_as(&s.admin_url, &s.app).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn migration_cannot_end_the_transaction() {
+    let s = require_pg!(setup().await);
+    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    for attack in [
+        "CREATE TABLE leaky (tenant_id text, x text); COMMIT; BEGIN",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "begin",
+        "START TRANSACTION",
+        "SAVEPOINT s",
+        "SET ROLE postgres",
+    ] {
+        let mut m = manifest();
+        m.migrations[0].statements.push(attack.to_string());
+        let tenant = format!("tx{}", suffix());
+        let err = migrate_tenant(&owner_exec, &m, &tenant, &s.app)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not allowed in migrations"), "{attack}: {err}");
+        let left: i64 = s
+            .admin
+            .query_one(
+                "SELECT count(*) FROM pg_namespace WHERE nspname = $1",
+                &[&format!("t_{tenant}")],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(left, 0, "{attack}: nothing may be committed");
+    }
+    // Procedures that COMMIT cannot end the transaction either.
+    let mut m = manifest();
+    m.migrations[0]
+        .statements
+        .push("CREATE PROCEDURE sneaky() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END $$".into());
+    m.migrations[0].statements.push("CALL sneaky()".into());
+    let tenant = format!("ty{}", suffix());
+    migrate_tenant(&owner_exec, &m, &tenant, &s.app)
+        .await
+        .unwrap_err();
+    let left: i64 = s
+        .admin
+        .query_one(
+            "SELECT count(*) FROM pg_namespace WHERE nspname = $1",
+            &[&format!("t_{tenant}")],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(left, 0);
+    // The executor connection still works afterwards.
+    migrate_tenant(&owner_exec, &manifest(), &format!("tz{}", suffix()), &s.app)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn postgres_errors_carry_detail() {
+    let s = require_pg!(setup().await);
+    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    let mut m = manifest();
+    m.migrations[0]
+        .statements
+        .push("ALTER TABLE no_such_table ADD COLUMN x text".into());
+    let err = migrate_tenant(&owner_exec, &m, &format!("te{}", suffix()), &s.app)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("no_such_table") && err.contains("42P01"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn pooled_connections_come_back_clean() {
+    let s = require_pg!(setup().await);
+    let exec = PgExec::connect_with(
+        &url_as(&s.admin_url, &s.app),
+        vibe::runtime::PgOptions {
+            pool_size: 1,
+            statement_timeout_ms: 5_000,
+            pool_timeout_ms: 2_000,
+        },
+    )
+    .await
+    .unwrap();
+    {
+        // Dropped mid-transaction with session state changed.
+        let session = exec.session().await.unwrap();
+        session
+            .batch(&[
+                "BEGIN".into(),
+                "CREATE TEMP TABLE leak (x int)".into(),
+                "SET app.tenant_id = 'leaked'".into(),
+            ])
+            .await
+            .unwrap();
+    }
+    let got = exec
+        .query_texts(
+            "SELECT (to_regclass('pg_temp.leak') IS NULL)::text || '|' || \
+             coalesce(current_setting('app.tenant_id', true), '') || '|' || \
+             coalesce(txid_current_if_assigned()::text, 'none') WHERE $1 = ''",
+            "",
+        )
+        .await
+        .unwrap();
+    assert_eq!(got, vec!["true||none".to_string()]);
 }
