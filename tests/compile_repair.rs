@@ -20,7 +20,7 @@ fn project() -> std::path::PathBuf {
     fs::create_dir_all(root.join("providers")).unwrap();
     fs::write(
         root.join("providers/main.md"),
-        include_str!("../examples/shop/providers/main.md"),
+        include_str!("fixtures/shop/providers/main.md"),
     )
     .unwrap();
     fs::write(
@@ -42,6 +42,7 @@ fn config() -> LlmConfig {
         seed: 0,
         endpoint_host: "api.openai.com".into(),
         endpoint_private: false,
+        api_style: "chat".into(),
     }
 }
 

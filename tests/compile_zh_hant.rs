@@ -186,6 +186,7 @@ async fn zh_hant_sample_shop_compiles_and_validates() {
         seed: 0,
         endpoint_host: "api.openai.com".into(),
         endpoint_private: false,
+        api_style: "chat".into(),
     };
     let out = compile_project(&CompileOptions {
         root: &root,
@@ -241,6 +242,7 @@ fn config() -> LlmConfig {
         seed: 0,
         endpoint_host: "api.openai.com".into(),
         endpoint_private: false,
+        api_style: "chat".into(),
     }
 }
 
