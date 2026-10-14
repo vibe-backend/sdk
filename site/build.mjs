@@ -16,6 +16,7 @@ import { Marked } from 'marked';
 import hljs from 'highlight.js';
 import sanitizeHtml from 'sanitize-html';
 import { LOCALES, DEFAULT_LOCALE } from './src/i18n.mjs';
+import { fetchActivity } from './activity.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
@@ -25,14 +26,6 @@ const REPO = 'https://github.com/vibe-backend/sdk';
 const SITE_URL = (process.env.SITE_URL || 'https://vibe-backend.github.io/sdk/').replace(/\/?$/, '/');
 const locales = Object.keys(LOCALES);
 
-// Build-time stats from site/src/data/stats.json. To show the "tokens used" stat, set
-// "tokensUsed" to a non-negative integer (e.g. {"tokensUsed": 123456}) and rebuild.
-// null, a missing key, or anything that is not a non-negative safe integer omits the stat entirely.
-function readStats() {
-  try { return JSON.parse(fs.readFileSync(path.join(here, 'src/data/stats.json'), 'utf8')) || {}; } catch { return {}; }
-}
-const stats = readStats();
-const tokensUsed = Number.isSafeInteger(stats.tokensUsed) && stats.tokensUsed >= 0 ? stats.tokensUsed : null;
 
 const slugify = (s) => s.toLowerCase().trim()
   .replace(/<[^>]+>/g, '').replace(/[`*_~]/g, '')
@@ -198,7 +191,7 @@ function layout({ loc, rel, title, body, active, sidebar = '', wide = false }) {
 <button class="theme" type="button" aria-label="${t.theme}" title="${t.theme}">${ICON_THEME}</button></div>
 </div></header>
 <div class="${sidebar ? 'docs-wrap' : wide ? 'page wide' : 'page'}">${sidebar}<main>${body}</main></div>
-<footer><div>${t.footer}<br><span class="maintainer">${esc(t.maintainedBy)}</span></div>${tokensUsed === null ? '' : `<div class="stat-tokens" data-stat="tokens-used">${esc(t.tokensUsed)}<data value="${tokensUsed}">${new Intl.NumberFormat(t.numberLocale).format(tokensUsed)}</data></div>`}<a href="${REPO}">${t.source}</a></footer>
+<footer><div>${t.footer}<br><span class="maintainer">${esc(t.maintainedBy)}</span></div><a href="${REPO}">${t.source}</a></footer>
 </body></html>`;
 }
 
@@ -229,6 +222,29 @@ function docsSidebar(loc, current) {
   return s + '</aside>';
 }
 
+// ---------- development activity (omitted when unavailable) ----------
+const activity = await fetchActivity(process.env.GITHUB_TOKEN);
+function activitySection(loc) {
+  if (!activity) return '';
+  const t = LOCALES[loc].activity;
+  const nf = new Intl.NumberFormat(LOCALES[loc].numberLocale);
+  const num = (n) => (Number.isSafeInteger(n) && n >= 0 ? nf.format(n) : '0');
+  const max = Math.max(1, ...activity.rows.map((r) => r.additions + r.deletions));
+  const pct = (n) => Math.round((n / max) * 1000) / 10;
+  const rows = activity.rows.map((r) => {
+    const [, mm, dd] = r.day.split('-').map(Number);
+    return `<tr${r.prs ? '' : ' class="zero"'}><th scope="row"><time datetime="${esc(r.day)}">${esc(t.day(mm, dd))}</time></th><td class="n">${num(r.prs)}</td>`
+      + `<td class="n add">+${num(r.additions)}</td><td class="n del">−${num(r.deletions)}</td>`
+      + `<td class="bar" aria-hidden="true"><span class="a" style="width:${pct(r.additions)}%"></span><span class="d" style="width:${pct(r.deletions)}%"></span></td></tr>`;
+  }).join('');
+  const [yy, mo] = activity.month.split('-').map(Number);
+  const repos = activity.repos.map((r) => `<a href="https://github.com/${esc(r)}">${esc(r.split('/')[1])}</a>`).join(', ');
+  return `<section class="activity" aria-labelledby="activity-title"><div class="section-head reveal"><p class="eyebrow">${esc(t.eyebrow)}</p><h2 id="activity-title">${esc(t.title(yy, mo))}</h2>`
+    + `<p class="sub">${esc(t.summary(num(activity.totals.prs), num(activity.totals.additions), num(activity.totals.deletions)))}</p></div>`
+    + `<div class="table-wrap reveal"><table class="activity-table"><thead><tr><th scope="col">${esc(t.date)}</th><th scope="col" class="n">${esc(t.prs)}</th><th scope="col" class="n">${esc(t.additions)}</th><th scope="col" class="n">${esc(t.deletions)}</th><th scope="col" class="bar"><span class="sr">${esc(t.chart)}</span></th></tr></thead><tbody>${rows}</tbody></table></div>`
+    + `<p class="note reveal">${esc(t.scope(activity.org, activity.repos.length))} ${repos}. ${esc(t.method(activity.generatedAt.slice(0, 16).replace('T', ' ') + ' UTC'))}</p></section>`;
+}
+
 // ---------- write ----------
 const write = (rel, html) => { const f = path.join(out, rel); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, html); };
 fs.rmSync(out, { recursive: true, force: true });
@@ -243,7 +259,7 @@ let count = 0;
 for (const loc of locales) {
   const t = LOCALES[loc];
   for (const [file, key, active] of handPages) {
-    let body = fs.readFileSync(path.join(src, 'pages', loc, file), 'utf8');
+    let body = fs.readFileSync(path.join(src, 'pages', loc, file), 'utf8').replace('<!-- ACTIVITY -->', () => activitySection(loc));
     body = body.replace(/<pre data-lang="([\w-]+)"([^>]*)>([\s\S]*?)<\/pre>/g, (_, l, attrs, c) =>
       `<pre${attrs}><code class="hljs language-${l}">${highlight(c.replace(/^\n/, '').replace(/\n$/, ''), l)}</code></pre>`);
     write(`${loc}/${file}`, layout({ loc, rel: file, title: t.pages[key], body, active, wide: key === 'index' }));

@@ -13,6 +13,9 @@ on:
       - "docs/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
+  schedule:
+    # Daily rebuild at 00:10 Hong Kong time (16:10 UTC) to refresh the development-activity section.
+    - cron: '10 16 * * *'
 
 permissions:
   contents: read
@@ -36,6 +39,9 @@ jobs:
         run: npm ci
       - name: Build site
         working-directory: site
+        env:
+          # Read-only token used to fetch development activity from the GitHub API (public repos only).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run build
       - name: Check links
         working-directory: site
