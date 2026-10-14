@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 
 type HttpResponse = Response<Body>;
@@ -19,10 +20,12 @@ use crate::manifest::{Manifest, RouteSpec};
 
 use super::crud::{self, MethodFail};
 use super::exec::QueryExec;
+use super::limiter::{ip_bucket, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision};
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredKey {
     pub key_id: String,
     pub secret_hash: String,
@@ -30,6 +33,7 @@ pub struct StoredKey {
     pub tenant_id: String,
     pub scopes: Vec<String>,
     pub expires_unix: i64,
+    #[serde(default)]
     pub revoked: bool,
 }
 
@@ -42,7 +46,16 @@ pub struct AuthConfig {
     pub aud: String,
     pub pepper: Vec<u8>,
     pub api_keys: Vec<StoredKey>,
+    /// When set, keys come from this file (reloaded on change) instead of
+    /// `api_keys`.
+    pub api_keys_file: Option<Arc<ApiKeyFile>>,
     pub env_name: String,
+    /// When set, JWT keys come from this JWKS (spec §4.1) instead of
+    /// `public_pem`/`kid`.
+    pub jwks: Option<Arc<super::jwks::JwksCache>>,
+    /// Default claim holding the caller's roles (`VIBE_JWT_ROLES_CLAIM`,
+    /// default `roles`); a route's `roles-claim` overrides it.
+    pub roles_claim: String,
 }
 
 impl AuthConfig {
@@ -55,7 +68,10 @@ impl AuthConfig {
             aud: "shop".into(),
             pepper: b"dev-pepper".to_vec(),
             api_keys: Vec::new(),
+            api_keys_file: None,
             env_name: "test".into(),
+            jwks: None,
+            roles_claim: "roles".into(),
         }
     }
 }
@@ -71,11 +87,13 @@ pub struct AppState {
     pub exec: Arc<dyn QueryExec>,
     pub auth: AuthConfig,
     pub slugs: HashMap<String, Slug>,
-    pub rates: Mutex<HashMap<String, Vec<Instant>>>,
-    pub quotas: Mutex<HashMap<String, u32>>,
+    pub rates: Mutex<RateBuckets>,
+    pub quotas: Mutex<QuotaBuckets>,
     pub disabled: HashSet<String>,
     pub min_override_ms: Option<u64>,
     pub honor_test_ip: bool,
+    /// Proxies whose `X-Forwarded-For` is trusted. Empty = use the peer address.
+    pub trusted_proxies: Vec<ProxyNet>,
     /// When set, an unknown public slug explains how to register it.
     pub dev_hints: bool,
 }
@@ -86,6 +104,140 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 /// Minimum API-key pepper length in production.
 pub const MIN_PEPPER_BYTES: usize = 32;
+
+/// An API key file that is re-read when its mtime changes (checked at most
+/// once a second), so revocations apply without a restart. A reload that
+/// fails (bad JSON, bad mode) keeps the previous key set and logs a warning.
+pub struct ApiKeyFile {
+    path: std::path::PathBuf,
+    state: std::sync::Mutex<ApiKeyFileState>,
+}
+
+struct ApiKeyFileState {
+    mtime: Option<std::time::SystemTime>,
+    checked: std::time::Instant,
+    keys: Arc<Vec<StoredKey>>,
+}
+
+impl ApiKeyFile {
+    /// Loads the file; a bad file at startup is an error.
+    pub fn open(path: std::path::PathBuf) -> Result<Self, String> {
+        let keys = load_api_keys(&path)?;
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        Ok(Self {
+            path,
+            state: std::sync::Mutex::new(ApiKeyFileState {
+                mtime,
+                checked: std::time::Instant::now(),
+                keys: Arc::new(keys),
+            }),
+        })
+    }
+
+    /// The current key set, reloading first if the file changed.
+    pub fn keys(&self) -> Arc<Vec<StoredKey>> {
+        self.keys_at(std::time::Instant::now())
+    }
+
+    fn keys_at(&self, now: std::time::Instant) -> Arc<Vec<StoredKey>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if now.duration_since(state.checked) >= std::time::Duration::from_secs(1) {
+            state.checked = now;
+            self.reload_if_changed(&mut state);
+        }
+        state.keys.clone()
+    }
+
+    /// Forces a re-read now (tests, signals), ignoring the mtime throttle.
+    pub fn reload(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.checked = std::time::Instant::now();
+        let mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
+        match load_api_keys(&self.path) {
+            Ok(keys) => {
+                state.keys = Arc::new(keys);
+                state.mtime = mtime;
+            }
+            Err(err) => {
+                tracing::warn!(%err, "API key reload failed; keeping previous keys");
+                // Remember the bad mtime so the periodic path does not spin.
+                if mtime.is_some() {
+                    state.mtime = mtime;
+                }
+            }
+        }
+    }
+
+    fn reload_if_changed(&self, state: &mut ApiKeyFileState) {
+        let mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime.is_some() && mtime == state.mtime {
+            return;
+        }
+        match load_api_keys(&self.path) {
+            Ok(keys) => {
+                state.keys = Arc::new(keys);
+                state.mtime = mtime;
+            }
+            Err(err) => tracing::warn!(%err, "API key reload failed; keeping previous keys"),
+        }
+    }
+}
+
+/// Loads stored API keys from a JSON array of [`StoredKey`] records (secrets
+/// are HMAC hashes, never plaintext). The file must not be writable by group
+/// or others, nor readable by others, and every record must be well formed.
+pub fn load_api_keys(path: &std::path::Path) -> Result<Vec<StoredKey>, String> {
+    let shown = path.display();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|err| format!("VIBE_API_KEYS_FILE {shown}: {err}"))?
+            .permissions()
+            .mode();
+        if mode & 0o026 != 0 {
+            return Err(format!(
+                "VIBE_API_KEYS_FILE {shown} has mode {:o}; it must not be group/other writable or other readable (chmod 600)",
+                mode & 0o777
+            ));
+        }
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("VIBE_API_KEYS_FILE {shown}: {err}"))?;
+    let keys: Vec<StoredKey> =
+        serde_json::from_str(&text).map_err(|err| format!("VIBE_API_KEYS_FILE {shown}: {err}"))?;
+    let mut seen = HashSet::new();
+    for key in &keys {
+        let ok_id = key.key_id.len() == 12
+            && key
+                .key_id
+                .chars()
+                .all(|c| matches!(c, 'a'..='z' | '2'..='7'));
+        let ok_hash =
+            key.secret_hash.len() == 64 && key.secret_hash.chars().all(|c| c.is_ascii_hexdigit());
+        if !ok_id
+            || !ok_hash
+            || !matches!(key.env.as_str(), "live" | "test")
+            || !super::slugs::valid_tenant(&key.tenant_id)
+        {
+            return Err(format!(
+                "VIBE_API_KEYS_FILE {shown}: invalid record for key_id {:?}",
+                key.key_id
+            ));
+        }
+        if !seen.insert(key.key_id.clone()) {
+            return Err(format!(
+                "VIBE_API_KEYS_FILE {shown}: duplicate key_id {}",
+                key.key_id
+            ));
+        }
+    }
+    Ok(keys)
+}
 
 /// Deployment environment, from `VIBE_ENV` (case-insensitive). This is the
 /// single place that decides "is this production?".
@@ -212,37 +364,59 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         .keys()
         .any(|key| matches!(key.as_str(), "api_key" | "api-key" | "key"))
     {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "API keys are not accepted in the query",
-            &request_id,
-            &[],
-        );
+        return finish(
+            found.route,
+            &state,
+            started,
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "API keys are not accepted in the query",
+                &request_id,
+                &[],
+            ),
+        )
+        .await;
     }
     let headers = header_map(req.headers());
-    let ip = client_ip(&headers, state.honor_test_ip);
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip());
+    let ip = client_ip(&headers, peer, &state.trusted_proxies, state.honor_test_ip);
     let body_limit = found.route.body_limit as usize;
     let bytes = match axum::body::to_bytes(req.into_body(), body_limit.saturating_add(1)).await {
         Ok(bytes) => bytes,
         Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                "Could not read the body",
-                &request_id,
-                &[],
-            );
+            return finish(
+                found.route,
+                &state,
+                started,
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    "BAD_REQUEST",
+                    "Could not read the body",
+                    &request_id,
+                    &[],
+                ),
+            )
+            .await;
         }
     };
     if bytes.len() > body_limit {
-        return error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "PAYLOAD_TOO_LARGE",
-            "Body is too large",
-            &request_id,
-            &[],
-        );
+        return finish(
+            found.route,
+            &state,
+            started,
+            error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "PAYLOAD_TOO_LARGE",
+                "Body is too large",
+                &request_id,
+                &[],
+            ),
+        )
+        .await;
     }
     let content_type = headers.get("content-type").cloned().unwrap_or_default();
     let body = if bytes.is_empty() {
@@ -252,36 +426,39 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             .to_ascii_lowercase()
             .starts_with("application/json")
     {
-        return error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "UNSUPPORTED_MEDIA_TYPE",
-            "Content-Type must be application/json",
-            &request_id,
-            &[],
-        );
-    } else {
-        match serde_json::from_slice::<Value>(&bytes) {
-            Ok(value) => value,
-            Err(_) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "BAD_REQUEST",
-                    "Body is not JSON",
-                    &request_id,
-                    &[],
-                );
-            }
-        }
-    };
-    if let Err(fail) = validate_request(found.route, &body, &query, &found.params) {
         return finish(
             found.route,
             &state,
             started,
-            fail_response(found.route, fail, &request_id),
+            error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "UNSUPPORTED_MEDIA_TYPE",
+                "Content-Type must be application/json",
+                &request_id,
+                &[],
+            ),
         )
         .await;
-    }
+    } else {
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return finish(
+                    found.route,
+                    &state,
+                    started,
+                    error_response(
+                        StatusCode::BAD_REQUEST,
+                        "BAD_REQUEST",
+                        "Body is not JSON",
+                        &request_id,
+                        &[],
+                    ),
+                )
+                .await;
+            }
+        }
+    };
     let principal = if found.route.public && found.route.auth_removed {
         let slug = found.params.get("slug").cloned().unwrap_or_default();
         match state.slugs.get(&slug) {
@@ -318,7 +495,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             }
         }
     } else {
-        match authenticate(&state.auth, found.route, &headers) {
+        match authenticate(&state.auth, found.route, &headers).await {
             Ok(principal) => principal,
             Err(response) => {
                 return finish(
@@ -352,26 +529,30 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
     }
-    if found.route.auth_mode == "api-key" {
+    let scope_ok = if found.route.auth_mode == "api-key" {
         let definition = found.route.feature_id.split('/').next().unwrap_or("");
         let write = found.route.method != "GET";
-        if !scope_allows(&principal.scopes, definition, write) {
-            return finish(
-                found.route,
-                &state,
-                started,
-                error_response(
-                    StatusCode::FORBIDDEN,
-                    "FORBIDDEN",
-                    "Forbidden",
-                    &request_id,
-                    &[],
-                ),
-            )
-            .await;
-        }
+        scope_allows(&principal.scopes, definition, write)
+    } else {
+        true
+    };
+    // Declared route scopes: the caller must hold every one of them.
+    if !scope_ok || !route_scopes_allow(&principal.scopes, &found.route.scopes) {
+        return finish(
+            found.route,
+            &state,
+            started,
+            error_response(
+                StatusCode::FORBIDDEN,
+                "FORBIDDEN",
+                "Forbidden",
+                &request_id,
+                &[],
+            ),
+        )
+        .await;
     }
-    if let Some(retry) = rate_limited(&state, found.route, &ip, &principal.tenant_id) {
+    if let Some(retry) = rate_limited(&state, found.route, &ip, &principal, &body) {
         return finish(
             found.route,
             &state,
@@ -386,7 +567,19 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
     }
+    // Validate only after authentication and authorization, so unauthenticated
+    // callers cannot probe the request schema of protected endpoints.
+    if let Err(fail) = validate_request(found.route, &body, &query, &found.params, &headers) {
+        return finish(
+            found.route,
+            &state,
+            started,
+            fail_response(found.route, fail, &request_id),
+        )
+        .await;
+    }
     if found.route.public_writes && quota_exhausted(&state, &principal.tenant_id, &ip) {
+        let retry = seconds_until_utc_midnight().to_string();
         return finish(
             found.route,
             &state,
@@ -396,7 +589,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                 "RATE_LIMITED",
                 "Public write quota is exhausted",
                 &request_id,
-                &[("retry-after", "3600")],
+                &[("retry-after", retry.as_str())],
             ),
         )
         .await;
@@ -445,18 +638,16 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     let input = match crud::eval_expr(&found.route.transform_in, &vars) {
         Ok(value) => value,
         Err(err) => {
-            return finish(
-                found.route,
-                &state,
-                started,
+            return finish(found.route, &state, started, {
+                tracing::warn!(%request_id, error = %err, "transform.in failed");
                 error_response(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "VALIDATION_FAILED",
-                    &err,
+                    "Invalid request",
                     &request_id,
                     &[],
-                ),
-            )
+                )
+            })
             .await;
         }
     };
@@ -482,18 +673,16 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     match crud::eval_expr(&step.args, &vars) {
                         Ok(value) => value,
                         Err(err) => {
-                            return finish(
-                                found.route,
-                                &state,
-                                started,
+                            return finish(found.route, &state, started, {
+                                tracing::warn!(%request_id, error = %err, "step args failed");
                                 error_response(
                                     StatusCode::UNPROCESSABLE_ENTITY,
                                     "VALIDATION_FAILED",
-                                    &err,
+                                    "Invalid request",
                                     &request_id,
                                     &[],
-                                ),
-                            )
+                                )
+                            })
                             .await;
                         }
                     }
@@ -550,7 +739,29 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     status = StatusCode::from_u16(step.status).unwrap_or(StatusCode::OK);
                 }
             }
-            "validate" | "transform" => {}
+            "validate" => {
+                vars.insert("input".into(), input.clone());
+                if crud::when_matches(&step.when_expr, &vars) {
+                    let code = if step.fail.is_empty() {
+                        "VALIDATION_FAILED".to_string()
+                    } else {
+                        step.fail.clone()
+                    };
+                    let mapped = found.route.errors.iter().find(|e| e.from == code);
+                    let status = mapped
+                        .and_then(|e| StatusCode::from_u16(e.status).ok())
+                        .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+                    let public_code = mapped.map(|e| e.code.clone()).unwrap_or(code);
+                    return finish(
+                        found.route,
+                        &state,
+                        started,
+                        error_response(status, &public_code, "Invalid request", &request_id, &[]),
+                    )
+                    .await;
+                }
+            }
+            "transform" => {}
             _ => {
                 return finish(
                     found.route,
@@ -683,12 +894,32 @@ fn normalize_request_path(path: &str) -> String {
     path
 }
 
+/// Validates the request against the route's declared fields.
+///
+/// Key policy: only top-level body keys are declared and checked; a declared
+/// field's value may be any JSON of its type, and nested objects/arrays are
+/// not walked (types are scalar, so an object value fails the type check).
+/// Duplicate JSON keys are resolved by the parser (serde_json keeps the last
+/// occurrence) before validation; duplicate query keys likewise keep the last
+/// value.
 fn validate_request(
     route: &RouteSpec,
     body: &Value,
     query: &BTreeMap<String, String>,
     path: &BTreeMap<String, String>,
+    headers: &BTreeMap<String, String>,
 ) -> Result<(), MethodFail> {
+    let has_body_fields = route.request.iter().any(|field| field.location == "body");
+    if !body.is_null() && !body.is_object() {
+        return Err(MethodFail::code(
+            "VALIDATION_FAILED",
+            if has_body_fields {
+                "body must be a JSON object"
+            } else {
+                "body is not allowed"
+            },
+        ));
+    }
     if let Some(obj) = body.as_object() {
         for key in obj.keys() {
             if !route
@@ -723,10 +954,13 @@ fn validate_request(
             }
             "query" => query.contains_key(&field.name),
             "path" => path.contains_key(&field.name),
-            "header" => true,
+            // An empty (or whitespace-only) header counts as missing.
+            "header" => headers
+                .get(&field.name.to_ascii_lowercase())
+                .is_some_and(|v| !v.trim().is_empty()),
             _ => false,
         };
-        if field.required && field.location != "header" && !present {
+        if field.required && !present {
             return Err(MethodFail::code(
                 "VALIDATION_FAILED",
                 format!("{} is required", field.name),
@@ -739,6 +973,13 @@ fn validate_request(
         }
         if field.location == "query" {
             if let Some(raw) = query.get(&field.name) {
+                check_type(field, &coerce(raw, &field.ty))?;
+            }
+        }
+        // Path params are typed too, so e.g. a malformed `path.id` uuid is a
+        // 422 here and never reaches SQL.
+        if field.location == "path" {
+            if let Some(raw) = path.get(&field.name) {
                 check_type(field, &coerce(raw, &field.ty))?;
             }
         }
@@ -794,9 +1035,52 @@ fn check_type(field: &crate::manifest::ReqField, value: &Value) -> Result<(), Me
                 ));
             }
         }
-        _ => {}
+        "number" => {
+            if !value.is_number() {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be a number", field.name),
+                ));
+            }
+        }
+        "boolean" => {
+            if !value.is_boolean() {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be a boolean", field.name),
+                ));
+            }
+        }
+        "uuid" => {
+            if value.as_str().is_none_or(|s| !is_canonical_uuid(s)) {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be a uuid", field.name),
+                ));
+            }
+        }
+        other => {
+            // `vibe validate` rejects unknown types; an old manifest fails closed.
+            return Err(MethodFail::code(
+                "INTERNAL",
+                format!("unsupported request type {other} for {}", field.name),
+            ));
+        }
     }
     Ok(())
+}
+
+/// Request field types the runtime understands.
+pub const REQUEST_TYPES: [&str; 5] = ["string", "integer", "number", "boolean", "uuid"];
+
+/// Only the canonical hyphenated form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
+/// (either case); braces, `urn:uuid:` and the 32-hex simple form are rejected.
+fn is_canonical_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
 }
 
 fn coerce(raw: &str, ty: &str) -> Value {
@@ -811,12 +1095,18 @@ fn coerce(raw: &str, ty: &str) -> Value {
             .and_then(serde_json::Number::from_f64)
             .map(Value::Number)
             .unwrap_or(Value::String(raw.into())),
-        "boolean" => Value::Bool(raw == "true"),
+        // Only the exact strings `true` and `false`; anything else stays a
+        // string and fails the boolean check.
+        "boolean" => match raw {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => Value::String(raw.into()),
+        },
         _ => Value::String(raw.into()),
     }
 }
 
-fn authenticate(
+async fn authenticate(
     auth: &AuthConfig,
     route: &RouteSpec,
     headers: &BTreeMap<String, String>,
@@ -825,48 +1115,127 @@ fn authenticate(
         let key = headers
             .get("x-api-key")
             .cloned()
-            .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+            .ok_or_else(|| AuthError::unauthorized("ApiKey"))?;
         return verify_api_key(auth, &key);
     }
     let header = headers.get("authorization").cloned().unwrap_or_default();
     let token = header
         .strip_prefix("Bearer ")
         .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
-    verify_jwt(auth, token)
+    let roles_claim = if route.roles_claim.is_empty() {
+        auth.roles_claim.as_str()
+    } else {
+        route.roles_claim.as_str()
+    };
+    let jwt_header =
+        jsonwebtoken::decode_header(token).map_err(|_| AuthError::unauthorized("Bearer"))?;
+    let kid = jwt_header
+        .kid
+        .clone()
+        .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+    let (alg, key) = if let Some(jwks) = &auth.jwks {
+        let found = jwks
+            .key(&kid)
+            .await
+            .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+        (found.alg, found.key)
+    } else {
+        if auth.public_pem.is_empty() || kid != auth.kid {
+            return Err(AuthError::unauthorized("Bearer"));
+        }
+        let key = if auth.alg == Algorithm::RS256 {
+            DecodingKey::from_rsa_pem(auth.public_pem.as_bytes())
+        } else {
+            DecodingKey::from_ec_pem(auth.public_pem.as_bytes())
+        }
+        .map_err(|_| AuthError::unauthorized("Bearer"))?;
+        (auth.alg, key)
+    };
+    if jwt_header.alg != alg {
+        return Err(AuthError::unauthorized("Bearer"));
+    }
+    verify_jwt(auth, token, alg, &key, roles_claim)
 }
 
-fn verify_jwt(auth: &AuthConfig, token: &str) -> Result<Principal, AuthError> {
-    if auth.public_pem.is_empty() {
-        return Err(AuthError::unauthorized("Bearer"));
-    }
-    let header =
-        jsonwebtoken::decode_header(token).map_err(|_| AuthError::unauthorized("Bearer"))?;
-    if header.kid.as_deref() != Some(auth.kid.as_str()) || header.alg != auth.alg {
-        return Err(AuthError::unauthorized("Bearer"));
-    }
-    let mut validation = Validation::new(auth.alg);
+fn verify_jwt(
+    auth: &AuthConfig,
+    token: &str,
+    alg: Algorithm,
+    key: &DecodingKey,
+    roles_claim: &str,
+) -> Result<Principal, AuthError> {
+    let mut validation = Validation::new(alg);
     validation.set_issuer(&[&auth.iss]);
     validation.set_audience(&[&auth.aud]);
     validation.leeway = 60;
     validation.validate_nbf = true;
-    let key = if auth.alg == Algorithm::RS256 {
-        DecodingKey::from_rsa_pem(auth.public_pem.as_bytes())
-            .map_err(|_| AuthError::unauthorized("Bearer"))?
-    } else {
-        DecodingKey::from_ec_pem(auth.public_pem.as_bytes())
-            .map_err(|_| AuthError::unauthorized("Bearer"))?
-    };
-    let data = jsonwebtoken::decode::<Claims>(token, &key, &validation)
+    let data = jsonwebtoken::decode::<Claims>(token, key, &validation)
         .map_err(|_| AuthError::unauthorized("Bearer"))?;
     if data.claims.exp.saturating_sub(data.claims.iat) > 3600 {
         return Err(AuthError::unauthorized("Bearer"));
     }
+    if !super::slugs::valid_tenant(&data.claims.tenant_id) {
+        return Err(AuthError::unauthorized("Bearer"));
+    }
+    // A present but malformed roles claim is rejected, not treated as "no roles".
+    let roles = roles_from_claims(&data.claims.extra, roles_claim)?;
+    let scopes = scopes_from_claims(&data.claims.extra);
     Ok(Principal {
         tenant_id: data.claims.tenant_id,
         subject: data.claims.sub,
-        roles: data.claims.roles,
-        scopes: Vec::new(),
+        roles,
+        scopes,
     })
+}
+
+/// Walks a dotted path (`realm_access.roles`) or a URL-style claim key.
+fn claim_value<'a>(extra: &'a HashMap<String, Value>, path: &str) -> Option<&'a Value> {
+    if path.contains("://") {
+        return extra.get(path);
+    }
+    let mut parts = path.split('.');
+    let first = parts.next()?;
+    let mut cur = extra.get(first)?;
+    for part in parts {
+        cur = cur.as_object()?.get(part)?;
+    }
+    Some(cur)
+}
+
+fn roles_from_claims(
+    extra: &HashMap<String, Value>,
+    roles_claim: &str,
+) -> Result<Vec<String>, AuthError> {
+    match claim_value(extra, roles_claim) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| AuthError::unauthorized("Bearer")),
+        Some(_) => Err(AuthError::unauthorized("Bearer")),
+    }
+}
+
+/// OAuth-style `scope` (space-separated string) or `scp` (array or string).
+fn scopes_from_claims(extra: &HashMap<String, Value>) -> Vec<String> {
+    let from = |v: &Value| -> Option<Vec<String>> {
+        match v {
+            Value::String(s) => Some(s.split_whitespace().map(str::to_string).collect()),
+            Value::Array(items) => items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>(),
+            _ => None,
+        }
+    };
+    if let Some(v) = extra.get("scope").and_then(from) {
+        return v;
+    }
+    if let Some(v) = extra.get("scp").and_then(from) {
+        return v;
+    }
+    Vec::new()
 }
 
 fn verify_api_key(auth: &AuthConfig, token: &str) -> Result<Principal, AuthError> {
@@ -891,13 +1260,18 @@ fn verify_api_key(auth: &AuthConfig, token: &str) -> Result<Principal, AuthError
         return Err(AuthError::unauthorized("ApiKey"));
     }
     let hash = hmac_hex(&auth.pepper, secret);
-    let Some(record) = auth.api_keys.iter().find(|key| key.key_id == key_id) else {
+    let current = auth.api_keys_file.as_ref().map(|file| file.keys());
+    let keys: &[StoredKey] = current.as_deref().map_or(&auth.api_keys, |k| k.as_slice());
+    let Some(record) = keys.iter().find(|key| key.key_id == key_id) else {
         return Err(AuthError::unauthorized("ApiKey"));
     };
     if !ct_eq(&record.secret_hash, &hash) || record.revoked || record.env != env {
         return Err(AuthError::unauthorized("ApiKey"));
     }
     if record.expires_unix < chrono::Utc::now().timestamp() {
+        return Err(AuthError::unauthorized("ApiKey"));
+    }
+    if !super::slugs::valid_tenant(&record.tenant_id) {
         return Err(AuthError::unauthorized("ApiKey"));
     }
     Ok(Principal {
@@ -923,8 +1297,37 @@ fn ct_eq(left: &str, right: &str) -> bool {
     left.ct_eq(right).into()
 }
 
+/// Picks ES256 or RS256 from a public PEM. `VIBE_JWT_ALG` can override this.
+pub fn detect_jwt_alg(pem: &str) -> Result<Algorithm, String> {
+    if DecodingKey::from_rsa_pem(pem.as_bytes()).is_ok() {
+        return Ok(Algorithm::RS256);
+    }
+    if DecodingKey::from_ec_pem(pem.as_bytes()).is_ok() {
+        return Ok(Algorithm::ES256);
+    }
+    Err("VIBE_JWT_PUBLIC_KEY_PEM is not a usable RSA or EC public key".into())
+}
+
 pub fn hash_api_secret(pepper: &[u8], secret: &str) -> String {
     hmac_hex(pepper, secret)
+}
+
+/// Every scope declared on the route must be held, exactly or through a
+/// `definition:*` / `definition:admin` grant (and `:write` covers `:read`).
+fn route_scopes_allow(have: &[String], required: &[String]) -> bool {
+    required.iter().all(|need| {
+        have.iter().any(|h| {
+            if h == need {
+                return true;
+            }
+            match (h.split_once(':'), need.split_once(':')) {
+                (Some((hd, ha)), Some((nd, na))) if hd == nd => {
+                    matches!(ha, "*" | "admin") || (ha == "write" && na == "read")
+                }
+                _ => false,
+            }
+        })
+    })
 }
 
 fn scope_allows(scopes: &[String], definition: &str, write: bool) -> bool {
@@ -943,56 +1346,135 @@ fn scope_allows(scopes: &[String], definition: &str, write: bool) -> bool {
     })
 }
 
-fn rate_limited(state: &AppState, route: &RouteSpec, ip: &str, tenant: &str) -> Option<String> {
+/// Shard and bucket for one rate-limit step. Shards are per route and key
+/// type, so flooding one key type cannot evict another's buckets.
+fn rate_bucket(
+    key: &str,
+    route: &RouteSpec,
+    ip: &str,
+    principal: &Principal,
+    body: &Value,
+    pepper: &[u8],
+) -> (String, String) {
+    let tenant = &principal.tenant_id;
+    let feature = &route.feature_id;
+    let field = match key {
+        "tenant" => return (format!("{feature}:tenant"), tenant.clone()),
+        "user" | "api-key" => {
+            return (
+                format!("{feature}:{key}"),
+                format!("{tenant}:{}", principal.subject),
+            )
+        }
+        // Deprecated alias (login-guard `account-per-minute`) for input.email.
+        "account" => Some("email"),
+        _ => key.strip_prefix("input."),
+    };
+    match field {
+        Some(field) => {
+            // Normalize, then HMAC so the plaintext is never stored (§4.3).
+            // A missing field normalizes to "" so all requests without it share
+            // one bucket per tenant: omitting the field cannot dodge the limit.
+            let raw = body
+                .get(field)
+                .map(|v| match v {
+                    Value::String(s) => s.trim().to_lowercase(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            (
+                format!("{feature}:input.{field}"),
+                format!("{tenant}:{}", hmac_hex(pepper, &raw)),
+            )
+        }
+        None => (format!("{feature}:ip"), ip.to_string()),
+    }
+}
+
+fn rate_limited(
+    state: &AppState,
+    route: &RouteSpec,
+    ip: &str,
+    principal: &Principal,
+    body: &Value,
+) -> Option<String> {
     if route.rates.is_empty() {
         return None;
     }
-    let mut rates = state.rates.lock().ok()?;
-    let now = Instant::now();
-    for rate in &route.rates {
-        let bucket = match rate.key.as_str() {
-            "tenant" => format!("tenant:{tenant}:{}", route.feature_id),
-            "account" => format!("account:{tenant}:{}", route.feature_id),
-            _ => format!("ip:{ip}:{}", route.feature_id),
-        };
-        let hits = rates.entry(bucket).or_default();
-        hits.retain(|at| now.duration_since(*at) < Duration::from_secs(60));
-        if hits.len() as u32 >= rate.per_minute {
-            return Some("60".into());
-        }
-        hits.push(now);
+    let checks: Vec<(String, String, u32)> = route
+        .rates
+        .iter()
+        .map(|rate| {
+            let (shard, key) =
+                rate_bucket(&rate.key, route, ip, principal, body, &state.auth.pepper);
+            (shard, key, rate.per_minute)
+        })
+        .collect();
+    let Ok(mut rates) = state.rates.lock() else {
+        return Some("1".into());
+    };
+    match rates.check(&checks, Instant::now()) {
+        RateDecision::Allow => None,
+        RateDecision::Limited(wait) => Some(wait.to_string()),
     }
-    None
+}
+
+fn seconds_until_utc_midnight() -> i64 {
+    let now = chrono::Utc::now();
+    let tomorrow = (now.date_naive() + chrono::Days::new(1))
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight")
+        .and_utc();
+    (tomorrow - now).num_seconds().max(1)
 }
 
 fn quota_exhausted(state: &AppState, tenant: &str, ip: &str) -> bool {
     let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let mut quotas = match state.quotas.lock() {
-        Ok(quotas) => quotas,
-        Err(_) => return false,
-    };
-    let tenant_key = format!("tenant:{tenant}:{day}");
-    let ip_key = format!("ip:{ip}:{day}");
-    let tenant_count = *quotas.get(&tenant_key).unwrap_or(&0);
-    let ip_count = *quotas.get(&ip_key).unwrap_or(&0);
-    if tenant_count >= 1000 || ip_count >= 50 {
+    let Ok(mut quotas) = state.quotas.lock() else {
         return true;
-    }
-    *quotas.entry(tenant_key).or_insert(0) += 1;
-    *quotas.entry(ip_key).or_insert(0) += 1;
-    false
+    };
+    !quotas.check(
+        &day,
+        &[
+            ("tenant", tenant.to_string(), 1000),
+            ("ip", ip.to_string(), 50),
+        ],
+    )
 }
 
-fn client_ip(headers: &BTreeMap<String, String>, honor_test_ip: bool) -> String {
+/// Client IP bucket: the peer address, unless the peer is a trusted proxy, in
+/// which case the rightmost `X-Forwarded-For` hop that is not a trusted proxy.
+/// IPv4-mapped IPv6 becomes IPv4; IPv6 is grouped by /64.
+fn client_ip(
+    headers: &BTreeMap<String, String>,
+    peer: Option<IpAddr>,
+    trusted: &[ProxyNet],
+    honor_test_ip: bool,
+) -> String {
     if honor_test_ip {
         if let Some(ip) = headers.get("x-vibe-test-ip") {
             return ip.clone();
         }
     }
-    headers
-        .get("x-forwarded-for")
-        .cloned()
-        .unwrap_or_else(|| "0.0.0.0".into())
+    let Some(peer) = peer.map(|p| p.to_canonical()) else {
+        return "0.0.0.0".into();
+    };
+    let is_trusted = |ip: IpAddr| trusted.iter().any(|net| net.contains(ip));
+    if !is_trusted(peer) {
+        return ip_bucket(peer);
+    }
+    let Some(xff) = headers.get("x-forwarded-for") else {
+        return ip_bucket(peer);
+    };
+    let mut last = peer;
+    for hop in xff.rsplit(',') {
+        match parse_hop(hop) {
+            Some(ip) if is_trusted(ip) => last = ip,
+            Some(ip) => return ip_bucket(ip),
+            None => break,
+        }
+    }
+    ip_bucket(last)
 }
 
 fn header_map(headers: &HeaderMap) -> BTreeMap<String, String> {
@@ -1052,22 +1534,36 @@ struct Claims {
     #[allow(dead_code)]
     nbf: Option<i64>,
     tenant_id: String,
-    #[serde(default)]
-    roles: Vec<String>,
+    /// All other claims, including the configured roles claim and `scope`.
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
 }
 
 struct AuthError {
     scheme: String,
+    /// Operator-facing reason; never sent to the client.
+    reason: &'static str,
 }
 
 impl AuthError {
     fn unauthorized(scheme: &str) -> Self {
+        Self::fail(scheme, "unauthorized")
+    }
+
+    fn fail(scheme: &str, reason: &'static str) -> Self {
         Self {
             scheme: scheme.into(),
+            reason,
         }
     }
 
     fn with_request(self, request_id: &str) -> HttpResponse {
+        tracing::debug!(
+            request_id,
+            scheme = %self.scheme,
+            reason = self.reason,
+            "auth rejected"
+        );
         let header = format!("{} realm=\"vibe\"", self.scheme);
         error_response(
             StatusCode::UNAUTHORIZED,
@@ -1173,6 +1669,117 @@ fn empty_response(
 }
 
 #[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn xff(v: &str) -> BTreeMap<String, String> {
+        let mut h = BTreeMap::new();
+        h.insert("x-forwarded-for".to_string(), v.to_string());
+        h
+    }
+
+    #[test]
+    fn xff_ignored_without_trusted_proxy() {
+        let got = client_ip(&xff("1.2.3.4"), Some(ip("9.9.9.9")), &[], false);
+        assert_eq!(got, "9.9.9.9");
+    }
+
+    #[test]
+    fn xff_rightmost_untrusted_hop_with_cidr_ports_and_mapped() {
+        let trusted = [ProxyNet::parse("10.0.0.0/8").unwrap()];
+        let got = client_ip(
+            &xff("6.6.6.6, 5.5.5.5:4321, [::ffff:10.0.0.2]:80"),
+            Some(ip("::ffff:10.0.0.1")),
+            &trusted,
+            false,
+        );
+        assert_eq!(got, "5.5.5.5", "spoofed leftmost entry must be ignored");
+    }
+
+    #[test]
+    fn ipv6_clients_share_a_64() {
+        let a = client_ip(&BTreeMap::new(), Some(ip("2001:db8:0:1::a")), &[], false);
+        let b = client_ip(&BTreeMap::new(), Some(ip("2001:db8:0:1::b")), &[], false);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn buckets_follow_the_key() {
+        let route = test_route();
+        let p = Principal {
+            tenant_id: "tenant0001".into(),
+            subject: "u1".into(),
+            roles: vec![],
+            scopes: vec![],
+        };
+        let body = json!({"email": " A@X.COM "});
+        let pep = b"p";
+        let (shard, key) = rate_bucket("user", &route, "1.1.1.1", &p, &body, pep);
+        assert_eq!(shard, "f:user");
+        assert!(key.ends_with(":u1"));
+        assert_eq!(
+            rate_bucket("tenant", &route, "1.1.1.1", &p, &body, pep).0,
+            "f:tenant"
+        );
+        let a = rate_bucket("input.email", &route, "1.1.1.1", &p, &body, pep);
+        let b = rate_bucket(
+            "input.email",
+            &route,
+            "2.2.2.2",
+            &p,
+            &json!({"email": "a@x.com"}),
+            pep,
+        );
+        assert_eq!(a, b, "normalized input key is IP independent");
+        assert!(!a.1.contains("a@x.com"), "plaintext must not be stored");
+        assert_eq!(a, rate_bucket("account", &route, "3.3.3.3", &p, &body, pep));
+        assert_eq!(
+            rate_bucket("ip", &route, "1.1.1.1", &p, &body, pep),
+            ("f:ip".to_string(), "1.1.1.1".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_input_fields_share_one_empty_bucket() {
+        let route = test_route();
+        let p = Principal {
+            tenant_id: "tenant0001".into(),
+            subject: String::new(),
+            roles: vec![],
+            scopes: vec![],
+        };
+        let a = rate_bucket("input.email", &route, "1.1.1.1", &p, &json!({}), b"p");
+        let b = rate_bucket("input.email", &route, "9.9.9.9", &p, &Value::Null, b"p");
+        let c = rate_bucket(
+            "input.email",
+            &route,
+            "8.8.8.8",
+            &p,
+            &json!({"email": ""}),
+            b"p",
+        );
+        assert_eq!(a, b);
+        assert_eq!(a, c, "missing and empty share the same bucket");
+    }
+
+    fn test_route() -> RouteSpec {
+        serde_json::from_value(json!({
+            "method": "GET", "path": "/", "feature_id": "f", "public": false,
+            "auth_removed": false, "auth_mode": "jwt", "roles": [], "scopes": [],
+            "rates": [], "body_limit": 0, "request": [], "transform_in": "",
+            "transform_out": "", "steps": [], "errors": [], "min_response_ms": 0,
+            "public_writes": false, "challenge_type": "", "challenge_when": "",
+            "deprecated": false, "sunset": ""
+        }))
+        .unwrap()
+    }
+}
+
+#[cfg(test)]
 mod pepper_tests {
     use super::{resolve_pepper, RunEnv};
 
@@ -1221,5 +1828,511 @@ mod pepper_tests {
         assert!(warn.is_some());
         let (_, warn) = resolve_pepper(RunEnv::Dev, Some("short")).unwrap();
         assert!(warn.is_some());
+    }
+}
+
+#[cfg(test)]
+mod auth_wiring_tests {
+    use super::*;
+    use jsonwebtoken::{EncodingKey, Header};
+
+    const PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgxoRRfBXmTDDBak37\n\
+e7KiA/uL9uVmC6SjFqNA0iA3/eChRANCAATSao2qWXXhogkSFioKJEtYlfrdPLpD\n\
+RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
+-----END PRIVATE KEY-----\n";
+    const X: &str = "0mqNqll14aIJEhYqCiRLWJX63Ty6Q0UxBzbmJ2wI9FM";
+    const Y: &str = "FSS8OFxIbiCRaiHQPz-m-qM0jRsjlGSuzoyHxiraTWM";
+
+    struct Doc(Value);
+    #[async_trait::async_trait]
+    impl super::super::jwks::JwksSource for Doc {
+        async fn fetch(&self) -> Result<Value, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn route(json_patch: Value) -> RouteSpec {
+        let mut v = json!({
+            "method": "GET", "path": "/x", "feature_id": "catalog/x", "public": false,
+            "auth_removed": false, "auth_mode": "jwt", "roles": [], "scopes": [],
+            "rates": [], "body_limit": 0, "request": [], "transform_in": "",
+            "transform_out": "", "steps": [], "errors": [], "min_response_ms": 0,
+            "public_writes": false, "challenge_type": "", "challenge_when": "",
+            "deprecated": false, "sunset": ""
+        });
+        for (k, val) in json_patch.as_object().unwrap() {
+            v[k] = val.clone();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn token(kid: &str, extra: Value) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = json!({
+            "sub": "u1", "exp": now + 600, "iat": now, "nbf": now,
+            "iss": "https://auth.localhost/shop", "aud": "shop", "tenant_id": "tenant0001"
+        });
+        for (k, val) in extra.as_object().unwrap() {
+            claims[k] = val.clone();
+        }
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(kid.into());
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn bearer(t: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([("authorization".to_string(), format!("Bearer {t}"))])
+    }
+
+    fn jwks_auth() -> AuthConfig {
+        let mut auth = AuthConfig::anonymous();
+        auth.jwks = Some(Arc::new(super::super::jwks::JwksCache::new(Arc::new(Doc(
+            json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "k1", "x": X, "y": Y}]}),
+        )))));
+        auth
+    }
+
+    #[tokio::test]
+    async fn jwks_keys_verify_tokens_and_unknown_kids_fail() {
+        let auth = jwks_auth();
+        let r = route(json!({}));
+        let p = authenticate(
+            &auth,
+            &r,
+            &bearer(&token("k1", json!({"roles": ["staff"]}))),
+        )
+        .await
+        .ok()
+        .unwrap();
+        assert_eq!(p.roles, vec!["staff"]);
+        assert!(authenticate(&auth, &r, &bearer(&token("nope", json!({}))))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn roles_claim_is_configurable_and_malformed_claims_fail() {
+        let mut auth = jwks_auth();
+        auth.roles_claim = "https://example.com/roles".into();
+        let r = route(json!({}));
+        let t = token(
+            "k1",
+            json!({"https://example.com/roles": ["admin"], "roles": ["x"]}),
+        );
+        let p = authenticate(&auth, &r, &bearer(&t)).await.ok().unwrap();
+        assert_eq!(p.roles, vec!["admin"]);
+        // Route-level override.
+        let r2 = route(json!({"roles_claim": "groups"}));
+        let t = token("k1", json!({"groups": ["ops"]}));
+        assert_eq!(
+            authenticate(&auth, &r2, &bearer(&t))
+                .await
+                .ok()
+                .unwrap()
+                .roles,
+            vec!["ops"]
+        );
+        let bad = token("k1", json!({"groups": "ops"}));
+        assert!(authenticate(&auth, &r2, &bearer(&bad)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_api_key_challenges_with_apikey_scheme() {
+        let auth = AuthConfig::anonymous();
+        let r = route(json!({"auth_mode": "api-key"}));
+        let err = authenticate(&auth, &r, &BTreeMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.scheme, "ApiKey");
+    }
+
+    #[test]
+    fn route_scopes_must_all_be_held() {
+        let have = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let need = have(&["catalog:read", "orders:read"]);
+        assert!(!route_scopes_allow(&have(&["catalog:read"]), &need));
+        assert!(route_scopes_allow(
+            &have(&["catalog:write", "orders:*"]),
+            &need
+        ));
+        assert!(!route_scopes_allow(
+            &have(&["catalog:read", "orders:readx"]),
+            &need
+        ));
+        assert!(route_scopes_allow(&[], &[]));
+        assert!(!route_scopes_allow(
+            &have(&["catalog:read"]),
+            &have(&["catalog:write"])
+        ));
+    }
+
+    #[test]
+    fn api_keys_file_is_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vibe-keys-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys.json");
+        let good = json!([{
+            "key_id": "abcdefghijk2", "secret_hash": "a".repeat(64), "env": "live",
+            "tenant_id": "tenant0001", "scopes": ["catalog:read"], "expires_unix": 4102444800i64
+        }]);
+        std::fs::write(&path, good.to_string()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_api_keys(&path).err().unwrap().contains("chmod 600"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(load_api_keys(&path).unwrap().len(), 1);
+        for bad in [
+            json!([{"key_id": "short", "secret_hash": "a".repeat(64), "env": "live",
+                    "tenant_id": "tenant0001", "scopes": [], "expires_unix": 0}]),
+            json!([{"key_id": "abcdefghijk2", "secret_hash": "plaintext", "env": "live",
+                    "tenant_id": "tenant0001", "scopes": [], "expires_unix": 0}]),
+            json!([{"key_id": "abcdefghijk2", "secret_hash": "a".repeat(64), "env": "live",
+                    "tenant_id": "x, t_victim", "scopes": [], "expires_unix": 0}]),
+            json!([{"key_id": "abcdefghijk2", "secret": "s", "secret_hash": "a".repeat(64),
+                    "env": "live", "tenant_id": "tenant0001", "scopes": [], "expires_unix": 0}]),
+            json!([good[0].clone(), good[0].clone()]),
+        ] {
+            std::fs::write(&path, bad.to_string()).unwrap();
+            assert!(load_api_keys(&path).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn jwt_rejects_alg_mismatch_hs256_wrong_aud_iss_and_expired() {
+        let auth = jwks_auth();
+        let r = route(json!({}));
+        // Wrong kid / missing key → 401.
+        assert!(authenticate(&auth, &r, &bearer(&token("nope", json!({}))))
+            .await
+            .is_err());
+        // Expired.
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = json!({
+            "sub": "u1", "exp": now - 120, "iat": now - 600, "nbf": now - 600,
+            "iss": "https://auth.localhost/shop", "aud": "shop", "tenant_id": "tenant0001",
+            "roles": ["staff"]
+        });
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some("k1".into());
+        let expired = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(authenticate(&auth, &r, &bearer(&expired)).await.is_err());
+        // Wrong aud.
+        claims["exp"] = json!(now + 600);
+        claims["iat"] = json!(now);
+        claims["nbf"] = json!(now);
+        claims["aud"] = json!("other");
+        let bad_aud = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(authenticate(&auth, &r, &bearer(&bad_aud)).await.is_err());
+        // Wrong iss.
+        claims["aud"] = json!("shop");
+        claims["iss"] = json!("https://evil.example/");
+        let bad_iss = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(authenticate(&auth, &r, &bearer(&bad_iss)).await.is_err());
+        // HS256 header with EC key in JWKS must fail (alg pin).
+        let mut hs = Header::new(Algorithm::HS256);
+        hs.kid = Some("k1".into());
+        let hs_token =
+            jsonwebtoken::encode(&hs, &claims, &EncodingKey::from_secret(b"not-the-jwks-key"))
+                .unwrap();
+        assert!(authenticate(&auth, &r, &bearer(&hs_token)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn nested_roles_claim_and_scp_scopes_are_read() {
+        let mut auth = jwks_auth();
+        auth.roles_claim = "realm_access.roles".into();
+        let r = route(json!({"scopes": ["catalog:read"]}));
+        let t = token(
+            "k1",
+            json!({
+                "realm_access": {"roles": ["staff"]},
+                "scp": ["catalog:read", "orders:read"]
+            }),
+        );
+        let p = authenticate(&auth, &r, &bearer(&t)).await.ok().unwrap();
+        assert_eq!(p.roles, vec!["staff"]);
+        assert_eq!(p.scopes, vec!["catalog:read", "orders:read"]);
+        // scope string still works when scp is absent.
+        let t2 = token("k1", json!({"scope": "catalog:read other:x"}));
+        let p2 = authenticate(&auth, &r, &bearer(&t2)).await.ok().unwrap();
+        assert_eq!(p2.scopes, vec!["catalog:read", "other:x"]);
+    }
+
+    #[tokio::test]
+    async fn empty_route_scopes_are_opt_in() {
+        let auth = jwks_auth();
+        let r = route(json!({"scopes": []}));
+        let t = token("k1", json!({"scope": "catalog:read"}));
+        assert!(authenticate(&auth, &r, &bearer(&t)).await.is_ok());
+        // Case sensitivity: Catalog:read does not satisfy catalog:read.
+        let need = vec!["catalog:read".into()];
+        assert!(!route_scopes_allow(&["Catalog:read".into()], &need));
+        assert!(!route_scopes_allow(&["other:*".into()], &need));
+        assert!(route_scopes_allow(&["catalog:*".into()], &need));
+    }
+
+    #[test]
+    fn api_keys_file_with_bad_tenant_id_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vibe-keys-tenant-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys.json");
+        let rec = |tenant: &str| {
+            json!([{
+                "key_id": "abcdefghijk2", "secret_hash": "a".repeat(64), "env": "live",
+                "tenant_id": tenant, "scopes": [], "expires_unix": 4102444800i64
+            }])
+        };
+        let write = |v: Value| {
+            std::fs::write(&path, v.to_string()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        for bad in [
+            "short",
+            "Tenant0001",
+            "tenant-0001",
+            "tenant0001; drop",
+            "x, t_victim",
+            "",
+            &"a".repeat(33),
+        ] {
+            write(rec(bad));
+            assert!(load_api_keys(&path).is_err(), "{bad:?}");
+        }
+        write(rec("tenant0001"));
+        let file = ApiKeyFile::open(path.clone()).unwrap();
+        // A reload that introduces a bad tenant id keeps the previous keys.
+        write(rec("x, t_victim"));
+        file.reload();
+        assert_eq!(file.keys().len(), 1);
+        assert_eq!(file.keys()[0].tenant_id, "tenant0001");
+    }
+
+    #[test]
+    fn api_key_file_reloads_on_mtime_and_keeps_old_on_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vibe-keys-reload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys.json");
+        let rec = |id: &str| {
+            json!({
+                "key_id": id, "secret_hash": "a".repeat(64), "env": "live",
+                "tenant_id": "tenant0001", "scopes": ["catalog:read"], "expires_unix": 4102444800i64
+            })
+        };
+        std::fs::write(&path, json!([rec("abcdefghijk2")]).to_string()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let file = ApiKeyFile::open(path.clone()).unwrap();
+        assert_eq!(file.keys().len(), 1);
+        // Corrupt the file: reload keeps the previous set.
+        std::fs::write(&path, "{not-json").unwrap();
+        file.reload();
+        assert_eq!(file.keys().len(), 1, "bad reload must keep previous keys");
+        // Valid replacement (write updates mtime).
+        std::fs::write(
+            &path,
+            json!([rec("abcdefghijk2"), rec("bcdefghijkl3")]).to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        file.reload();
+        assert_eq!(file.keys().len(), 2);
+    }
+
+    #[test]
+    fn detect_jwt_alg_picks_ec_and_rsa() {
+        assert_eq!(
+            detect_jwt_alg(
+                "-----BEGIN PUBLIC KEY-----\n\
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0mqNqll14aIJEhYqCiRLWJX63Ty6\n\
+Q0UxBzbmJ2wI9FMVJLw4XEhuIJFqIdA/P6b6ozSNGyOUZK7OjIfGKtpNYw==\n\
+-----END PUBLIC KEY-----\n"
+            )
+            .unwrap(),
+            Algorithm::ES256
+        );
+    }
+}
+
+#[cfg(test)]
+mod request_validation_tests {
+    use super::*;
+    use crate::manifest::ReqField;
+    use serde_json::json;
+
+    fn field(location: &str, name: &str, ty: &str, required: bool) -> ReqField {
+        ReqField {
+            location: location.into(),
+            name: name.into(),
+            ty: ty.into(),
+            required,
+            min: None,
+            max: None,
+            format: String::new(),
+        }
+    }
+
+    fn route(request: Vec<ReqField>) -> RouteSpec {
+        let mut value = json!({
+            "method": "POST", "path": "/x", "feature_id": "f", "public": false,
+            "auth_removed": false, "auth_mode": "jwt", "roles": [], "scopes": [],
+            "rates": [], "body_limit": 0, "request": [], "transform_in": "",
+            "transform_out": "", "steps": [], "errors": [], "min_response_ms": 0,
+            "public_writes": false, "challenge_type": "", "challenge_when": "",
+            "deprecated": false, "sunset": ""
+        });
+        value["request"] = serde_json::to_value(request).unwrap();
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn check(route: &RouteSpec, body: Value, headers: &[(&str, &str)]) -> Result<(), MethodFail> {
+        let headers = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        validate_request(route, &body, &BTreeMap::new(), &BTreeMap::new(), &headers)
+    }
+
+    fn check_path(route: &RouteSpec, path: &[(&str, &str)]) -> Result<(), MethodFail> {
+        let path = path
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        validate_request(
+            route,
+            &Value::Null,
+            &BTreeMap::new(),
+            &path,
+            &BTreeMap::new(),
+        )
+    }
+
+    fn check_query(route: &RouteSpec, query: &[(&str, &str)]) -> Result<(), MethodFail> {
+        let query = query
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        validate_request(
+            route,
+            &Value::Null,
+            &query,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+    }
+
+    #[test]
+    fn path_params_are_typed() {
+        let r = route(vec![
+            field("path", "id", "uuid", true),
+            field("path", "n", "integer", false),
+        ]);
+        let ok = "6f1c1e7e-8a4b-4c55-9b0e-2b8f6f0f2a11";
+        assert!(check_path(&r, &[("id", ok)]).is_ok());
+        assert!(check_path(&r, &[("id", "1; DROP TABLE x")]).is_err());
+        assert!(check_path(&r, &[("id", ok), ("n", "12")]).is_ok());
+        assert!(check_path(&r, &[("id", ok), ("n", "1x")]).is_err());
+    }
+
+    #[test]
+    fn query_booleans_are_exact() {
+        let r = route(vec![field("query", "flag", "boolean", false)]);
+        assert!(check_query(&r, &[("flag", "true")]).is_ok());
+        assert!(check_query(&r, &[("flag", "false")]).is_ok());
+        for bad in ["1", "yes", "TRUE", ""] {
+            assert!(check_query(&r, &[("flag", bad)]).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn uuid_must_be_canonical_hyphenated() {
+        let f = field("body", "v", "uuid", true);
+        for bad in [
+            "6f1c1e7e8a4b4c559b0e2b8f6f0f2a11",
+            "{6f1c1e7e-8a4b-4c55-9b0e-2b8f6f0f2a11}",
+            "urn:uuid:6f1c1e7e-8a4b-4c55-9b0e-2b8f6f0f2a11",
+        ] {
+            assert!(check_type(&f, &json!(bad)).is_err(), "{bad}");
+        }
+        assert!(check_type(&f, &json!("6F1C1E7E-8A4B-4C55-9B0E-2B8F6F0F2A11")).is_ok());
+    }
+
+    #[test]
+    fn unknown_types_fail_closed() {
+        let f = field("body", "v", "date", true);
+        assert_eq!(check_type(&f, &json!("x")).unwrap_err().code, "INTERNAL");
+    }
+
+    #[test]
+    fn required_headers_are_enforced_case_insensitively() {
+        let r = route(vec![field("header", "Idempotency-Key", "string", true)]);
+        assert!(check(&r, Value::Null, &[]).is_err());
+        assert!(
+            check(&r, Value::Null, &[("idempotency-key", "")]).is_err(),
+            "empty = missing"
+        );
+        assert!(check(&r, Value::Null, &[("idempotency-key", "  ")]).is_err());
+        assert!(check(&r, Value::Null, &[("idempotency-key", "k")]).is_ok());
+    }
+
+    #[test]
+    fn non_object_bodies_are_rejected() {
+        let r = route(vec![field("body", "sku", "string", false)]);
+        for body in [
+            json!([{"sku": "x"}]),
+            json!("x"),
+            json!(1),
+            json!(true),
+            json!([]),
+        ] {
+            assert!(check(&r, body.clone(), &[]).is_err(), "{body}");
+        }
+        assert!(check(&r, json!({"sku": "x"}), &[]).is_ok());
+        // A null body (no body) is fine when no body field is required.
+        assert!(check(&r, Value::Null, &[]).is_ok());
+        let required = route(vec![field("body", "sku", "string", true)]);
+        assert!(check(&required, Value::Null, &[]).is_err());
+    }
+
+    #[test]
+    fn every_type_is_checked() {
+        let cases = [
+            ("number", json!(1.5), json!("1.5")),
+            ("boolean", json!(true), json!("true")),
+            (
+                "uuid",
+                json!("6f1c1e7e-8a4b-4c55-9b0e-2b8f6f0f2a11"),
+                json!("not-a-uuid"),
+            ),
+            ("integer", json!(3), json!(3.5)),
+            ("string", json!("s"), json!(1)),
+        ];
+        for (ty, good, bad) in cases {
+            let f = field("body", "v", ty, true);
+            assert!(check_type(&f, &good).is_ok(), "{ty} good");
+            assert!(check_type(&f, &bad).is_err(), "{ty} bad");
+        }
     }
 }
