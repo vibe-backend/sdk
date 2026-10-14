@@ -24,6 +24,8 @@ pub struct LlmConfig {
     pub endpoint_private: bool,
     /// When false (`LLM_SEND_SAMPLING=0`), omit temperature/seed/top_* (#35).
     pub send_sampling: bool,
+    /// OpenAI API style: `chat` (default) or `responses` (`LLM_API_STYLE`, #40).
+    pub api_style: String,
 }
 
 #[derive(Clone, Debug)]
@@ -89,86 +91,122 @@ struct SamplingCaps {
     reasoning_none: bool,
 }
 
-/// Explicit capability registry: `(provider, model prefix, caps)`, shipped
-/// with this SDK version (spec 2A.8.6, decision 58, #35). A model gets
-/// sampling parameters only when its lower-cased name starts with a listed
-/// prefix; unknown models and providers get none. Anthropic never gets both
-/// `temperature` and `top_p`.
-const SAMPLING_REGISTRY: &[(&str, &str, SamplingCaps)] = &[
-    (
-        GEMINI,
-        "gemini-",
-        SamplingCaps {
-            temperature: true,
-            top_p: true,
-            top_k: true,
-            seed: true,
-            reasoning_none: false,
-        },
-    ),
-    (
-        OPENAI,
-        "gpt-5.1",
-        SamplingCaps {
-            temperature: true,
-            top_p: true,
-            top_k: false,
-            seed: true,
-            reasoning_none: true,
-        },
-    ),
-    (
-        OPENAI,
-        "gpt-5.2",
-        SamplingCaps {
-            temperature: true,
-            top_p: true,
-            top_k: false,
-            seed: true,
-            reasoning_none: true,
-        },
-    ),
-    (
-        OPENAI,
-        "gpt-4.1",
-        SamplingCaps {
-            temperature: true,
-            top_p: true,
-            top_k: false,
-            seed: true,
-            reasoning_none: false,
-        },
-    ),
-    (
-        OPENAI,
-        "gpt-4o",
-        SamplingCaps {
-            temperature: true,
-            top_p: true,
-            top_k: false,
-            seed: true,
-            reasoning_none: false,
-        },
-    ),
-    (
-        ANTHROPIC,
-        "claude-",
-        SamplingCaps {
-            temperature: true,
-            top_p: false,
-            top_k: false,
-            seed: false,
-            reasoning_none: false,
-        },
-    ),
+/// Sampling parameters for one config and model, by API style. This is the
+/// single map both the request body and the lock's `sent-params` stamp use.
+/// The Responses API has no `seed`, so it is dropped for `responses`.
+pub fn sent_params(config: &LlmConfig, model: &str) -> SentParams {
+    let mut params =
+        model_capabilities_with(&config.provider, model, config.seed, config.send_sampling);
+    if config.provider == OPENAI && config.api_style == "responses" {
+        params.seed = None;
+    }
+    params
+}
+
+/// Provider name recorded in the lock: `openai-responses` when the OpenAI
+/// Responses API is used (#40), otherwise the provider itself.
+pub fn lock_provider(config: &LlmConfig) -> String {
+    if config.provider == OPENAI && config.api_style == "responses" {
+        "openai-responses".into()
+    } else {
+        config.provider.clone()
+    }
+}
+
+const GEMINI_2: SamplingCaps = SamplingCaps {
+    temperature: true,
+    top_p: true,
+    top_k: true,
+    seed: true,
+    reasoning_none: false,
+};
+const GPT_5_NONE: SamplingCaps = SamplingCaps {
+    temperature: true,
+    top_p: true,
+    top_k: false,
+    seed: true,
+    reasoning_none: true,
+};
+const GPT_4: SamplingCaps = SamplingCaps {
+    temperature: true,
+    top_p: true,
+    top_k: false,
+    seed: true,
+    reasoning_none: false,
+};
+const CLAUDE_TEMP: SamplingCaps = SamplingCaps {
+    temperature: true,
+    top_p: false,
+    top_k: false,
+    seed: false,
+    reasoning_none: false,
+};
+
+/// Variants that share a registered prefix but reject sampling parameters
+/// (or `reasoning_effort: none`).
+const OPENAI_EXCLUDED: &[&str] = &[
+    "-pro",
+    "-codex",
+    "-chat",
+    "-search",
+    "-audio",
+    "-realtime",
+    "-transcribe",
+    "-tts",
+];
+
+/// Explicit capability registry: `(provider, model prefix, excluded
+/// substrings, caps)`, shipped with this SDK version (spec 2A.8.6, decision
+/// 58, #35). A model gets sampling parameters only when its lower-cased name
+/// starts with a listed prefix and contains none of the excluded substrings;
+/// unknown models and providers get none.
+///
+/// - Gemini 1.5 / 2.x: temperature 0, topP 1, topK 1, seed. Gemini 3 and
+///   later are not listed: Google recommends the default temperature 1.0
+///   (lower values can loop) and newer models deprecate sampling knobs, so
+///   they get none.
+/// - OpenAI gpt-5.1 / gpt-5.2 (not -pro, -codex, -chat): temperature 0,
+///   top_p 1, seed, `reasoning_effort: none`. gpt-4.1 / gpt-4o (not search,
+///   audio, realtime, transcribe, tts): temperature 0, top_p 1, seed.
+/// - Anthropic: `temperature: 0` only (never with top_p) for Claude Opus 4.6,
+///   Sonnet 4.6, Haiku 4.5 and earlier, listed per version. Opus 4.7 and
+///   later, Sonnet 5+, Haiku 5.5 and newer reject non-default sampling
+///   parameters with a 400, so they get none.
+const SAMPLING_REGISTRY: &[(&str, &str, &[&str], SamplingCaps)] = &[
+    (GEMINI, "gemini-1.5-", &[], GEMINI_2),
+    (GEMINI, "gemini-2.0-", &[], GEMINI_2),
+    (GEMINI, "gemini-2.5-", &[], GEMINI_2),
+    (OPENAI, "gpt-5.1", OPENAI_EXCLUDED, GPT_5_NONE),
+    (OPENAI, "gpt-5.2", OPENAI_EXCLUDED, GPT_5_NONE),
+    (OPENAI, "gpt-4.1", OPENAI_EXCLUDED, GPT_4),
+    (OPENAI, "gpt-4o", OPENAI_EXCLUDED, GPT_4),
+    (ANTHROPIC, "claude-opus-4-6", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-opus-4-5", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-opus-4-1", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-opus-4-0", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-opus-4-2025", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-sonnet-4-6", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-sonnet-4-5", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-sonnet-4-0", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-sonnet-4-2025", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-haiku-4-5", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-7-sonnet", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-5-sonnet", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-5-haiku", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-opus", &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-haiku", &[], CLAUDE_TEMP),
 ];
 
 fn registered_caps(provider: &str, model: &str) -> Option<SamplingCaps> {
     let model = model.to_ascii_lowercase();
     SAMPLING_REGISTRY
         .iter()
-        .find(|(p, prefix, _)| *p == provider && model.starts_with(prefix))
-        .map(|(_, _, caps)| *caps)
+        .find(|(p, prefix, excluded, _)| {
+            *p == provider
+                && model.starts_with(prefix)
+                && !excluded.iter().any(|x| model.contains(x))
+        })
+        .map(|(_, _, _, caps)| *caps)
 }
 
 /// Sampling parameters for a model with sampling enabled (the default).
@@ -350,6 +388,25 @@ pub fn load_llm_config(
             .as_deref(),
         Some("0") | Some("false") | Some("no") | Some("off")
     );
+    let api_style = env
+        .get("LLM_API_STYLE")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "chat".into());
+    if !matches!(api_style.as_str(), "chat" | "responses") {
+        report.push(Diag::error(
+            "env",
+            "LLM_API_STYLE must be chat or responses",
+        ));
+        return Err(report);
+    }
+    if api_style == "responses" && provider != OPENAI {
+        report.push(Diag::error(
+            "env",
+            "LLM_API_STYLE=responses is only valid with LLM_PROVIDER=openai",
+        ));
+        return Err(report);
+    }
     Ok(LlmConfig {
         provider,
         base_url,
@@ -361,6 +418,7 @@ pub fn load_llm_config(
         endpoint_host: host,
         endpoint_private: private,
         send_sampling,
+        api_style,
     })
 }
 
@@ -671,6 +729,7 @@ impl LlmAdapter for HttpAdapter {
         match self.config.provider.as_str() {
             ANTHROPIC => "anthropic",
             GEMINI => "gemini",
+            _ if self.config.api_style == "responses" => "openai-responses",
             _ => "openai",
         }
     }
@@ -709,6 +768,9 @@ impl HttpAdapter {
         let (url, body, headers) = match self.config.provider.as_str() {
             ANTHROPIC => anthropic_call(&self.config, request),
             GEMINI => gemini_call(&self.config, request),
+            _ if self.config.api_style == "responses" => {
+                openai_responses_call(&self.config, request)
+            }
             _ => openai_call(&self.config, request),
         };
         let mut builder = self.client.post(&url).json(&body);
@@ -755,10 +817,13 @@ impl HttpAdapter {
         let parsed = match self.config.provider.as_str() {
             ANTHROPIC => parse_anthropic(&value),
             GEMINI => parse_gemini(&value),
+            _ if self.config.api_style == "responses" => {
+                parse_openai_responses_masked(&value, &self.config.api_key)
+            }
             _ => parse_openai(&value),
         }
         .map_err(|message| CallError {
-            message,
+            message: mask_secrets(&message, &self.config.api_key),
             retryable: false,
         })?;
         if let Some(reported) = &parsed.model_reported {
@@ -842,12 +907,7 @@ fn openai_call(
     request: &LlmRequest,
 ) -> (String, Value, Vec<(&'static str, String)>) {
     let url = join_url(&config.base_url, "chat/completions");
-    let params = model_capabilities_with(
-        &config.provider,
-        &request.model,
-        config.seed,
-        config.send_sampling,
-    );
+    let params = sent_params(config, &request.model);
     let body = openai_body(request, &params);
     let headers = vec![("Authorization", format!("Bearer {}", config.api_key))];
     (url, body, headers)
@@ -858,12 +918,7 @@ fn anthropic_call(
     request: &LlmRequest,
 ) -> (String, Value, Vec<(&'static str, String)>) {
     let url = join_url(&config.base_url, "v1/messages");
-    let params = model_capabilities_with(
-        &config.provider,
-        &request.model,
-        config.seed,
-        config.send_sampling,
-    );
+    let params = sent_params(config, &request.model);
     let body = anthropic_body(request, &params);
     let headers = vec![
         ("x-api-key", config.api_key.clone()),
@@ -880,7 +935,7 @@ fn gemini_call(
         &config.base_url,
         &format!("models/{}:generateContent", request.model),
     );
-    let params = model_capabilities_with(GEMINI, &request.model, config.seed, config.send_sampling);
+    let params = sent_params(config, &request.model);
     let body = gemini_body(request, &params);
     let headers = vec![("x-goog-api-key", config.api_key.clone())];
     (url, body, headers)
@@ -905,6 +960,87 @@ fn parse_openai(value: &Value) -> Result<LlmResponse, String> {
         text,
         model_reported,
         system_fingerprint,
+    })
+}
+
+/// Body for `POST /v1/responses` (#40). Sampling params are sent the same way
+/// as chat; `reasoning_effort` maps to `reasoning.effort`.
+pub fn openai_responses_body(request: &LlmRequest, params: &SentParams) -> Value {
+    let mut body = json!({
+        "model": request.model,
+        "instructions": request.system,
+        "input": request.input,
+        "store": false
+    });
+    apply_number(&mut body, "temperature", params.temperature.as_deref());
+    apply_number(&mut body, "top_p", params.top_p.as_deref());
+    apply_number(&mut body, "seed", params.seed.as_deref());
+    if let Some(effort) = &params.reasoning_effort {
+        body["reasoning"] = json!({"effort": effort});
+    }
+    body
+}
+
+fn openai_responses_call(
+    config: &LlmConfig,
+    request: &LlmRequest,
+) -> (String, Value, Vec<(&'static str, String)>) {
+    let url = join_url(&config.base_url, "responses");
+    let params = sent_params(config, &request.model);
+    let body = openai_responses_body(request, &params);
+    let headers = vec![("Authorization", format!("Bearer {}", config.api_key))];
+    (url, body, headers)
+}
+
+/// Reads `output_text`, or concatenates `output[].content[]` text parts.
+/// A response with `status: incomplete`, `failed` or `error`, or a non-null
+/// `error`, is an error even when some text was produced.
+pub fn parse_openai_responses(value: &Value) -> Result<LlmResponse, String> {
+    parse_openai_responses_masked(value, "")
+}
+
+/// Like [`parse_openai_responses`]; provider error messages are masked
+/// (API key, `key=`-style values) before they are cut to 200 characters.
+pub fn parse_openai_responses_masked(value: &Value, api_key: &str) -> Result<LlmResponse, String> {
+    let status = value["status"].as_str().unwrap_or("");
+    if status == "incomplete" {
+        let reason = value["incomplete_details"]["reason"]
+            .as_str()
+            .unwrap_or("unknown");
+        return Err(format!("openai responses output is incomplete ({reason})"));
+    }
+    if matches!(status, "failed" | "error") || !value["error"].is_null() {
+        let error = &value["error"];
+        let code = error["code"].as_str().unwrap_or("unknown");
+        let message = mask_secrets(error["message"].as_str().unwrap_or("no message"), api_key);
+        let message: String = message.chars().take(200).collect();
+        return Err(format!(
+            "openai responses returned an error ({code}): {message}"
+        ));
+    }
+    let text = if let Some(text) = value["output_text"].as_str() {
+        text.to_string()
+    } else {
+        let mut out = String::new();
+        for item in value["output"].as_array().into_iter().flatten() {
+            if item["type"].as_str().is_some_and(|t| t != "message") {
+                continue;
+            }
+            for part in item["content"].as_array().into_iter().flatten() {
+                if let Some(t) = part["text"].as_str() {
+                    out.push_str(t);
+                }
+            }
+        }
+        out
+    };
+    if text.is_empty() {
+        return Err("openai responses output has no text".into());
+    }
+    Ok(LlmResponse {
+        text,
+        model_reported: value["model"].as_str().map(str::to_string),
+        system_fingerprint: None,
     })
 }
 
@@ -1049,7 +1185,7 @@ mod tests {
         assert_eq!(openai_pinned["reasoning_effort"], "none");
         let anthropic = anthropic_body(
             &request,
-            &model_capabilities(ANTHROPIC, "claude-sonnet-2026-09-01", 0),
+            &model_capabilities(ANTHROPIC, "claude-sonnet-4-6", 0),
         );
         assert_eq!(anthropic["temperature"], 0);
         assert!(anthropic.get("top_p").is_none(), "anthropic: not both");
@@ -1069,7 +1205,26 @@ mod tests {
             (OPENAI, "o3-2025-04-16"),
             (OPENAI, "qwen2.5-coder:32b"),
             (GEMINI, "vendor-model"),
+            (GEMINI, "gemini-3-pro-preview"),
+            (GEMINI, "gemini-3.5-flash"),
             ("mystery", "gpt-4o-2024-08-06"),
+            (OPENAI, "gpt-5.2-pro-2025-12-11"),
+            (OPENAI, "gpt-5.1-codex"),
+            (OPENAI, "gpt-5.1-codex-mini"),
+            (OPENAI, "gpt-5.1-chat-latest"),
+            (OPENAI, "gpt-4o-search-preview-2025-03-11"),
+            (OPENAI, "gpt-4o-mini-search-preview"),
+            (OPENAI, "gpt-4o-audio-preview"),
+            (OPENAI, "gpt-4o-realtime-preview"),
+            (ANTHROPIC, "claude-opus-4-7"),
+            (ANTHROPIC, "claude-opus-4-7-20260416"),
+            (ANTHROPIC, "claude-opus-4-8"),
+            (ANTHROPIC, "claude-opus-5"),
+            (ANTHROPIC, "claude-opus-5-5"),
+            (ANTHROPIC, "claude-sonnet-5"),
+            (ANTHROPIC, "claude-sonnet-5-5"),
+            (ANTHROPIC, "claude-haiku-5-5"),
+            (ANTHROPIC, "claude-fable-5-1"),
         ] {
             assert!(
                 model_capabilities(provider, model, 1).is_empty(),
@@ -1081,6 +1236,10 @@ mod tests {
             (OPENAI, "gpt-5.1-2025-11-13"),
             (OPENAI, "GPT-4o-2024-08-06"),
             (ANTHROPIC, "claude-opus-4-6"),
+            (ANTHROPIC, "claude-sonnet-4-5-20250929"),
+            (ANTHROPIC, "claude-haiku-4-5-20251001"),
+            (OPENAI, "gpt-4.1-mini-2025-04-14"),
+            (OPENAI, "gpt-5.2-2025-12-11"),
             (GEMINI, "gemini-2.5-pro"),
         ] {
             assert!(sampling_registered(provider, model), "{provider} {model}");
@@ -1200,5 +1359,270 @@ mod failure_message_tests {
             assert!(!m.contains("tOk"), "{m}");
             assert!(m.contains("***"), "{m}");
         }
+    }
+}
+
+#[cfg(test)]
+mod responses_tests {
+    use super::*;
+
+    #[test]
+    fn error_messages_are_masked_before_truncation() {
+        let key = "sk-test-secret-value-1234567890";
+        let long = format!("{}{key} and api_key=abc123secret", "x".repeat(190));
+        let err = parse_openai_responses_masked(
+            &json!({"status": "failed", "error": {"code": "bad", "message": long}}),
+            key,
+        )
+        .unwrap_err();
+        assert!(!err.contains("sk-test-secret"), "{err}");
+        assert!(!err.contains("sk-test"), "partial key leaked: {err}");
+        assert!(err.contains("***"), "{err}");
+        let err = parse_openai_responses(&json!({
+            "error": {"code": "bad", "message": "see https://x/?api_key=abc123secret"}
+        }))
+        .unwrap_err();
+        assert!(!err.contains("abc123secret"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn responses_http_errors_are_reported_and_masked() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let key = "sk-test-value";
+        for (status, retry) in [
+            (400u16, false),
+            (401, false),
+            (404, false),
+            (429, true),
+            (500, true),
+            (503, true),
+        ] {
+            let body = format!("{{\"error\":{{\"message\":\"bad key {key}\"}}}}");
+            let app = Router::new().route(
+                "/v1/responses",
+                post(move || {
+                    let body = body.clone();
+                    async move { (StatusCode::from_u16(status).unwrap(), body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let model = "gpt-5.1-2026-01-01";
+            let mut config = responses_config(model);
+            config.base_url = format!("http://{addr}/v1");
+            config.max_retries = 0;
+            let adapter = HttpAdapter::new(config).unwrap();
+            let request = LlmRequest {
+                system: "s".into(),
+                input: "i".into(),
+                model: model.into(),
+                seed: 7,
+                timeout: Duration::from_secs(5),
+            };
+            let err = adapter.compile(&request).await.unwrap_err();
+            assert!(err.contains(&status.to_string()), "{status}: {err}");
+            assert!(!err.contains(key), "{status}: {err}");
+            let _ = retry;
+        }
+    }
+
+    fn responses_config(model: &str) -> LlmConfig {
+        LlmConfig {
+            provider: OPENAI.into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "sk-test-value".into(),
+            model: model.into(),
+            timeout: Duration::from_secs(5),
+            max_retries: 0,
+            seed: 7,
+            endpoint_host: "api.openai.com".into(),
+            endpoint_private: false,
+            api_style: "responses".into(),
+            send_sampling: true,
+        }
+    }
+
+    #[test]
+    fn stamp_and_body_share_one_capability_map() {
+        for model in [
+            "gpt-5.1-2026-01-01",
+            "gpt-5.2-2026-01-01",
+            "gpt-4o-2024-08-06",
+        ] {
+            let config = responses_config(model);
+            let params = sent_params(&config, model);
+            assert!(params.seed.is_none(), "responses never sends seed");
+            let request = LlmRequest {
+                system: "s".into(),
+                input: "i".into(),
+                model: model.into(),
+                seed: config.seed,
+                timeout: config.timeout,
+            };
+            let (_, body, _) = openai_responses_call(&config, &request);
+            let stamp = params.to_map();
+            for (key, field) in [
+                ("temperature", "temperature"),
+                ("top_p", "top_p"),
+                ("seed", "seed"),
+            ] {
+                assert_eq!(
+                    stamp.contains_key(key),
+                    body.get(field).is_some(),
+                    "{model} {key}"
+                );
+            }
+            assert_eq!(
+                stamp.contains_key("reasoning_effort"),
+                body.get("reasoning").is_some(),
+                "{model}"
+            );
+        }
+        let mut chat = responses_config("gpt-5.1-2026-01-01");
+        chat.api_style = "chat".into();
+        assert_eq!(sent_params(&chat, &chat.model).seed.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn lock_provider_records_the_api_style() {
+        let mut config = responses_config("gpt-5.1-2026-01-01");
+        assert_eq!(lock_provider(&config), "openai-responses");
+        config.api_style = "chat".into();
+        assert_eq!(lock_provider(&config), "openai");
+    }
+
+    #[test]
+    fn incomplete_and_error_statuses_are_errors() {
+        let err = parse_openai_responses(&json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output_text": "## partial"
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("incomplete") && err.contains("max_output_tokens"),
+            "{err}"
+        );
+        for value in [
+            json!({"status": "failed", "error": {"code": "server_error", "message": "boom"}}),
+            json!({"status": "error", "error": {"code": "server_error", "message": "boom"}}),
+            json!({"error": {"code": "server_error", "message": "boom"}, "output_text": "x"}),
+        ] {
+            let err = parse_openai_responses(&value).unwrap_err();
+            assert!(
+                err.contains("server_error") && err.contains("boom"),
+                "{err}"
+            );
+        }
+        assert!(parse_openai_responses(
+            &json!({"status": "completed", "error": null, "output_text": "ok"})
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn responses_adapter_against_a_mock_server() {
+        use axum::{routing::post, Json, Router};
+        let reply = std::sync::Arc::new(std::sync::Mutex::new(Value::Null));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let app = {
+            let reply = reply.clone();
+            let seen = seen.clone();
+            Router::new().route(
+                "/v1/responses",
+                post(move |Json(body): Json<Value>| {
+                    let reply = reply.clone();
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(body);
+                        Json(reply.lock().unwrap().clone())
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let model = "gpt-5.1-2026-01-01";
+        let mut config = responses_config(model);
+        config.base_url = format!("http://{addr}/v1");
+        let adapter = HttpAdapter::new(config).unwrap();
+        let request = LlmRequest {
+            system: "sys".into(),
+            input: "in".into(),
+            model: model.into(),
+            seed: 7,
+            timeout: Duration::from_secs(5),
+        };
+        *reply.lock().unwrap() =
+            json!({"status": "completed", "model": model, "output_text": "## A"});
+        assert_eq!(adapter.compile(&request).await.unwrap().text, "## A");
+        let body = seen.lock().unwrap()[0].clone();
+        assert_eq!(body["instructions"], "sys");
+        assert!(body.get("seed").is_none());
+        *reply.lock().unwrap() = json!({
+            "status": "incomplete", "model": model,
+            "incomplete_details": {"reason": "max_output_tokens"}, "output_text": "## A"
+        });
+        let err = adapter.compile(&request).await.unwrap_err();
+        assert!(err.contains("incomplete"), "{err}");
+        *reply.lock().unwrap() = json!({
+            "status": "failed", "model": model,
+            "error": {"code": "server_error", "message": "boom"}
+        });
+        let err = adapter.compile(&request).await.unwrap_err();
+        assert!(err.contains("server_error"), "{err}");
+    }
+
+    #[test]
+    fn responses_body_and_parse() {
+        let request = LlmRequest {
+            system: "sys".into(),
+            input: "in".into(),
+            model: "gpt-5.1-2026-01-01".into(),
+            seed: 0,
+            timeout: Duration::from_secs(1),
+        };
+        let body = openai_responses_body(&request, &model_capabilities(OPENAI, "gpt-5.1", 0));
+        assert_eq!(body["instructions"], "sys");
+        assert_eq!(body["input"], "in");
+        assert_eq!(body["reasoning"]["effort"], "none");
+        assert!(body.get("messages").is_none());
+        let parsed = parse_openai_responses(&json!({
+            "model": "m",
+            "output": [{"type": "reasoning"}, {"type": "message", "content": [
+                {"type": "output_text", "text": "## A"}, {"type": "output_text", "text": "\n- k: v"}
+            ]}]
+        }))
+        .unwrap();
+        assert_eq!(parsed.text, "## A\n- k: v");
+        assert_eq!(
+            parse_openai_responses(&json!({"output_text": "x"}))
+                .unwrap()
+                .text,
+            "x"
+        );
+        assert!(parse_openai_responses(&json!({"output": []})).is_err());
+    }
+
+    #[test]
+    fn api_style_is_validated() {
+        let env = |style: &str, provider: &str| {
+            HashMap::from([
+                ("LLM_PROVIDER".to_string(), provider.to_string()),
+                ("LLM_API_KEY".to_string(), "sk-test-value".to_string()),
+                ("LLM_MODEL".to_string(), "gpt-test-2026-01-01".to_string()),
+                ("LLM_API_STYLE".to_string(), style.to_string()),
+            ])
+        };
+        assert_eq!(
+            load_llm_config(&env("responses", "openai"), false)
+                .unwrap()
+                .api_style,
+            "responses"
+        );
+        assert!(load_llm_config(&env("bogus", "openai"), false).is_err());
+        assert!(load_llm_config(&env("responses", "gemini"), false).is_err());
     }
 }
