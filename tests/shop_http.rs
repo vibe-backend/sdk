@@ -113,8 +113,8 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         },
     );
     let state = Arc::new(AppState {
+        exec: Arc::new(MemoryExec::from_manifest(&manifest).unwrap()),
         manifest,
-        exec: Arc::new(MemoryExec::new()),
         auth,
         slugs,
         rates: std::sync::Mutex::new(Default::default()),
@@ -763,8 +763,8 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
     auth.public_pem = PUBLIC_PEM.into();
     auth.alg = Algorithm::ES256;
     let app = router(Arc::new(AppState {
+        exec: Arc::new(MemoryExec::from_manifest(&manifest).unwrap()),
         manifest,
-        exec: Arc::new(MemoryExec::new()),
         auth,
         slugs: std::collections::HashMap::new(),
         rates: std::sync::Mutex::new(Default::default()),

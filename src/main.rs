@@ -371,7 +371,7 @@ async fn cmd_serve(
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
     let exec: Arc<dyn QueryExec> = if memory {
-        Arc::new(vibe::runtime::MemoryExec::new())
+        Arc::new(vibe::runtime::MemoryExec::from_manifest(&manifest)?)
     } else {
         let url = std::env::var("VIBE_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))

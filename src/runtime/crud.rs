@@ -1062,6 +1062,7 @@ mod ownership_tests {
             sensitive_output: vec![],
             owner_key: owner_key.map(str::to_string),
             ownership: ownership.into(),
+            grants: String::new(),
         }
     }
 

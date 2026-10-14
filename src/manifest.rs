@@ -184,6 +184,9 @@ pub struct ModelSpec {
     /// Explicit relaxation: `tenant-wide` or `role(admin)`.
     #[serde(default)]
     pub ownership: String,
+    /// Raw `## Policies` `grants:` line (role and column grants).
+    #[serde(default)]
+    pub grants: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -451,6 +454,10 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
         sensitive_output,
         owner_key,
         ownership,
+        grants: find_section(&doc.sections, "Policies")
+            .and_then(|s| s.get("grants"))
+            .unwrap_or("")
+            .to_string(),
     }
 }
 

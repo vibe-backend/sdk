@@ -1,5 +1,6 @@
 mod crud;
 mod exec;
+pub mod grants;
 mod http;
 pub mod jwks;
 mod limiter;
