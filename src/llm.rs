@@ -494,9 +494,26 @@ pub struct HttpAdapter {
     client: Client,
 }
 
+/// Masks API keys and common secret query/fragment params. Shared by
+/// `describe_failure` and transport-error paths so secrets are never printed.
+pub fn mask_secrets(text: &str, api_key: &str) -> String {
+    let mut out = text.to_string();
+    if api_key.len() >= 4 {
+        out = out.replace(api_key, "***");
+    }
+    // Query, fragment, and `;`-separated params: key / api_key / token / …
+    static KEY_PARAM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)([?&#;](?:key|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|token|secret|password|auth)=)[^&\s#;]*",
+        )
+        .expect("regex")
+    });
+    KEY_PARAM.replace_all(&out, "${1}***").into_owned()
+}
+
 /// Explains a failed or non-JSON LLM response. Only 401/403 blame the key;
 /// HTML (or a 404) hints at the base URL. The request URL and a short body
-/// excerpt are included, with the API key and `key=` query values masked.
+/// excerpt are included, with the API key and secret query values masked.
 pub fn describe_failure(
     url: &str,
     status: u16,
@@ -504,20 +521,12 @@ pub fn describe_failure(
     body: &[u8],
     api_key: &str,
 ) -> String {
-    let mask = |text: &str| {
-        let mut out = text.to_string();
-        if api_key.len() >= 4 {
-            out = out.replace(api_key, "***");
-        }
-        static KEY_PARAM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"(?i)([?&](?:key|api_key|api-key)=)[^&\s]*").expect("regex")
-        });
-        KEY_PARAM.replace_all(&out, "${1}***").into_owned()
-    };
-    let shown_url = mask(url);
+    let shown_url = mask_secrets(url, api_key);
     let raw = String::from_utf8_lossy(body);
     let excerpt: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    let excerpt = mask(&excerpt.chars().take(200).collect::<String>());
+    // Mask the full body first so a key straddling the 200-char cut cannot leak.
+    let excerpt = mask_secrets(&excerpt, api_key);
+    let excerpt: String = excerpt.chars().take(200).collect();
     let html = content_type.to_ascii_lowercase().contains("text/html")
         || excerpt
             .trim_start()
@@ -605,7 +614,7 @@ impl HttpAdapter {
             builder = builder.header(key, value);
         }
         let response = builder.send().await.map_err(|err| CallError {
-            message: format!("LLM request failed: {err}"),
+            message: mask_secrets(&format!("LLM request failed: {err}"), &self.config.api_key),
             retryable: true,
         })?;
         let status = response.status();
@@ -616,7 +625,7 @@ impl HttpAdapter {
             .unwrap_or("")
             .to_string();
         let bytes = response.bytes().await.map_err(|err| CallError {
-            message: format!("LLM response body: {err}"),
+            message: mask_secrets(&format!("LLM response body: {err}"), &self.config.api_key),
             retryable: true,
         })?;
         if !status.is_success() {
@@ -1002,5 +1011,43 @@ mod failure_message_tests {
         );
         assert!(!m.contains("AIzaSECRET") && m.contains("key=***"), "{m}");
         assert!(m.contains("LLM_BASE_URL"));
+    }
+
+    #[test]
+    fn mask_runs_before_truncate_so_straddling_keys_do_not_leak() {
+        let key = "sk-STRADDLE-SECRET-KEY-VALUE";
+        // 190 filler chars + key → key straddles the 200-char boundary if we
+        // truncated first; masking first removes it entirely.
+        let filler: String = "x".repeat(190);
+        let body = format!("{filler} {key} trailing");
+        let m = describe_failure(
+            "https://api.example/v1/chat",
+            500,
+            "text/plain",
+            body.as_bytes(),
+            key,
+        );
+        assert!(!m.contains("sk-STRADDLE"), "{m}");
+        assert!(!m.contains(key), "{m}");
+        assert!(m.contains("***"), "{m}");
+    }
+
+    #[test]
+    fn query_and_fragment_tokens_are_masked() {
+        for url in [
+            "https://api.example/v1?access_token=tok123&x=1",
+            "https://api.example/v1?password=s3cret&token=tOk",
+            "https://api.example/v1#api_key=fragsecret",
+            "https://api.example/v1?a=1;secret=s3cret",
+            "https://api.example/v1?apikey=ak1value",
+        ] {
+            let m = describe_failure(url, 400, "text/plain", b"ok", "unused-key-here");
+            assert!(!m.contains("tok123"), "{m}");
+            assert!(!m.contains("fragsecret"), "{m}");
+            assert!(!m.contains("s3cret"), "{m}");
+            assert!(!m.contains("ak1value"), "{m}");
+            assert!(!m.contains("tOk"), "{m}");
+            assert!(m.contains("***"), "{m}");
+        }
     }
 }
