@@ -8,7 +8,7 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tower::ServiceExt;
-use vibe::approve::{approve_project, ApproveOptions};
+use vibe::approve::{approve_project, approve_project_with_hook, ApproveOptions};
 use vibe::compile::{compile_project, CompileOptions};
 use vibe::manifest::manifest_from_project;
 use vibe::runtime::{hash_api_secret, router, AppState, AuthConfig, MemoryExec, Slug, StoredKey};
@@ -562,6 +562,109 @@ async fn approve_refuses_locks_that_fail_validation() {
     assert!(text.contains("validation failed"), "{text}");
     assert!(text.contains("compiler name is not md-logic"), "{text}");
     assert_eq!(before, lock_snapshot(&root), "no lock may be signed");
+}
+
+async fn compiled_shop() -> PathBuf {
+    let root = copy_shop();
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|err| panic!("{err}"));
+    root
+}
+
+fn approve_opts<'a>(
+    root: &'a Path,
+    key: &'a ed25519_dalek::SigningKey,
+    reviewers: &'a [String],
+) -> ApproveOptions<'a> {
+    ApproveOptions {
+        root,
+        reviewers,
+        reason: "local test",
+        approval_ref: "local",
+        commit: "local",
+        now: "2026-10-14T00:00:00Z",
+        signing_key: key,
+    }
+}
+
+#[tokio::test]
+async fn approve_signs_nothing_when_a_lock_changes_after_validation() {
+    let root = compiled_shop().await;
+    let lock = root.join("api/catalog/v1/get-product/get-product.lock.md");
+    let key = sign::generate_key();
+    let reviewers = [
+        "ada@example.com".to_string(),
+        "grace@example.com".to_string(),
+    ];
+    let mut tampered = Vec::new();
+    let err = approve_project_with_hook(&approve_opts(&root, &key, &reviewers), || {
+        let text = fs::read_to_string(&lock).unwrap();
+        fs::write(&lock, text.replace("name: md-logic", "name: hand-edited")).unwrap();
+        tampered = lock_snapshot(&root);
+    })
+    .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("lock changed after validation"), "{text}");
+    assert_eq!(tampered, lock_snapshot(&root), "no lock may be signed");
+    assert!(!fs::read_to_string(&lock)
+        .unwrap()
+        .contains("status: approved"));
+    // No temp files are left behind.
+    let leftovers: Vec<_> = fs::read_dir(lock.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty());
+}
+
+#[tokio::test]
+async fn approve_refuses_stale_locks() {
+    let root = compiled_shop().await;
+    let source = root.join("api/catalog/v1/get-product/get-product.md");
+    let text = fs::read_to_string(&source).unwrap();
+    fs::write(&source, text.replace("timeout: 10s", "timeout: 9s")).unwrap();
+    let before = lock_snapshot(&root);
+    let key = sign::generate_key();
+    let reviewers = [
+        "ada@example.com".to_string(),
+        "grace@example.com".to_string(),
+    ];
+    let err = approve_project(&approve_opts(&root, &key, &reviewers)).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("source-hash does not match"), "{text}");
+    assert_eq!(before, lock_snapshot(&root));
+}
+
+#[tokio::test]
+async fn approve_with_only_warnings_signs_and_reports_them() {
+    // The shop validates with warnings only (product has no owner-key).
+    let root = compiled_shop().await;
+    let key = sign::generate_key();
+    let reviewers = [
+        "ada@example.com".to_string(),
+        "grace@example.com".to_string(),
+    ];
+    let report = approve_project(&approve_opts(&root, &key, &reviewers))
+        .unwrap_or_else(|err| panic!("{err}"));
+    let text = report.to_string();
+    assert!(text.contains("no owner-key"), "{text}");
+    assert!(!report.has_errors());
+    let lock =
+        fs::read_to_string(root.join("api/catalog/v1/get-product/get-product.lock.md")).unwrap();
+    assert!(lock.contains("status: approved"), "{lock}");
+    vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+        root: &root,
+        deploy: true,
+        verify_key: Some(&key.verifying_key()),
+    })
+    .unwrap_or_else(|err| panic!("{err}"));
 }
 
 fn lock_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {

@@ -29,13 +29,43 @@ pub struct ValidateOptions<'a> {
     pub verify_key: Option<&'a ed25519_dalek::VerifyingKey>,
 }
 
+/// Sources plus the exact lock text read for each (None when missing).
+pub struct LoadedProject {
+    pub sources: Vec<SourceFile>,
+    pub lock_texts: Vec<Option<String>>,
+}
+
+/// Discovers sources and reads every lock once.
+pub fn load_project(root: &Path) -> Result<LoadedProject, Report> {
+    let sources = discover::discover(root)?;
+    let lock_texts = sources
+        .iter()
+        .map(|source| fs::read_to_string(root.join(lock_rel(&source.rel))).ok())
+        .collect();
+    Ok(LoadedProject {
+        sources,
+        lock_texts,
+    })
+}
+
 pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
-    let sources = discover::discover(opts.root)?;
+    let loaded = load_project(opts.root)?;
+    validate_loaded(opts, &loaded).0
+}
+
+/// Validates already loaded lock texts (nothing is re-read from disk except
+/// to look for orphan locks). Also returns the parsed docs by source id, so
+/// a caller (approve) can act on exactly what was validated.
+pub fn validate_loaded(
+    opts: &ValidateOptions<'_>,
+    loaded: &LoadedProject,
+) -> (Result<Report, Report>, HashMap<String, LockDoc>) {
+    let sources = &loaded.sources;
     let mut report = Report::new();
     let mut docs: HashMap<String, LockDoc> = HashMap::new();
     let mut source_by_id: HashMap<String, SourceFile> = HashMap::new();
 
-    for source in &sources {
+    for (source, text) in sources.iter().zip(&loaded.lock_texts) {
         source_by_id.insert(source.id.clone(), source.clone());
         for hit in scan::scan_text(&source.combined_text()) {
             if hit.fatal {
@@ -44,35 +74,40 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
                 report.push(Diag::warning(&source.rel, hit.message));
             }
         }
-        let lock_path = opts.root.join(lock_rel(&source.rel));
-        let text = match fs::read_to_string(&lock_path) {
-            Ok(text) => text,
-            Err(_) => {
+        let text = match text {
+            Some(text) => text,
+            None => {
                 report.push(Diag::error(&source.rel, "source has no lock file"));
                 continue;
             }
         };
-        let doc = match parse_lock(&text) {
+        let doc = match parse_lock(text) {
             Ok(doc) => doc,
             Err(err) => {
                 report.push(Diag::error(lock_rel(&source.rel), err));
                 continue;
             }
         };
-        check_lock(&doc, source, opts, &mut report);
+        check_lock(&doc, text, source, opts, &mut report);
         docs.insert(source.id.clone(), doc);
     }
-    check_orphans(opts.root, &sources, &mut report);
+    check_orphans(opts.root, sources, &mut report);
     check_routes(&docs, &mut report);
     check_calls(&docs, &mut report);
     check_migrations(&docs, &mut report);
     if opts.deploy {
         check_approval_set(&docs, &source_by_id, opts, &mut report);
     }
-    report.into_result()
+    (report.into_result(), docs)
 }
 
-fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, report: &mut Report) {
+fn check_lock(
+    doc: &LockDoc,
+    text: &str,
+    source: &SourceFile,
+    opts: &ValidateOptions<'_>,
+    report: &mut Report,
+) {
     let file = lock_rel(&source.rel);
     if doc.meta.lock_version != LOCK_VERSION {
         report.push(Diag::error(&file, "unsupported lock-version"));
@@ -161,8 +196,7 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
                 report.push(Diag::error(&file, "approved lock is missing a signature"));
             }
         } else if let Some(key) = opts.verify_key {
-            let text = fs::read_to_string(opts.root.join(&file)).unwrap_or_default();
-            if !sign::verify_lock(&text, key) {
+            if !sign::verify_lock(text, key) {
                 report.push(Diag::error(&file, "signature verification failed"));
             }
         }
