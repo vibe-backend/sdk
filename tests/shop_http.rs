@@ -80,7 +80,10 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
             stored_key("catalogreadx", read_secret, &pepper, &["catalog:read"]),
             stored_key("catalogwrite", write_secret, &pepper, &["catalog:write"]),
         ],
+        api_keys_file: None,
         env_name: "test".into(),
+        jwks: None,
+        roles_claim: "roles".into(),
     };
     let loaded = vibe::runtime::load_project_slugs(&root, true).unwrap();
     assert!(loaded.slugs.contains_key("acme"));

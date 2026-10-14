@@ -202,7 +202,7 @@ fn jwt_customized(section: Option<&Section>) -> bool {
             && block
                 .bullets
                 .iter()
-                .any(|b| matches!(b.key.as_str(), "iss" | "aud" | "jwks-uri"))
+                .any(|b| matches!(b.key.as_str(), "iss" | "aud" | "jwks-uri" | "roles-claim"))
     })
 }
 
