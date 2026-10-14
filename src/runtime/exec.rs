@@ -489,9 +489,20 @@ impl PgExec {
         let body = sql.trim().trim_end_matches(';');
         let rows = if returns_rows(body) {
             // Every column comes back as JSON, whatever its type.
-            let wrapped = format!("WITH q AS ({body}) SELECT row_to_json(q)::text FROM q");
+            let wrapped = crate::sqlguard::wrap_for_rows(body);
+            if role.is_some() {
+                // Query steps: check the text that is actually executed.
+                if let Some(problem) = crate::sqlguard::wrapped_problem(&wrapped) {
+                    return Err(ExecError::Message(problem));
+                }
+            }
             tx.query(&wrapped, &refs).await.map_err(map_pg)?
         } else {
+            if role.is_some() {
+                if let Some(problem) = crate::sqlguard::query_problem(body) {
+                    return Err(ExecError::Message(problem));
+                }
+            }
             tx.execute(body, &refs).await.map_err(map_pg)?;
             Vec::new()
         };
