@@ -58,6 +58,8 @@ pub struct AuthConfig {
     pub roles_claim: String,
     /// Private keys for `sign-jwt` steps, by `key-ref` (loaded at startup).
     pub signing_keys: HashMap<String, SigningKey>,
+    /// Breached-password source for `hash-password` (spec §4A.2).
+    pub breached: Arc<super::breached::BreachedSource>,
 }
 
 /// A JWT signing key named by a lock `key-ref`.
@@ -83,6 +85,7 @@ impl AuthConfig {
             jwks: None,
             roles_claim: "roles".into(),
             signing_keys: HashMap::new(),
+            breached: Arc::new(super::breached::BreachedSource::builtin()),
         }
     }
 }

@@ -115,7 +115,7 @@ async fn run_steps(
                 let value = match step.op.as_str() {
                     "query" => super::ops::query(exec, step, &vars, ctx).await?,
                     "verify-password" => super::ops::verify_password(step, &vars).await?,
-                    "hash-password" => super::ops::hash_password_op(step, &vars).await?,
+                    "hash-password" => super::ops::hash_password_op(step, &vars, ctx).await?,
                     "random-token" => super::ops::random_token(step, ctx)?,
                     "hash-token" => super::ops::hash_token(step, &vars, ctx)?,
                     _ => super::ops::sign_jwt(manifest, exec, method, step, &vars, ctx).await?,
@@ -871,9 +871,7 @@ fn db(err: ExecError) -> MethodFail {
 
 pub fn hash_password(plain: &str) -> Result<String, MethodFail> {
     let len = plain.chars().count();
-    if !(12..=256).contains(&len)
-        || matches!(plain, "password1234" | "123456789012" | "qwertyuiopas")
-    {
+    if !(12..=256).contains(&len) {
         return Err(MethodFail::code(
             "WEAK_PASSWORD",
             "password does not meet the platform baseline",

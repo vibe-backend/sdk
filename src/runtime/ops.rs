@@ -174,13 +174,35 @@ pub async fn verify_password(
     Ok(Value::Bool(ok && real))
 }
 
-/// `hash-password` with the platform floor (WEAK_PASSWORD below it).
+/// `hash-password` with the platform floor: 12..=256 characters and not a
+/// known breached password (spec §4A.2); otherwise WEAK_PASSWORD. When the
+/// breached-password source cannot answer, the step fails closed with 503.
 pub async fn hash_password_op(
     step: &StepSpec,
     vars: &Map<String, Value>,
+    ctx: CallCtx<'_>,
 ) -> Result<Value, MethodFail> {
     let plain = eval(opt(step, "plain"), vars)?;
     let plain = plain.as_str().unwrap_or("").to_string();
+    let len = plain.chars().count();
+    if (12..=256).contains(&len) {
+        match ctx.auth.breached.is_breached(&plain).await {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(MethodFail::code(
+                    "WEAK_PASSWORD",
+                    "password does not meet the platform baseline",
+                ))
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "breached-password check unavailable; failing closed");
+                return Err(MethodFail::code(
+                    "SERVICE_UNAVAILABLE",
+                    "Password check is unavailable; try again later",
+                ));
+            }
+        }
+    }
     let _slot = argon_slot().await?;
     let hash = tokio::task::spawn_blocking(move || hash_password(&plain))
         .await

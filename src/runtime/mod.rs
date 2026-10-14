@@ -1,3 +1,4 @@
+pub mod breached;
 mod crud;
 mod exec;
 mod http;
