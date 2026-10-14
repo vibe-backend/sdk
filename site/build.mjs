@@ -197,7 +197,10 @@ function renderTree(text, attrs = '') {
     depth = r.depth;
   }
   list += '</li>' + '</ul></li>'.repeat(depth) + '</ul>';
-  return `<pre class="tree"${attrs} role="img" aria-label="${esc(label)}"><code>${html}</code></pre><div class="sr">${list}</div>`;
+  // Merge any class="..." from the source <pre> into ours (avoid a duplicate class attribute).
+  const extra = (/\sclass="([^"]*)"/.exec(attrs) || [])[1];
+  attrs = attrs.replace(/\s*class="[^"]*"/, '');
+  return `<pre class="tree${extra ? ' ' + esc(extra) : ''}"${attrs} role="img" aria-label="${esc(label)}"><code>${html}</code></pre><div class="sr">${list}</div>`;
 }
 
 // ---------- layout ----------
@@ -211,8 +214,10 @@ function layout({ loc, rel, title, body, active, sidebar = '', wide = false, can
   const toRoot = '../'.repeat(depth + 1);       // dist/
   const toLoc = '../'.repeat(depth);            // dist/<loc>/
   const links = NAV.map(([h, k]) => `<a href="${toLoc}${h}"${active === k ? ' aria-current="page"' : ''}>${t.nav[k]}</a>`).join('');
-  const alternates = locales.map((l) => `<link rel="alternate" hreflang="${LOCALES[l].hreflang}" href="${SITE_URL}${l}/${rel}">`).join('')
-    + `<link rel="alternate" hreflang="x-default" href="${SITE_URL}${rel === 'index.html' ? '' : rel}">`;
+  // hreflang alternates use the same (versioned, index.html-less) URL as the canonical.
+  const canon = canonicalRel.replace(/(^|\/)index\.html$/, '$1');
+  const alternates = locales.map((l) => `<link rel="alternate" hreflang="${LOCALES[l].hreflang}" href="${SITE_URL}${l}/${canon}">`).join('')
+    + `<link rel="alternate" hreflang="x-default" href="${SITE_URL}${canon}">`;
   const switcher = locales.map((l) => l === loc
     ? `<span class="cur" aria-current="true">${LOCALES[l].short}</span>`
     : `<a href="${toRoot}${l}/${rel}" hreflang="${LOCALES[l].hreflang}" lang="${LOCALES[l].htmlLang}" data-lang="${l}" title="${LOCALES[l].name}">${LOCALES[l].short}</a>`).join('');
@@ -221,7 +226,7 @@ function layout({ loc, rel, title, body, active, sidebar = '', wide = false, can
 <title>${esc(title)} · vibe-backend</title>
 <meta name="description" content="${esc(t.description)}">
 <meta name="color-scheme" content="light dark">
-<link rel="canonical" href="${SITE_URL}${loc}/${canonicalRel.replace(/(^|\/)index\.html$/, "$1")}">${alternates}
+<link rel="canonical" href="${SITE_URL}${loc}/${canon}">${alternates}
 <script>${THEME_BOOT}</script>
 <link rel="stylesheet" href="${toRoot}assets/style.css?v=${assetVersion['style.css']}">
 <script defer src="${toRoot}assets/site.js?v=${assetVersion['site.js']}"></script>
@@ -239,6 +244,8 @@ function layout({ loc, rel, title, body, active, sidebar = '', wide = false, can
 }
 
 // Root-level pickers for every page path: localStorage choice > navigator.languages > en.
+// Language mapping (product decision, kept as specified for #8): zh-Hant / zh-TW / zh-HK / zh-MO and a bare
+// "zh" go to zh-hant; zh-Hans / zh-CN / zh-SG and everything else go to en. A stored choice always wins.
 function picker(rel) {
   const depth = rel.split('/').length - 1;
   const up = '../'.repeat(depth);
@@ -283,10 +290,12 @@ function specChrome(loc, fromRel, d) {
 }
 
 // Locale-level redirect page (e.g. old docs/spec.html -> docs/spec/latest/).
-function redirectPage(fromRel, toRel) {
+// The canonical is absolute and points at the versioned URL; the redirect page itself is noindex.
+function redirectPage(loc, fromRel, toRel, canonicalRel) {
   const href = relHref(fromRel, toRel);
-  return `<!doctype html><html><head><meta charset="utf-8"><title>vibe-backend</title><meta http-equiv="refresh" content="0; url=${href}">`
-    + `<link rel="canonical" href="${href}"><script>location.replace(${JSON.stringify(href)}+location.hash)</script></head>`
+  const canon = `${SITE_URL}${loc}/${canonicalRel.replace(/(^|\/)index\.html$/, '$1')}`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>vibe-backend</title><meta name="robots" content="noindex"><meta http-equiv="refresh" content="0; url=${href}">`
+    + `<link rel="canonical" href="${canon}"><script>location.replace(${JSON.stringify(href)}+location.hash)</script></head>`
     + `<body><p><a href="${href}">${href}</a></p></body></html>`;
 }
 
@@ -430,7 +439,7 @@ for (const loc of locales) {
     }));
     count++;
   }
-  if (LATEST) write(`${loc}/docs/spec.html`, redirectPage('docs/spec.html', LATEST_REL));
+  if (LATEST) write(`${loc}/docs/spec.html`, redirectPage(loc, 'docs/spec.html', LATEST_REL, docs.find((d) => d.isLatest).rel));
 }
 for (const rel of allRels) write(rel, picker(rel));
 
