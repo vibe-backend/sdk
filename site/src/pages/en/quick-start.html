@@ -1,0 +1,47 @@
+<header class="page-head reveal"><p class="eyebrow">Quick start</p><h1>Your first endpoint.</h1><p class="lead">The shape of a vibe-backend project, as defined in <a href="docs/spec/latest/index.html">the spec</a>.</p></header>
+<section class="prose">
+<h2 class="reveal"><span class="num">1</span>Lay out your project</h2>
+<pre data-tree data-label="Project structure" class="reveal">
+project/
+├── providers/
+│   └── main.md  # database provider (PostgreSQL by default)
+├── pipelines/
+│   └── login-guard.md  # reusable request pipeline
+├── migrations/main/
+│   └── 0001-create-users.md  # database migration (4-digit sequence)
+├── models/user/
+│   ├── user.md  # model definition
+│   └── methods/sign-token.md  # model method
+└── api/users/
+    ├── _definition.md  # shared settings for the “users” API
+    └── v1/
+        ├── _version.md  # settings for version v1
+        └── login/login.md  # entry point: POST /users/v1/login
+</pre>
+<p class="reveal tree-note">Compiled <code>.lock.md</code> files appear next to each source file; they are omitted here.</p>
+<p class="reveal">All names are kebab-case (<code>a-z0-9-</code>). Files that start with <code>_</code> are reserved and never routed.</p>
+<h2 class="reveal"><span class="num">2</span>Describe a feature in plain language</h2>
+<p class="reveal">A feature file says what the endpoint does. Optional headings help the compiler: purpose, input, output, approach, errors and permissions.</p>
+<pre data-lang="markdown" class="reveal">
+# login
+
+Public endpoint. Uses POST.
+
+## Input
+- email
+- password
+
+## Approach
+Run the login-guard pipeline, then call user.sign-token and return the tokens.
+
+## Errors
+- Wrong email or password returns 401.
+</pre>
+<h2 class="reveal"><span class="num">3</span>Compile, review, deploy</h2>
+<ol class="reveal">
+  <li>The compiler writes <code>login.lock.md</code> next to your source, with fixed sections such as <code>## Route</code>, <code>## Access</code>, <code>## Request</code>, <code>## Steps</code> and <code>## Errors</code>. Never edit locks by hand.</li>
+  <li>An owner or maintainer confirms the lock in the PR review; the validator highlights every security item.</li>
+  <li>On deploy, confirmed locks become a signed manifest and the endpoint is served serverless.</li>
+</ol>
+<p class="reveal">Next, read the <a href="docs/index.html">docs</a> for the full lock format, validation rules and examples.</p>
+</section>

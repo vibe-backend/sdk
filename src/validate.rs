@@ -114,8 +114,15 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
     }
     if doc.meta.compiler.model_snapshot == "latest"
         || doc.meta.compiler.model_snapshot.ends_with(":latest")
+        || doc.meta.compiler.model_snapshot.ends_with("-latest")
     {
         report.push(Diag::error(&file, "model snapshot is a floating alias"));
+    }
+    if opts.deploy && doc.meta.compiler.endpoint_private {
+        report.push(Diag::error(
+            &file,
+            "locks compiled against a private endpoint cannot be deployed",
+        ));
     }
     let order = section_order(doc.meta.kind, doc.meta.scope);
     let names: Vec<&str> = doc
@@ -278,9 +285,9 @@ fn check_model(doc: &LockDoc, file: &str, report: &mut Report) {
                 }
                 if method == "list" {
                     if let Some(max) = rule_number(options, "max-page-size") {
-                        if max > 100 {
+                        if max > 500 {
                             report.push(
-                                Diag::error(file, "max-page-size cannot exceed 100")
+                                Diag::error(file, "max-page-size cannot exceed 500")
                                     .at_section("CRUD"),
                             );
                         }

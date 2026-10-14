@@ -58,6 +58,16 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
             ));
             continue;
         }
+        if !structured {
+            if let Some(config) = opts.llm_config {
+                if !crate::llm::sampling_registered(&config.provider, &config.model) {
+                    report.push(Diag::warning(
+                        &source.rel,
+                        "model is not in the capability table; sampling parameters were not sent",
+                    ));
+                }
+            }
+        }
         let sections = if structured {
             match crate::lock::parse_sections(&source.combined_text()) {
                 Ok(sections) => sections,
@@ -68,7 +78,15 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
             }
         } else {
             match llm_sections(opts, source, &docs).await {
-                Ok(sections) => sections,
+                Ok((sections, fingerprint)) => {
+                    if let Some(fingerprint) = fingerprint {
+                        report.push(Diag::warning(
+                            &source.rel,
+                            format!("openai system_fingerprint {fingerprint}"),
+                        ));
+                    }
+                    sections
+                }
                 Err(diag) => {
                     report.push(diag);
                     continue;
@@ -206,6 +224,12 @@ fn stamp_from(config: Option<&LlmConfig>) -> CompilerStamp {
             endpoint_host: config.endpoint_host.clone(),
             endpoint_private: config.endpoint_private,
             seed: config.seed,
+            sent_params: crate::llm::model_capabilities(
+                &config.provider,
+                &config.model,
+                config.seed,
+            )
+            .to_map(),
         },
         None => CompilerStamp::deterministic(),
     }
@@ -215,7 +239,7 @@ async fn llm_sections(
     opts: &CompileOptions<'_>,
     source: &SourceFile,
     docs: &HashMap<String, LockDoc>,
-) -> Result<Vec<Section>, Diag> {
+) -> Result<(Vec<Section>, Option<String>), Diag> {
     let adapter = opts
         .llm
         .ok_or_else(|| Diag::error(&source.rel, "natural-language source needs an LLM adapter"))?;
@@ -239,12 +263,13 @@ async fn llm_sections(
         .compile(&request)
         .await
         .map_err(|err| Diag::error(&source.rel, err))?;
-    crate::lock::parse_sections(&strip_fence(&response.text)).map_err(|err| {
+    let sections = crate::lock::parse_sections(&strip_fence(&response.text)).map_err(|err| {
         Diag::error(
             &source.rel,
             format!("LLM output is not lock markdown: {err}"),
         )
-    })
+    })?;
+    Ok((sections, response.system_fingerprint))
 }
 
 pub fn system_prompt(kind: Kind, scope: Option<Scope>) -> String {

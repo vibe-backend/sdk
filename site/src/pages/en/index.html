@@ -1,0 +1,77 @@
+<section class="hero">
+  <p class="eyebrow reveal">vibe-backend SDK</p>
+  <h1 class="reveal">Write your backend<br>in plain language.</h1>
+  <p class="lead reveal">Describe each API in a Markdown file. vibe-backend compiles it into a reviewed lock file and a signed manifest, then runs every request serverless with a cold start.</p>
+  <p class="cta reveal"><a class="btn" href="quick-start.html">Get started</a><a class="link" href="docs/spec/latest/index.html">Read the spec ›</a></p>
+</section>
+
+<section class="demo" aria-labelledby="demo-title">
+  <div class="section-head reveal">
+    <p class="eyebrow">How it works</p>
+    <h2 id="demo-title">One Markdown file in. A real API out.</h2>
+    <p class="sub">The example below follows §11.5 of the spec: a v2 endpoint that reads a user.</p>
+  </div>
+  <div class="split reveal">
+    <figure class="panel">
+      <figcaption><span class="dot"></span>api/users/v2/get-user/get-user.md</figcaption>
+<pre data-lang="markdown" class="code">
+# Get user
+GET, path /users/v2/{id}, where id is a uuid.
+Use user.get to fetch the user and return 200 with
+id, email and name; if not found, return 404 NOT_FOUND.
+In v2 the name field is called display_name.
+</pre>
+    </figure>
+    <div class="arrow" aria-hidden="true"><span>compile · review · sign</span></div>
+    <figure class="panel">
+      <figcaption><span class="dot live"></span>GET /users/v2/{id}</figcaption>
+<pre data-lang="http" class="code">
+GET /users/v2/7d1e0c52-5b8a-4f0e-9a51-3c2f8e6b1a90
+Authorization: Bearer <access token>
+</pre>
+<pre data-lang="http" class="code resp">
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "id": "7d1e0c52-5b8a-4f0e-9a51-3c2f8e6b1a90",
+  "email": "ada@example.com",
+  "display_name": "Ada"
+}
+</pre>
+<pre data-lang="http" class="code resp err">
+HTTP/1.1 404 Not Found
+
+{ "error": { "code": "NOT_FOUND", "message": "…", "request_id": "…" } }
+</pre>
+    </figure>
+  </div>
+  <p class="note reveal">In between, the compiler writes <code>get-user.lock.md</code> with fixed sections (<code>## Route</code>, <code>## Request</code>, <code>## Response</code>, <code>## Transform</code>, <code>## Steps</code>, <code>## Errors</code>). The runtime only ever reads confirmed locks — never your prose.</p>
+</section>
+
+<section class="steps-band">
+  <div class="section-head reveal"><p class="eyebrow">Three stages</p><h2>From intent to production.</h2></div>
+  <ol class="steps3">
+    <li class="reveal"><span class="num">01</span><h3>Source</h3><p>Write <code>{feature}.md</code> in natural language: what it does, input, output, errors and permissions.</p></li>
+    <li class="reveal"><span class="num">02</span><h3>Lock</h3><p>The compiler emits a structured <code>{feature}.lock.md</code>. An independent, deterministic validator checks it, and an owner confirms it in the PR.</p></li>
+    <li class="reveal"><span class="num">03</span><h3>Manifest</h3><p>On deploy, confirmed locks are merged into a single signed manifest. Each request runs serverless with a cold start.</p></li>
+  </ol>
+</section>
+
+<section class="stats">
+  <div class="section-head reveal"><p class="eyebrow">Best practices, built in</p><h2>Security you don’t have to write.</h2></div>
+  <div class="grid4">
+    <div class="stat reveal"><b>1&nbsp;h</b><span>Maximum access-token lifetime. Refresh tokens rotate on every use.</span></div>
+    <div class="stat reveal"><b>12+</b><span>Minimum password length, plus a breached-password check.</span></div>
+    <div class="stat reveal"><b>5 / 15&nbsp;min</b><span>Failed logins before an account is locked for 15 minutes.</span></div>
+    <div class="stat reveal"><b>&lt;&nbsp;1&nbsp;s</b><span>p95 cold-start target for every request.</span></div>
+  </div>
+  <p class="center reveal"><a class="link" href="features.html">Explore all features ›</a></p>
+</section>
+
+<!-- ACTIVITY -->
+
+<section class="final reveal">
+  <h2>Start with a single file.</h2>
+  <p><a class="btn" href="quick-start.html">Quick start</a><a class="link" href="docs/index.html">Browse the docs ›</a></p>
+</section>

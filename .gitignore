@@ -1,3 +1,14 @@
-/target
+# Local environment / secrets (never commit real keys)
 .env
+.env.*
+!.env.example
+
+# Rust build output
+target/
+
+# Local signing keys and runtime state
 .vibe/
+
+# Node (site/)
+node_modules/
+site/dist/

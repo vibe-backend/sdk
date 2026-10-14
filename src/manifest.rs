@@ -335,7 +335,7 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
                     list.page_size = number_rule(options, "page-size").unwrap_or(20);
                     list.max_page_size = number_rule(options, "max-page-size")
                         .unwrap_or(100)
-                        .min(100);
+                        .min(500);
                     list.sort = bracket_list(options, "sort");
                     list.filter = bracket_list(options, "filter");
                     if list.sort.is_empty() {

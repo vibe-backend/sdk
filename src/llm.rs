@@ -37,6 +37,77 @@ pub struct LlmRequest {
 pub struct LlmResponse {
     pub text: String,
     pub model_reported: Option<String>,
+    pub system_fingerprint: Option<String>,
+}
+
+/// Sampling parameters the adapter is allowed to send for one model.
+///
+/// Absent fields are omitted from the request. Unregistered models send none.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SentParams {
+    pub temperature: Option<String>,
+    pub top_p: Option<String>,
+    pub top_k: Option<String>,
+    pub seed: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+impl SentParams {
+    pub fn is_empty(&self) -> bool {
+        self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.top_k.is_none()
+            && self.seed.is_none()
+            && self.reasoning_effort.is_none()
+    }
+
+    pub fn to_map(&self) -> std::collections::BTreeMap<String, String> {
+        let mut map = std::collections::BTreeMap::new();
+        let mut put = |key: &str, value: &Option<String>| {
+            if let Some(value) = value {
+                map.insert(key.to_string(), value.clone());
+            }
+        };
+        put("reasoning_effort", &self.reasoning_effort);
+        put("seed", &self.seed);
+        put("temperature", &self.temperature);
+        put("top_k", &self.top_k);
+        put("top_p", &self.top_p);
+        map
+    }
+}
+
+/// Capability table shipped with this SDK version (spec 2A.8.6, decision 58).
+///
+/// Gemini accepts temperature, topP, topK, and seed for every model. OpenAI
+/// sends sampling parameters only for models that also accept
+/// `reasoning_effort: none` (GPT-5.1 and GPT-5.2). Everything else, including
+/// Anthropic and local OpenAI-compatible tags, gets no sampling parameters.
+pub fn model_capabilities(provider: &str, model: &str, seed: u64) -> SentParams {
+    let model = model.to_ascii_lowercase();
+    if provider == GEMINI {
+        return SentParams {
+            temperature: Some("0".into()),
+            top_p: Some("1".into()),
+            top_k: Some("1".into()),
+            seed: Some(seed.to_string()),
+            reasoning_effort: None,
+        };
+    }
+    if provider == OPENAI && (model.contains("gpt-5.1") || model.contains("gpt-5.2")) {
+        return SentParams {
+            temperature: Some("0".into()),
+            top_p: Some("1".into()),
+            top_k: None,
+            seed: Some(seed.to_string()),
+            reasoning_effort: Some("none".into()),
+        };
+    }
+    SentParams::default()
+}
+
+pub fn sampling_registered(provider: &str, model: &str) -> bool {
+    !model_capabilities(provider, model, 0).is_empty()
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +150,7 @@ where
         Ok(LlmResponse {
             text: (self.responder)(request)?,
             model_reported: Some(request.model.clone()),
+            system_fingerprint: None,
         })
     }
 }
@@ -245,20 +317,24 @@ pub fn model_is_pinned(model: &str) -> bool {
     {
         return false;
     }
-    if regex_has(r"20\d{2}-\d{2}-\d{2}", model) || regex_has(r"20\d{6}", model) {
-        return true;
-    }
-    if model.contains(':') || model.contains('@') {
-        return true;
-    }
-    regex_has(r"(?:^|[-_])v?\d{4,}(?:$|[-_.])", model)
+    !FLOATING_ALIASES.contains(&lower.as_str())
 }
 
-fn regex_has(pattern: &str, text: &str) -> bool {
-    regex::Regex::new(pattern)
-        .expect("static regex")
-        .is_match(text)
-}
+const FLOATING_ALIASES: &[&str] = &[
+    "chatgpt-4o-latest",
+    "gpt-3.5-turbo",
+    "gpt-4",
+    "gpt-4-turbo",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-5",
+    "gpt-5-mini",
+    "o1",
+    "o1-mini",
+    "o3",
+    "o3-mini",
+    "o4-mini",
+];
 
 fn default_base_url(provider: &str) -> &'static str {
     match provider {
@@ -524,38 +600,65 @@ impl HttpAdapter {
     }
 }
 
-pub fn openai_body(request: &LlmRequest, seed: u64, send_seed: bool) -> Value {
+pub fn openai_body(request: &LlmRequest, params: &SentParams) -> Value {
     let mut body = json!({
         "model": request.model,
-        "temperature": 0,
-        "top_p": 1,
         "messages": [
             {"role": "system", "content": request.system},
             {"role": "user", "content": request.input}
         ]
     });
-    if send_seed {
-        body["seed"] = json!(seed);
+    apply_number(&mut body, "temperature", params.temperature.as_deref());
+    apply_number(&mut body, "top_p", params.top_p.as_deref());
+    apply_number(&mut body, "seed", params.seed.as_deref());
+    if let Some(effort) = &params.reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
     }
     body
 }
 
-pub fn anthropic_body(request: &LlmRequest) -> Value {
-    json!({
+pub fn anthropic_body(request: &LlmRequest, params: &SentParams) -> Value {
+    let mut body = json!({
         "model": request.model,
         "max_tokens": 8192,
-        "temperature": 0,
         "system": request.system,
         "messages": [{"role": "user", "content": request.input}]
-    })
+    });
+    apply_number(&mut body, "temperature", params.temperature.as_deref());
+    body
 }
 
-pub fn gemini_body(request: &LlmRequest, seed: u64) -> Value {
+pub fn gemini_body(request: &LlmRequest, params: &SentParams) -> Value {
+    let mut generation = serde_json::Map::new();
+    if let Some(value) = params.temperature.as_deref() {
+        generation.insert("temperature".into(), number_value(value));
+    }
+    if let Some(value) = params.top_p.as_deref() {
+        generation.insert("topP".into(), number_value(value));
+    }
+    if let Some(value) = params.top_k.as_deref() {
+        generation.insert("topK".into(), number_value(value));
+    }
+    if let Some(value) = params.seed.as_deref() {
+        generation.insert("seed".into(), number_value(value));
+    }
     json!({
         "systemInstruction": {"parts": [{"text": request.system}]},
         "contents": [{"role": "user", "parts": [{"text": request.input}]}],
-        "generationConfig": {"temperature": 0, "topP": 1, "topK": 1, "seed": seed}
+        "generationConfig": generation
     })
+}
+
+fn apply_number(body: &mut Value, key: &str, raw: Option<&str>) {
+    if let Some(raw) = raw {
+        body[key] = number_value(raw);
+    }
+}
+
+fn number_value(raw: &str) -> Value {
+    raw.parse::<i64>()
+        .map(|n| json!(n))
+        .unwrap_or_else(|_| json!(raw.parse::<f64>().unwrap_or(0.0)))
 }
 
 fn openai_call(
@@ -563,7 +666,8 @@ fn openai_call(
     request: &LlmRequest,
 ) -> (String, Value, Vec<(&'static str, String)>) {
     let url = join_url(&config.base_url, "chat/completions");
-    let body = openai_body(request, config.seed, true);
+    let params = model_capabilities(&config.provider, &request.model, config.seed);
+    let body = openai_body(request, &params);
     let headers = vec![("Authorization", format!("Bearer {}", config.api_key))];
     (url, body, headers)
 }
@@ -573,7 +677,8 @@ fn anthropic_call(
     request: &LlmRequest,
 ) -> (String, Value, Vec<(&'static str, String)>) {
     let url = join_url(&config.base_url, "v1/messages");
-    let body = anthropic_body(request);
+    let params = model_capabilities(&config.provider, &request.model, config.seed);
+    let body = anthropic_body(request, &params);
     let headers = vec![
         ("x-api-key", config.api_key.clone()),
         ("anthropic-version", "2023-06-01".into()),
@@ -589,7 +694,8 @@ fn gemini_call(
         &config.base_url,
         &format!("models/{}:generateContent", request.model),
     );
-    let body = gemini_body(request, config.seed);
+    let params = model_capabilities(GEMINI, &request.model, config.seed);
+    let body = gemini_body(request, &params);
     let headers = vec![("x-goog-api-key", config.api_key.clone())];
     (url, body, headers)
 }
@@ -608,9 +714,11 @@ fn parse_openai(value: &Value) -> Result<LlmResponse, String> {
         .ok_or("openai response missing message content")?
         .to_string();
     let model_reported = value["model"].as_str().map(str::to_string);
+    let system_fingerprint = value["system_fingerprint"].as_str().map(str::to_string);
     Ok(LlmResponse {
         text,
         model_reported,
+        system_fingerprint,
     })
 }
 
@@ -624,6 +732,7 @@ fn parse_anthropic(value: &Value) -> Result<LlmResponse, String> {
     Ok(LlmResponse {
         text,
         model_reported,
+        system_fingerprint: None,
     })
 }
 
@@ -636,6 +745,7 @@ fn parse_gemini(value: &Value) -> Result<LlmResponse, String> {
     Ok(LlmResponse {
         text,
         model_reported,
+        system_fingerprint: None,
     })
 }
 
@@ -732,22 +842,36 @@ mod tests {
             seed: 0,
             timeout: Duration::from_secs(1),
         };
-        let openai = openai_body(&request, 0, true);
-        assert_eq!(openai["temperature"], 0);
-        assert_eq!(openai["top_p"], 1);
-        assert_eq!(openai["seed"], 0);
+        let unknown = model_capabilities(OPENAI, &request.model, 0);
+        assert!(unknown.is_empty());
+        let openai = openai_body(&request, &unknown);
+        assert!(openai.get("temperature").is_none());
+        assert!(openai.get("seed").is_none());
         assert!(openai.get("tools").is_none());
         assert!(openai.get("functions").is_none());
         assert!(openai.get("tool_choice").is_none());
-        let anthropic = anthropic_body(&request);
-        assert_eq!(anthropic["temperature"], 0);
+        let pinned = model_capabilities(OPENAI, "gpt-5.1", 0);
+        let openai_pinned = openai_body(&request, &pinned);
+        assert_eq!(openai_pinned["temperature"], 0);
+        assert_eq!(openai_pinned["top_p"], 1);
+        assert_eq!(openai_pinned["seed"], 0);
+        assert_eq!(openai_pinned["reasoning_effort"], "none");
+        let anthropic = anthropic_body(&request, &SentParams::default());
+        assert!(anthropic.get("temperature").is_none());
         assert!(anthropic.get("tools").is_none());
         assert!(anthropic.get("top_p").is_none());
-        let gemini = gemini_body(&request, 0);
+        let gemini = gemini_body(&request, &model_capabilities(GEMINI, &request.model, 0));
         assert_eq!(gemini["generationConfig"]["temperature"], 0);
         assert_eq!(gemini["generationConfig"]["topK"], 1);
         assert!(gemini.get("tools").is_none());
         assert!(gemini.get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn undated_fixed_snapshot_is_allowed() {
+        assert!(model_is_pinned("claude-opus-4-6"));
+        assert!(!model_is_pinned("gpt-4o"));
+        assert!(!model_is_pinned("vendor:latest"));
     }
 
     #[test]

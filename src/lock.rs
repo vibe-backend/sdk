@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
+
 use crate::hashutil::sha256_prefixed;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 pub const COMPILER_NAME: &str = "md-logic";
 pub const COMPILER_VERSION: &str = "0.1.0";
@@ -180,6 +183,8 @@ pub struct CompilerStamp {
     pub endpoint_host: String,
     pub endpoint_private: bool,
     pub seed: u64,
+    /// Deterministic parameters the adapter actually sent. Empty when none were sent.
+    pub sent_params: BTreeMap<String, String>,
 }
 
 impl CompilerStamp {
@@ -192,6 +197,7 @@ impl CompilerStamp {
             endpoint_host: "none".into(),
             endpoint_private: false,
             seed: 0,
+            sent_params: BTreeMap::new(),
         }
     }
 }
@@ -343,19 +349,42 @@ pub fn section_order(kind: Kind, scope: Option<Scope>) -> &'static [&'static str
     }
 }
 
+/// Canonical compiler-hash from spec 2A.1: sorted-key JSON, UTF-8, no whitespace.
 pub fn compiler_hash(stamp: &CompilerStamp) -> String {
-    let raw = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}",
-        stamp.llm_provider,
-        stamp.endpoint_host,
-        stamp.endpoint_private,
-        stamp.model_snapshot,
-        PROMPT_VERSION,
-        stamp.name,
-        stamp.version,
-        stamp.seed
+    let mut root = BTreeMap::new();
+    root.insert("compiler.version".to_string(), json!(stamp.version));
+    root.insert("endpoint-host".to_string(), json!(stamp.endpoint_host));
+    root.insert(
+        "endpoint-private".to_string(),
+        json!(stamp.endpoint_private),
     );
+    root.insert("llm-provider".to_string(), json!(stamp.llm_provider));
+    root.insert("llm-seed".to_string(), json!(stamp.seed));
+    root.insert("model-snapshot".to_string(), json!(stamp.model_snapshot));
+    root.insert("prompt-version".to_string(), json!(PROMPT_VERSION));
+    root.insert(
+        "sent-params".to_string(),
+        sent_params_json(&stamp.sent_params),
+    );
+    let raw = serde_json::to_string(&root).expect("compiler hash json");
     sha256_prefixed(raw.as_bytes())
+}
+
+fn sent_params_json(params: &BTreeMap<String, String>) -> Value {
+    let mut out = serde_json::Map::new();
+    for (key, value) in params {
+        let parsed = if key == "reasoning_effort" {
+            Value::String(value.clone())
+        } else if let Ok(number) = value.parse::<i64>() {
+            json!(number)
+        } else if let Ok(number) = value.parse::<f64>() {
+            json!(number)
+        } else {
+            Value::String(value.clone())
+        };
+        out.insert(key.clone(), parsed);
+    }
+    Value::Object(out)
 }
 
 /// Hash of the definition a dependent should pin.
@@ -416,14 +445,15 @@ fn render_meta(meta: &Meta) -> String {
         }
     }
     out.push_str(&format!(
-        "compiler: {{ name: {}, version: {}, model-snapshot: {}, llm-provider: {}, endpoint-host: {}, endpoint-private: {}, seed: {} }}\n",
+        "compiler: {{ name: {}, version: {}, model-snapshot: {}, llm-provider: {}, endpoint-host: {}, endpoint-private: {}, llm-seed: {}, sent-params: {} }}\n",
         meta.compiler.name,
         meta.compiler.version,
         meta.compiler.model_snapshot,
         meta.compiler.llm_provider,
         meta.compiler.endpoint_host,
         meta.compiler.endpoint_private,
-        meta.compiler.seed
+        meta.compiler.seed,
+        render_sent_params(&meta.compiler.sent_params)
     ));
     push_line(&mut out, "compiler-hash", &meta.compiler_hash);
     push_line(&mut out, "status", meta.status.as_str());
@@ -802,8 +832,30 @@ fn parse_security(raw: &str) -> Result<Vec<SecurityItem>, String> {
         .collect()
 }
 
+fn render_sent_params(params: &BTreeMap<String, String>) -> String {
+    if params.is_empty() {
+        return "{}".into();
+    }
+    let body = params
+        .iter()
+        .map(|(key, value)| format!("{key}: {value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{ {body} }}")
+}
+
 fn parse_compiler(raw: &str) -> Result<CompilerStamp, String> {
     let map = parse_inline_map(raw)?;
+    let seed = map
+        .iter()
+        .find(|(key, _)| key == "llm-seed" || key == "seed")
+        .map(|(_, value)| value.as_str())
+        .ok_or("missing llm-seed")?;
+    let sent_raw = map
+        .iter()
+        .find(|(key, _)| key == "sent-params")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("{}");
     Ok(CompilerStamp {
         name: map_get(&map, "name")?.to_string(),
         version: map_get(&map, "version")?.to_string(),
@@ -811,8 +863,14 @@ fn parse_compiler(raw: &str) -> Result<CompilerStamp, String> {
         llm_provider: map_get(&map, "llm-provider")?.to_string(),
         endpoint_host: map_get(&map, "endpoint-host")?.to_string(),
         endpoint_private: map_get(&map, "endpoint-private")? == "true",
-        seed: map_get(&map, "seed")?.parse().map_err(|_| "bad seed")?,
+        seed: seed.parse().map_err(|_| "bad seed".to_string())?,
+        sent_params: parse_sent_params(sent_raw)?,
     })
+}
+
+fn parse_sent_params(raw: &str) -> Result<BTreeMap<String, String>, String> {
+    let map = parse_inline_map(raw)?;
+    Ok(map.into_iter().collect())
 }
 
 fn map_get<'a>(map: &'a [(String, String)], key: &str) -> Result<&'a str, String> {
