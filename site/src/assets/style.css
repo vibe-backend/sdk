@@ -1,7 +1,7 @@
 /* vibe-backend site — minimal, monochrome + one accent. */
 :root {
   --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", Inter, "Segoe UI", "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", system-ui, sans-serif;
-  --mono: "SF Mono", ui-monospace, Menlo, Consolas, "Noto Sans Mono CJK TC", monospace;
+  --mono: "SF Mono", ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono CJK TC", monospace;
   --bg: #fff; --bg2: #f5f5f7; --fg: #1d1d1f; --mut: #6e6e73; --line: #d2d2d7;
   --card: #fff; --code-bg: #f5f5f7; --accent: #0071e3; --accent-fg: #fff; --header: rgba(255,255,255,.72);
   --k: #ad3da4; --s: #c41a16; --n: #1c00cf; --c: #707f8c; --t: #3f6e74; --f: #4b21b0;
@@ -234,3 +234,12 @@ footer { border-top: 1px solid var(--line); color: var(--mut); font-size: 12px; 
   .chart .prs { stroke-width: 3.5; }
   .act-table .table-wrap { padding: 4px 8px; }
 }
+
+/* file tree (quick start) */
+.tree { line-height: 1.75; font-size: 14px; overflow-x: auto; white-space: pre; }
+.tree .g { color: var(--mut); opacity: .55; }
+.tree .dir { color: var(--accent); font-weight: 600; }
+.tree .file { color: var(--fg); }
+.tree .cm { color: var(--mut); }
+.tree-note { color: var(--mut); font-size: 14px; margin-top: -4px; }
+@media (max-width: 740px) { .tree { font-size: 12.5px; } }

@@ -1,16 +1,22 @@
 <header class="page-head reveal"><p class="eyebrow">Quick start</p><h1>Your first endpoint.</h1><p class="lead">The shape of a vibe-backend project, as defined in <a href="docs/spec.html">Spec v1.5</a>.</p></header>
 <section class="prose">
 <h2 class="reveal"><span class="num">1</span>Lay out your project</h2>
-<pre data-lang="plaintext" class="reveal">
+<pre data-tree class="reveal">
 project/
-  providers/main.md                     # database provider (PostgreSQL by default)
-  pipelines/login-guard.md              # reusable request pipeline
-  models/user/user.md                   # model definition
-  models/user/methods/sign-token.md     # model method
-  api/users/_definition.md              # shared settings for the "users" API
-  api/users/v1/_version.md              # settings for version v1
-  api/users/v1/login/login.md           # entry point: POST /users/v1/login
+├── providers/
+│   └── main.md  # database provider (PostgreSQL by default)
+├── pipelines/
+│   └── login-guard.md  # reusable request pipeline
+├── models/user/
+│   ├── user.md  # model definition
+│   └── methods/sign-token.md  # model method
+└── api/users/
+    ├── _definition.md  # shared settings for the “users” API
+    └── v1/
+        ├── _version.md  # settings for version v1
+        └── login/login.md  # entry point: POST /users/v1/login
 </pre>
+<p class="reveal tree-note">Compiled <code>.lock.md</code> files appear next to each source file; they are omitted here.</p>
 <p class="reveal">All names are kebab-case (<code>a-z0-9-</code>). Files that start with <code>_</code> are reserved and never routed.</p>
 <h2 class="reveal"><span class="num">2</span>Describe a feature in plain language</h2>
 <p class="reveal">A feature file says what the endpoint does. Optional headings help the compiler: purpose, input, output, approach, errors and permissions.</p>

@@ -161,6 +161,21 @@ const docTitle = (d, loc) => {
 const assetVersion = Object.fromEntries(fs.readdirSync(path.join(src, 'assets')).map((f) =>
   [f, createHash('sha256').update(fs.readFileSync(path.join(src, 'assets', f))).digest('hex').slice(0, 10)]));
 
+// File tree for hand-written pages: "├── name/  # comment" lines -> coloured spans, comments aligned.
+function renderTree(text, attrs = '') {
+  const rows = text.split('\n').map((line) => {
+    const [, guide, name, comment = ''] = /^([│├└─\s]*)(\S+)(?:\s+#\s*(.*))?$/.exec(line) || [null, '', line];
+    return { guide, name, comment };
+  });
+  const width = Math.max(...rows.map((r) => [...(r.guide + r.name)].length)) + 2;
+  const html = rows.map(({ guide, name, comment }) => {
+    const pad = ' '.repeat(Math.max(1, width - [...(guide + name)].length));
+    const cls = name.endsWith('/') ? 'dir' : 'file';
+    return `<span class="g">${esc(guide)}</span><span class="${cls}">${esc(name)}</span>${comment ? `${pad}<span class="cm"># ${esc(comment)}</span>` : ''}`;
+  }).join('\n');
+  return `<pre class="tree"${attrs}><code>${html}</code></pre>`;
+}
+
 // ---------- layout ----------
 const NAV = [['index.html', 'home'], ['features.html', 'features'], ['quick-start.html', 'quickStart'], ['docs/index.html', 'docs']];
 const THEME_BOOT = "try{var t=localStorage.getItem('vb-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}document.documentElement.classList.add('js')";
@@ -339,6 +354,7 @@ for (const loc of locales) {
   const t = LOCALES[loc];
   for (const [file, key, active] of handPages) {
     let body = fs.readFileSync(path.join(src, 'pages', loc, file), 'utf8').replace('<!-- ACTIVITY -->', () => activitySection(loc));
+    body = body.replace(/<pre data-tree([^>]*)>\n?([\s\S]*?)\n?<\/pre>/g, (_, attrs, c) => renderTree(c, attrs));
     body = body.replace(/<pre data-lang="([\w-]+)"([^>]*)>([\s\S]*?)<\/pre>/g, (_, l, attrs, c) =>
       `<pre${attrs}><code class="hljs language-${l}">${highlight(c.replace(/^\n/, '').replace(/\n$/, ''), l)}</code></pre>`);
     write(`${loc}/${file}`, layout({ loc, rel: file, title: t.pages[key], body, active, wide: key === 'index' }));
