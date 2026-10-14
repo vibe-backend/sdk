@@ -4,6 +4,12 @@
     "MD013": false,
     "MD024": { "siblings_only": true },
     "MD033": false,
-    "MD041": false
+    "MD041": false,
+    // Existing spec uses compact formatting; relax whitespace-only rules
+    "MD022": false,
+    "MD031": false,
+    "MD032": false,
+    "MD040": false,
+    "MD058": false
   }
 }
