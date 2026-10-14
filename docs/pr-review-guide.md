@@ -74,7 +74,7 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
 - 唔好用 `pull_request_target` 執行 PR 入面嘅 code。
 - Fork PR 唔跑需要 `LLM_API_KEY` 嘅重編步驟（spec 2A.8.8 已經跳過）。
 
-## 6. Release environment 同 KMS（spec 決定 89、92）
+## 6. Release environment 同 Sigstore 簽名（spec 決定 89、92、119）
 
 - 開一個 `release` environment，設 **Required reviewers**；**Deployment branches and tags** 揀 Selected branches and tags，只加 tag 規則 `v*`（唔加任何 branch），即係只准受 release ruleset 保護嘅 `v*` tag 部署。
 - `release` environment **Required reviewers** 係 `j113203`（Jack）；**Prevent self-review 關閉**（spec 決定 96）。所有 agent 都用 `j113203` push，所以 agent 觸發嘅 release 可以由同一個帳戶自己批准；呢個風險 Jack 已經接受。`--release-approval` 未實作；實作後佢唔數 reviewer，只驗證前置條件同 `release` environment 批准存在（spec 決定 90、118）。
@@ -90,12 +90,13 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
     contents: read
     pull-requests: read
     actions: read
-    id-token: write   # 只畀 OIDC 換 KMS 用
+    id-token: write   # 只畀 Sigstore keyless 簽名同 attestation 用 GitHub OIDC
   ```
 
 - 任何 API 錯誤、404 或者 rate limit，release build 都會失敗（fail closed），唔好加 retry 去繞過。
-- Release manifest 簽名 key 放喺 KMS，用 GitHub OIDC 綁定 `release` environment 同 ref 先可以用；唔好將 key 放做 repository secret。
-- CI release build 攞唔到 KMS key 就失敗，唔可以 fallback 去 dev key。
+- Release manifest 用 Sigstore keyless 簽（spec 決定 119）：release workflow 喺 `release` environment 用 GitHub OIDC 身份簽，寫入 Rekor；冇長期 key。驗證時 pin issuer `https://token.actions.githubusercontent.com`，證書身份綁定 repo、`.github/workflows/release.yml`、`refs/tags/v*` 同 commit SHA。
+- Environment secret（例如簽名 secret）只可以用喺 dev／test，永遠唔簽 release。
+- Sigstore 簽名失敗就失敗，唔可以 fallback 去 dev key。
 - 詳細加固步驟見 issue #28。
 
 ## 7. 選用：signed commits

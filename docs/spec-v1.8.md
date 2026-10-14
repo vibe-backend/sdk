@@ -21,7 +21,7 @@
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 compiler-hash 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。
 - 新增 `vibe build`：一個指令做晒編譯、驗證同 manifest（類似 `nest build`），冇 reviewer 步驟（審核由 Git 平台設定負責，決定 76，見 2C.3）。
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣由 build／CI key 簽名（決定 77–80）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
-- 新增產品經理六條基線做決定 89–94（release 簽名只限 `v*` tag 加 required-reviewer environment（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；真正閘門係要 Jack 批准嘅 `release` environment）、高風險 fail closed、production 拒絕 in-memory、冇 KMS key 就失敗、決定 29／37 恢復、`/latest/` 永遠唔係草稿），同決定 95（create-user 邀請失敗處理）。
+- 新增產品經理六條基線做決定 89–94（release 簽名只限 `v*` tag 加 required-reviewer environment（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；真正閘門係要 Jack 批准嘅 `release` environment）、高風險 fail closed、production 拒絕 in-memory、冇 release 簽名就失敗（決定 119 改用 Sigstore keyless）、決定 29／37 恢復、`/latest/` 永遠唔係草稿），同決定 95（create-user 邀請失敗處理）。
 - Lock 係 build 輸出，唔再 commit（`.gitignore`），由 CI／CD 喺部署時由 source build（決定 117，取代決定 80）。
 - CLI `--project` 預設係目前目錄；README 簡化做兩行（決定 81、82，見 2C.1）。
 - 新增 9C「冇人手 review 嘅安全模型」：寫明未經人手 review 嘅 LLM 輸出而家可以直接部署、剩餘風險同仍然有效嘅防線；另附 PR review 指引草稿（[`pr-review-guide.md`](pr-review-guide.md)，決定 83）。
@@ -79,7 +79,7 @@
 | 26 | `public_write_access` 只可以由租戶 admin 喺平台 UI 開啟。 | 7.2 |
 | 27 | 所有 lock 禁止 DDL 同 TRUNCATE（migration 另外處理）；UPDATE 一定要用主鍵或者 RLS 限定範圍；DB role 冇 DELETE／TRUNCATE 權限。 | 2A.4、7.1、10.8 |
 | 28 | （v1.8 由決定 77 取代，待產品經理確認）SDK 冇 commit hash 綁定嘅確認；建議喺 Git 平台開「有新 commit 就撤銷 approval」（見 [`pr-review-guide.md`](pr-review-guide.md)）。 | 2A.5 |
-| 29 | CODEOWNERS 必須（v1.8 照舊，唔係建議）：`api/`、`models/`、`migrations/`、`providers/`、`pipelines/`、`.github/`、`.compiler/`，同埋編譯器、驗證器版本設定，一定要有 CODEOWNERS 覆蓋，改動要 code owner review；release build 會檢查（決定 93）。Manifest 簽名 key 只喺要 Jack 批准嘅 `release` environment 經 OIDC 用 KMS（決定 79、89、118）。 | 9B |
+| 29 | CODEOWNERS 必須（v1.8 照舊，唔係建議）：`api/`、`models/`、`migrations/`、`providers/`、`pipelines/`、`.github/`、`.compiler/`，同埋編譯器、驗證器版本設定，一定要有 CODEOWNERS 覆蓋，改動要 code owner review；release build 會檢查（決定 93）。Release manifest 用 Sigstore keyless（決定 119），只喺要 Jack 批准嘅 `release` environment 用 release workflow 嘅 GitHub OIDC 身份簽（決定 79、89、118）。 | 9B |
 | 30 | Token 簽發喺 lock 明確標示 capability 旗標（唔靠 method 名推斷）；claim 白名單；roles 同 tenant_id 由平台從 DB 讀；exp 有上限；key 只用引用。 | 12.6 |
 | 31 | 新增緊急 kill switch，可以停用個別 endpoint（回 503、寫審計、唔使重新部署）。 | 9A |
 | 32 | Public 最低回應耗時由 p95 改為固定值（數值見決定 36）。 | 0.1、7.2 |
@@ -182,11 +182,11 @@
 | --- | --- | --- | --- |
 | 73 | `vibe dev`：本地 web API server，唔使預先編譯。Request 嚟到先按路由搵 `.md`，第一次用先編譯成 lock，cache key 係 source hash 加全部依賴 hash 加 compiler-hash 輸入；file watch 偵測到改動就重編受影響嘅 lock；驗證器每次編譯同每次載入 cache 都跑，唔通過就回 500 並喺 terminal 報錯。 | 待產品經理確認 | 2C.2 |
 | 74 | 正式支援 in-memory 資料庫（Jack 新要求，取代原本「預設內嵌 PostgreSQL」）：`vibe dev` 預設用 in-memory，`vibe serve --memory` 亦用同一個 in-memory 執行器。In-memory 只限開發同測試，server 一停所有資料即刻消失。喺非 dev build-mode 或者 production 環境一律拒絕 in-memory，啟動報錯退出，冇 override（決定 91）。因為 in-memory 係預設 dev 路徑，執行器一定要模擬租戶隔離（RLS＋FORCE 語意）、role grant 同 column grant，令 dev 行為同 production 一致；已知語意差異喺 2C.4 列明；CI 整合測試照樣要對真 PostgreSQL 跑。內嵌 PostgreSQL 保留做 opt-in `--db postgres`，用嚟做保真度測試。 | 待產品經理確認 | 2C.2、2C.4 |
-| 75 | Dev 編譯嘅 lock 同 manifest 一律唔可以部署：lock 記 `build-mode: dev`，manifest 用本機 dev key 簽；production runtime 只接受 build／CI key 簽嘅 manifest。2A.8 嘅本地 LLM http 規則只喺 dev 適用。 | 待產品經理確認 | 2C.2、2A.8.4 |
+| 75 | Dev 編譯嘅 lock 同 manifest 一律唔可以部署：lock 記 `build-mode: dev`，manifest 用本機 dev key 簽；production runtime 只接受 Sigstore keyless 簽、身份符合決定 119 嘅 release manifest。2A.8 嘅本地 LLM http 規則只喺 dev 適用。 | 待產品經理確認 | 2C.2、2A.8.4 |
 | 76 | `vibe build`：一個指令做晒編譯（只編譯過時嘅 lock）、驗證、manifest 產生同簽名，冇 reviewer 步驟（審核由 Git 平台設定負責）；（決定 117）lock 係 build 輸出，冇 `--check-determinism`。 | 待產品經理確認 | 2C.3 |
 | 77 | SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 刪除 `status`、`approval-mode`、`approved-by`、`approved-at`、`approval-ref`、`approved-commit`；SDK 讀到呢啲舊欄位（包括舊 lock 嘅 `approval-ref`，同決定 90 嘅 build 旗標 `--release-approval` 係兩回事）會忽略並出 warning，唔再以佢哋做部署條件。取代決定 10、11、16（人手 review 部分）、20（人手確認部分）、28、33。 | 已確認（產品經理 2026-10-14） | 2A.1、2A.5、10.1 |
 | 78 | `security-items` 保留，但改為資訊性：驗證器 deterministic 抽出、寫入 lock 同部署報告，方便 PR 高亮同 label；唔再要求逐項確認人、原因、兩個非作者，亦冇每個 PR 5 項上限。取代決定 19（確認部分）、34。 | 待產品經理確認 | 2A.5、10.10 |
-| 79 | Lock 唔再有 `signature`（lock 完整性靠 `source-hash`、依賴 hash、compiler-hash；v1.8 部署靠決定 113 attestation，決定 117 之後 lock 唔 commit）；manifest 照樣簽名，由 `vibe build` 用 build key 簽：release 用 `v*` tag 加要 Jack 批准嘅 GitHub `release` environment（真正閘門係 environment，唔係 tag，見決定 118）嘅 OIDC 綁定 KMS key（決定 89），本機用 dev key。Production runtime 只信任平台 pin 死嘅 release 公鑰（`VIBE_MANIFEST_PUBKEY`），dev key 永遠唔信任。 | 已確認（產品經理 2026-10-14） | 2A.1、9、9B、10.1 |
+| 79 | Lock 唔再有 `signature`（lock 完整性靠 `source-hash`、依賴 hash、compiler-hash；v1.8 部署靠決定 113 attestation，決定 117 之後 lock 唔 commit）；manifest 照樣簽名，由 `vibe build` 簽：release 用 Sigstore keyless（決定 119），以 `release` environment（要 Jack 批准；真正閘門係 environment，唔係 tag，見決定 118）入面 release workflow 嘅 GitHub OIDC 身份簽，本機用 dev key。Production runtime 只信任 pin 死嘅 Sigstore 身份（issuer `https://token.actions.githubusercontent.com` 加決定 119 嘅 certificate identity），dev key 永遠唔信任。 | 已確認（產品經理 2026-10-14） | 2A.1、9、9B、10.1 |
 | 80 | （已由決定 117 取代：lock 唔再 commit）建議 `*.lock.md` 同 source 一齊 commit，令 PR diff 睇到編譯結果；CI 重編決定性檢查保留，唔一致照樣封鎖部署，冇 override。 | 待產品經理確認 | 2A.6、2C.3 |
 | 81 | CLI 所有指令嘅 `--project` 預設係目前目錄（cwd）。 | 待產品經理確認 | 2C.1 |
 | 82 | README 快速開始簡化做兩行：`vibe dev` 加一個 `curl`。 | 待產品經理確認 | 2C.1 |
@@ -196,10 +196,10 @@
 | 86 | 新增 re-invite endpoint `POST /users/v2/{id}/invite`（admin），用 `user.invite` 重新寄邀請；用戶已驗證回 409 `ALREADY_ACTIVE`（決定 69 延伸）。 | 待產品經理確認 | 11.4b |
 | 87 | 11.3 `_version` 同 11.4 create-user 嘅 rate-limit 補 `key`（分別係 `user` 同 `user`），合 4.3 schema；冇 `key` 嘅 rate-limit 係驗證器 error。 | 待產品經理確認 | 11.3、11.4、10.3 |
 | 88 | Admin 建立用戶時遇到自己註冊緊（未驗證、冇密碼）嘅同一個 email：當同一個用戶處理，邀請 token 取代註冊 token（`email_verify_purpose` 變 `invite`），用戶只會收到邀請信。 | 待產品經理確認 | 11.4 |
-| 89 | 產品經理基線 1：release manifest 只可以喺有專用 release ruleset 嘅 `v*` tag（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；真正閘門係要 Jack 批准嘅 `release` environment）（v1.8 修訂：唔再由 `main` 直接出 release，見決定 96）、經有 required reviewers（Jack）、只准 `v*` tag、唔准 admin bypass 嘅 GitHub environment `release`（Prevent self-review 關閉，見決定 96）、用 OIDC 綁定嘅 KMS key 簽；依賴 issue #28（release.yml 加固）完成先可以出第一個 release。 | 待產品經理確認 | 2C.3、9B、9C |
+| 89 | 產品經理基線 1：release manifest 只可以喺有專用 release ruleset 嘅 `v*` tag（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；真正閘門係要 Jack 批准嘅 `release` environment）（v1.8 修訂：唔再由 `main` 直接出 release，見決定 96）、經有 required reviewers（Jack）、只准 `v*` tag嘅 GitHub environment `release`（Prevent self-review 關閉，見決定 96；admin bypass 保持開啟，Jack 已接受風險）、用 Sigstore keyless（決定 119） 簽；依賴 issue #28（release.yml 加固）完成先可以出第一個 release。 | 待產品經理確認 | 2C.3、9B、9C |
 | 90 | 產品經理基線 2（同決定 118 對齊）：release build 有高風險 `security-items` 就 fail closed，除非提供有效嘅 `--release-approval`（`env:<run_id>`，可以加 `pr:<n>`）。`--release-approval` **唔數 PR review 做批准**；真正批准係 `release` environment 由 Jack 批准（決定 118）。佢只驗證 deterministic 前置條件同批准存在（2C.3a）：`tree(B) == tree(H)`、build commit 喺 `main`、ruleset 同 CODEOWNERS 設定、attestation 輸入（repo、workflow、tag、commit SHA）一致，同埋呢個 run 有 `release` environment 嘅 approved 紀錄；任何 API 錯誤即失敗。驗證結果寫入 manifest 同部署報告。 | 已確認（產品經理 2026-10-14） | 2A.5、2C.3a、9C |
 | 91 | 產品經理基線 3：production 一律拒絕 in-memory 資料庫，啟動直接報錯退出；冇任何 override 旗標。Production 定義只睇 build-mode 同環境：manifest 唔係 `build-mode: dev`，或者 `VIBE_ENV=production`。Listen 地址唔係 loopback（例如 Docker 入面 `vibe dev` 綁 `0.0.0.0`）只會警告，唔會拒絕；Docker 入面請明確設 `VIBE_ENV=development`。 | 待產品經理確認 | 2C.4、9C |
-| 92 | 產品經理基線 4：CI release build 攞唔到 KMS key 就失敗，永遠唔 fallback 去 dev key；production runtime 只信任平台 pin 死嘅 release 公鑰，dev key 永遠唔信任。 | 待產品經理確認 | 2C.2、2C.3、9B |
+| 92 | 產品經理基線 4（v1.8 由決定 119 修訂）：CI release build 冇辦法用 Sigstore keyless 簽（攞唔到 OIDC token、Fulcio 或者 Rekor 失敗）就失敗，永遠唔 fallback 去 dev key 或者任何 secret；production runtime 只信任 pin 死嘅 Sigstore 身份，dev key 永遠唔信任。 | 待產品經理確認 | 2C.2、2C.3、9B |
 | 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；`vibe build` release 模式檢查 CODEOWNERS 覆蓋路徑，冇就失敗。 | 已確認（產品經理 2026-10-14）：CODEOWNERS required 係 source PR 合併條件 | 2A.7、9B |
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 待產品經理確認 | 文件標頭、網站 |
 | 95 | create-user 邀請（v1.8 修訂）：邀請信寫入 transactional outbox（同其他寫入同一個 transaction）之後，create-user 同 re-invite 回 **202**，body 帶 `user_id` 同 `invite_status: invite_pending`。Mail worker 喺背景寄同重試；超過重試上限標 `delivery_failed`。邀請狀態（`invite_pending`／`sent`／`delivery_failed`）可以查詢，亦可以經 re-invite 重寄。只有 transaction 失敗（outbox 冇寫入，成個 request rollback，決定 99）先回 503 `INVITE_NOT_QUEUED`（帶 `Retry-After`）。`INVITE_DELIVERY_FAILED` 唔再係 503 錯誤碼，改為狀態值 `delivery_failed`。同 issue #26 相關。 | 已確認（產品經理 2026-10-14） | 11.4、11.4a、11.4b |
@@ -220,12 +220,13 @@
 | 110 | 高風險 release build 唔可以用翻譯 cache，一定重新翻譯。 | 已確認（產品經理 2026-10-14） | 2.1a、2C.3 |
 | 111 | 翻譯 call 計入 #92 P5 每次編譯 LLM call 上限；超過即編譯失敗。 | 已確認（產品經理 2026-10-14） | 2.1a |
 | 112 | 修訂決定 16：高風險欄位（寫入、公開、auth、secret）一定要喺 source frontmatter 宣告；宣告同譯文唔一致，或者偵測到未宣告嘅高風險行為，即 fail closed，錯誤訊息講明缺咗邊個宣告。關鍵字檢查係一致性檢查（縱深防禦），唔係唯一防線。api feature 唔再做寫入 sql 關鍵字檢查（由已檢查嘅 method lock 繼承）。 | 已確認（產品經理 2026-10-14） | 2.2、2.1a、2A.7 |
-| 113 | 部署來源（issue #97，取代 lock 簽名做閘門）：runtime／部署只接受 CI 喺 `release` environment 由 source 重新 build 嘅 artifact，帶 GitHub artifact attestation（build provenance，SLSA），綁定 repo、workflow 路徑、ref（`refs/tags/v*`）同 commit SHA；再加現有 KMS manifest 簽名。部署器驗證 attestation、manifest 簽名同 subject digest，任何一樣失敗即拒絕。Lock 係 build 輸出，唔 commit（決定 117）；部署輸入只有 CI 呢次 build 嘅 artifact；唔做重編比對（LLM 唔決定性）。注意：KMS key 嘅建立、權限同輪換喺實際部署之前要 Jack 本人批准（唔喺產品經理代決範圍）。CI 重編再比對唔再係部署條件（修訂決定 80 同 2A.6）。 | 已確認（產品經理 2026-10-14） | 2C.3b、9C、10.1 |
+| 113 | 部署來源（issue #97，取代 lock 簽名做閘門）：runtime／部署只接受 CI 喺 `release` environment 由 source 重新 build 嘅 artifact，帶 GitHub artifact attestation（build provenance，SLSA），綁定 repo、workflow 路徑、ref（`refs/tags/v*`）同 commit SHA；再加 Sigstore keyless（決定 119） manifest 簽名。部署器驗證 attestation、manifest 簽名同 subject digest，任何一樣失敗即拒絕。Lock 係 build 輸出，唔 commit（決定 117）；部署輸入只有 CI 呢次 build 嘅 artifact；唔做重編比對（LLM 唔決定性）。CI 重編再比對唔再係部署條件（修訂決定 80 同 2A.6）。 | 已確認（產品經理 2026-10-14） | 2C.3b、9C、10.1 |
 | 114 | 部署前 deterministic policy 檢查（對 artifact）：roles、寫入、public、auth 一定要等於決定 112 嘅 frontmatter 宣告；SQL 通過決定 98 parser 白名單；UPDATE 一定要有引用主鍵／唯一鍵或者宣告篩選欄位、而且綁參數嘅 WHERE；保守規則拒絕冇 WHERE、常數或者恆真條件；判斷唔到即 fail closed；任何錯誤即 fail closed。 | 已確認（產品經理 2026-10-14） | 2C.3b、10.1 |
 | 115 | CODEOWNERS 唔係部署 gate，部署由決定 113／114 把關；CODEOWNERS required 照舊係 source PR 合併條件（決定 93）。 | 已確認（產品經理 2026-10-14） | 2C.3b、9C |
 | 116 | （已由決定 117 取代）Artifact 同 repo lock 嘅差異：release job 產生 artifact 同 repo lock 嘅 deterministic diff（SQL 先經 parse tree 正規化，只係格式唔同唔計），放入 job summary 並 attest；高風險 release 嘅 diff 涉及 roles、寫入、public、auth 或者 SQL 就失敗，錯誤訊息講明 artifact 同 repo lock 喺邊度唔同（lock id、section、step），直到 repo lock 更新到一致。 | 已確認（產品經理 2026-10-14） | 2C.3b |
 | 117 | Lock 係 build 輸出（Jack 方向，取代決定 80 同決定 116）：`*.lock.md` 唔再 commit（加入 `.gitignore`），由 CI／CD 喺部署時 build。Release job 將產生嘅 lock 存做審計 artifact 並納入 attestation，同上一個已部署版本比較，喺 release summary **列出**（唔阻擋）roles、寫入、public、auth 同 SQL 嘅變化（SQL 經 parse tree 正規化比較）。主要閘門照樣係決定 113 attestation 加決定 114 deterministic policy。`compile --check` 只喺本地／CI 驗證 build 結果同 policy，唔同已 commit 嘅 lock 比較。剩餘風險：產生嘅 SQL 唔再有人手 review；保護靠 source PR review frontmatter 宣告、決定 114 policy 同 release summary 列出變化。 | 已確認（產品經理 2026-10-14） | 2.1、2A.6、2C.3、2C.3b、9C |
 | 118 | Build once, promote：release job 只喺 `v*` tag build 一次，同一個 artifact 原封不動 promote 去各環境，唔重新 build；部署器用 `gh attestation verify --source-ref refs/tags/v<version>` 驗證。PR CI build 只係非權威預覽，結果唔可以部署。LLM key：release 用 `release` environment secret `VIBE_LLM_API_KEY`，PR 預覽用 `VIBE_LLM_API_KEY_PREVIEW`，兩條分開。Artifact 入面要有審計戳記（tag、commit SHA、workflow run id、compiler-hash、build 時間），唔包含任何 key。閘門：臨時方案 (i) 下任何有寫權限嘅人都可以開 `v*` tag，所以 tag 唔係真正閘門；真正閘門係 `release` environment 要 Jack 批准（`--release-approval` 實作之後再加埋）。將來目標係方案 (iii)：專用 release App 係唯一可以開 `v*` tag 嘅 actor，並開啟 `prevent_self_review`。兩條 LLM secret 由 Jack 本人建立。 | 已確認（產品經理 2026-10-14） | 2A.8、2C.3b |
+| 119 | Manifest 簽名改用 Sigstore keyless（Jack 決定，取代 KMS）：release manifest 由 release workflow 喺 `release` environment 用 GitHub OIDC 身份經 Sigstore（Fulcio 證書）簽，簽名一定要記錄喺 Rekor transparency log。驗證時證書身份一定要綁定 repo、release workflow 路徑（`.github/workflows/release.yml`）、`refs/tags/v*` 同 commit SHA，同埋 GitHub-hosted runner，同決定 113 attestation 一致；issuer pin 死 `https://token.actions.githubusercontent.com`；冇 Rekor inclusion 證明即拒絕。冇任何長期簽名 key、KMS 或者 key 輪換。Environment secret（例如簽名 secret）只可以用喺 dev／test，永遠唔用嚟簽 release。剩餘風險：臨時方案 (i) 下 tag 身份唔係閘門，真正閘門係 `release` environment 批准（決定 118）。 | 已確認（產品經理 2026-10-14） | 2C.2、2C.3、2C.3b、9B、9C |
 
 ## 1. 目錄同命名
 
@@ -275,7 +276,7 @@ project/
 
 1. **Source（`{name}.md`）**：用自然語言寫，講清楚「要做咩」。可以有選填嘅結構化 frontmatter（例如 `method: POST`），但唔係必須。
 2. **Lock（`{name}.lock.md`）**：編譯器將 source 編譯成固定格式嘅結構化 markdown（格式見 2A）。Lock 係 **build 輸出**，唔 commit 入 repo（`.gitignore`，決定 117）；CI／CD 喺部署時由 source build，通過驗證器同決定 114 policy 檢查，而且被收入有 attestation 同簽名嘅 manifest 之後先算生效（決定 77、79、113）。
-3. **Manifest**：`vibe build` 將所有通過驗證嘅 lock 合併成一份 manifest，用 release key 簽名（決定 79、89）。runtime 只載入 manifest。
+3. **Manifest**：`vibe build` 將所有通過驗證嘅 lock 合併成一份 manifest，release 用 Sigstore keyless 簽名（決定 79、89、119）。runtime 只載入 manifest。
 
 - runtime 永遠唔會解譯自然語言，亦唔會讀 source `.md`；lock md 係 runtime 嘅唯一依據（經 manifest 載入）。
 - 所有安全同驗證規則都喺 lock 層檢查（見第 10 節），唔係喺 source 層。
@@ -734,7 +735,7 @@ jobs:
   - `--db url`：用 `VIBE_DATABASE_URL` 連自己嘅 Postgres。
   - 唔用 PGlite：佢係 WASM 單用戶模式 Postgres，SDK 係 Rust，要再嵌 WASM runtime，role 同連線行為保真度亦唔夠；需要保真度就用 `--db postgres`。
 - Dev 限制（決定 75）：
-  - Lock 寫 `build-mode: dev`，manifest 用本機 dev key（沿用現有 `.vibe/signing.key`，第一次自動產生）簽。Production runtime 只信任平台設定 pin 死嘅 release 公鑰（可以多於一條，方便輪換）；dev key 永遠唔會被信任，就算有人將佢嘅公鑰放入設定，runtime 見到 manifest 標 `build-mode: dev` 都拒絕。
+  - Lock 寫 `build-mode: dev`，manifest 用本機 dev key（沿用現有 `.vibe/signing.key`，第一次自動產生）簽。Production runtime 只信任 pin 死嘅 Sigstore 身份（決定 119）；dev key 永遠唔會被信任，就算有人將佢嘅公鑰放入設定，runtime 見到 manifest 標 `build-mode: dev` 都拒絕。
   - 2A.8.4 嘅本地 LLM 規則（http loopback、`LLM_ALLOW_PRIVATE_HOST`）只喺 `vibe dev` 適用。
   - Kill switch、配額、captcha 喺 dev 用假實作（captcha 一律通過，terminal 標示）；最低回應耗時照做，令 timing 行為一致。
 
@@ -744,7 +745,7 @@ jobs:
   0. **只讀一次**（決定 102）：開始時將所有 source、lock 同依賴讀入記憶體，記低每個檔嘅 hash。之後驗證、manifest、部署報告同簽名全部用呢份記憶體內容，唔再由磁碟讀；第 1 步重編寫返嘅 lock 亦用寫入時嗰份記憶體內容繼續。完成前再比對磁碟 hash，唔一致就失敗，唔會出部分輸出（issue #34）。Release build 永遠唔由磁碟讀 lock：所有 lock 喺呢次 build 由 source 重新編譯，只存喺記憶體同 build 輸出（決定 113、117）。
   1. 編譯 lock（dev／本地：source 或者依賴 hash 變咗、或者 compiler-hash 輸入變咗先編譯；release：全部編譯），寫入本地 build 目錄（例如 `.vibe/build/`）或者 release artifact，**永遠唔寫返 repo**（lock 已 gitignore，決定 117）；全部或者冇（all-or-nothing），任何一步失敗都唔會留低部分輸出。
   2. 跑驗證器（第 10 節全部檢查）；任何 error 即刻失敗。高風險 release build 嘅翻譯一律重新做，唔用翻譯 cache（決定 110）。
-  3. 產生 manifest，用 build key 簽（決定 79、89、92）：release build 一定要用受保護 CI environment 嘅 KMS key；攞唔到 KMS key 就失敗，永遠唔 fallback 去 dev key（決定 92）。只有明確 `--dev` 先用 dev key，並標 `build-mode: dev`。
+  3. 產生 manifest 並簽（決定 79、89、92、119）：release build 一定要喺 `release` environment 用 release workflow 嘅 GitHub OIDC 身份做 Sigstore keyless 簽名，並寫入 Rekor；做唔到就失敗，永遠唔 fallback 去 dev key 或者任何 secret（決定 92）。只有明確 `--dev` 先用 dev key，並標 `build-mode: dev`。
   4. 輸出部署報告（10.10）同安全項目清單。Release build 遇到高風險安全項目，冇有效嘅 `--release-approval` 就失敗（決定 90，驗證規則見 2C.3a）。
   5. Release build 檢查 CODEOWNERS 覆蓋（決定 93）。
 - 選項：`--labels`（輸出建議 PR label）、`--dev`、`-o manifest.json`。
@@ -849,10 +850,10 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
 
 - Runtime 同部署器**只**接受 CI 喺 `release` environment 由 source 重新 build（`vibe build`，包括重新編譯）嘅 artifact（manifest 同佢包含嘅 lock 內容）。
 - Artifact 一定要有 GitHub artifact attestation（build provenance，predicate `https://slsa.dev/provenance/v1`），綁定：repo、workflow 路徑（例如 `.github/workflows/release.yml`）、ref（`refs/tags/v*`，決定 96；呢個綁定只證明來源，唔係閘門，見第 5 節）、commit SHA；runner 一定係 GitHub-hosted。
-- 另外照樣要有 KMS manifest 簽名（決定 79、89、92）。**KMS key 嘅建立、權限同輪換，喺實際部署之前一定要 Jack 本人批准**，唔喺產品經理代決範圍。
+- 另外要有 Sigstore keyless manifest 簽名（決定 119）：release workflow 喺 `release` environment 用 GitHub OIDC 身份簽，一定要有 Rekor transparency log inclusion。冇任何長期 key。
 - 部署器全部驗證，任何一樣失敗即拒絕部署：
   - Attestation：例如 `gh attestation verify <artifact> --repo <owner>/<repo> --signer-workflow <owner>/<repo>/.github/workflows/release.yml --source-ref refs/tags/v<version> --source-digest <commit sha> --deny-self-hosted-runners`，或者用 sigstore 驗證同樣條件。
-  - Manifest 簽名用 pin 死嘅 release public key（決定 92）。
+  - Manifest 簽名：Sigstore 驗證（例如 `cosign verify-blob --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/v<version>`，加 `--certificate-github-workflow-sha <commit sha>`、`--certificate-github-workflow-repository <owner>/<repo>`，同埋證書 extension 證明係 GitHub-hosted runner），一定要有 Rekor inclusion；身份同 attestation 一致（決定 119）。
   - Attestation 嘅 subject digest 一定等於實際部署嘅 artifact digest。
 - Lock 係 build 輸出，唔 commit（決定 117）；部署輸入只有 CI 呢次 build 嘅 artifact。
 - LLM 輸出唔決定性，所以唔做任何「重編再逐字比對」；安全靠第 2 節嘅 deterministic 檢查。
@@ -1397,7 +1398,7 @@ migration 放喺 ./migrations/main/。
   - 同 `subject-key` 嘅 `hash:{column}` 唔同：嗰個係 DB 欄位，值係 `HMAC-SHA-256(pepper, normalize(email))` 嘅 raw bytes（`bytea`），用嚟做私隱刪除；audit 用另一條 key，所以 audit log 外洩唔可以直接對比 DB。
   - lock 入面 `hash: [req.body.email]`（例如 11.2、12.11.6）一律指呢個格式。
 - 部署時將所有 lock 編譯成 manifest，入面有 routes、pipelines、steps、provider 對應、公開 endpoint 清單、public 寫入 endpoint 清單，同埋每個 lock 嘅 id、hash 同簽名。
-- manifest 由 `vibe build` 用 build key 簽名（決定 79）；runtime 只會載入驗證成功而且簽名有效嘅 manifest，冷啟動唔會再解析任何 md（source 或者 lock 都唔會）。
+- manifest 由 `vibe build` 簽名（決定 79；release 用 Sigstore keyless，決定 119）；runtime 只會載入驗證成功而且簽名有效嘅 manifest，冷啟動唔會再解析任何 md（source 或者 lock 都唔會）。
 - 編譯 manifest 前 `vibe build` 會逐個檢查 lock 嘅 hash（source、依賴、compiler-hash）同驗證器結果；lock 本身冇簽名（決定 79）。任何一個 lock 唔合格，成個部署失敗。
 
 ## 9A. 緊急 Kill Switch
@@ -1417,14 +1418,14 @@ migration 放喺 ./migrations/main/。
 ## 9B. 供應鏈同設定保護
 
 - CODEOWNERS 必須（決定 29、37、93）：`api/`、`models/`、`migrations/`、`providers/`、`pipelines/`、`.github/`、`.compiler/`（包括 `injection-allowlist`）、編譯器同驗證器版本設定，全部要有 CODEOWNERS 覆蓋；`vibe build` release 模式檢查 `CODEOWNERS`（或者 `.github/CODEOWNERS`）有冇覆蓋晒呢啲路徑，冇就失敗。設定方法見 [`pr-review-guide.md`](pr-review-guide.md)。
-- Manifest build key（決定 79）：production key 只存在 CI 用嘅 KMS，開發者攞唔到；`vibe build` 喺 CI 用佢簽 release manifest。本機 `vibe dev`／`vibe build --dev` 用本機 dev key，production runtime 拒絕。
+- Release manifest 簽名（決定 79、119）：冇長期 production key；`vibe build` 喺 CI `release` environment 用 release workflow 嘅 GitHub OIDC 身份做 Sigstore keyless 簽名，寫入 Rekor。Environment secret 只可以用喺 dev／test 簽名，永遠唔簽 release。本機 `vibe dev`／`vibe build --dev` 用本機 dev key，production runtime 拒絕。
 - Manifest 簽名前 `vibe build` 一定再跑一次驗證器；runtime 載入時驗證 manifest 簽名同每個 lock 嘅 hash，唔需要任何人手確認簽名。
 - 業務 secret（DB 連線、JWT 私鑰）只用引用名，永遠唔會出現喺 source、lock、manifest 或者 log。
 - 編譯用 `LLM_API_KEY`（或者別名 `OPENAI_API_KEY`）只存在 CI secret 同開發者本機 `.env`（已 gitignore），runtime 冇（見 2A.8.5）。
 
 ## 9C. 冇人手 review 嘅安全模型（決定 77–80、83、89–94、96；本節已定稿，產品經理 2026-10-14）
 
-**明確聲明：v1.8 起，未經人手 review 嘅 LLM 編譯輸出可以直接 build 同部署去 dev／staging；release manifest 就受決定 89–93 限制（受保護 environment 批准、高風險要 approval 參照、CODEOWNERS、冇 KMS key 就失敗）。** SDK 唔再要求任何人確認 lock；係咪有人 review，完全取決於用戶喺 Git 平台嘅設定。
+**明確聲明：v1.8 起，未經人手 review 嘅 LLM 編譯輸出可以直接 build 同部署去 dev／staging；release manifest 就受決定 89–93 限制（受保護 environment 批准、高風險要 approval 參照、CODEOWNERS、冇 Sigstore keyless 簽名就失敗）。** SDK 唔再要求任何人確認 lock；係咪有人 review，完全取決於用戶喺 Git 平台嘅設定。
 
 剩餘風險：
 
@@ -1438,10 +1439,10 @@ migration 放喺 ./migrations/main/。
 仍然有效嘅防線：
 
 - 獨立 deterministic 驗證器（2A.7、第 10 節）：op 白名單、RLS、public 寫入規則、黑名單欄位、capability 規則、密碼同驗證寫入規則、語意一致性檢查；唔通過就唔可以 build。
-- 部署來源（決定 113–115、117，取代 CI 重編決定性檢查做部署條件，見 2C.3b）：lock 係 build 輸出唔 commit；只接受 CI 由 source 重新 build、有 attestation 同 KMS 簽名嘅 artifact，部署前做 deterministic policy 檢查，release summary 列出高風險變化。剩餘風險：產生嘅 SQL 冇人手 review。舊條（已取代）：CI 重編決定性檢查（2A.6）：lock 一定係 pin 死嘅編譯器喺 CI 重編得返嘅結果，冇人可以手改 lock 偷運邏輯；冇 override。
+- 部署來源（決定 113–115、117，取代 CI 重編決定性檢查做部署條件，見 2C.3b）：lock 係 build 輸出唔 commit；只接受 CI 由 source 重新 build、有 attestation 同 Sigstore keyless 簽名（決定 119）嘅 artifact，部署前做 deterministic policy 檢查，release summary 列出高風險變化。剩餘風險：產生嘅 SQL 冇人手 review。舊條（已取代）：CI 重編決定性檢查（2A.6）：lock 一定係 pin 死嘅編譯器喺 CI 重編得返嘅結果，冇人可以手改 lock 偷運邏輯；冇 override。
 - 資料庫層：每個 request 一個 transaction 加租戶 role（決定 97、99）、parser 白名單（決定 98）、`FORCE ROW LEVEL SECURITY`、non-owner role、column grant、冇 DELETE／TRUNCATE／DDL（7.1）。
 - Runtime 限制：只載入簽咗名嘅 manifest、唔解析 md、冇 `LLM_*`、對外 call 白名單、kill switch（9A）、固定最低回應耗時、配額同限流。
-- Manifest 簽名（決定 79、89、92、96）：release 只由有專用 release ruleset（bypass 一定要空）嘅 `v*` tag 出（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；真正閘門係要 Jack 批准嘅 `release` environment）；release key 只喺 `v*` tag 加有 required reviewers（Jack）嘅 GitHub environment，經 OIDC 綁定 KMS 使用；CI 冇 key 就失敗，唔 fallback；production 只信 pin 死嘅 release 公鑰，dev key 永遠唔信任。
+- Manifest 簽名（決定 79、89、92、96）：release 只由有專用 release ruleset（bypass 一定要空）嘅 `v*` tag 出（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；真正閘門係要 Jack 批准嘅 `release` environment）；release 簽名只喺 `v*` tag 加有 required reviewers（Jack）嘅 `release` environment，用 release workflow 嘅 GitHub OIDC 身份做 Sigstore keyless 簽名（Rekor inclusion 必須，決定 119）；簽唔到就失敗，唔 fallback；production 只信 pin 死嘅 Sigstore 身份（issuer `https://token.actions.githubusercontent.com`，綁定 repo、workflow、`refs/tags/v*`、commit SHA），dev key 永遠唔信任。剩餘風險：臨時方案 (i) 下 tag 身份唔係閘門，`release` environment 批准先係。
 - 高風險 fail closed（決定 90）：release build 有高風險安全項目就要有效嘅 `--release-approval`（唔數 PR review；驗證 `tree(B) == tree(H)`、ruleset 同 CODEOWNERS 設定、attestation 輸入，同埋 `release` environment 有 Jack 嘅批准；見 2C.3a、決定 118），先可以出 release manifest。
 - `main` ruleset 可以有 admin bypass（決定 96 修訂）：日常 `--admin` merge 唔受影響；`--release-approval` 實作之後，高風險 release 先會驗證 tree 相等同 `release` environment 批准存在，令 admin bypass merge 出唔到高風險 release（`--release-approval` 未實作，實作之前唔成立，今日冇保護）。
 - CODEOWNERS 必須（決定 29、37、93）：release build 檢查覆蓋路徑。
@@ -3534,7 +3535,7 @@ security-items:
 
 私隱法（PDPO、GDPR）部分嘅建議請法律意見覆核。
 
-另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–118 已經由產品經理確認）；確認之前 v1.7 定稿照樣有效。
+另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–119 已經由產品經理確認）；確認之前 v1.7 定稿照樣有效。
 
 ## 14. 後續版本
 
