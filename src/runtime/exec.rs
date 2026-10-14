@@ -327,22 +327,192 @@ pub fn role_allows(role: &str, stmt: &Stmt) -> Result<(), String> {
     }
 }
 
+/// Connection settings for [`PgExec`].
+#[derive(Clone, Debug)]
+pub struct PgOptions {
+    /// Maximum pooled connections (`VIBE_DB_POOL_SIZE`, default 16).
+    pub pool_size: usize,
+    /// Per-request `statement_timeout` (`VIBE_DB_STATEMENT_TIMEOUT_MS`,
+    /// default 5000). Applied with `SET LOCAL` inside each request transaction.
+    pub statement_timeout_ms: u64,
+    /// How long a request waits for a free connection
+    /// (`VIBE_DB_POOL_TIMEOUT_MS`, default 5000).
+    pub pool_timeout_ms: u64,
+}
+
+impl Default for PgOptions {
+    fn default() -> Self {
+        Self {
+            pool_size: 16,
+            statement_timeout_ms: 5_000,
+            pool_timeout_ms: 5_000,
+        }
+    }
+}
+
+impl PgOptions {
+    pub fn from_env() -> Result<Self, String> {
+        let mut out = Self::default();
+        let num = |name: &str| -> Result<Option<u64>, String> {
+            match std::env::var(name) {
+                Ok(v) if !v.trim().is_empty() => v
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .map(Some)
+                    .ok_or_else(|| format!("{name} must be a positive integer")),
+                _ => Ok(None),
+            }
+        };
+        if let Some(n) = num("VIBE_DB_POOL_SIZE")? {
+            out.pool_size = n as usize;
+        }
+        if let Some(n) = num("VIBE_DB_STATEMENT_TIMEOUT_MS")? {
+            out.statement_timeout_ms = n;
+        }
+        if let Some(n) = num("VIBE_DB_POOL_TIMEOUT_MS")? {
+            out.pool_timeout_ms = n;
+        }
+        Ok(out)
+    }
+}
+
+/// TLS decision for a connection URL. `sslmode=disable` is plain text;
+/// `require`/`verify-ca`/`verify-full` use TLS with certificate and host
+/// verification (webpki roots). Without `sslmode` (or `prefer`/`allow`),
+/// loopback and Unix-socket hosts are plain text and any other host requires
+/// TLS, so a remote database is never reached unencrypted by accident.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TlsMode {
+    Disable,
+    Require,
+}
+
+/// Parses a URL into a tokio-postgres config, ignoring `sslmode` (which this
+/// module handles; tokio-postgres rejects `verify-ca`/`verify-full`).
+fn pg_config(url: &str) -> Result<tokio_postgres::Config, String> {
+    let cleaned = match url::Url::parse(url) {
+        Ok(mut u) if u.query().is_some() => {
+            let pairs: Vec<(String, String)> = u
+                .query_pairs()
+                .filter(|(k, _)| k != "sslmode")
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            if pairs.is_empty() {
+                u.set_query(None);
+            } else {
+                u.query_pairs_mut().clear().extend_pairs(pairs);
+            }
+            u.to_string()
+        }
+        _ => url.to_string(),
+    };
+    let mut config: tokio_postgres::Config = cleaned
+        .parse()
+        .map_err(|err| format!("invalid database URL: {err}"))?;
+    config.ssl_mode(tokio_postgres::config::SslMode::Disable);
+    Ok(config)
+}
+
+pub fn tls_mode(url: &str) -> Result<TlsMode, String> {
+    let config = pg_config(url)?;
+    let sslmode = url::Url::parse(url).ok().and_then(|u| {
+        u.query_pairs()
+            .find(|(k, _)| k == "sslmode")
+            .map(|(_, v)| v.to_ascii_lowercase())
+    });
+    match sslmode.as_deref() {
+        Some("disable") => return Ok(TlsMode::Disable),
+        Some("require" | "verify-ca" | "verify-full") => return Ok(TlsMode::Require),
+        Some("prefer" | "allow") | None => {}
+        Some(other) => return Err(format!("unsupported sslmode {other}")),
+    }
+    let local = config.get_hosts().iter().all(|host| match host {
+        tokio_postgres::config::Host::Tcp(name) => {
+            name == "localhost"
+                || name
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+        #[cfg(unix)]
+        tokio_postgres::config::Host::Unix(_) => true,
+    });
+    Ok(if local {
+        TlsMode::Disable
+    } else {
+        TlsMode::Require
+    })
+}
+
+/// A pool of PostgreSQL connections. Requests no longer share one connection,
+/// so a slow query only holds its own connection, and each request
+/// transaction has a `statement_timeout`.
 pub struct PgExec {
-    client: tokio::sync::Mutex<tokio_postgres::Client>,
+    pool: deadpool_postgres::Pool,
+    options: PgOptions,
 }
 
 impl PgExec {
     pub async fn connect(url: &str) -> Result<Self, String> {
-        let (client, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls)
-            .await
-            .map_err(pg_error)?;
-        tokio::spawn(async move {
-            if let Err(err) = conn.await {
-                tracing::error!(%err, "postgres connection ended");
+        Self::connect_with(url, PgOptions::default()).await
+    }
+
+    pub async fn connect_with(url: &str, options: PgOptions) -> Result<Self, String> {
+        let config = pg_config(url)?;
+        let manager_config = deadpool_postgres::ManagerConfig {
+            // A connection can come back mid-transaction (a dropped session, a
+            // cancelled request). Roll back and reset session state before
+            // reuse; a connection where this fails is discarded.
+            recycling_method: deadpool_postgres::RecyclingMethod::Custom(RECYCLE_SQL.into()),
+        };
+        let manager = match tls_mode(url)? {
+            TlsMode::Disable => deadpool_postgres::Manager::from_config(
+                config,
+                tokio_postgres::NoTls,
+                manager_config,
+            ),
+            TlsMode::Require => {
+                let roots = rustls::RootCertStore {
+                    roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+                };
+                let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .map_err(|err| err.to_string())?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+                deadpool_postgres::Manager::from_config(
+                    config,
+                    tokio_postgres_rustls::MakeRustlsConnect::new(tls),
+                    manager_config,
+                )
             }
-        });
-        Ok(Self {
-            client: tokio::sync::Mutex::new(client),
+        };
+        let pool = deadpool_postgres::Pool::builder(manager)
+            .max_size(options.pool_size)
+            .wait_timeout(Some(std::time::Duration::from_millis(
+                options.pool_timeout_ms,
+            )))
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .build()
+            .map_err(|err| err.to_string())?;
+        // Fail at startup, not on the first request.
+        drop(pool.get().await.map_err(pool_error)?);
+        Ok(Self { pool, options })
+    }
+
+    async fn client(&self) -> Result<deadpool_postgres::Object, String> {
+        self.pool.get().await.map_err(pool_error)
+    }
+
+    /// One pooled connection held for several calls (transactions, session
+    /// settings). Returned to the pool on drop.
+    pub async fn session(&self) -> Result<PgSession, String> {
+        Ok(PgSession {
+            client: Some(self.client().await?),
+            in_transaction: false,
         })
     }
 
@@ -351,7 +521,7 @@ impl PgExec {
     /// membership) any tenant schema or table. Spec §7.1: the connection role
     /// must not own the tables and must not have BYPASSRLS.
     pub async fn check_runtime_role(&self) -> Result<(), String> {
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let row = client
             .query_one(ROLE_STATUS_SQL, &[])
             .await
@@ -383,22 +553,82 @@ impl PgExec {
     /// Runs exactly one SQL command over the extended protocol; the server
     /// rejects text that contains more than one.
     pub async fn execute_one(&self, statement: &str) -> Result<(), String> {
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client.execute(statement, &[]).await.map_err(pg_error)?;
         Ok(())
     }
 
     /// Runs a query returning one text column.
     pub async fn query_texts(&self, sql: &str, param: &str) -> Result<Vec<String>, String> {
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client.query(sql, &[&param]).await.map_err(pg_error)?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
+    /// Runs statements in order on one connection (session settings such as
+    /// `SET search_path` carry across the slice, not across calls).
     pub async fn batch(&self, statements: &[String]) -> Result<(), String> {
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         for statement in statements {
             client.batch_execute(statement).await.map_err(pg_error)?;
+        }
+        Ok(())
+    }
+}
+
+/// A single pinned connection from [`PgExec::session`].
+///
+/// While [`in_transaction`](Self::in_transaction) is set (between `BEGIN`
+/// and COMMIT/ROLLBACK), dropping the session — an error path that skipped
+/// ROLLBACK, a panic, or a cancelled future — detaches the connection from
+/// the pool and closes it, so the server rolls back and no half-done
+/// transaction is ever handed out again. Otherwise it returns to the pool,
+/// which also rolls back and resets state on recycle.
+pub struct PgSession {
+    client: Option<deadpool_postgres::Object>,
+    in_transaction: bool,
+}
+
+impl Drop for PgSession {
+    fn drop(&mut self) {
+        if self.in_transaction {
+            if let Some(object) = self.client.take() {
+                drop(deadpool_postgres::Object::take(object));
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for PgSession {
+    type Target = deadpool_postgres::Object;
+    fn deref(&self) -> &Self::Target {
+        self.client.as_ref().expect("session client")
+    }
+}
+
+impl PgSession {
+    /// Marks whether a transaction is open on this session (see the type
+    /// docs for what happens on drop).
+    pub fn in_transaction(&mut self, open: bool) {
+        self.in_transaction = open;
+    }
+
+    /// Runs exactly one SQL command over the extended protocol; the server
+    /// rejects text that contains more than one.
+    pub async fn execute_one(&self, statement: &str) -> Result<(), String> {
+        (**self).execute(statement, &[]).await.map_err(pg_error)?;
+        Ok(())
+    }
+
+    /// Runs a query returning one text column.
+    pub async fn query_texts(&self, sql: &str, param: &str) -> Result<Vec<String>, String> {
+        let rows = (**self).query(sql, &[&param]).await.map_err(pg_error)?;
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    pub async fn batch(&self, statements: &[String]) -> Result<(), String> {
+        for statement in statements {
+            (**self).batch_execute(statement).await.map_err(pg_error)?;
         }
         Ok(())
     }
@@ -421,15 +651,23 @@ impl QueryExec for PgExec {
         role_allows(role, &stmt).map_err(ExecError::Message)?;
         let (sql, params) = sql::render(&stmt).map_err(ExecError::Message)?;
         let returning = returning_cols(&stmt);
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client()
+            .await
+            .map_err(|err| ExecError::Message(format!("database unavailable: {err}")))?;
         let tx = client
             .transaction()
             .await
             .map_err(|err| ExecError::Message(pg_error(err)))?;
         let schema = format!("\"t_{tenant_id}\"");
         tx.query(
-            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true)",
-            &[&tenant_id, &schema],
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), \
+             set_config('statement_timeout', $3, true)",
+            &[
+                &tenant_id,
+                &schema,
+                &self.options.statement_timeout_ms.to_string(),
+            ],
         )
         .await
         .map_err(|err| ExecError::Message(pg_error(err)))?;
@@ -498,6 +736,18 @@ fn map_pg(err: tokio_postgres::Error) -> ExecError {
         ExecError::Conflict
     } else {
         ExecError::Message(pg_error(err))
+    }
+}
+
+/// Run on every connection before it is handed out again.
+const RECYCLE_SQL: &str = "ROLLBACK; CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; \
+     UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
+
+/// A pool error; connection failures keep the server's detail.
+fn pool_error(err: deadpool_postgres::PoolError) -> String {
+    match err {
+        deadpool_postgres::PoolError::Backend(err) => pg_error(err),
+        other => other.to_string(),
     }
 }
 
@@ -587,5 +837,39 @@ mod role_tests {
         };
         assert!(role_allows("public_reader", &insert).is_err());
         assert!(role_allows("public_writer", &insert).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::{tls_mode, PgOptions, TlsMode};
+
+    #[test]
+    fn remote_hosts_require_tls_unless_disabled() {
+        let m = |u: &str| tls_mode(u).unwrap();
+        assert_eq!(m("postgres://u@localhost/db"), TlsMode::Disable);
+        assert_eq!(m("postgres://u@127.0.0.1/db"), TlsMode::Disable);
+        assert_eq!(m("postgres://u@db.example.com/db"), TlsMode::Require);
+        assert_eq!(
+            m("postgres://u@db.example.com/db?sslmode=prefer"),
+            TlsMode::Require
+        );
+        assert_eq!(
+            m("postgres://u@db.example.com/db?sslmode=disable"),
+            TlsMode::Disable
+        );
+        assert_eq!(
+            m("postgres://u@localhost/db?sslmode=verify-full"),
+            TlsMode::Require
+        );
+        assert!(tls_mode("postgres://u@localhost/db?sslmode=bogus").is_err());
+    }
+
+    #[test]
+    fn options_have_safe_defaults() {
+        let o = PgOptions::default();
+        assert_eq!(o.pool_size, 16);
+        assert_eq!(o.statement_timeout_ms, 5_000);
+        assert_eq!(o.pool_timeout_ms, 5_000);
     }
 }
