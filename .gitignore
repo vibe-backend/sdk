@@ -1,0 +1,11 @@
+# Local environment / secrets (never commit real keys)
+.env
+.env.*
+!.env.example
+
+# Rust build output
+target/
+
+# Node (site/)
+node_modules/
+site/dist/
