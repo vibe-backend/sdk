@@ -1,5 +1,7 @@
 # Markdown 驅動 Serverless Backend：架構 Spec v1.5（定稿）
 
+> **已被 v1.7 取代**：呢份 v1.5 只作歷史參考，最新定稿見 [spec-v1.7.md](spec-v1.7.md)。
+>
 > 核心架構：所有定義（model、method、api、pipeline、provider）嘅 source `.md` 一律用自然語言寫。編譯流程係「自然語言 source `.md` → 結構化 lock markdown（`{name}.lock.md`）→ 簽名 manifest」。lock md 係 runtime 唯一依據，runtime 永遠唔會解譯自然語言。
 >
 > 定稿內容：除咗下面 v1.5 決定，仲包括：安全設定照用自然語言寫，唔強制結構化 frontmatter，防線改為「獨立 deterministic 驗證器 + 收緊嘅人手 review」；編譯器冇網絡、冇工具；model snapshot pin 死同 compiler-hash；確認綁定 commit；收緊 public 寫入；禁止 DDL／TRUNCATE；token 簽發用 capability 旗標；新增緊急 kill switch；public 最低回應耗時改為固定值。
@@ -81,30 +83,21 @@
 
 ```text
 project/
-├── providers/
-│   ├── {name}.md
-│   └── {name}.lock.md
-├── pipelines/
-│   ├── {name}.md
-│   └── {name}.lock.md
-├── models/
-│   └── {object}/
-│       ├── {object}.md
-│       ├── {object}.lock.md
-│       └── methods/
-│           ├── {method}.md
-│           └── {method}.lock.md
-└── api/
-    └── {definition}/
-        ├── _definition.md
-        ├── _definition.lock.md
-        └── {version}/
-            ├── _version.md
-            ├── _version.lock.md
-            └── {feature}/
-                ├── {feature}.md
-                ├── {feature}.lock.md
-                └── schema.md      # 選填，自然語言欄位補充說明，會併入 feature 嘅 lock
+  providers/{name}.md
+  providers/{name}.lock.md
+  pipelines/{name}.md
+  pipelines/{name}.lock.md
+  models/{object}/{object}.md
+  models/{object}/{object}.lock.md
+  models/{object}/methods/{method}.md
+  models/{object}/methods/{method}.lock.md
+  api/{definition}/_definition.md
+  api/{definition}/_definition.lock.md
+  api/{definition}/{version}/_version.md
+  api/{definition}/{version}/_version.lock.md
+  api/{definition}/{version}/{feature}/{feature}.md
+  api/{definition}/{version}/{feature}/{feature}.lock.md
+  api/{definition}/{version}/{feature}/schema.md      # 選填，自然語言欄位補充說明，會併入 feature 嘅 lock
 ```
 
 - 所有名一律用 kebab-case，只准 `a-z0-9-`。
