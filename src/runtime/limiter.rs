@@ -46,8 +46,24 @@ pub const NETWORK_CAP: usize = SHARD_CAPACITY / 10;
 /// `RESERVE_NETWORK_CAP`). New clients keep getting buckets even after heavy
 /// clients have used up everything else.
 pub const RESERVE: usize = SHARD_CAPACITY / 10;
+/// Reserve caps for IPv4: an address below `RESERVE_OWNER_CAP`, its /24 below
+/// `RESERVE_NETWORK_CAP`.
 pub const RESERVE_OWNER_CAP: usize = 5;
 pub const RESERVE_NETWORK_CAP: usize = 10;
+/// Reserve caps for IPv6: a /48 below `RESERVE_V6_48_CAP`, its /32 below
+/// `RESERVE_V6_32_CAP` in total across all of its /48s.
+pub const RESERVE_V6_48_CAP: usize = 10;
+pub const RESERVE_V6_32_CAP: usize = 50;
+
+/// `(network cap, wider network cap)` inside the reserve for an
+/// [`owner_of`] string.
+fn reserve_caps(owner: &str) -> (usize, usize) {
+    if owner.ends_with("/48") {
+        (RESERVE_V6_48_CAP, RESERVE_V6_32_CAP)
+    } else {
+        (RESERVE_OWNER_CAP, RESERVE_NETWORK_CAP)
+    }
+}
 
 /// A map with a fixed capacity and least-recently-used eviction.
 pub struct BoundedMap<V> {
@@ -245,9 +261,10 @@ impl RateShard {
         if !self.prune_below(&owners[1], NETWORK_CAP, now) {
             return Err("network_cap");
         }
+        let (own_cap, net_cap) = reserve_caps(&owners[0]);
         if self.map.entries.len() >= SHARD_CAPACITY - RESERVE
-            && (!self.prune_below(&owners[0], RESERVE_OWNER_CAP, now)
-                || !self.prune_below(&owners[1], RESERVE_NETWORK_CAP, now))
+            && (!self.prune_below(&owners[0], own_cap, now)
+                || !self.prune_below(&owners[1], net_cap, now))
         {
             return Err("reserve");
         }
@@ -1154,5 +1171,98 @@ mod tests {
             &owner_of(&v6),
             now
         )));
+    }
+
+    /// Fills everything but the reserve with 9 IPv4 /24s at NETWORK_CAP.
+    fn fill_outside_reserve(rates: &mut RateBuckets, shard: &str, now: Instant) {
+        fill_29_24s(rates, shard, 9, now);
+        assert_eq!(rates.shards[shard].map.len(), SHARD_CAPACITY - RESERVE);
+    }
+
+    fn new_keys(
+        rates: &mut RateBuckets,
+        shard: &str,
+        owner: &str,
+        n: usize,
+        now: Instant,
+    ) -> usize {
+        (0..n)
+            .filter(|k| {
+                allowed(rates.check(&[(shard.into(), format!("{owner}-{k}"), 1)], owner, now))
+            })
+            .count()
+    }
+
+    #[test]
+    fn reserve_caps_each_ipv6_48_at_10() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::default();
+        fill_outside_reserve(&mut rates, "s", now);
+        assert_eq!(
+            new_keys(&mut rates, "s", "2001:db8:1::/48", 30, now),
+            RESERVE_V6_48_CAP
+        );
+        // Another /48 in the same /32 gets its own 10.
+        assert_eq!(
+            new_keys(&mut rates, "s", "2001:db8:2::/48", 30, now),
+            RESERVE_V6_48_CAP
+        );
+    }
+
+    #[test]
+    fn reserve_caps_each_ipv6_32_at_50_across_many_48s() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::default();
+        fill_outside_reserve(&mut rates, "s", now);
+        let got: usize = (0..40)
+            .map(|n| new_keys(&mut rates, "s", &format!("2001:db8:{n:x}::/48"), 30, now))
+            .sum();
+        assert_eq!(got, RESERVE_V6_32_CAP);
+        // A different /32 is not affected.
+        assert_eq!(
+            new_keys(&mut rates, "s", "2001:db9:1::/48", 30, now),
+            RESERVE_V6_48_CAP
+        );
+    }
+
+    #[test]
+    fn reserve_caps_for_ipv4_are_unchanged() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::default();
+        fill_outside_reserve(&mut rates, "s", now);
+        assert_eq!(
+            new_keys(&mut rates, "s", "198.51.100.1", 30, now),
+            RESERVE_OWNER_CAP
+        );
+        assert_eq!(
+            new_keys(&mut rates, "s", "198.51.100.2", 30, now),
+            RESERVE_OWNER_CAP
+        );
+        // The /24 is now at its reserve cap of 10.
+        assert_eq!(new_keys(&mut rates, "s", "198.51.100.3", 30, now), 0);
+        assert_eq!(RESERVE_NETWORK_CAP, 10);
+    }
+
+    #[test]
+    fn reserve_still_admits_new_clients_after_heavy_ipv6_32s() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::default();
+        fill_outside_reserve(&mut rates, "s", now);
+        // 10 /32s, each spreading over 20 /48s, use their reserve allowance.
+        for a in 0..10 {
+            for n in 0..20 {
+                new_keys(
+                    &mut rates,
+                    "s",
+                    &format!("2001:{:x}:{n:x}::/48", 0x100 + a),
+                    30,
+                    now,
+                );
+            }
+        }
+        assert!(rates.shards["s"].map.len() < SHARD_CAPACITY);
+        assert_eq!(new_keys(&mut rates, "s", "203.0.113.9", 1, now), 1);
+        let v6 = ip_bucket("2a00:1450:4001::1".parse().unwrap());
+        assert_eq!(new_keys(&mut rates, "s", &owner_of(&v6), 1, now), 1);
     }
 }

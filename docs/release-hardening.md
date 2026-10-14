@@ -17,9 +17,18 @@ Before the first `v*` tag. Items 1–2 are repository settings decided by the pr
 
 ## Rate-limit capacity limits (#71, #73)
 
-The in-memory limiter keeps at most 10,000 active buckets per `(route, key type)` shard (`SHARD_CAPACITY`). A single client network may own at most 100 of them (`OWNER_CAP`: one IPv4 address or one IPv6 /48), a wider network at most 1,000 (`NETWORK_CAP`: one IPv4 /24 or IPv6 /32), and the last 1,000 slots (`RESERVE`) only go to clients that hold fewer than 5 buckets (and whose wider network holds fewer than 10, `RESERVE_NETWORK_CAP`), so 29 /24s with 10 busy addresses each cannot fill a shard; it takes over 100 wider networks.
+The in-memory limiter keeps at most 10,000 active buckets per `(route, key type)` shard (`SHARD_CAPACITY`). A single client network may own at most 100 of them (`OWNER_CAP`: one IPv4 address or one IPv6 /48), and a wider network at most 1,000 (`NETWORK_CAP`: one IPv4 /24 or IPv6 /32). The last 1,000 slots (`RESERVE`) only go to clients below the reserve caps:
 
-These caps bound one network, not a distributed client. In review, 290 IPv4 addresses spread over 29 /24 networks filled a 10,000-slot shard with at-limit buckets: 50 of 50 new users then got 429 on that route, and the route recovered once the 60-second window passed. An attacker with a few hundred addresses across a few dozen /24s can therefore block new clients on one route (existing clients and other routes are unaffected) for as long as they keep refreshing their buckets. Mitigations outside the SDK: rate limiting at the load balancer or CDN, and a WAF for the public routes.
+- IPv4: fewer than 5 buckets per address (`RESERVE_OWNER_CAP`) and fewer than 10 per /24 (`RESERVE_NETWORK_CAP`).
+- IPv6: two tiers. Fewer than 10 new keys per /48 (`RESERVE_V6_48_CAP`) and fewer than 50 in total per /32 across all of its /48s (`RESERVE_V6_32_CAP`).
+
+**This is a mitigation, not a guarantee.** The caps bound one network, not a distributed client. Cases that can still fill a shard and lock out new clients on that route:
+
+- IPv4: 9 /24s at `NETWORK_CAP` take the 9,000 non-reserve slots, then about 100 /24s with 2 addresses each (5 buckets per address, 10 per /24) fill the 1,000 reserve slots.
+- IPv6: many /32s. 9 /32s at `NETWORK_CAP` take the non-reserve slots, then 20 /32s with 5 /48s each (10 per /48, 50 per /32) fill the reserve; an attacker with addresses in that many /32s (or a mix of /32s and /24s) can do it.
+- Many clients behind one address or /24 (CGNAT, or a proxy when `VIBE_TRUSTED_PROXIES` is unset) share that network's caps, so they can be refused together.
+
+When a shard is filled, new clients get 429 on that route only (existing clients and other routes are unaffected) until the 60-second window passes, for as long as the attacker keeps refreshing their buckets. Mitigations outside the SDK: rate limiting at the load balancer or CDN, and a WAF for the public routes.
 
 ### Saturation alert
 
