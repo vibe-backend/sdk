@@ -453,8 +453,16 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
         exec.batch(&statements).await?;
         println!("bootstrapped {}.{}", schema, model.table);
     }
+    // Migrations run in the tenant schema, never `public`.
+    let quoted = vibe::runtime::quote_ident(&schema)?;
     for migration in &manifest.migrations {
-        exec.batch(&migration.statements).await?;
+        let mut statements = vec![
+            format!("CREATE SCHEMA IF NOT EXISTS {quoted}"),
+            format!("SET search_path TO {quoted}"),
+        ];
+        statements.extend(migration.statements.iter().cloned());
+        statements.push("RESET search_path".into());
+        exec.batch(&statements).await?;
         println!("applied {}", migration.id);
     }
     Ok(())

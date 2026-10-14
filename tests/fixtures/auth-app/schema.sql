@@ -20,6 +20,7 @@ CREATE TABLE {schema}.users (
   email_verified_at timestamptz,
   deleted_at timestamptz
 );
+CREATE UNIQUE INDEX ON {schema}.users (tenant_id, email);
 ALTER TABLE {schema}.users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE {schema}.users FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON {schema}.users

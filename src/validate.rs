@@ -385,6 +385,11 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                     .at_step(&block.heading),
             );
         }
+        if op == "validate" {
+            if let Some(problem) = crate::runtime::when_problem(&block_val(block, "when")) {
+                report.push(Diag::error(file, problem).at_step(&block.heading));
+            }
+        }
         if op == "sign-jwt" {
             if !caps.contains("sign-token") {
                 report.push(

@@ -127,9 +127,8 @@ pub async fn query(
         .await
         .map_err(|err| match err {
             ExecError::Message(msg) if msg.contains("--memory") => internal(msg),
-            ExecError::Message(msg) if msg.contains("duplicate key") => {
-                MethodFail::code("CONFLICT", "already exists")
-            }
+            // SQLSTATE 23505 (unique violation), mapped in exec.
+            ExecError::Conflict => MethodFail::code("CONFLICT", "already exists"),
             other => {
                 tracing::warn!(error = ?other, "query step failed");
                 internal("query failed")
@@ -370,6 +369,9 @@ pub async fn sign_jwt(
         "access_token": token,
         "token_type": "Bearer",
         "expires_in": ttl,
+        "expires_at": chrono::DateTime::from_timestamp(now + ttl, 0)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_default(),
     }))
 }
 

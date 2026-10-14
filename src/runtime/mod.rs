@@ -7,7 +7,9 @@ mod ops;
 mod slugs;
 mod sql;
 
-pub use crud::{parse_ownership, run_method, CallCtx, CallResult, Caller, MethodFail, Ownership};
+pub use crud::{
+    parse_ownership, run_method, when_problem, CallCtx, CallResult, Caller, MethodFail, Ownership,
+};
 pub use exec::{etag, ExecError, MemoryExec, PgExec, QueryExec};
 pub use http::{
     detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router, ApiKeyFile, AppState,
@@ -21,4 +23,4 @@ pub fn hash_password_for_tests(plain: &str) -> String {
 }
 pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
-pub use sql::{bootstrap_statements, Col};
+pub use sql::{bootstrap_statements, quote as quote_ident, Col};

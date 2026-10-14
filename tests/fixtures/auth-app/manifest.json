@@ -39,7 +39,7 @@
          "sql": "", "params": [], "out": "ok", "fail": "", "when_expr": "", "writes": false, "table": "",
          "opts": {"hash": "u.password", "plain": "input.password", "missing-user": "dummy-hash"}},
         {"id": "s3", "op": "validate", "target": "", "args": "", "value": "", "status": 0,
-         "sql": "", "params": [], "out": "", "fail": "INVALID_CREDENTIALS", "when_expr": "ok != true",
+         "sql": "", "params": [], "out": "", "fail": "INVALID_CREDENTIALS", "when_expr": "`ok != true`",
          "writes": false, "table": ""},
         {"id": "s4", "op": "sign-jwt", "target": "", "args": "", "value": "", "status": 0,
          "sql": "", "params": [], "out": "tok", "fail": "", "when_expr": "", "writes": false, "table": "",

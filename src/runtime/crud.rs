@@ -72,6 +72,7 @@ async fn run_steps(
 ) -> Result<CallResult, MethodFail> {
     let mut vars = Map::new();
     vars.insert("input".into(), input.clone());
+    vars.insert("ctx".into(), ctx_var(&ctx));
     let mut last = Value::Null;
     for step in &method.steps {
         match step.op.as_str() {
@@ -105,7 +106,11 @@ async fn run_steps(
                 });
             }
             "validate" => {
-                if when_matches(&step.when_expr, &vars) {
+                let hit = when_matches(&step.when_expr, &vars).map_err(|err| {
+                    tracing::error!(error = %err, "validate step has an invalid when");
+                    MethodFail::code("INTERNAL", err)
+                })?;
+                if hit {
                     return Err(MethodFail::code(step.fail.clone(), step.fail.clone()));
                 }
             }
@@ -1009,18 +1014,85 @@ fn lookup(path: &str, vars: &Map<String, Value>) -> Value {
     current
 }
 
-fn when_matches(expr: &str, vars: &Map<String, Value>) -> bool {
-    let expr = expr.trim();
-    if let Some(name) = expr.strip_suffix(" is empty") {
-        let value = lookup(name.trim(), vars);
-        return value.is_null()
-            || value.as_array().is_some_and(Vec::is_empty)
-            || value.as_object().is_some_and(|m| m.is_empty());
+/// A parsed `when` condition. Forms: `X is empty`, `X is not empty`,
+/// `X == v`, `X != v` with `v` one of true, false, null. Surrounding
+/// backticks (lock code spans) are stripped.
+enum When {
+    Empty(String, bool),
+    Eq(String, Value, bool),
+}
+
+fn parse_when(expr: &str) -> Result<When, String> {
+    let expr = expr.trim().trim_matches('`').trim();
+    let path_ok = |p: &str| {
+        !p.is_empty()
+            && p.split('.').all(|seg| {
+                !seg.is_empty()
+                    && seg
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            })
+    };
+    if let Some(name) = expr.strip_suffix(" is not empty") {
+        let name = name.trim();
+        if path_ok(name) {
+            return Ok(When::Empty(name.to_string(), false));
+        }
+    } else if let Some(name) = expr.strip_suffix(" is empty") {
+        let name = name.trim();
+        if path_ok(name) {
+            return Ok(When::Empty(name.to_string(), true));
+        }
     }
-    if let Some(name) = expr.strip_suffix(" != true") {
-        return lookup(name.trim(), vars) != Value::Bool(true);
+    for (op, equal) in [("!=", false), ("==", true)] {
+        if let Some((left, right)) = expr.split_once(op) {
+            let left = left.trim();
+            let literal = match right.trim() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                "null" => Value::Null,
+                _ => break,
+            };
+            if path_ok(left) {
+                return Ok(When::Eq(left.to_string(), literal, equal));
+            }
+        }
     }
-    false
+    Err(format!("unsupported when condition `{expr}`"))
+}
+
+/// Why a `when` condition cannot run, if it cannot (validate uses this).
+pub fn when_problem(expr: &str) -> Option<String> {
+    parse_when(expr).err()
+}
+
+/// Evaluates a `when`. An unparseable condition is an error, never "false":
+/// a validate step must fail closed.
+fn when_matches(expr: &str, vars: &Map<String, Value>) -> Result<bool, String> {
+    Ok(match parse_when(expr)? {
+        When::Empty(name, want) => {
+            let value = lookup(&name, vars);
+            let empty = value.is_null()
+                || value.as_array().is_some_and(Vec::is_empty)
+                || value.as_object().is_some_and(|m| m.is_empty())
+                || value.as_str().is_some_and(str::is_empty);
+            empty == want
+        }
+        When::Eq(name, literal, equal) => (lookup(&name, vars) == literal) == equal,
+    })
+}
+
+/// `ctx.user` for step expressions: the caller's `sub`, `roles` and `tenant`
+/// (`sub` is null on unauthenticated routes).
+pub fn ctx_var(ctx: &CallCtx<'_>) -> Value {
+    let sub = if ctx.caller.subject.is_empty() {
+        Value::Null
+    } else {
+        Value::String(ctx.caller.subject.to_string())
+    };
+    serde_json::json!({
+        "user": {"sub": sub, "roles": ctx.caller.roles, "tenant": ctx.tenant_id}
+    })
 }
 
 pub fn req_var(

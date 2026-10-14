@@ -261,6 +261,10 @@ async fn sign_jwt_requires_capability_and_sets_platform_claims() {
     .unwrap();
     assert_eq!(out["token_type"], "Bearer");
     assert_eq!(out["expires_in"], 900);
+    let expires_at = chrono::DateTime::parse_from_rfc3339(out["expires_at"].as_str().unwrap())
+        .unwrap()
+        .timestamp();
+    assert!((expires_at - chrono::Utc::now().timestamp() - 900).abs() <= 5);
     let data = decode(out["access_token"].as_str().unwrap());
     assert_eq!(
         data.claims["tenant_id"], "tenant0001",
@@ -710,4 +714,126 @@ async fn query_cannot_read_another_tenant() {
         !matches!(&out, Ok(r) if r.value.to_string().contains("secret@b.example")),
         "tenant {tenant_a} read tenant {tenant_b}: {out:?}"
     );
+}
+
+/// The validate step from docs/best-practices/user-login.md, verbatim
+/// (`when: `ok != true``, with the code-span backticks).
+fn docs_login_check() -> Value {
+    json!([
+        step(
+            "verify-password",
+            "ok",
+            json!({"opts": {"hash": "input.hash", "plain": "input.password", "missing-user": "dummy-hash"}})
+        ),
+        step(
+            "validate",
+            "",
+            json!({"when_expr": "`ok != true`", "fail": "INVALID_CREDENTIALS"})
+        ),
+        respond("{ok: ok}"),
+    ])
+}
+
+#[tokio::test]
+async fn docs_login_when_with_backticks_rejects_wrong_and_missing_users() {
+    let m = method_manifest(&[], docs_login_check());
+    let hash = vibe::runtime::hash_password_for_tests("correct horse battery");
+    let ok = run(
+        &m,
+        &MemoryExec::new(),
+        json!({"hash": hash, "password": "correct horse battery"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok, json!({"ok": true}));
+    for input in [
+        json!({"hash": hash, "password": "wrong horse battery"}),
+        json!({"password": "correct horse battery"}),
+    ] {
+        let err = run(&m, &MemoryExec::new(), input).await.unwrap_err();
+        assert_eq!(err.0, "INVALID_CREDENTIALS");
+    }
+}
+
+#[tokio::test]
+async fn unparseable_when_fails_closed() {
+    for when in ["ok is maybe", "`ok`", "", "ok != 1"] {
+        assert!(vibe::runtime::when_problem(when).is_some(), "{when}");
+        let m = method_manifest(
+            &[],
+            json!([
+                step("validate", "", json!({"when_expr": when, "fail": "NOPE"})),
+                respond("{ran: input.x}")
+            ]),
+        );
+        let err = run(&m, &MemoryExec::new(), json!({"x": 1}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "INTERNAL", "{when}: must not pass");
+    }
+    for when in [
+        "ok != true",
+        "`ok == false`",
+        "u is empty",
+        "u.id is not empty",
+        "x == null",
+    ] {
+        assert!(vibe::runtime::when_problem(when).is_none(), "{when}");
+    }
+}
+
+#[tokio::test]
+async fn steps_can_read_ctx_user() {
+    let m = method_manifest(
+        &[],
+        json!([respond(
+            "{sub: ctx.user.sub, roles: ctx.user.roles, tenant: ctx.user.tenant}"
+        )]),
+    );
+    let auth = auth();
+    let roles = vec!["staff".to_string()];
+    let mut c = ctx(&auth, "tenant0001");
+    c.caller = Caller {
+        subject: "u1",
+        roles: &roles,
+    };
+    let out = run_method(&m, &MemoryExec::new(), "t.run", &json!({}), c, 0)
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(
+        out,
+        json!({"sub": "u1", "roles": ["staff"], "tenant": "tenant0001"})
+    );
+}
+
+#[tokio::test]
+async fn duplicate_insert_is_conflict_not_internal() {
+    let Some((_app, _admin, tenant, url)) = pg_app().await else {
+        eprintln!("VIBE_TEST_PG_ADMIN_URL not set; skipping Postgres test");
+        return;
+    };
+    let exec = PgExec::connect(&url).await.unwrap();
+    let m = method_manifest(
+        &[],
+        json!([
+            step(
+                "query",
+                "(none)",
+                json!({"table": "users", "writes": true,
+                "sql": "insert into users (tenant_id, email) values ($1, $2)",
+                "params": ["ctx.user.tenant", "input.email"]})
+            ),
+            respond("{done: input.email}")
+        ]),
+    );
+    let auth = auth();
+    let input = json!({"email": "dup@example.com"});
+    run_method(&m, &exec, "t.run", &input, ctx(&auth, &tenant), 0)
+        .await
+        .unwrap();
+    let err = run_method(&m, &exec, "t.run", &input, ctx(&auth, &tenant), 0)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "CONFLICT", "{err:?}");
 }

@@ -282,6 +282,13 @@ Required sections in order: {sections}. \
 Use `- key: value` bullets, `### sN op` steps, and markdown tables where the section needs them. \
 Allowed method ops: query, validate, call, method, respond, verify-password, hash-password, random-token, hash-token, sign-jwt. \
 Allowed api ops: method, validate, transform, respond. \
+Method op settings: query {{ sql, params: [exprs], table, writes: true only for INSERT/UPDATE, out }} (PostgreSQL only; runs as public_reader, or public_writer when writes). \
+validate {{ when, fail: ERROR_CODE }}; when is one of `X is empty`, `X is not empty`, `X == true|false|null`, `X != true|false|null`. \
+verify-password {{ hash: expr, plain: expr, missing-user: dummy-hash, out }} gives true/false. \
+hash-password {{ plain: expr, out }}. random-token {{ out }} gives {{ value, hash }} (32 bytes; store hash, a bytea). \
+hash-token {{ value: expr, normalize: email (optional), out }}. \
+sign-jwt {{ alg: ES256|RS256, key-ref: ENV_NAME, claims: {{ sub: expr, ... }}, custom-claims: [names], ttl: <=1h, out }} needs capabilities: [sign-token]; roles come from users.roles, never from claims; output {{ access_token, token_type, expires_in, expires_at }}. \
+Expressions can read input.*, earlier step outputs, and ctx.user.sub, ctx.user.roles, ctx.user.tenant. \
 SQL must be a single parameterized statement using $1, $2. \
 Never emit DELETE, TRUNCATE, GRANT, REVOKE, or DDL outside a migration. \
 Do not invent public access, removed auth, writes, token signing, or external calls unless the source says so. \
@@ -717,6 +724,11 @@ fn merge_pipelines(def: Option<&Section>, ver: Option<&Section>, own: Option<&Se
                 blocks.push(block.clone());
                 continue;
             }
+            // Rate limits add up: every rate-limit block is its own limit.
+            if name == "rate-limit" {
+                blocks.push(block.clone());
+                continue;
+            }
             if let Some(existing) = blocks
                 .iter_mut()
                 .find(|existing| pipeline_name(&existing.heading) == name)
@@ -1031,4 +1043,44 @@ fn render_inline_list(items: &[String]) -> String {
 
 fn parse_name_list(raw: &str) -> Vec<String> {
     crate::lock::parse_string_list(raw).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    fn block(heading: &str, bullets: &[(&str, &str)]) -> Block {
+        Block {
+            heading: heading.into(),
+            bullets: bullets
+                .iter()
+                .map(|(k, v)| Bullet {
+                    key: (*k).into(),
+                    value: (*v).into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn every_rate_limit_block_is_kept() {
+        let own = Section {
+            name: "Pipelines".into(),
+            bullets: Vec::new(),
+            table: None,
+            blocks: vec![
+                block("p1 login-guard", &[("ip-per-minute", "10")]),
+                block("p2 rate-limit", &[("per-minute", "5"), ("key", "ip")]),
+                block("p3 rate-limit", &[("per-minute", "300"), ("key", "tenant")]),
+            ],
+            none: false,
+        };
+        let merged = merge_pipelines(None, None, Some(&own));
+        let rates: Vec<_> = merged
+            .blocks
+            .iter()
+            .filter(|b| pipeline_name(&b.heading) == "rate-limit")
+            .collect();
+        assert_eq!(rates.len(), 2, "{:?}", merged.blocks);
+    }
 }

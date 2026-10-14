@@ -647,6 +647,18 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     let req_value = crud::req_var(body, query_values, found.params.clone(), header_values);
     let mut vars = Map::new();
     vars.insert("req".into(), req_value);
+    vars.insert(
+        "ctx".into(),
+        crud::ctx_var(&crud::CallCtx {
+            auth: &state.auth,
+            tenant_id: &principal.tenant_id,
+            role: "",
+            caller: crud::Caller {
+                subject: &principal.subject,
+                roles: &principal.roles,
+            },
+        }),
+    );
     let input = match crud::eval_expr(&found.route.transform_in, &vars) {
         Ok(value) => value,
         Err(err) => {
@@ -1401,10 +1413,12 @@ fn rate_limited(
     let checks: Vec<(String, String, u32)> = route
         .rates
         .iter()
-        .map(|rate| {
+        .enumerate()
+        .map(|(index, rate)| {
             let (shard, key) =
                 rate_bucket(&rate.key, route, ip, principal, body, &state.auth.pepper);
-            (shard, key, rate.per_minute)
+            // Each block is its own limit, even when two share a key.
+            (format!("{shard}#{index}"), key, rate.per_minute)
         })
         .collect();
     let Ok(mut rates) = state.rates.lock() else {
