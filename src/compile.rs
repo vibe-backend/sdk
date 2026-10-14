@@ -1154,9 +1154,21 @@ mod prompt_tests {
         }
     }
 
+    /// The shop test project: `tests/fixtures/shop` (after #76), or the old
+    /// `examples/shop` on branches that predate the move.
+    fn shop_fixture() -> std::path::PathBuf {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = root.join("tests/fixtures/shop");
+        if fixture.is_dir() {
+            fixture
+        } else {
+            root.join("examples/shop")
+        }
+    }
+
     /// Structured shop locks compiled into a temp dir.
     async fn shop_docs() -> HashMap<String, LockDoc> {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/shop");
+        let src = shop_fixture();
         let dir = std::env::temp_dir().join(format!("vibe-prompt-{}", uuid::Uuid::new_v4()));
         copy_dir(&src, &dir);
         let opts = super::CompileOptions {
@@ -1261,7 +1273,7 @@ mod prompt_tests {
 
     #[tokio::test]
     async fn unknown_method_target_is_an_error() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/shop");
+        let src = shop_fixture();
         let dir = std::env::temp_dir().join(format!("vibe-target-{}", uuid::Uuid::new_v4()));
         copy_dir(&src, &dir);
         let f = dir.join("api/catalog/v1/get-product/get-product.md");
