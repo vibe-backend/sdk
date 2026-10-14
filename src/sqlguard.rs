@@ -6,7 +6,9 @@
 
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, ObjectName, Query, SetExpr, Statement, TableFactor, Visit, Visitor};
+use sqlparser::ast::{
+    BinaryOperator, Expr, ObjectName, Query, SetExpr, Statement, TableFactor, Visit, Visitor,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -66,6 +68,18 @@ fn table_problem(name: &ObjectName) -> Option<String> {
     None
 }
 
+/// Problems in the set-expression tree that the visitor does not reach as
+/// relations (for example `TABLE name` operands).
+fn set_expr_problem(body: &SetExpr) -> Option<String> {
+    match body {
+        SetExpr::Table(_) => Some("TABLE expressions are not allowed".into()),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_problem(left).or_else(|| set_expr_problem(right))
+        }
+        _ => None,
+    }
+}
+
 struct Guard(Option<String>);
 
 impl Guard {
@@ -79,6 +93,9 @@ impl Visitor for Guard {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if let Some(problem) = set_expr_problem(&query.body) {
+            return self.fail(problem);
+        }
         if let SetExpr::Select(select) = &*query.body {
             if select.into.is_some() {
                 return self.fail("SELECT ... INTO is not allowed".into());
@@ -143,6 +160,18 @@ impl Visitor for Guard {
             if base.starts_with("reg") || base == "oid" || base == "name" {
                 return self.fail(format!("cast to {ty} is not allowed in lock SQL"));
             }
+        }
+        match expr {
+            Expr::Collate { collation, .. } if collation.0.len() != 1 => {
+                return self.fail(format!(
+                    "collation {collation} must not be schema-qualified"
+                ));
+            }
+            Expr::BinaryOp {
+                op: BinaryOperator::PGCustomBinaryOperator(_),
+                ..
+            } => return self.fail("OPERATOR(...) is not allowed in lock SQL".into()),
+            _ => {}
         }
         if let Expr::Function(func) = expr {
             let ok = func.name.0.len() == 1 && {
@@ -218,9 +247,55 @@ pub fn query_problem(sql: &str) -> Option<String> {
     guard.0
 }
 
+/// The text actually sent for a step whose rows are read: the step SQL in a
+/// CTE so every column comes back as JSON.
+pub fn wrap_for_rows(body: &str) -> String {
+    format!("WITH q AS ({body}\n) SELECT row_to_json(q)::text FROM q")
+}
+
+/// Checks the final wrapped text from [`wrap_for_rows`]: it must be exactly
+/// one CTE named `q` with the fixed outer SELECT, and the CTE body must pass
+/// [`query_problem`].
+pub fn wrapped_problem(wrapped: &str) -> Option<String> {
+    let statements = match Parser::parse_sql(&PostgreSqlDialect {}, wrapped) {
+        Ok(s) => s,
+        Err(err) => return Some(format!("SQL does not parse: {err}")),
+    };
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Some("wrapped SQL has an unexpected shape".into());
+    };
+    let expected_outer = Parser::parse_sql(
+        &PostgreSqlDialect {},
+        "WITH q AS (SELECT 1) SELECT row_to_json(q)::text FROM q",
+    )
+    .ok()
+    .and_then(|mut s| match s.pop() {
+        Some(Statement::Query(q)) => Some(q),
+        _ => None,
+    })?;
+    let Some(with) = &query.with else {
+        return Some("wrapped SQL has an unexpected shape".into());
+    };
+    let shape_ok = !with.recursive
+        && with.cte_tables.len() == 1
+        && with.cte_tables[0].alias.name.value == "q"
+        && with.cte_tables[0].alias.columns.is_empty()
+        && with.cte_tables[0].from.is_none()
+        && query.body == expected_outer.body
+        && query.order_by == expected_outer.order_by
+        && query.limit == expected_outer.limit
+        && query.offset == expected_outer.offset
+        && query.fetch == expected_outer.fetch
+        && query.locks.is_empty();
+    if !shape_ok {
+        return Some("wrapped SQL has an unexpected shape".into());
+    }
+    query_problem(&with.cte_tables[0].query.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{analyze, query_problem, SqlInfo};
+    use super::{analyze, query_problem, wrap_for_rows, wrapped_problem, SqlInfo};
 
     #[test]
     fn returns_rows_reads_returning_from_the_parse_tree() {
@@ -301,8 +376,40 @@ mod tests {
             "select cast('x' as regproc)",
             "select count(*) from users where tableoid = '_platform_refresh_tokens'::regclass",
             "select regclass 'users'",
+            "select name from users where name = 'a' collate pg_catalog.\"C\"",
+            "select 1 operator(pg_catalog.+) 1",
         ] {
             assert!(query_problem(sql).is_some(), "accepted: {sql}");
+        }
+    }
+
+    #[test]
+    fn table_operands_are_checked() {
+        for sql in [
+            "select id from users union table _platform_refresh_tokens",
+            "select id from users except table _platform_refresh_tokens",
+            "select id from users union all table users",
+            "insert into users (id) table _platform_refresh_tokens",
+            "table _platform_refresh_tokens",
+        ] {
+            assert!(query_problem(sql).is_some(), "accepted: {sql}");
+        }
+    }
+
+    #[test]
+    fn wrapped_text_is_checked() {
+        for sql in [
+            "select id from users where email = $1",
+            "insert into users (email) values ($1) returning id",
+        ] {
+            assert_eq!(wrapped_problem(&wrap_for_rows(sql)), None, "{sql}");
+        }
+        for sql in [
+            "select 1 as x) , d as (delete from users returning id) select row_to_json(d)::text from d --",
+            "select id from users) select 1 from q union select 1 from (select 1",
+            "select * from _platform_refresh_tokens",
+        ] {
+            assert!(wrapped_problem(&wrap_for_rows(sql)).is_some(), "accepted: {sql}");
         }
     }
 }
