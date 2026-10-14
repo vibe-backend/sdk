@@ -625,8 +625,8 @@ fn owner_eq(model: &ModelSpec, caller: Caller<'_>) -> Result<Option<(Col, Value)
     }
     let column = match model.fields.iter().find(|field| field.name == key) {
         Some(field) => col(field),
-        // The `users` table may use its own primary key (spec §12.6a).
-        None if key == "id" => Col {
+        // Only the `users` table may use its own primary key (spec §12.6a).
+        None if key == "id" && model.table == "users" => Col {
             name: "id".into(),
             ty: "uuid".into(),
         },
@@ -650,7 +650,10 @@ fn owner_value(
     field: &FieldSpec,
     caller: Caller<'_>,
 ) -> Result<Value, MethodFail> {
-    if model.ownership == "tenant-wide" && caller.subject.is_empty() {
+    let tenant_wide = parse_ownership(&model.ownership)
+        .map_err(|err| MethodFail::code("INTERNAL", format!("model {}: {err}", model.id)))?
+        == Ownership::TenantWide;
+    if tenant_wide && caller.subject.is_empty() {
         return Ok(Value::Null);
     }
     if caller.subject.is_empty() {
@@ -1076,10 +1079,12 @@ mod ownership_tests {
     }
 
     #[test]
-    fn id_owner_key_uses_primary_key() {
-        let (column, value) = owner_eq(&model(Some("id"), ""), caller("u1", &[]))
-            .unwrap()
-            .unwrap();
+    fn id_owner_key_is_only_for_users() {
+        let err = owner_eq(&model(Some("id"), ""), caller("u1", &[])).unwrap_err();
+        assert_eq!(err.code, "INTERNAL", "cart_items may not use owner-key: id");
+        let mut users = model(Some("id"), "");
+        users.table = "users".into();
+        let (column, value) = owner_eq(&users, caller("u1", &[])).unwrap().unwrap();
         assert_eq!(column.name, "id");
         assert_eq!(value, Value::String("u1".into()));
     }

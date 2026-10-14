@@ -271,7 +271,22 @@ fn check_model(doc: &LockDoc, file: &str, report: &mut Report) {
                 .rows
                 .iter()
                 .any(|row| row.first().map(String::as_str) == Some(key));
-            if !declared && key != "id" {
+            let table_name = find_section(&doc.sections, "Table")
+                .and_then(|section| section.get("table"))
+                .unwrap_or("");
+            if key == "id" {
+                // Only the `users` table may scope rows by its own primary key
+                // (spec §12.6a); elsewhere `id = ctx.user.id` is a mistake.
+                if table_name != "users" {
+                    report.push(
+                        Diag::error(
+                            file,
+                            "owner-key: id is only allowed on the users table; use a column holding the owner's user id",
+                        )
+                        .at_section("Table"),
+                    );
+                }
+            } else if !declared {
                 report.push(
                     Diag::error(file, format!("owner-key {key} is not a field"))
                         .at_section("Table"),
