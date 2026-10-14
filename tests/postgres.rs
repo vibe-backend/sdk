@@ -359,3 +359,108 @@ async fn serve_refuses_tables_without_forced_rls() {
         .unwrap();
     check_as(&s.admin_url, &s.app).await.unwrap();
 }
+
+#[tokio::test]
+async fn migration_policies_are_refused_and_nothing_is_committed() {
+    let s = require_pg!(setup().await);
+    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    for stmt in [
+        "CREATE POLICY open ON audit_notes USING (true)",
+        "CREATE POLICY narrow ON audit_notes AS RESTRICTIVE USING (true)",
+    ] {
+        let mut m = manifest();
+        m.migrations[0].statements.push(stmt.to_string());
+        let tenant = format!("tp{}", suffix());
+        let err = migrate_tenant(&owner_exec, &m, &tenant, &s.app)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("must not create row level security policies"),
+            "{stmt}: {err}"
+        );
+        // Transactional: the failed migration left no schema or tables behind.
+        let left = s
+            .admin
+            .query_one(
+                "SELECT count(*) FROM pg_namespace WHERE nspname = $1",
+                &[&format!("t_{tenant}")],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(left, 0, "{stmt}: schema must be rolled back");
+    }
+    // The executor connection is still usable after the rollback.
+    migrate_tenant(&owner_exec, &manifest(), &format!("tq{}", suffix()), &s.app)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn serve_refuses_extra_or_altered_policies() {
+    let s = require_pg!(setup().await);
+    let schema = format!("t_{}", s.tenant);
+    check_as(&s.admin_url, &s.app).await.unwrap();
+    // Reproduce the leak first: an extra permissive policy lets the runtime
+    // role read another tenant's row.
+    s.admin
+        .batch_execute(&format!(
+            "INSERT INTO {schema}.audit_notes VALUES ('othertenant1', 'leak'); \
+             CREATE POLICY open ON {schema}.audit_notes USING (true)"
+        ))
+        .await
+        .unwrap();
+    let leaked = s
+        .admin
+        .batch_execute(&format!(
+            "SET ROLE {app}; BEGIN; SELECT set_config('app.tenant_id', '{t}', true); \
+             DO $$ BEGIN IF (SELECT count(*) FROM {schema}.audit_notes) = 0 THEN RAISE EXCEPTION 'none'; END IF; END $$; \
+             COMMIT; RESET ROLE",
+            app = s.app,
+            t = s.tenant
+        ))
+        .await;
+    let _ = s.admin.batch_execute("ROLLBACK; RESET ROLE").await;
+    assert!(leaked.is_ok(), "extra permissive policy widens access");
+    let err = check_as(&s.admin_url, &s.app).await.unwrap_err();
+    assert!(
+        err.contains(&format!("{schema}.audit_notes:open")) && err.contains("OR-combined"),
+        "{err}"
+    );
+    s.admin
+        .batch_execute(&format!("DROP POLICY open ON {schema}.audit_notes"))
+        .await
+        .unwrap();
+    check_as(&s.admin_url, &s.app).await.unwrap();
+    // A tenant_isolation whose expression was altered is refused as well.
+    s.admin
+        .batch_execute(&format!(
+            "ALTER POLICY tenant_isolation ON {schema}.notes USING (true)"
+        ))
+        .await
+        .unwrap();
+    let err = check_as(&s.admin_url, &s.app).await.unwrap_err();
+    assert!(err.contains("notes:tenant_isolation"), "{err}");
+    // Restricted to a role instead of PUBLIC: refused.
+    s.admin
+        .batch_execute(&format!(
+            "DROP POLICY tenant_isolation ON {schema}.notes; \
+             CREATE POLICY tenant_isolation ON {schema}.notes TO {app} \
+             USING (\"tenant_id\" = current_setting('app.tenant_id', false)) \
+             WITH CHECK (\"tenant_id\" = current_setting('app.tenant_id', false))",
+            app = s.app
+        ))
+        .await
+        .unwrap();
+    assert!(check_as(&s.admin_url, &s.app).await.is_err());
+    // Re-running migrate restores the canonical policy.
+    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    migrate_tenant(&owner_exec, &manifest(), &s.tenant, &s.app)
+        .await
+        .unwrap();
+    check_as(&s.admin_url, &s.app).await.unwrap();
+}
