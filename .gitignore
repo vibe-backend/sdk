@@ -6,6 +6,9 @@
 # Rust build output
 target/
 
+# Local signing keys and runtime state
+.vibe/
+
 # Node (site/)
 node_modules/
 site/dist/

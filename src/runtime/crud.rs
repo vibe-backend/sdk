@@ -1,0 +1,945 @@
+use std::collections::BTreeMap;
+
+use serde_json::{Map, Value};
+
+use crate::manifest::{FieldSpec, Manifest, MethodSpec, ModelSpec};
+
+use super::exec::{etag, ExecError, QueryExec, Row};
+use super::sql::{Col, Sort, Stmt};
+
+pub struct CallResult {
+    pub value: Value,
+    pub etag: Option<String>,
+    pub status: u16,
+}
+
+/// Authenticated caller. `subject` is `ctx.user.id` (JWT `sub`, or the API key id).
+#[derive(Clone, Copy)]
+pub struct Caller<'a> {
+    pub subject: &'a str,
+    pub admin: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct CallCtx<'a> {
+    pub tenant_id: &'a str,
+    pub role: &'a str,
+    pub caller: Caller<'a>,
+}
+
+pub async fn run_method(
+    manifest: &Manifest,
+    exec: &dyn QueryExec,
+    target: &str,
+    input: &Value,
+    ctx: CallCtx<'_>,
+    depth: u32,
+) -> Result<CallResult, MethodFail> {
+    if depth > 3 {
+        return Err(MethodFail::code("INTERNAL", "call depth exceeded"));
+    }
+    let method = crate::manifest::method(manifest, target)
+        .ok_or_else(|| MethodFail::code("INTERNAL", format!("unknown method {target}")))?;
+    if method.crud_action.is_empty() {
+        return run_steps(manifest, exec, method, input, ctx, depth).await;
+    }
+    let model = crate::manifest::model(manifest, &method.crud_model)
+        .ok_or_else(|| MethodFail::code("INTERNAL", "unknown model"))?;
+    match method.crud_action.as_str() {
+        "create" => create(exec, model, input, ctx).await,
+        "get" => get(exec, model, input, ctx).await,
+        "list" => list(exec, model, input, ctx).await,
+        "update" => update(exec, model, input, ctx).await,
+        "delete" => delete(exec, model, input, ctx).await,
+        other => Err(MethodFail::code(
+            "INTERNAL",
+            format!("unknown crud {other}"),
+        )),
+    }
+}
+
+async fn run_steps(
+    manifest: &Manifest,
+    exec: &dyn QueryExec,
+    method: &MethodSpec,
+    input: &Value,
+    ctx: CallCtx<'_>,
+    depth: u32,
+) -> Result<CallResult, MethodFail> {
+    let mut vars = Map::new();
+    vars.insert("input".into(), input.clone());
+    let mut last = Value::Null;
+    for step in &method.steps {
+        match step.op.as_str() {
+            "method" => {
+                let args = eval_or_input(&step.args, &vars, input)?;
+                let result = Box::pin(run_method(
+                    manifest,
+                    exec,
+                    &step.target,
+                    &args,
+                    ctx,
+                    depth + 1,
+                ))
+                .await?;
+                if !step.out.is_empty() && step.out != "(none)" {
+                    vars.insert(step.out.clone(), result.value.clone());
+                }
+                last = result.value;
+            }
+            "respond" => {
+                let value = if step.value.is_empty() {
+                    last
+                } else {
+                    eval_expr(&step.value, &vars)
+                        .map_err(|err| MethodFail::code("INTERNAL", err))?
+                };
+                return Ok(CallResult {
+                    value,
+                    etag: None,
+                    status: step.status,
+                });
+            }
+            "validate" => {
+                if when_matches(&step.when_expr, &vars) {
+                    return Err(MethodFail::code(step.fail.clone(), step.fail.clone()));
+                }
+            }
+            _ => {
+                return Err(MethodFail::code(
+                    "INTERNAL",
+                    format!("method op {} is not executable in this build", step.op),
+                ));
+            }
+        }
+    }
+    Ok(CallResult {
+        value: last,
+        etag: None,
+        status: 200,
+    })
+}
+
+fn eval_or_input(
+    args: &str,
+    vars: &Map<String, Value>,
+    input: &Value,
+) -> Result<Value, MethodFail> {
+    if args.is_empty() || args == "transform.in" || args == "input" {
+        if args == "input" {
+            return Ok(input.clone());
+        }
+        if let Some(value) = vars.get("input") {
+            return Ok(value.clone());
+        }
+        return Ok(input.clone());
+    }
+    eval_expr(args, vars).map_err(|err| MethodFail::code("VALIDATION_FAILED", err))
+}
+
+async fn create(
+    exec: &dyn QueryExec,
+    model: &ModelSpec,
+    input: &Value,
+    ctx: CallCtx<'_>,
+) -> Result<CallResult, MethodFail> {
+    let obj = input.as_object().cloned().unwrap_or_default();
+    reject_system(&obj)?;
+    if let Some(owner) = &model.owner_key {
+        if obj.contains_key(owner) {
+            return Err(MethodFail::code(
+                "VALIDATION_FAILED",
+                format!("{owner} cannot be written"),
+            ));
+        }
+    }
+    let tenant_id = ctx.tenant_id;
+    let role = ctx.role;
+    let mut row_values: Vec<(Col, Value)> = Vec::new();
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    for field in &model.fields {
+        if field.name == "id" {
+            row_values.push((col(field), Value::String(id.clone())));
+            continue;
+        }
+        if field.name == "tenant_id" {
+            row_values.push((col(field), Value::String(tenant_id.into())));
+            continue;
+        }
+        if matches!(field.name.as_str(), "created_at" | "updated_at") {
+            row_values.push((col(field), Value::String(now.clone())));
+            continue;
+        }
+        if matches!(field.name.as_str(), "deleted_at" | "erased_at") {
+            row_values.push((col(field), Value::Null));
+            continue;
+        }
+        if model.owner_key.as_deref() == Some(field.name.as_str()) {
+            row_values.push((col(field), owner_value(model, field, ctx.caller)?));
+            continue;
+        }
+        let provided = obj.get(&field.name).cloned();
+        if field.required && provided.as_ref().is_none_or(Value::is_null) {
+            return Err(MethodFail::code(
+                "VALIDATION_FAILED",
+                format!("{} is required", field.name),
+            ));
+        }
+        let mut value = provided.unwrap_or(Value::Null);
+        if field.ty == "password" && value.is_string() {
+            value = Value::String(hash_password(value.as_str().unwrap_or(""))?);
+        }
+        check_field(field, &value)?;
+        if field.unique && !value.is_null() {
+            let existing = exec
+                .execute(
+                    tenant_id,
+                    role,
+                    Stmt::Select {
+                        table: model.table.clone(),
+                        columns: vec![Col {
+                            name: "id".into(),
+                            ty: "uuid".into(),
+                        }],
+                        id: None,
+                        filters: vec![(col(field), value.clone())],
+                        sort: None,
+                        limit: 1,
+                        offset: 0,
+                    },
+                )
+                .await
+                .map_err(db)?;
+            if !existing.is_empty() {
+                return Err(MethodFail::code(
+                    "CONFLICT",
+                    format!("{} already exists", field.name),
+                ));
+            }
+        }
+        row_values.push((col(field), value));
+    }
+    for key in obj.keys() {
+        if !model.fields.iter().any(|field| field.name == *key) {
+            return Err(MethodFail::code(
+                "VALIDATION_FAILED",
+                format!("unknown field {key}"),
+            ));
+        }
+    }
+    let returning = output_cols(model, false);
+    let rows = exec
+        .execute(
+            tenant_id,
+            role,
+            Stmt::Insert {
+                table: model.table.clone(),
+                values: row_values,
+                returning: returning.clone(),
+            },
+        )
+        .await
+        .map_err(db)?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| MethodFail::code("INTERNAL", "insert returned nothing"))?;
+    Ok(finish_row(model, row, false))
+}
+
+async fn get(
+    exec: &dyn QueryExec,
+    model: &ModelSpec,
+    input: &Value,
+    ctx: CallCtx<'_>,
+) -> Result<CallResult, MethodFail> {
+    let tenant_id = ctx.tenant_id;
+    let role = ctx.role;
+    let id = input
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if id.is_empty() {
+        return Err(MethodFail::code("VALIDATION_FAILED", "id is required"));
+    }
+    let rows = exec
+        .execute(
+            tenant_id,
+            role,
+            Stmt::Select {
+                table: model.table.clone(),
+                columns: all_cols(model),
+                id: Some(id),
+                filters: owner_filters(model, ctx.caller),
+                sort: None,
+                limit: 1,
+                offset: 0,
+            },
+        )
+        .await
+        .map_err(db)?;
+    let Some(row) = rows.into_iter().next() else {
+        return Err(MethodFail::code("NOT_FOUND", "not found"));
+    };
+    Ok(finish_row(model, row, true))
+}
+
+async fn list(
+    exec: &dyn QueryExec,
+    model: &ModelSpec,
+    input: &Value,
+    ctx: CallCtx<'_>,
+) -> Result<CallResult, MethodFail> {
+    let tenant_id = ctx.tenant_id;
+    let role = ctx.role;
+    let page = int_field(input, "page").unwrap_or(1);
+    let page_size = int_field(input, "page_size")
+        .or_else(|| int_field(input, "page-size"))
+        .unwrap_or(model.list.page_size);
+    if page < 1 {
+        return Err(MethodFail::code("VALIDATION_FAILED", "page starts at 1"));
+    }
+    if page_size < 1 || page_size > model.list.max_page_size {
+        return Err(MethodFail::code(
+            "VALIDATION_FAILED",
+            "page_size is outside the allowed range",
+        ));
+    }
+    let (sort_col, desc) = parse_sort(
+        input.get("sort").and_then(Value::as_str).unwrap_or(""),
+        &model.list.sort,
+    )?;
+    let mut filters = Vec::new();
+    if let Some(filter) = input.get("filter").and_then(Value::as_object) {
+        for (key, value) in filter {
+            if value.is_null() {
+                continue;
+            }
+            if !model.list.filter.iter().any(|name| name == key) {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{key} cannot be filtered"),
+                ));
+            }
+            let field = model
+                .fields
+                .iter()
+                .find(|field| field.name == *key)
+                .ok_or_else(|| {
+                    MethodFail::code("VALIDATION_FAILED", format!("unknown filter {key}"))
+                })?;
+            if field.sensitive {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{key} cannot be filtered"),
+                ));
+            }
+            filters.push((col(field), value.clone()));
+        }
+    }
+    filters.extend(owner_filters(model, ctx.caller));
+    let rows = exec
+        .execute(
+            tenant_id,
+            role,
+            Stmt::Select {
+                table: model.table.clone(),
+                columns: output_cols(model, false),
+                id: None,
+                filters,
+                sort: Some(Sort {
+                    column: sort_col,
+                    desc,
+                }),
+                limit: page_size + 1,
+                offset: (page - 1) * page_size,
+            },
+        )
+        .await
+        .map_err(db)?;
+    let has_more = rows.len() as i64 > page_size;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .take(page_size as usize)
+        .map(|row| Value::Object(row_output(model, &row, false).0))
+        .collect();
+    Ok(CallResult {
+        value: serde_json::json!({
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "has_more": has_more,
+        }),
+        etag: None,
+        status: 200,
+    })
+}
+
+async fn update(
+    exec: &dyn QueryExec,
+    model: &ModelSpec,
+    input: &Value,
+    ctx: CallCtx<'_>,
+) -> Result<CallResult, MethodFail> {
+    let tenant_id = ctx.tenant_id;
+    let role = ctx.role;
+    let id = input
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let if_match = input
+        .get("if_match")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        return Err(MethodFail::code("VALIDATION_FAILED", "id is required"));
+    }
+    if if_match.is_empty() {
+        return Err(MethodFail::code(
+            "PRECONDITION_REQUIRED",
+            "If-Match is required",
+        ));
+    }
+    let current = get(exec, model, &serde_json::json!({"id": id}), ctx).await?;
+    let current_etag = current.etag.unwrap_or_default();
+    if current_etag != if_match {
+        return Err(MethodFail::code(
+            "PRECONDITION_FAILED",
+            "If-Match does not match",
+        ));
+    }
+    let updated_at = current
+        .value
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let obj = input.as_object().cloned().unwrap_or_default();
+    reject_system_allow_id(&obj)?;
+    let mut sets = Vec::new();
+    for (key, value) in &obj {
+        if matches!(key.as_str(), "id" | "if_match") {
+            continue;
+        }
+        let Some(field) = model.fields.iter().find(|field| field.name == *key) else {
+            return Err(MethodFail::code(
+                "VALIDATION_FAILED",
+                format!("unknown field {key}"),
+            ));
+        };
+        if field.system || model.owner_key.as_deref() == Some(key.as_str()) {
+            return Err(MethodFail::code(
+                "VALIDATION_FAILED",
+                format!("{key} is system-owned"),
+            ));
+        }
+        check_field(field, value)?;
+        sets.push((col(field), value.clone()));
+    }
+    if sets.is_empty() {
+        return Err(MethodFail::code(
+            "VALIDATION_FAILED",
+            "update needs at least one field",
+        ));
+    }
+    let touched = chrono::Utc::now().to_rfc3339();
+    let rows = exec
+        .execute(
+            tenant_id,
+            role,
+            Stmt::Update {
+                table: model.table.clone(),
+                id,
+                sets,
+                expected_updated_at: updated_at,
+                touched_at: touched,
+                returning: all_cols(model),
+                owner: owner_eq(model, ctx.caller),
+            },
+        )
+        .await
+        .map_err(db)?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| MethodFail::code("PRECONDITION_FAILED", "conflict"))?;
+    Ok(finish_row(model, row, true))
+}
+
+async fn delete(
+    exec: &dyn QueryExec,
+    model: &ModelSpec,
+    input: &Value,
+    ctx: CallCtx<'_>,
+) -> Result<CallResult, MethodFail> {
+    let tenant_id = ctx.tenant_id;
+    let role = ctx.role;
+    let id = input
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if id.is_empty() {
+        return Err(MethodFail::code("VALIDATION_FAILED", "id is required"));
+    }
+    exec.execute(
+        tenant_id,
+        role,
+        Stmt::SoftDelete {
+            table: model.table.clone(),
+            id,
+            touched_at: chrono::Utc::now().to_rfc3339(),
+            owner: owner_eq(model, ctx.caller),
+        },
+    )
+    .await
+    .map_err(db)?;
+    Ok(CallResult {
+        value: Value::Null,
+        etag: None,
+        status: 204,
+    })
+}
+
+fn finish_row(model: &ModelSpec, row: Row, include_sensitive: bool) -> CallResult {
+    let (out, tag) = row_output(model, &row, include_sensitive);
+    CallResult {
+        value: Value::Object(out),
+        etag: tag,
+        status: 200,
+    }
+}
+
+fn row_output(
+    model: &ModelSpec,
+    row: &Row,
+    include_sensitive: bool,
+) -> (Map<String, Value>, Option<String>) {
+    let id = row.get("id").and_then(Value::as_str).unwrap_or("");
+    let updated = row.get("updated_at").and_then(Value::as_str).unwrap_or("");
+    let tag = if id.is_empty() {
+        None
+    } else {
+        Some(etag(id, updated))
+    };
+    let mut out = Map::new();
+    for field in &model.fields {
+        if field.ty == "password"
+            || matches!(
+                field.name.as_str(),
+                "tenant_id" | "deleted_at" | "erased_at"
+            )
+        {
+            continue;
+        }
+        if field.sensitive
+            && !(include_sensitive
+                && model
+                    .sensitive_output
+                    .iter()
+                    .any(|name| name == &field.name))
+        {
+            continue;
+        }
+        if let Some(value) = row.get(&field.name) {
+            if value.is_null() && matches!(field.name.as_str(), "deleted_at" | "erased_at") {
+                continue;
+            }
+            out.insert(field.name.clone(), value.clone());
+        }
+    }
+    (out, tag)
+}
+
+fn all_cols(model: &ModelSpec) -> Vec<Col> {
+    model.fields.iter().map(col).collect()
+}
+
+fn output_cols(model: &ModelSpec, include_sensitive: bool) -> Vec<Col> {
+    model
+        .fields
+        .iter()
+        .filter(|field| field.ty != "password")
+        .filter(|field| {
+            !matches!(
+                field.name.as_str(),
+                "tenant_id" | "deleted_at" | "erased_at"
+            )
+        })
+        .filter(|field| !field.sensitive || include_sensitive)
+        .map(col)
+        .collect()
+}
+
+fn owner_eq(model: &ModelSpec, caller: Caller<'_>) -> Option<(Col, Value)> {
+    if model.ownership == "tenant-wide" || caller.admin {
+        return None;
+    }
+    let key = model.owner_key.as_deref()?;
+    let field = model.fields.iter().find(|field| field.name == key)?;
+    Some((col(field), Value::String(caller.subject.to_string())))
+}
+
+fn owner_filters(model: &ModelSpec, caller: Caller<'_>) -> Vec<(Col, Value)> {
+    owner_eq(model, caller).into_iter().collect()
+}
+
+fn owner_value(
+    model: &ModelSpec,
+    field: &FieldSpec,
+    caller: Caller<'_>,
+) -> Result<Value, MethodFail> {
+    if model.ownership == "tenant-wide" && caller.subject.is_empty() {
+        return Ok(Value::Null);
+    }
+    if caller.subject.is_empty() {
+        return Err(MethodFail::code(
+            "VALIDATION_FAILED",
+            format!("{} is set from the signed-in user", field.name),
+        ));
+    }
+    let value = Value::String(caller.subject.to_string());
+    check_field(field, &value)?;
+    Ok(value)
+}
+
+fn col(field: &FieldSpec) -> Col {
+    Col {
+        name: field.name.clone(),
+        ty: field.ty.clone(),
+    }
+}
+
+fn reject_system(obj: &Map<String, Value>) -> Result<(), MethodFail> {
+    for key in [
+        "id",
+        "tenant_id",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+        "erased_at",
+        "created_by",
+    ] {
+        if obj.contains_key(key) {
+            return Err(MethodFail::code(
+                "VALIDATION_FAILED",
+                format!("{key} cannot be written"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_system_allow_id(obj: &Map<String, Value>) -> Result<(), MethodFail> {
+    for key in [
+        "tenant_id",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+        "erased_at",
+        "created_by",
+    ] {
+        if obj.contains_key(key) {
+            return Err(MethodFail::code(
+                "VALIDATION_FAILED",
+                format!("{key} cannot be written"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_field(field: &FieldSpec, value: &Value) -> Result<(), MethodFail> {
+    if value.is_null() {
+        if field.required && !field.nullable {
+            return Err(MethodFail::code(
+                "VALIDATION_FAILED",
+                format!("{} is required", field.name),
+            ));
+        }
+        return Ok(());
+    }
+    match field.ty.as_str() {
+        "string" | "password" => {
+            let text = value.as_str().ok_or_else(|| {
+                MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be a string", field.name),
+                )
+            })?;
+            if let Some(max) = field.max {
+                if text.chars().count() as i64 > max {
+                    return Err(MethodFail::code(
+                        "VALIDATION_FAILED",
+                        format!("{} is too long", field.name),
+                    ));
+                }
+            }
+            if let Some(min) = field.min {
+                if (text.chars().count() as i64) < min {
+                    return Err(MethodFail::code(
+                        "VALIDATION_FAILED",
+                        format!("{} is too short", field.name),
+                    ));
+                }
+            }
+            if field.format == "email" && !text.contains('@') {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be an email", field.name),
+                ));
+            }
+        }
+        "integer" => {
+            let number = value.as_i64().ok_or_else(|| {
+                MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be an integer", field.name),
+                )
+            })?;
+            if let Some(min) = field.min {
+                if number < min {
+                    return Err(MethodFail::code(
+                        "VALIDATION_FAILED",
+                        format!("{} is below the minimum", field.name),
+                    ));
+                }
+            }
+            if let Some(max) = field.max {
+                if number > max {
+                    return Err(MethodFail::code(
+                        "VALIDATION_FAILED",
+                        format!("{} is above the maximum", field.name),
+                    ));
+                }
+            }
+        }
+        "uuid" => {
+            let text = value.as_str().unwrap_or("");
+            if uuid::Uuid::parse_str(text).is_err() {
+                return Err(MethodFail::code(
+                    "VALIDATION_FAILED",
+                    format!("{} must be a uuid", field.name),
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn parse_sort(raw: &str, allowed: &[String]) -> Result<(String, bool), MethodFail> {
+    let desc = raw.starts_with('-');
+    let name = raw.trim_start_matches('-');
+    let name = if name.is_empty() {
+        allowed.first().map(String::as_str).unwrap_or("created_at")
+    } else {
+        name
+    };
+    if !allowed.iter().any(|item| item == name) {
+        return Err(MethodFail::code(
+            "VALIDATION_FAILED",
+            "sort field is not allowed",
+        ));
+    }
+    Ok((name.to_string(), desc))
+}
+
+fn int_field(input: &Value, key: &str) -> Option<i64> {
+    match input.get(key)? {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.parse().ok(),
+        Value::Null => None,
+        _ => None,
+    }
+}
+
+fn db(err: ExecError) -> MethodFail {
+    match err {
+        ExecError::NotFound => MethodFail::code("NOT_FOUND", "not found"),
+        ExecError::Conflict => MethodFail::code("CONFLICT", "conflict"),
+        ExecError::Precondition => MethodFail::code("PRECONDITION_FAILED", "precondition failed"),
+        ExecError::Message(message) => MethodFail::code("INTERNAL", message),
+    }
+}
+
+pub fn hash_password(plain: &str) -> Result<String, MethodFail> {
+    let len = plain.chars().count();
+    if !(12..=256).contains(&len)
+        || matches!(plain, "password1234" | "123456789012" | "qwertyuiopas")
+    {
+        return Err(MethodFail::code(
+            "WEAK_PASSWORD",
+            "password does not meet the platform baseline",
+        ));
+    }
+    let params = argon2::Params::new(65_536, 3, 1, Some(32))
+        .map_err(|err| MethodFail::code("INTERNAL", err.to_string()))?;
+    let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
+    let hash =
+        argon2::password_hash::PasswordHasher::hash_password(&argon, plain.as_bytes(), &salt)
+            .map_err(|err| MethodFail::code("INTERNAL", err.to_string()))?;
+    Ok(hash.to_string())
+}
+
+#[derive(Debug)]
+pub struct MethodFail {
+    pub code: String,
+    pub message: String,
+}
+
+impl MethodFail {
+    pub fn code(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+pub fn eval_expr(input: &str, vars: &Map<String, Value>) -> Result<Value, String> {
+    let (expr, rest) = parse_expr(input.trim())?;
+    if !rest.trim().is_empty() {
+        return Err(format!("trailing input in expression {input}"));
+    }
+    Ok(eval_parsed(&expr, vars))
+}
+
+enum Expr {
+    Path(String),
+    Object(Vec<(String, Expr)>),
+}
+
+fn parse_expr(input: &str) -> Result<(Expr, &str), String> {
+    let input = input.trim();
+    if let Some(rest) = input.strip_prefix('{') {
+        let mut rest = rest.trim();
+        let mut fields = Vec::new();
+        if rest.starts_with('}') {
+            let Some(stripped) = rest.strip_prefix('}') else {
+                return Err("expected }".into());
+            };
+            return Ok((Expr::Object(fields), stripped));
+        }
+        loop {
+            let (key, next) = take_ident(rest)?;
+            let next = next.trim().strip_prefix(':').ok_or("expected :")?.trim();
+            let (value, next) = parse_expr(next)?;
+            fields.push((key, value));
+            let next = next.trim();
+            if let Some(next) = next.strip_prefix(',') {
+                rest = next.trim();
+                continue;
+            }
+            if let Some(next) = next.strip_prefix('}') {
+                return Ok((Expr::Object(fields), next));
+            }
+            return Err("expected , or }".into());
+        }
+    }
+    let (path, rest) = take_path(input)?;
+    Ok((Expr::Path(path), rest))
+}
+
+fn take_ident(input: &str) -> Result<(String, &str), String> {
+    let mut end = 0;
+    for (idx, ch) in input.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return Err("expected a name".into());
+    }
+    Ok((input[..end].to_string(), &input[end..]))
+}
+
+fn take_path(input: &str) -> Result<(String, &str), String> {
+    let (first, mut rest) = take_ident(input)?;
+    let mut path = first;
+    while let Some(next) = rest.strip_prefix('.') {
+        let (seg, next_rest) = take_ident(next)?;
+        path.push('.');
+        path.push_str(&seg);
+        rest = next_rest;
+    }
+    Ok((path, rest))
+}
+
+fn eval_parsed(expr: &Expr, vars: &Map<String, Value>) -> Value {
+    match expr {
+        Expr::Path(path) => lookup(path, vars),
+        Expr::Object(fields) => {
+            let mut obj = Map::new();
+            for (key, value) in fields {
+                let resolved = eval_parsed(value, vars);
+                if !resolved.is_null() {
+                    obj.insert(key.clone(), resolved);
+                }
+            }
+            Value::Object(obj)
+        }
+    }
+}
+
+fn lookup(path: &str, vars: &Map<String, Value>) -> Value {
+    let mut parts = path.split('.');
+    let Some(root) = parts.next() else {
+        return Value::Null;
+    };
+    let mut current = if root == "req" {
+        vars.get("req").cloned().unwrap_or(Value::Null)
+    } else {
+        vars.get(root).cloned().unwrap_or(Value::Null)
+    };
+    for part in parts {
+        current = match current {
+            Value::Object(map) => map.get(part).cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
+        };
+    }
+    current
+}
+
+fn when_matches(expr: &str, vars: &Map<String, Value>) -> bool {
+    let expr = expr.trim();
+    if let Some(name) = expr.strip_suffix(" is empty") {
+        let value = lookup(name.trim(), vars);
+        return value.is_null()
+            || value.as_array().is_some_and(Vec::is_empty)
+            || value.as_object().is_some_and(|m| m.is_empty());
+    }
+    if let Some(name) = expr.strip_suffix(" != true") {
+        return lookup(name.trim(), vars) != Value::Bool(true);
+    }
+    false
+}
+
+pub fn req_var(
+    body: Value,
+    query: BTreeMap<String, Value>,
+    path: BTreeMap<String, String>,
+    headers: BTreeMap<String, String>,
+) -> Value {
+    let query = Value::Object(query.into_iter().collect());
+    let path = Value::Object(
+        path.into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect(),
+    );
+    let header = Value::Object(
+        headers
+            .into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect(),
+    );
+    serde_json::json!({"body": body, "query": query, "path": path, "header": header})
+}
