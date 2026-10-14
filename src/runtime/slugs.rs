@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn example_is_ignored_unless_allowed() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/shop");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shop");
         let loaded = load_project_slugs(&root, false).unwrap();
         assert!(loaded.slugs.is_empty());
         assert!(loaded
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn example_shop_slug_resolves_acme() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/shop");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shop");
         let loaded = load_project_slugs(&root, true).unwrap();
         let acme = loaded.slugs.get("acme").expect("acme slug");
         assert_eq!(acme.tenant_id, "acme0001");
