@@ -204,6 +204,12 @@
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 待產品經理確認 | 文件標頭、網站 |
 | 95 | create-user 邀請失敗：`user.invite` 嘅 enqueue（s4）失敗時，create-user 回 503 `INVITE_DELIVERY_FAILED`（只帶 `Retry-After`，body 唔帶 `user_id`），唔回 201／200；因為 s2 已經輪換咗 token 但信冇寄出，用戶手上冇有效連結，恢復方法係重試 create-user（決定 85）或者 re-invite（決定 86），兩者都會發新 token 同新信。同 issue #26（auth flow 實作）相關。 | 待產品經理確認 | 11.4、11.4a |
 | 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i) 做**臨時方案**）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。高風險 `--release-approval` 係計劃中、未實作，實作後先額外把關。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，同時開返 Prevent self-review。另外 live `release` environment `can_admins_bypass` 而家係 `true`，Jack 負責關閉。高風險 release build 用只有 Administration: read 嘅專用 GitHub App 讀呢個 ruleset，讀唔到、`bypass_actors` 唔係空、唔係 active、缺少三條 rule、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass，SDK 唔檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval`（未實作）實作後會獨立驗證 PR review（2C.3a）。普通 build 只記錄。 | 待產品經理確認 | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
+| 97 | 租戶隔離身份（v1 blocker）：runtime 每個 request 喺 transaction 入面先 `SET LOCAL ROLE tenant_<id>`，再執行 lock SQL；每個租戶一個 role（`NOINHERIT`、只有自己 schema 嘅權限、唔係其他 role 嘅成員）；app 連線 role 對任何租戶 schema 冇直接權限；`app.tenant_id` 之類 GUC 只可以輔助（例如 log），永遠唔係身份來源。安全細節經私人 security advisory 處理。 | 已確認（產品經理 2026-10-14） | 7.1、7.1a、9C |
+| 98 | Lock SQL parser 白名單：用 PostgreSQL 解析器（例如 `pg_query`）解析，只准單一 DML statement；禁止 `SET`／`RESET`／`SET ROLE`／`DO`／`COPY`／`BEGIN`／`COMMIT`／`SAVEPOINT` 等 transaction 同 session 控制、schema-qualified 名稱；function 只准白名單（`set_config`、`current_setting`、`dblink` 等唔喺白名單）；解析失敗即 fail closed。Conformance 要有跨租戶負面測試。 | 已確認（產品經理 2026-10-14） | 2A.4、7.1a、10.1 |
+| 99 | 跨 model transaction：一個 request = 一個 runtime 管理嘅 transaction（`READ COMMITTED`）；用戶 SQL 控制唔到 transaction 邊界；庫存扣減用條件 UPDATE（`WHERE stock >= qty`）再檢查 affected rows，唔夠就 409 同 rollback；冇跨 request、跨 DB 或者分散式 transaction；寫入按固定次序、喺租戶 role 之下執行。取代 7.1「每個 query 獨立 transaction」。 | 已確認（產品經理 2026-10-14） | 7.1、7.4、12.6 |
+| 100 | Transaction 超時同衝突：預設 `statement_timeout` 5s、transaction 總時間 10s、`idle_in_transaction_session_timeout` 5s；超時 rollback，回 504 `TX_TIMEOUT`。Deadlock（`40P01`）同 serialization failure（`40001`）回 503 `TX_CONFLICT`，body `retryable: true`，帶 `Retry-After: 1`；平台永遠唔會自動重試非冪等寫入。 | 已確認（產品經理 2026-10-14） | 7.4、8 |
+| 101 | 瀏覽器 refresh cookie（issue #78）：refresh token 放 `HttpOnly; Secure; SameSite=Strict` cookie，用 `__Host-` 前綴；每次 refresh 輪換，偵測重用撤銷成個家族；refresh 同 logout 要 CSRF 防護（`Origin` 白名單檢查加 SameSite）；access token 唔放 cookie；logout 清 cookie 同撤銷家族。`__Host-` 規定 `Path=/`，同「Path 限定 refresh endpoint」衝突，揀 `__Host-`（見 4A.1a）。 | 已確認（產品經理 2026-10-14）；`Path` 取捨待產品經理確認 | 4A.1、4A.1a |
+| 102 | Build TOCTOU：`vibe build` 只讀一次 source 同 lock 入記憶體，驗證同之後所有 build 步驟（manifest、報告、簽名）都用同一份內容；之後檔案改動唔會影響今次 build。 | 已確認（產品經理 2026-10-14） | 2C.3 |
 
 ## 1. 目錄同命名
 
@@ -373,7 +379,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - `fail: CODE` 係 `validate` 嘅參數，CODE 一定要喺有宣告嘅錯誤碼入面。
 - `DELETE` sql 喺任何 lock 都唔准出現（決定 13，所有刪除都係軟刪除）。
 - 所有 DDL（`CREATE`、`ALTER`、`DROP`、`GRANT`、`REVOKE`、`COMMENT` 等）同 `TRUNCATE` 喺 migration 以外嘅任何 lock 都唔准出現；schema 改動只可以經 `kind: migration` lock（決定 27、51，見 2B）。`TRUNCATE`、`GRANT`、`REVOKE` 連 migration 都唔准。
-- `query` 只准單一 statement，唔准 `;` 串多句、唔准 `SET`／`RESET`／`COPY`／`DO`／function 定義。
+- `query` 只准單一 statement，唔准 `;` 串多句、唔准 `SET`／`RESET`／`COPY`／`DO`／function 定義。驗證器同 runtime 都用 PostgreSQL 解析器檢查（決定 98，見 7.1a），唔靠字串比對。
 - `UPDATE` 一定要有 `WHERE`，而且要用主鍵（或者唯一鍵）限定，或者明確依賴 RLS 範圍（lock 寫 `scope: pk` 或者 `scope: rls`）；冇 WHERE 嘅 UPDATE 一律 error。
 
 ### 2A.5 安全項目同 review（v1.8 改寫，決定 77、78，待產品經理確認）
@@ -631,6 +637,7 @@ jobs:
 ### 2C.3 `vibe build`
 
 - 一個指令做晒（決定 76）：
+  0. **只讀一次**（決定 102）：開始時將所有 source、lock 同依賴讀入記憶體，記低每個檔嘅 hash。之後驗證、manifest、部署報告同簽名全部用呢份記憶體內容，唔再由磁碟讀；第 1 步重編寫返嘅 lock 亦用寫入時嗰份記憶體內容繼續。完成前再比對磁碟 hash，唔一致就失敗，唔會出部分輸出（issue #34）。
   1. 編譯過時嘅 lock（source 或者依賴 hash 變咗、或者 compiler-hash 輸入變咗），寫返 repo 入面嘅 `*.lock.md`。
   2. 跑驗證器（第 10 節全部檢查）；任何 error 即刻失敗。
   3. 產生 manifest，用 build key 簽（決定 79、89、92）：release build 一定要用受保護 CI environment 嘅 KMS key；攞唔到 KMS key 就失敗，永遠唔 fallback 去 dev key（決定 92）。只有明確 `--dev` 先用 dev key，並標 `build-mode: dev`。
@@ -772,7 +779,7 @@ Release ruleset 檢查（`v*` tag，決定 96）：
   - Column grant：INSERT／UPDATE 嘅每個欄位要喺該 role 嘅 column grant 入面；`writable-columns` 同 `effective-grant` 同 production 一樣檢查。
   - 所有 runtime role 冇 DELETE、TRUNCATE、DDL。
   - 唯一鍵（包括 `(tenant_id, email)`）、NOT NULL、CHECK（`char_length`、enum）、`ON CONFLICT ... DO UPDATE ... WHERE`、`RETURNING`、軟刪除、If-Match／ETag 版本檢查。
-  - 每個 query 獨立 commit（同 7.1 一樣），令失敗恢復行為（例如 11.4 重試）一致。
+  - 每個 request 一個 transaction（同 7.4 一樣），失敗就成個 request rollback，令失敗恢復行為（例如 11.4 重試）一致；超時同衝突錯誤碼（`TX_TIMEOUT`、`TX_CONFLICT`）一樣。
 - **已知語意差異**（喺 terminal 啟動訊息同文件列明）：
   - 只支援 lock 白名單用到嘅 SQL 子集；任意 SQL 函數、複雜 JOIN／subquery、window function 未必支援，唔支援就報 `MEMORY_UNSUPPORTED_SQL`，唔會靜靜錯。
   - 冇真正並發隔離（全部 statement 串行），所以 race condition（例如 refresh 寬限期兩個並發請求）喺 in-memory 測唔出。
@@ -973,6 +980,20 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 - refresh 流程由平台內置 `token-refresh` pipeline 實現，用 `method` op 呼叫標咗 `capabilities: [sign-token]` 嘅 model method 簽新 access token。
 - 簽發：`sign-jwt` op 嘅 `issue-refresh` 參數決定係咪同時發 refresh token：`new-family`（登入）、`rotate`（refresh，由 `token-refresh` pipeline 注入）、`none`；由平台按呼叫來源決定，method 唔可以自己揀 `rotate`。
 
+### 4A.1a 瀏覽器 refresh cookie（決定 101，issue #78）
+
+瀏覽器 client：access token 只放記憶體（唔放 cookie、唔放 localStorage），refresh token 放 cookie；重新載入頁面時 call refresh endpoint 攞新 access token。
+
+- **Endpoint**：`POST /{definition}/{version}/{slug}/refresh`（`token-refresh`，`transport: cookie`）同 `POST /{definition}/{version}/{slug}/logout`（`token-revoke`）。Refresh 回 body `{ "access_token", "expires_in" }`，新 refresh token 只喺 `Set-Cookie`。
+- **Cookie 屬性**：`__Host-vibe_rt_{slug}=<token>; HttpOnly; Secure; SameSite=Strict; Path=/`，冇 `Domain`，`Max-Age` 唔超過家族剩餘絕對壽命。
+  - `__Host-` 前綴保證 cookie 只屬於呢個 host、一定 Secure，防止 subdomain 寫入或者覆蓋 cookie；但瀏覽器規定 `__Host-` cookie 一定要 `Path=/`，所以唔可以再限定 `Path` 去 refresh endpoint。我哋揀 `__Host-`：`Path` 唔係安全邊界，而 `HttpOnly` 已經令 JS 讀唔到；server 只喺 refresh 同 logout 讀呢個 cookie，其他 endpoint 一律忽略。Cookie 名包括 slug，同一個 host 多個租戶唔會撞（待產品經理確認呢個取捨）。
+  - 用 `SameSite=Strict`：前端同 API 一定要同 site（例如 `app.example.com` 同 `api.example.com`）。跨 site 前端 v1.8 唔支援 cookie transport。
+- **輪換同重用偵測**：跟 4A.1，每次 refresh 輪換；偵測到重用已失效 token（寬限期外）撤銷成個家族，同時回 `Set-Cookie` 清除 cookie。
+- **CSRF**：refresh 同 logout 一定要有 `Origin` header，而且喺租戶設定嘅前端 origin 白名單入面（完全相等，唔准 wildcard）；冇 `Origin` 或者唔喺白名單回 403，唔讀 cookie。加上 `SameSite=Strict` 做雙重防護。只接受 `POST`。
+- **CORS**：只對白名單 origin 回 `Access-Control-Allow-Origin: <origin>`（唔准 `*`）、`Access-Control-Allow-Credentials: true`、`Vary: Origin`；只限 refresh 同 logout endpoint。
+- **Logout**：撤銷當前家族，回 `Set-Cookie: __Host-vibe_rt_{slug}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict` 清除 cookie；cookie 無效都照樣清除，回 204。
+- Refresh 回應帶 `Cache-Control: no-store`。
+
 #### `token-refresh` pipeline 參數（決定 45）
 
 | 參數 | 類型 | 預設 | 上限／說明 |
@@ -981,7 +1002,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 | `refresh-ttl` | duration | 30d | 上限 30d（家族絕對壽命） |
 | `idle-ttl` | duration | 7d | 上限 7d |
 | `reuse-grace` | duration | 10s | 上限 10s |
-| `transport` | `body` \| `cookie` | body | cookie 時一律 `HttpOnly; Secure; SameSite=Strict; Path=/{definition}/{version}/{slug}/refresh`（決定 60，同 10.7 嘅 slug 路由一致） |
+| `transport` | `body` \| `cookie` | body | cookie 時跟 4A.1a（決定 101 修訂決定 60） |
 
 - 對應 endpoint 寫法：api feature 寫「呢個係 refresh token endpoint」，lock 會有 `pipelines: [-auth, token-refresh: {...}]`，`public: true`（因為冇 access token），租戶由 slug 決定；`token-revoke` 用喺登出 endpoint，要 `auth`。
 
@@ -1090,9 +1111,9 @@ migration 放喺 ./migrations/main/。
 
 ### 7.1 通用規則
 
-- 每次 query 都喺自己嘅 transaction 入面執行：先 `BEGIN`，再 `SET LOCAL app.tenant_id`，然後執行 query，最後 `COMMIT`。就算用 PgBouncer transaction mode 都唔會漏。
+- 每個 request 喺一個 runtime 管理嘅 transaction 入面執行（決定 99，見 7.4）：先 `BEGIN`，再 `SET LOCAL ROLE tenant_<id>`（決定 97，見 7.1a），然後按次序執行 lock SQL，最後 `COMMIT`。`SET LOCAL` 喺 transaction 結束自動還原，就算用 PgBouncer transaction mode 都唔會漏。
 - 每張表都一定要有 `tenant_id` 欄位，要 `ENABLE` 同 `FORCE ROW LEVEL SECURITY`。
-- RLS policy 一律用 `tenant_id = current_setting('app.tenant_id', false)`；冇設定 tenant 嘅話，query 會直接報錯，唔會回空結果。
+- RLS policy 由平台按租戶產生，`TO tenant_<id>`，租戶 id 係常數；`app.tenant_id` GUC 可以照設做輔助（例如 log 同診斷），但冇任何 policy 或者權限只靠佢（決定 97）。冇切換到租戶 role 嘅話，query 會因為冇權限直接報錯，唔會回空結果。
 - `search_path` 由平台固定產生：schema 模式係 `t_{tenant_id}`，唔包括 `public`；`public` schema 嘅 CREATE 權限要收走。
 - 連線 role 唔可以係表嘅 owner，亦唔可以有 `BYPASSRLS`。
 - 所有 runtime DB role（`app_rw`、`public_reader`、`public_writer`）都冇 `DELETE`、`TRUNCATE`、DDL 權限（決定 27）。
@@ -1108,10 +1129,25 @@ migration 放喺 ./migrations/main/。
 
   全部都冇 DELETE、TRUNCATE、BYPASSRLS，全部行為寫審計記錄。
 
+- 租戶身份（決定 97）：
+  - 每個租戶一個 DB role `tenant_<id>`：`NOINHERIT`、`NOLOGIN`、只有自己 schema（database 模式：自己 database）嘅權限，唔係任何其他 role 嘅成員。
+  - Lock 指定嘅 role 類別（`app_rw`、`public_reader`、`public_writer`）對應每個租戶各自一套 role（例如 `tenant_<id>_rw`），全部符合上一點；`SET LOCAL ROLE` 揀對應嗰個。
+  - App 連線 role 對任何租戶 schema 冇直接權限，只可以 `SET ROLE` 去租戶 role；平台專用 role 同樣唔係租戶 role 嘅成員。
 - 連線池同 cache 都按租戶分開；cache key 一定要包含 `tenant_id`。
 - 每個租戶都有 CPU、記憶體、並發同 DB 連線上限。
 - database 模式下同樣要加 RLS，做縱深防禦。
 - 以上全部由平台產生，記錄喺 model lock 嘅 `## Policies`；source 唔可以改。
+
+### 7.1a Lock SQL 白名單同租戶隔離測試（決定 97、98）
+
+- 驗證器（部署前）同 runtime（載入 manifest 時）都用 PostgreSQL 解析器（例如 `pg_query`）解析每句 lock SQL，唔靠字串比對：
+  - 只准單一 DML statement（`SELECT`、`INSERT`、`UPDATE`；`DELETE` 跟 2A.4 唔准）。
+  - 禁止 transaction 同 session 控制：`SET`、`RESET`、`SET ROLE`、`DO`、`COPY`、`BEGIN`、`COMMIT`、`ROLLBACK`、`SAVEPOINT`、`PREPARE`、`LISTEN`／`NOTIFY` 等。
+  - 禁止 schema-qualified 名稱（表、view、function 一律唔准寫 schema），名稱只經平台固定嘅 `search_path` 解析。
+  - Function 只准平台白名單（例如常用嘅聚合、字串、日期 function）；`set_config`、`current_setting`、`dblink` 同任何可以改 session 狀態、讀設定或者連外嘅 function 都唔喺白名單。
+  - 解析失敗、解析器版本同 PostgreSQL 版本唔對應、或者遇到唔認識嘅 node，一律失敗（fail closed）。
+- Conformance 測試一定要包括跨租戶負面測試：用租戶 A 嘅身份執行，確認讀唔到、寫唔到、改唔到租戶 B 嘅資料同設定；呢啲測試唔可以跳過。
+- 呢節只寫要求；具體攻擊方式同修正細節經私人 security advisory 處理，唔會寫喺公開文件。
 
 ### 7.2 Public endpoint
 
@@ -1155,6 +1191,17 @@ migration 放喺 ./migrations/main/。
 6. 即刻撤銷臨時遷移 role。
 7. 舊 schema 改為唯讀，保留 30 日；保留期內可以回退，之後自動刪除，並且寫入審計記錄。（呢個係平台遷移流程，同業務資料嘅軟刪除無關。）
 
+### 7.4 Request transaction（決定 99、100）
+
+- 一個 request = 一個 runtime 管理嘅 transaction，isolation level `READ COMMITTED`。
+- 用戶 SQL 控制唔到 transaction 邊界（7.1a 禁止 `BEGIN`／`COMMIT`／`SAVEPOINT` 等）；pipeline、steps 同 `method` 呼叫全部喺同一個 transaction。
+- 所有寫入喺租戶 role 之下、按 lock 入面固定嘅 step 次序執行，減少 deadlock。
+- 庫存類扣減用條件 UPDATE，例如 `UPDATE ... SET stock = stock - $qty WHERE id = $id AND stock >= $qty`，再檢查 affected rows；唔夠就成個 transaction rollback，回 409（錯誤碼由 lock 宣告，例如 `INSUFFICIENT_STOCK`）。
+- 唔支援跨 request、跨 DB 或者分散式 transaction；需要跨 request 嘅流程用 outbox 之類非同步做法。
+- 超時預設（決定 100）：`statement_timeout` 5s、transaction 總時間 10s、`idle_in_transaction_session_timeout` 5s。超時即 rollback，回 504 `TX_TIMEOUT`。
+- 衝突：deadlock（SQLSTATE `40P01`）同 serialization failure（`40001`）rollback，回 503 `TX_CONFLICT`，body 帶 `retryable: true`，header `Retry-After: 1`。
+- 平台永遠唔會自動重試非冪等寫入；client 要自己決定重試（建議用 idempotency key）。
+
 ## 8. 狀態碼同錯誤
 
 | 狀態碼 | 用途 |
@@ -1168,7 +1215,7 @@ migration 放喺 ./migrations/main/。
 | 403 | 已認證但冇權限 |
 | 404 | 資源唔存在（public endpoint 規則見 7.2） |
 | 405 | method 唔啱，要帶 `Allow` |
-| 409 | 同現有狀態衝突（例如唯一欄位重複） |
+| 409 | 同現有狀態衝突（例如唯一欄位重複、庫存唔夠，見 7.4） |
 | 412 | `If-Match` 同資源而家嘅 `ETag` 唔一致（樂觀鎖衝突） |
 | 413 | body 太大 |
 | 415 | Content-Type 唔支援 |
@@ -1176,8 +1223,8 @@ migration 放喺 ./migrations/main/。
 | 428 | 需要 `If-Match` 但冇帶（RFC 6585） |
 | 429 | 請求太多，要帶 `Retry-After` |
 | 500 | 未宣告嘅錯誤，code 一律係 `INTERNAL`，唔會洩露內部資料 |
-| 503 | 暫時唔可用（包括遷移期間凍結寫入、kill switch 停用咗嘅 endpoint），可以帶 `Retry-After` |
-| 504 | 對外 call 超時 |
+| 503 | 暫時唔可用（包括遷移期間凍結寫入、kill switch 停用咗嘅 endpoint、`TX_CONFLICT`（7.4，帶 `Retry-After: 1`）），可以帶 `Retry-After` |
+| 504 | 對外 call 超時，或者 transaction 超時 `TX_TIMEOUT`（7.4） |
 
 - 錯誤 body 統一格式：`{ "error": { "code", "message", "request_id" } }`。
 - 401、405、429 嘅必要 header 由平台自動加。
@@ -1234,7 +1281,7 @@ migration 放喺 ./migrations/main/。
 
 - 獨立 deterministic 驗證器（2A.7、第 10 節）：op 白名單、RLS、public 寫入規則、黑名單欄位、capability 規則、密碼同驗證寫入規則、語意一致性檢查；唔通過就唔可以 build。
 - CI 重編決定性檢查（2A.6）：lock 一定係 pin 死嘅編譯器喺 CI 重編得返嘅結果，冇人可以手改 lock 偷運邏輯；冇 override。
-- 資料庫層：每個 query 獨立 transaction、`FORCE ROW LEVEL SECURITY`、non-owner role、column grant、冇 DELETE／TRUNCATE／DDL（7.1）。
+- 資料庫層：每個 request 一個 transaction 加租戶 role（決定 97、99）、parser 白名單（決定 98）、`FORCE ROW LEVEL SECURITY`、non-owner role、column grant、冇 DELETE／TRUNCATE／DDL（7.1）。
 - Runtime 限制：只載入簽咗名嘅 manifest、唔解析 md、冇 `LLM_*`、對外 call 白名單、kill switch（9A）、固定最低回應耗時、配額同限流。
 - Manifest 簽名（決定 79、89、92、96）：release 只由受專用 release ruleset（bypass 一定要空）保護嘅 `v*` tag 出；release key 只喺受保護 tag 加有 required reviewers 嘅 GitHub environment，經 OIDC 綁定 KMS 使用；CI 冇 key 就失敗，唔 fallback；production 只信 pin 死嘅 release 公鑰，dev key 永遠唔信任。
 - 高風險 fail closed（決定 90）：release build 有高風險安全項目就要有效嘅 `--release-approval`（2 個唔同嘅合資格批准人，批准喺 PR 最後 head SHA 上，build commit tree 同 PR head 一樣，批准人唔喺作者／committer／co-author 排除名單，高風險路徑係 PR base CODEOWNERS 嘅 owner；見 2C.3a），先可以出 release manifest。
@@ -1663,8 +1710,8 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" 
 | 503 | INVITE_DELIVERY_FAILED | user.invite |
 ````
 
-- 邀請失敗（決定 95，待產品經理確認）：s2 `user.invite` 入面 enqueue 失敗，create-user 回 503 `INVITE_DELIVERY_FAILED`（header 帶 `Retry-After`；body 只有錯誤碼，唔帶 `user_id`，因為錯誤映射攞唔到之前 step 嘅輸出），唔回 201／200。Admin 用同一個 email 重試 create-user（決定 85，會回原有 id），或者按 email 搵用戶再 call re-invite。因為 `user.invite` 嘅 token UPDATE 已經 commit，舊 token 失效而新 token 冇寄出；恢復方法係重試 create-user 或者 call re-invite（11.4b），兩者都發新 token 同新信。實作見 issue #26。
-- 失敗恢復（決定 85，待產品經理確認）：7.1 每個 query 獨立 commit，所以 s1 成功、s2 失敗（例如 DB 斷線）會留低「已建立、未邀請」嘅用戶。Admin 用同一個 body 重試 create-user：`user.register` 對已存在、未驗證、冇密碼嘅用戶回原有 id（`created: false`），s2 重新寄邀請，回 200；或者用 11.4b 嘅 re-invite endpoint。
+- 邀請失敗（決定 95，待產品經理確認）：s2 `user.invite` 入面 enqueue 失敗，create-user 回 503 `INVITE_DELIVERY_FAILED`（header 帶 `Retry-After`；body 只有錯誤碼，唔帶 `user_id`，因為錯誤映射攞唔到之前 step 嘅輸出），唔回 201／200。Admin 用同一個 email 重試 create-user（決定 85，會回原有 id），或者按 email 搵用戶再 call re-invite。v1.8 起成個 request 喺同一個 transaction（決定 99），enqueue 失敗會 rollback 埋 s1 同 token UPDATE，唔會留低半完成狀態；恢復方法係重試 create-user 或者 call re-invite（11.4b），兩者都發新 token 同新信。實作見 issue #26。
+- 失敗恢復（決定 85，待產品經理確認）：v1.8 起一個 request 一個 transaction（決定 99），s2 失敗會 rollback s1；但 commit 之後先失敗（例如回應途中斷線）或者舊資料仍然可能有「已建立、未邀請」嘅用戶。Admin 用同一個 body 重試 create-user：`user.register` 對已存在、未驗證、冇密碼嘅用戶回原有 id（`created: false`），s2 重新寄邀請，回 200；或者用 11.4b 嘅 re-invite endpoint。
 - `EMAIL_TAKEN`（決定 84，待產品經理確認）：只限 admin（已認證、`roles: [admin]`、按用戶限流、audit-log），admin 本身可以列出租戶用戶，所以 409 唔當 enumeration 洩漏；public 註冊（12.11）照樣唔分辨。
 - 同一個 email 自己註冊緊（未驗證、冇密碼）：當同一個用戶，邀請 token 取代註冊 token（決定 88，待產品經理確認）。
 - 邀請流程（決定 69，已確認（產品經理 2026-10-14））：admin 建立嘅用戶冇 password、`email_verified_at` 係 null，所以未接受邀請之前唔可以 login（決定 55）。完整流程見 12.11.9。
@@ -2245,7 +2292,7 @@ api source 寫「用 user.login 驗證帳戶密碼」，編譯成：
 
 ### 12.6 安全
 
-- method 一樣行 7.1 嘅租戶隔離：每個 query 都喺有 `SET LOCAL app.tenant_id` 嘅 transaction 入面執行，RLS 強制生效。
+- method 一樣行 7.1 嘅租戶隔離：喺 request 嘅同一個 transaction、租戶 role（`SET LOCAL ROLE tenant_<id>`）之下執行，RLS 強制生效（決定 97、99）。
 - 由 public endpoint call 嘅 method：
   - tenant 由 slug 解析，平台注入。
   - 只讀 step 用 `public_reader` role；寫入 step 用 `public_writer` role，grant 只限 lock 用到嘅表、欄位同操作（見 7.2）。
@@ -3310,7 +3357,7 @@ security-items:
 
 私隱法（PDPO、GDPR）部分嘅建議請法律意見覆核。
 
-另外，0.10 嘅決定 73–96 全部待產品經理確認；確認之前 v1.7 定稿照樣有效。
+另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–102 已經由產品經理確認，決定 101 嘅 `Path` 取捨除外）；確認之前 v1.7 定稿照樣有效。
 
 ## 14. 後續版本
 
