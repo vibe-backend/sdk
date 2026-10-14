@@ -48,7 +48,21 @@ pub async fn run_method(
     let method = crate::manifest::method(manifest, target)
         .ok_or_else(|| MethodFail::code("INTERNAL", format!("unknown method {target}")))?;
     if method.crud_action.is_empty() {
-        return run_steps(manifest, exec, method, input, ctx, depth).await;
+        let mut verified = Vec::new();
+        let result = run_steps(manifest, exec, method, input, ctx, depth, &mut verified).await?;
+        // Decision 67: a confirmed verification ends every session of that
+        // user (platform behaviour; the lock does not declare it).
+        for user in verified {
+            let target = super::refresh::RevokeTarget::User {
+                user: &user,
+                reason: "email-verified",
+            };
+            if let Err(err) = exec.refresh_revoke(ctx.tenant_id, target).await {
+                tracing::error!(error = ?err, "revoking sessions after verification failed");
+                return Err(MethodFail::code("INTERNAL", "session revoke failed"));
+            }
+        }
+        return Ok(result);
     }
     let model = crate::manifest::model(manifest, &method.crud_model)
         .ok_or_else(|| MethodFail::code("INTERNAL", "unknown model"))?;
@@ -72,6 +86,7 @@ async fn run_steps(
     input: &Value,
     ctx: CallCtx<'_>,
     depth: u32,
+    verified: &mut Vec<String>,
 ) -> Result<CallResult, MethodFail> {
     let mut vars = Map::new();
     vars.insert("input".into(), input.clone());
@@ -116,7 +131,22 @@ async fn run_steps(
             "query" | "verify-password" | "hash-password" | "random-token" | "hash-token"
             | "sign-jwt" => {
                 let value = match step.op.as_str() {
-                    "query" => super::ops::query(exec, step, &vars, ctx).await?,
+                    "query" => {
+                        let row = super::ops::query(exec, method, step, &vars, ctx).await?;
+                        if method
+                            .capabilities
+                            .iter()
+                            .any(|c| c == "confirm-verification")
+                            && crate::validate::written_columns(&step.sql)
+                                .iter()
+                                .any(|c| c == "email_verified_at")
+                        {
+                            if let Some(id) = row.get("id").and_then(Value::as_str) {
+                                verified.push(id.to_string());
+                            }
+                        }
+                        row
+                    }
                     "verify-password" => super::ops::verify_password(step, &vars).await?,
                     "hash-password" => super::ops::hash_password_op(step, &vars).await?,
                     "random-token" => super::ops::random_token(step, ctx)?,
@@ -918,6 +948,8 @@ pub fn eval_expr(input: &str, vars: &Map<String, Value>) -> Result<Value, String
 enum Expr {
     Path(String),
     Object(Vec<(String, Expr)>),
+    /// A quoted string literal: `'register'` or `"..."` (no escapes).
+    Lit(String),
 }
 
 fn parse_expr(input: &str) -> Result<(Expr, &str), String> {
@@ -945,6 +977,14 @@ fn parse_expr(input: &str) -> Result<(Expr, &str), String> {
                 return Ok((Expr::Object(fields), next));
             }
             return Err("expected , or }".into());
+        }
+    }
+    for quote in ['\'', '"'] {
+        if let Some(body) = input.strip_prefix(quote) {
+            let end = body
+                .find(quote)
+                .ok_or_else(|| format!("unterminated string in {input}"))?;
+            return Ok((Expr::Lit(body[..end].to_string()), &body[end + 1..]));
         }
     }
     let (path, rest) = take_path(input)?;
@@ -981,6 +1021,7 @@ fn take_path(input: &str) -> Result<(String, &str), String> {
 fn eval_parsed(expr: &Expr, vars: &Map<String, Value>) -> Value {
     match expr {
         Expr::Path(path) => lookup(path, vars),
+        Expr::Lit(text) => Value::String(text.clone()),
         Expr::Object(fields) => {
             let mut obj = Map::new();
             for (key, value) in fields {

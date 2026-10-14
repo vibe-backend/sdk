@@ -37,8 +37,9 @@ pub enum Rotated {
 pub enum RevokeTarget<'a> {
     /// The family of this token hash, only if it belongs to `user` (logout).
     FamilyOf { hash: &'a str, user: &'a str },
-    /// Every family of this user (log out everywhere).
-    User(&'a str),
+    /// Every family of this user: `logout-all`, or `email-verified` after
+    /// `user.complete-verification` (decision 67).
+    User { user: &'a str, reason: &'static str },
 }
 
 /// Columns of `_platform_refresh_tokens`.
@@ -159,7 +160,7 @@ pub fn memory_rotate(
     };
     if !cur["revoked_at"].is_null() {
         if text(&cur, "revoke_reason") == "grace-reissue" {
-            revoke_family(rows, "reuse");
+            revoke_family(rows, "reuse-detected");
             return Rotated::Reuse { family_id: family };
         }
         return Rotated::Invalid;
@@ -199,7 +200,7 @@ pub fn memory_rotate(
             rows[idx].insert("grace_reissued_at".into(), now.into());
         }
         Some(_) => {
-            revoke_family(rows, "reuse");
+            revoke_family(rows, "reuse-detected");
             return Rotated::Reuse { family_id: family };
         }
     }
@@ -226,7 +227,7 @@ pub fn memory_revoke(
             })
             .map(|r| text(r, "family_id"))
             .collect(),
-        RevokeTarget::User(_) => Vec::new(),
+        RevokeTarget::User { .. } => Vec::new(),
     };
     let mut n = 0;
     for r in rows
@@ -235,11 +236,15 @@ pub fn memory_revoke(
     {
         let hit = match target {
             RevokeTarget::FamilyOf { .. } => families.contains(&text(r, "family_id")),
-            RevokeTarget::User(user) => text(r, "user_id") == *user,
+            RevokeTarget::User { user, .. } => text(r, "user_id") == *user,
         };
         if hit {
             r.insert("revoked_at".into(), now.into());
-            r.insert("revoke_reason".into(), "logout".into());
+            let reason = match target {
+                RevokeTarget::FamilyOf { .. } => "logout",
+                RevokeTarget::User { reason, .. } => reason,
+            };
+            r.insert("revoke_reason".into(), reason.into());
             n += 1;
         }
     }
@@ -307,7 +312,7 @@ mod tests {
             Rotated::Invalid
         );
         assert!(rows.iter().all(|r| !r["revoked_at"].is_null()));
-        assert!(rows.iter().any(|r| r["revoke_reason"] == "reuse"));
+        assert!(rows.iter().any(|r| r["revoke_reason"] == "reuse-detected"));
     }
 
     #[test]
@@ -386,7 +391,18 @@ mod tests {
             Rotated::Invalid
         );
         ok_family(memory_rotate(&mut rows, T, "b0", "b1", policy(), 2));
-        assert_eq!(memory_revoke(&mut rows, T, &RevokeTarget::User("u1"), 3), 2);
+        assert_eq!(
+            memory_revoke(
+                &mut rows,
+                T,
+                &RevokeTarget::User {
+                    user: "u1",
+                    reason: "logout-all"
+                },
+                3
+            ),
+            2
+        );
         assert_eq!(
             memory_rotate(&mut rows, T, "b1", "x", policy(), 4),
             Rotated::Invalid

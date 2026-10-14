@@ -19,6 +19,17 @@ curl http://localhost:8080/catalog/v1/acme/items
 
 **Refresh tokens (#26, part 2).** A route with a `### token-refresh` pipeline (`sign-method`, `refresh-ttl` ≤ 30d, `idle-ttl` ≤ 7d, `reuse-grace` default 10s, `transport: body`) must be public with auth removed. It takes `{refresh_token}` and returns `{access_token, token_type, expires_in, expires_at, refresh_token}`. Tokens are 32 random bytes; only an HMAC (under a key derived from the pepper) is stored, in each tenant's `_platform_refresh_tokens` (created by `vibe migrate` when such a route exists). Every use rotates the token. Presenting a spent token again revokes the whole family, except for one reissue inside `reuse-grace`, and that reissue kills the lost child. Every failure (unknown, expired, revoked, replayed) is the same 401 `INVALID_REFRESH_TOKEN`, padded to 300 ms. Replays are logged. Limits: 30/min per IP (platform), and 10/min per family (`rate-limit` `key: family` can only lower it). A `### token-revoke` pipeline (`scope: family` takes the caller's own `refresh_token`; `scope: all` revokes every family of the caller) needs auth, runs before the route's steps, and answers 204 whether or not anything was revoked.
 
+**Registration and verification (#26, part 3).** The fixture `tests/fixtures/auth-app` implements spec §12.11 end to end:
+- `POST /auth/v1/{slug}/register` takes only email and name (decision 67). It always runs one upsert plus one outbox insert and answers the same 202 body whether the email is new, unverified, verified or invited (decision 56).
+- Re-registering an unverified email only rotates its token, so the old link stops working; a verified user or one with a pending invite gets an "already registered" notice instead.
+- `POST /auth/v1/{slug}/verify-email` runs `user.complete-verification`. It always hashes the password first, then sets `password` and `email_verified_at` in one UPDATE.
+- After a successful verification the platform revokes every refresh family of that user (`email-verified`). Admin invites (decision 69) use the same route and method.
+
+Runtime rules:
+- A `query` that writes `password` needs `capabilities: [set-password]`, and one that writes `email_verified_at` needs `confirm-verification` (checked by validate and at runtime).
+- Public response floors pad a response that runs past the floor up to the next 100 ms (decision 66).
+- Expressions accept quoted string literals (`purpose: 'invite'`).
+
 ## Install
 
 Download `vibe` from [GitHub Releases](https://github.com/vibe-backend/sdk/releases). The CLI is not published to crates.io and it is not published as a container image.

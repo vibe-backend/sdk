@@ -5,47 +5,790 @@
   "models": [],
   "routes": [
     {
-      "method": "POST", "path": "/auth/v1/{slug}/login", "feature_id": "auth/v1/login",
-      "public": true, "auth_removed": true, "auth_mode": "jwt", "roles": [], "scopes": [],
-      "rates": [], "body_limit": 4096,
+      "method": "POST",
+      "path": "/auth/v1/{slug}/login",
+      "feature_id": "auth/v1/login",
+      "public": true,
+      "auth_removed": true,
+      "auth_mode": "jwt",
+      "roles": [],
+      "scopes": [],
+      "rates": [],
+      "body_limit": 4096,
       "request": [
-        {"location": "body", "name": "email", "ty": "string", "required": true, "min": null, "max": null, "format": ""},
-        {"location": "body", "name": "password", "ty": "string", "required": true, "min": null, "max": null, "format": ""}
+        {
+          "location": "body",
+          "name": "email",
+          "ty": "string",
+          "required": true,
+          "min": null,
+          "max": null,
+          "format": ""
+        },
+        {
+          "location": "body",
+          "name": "password",
+          "ty": "string",
+          "required": true,
+          "min": null,
+          "max": null,
+          "format": ""
+        }
       ],
       "transform_in": "{email: req.body.email, password: req.body.password}",
       "transform_out": "result",
       "steps": [
-        {"id": "s1", "op": "method", "target": "user.login", "args": "transform.in", "value": "",
-         "status": 0, "sql": "", "params": [], "out": "result", "fail": "", "when_expr": "",
-         "writes": false, "table": ""},
-        {"id": "s2", "op": "respond", "target": "", "args": "", "value": "transform.out",
-         "status": 200, "sql": "", "params": [], "out": "", "fail": "", "when_expr": "",
-         "writes": false, "table": ""}
+        {
+          "id": "s1",
+          "op": "method",
+          "target": "user.login",
+          "args": "transform.in",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "result",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": ""
+        },
+        {
+          "id": "s2",
+          "op": "respond",
+          "target": "",
+          "args": "",
+          "value": "transform.out",
+          "status": 200,
+          "sql": "",
+          "params": [],
+          "out": "",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": ""
+        }
       ],
-      "errors": [{"status": 401, "code": "INVALID_CREDENTIALS", "from": "user.login"}],
-      "min_response_ms": 300, "public_writes": false, "challenge_type": "none",
-      "challenge_when": "always", "deprecated": false, "sunset": ""
+      "errors": [
+        {
+          "status": 401,
+          "code": "INVALID_CREDENTIALS",
+          "from": "user.login"
+        }
+      ],
+      "min_response_ms": 300,
+      "public_writes": false,
+      "challenge_type": "none",
+      "challenge_when": "always",
+      "deprecated": false,
+      "sunset": ""
+    },
+    {
+      "method": "POST",
+      "path": "/auth/v1/{slug}/register",
+      "feature_id": "auth/v1/register",
+      "public": true,
+      "auth_removed": true,
+      "auth_mode": "jwt",
+      "roles": [],
+      "scopes": [],
+      "rates": [
+        {
+          "per_minute": 5,
+          "key": "ip"
+        },
+        {
+          "per_minute": 60,
+          "key": "tenant"
+        }
+      ],
+      "body_limit": 4096,
+      "request": [
+        {
+          "location": "body",
+          "name": "email",
+          "ty": "string",
+          "required": true,
+          "min": null,
+          "max": 254,
+          "format": "email"
+        },
+        {
+          "location": "body",
+          "name": "name",
+          "ty": "string",
+          "required": true,
+          "min": 1,
+          "max": 50,
+          "format": ""
+        }
+      ],
+      "transform_in": "{email: req.body.email, name: req.body.name}",
+      "transform_out": "{message: 'If the details are correct, you will receive a confirmation email'}",
+      "steps": [
+        {
+          "id": "s1",
+          "op": "method",
+          "target": "user.self-register",
+          "args": "transform.in",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "(none)",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        },
+        {
+          "id": "s2",
+          "op": "respond",
+          "target": "",
+          "args": "",
+          "value": "transform.out",
+          "status": 202,
+          "sql": "",
+          "params": [],
+          "out": "",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        }
+      ],
+      "errors": [],
+      "min_response_ms": 300,
+      "public_writes": true,
+      "challenge_type": "captcha",
+      "challenge_when": "always",
+      "deprecated": false,
+      "sunset": ""
+    },
+    {
+      "method": "POST",
+      "path": "/auth/v1/{slug}/verify-email",
+      "feature_id": "auth/v1/verify-email",
+      "public": true,
+      "auth_removed": true,
+      "auth_mode": "jwt",
+      "roles": [],
+      "scopes": [],
+      "rates": [
+        {
+          "per_minute": 10,
+          "key": "ip"
+        },
+        {
+          "per_minute": 120,
+          "key": "tenant"
+        }
+      ],
+      "body_limit": 4096,
+      "request": [
+        {
+          "location": "body",
+          "name": "token",
+          "ty": "string",
+          "required": true,
+          "min": 43,
+          "max": 43,
+          "format": ""
+        },
+        {
+          "location": "body",
+          "name": "password",
+          "ty": "string",
+          "required": true,
+          "min": 1,
+          "max": 256,
+          "format": ""
+        }
+      ],
+      "transform_in": "{token: req.body.token, password: req.body.password}",
+      "transform_out": "result",
+      "steps": [
+        {
+          "id": "s1",
+          "op": "method",
+          "target": "user.complete-verification",
+          "args": "transform.in",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "(none)",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        },
+        {
+          "id": "s2",
+          "op": "respond",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 204,
+          "sql": "",
+          "params": [],
+          "out": "",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        }
+      ],
+      "errors": [
+        {
+          "status": 422,
+          "code": "WEAK_PASSWORD",
+          "from": "user.complete-verification"
+        },
+        {
+          "status": 422,
+          "code": "INVALID_TOKEN",
+          "from": "user.complete-verification"
+        }
+      ],
+      "min_response_ms": 300,
+      "public_writes": true,
+      "challenge_type": "none",
+      "challenge_when": "always",
+      "deprecated": false,
+      "sunset": ""
+    },
+    {
+      "method": "POST",
+      "path": "/admin/v1/users/invite",
+      "feature_id": "admin/v1/invite",
+      "public": false,
+      "auth_removed": false,
+      "auth_mode": "jwt",
+      "roles": [
+        "admin"
+      ],
+      "scopes": [],
+      "rates": [],
+      "body_limit": 4096,
+      "request": [
+        {
+          "location": "body",
+          "name": "email",
+          "ty": "string",
+          "required": true,
+          "min": null,
+          "max": 254,
+          "format": "email"
+        },
+        {
+          "location": "body",
+          "name": "name",
+          "ty": "string",
+          "required": true,
+          "min": 1,
+          "max": 50,
+          "format": ""
+        }
+      ],
+      "transform_in": "{email: req.body.email, name: req.body.name}",
+      "transform_out": "result",
+      "steps": [
+        {
+          "id": "s1",
+          "op": "method",
+          "target": "user.invite",
+          "args": "transform.in",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "result",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        },
+        {
+          "id": "s2",
+          "op": "respond",
+          "target": "",
+          "args": "",
+          "value": "transform.out",
+          "status": 201,
+          "sql": "",
+          "params": [],
+          "out": "",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        }
+      ],
+      "errors": [
+        {
+          "status": 409,
+          "code": "ALREADY_VERIFIED",
+          "from": "user.invite"
+        }
+      ],
+      "min_response_ms": 0,
+      "public_writes": false,
+      "challenge_type": "none",
+      "challenge_when": "always",
+      "deprecated": false,
+      "sunset": ""
     }
   ],
   "methods": [
     {
-      "target": "user.login", "writes": false, "input": [], "errors": ["INVALID_CREDENTIALS"],
-      "capabilities": ["sign-token"], "crud_model": "", "crud_action": "",
+      "target": "user.login",
+      "writes": false,
+      "input": [],
+      "errors": [
+        "INVALID_CREDENTIALS"
+      ],
+      "capabilities": [
+        "sign-token"
+      ],
+      "crud_model": "",
+      "crud_action": "",
       "steps": [
-        {"id": "s1", "op": "query", "target": "", "args": "", "value": "", "status": 0,
-         "sql": "select id::text as id, roles, password from users where email = $1 and deleted_at is null and email_verified_at is not null",
-         "params": ["input.email"], "out": "u", "fail": "", "when_expr": "", "writes": false, "table": "users"},
-        {"id": "s2", "op": "verify-password", "target": "", "args": "", "value": "", "status": 0,
-         "sql": "", "params": [], "out": "ok", "fail": "", "when_expr": "", "writes": false, "table": "",
-         "opts": {"hash": "u.password", "plain": "input.password", "missing-user": "dummy-hash"}},
-        {"id": "s3", "op": "validate", "target": "", "args": "", "value": "", "status": 0,
-         "sql": "", "params": [], "out": "", "fail": "INVALID_CREDENTIALS", "when_expr": "`ok != true`",
-         "writes": false, "table": ""},
-        {"id": "s4", "op": "sign-jwt", "target": "", "args": "", "value": "", "status": 0,
-         "sql": "", "params": [], "out": "tok", "fail": "", "when_expr": "", "writes": false, "table": "",
-         "opts": {"alg": "ES256", "key-ref": "JWT_SIGNING_KEY", "claims": "{ sub: u.id }", "ttl": "15m"}},
-        {"id": "s5", "op": "respond", "target": "", "args": "", "value": "tok", "status": 200,
-         "sql": "", "params": [], "out": "", "fail": "", "when_expr": "", "writes": false, "table": ""}
+        {
+          "id": "s1",
+          "op": "query",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "select id::text as id, roles, password from users where email = $1 and deleted_at is null and email_verified_at is not null",
+          "params": [
+            "input.email"
+          ],
+          "out": "u",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "users"
+        },
+        {
+          "id": "s2",
+          "op": "verify-password",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "ok",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {
+            "hash": "u.password",
+            "plain": "input.password",
+            "missing-user": "dummy-hash"
+          }
+        },
+        {
+          "id": "s3",
+          "op": "validate",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "",
+          "fail": "INVALID_CREDENTIALS",
+          "when_expr": "`ok != true`",
+          "writes": false,
+          "table": ""
+        },
+        {
+          "id": "s4",
+          "op": "sign-jwt",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "tok",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {
+            "alg": "ES256",
+            "key-ref": "JWT_SIGNING_KEY",
+            "claims": "{ sub: u.id }",
+            "ttl": "15m"
+          }
+        },
+        {
+          "id": "s5",
+          "op": "respond",
+          "target": "",
+          "args": "",
+          "value": "tok",
+          "status": 200,
+          "sql": "",
+          "params": [],
+          "out": "",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": ""
+        }
+      ]
+    },
+    {
+      "target": "email-outbox.enqueue",
+      "writes": true,
+      "input": [],
+      "errors": [],
+      "capabilities": [],
+      "crud_model": "",
+      "crud_action": "",
+      "steps": [
+        {
+          "id": "s1",
+          "op": "hash-token",
+          "target": "",
+          "args": "",
+          "value": "input.email",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "rh",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {
+            "normalize": "email"
+          }
+        },
+        {
+          "id": "s2",
+          "op": "query",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "insert into email_outbox (user_id, email, recipient_hash, template, token) values ($1, $2, $4, case when $1::uuid is null then 'already-registered' when $5 = 'invite' then 'invite' else 'verify-email' end, case when $1::uuid is null then null else convert_to($3, 'UTF8') end)",
+          "params": [
+            "input.user_id",
+            "input.email",
+            "input.token",
+            "rh",
+            "input.purpose"
+          ],
+          "out": "(none)",
+          "fail": "",
+          "when_expr": "",
+          "writes": true,
+          "table": "email_outbox",
+          "opts": {}
+        },
+        {
+          "id": "s3",
+          "op": "respond",
+          "target": "",
+          "args": "",
+          "value": "{}",
+          "status": 200,
+          "sql": "",
+          "params": [],
+          "out": "",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        }
+      ]
+    },
+    {
+      "target": "user.self-register",
+      "writes": true,
+      "input": [],
+      "errors": [],
+      "capabilities": [],
+      "crud_model": "",
+      "crud_action": "",
+      "steps": [
+        {
+          "id": "s1",
+          "op": "random-token",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "vt",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        },
+        {
+          "id": "s2",
+          "op": "query",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "insert into users (email, name, email_verify_hash, email_verify_expires_at, email_verify_purpose) values ($1, $2, $3, now() + interval '24 hours', 'register') on conflict (tenant_id, email) do update set email_verify_hash = excluded.email_verify_hash, email_verify_expires_at = excluded.email_verify_expires_at, email_verify_purpose = 'register' where users.email_verified_at is null and users.deleted_at is null and not (users.email_verify_purpose = 'invite' and users.email_verify_expires_at > now()) returning id",
+          "params": [
+            "input.email",
+            "input.name",
+            "vt.hash"
+          ],
+          "out": "ins",
+          "fail": "",
+          "when_expr": "",
+          "writes": true,
+          "table": "users",
+          "opts": {}
+        },
+        {
+          "id": "s3",
+          "op": "method",
+          "target": "email-outbox.enqueue",
+          "args": "{ user_id: ins.id, email: input.email, token: vt.value, purpose: 'register' }",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "(none)",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        },
+        {
+          "id": "s4",
+          "op": "respond",
+          "target": "",
+          "args": "",
+          "value": "{}",
+          "status": 200,
+          "sql": "",
+          "params": [],
+          "out": "",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        }
+      ]
+    },
+    {
+      "target": "user.complete-verification",
+      "writes": true,
+      "input": [],
+      "errors": [],
+      "capabilities": [
+        "set-password",
+        "confirm-verification"
+      ],
+      "crud_model": "",
+      "crud_action": "",
+      "steps": [
+        {
+          "id": "s1",
+          "op": "hash-password",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "pw",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {
+            "plain": "input.password",
+            "policy": "platform-floor"
+          }
+        },
+        {
+          "id": "s2",
+          "op": "hash-token",
+          "target": "",
+          "args": "",
+          "value": "input.token",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "th",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        },
+        {
+          "id": "s3",
+          "op": "query",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "update users set password = $1, email_verified_at = now(), email_verify_hash = null, email_verify_expires_at = null, email_verify_purpose = null where email_verify_hash = $2 and email_verify_expires_at > now() and email_verified_at is null and deleted_at is null returning id",
+          "params": [
+            "pw",
+            "th"
+          ],
+          "out": "upd",
+          "fail": "",
+          "when_expr": "",
+          "writes": true,
+          "table": "users",
+          "opts": {}
+        },
+        {
+          "id": "s4",
+          "op": "validate",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "",
+          "fail": "INVALID_TOKEN",
+          "when_expr": "`upd.id == null`",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        },
+        {
+          "id": "s5",
+          "op": "respond",
+          "target": "",
+          "args": "",
+          "value": "{}",
+          "status": 200,
+          "sql": "",
+          "params": [],
+          "out": "",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        }
+      ]
+    },
+    {
+      "target": "user.invite",
+      "writes": true,
+      "input": [],
+      "errors": [],
+      "capabilities": [],
+      "crud_model": "",
+      "crud_action": "",
+      "steps": [
+        {
+          "id": "s1",
+          "op": "random-token",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "vt",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        },
+        {
+          "id": "s2",
+          "op": "query",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "insert into users (email, name, email_verify_hash, email_verify_expires_at, email_verify_purpose) values ($1, $2, $3, now() + interval '72 hours', 'invite') on conflict (tenant_id, email) do update set email_verify_hash = excluded.email_verify_hash, email_verify_expires_at = excluded.email_verify_expires_at, email_verify_purpose = 'invite' where users.email_verified_at is null and users.deleted_at is null returning id",
+          "params": [
+            "input.email",
+            "input.name",
+            "vt.hash"
+          ],
+          "out": "inv",
+          "fail": "",
+          "when_expr": "",
+          "writes": true,
+          "table": "users",
+          "opts": {}
+        },
+        {
+          "id": "s3",
+          "op": "validate",
+          "target": "",
+          "args": "",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "",
+          "fail": "ALREADY_VERIFIED",
+          "when_expr": "inv.id == null",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        },
+        {
+          "id": "s4",
+          "op": "method",
+          "target": "email-outbox.enqueue",
+          "args": "{ user_id: inv.id, email: input.email, token: vt.value, purpose: 'invite' }",
+          "value": "",
+          "status": 0,
+          "sql": "",
+          "params": [],
+          "out": "(none)",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        },
+        {
+          "id": "s5",
+          "op": "respond",
+          "target": "",
+          "args": "",
+          "value": "{id: inv.id}",
+          "status": 200,
+          "sql": "",
+          "params": [],
+          "out": "",
+          "fail": "",
+          "when_expr": "",
+          "writes": false,
+          "table": "",
+          "opts": {}
+        }
       ]
     }
   ]

@@ -838,3 +838,13 @@ async fn duplicate_insert_is_conflict_not_internal() {
         .unwrap_err();
     assert_eq!(err.code, "CONFLICT", "{err:?}");
 }
+
+#[tokio::test]
+async fn expressions_accept_quoted_string_literals() {
+    let m = method_manifest(
+        &[],
+        json!([respond("{purpose: 'invite', note: \"a b\", who: input.x}")]),
+    );
+    let out = run(&m, &MemoryExec::new(), json!({"x": 1})).await.unwrap();
+    assert_eq!(out, json!({"purpose": "invite", "note": "a b", "who": 1}));
+}

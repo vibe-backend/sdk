@@ -618,7 +618,7 @@ impl QueryExec for PgExec {
         let in_grace: bool = row.get(7);
         let old_child: Option<String> = row.get(8);
         let revoke_family =
-            "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'reuse' \
+            "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'reuse-detected' \
                              WHERE family_id = $1::text::uuid AND revoked_at IS NULL";
         if revoked {
             if reason.as_deref() == Some("grace-reissue") {
@@ -691,10 +691,10 @@ impl QueryExec for PgExec {
                  WHERE revoked_at IS NULL AND family_id = (SELECT family_id FROM _platform_refresh_tokens WHERE token_hash = $1 AND user_id = $2) RETURNING id",
                 vec![Some(hash.to_string()), Some(user.to_string())],
             ),
-            RevokeTarget::User(user) => (
-                "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'logout' \
+            RevokeTarget::User { user, reason } => (
+                "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = $2 \
                  WHERE revoked_at IS NULL AND user_id = $1 RETURNING id",
-                vec![Some(user.to_string())],
+                vec![Some(user.to_string()), Some(reason.to_string())],
             ),
         };
         let rows = self.run_tx(tenant_id, None, true, sql, params).await?;

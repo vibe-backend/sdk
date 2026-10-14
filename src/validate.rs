@@ -504,6 +504,14 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                         .at_section("Steps"),
                 );
             }
+            let cap_list: Vec<String> = crate::lock::parse_string_list(caps).unwrap_or_default();
+            if let Some(problem) = credential_write_problem(&sql, &cap_list) {
+                report.push(
+                    Diag::error(file, problem)
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+            }
             if writable_cte(&sql) {
                 report.push(
                     Diag::error(file, "data-modifying WITH queries are not allowed")
@@ -1102,6 +1110,52 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
 /// `WITH x AS (INSERT ...)`: a write hidden inside a read. Rejected.
 pub fn writable_cte(sql: &str) -> bool {
     crate::security::sql_writes(sql) && !plain_write(sql)
+}
+
+/// Columns an INSERT/UPDATE writes: the INSERT column list, and the left
+/// side of each `SET` assignment (including `ON CONFLICT DO UPDATE SET`).
+/// Lowercase, unquoted.
+pub fn written_columns(sql: &str) -> Vec<String> {
+    static INSERT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)\binsert\s+into\s+[a-z0-9_\x22.]+\s*\(([^)]*)\)").expect("regex")
+    });
+    static SET: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)\bset\s+(.*?)(?:\bwhere\b|\breturning\b|\bfrom\b|$)").expect("regex")
+    });
+    let clean = crate::security::strip_sql_noise(sql);
+    let mut cols = Vec::new();
+    let mut push = |name: &str| {
+        let name = name.trim().trim_matches('"').to_ascii_lowercase();
+        if !name.is_empty() && !cols.contains(&name) {
+            cols.push(name);
+        }
+    };
+    if let Some(cap) = INSERT.captures(&clean) {
+        cap[1].split(',').for_each(&mut push);
+    }
+    for cap in SET.captures_iter(&clean) {
+        for assignment in crate::lock::split_top_level(&cap[1]) {
+            if let Some((left, _)) = assignment.split_once('=') {
+                push(left);
+            }
+        }
+    }
+    cols
+}
+
+/// Credential columns need their capability (spec §12.8): writing
+/// `password` needs `set-password`; writing `email_verified_at` needs
+/// `confirm-verification`.
+pub fn credential_write_problem(sql: &str, capabilities: &[String]) -> Option<String> {
+    let cols = written_columns(sql);
+    let has = |cap: &str| capabilities.iter().any(|c| c == cap);
+    if cols.iter().any(|c| c == "password") && !has("set-password") {
+        return Some("writing password needs capabilities: [set-password]".into());
+    }
+    if cols.iter().any(|c| c == "email_verified_at") && !has("confirm-verification") {
+        return Some("writing email_verified_at needs capabilities: [confirm-verification]".into());
+    }
+    None
 }
 
 /// A statement that is itself an INSERT or UPDATE.

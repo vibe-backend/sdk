@@ -885,12 +885,23 @@ async fn finish(
     };
     let elapsed = started.elapsed();
     if min_ms > 0 {
-        let min = Duration::from_millis(min_ms);
-        if elapsed < min {
-            tokio::time::sleep(min - elapsed).await;
+        let target = Duration::from_millis(padded_ms(min_ms, elapsed.as_millis() as u64));
+        if elapsed < target {
+            tokio::time::sleep(target - elapsed).await;
         }
     }
     response
+}
+
+/// Response-time floor (decision 66): at least `min_ms`; a slower response
+/// is padded up to the next multiple of 100 ms, so its duration says little
+/// about which path ran.
+fn padded_ms(min_ms: u64, elapsed_ms: u64) -> u64 {
+    if elapsed_ms <= min_ms {
+        min_ms
+    } else {
+        elapsed_ms.div_ceil(100) * 100
+    }
 }
 
 struct Found<'a> {
@@ -1626,7 +1637,10 @@ async fn revoke_tokens(
 ) -> Result<(), HttpResponse> {
     let hash;
     let target = if spec.scope == "all" {
-        RevokeTarget::User(&principal.subject)
+        RevokeTarget::User {
+            user: &principal.subject,
+            reason: "logout-all",
+        }
     } else {
         let Some(token) = body.get("refresh_token").and_then(Value::as_str) else {
             return Err(error_response(
@@ -1909,6 +1923,18 @@ fn empty_response(
     response
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+#[cfg(test)]
+mod floor_tests {
+    #[test]
+    fn floor_pads_to_the_next_100ms_once_exceeded() {
+        assert_eq!(super::padded_ms(300, 12), 300);
+        assert_eq!(super::padded_ms(300, 300), 300);
+        assert_eq!(super::padded_ms(300, 301), 400);
+        assert_eq!(super::padded_ms(300, 499), 500);
+        assert_eq!(super::padded_ms(300, 500), 500);
+    }
 }
 
 #[cfg(test)]

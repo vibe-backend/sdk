@@ -98,10 +98,16 @@ fn as_param(value: Value) -> Option<String> {
 /// `query`: the first row as an object, or null when there is none.
 pub async fn query(
     exec: &dyn QueryExec,
+    method: &MethodSpec,
     step: &StepSpec,
     vars: &Map<String, Value>,
     ctx: CallCtx<'_>,
 ) -> Result<Value, MethodFail> {
+    if let Some(problem) =
+        crate::validate::credential_write_problem(&step.sql, &method.capabilities)
+    {
+        return Err(internal(problem));
+    }
     if step.table.starts_with("_platform") || step.sql.to_ascii_lowercase().contains("_platform_") {
         return Err(internal("platform tables cannot be queried"));
     }

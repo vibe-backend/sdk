@@ -289,7 +289,7 @@ hash-password {{ plain: expr, out }}. random-token {{ out }} gives {{ value, has
 hash-token {{ value: expr, normalize: email (optional), out }}. \
 sign-jwt {{ alg: ES256|RS256, key-ref: ENV_NAME, claims: {{ sub: expr, ... }}, custom-claims: [names], ttl: <=1h, out }} needs capabilities: [sign-token]; roles come from users.roles, never from claims; output {{ access_token, token_type, expires_in, expires_at }}. \
 sign-jwt issue-refresh: platform-decided only when an api route has a token-refresh pipeline {{ sign-method, refresh-ttl, idle-ttl, reuse-grace, transport: body }} (public, auth removed); a token-revoke pipeline {{ scope: family|all }} needs auth. \
-Expressions can read input.*, earlier step outputs, and ctx.user.sub, ctx.user.roles, ctx.user.tenant. \
+Expressions can read input.*, earlier step outputs, and ctx.user.sub, ctx.user.roles, ctx.user.tenant; constants are quoted strings like 'invite'. A query writing password needs capabilities [set-password]; writing email_verified_at needs [confirm-verification]. \
 SQL must be a single parameterized statement using $1, $2. \
 Never emit DELETE, TRUNCATE, GRANT, REVOKE, or DDL outside a migration. \
 Do not invent public access, removed auth, writes, token signing, or external calls unless the source says so. \

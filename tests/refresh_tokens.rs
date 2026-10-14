@@ -536,9 +536,15 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
         Rotated::Invalid
     );
     assert_eq!(
-        exec.refresh_revoke(&tenant, RevokeTarget::User("u1"))
-            .await
-            .unwrap(),
+        exec.refresh_revoke(
+            &tenant,
+            RevokeTarget::User {
+                user: "u1",
+                reason: "logout-all"
+            }
+        )
+        .await
+        .unwrap(),
         1
     );
     assert_eq!(
