@@ -60,7 +60,7 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 
 GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自訂 required status check：
 
-1. CI 按 lock 嘅 `security-items` 自動加 `security:high` 或者 `security:medium` label（計劃中：`vibe build --labels` 輸出建議 label）。
+1. CI 按佢由 source build 出嚟嘅 lock 嘅 `security-items` 自動加 `security:high` 或者 `security:medium` label（計劃中：`vibe build --labels` 輸出建議 label）。
 2. 另一個 workflow（例如 `high-risk-approvals`）喺 `pull_request`、`pull_request_review` 同 `labeled` 事件觸發，讀 PR 嘅 label 同 review；有 `security:high` 但少過 2 個非作者、針對最新 commit 嘅 approval，就 fail。
 3. 將 `high-risk-approvals` 設為 required status check。
 
