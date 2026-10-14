@@ -133,6 +133,28 @@
 | --- | --- | --- |
 | 57 | 初始化 project／SDK 時，用戶揀編譯用 LLM：`LLM_PROVIDER` 係 `openai`（預設，涵蓋所有 OpenAI-compatible endpoint 包括 Ollama、LM Studio、vLLM）、`anthropic` 或者 `gemini`；只喺部署／編譯時用。中立變數 `LLM_BASE_URL`、`LLM_API_KEY`（必填）、`LLM_MODEL`（必填，pin 死 snapshot）；`OPENAI_*` 只做 `openai` 嘅別名，`LLM_*` 優先，值衝突 error；選填 `LLM_TIMEOUT`、`LLM_MAX_RETRIES`、`LLM_SEED`。本地開發准 http loopback，其他內網要 `LLM_ALLOW_PRIVATE_HOST=true`；CI／production 一定 https 公開 host，本地 lock 唔可以部署。Key 永遠唔寫入 repo、lock、manifest、log、部署報告或者錯誤訊息；runtime 唔可以有任何 `LLM_*`／`OPENAI_*`。沙盒網絡只准連 endpoint host；provider、host、model 寫入 lock 並計入 compiler-hash，改任何一樣都當 major。 | 2A.1、2A.6、2A.7、2A.8、9B、10.1、14 |
 
+### 0.9 v1.7 review 修訂（決定 58 起）
+
+呢節係 PR #5 code review 之後加嘅決定。純技術修正由架構直接定為「已確認」；涉及產品、私隱或者安全政策取捨嘅標「待 Jack 確認」，喺確認之前照用下表寫嘅建議值，但唔可以當定案引用。
+
+| # | 決定 | 狀態 | 位置 |
+| --- | --- | --- | --- |
+| 58 | Adapter 按 model capability 送決定性參數：model 唔支援嘅參數（例如 `temperature`、`top_p`、`seed`）就唔送，唔可以強送；決定性只靠 CI 重編比對保證。Model pin 用 provider 回報嘅 model id／snapshot id，唔再要求 id 帶日期後綴。 | 已確認 | 2A.6、2A.8.2、2A.8.3、2A.8.6 |
+| 59 | 三個 provider 嘅 request path 同 header 固定寫入 adapter：OpenAI `POST {base}/chat/completions`＋`Authorization: Bearer`；Anthropic `POST {base}/v1/messages`＋`x-api-key`＋`anthropic-version: 2023-06-01`；Gemini `POST {base}/models/{model}:generateContent`＋`x-goog-api-key`。 | 已確認 | 2A.8.2 |
+| 60 | Refresh cookie 嘅 `Path` 一定包含 `{slug}`：`/{definition}/{version}/{slug}/refresh`（同 10.7 一致）。 | 已確認 | 4A.1 |
+| 61 | Refresh 寬限期精確定義：DB 只存 hash；寬限期內用返舊 token，平台用 `used_at` 判斷，撤銷上一次發出嘅子 token，再喺同一家族發一組新 token；唔儲存、唔重發明文。 | 已確認 | 4A.1 |
+| 62 | `sign-token` 嘅 `tenant_id` 只有一個來源：平台由 slug（public）或者已驗證 token（auth）解析出嚟嘅 `ctx.tenant_id`；永遠唔由 client 或者 method 傳入，亦唔由 `users` 表讀。 | 已確認 | 12.6、12.8 |
+| 63 | `mail_worker` 加入 7.1 平台專用 role 表。 | 已確認 | 7.1 |
+| 64 | `compiler-hash` 只有一個標準定義（2A.1），包括 seed 同實際送出嘅決定性參數。 | 已確認 | 2A.1、2A.6、10.1 |
+| 65 | 補齊 grammar：`rate-limit` 參數 schema、`## Order` 准用值、`subject-key` 寫法、`token-revoke` 參數。 | 已確認 | 4.3、4.4、4A.1、12.10 |
+| 66 | 非阻塞修正：CI 範例 pin `vibe` 版本同用 SHA pin action；Ollama 記 tag（唔係 digest）；token 類型統一；`email-outbox.enqueue` 嘅 `template` 寫入 Signature；註冊耗時用固定下限＋固定工作量（唔受 argon2 排隊影響）。 | 已確認 | 2A.8.3、2A.8.8、12.11 |
+| 67 | 防預先註冊搶帳戶：未驗證 email 再註冊會覆寫 password 同驗證 token；未驗證帳戶 24 小時後由平台匿名化並 soft delete（唔 DELETE，決定 13）；驗證成功即撤銷該用戶所有 refresh 家族。 | 待 Jack 確認 | 12.11 |
+| 68 | Audit 永遠唔記明文 email（記 HMAC hash 或者遮罩）；`email_outbox` 加 `recipient_hash`，令冇 `user_id` 嘅列都可以私隱刪除；outbox 列發送後 30 日由平台匿名化。 | 待 Jack 確認（保留期） | 9、12.10、12.11 |
+| 69 | Admin 建立用戶改為邀請流程：admin 建立時唔設 password、唔設 `email_verified_at`；用戶用邀請 token 設 password，同時設 `email_verified_at`，令決定 55 成立。 | 待 Jack 確認 | 11.4、12.11.9 |
+| 70 | 列層擁有權預設規則：有 `owner-key` 嘅 model，非 admin 只可以讀寫 `owner-key = ctx.user_id` 嘅列；要放寬一定喺 source 明寫，屬高風險安全項目。 | 待 Jack 確認 | 12.6a |
+| 71 | `max-page-size` 平台上限 500（model 可以設低，唔可以設高）。 | 待 Jack 確認（數值） | 12.9 |
+| 72 | Refresh endpoint 分類：public（冇 access token）但唔屬 public 寫入（只寫平台表，唔計 public 寫入配額）；限流 IP 30/min、家族 10/min；最低回應耗時 300ms。 | 待 Jack 確認（數值） | 4A.1 |
+
 ## 1. 目錄同命名
 
 ```text
@@ -228,8 +250,8 @@ source-type: natural               # natural | structured
 dependencies:                      # 所有依賴 source／lock 嘅 hash，按 id 排序
   - { id: user, kind: model, hash: sha256:<...> }
   - { id: main, kind: provider, hash: sha256:<...> }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
-compiler-hash: sha256:<llm provider + endpoint host + model snapshot + prompt + 編譯器版本 嘅 hash>
+compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: { temperature: 0, top_p: 1, seed: 0 } }
+compiler-hash: sha256:<見下面標準定義>
 status: approved                   # pending | approved | rejected
 approval-mode: manual              # manual | auto
 approved-by: [jack@example]        # 由 CI 根據 PR review 寫入；高風險要兩人
@@ -245,7 +267,17 @@ signature: <平台對成份 lock 正規化內容（除 signature 欄位外）嘅
 - `source-hash`：source 先正規化（統一換行、去行尾空白、去 BOM、合併多餘空行），再計 sha256。淨係改排版而正規化內容唔變，hash 就唔變，**唔會重新編譯**。
 - `dependencies`：lock 用到嘅所有其他定義（例如 method 依賴 model 同 provider、api 依賴 method、`_definition`、`_version` 同 pipeline）。任何一個依賴嘅 hash 變咗，lock 都當過時，要重新編譯。
 - `source-type: structured` 只限 source 完全由結構化 frontmatter 同結構化列點組成、冇自由文字；判斷由平台嘅 deterministic parser 做，唔由 LLM 編譯器判斷（決定 20）。
-- `compiler-hash`：llm provider、endpoint host、endpoint-private、model snapshot、prompt 版本同編譯器版本合埋計 hash（決定 18、57）；只記 host（例如 `api.openai.com`），唔記完整 URL 嘅 path／query，永遠唔記 key。
+- `compiler-hash`（標準定義，全文只此一個，決定 18、57、64）：`sha256` of 以下欄位按呢個次序、用 canonical JSON（key 排序、UTF-8、冇空白）串成嘅字串：
+  1. `llm-provider`
+  2. `endpoint-host`（只記 host，例如 `api.openai.com`，唔記 path／query）
+  3. `endpoint-private`
+  4. `model-snapshot`（provider 回報嘅 model id／snapshot id；Ollama 係 tag，見 2A.8.3）
+  5. `llm-seed`（`LLM_SEED` 嘅值；就算 model 唔支援 seed 冇送出，都照計）
+  6. `sent-params`（adapter 實際送出嘅決定性參數，見 2A.8.6）
+  7. `prompt-version`
+  8. `compiler.version`
+
+  永遠唔記 key。2A.6、2A.8、10.1 提到 compiler-hash 一律指呢個定義。
 - `approved-commit`：確認時 PR head 嘅 commit hash（決定 28）。
 - `security-items`：驗證器 deterministic 抽出嘅安全項目清單；每項要有 `reason` 同確認人；冇安全項目就寫 `[]`。
 - `signature` 由平台簽名 key 簽；簽名覆蓋 frontmatter（除 signature 本身）同全部 section。
@@ -329,12 +361,12 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 ### 2A.6 重新編譯規則
 
 - 只有 `source-hash` 或者任何 `dependencies` hash 變咗先會重新編譯；source 改咗但正規化 hash 唔變就唔會重新編譯。
-- 編譯用嘅 model 一定 pin 死 snapshot（唔准用會浮動嘅別名）；model snapshot、prompt 版本、編譯器版本合埋計 `compiler-hash`，寫入每個 lock（決定 18）。
+- 編譯用嘅 model 一定 pin 死 snapshot（唔准用會浮動嘅別名）；`compiler-hash` 按 2A.1 標準定義計，寫入每個 lock（決定 18、64）。
 - 編譯器 major version 升級（例如 1.x → 2.0）、或者 model snapshot／prompt 改咗：所有 lock 強制重新編譯，即使 source hash 冇變；natural lock 同觸及安全項目嘅 lock 要重新人手確認，確認前唔可以部署。建議用獨立 PR 做升級。
 - 編譯器 minor／patch 升級：唔會強制重新編譯；但平台會用 golden corpus 對比新舊輸出，**只要任何輸出唔同，該升級就當 major 處理**。
 - Golden corpus 由平台編譯器團隊維護，最少 500 個案例，覆蓋所有 kind 同所有安全項目；項目可以喺 `.golden/` 加自己嘅案例，一樣會參與比對（決定 35）。
 - Model snapshot 淘汰（決定 35）：平台承諾宣布淘汰後最少保留 12 個月；項目有 90 日遷移窗口，窗口內舊 lock 照常有效、照常可以部署；窗口完結前未遷移，部署會被封鎖（runtime 已部署嘅 manifest 照常運作）。
-- 編譯一定要 deterministic（固定 temperature 0、固定 prompt、固定 seed、固定 snapshot）。CI 會用 lock 記錄嘅 `compiler-hash` 重編一次比對；唔一致就**封鎖部署，冇任何 override**。
+- 編譯一定要盡量 deterministic：固定 prompt、固定 snapshot；`temperature`、`top_p`、`seed` 等參數只喺 model capability 支援時先送固定值（決定 58，見 2A.8.6），唔支援就唔送，唔可以強送。決定性唔靠參數保證，靠 CI 重編比對。CI 會用 lock 記錄嘅 `compiler-hash` 重編一次比對；唔一致就**封鎖部署，冇任何 override**。
 - 唔准手改 lock：要改就改 source 再重新編譯同確認，手改會令簽名驗證失敗。
 
 ### 2A.7 獨立驗證器同編譯器隔離
@@ -357,14 +389,21 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 
 #### 2A.8.2 Provider
 
-v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`：
+v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`（決定 57、59）：
 
-| `LLM_PROVIDER` | 涵蓋 | 預設 base URL | 決定性設定 |
-| --- | --- | --- | --- |
-| `openai`（預設） | OpenAI 同所有 OpenAI-compatible endpoint，包括本地 API（Ollama、LM Studio、vLLM） | `https://api.openai.com/v1` | `temperature: 0`、`top_p: 1`、固定 `seed`（endpoint 支援就帶）、唔帶 `tools`／`functions`／`tool_choice` |
-| `anthropic` | Anthropic Messages API | `https://api.anthropic.com` | `temperature: 0`、唔設 `top_p`／`top_k`（用 provider 預設並固定）、唔帶 `tools`；冇保證決定性嘅 seed，靠 CI 重編比對 |
-| `gemini` | Google Gemini API | `https://generativelanguage.googleapis.com/v1beta` | `temperature: 0`、`topP: 1`、`topK: 1`、`generationConfig.seed` 固定（best-effort，唔保證）；唔帶 `tools`／`toolConfig`；靠 CI 重編比對 |
+| `LLM_PROVIDER` | 涵蓋 | 預設 base URL | Request | Header |
+| --- | --- | --- | --- | --- |
+| `openai`（預設） | OpenAI 同所有 OpenAI-compatible endpoint，包括本地 API（Ollama、LM Studio、vLLM） | `https://api.openai.com/v1` | `POST {base}/chat/completions` | `Authorization: Bearer {LLM_API_KEY}`、`Content-Type: application/json` |
+| `anthropic` | Anthropic Messages API | `https://api.anthropic.com` | `POST {base}/v1/messages` | `x-api-key: {LLM_API_KEY}`、`anthropic-version: 2023-06-01`、`Content-Type: application/json` |
+| `gemini` | Google Gemini API | `https://generativelanguage.googleapis.com/v1beta` | `POST {base}/models/{LLM_MODEL}:generateContent` | `x-goog-api-key: {LLM_API_KEY}`、`Content-Type: application/json`（key 唔放 query string，避免入 log） |
 
+- `{base}` 係 `LLM_BASE_URL`（冇設就用預設），去尾 `/`。`openai` 嘅 base 包含 `/v1`；`anthropic` 嘅 base 唔包含，path 自己帶 `/v1`；`gemini` 嘅 base 包含 `/v1beta`。
+- `openai` 用 Chat Completions，因為所有 OpenAI-compatible 本地 API 都支援；Responses API 唔喺 v1 範圍（見第 14 節）。
+- 決定性參數唔再按 provider 寫死，改由 adapter 按 model capability 決定（決定 58，見 2A.8.6）。已知限制（2026-10 查證）：
+  - Anthropic：較新 model（Opus 4.6 之後）只接受 `temperature: 1`、拒絕 `top_k`、`top_p` 只接受 ≥ 0.99；就算 `temperature: 0` 都唔保證決定性；冇 seed。
+  - OpenAI：GPT-5 系列 reasoning model 只喺 reasoning effort `none`（5.1、5.2）先接受 `temperature`／`top_p`，較舊 GPT-5 model 一律拒絕；`seed` 屬 beta、best-effort。
+  - Gemini：`generationConfig.temperature`、`topP`、`topK`、`seed` 都接受，但 `seed` 只係 best-effort。
+- 所有 provider 一律唔帶 `tools`／`functions`／`tool_choice`／`toolConfig`，唔用 streaming。
 - 決定性最終由 CI 重編比對保證（2A.6）：任何 provider 重編結果同 lock 唔一致，一律封鎖部署，冇 override。
 - Azure OpenAI 唔喺 v1 範圍（見第 14 節）。
 
@@ -375,15 +414,16 @@ v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`：
 | `LLM_PROVIDER` | 否 | `openai`、`anthropic`、`gemini`；預設 `openai` |
 | `LLM_BASE_URL` | 否 | 預設用上表嘅 provider base URL；規則見 2A.8.4 |
 | `LLM_API_KEY` | 是 | 只經環境變數、`.env`（已 gitignore）或者 CI secret 提供；本地 API 唔需要 key 時可以用任意占位值 |
-| `LLM_MODEL` | 是 | 一定係 pin 死嘅 snapshot id（例如 `vendor-model-2026-09-01`）；`latest`、`default`、冇日期或者版本後綴嘅別名一律拒絕；本地 API 用 model 檔嘅 digest 或者完整 tag（例如 `qwen2.5-coder:32b-instruct-q8_0`），唔准 `:latest` |
+| `LLM_MODEL` | 是 | 一定係 provider 承諾唔會浮動嘅 model id／snapshot id（決定 58）。判斷唔靠有冇日期後綴：provider 文件列明會浮動嘅別名（例如 `latest`、`default`、`*-latest`、OpenAI 冇日期嘅 alias）一律拒絕；provider 文件列明係固定 snapshot 嘅冇日期 id（例如 Anthropic 4.6 代之後嘅 id）可以用。Lock 記錄 provider 回報嘅 model id（`modelReported`），唔係用戶輸入。本地 API 用完整 tag（例如 `qwen2.5-coder:32b-instruct-q8_0`），唔准 `:latest` |
 | `LLM_TIMEOUT` | 否 | 單次請求超時，預設 60s，上限 300s |
 | `LLM_MAX_RETRIES` | 否 | 網絡錯誤重試次數，預設 2，上限 5；重試唔會改變輸入 |
-| `LLM_SEED` | 否 | provider 支援 seed 就用，預設 `0`；值計入 compiler-hash |
+| `LLM_SEED` | 否 | model capability 支援 seed 先送，預設 `0`；冇送出都照計入 compiler-hash（2A.1） |
 | `LLM_ALLOW_PRIVATE_HOST` | 否 | 預設 `false`；只喺本地開發用（見 2A.8.4） |
 
 - 別名：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL` 只喺 `LLM_PROVIDER=openai` 時接受，分別等於 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`。
 - 優先次序：`LLM_*` 優先；只設咗別名就用別名。兩邊都有設而且值唔同，即刻 error（唔會靜靜揀一個）。
 - `LLM_PROVIDER` 唔係 `openai` 但設咗任何 `OPENAI_*`，error。
+- Ollama 嘅 API 只回報 tag，唔回報 model 檔 digest：lock 嘅 `model-snapshot` 記 tag。注意同一個 tag 可以被重新 pull 換成另一個檔，所以本地 lock 一律唔可以部署（2A.8.4）；可以部署嘅 lock 一定喺 CI 用公開 provider 編譯。
 
 #### 2A.8.4 Endpoint 地址規則（包括本地 API）
 
@@ -432,9 +472,15 @@ LLM_SEED=0
 interface LlmAdapter {
   readonly provider: "openai" | "anthropic" | "gemini";
   readonly capabilities: {
-    seed: boolean;              // 支援 seed 參數（唔代表保證決定性）
-    deterministicParams: Record<string, unknown>; // adapter 固定送出嘅參數，例如 { temperature: 0, top_p: 1 }
     tools: false;               // 永遠 false，adapter 唔可以送 tools／functions
+    streaming: false;           // 永遠 false，只做單次非 streaming 請求
+  };
+  // 按 model id 回報該 model 支援邊啲決定性參數；資料來自 adapter 內置、隨 SDK 版本發佈嘅 capability 表
+  modelCapabilities(model: string): {
+    temperature: number | null; // 准送嘅固定值（例如 0）；null = 唔送
+    topP: number | null;        // 例如 1；null = 唔送
+    topK: number | null;        // 例如 1（只限 gemini）；null = 唔送
+    seed: boolean;              // true 先送 LLM_SEED（唔代表保證決定性）
   };
   compile(request: {
     system: string;             // 平台 prompt（版本計入 compiler-hash）
@@ -446,8 +492,10 @@ interface LlmAdapter {
 }
 ```
 
-- adapter 唔准加 `tools`、function calling、streaming 以外嘅副作用；request 參數由 adapter 固定，用戶唔可以覆蓋。
-- `modelReported`（provider 回報嘅 model 版本）同 `LLM_MODEL` 唔一致就 error。
+- adapter 只發一個非 streaming 請求，唔准送 `tools`、function calling 或者任何會令 provider 執行動作嘅參數；request 參數全部由 adapter 按 `modelCapabilities` 固定，用戶唔可以覆蓋（決定 58）。
+- `modelCapabilities` 某參數回 `null`／`false` 就完全唔送嗰個參數，唔可以送 model 會拒絕嘅值；實際送出嘅參數集寫入 lock `compiler.sent-params` 並計入 compiler-hash。
+- capability 表冇登記嘅 model：只送 provider 必填參數，其他決定性參數一律唔送，並出 warning。
+- `modelReported`（provider 回報嘅 model id）係 lock `model-snapshot` 嘅來源；佢同 `LLM_MODEL` 唔一致（例如 provider 將別名解析成另一個 id）就 error。
 - 新增 provider 要改 SDK 同驗證器，屬平台改動，唔可以喺 project 內加。
 
 #### 2A.8.7 同其他規則嘅關係
@@ -472,9 +520,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2，用 SHA pin
       - name: Secret scan
-        run: npx vibe secret-scan --fail-on-find
+        run: npx --yes vibe@0.1.0 secret-scan --fail-on-find
       - name: Recompile and compare locks
         if: github.event.pull_request.head.repo.fork != true
         env:
@@ -482,10 +530,12 @@ jobs:
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_MODEL: ${{ vars.LLM_MODEL }}
-        run: npx vibe compile --check-determinism
+        run: npx --yes vibe@0.1.0 compile --check-determinism
       - name: Validate locks
-        run: npx vibe validate
+        run: npx --yes vibe@0.1.0 validate
 ```
+
+- `vibe@0.1.0` 係示範版本號（CLI 名 `vibe` 暫定）；實際一定 pin 死確切版本，唔准 `latest` 或者 range。所有第三方 action 一律用完整 commit SHA pin，tag 只寫喺註解。
 
 - `vibe` 係 SDK CLI 名（暫定）；deploy job 唔設任何 `LLM_*` 或者 `OPENAI_*` 變數。
 
@@ -643,6 +693,32 @@ signature: MEUCIQ...
 
 - `auth` 成功同樣注入 `ctx.tenant_id`（由 key 綁定嘅租戶決定）同 `ctx.user`（`type: api-key`、`key_id`、`scopes`）。
 
+### 4.3 `rate-limit` 參數 schema（決定 65）
+
+| 參數 | 類型 | 必填 | 說明 |
+| --- | --- | --- | --- |
+| `per-minute`／`per-hour`／`per-day` | 正整數 | 三揀一 | 時間窗內最多次數；一個 step 只可以寫一個 |
+| `key` | `ip` \| `tenant` \| `user` \| `api-key` \| `family` \| `input.{field}` | 是 | 計數鍵；`user` 要 `auth`；`family` 只限 `token-refresh`；`input.{field}` 會先 normalize（trim、lowercase）再 HMAC，唔儲存明文 |
+| `burst` | 正整數 | 否 | 預設等於窗口上限，唔可以大過佢 |
+| `fail` | 錯誤碼 | 否 | 預設 `RATE_LIMITED`（429，帶 `Retry-After`） |
+
+- 計數用滑動窗口，按 `tenant_id` 分開儲存；`key: ip` 嘅 IP 由平台按受信任 proxy 設定解析，唔讀 client 自報 header。
+- 同一 endpoint 可以有多個 `rate-limit` step；任何一個超過就拒絕。
+
+### 4.4 `## Order` 准用值（決定 65）
+
+pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
+
+| 值 | 意思 |
+| --- | --- |
+| `first` | 一定係第一個 pipeline（只限 `auth`，同埋取代 `auth` 嘅平台 pipeline） |
+| `before-steps` | 一定喺所有 Logic step 之前，但喺 `first` 之後 |
+| `after-steps` | 喺 Logic step 之後、`respond` 之前 |
+| `last` | 回應之後執行（例如 `audit-log`）；唔可以改回應 |
+| `any` | 冇限制，按 lock `## Pipelines` 次序 |
+
+其他值，或者一個 lock 有兩個 `first`，驗證器報 error。
+
 ## 4A. 帳戶安全：Token、密碼同鎖定
 
 ### 4A.1 Access token 同 refresh token（決定 6）
@@ -651,7 +727,11 @@ signature: MEUCIQ...
 - Refresh token：不透明隨機值（最少 256 bit），DB 只存 hash；ttl 上限 30 日（由家族第一次簽發計，絕對壽命），閒置 7 日冇用就失效。
 - 每次用 refresh token 都輪換：發新 refresh token 同新 access token，舊 refresh token 即時失效。
 - 同一次登入產生嘅 refresh token 屬同一個家族（`family_id`）；偵測到重用已失效嘅 refresh token，即時撤銷成個家族，並寫審計記錄、通知用戶。
-- 為咗容忍網絡重試，輪換後 10 秒內用返同一個舊 token 會回同一組新 token，唔當重用。
+- 寬限期（決定 61）：為咗容忍網絡重試，輪換後 `reuse-grace`（預設同上限 10 秒）內再用同一個舊 token，唔當重用。DB 只存 hash，平台冇可能回返上一次嘅明文，所以做法係：
+  1. 用 `HMAC-SHA-256(pepper, token)` 搵到嗰列；佢 `used_at` 唔係 null、`now() - used_at <= reuse-grace`、家族未撤銷。
+  2. 喺同一個 transaction 撤銷佢嘅 `replaced_by` 子 token（`revoke_reason: grace-reissue`），再由同一個舊 token 發一個新子 token（同一個 `family_id`，`parent_id` 指舊 token），更新舊 token 嘅 `replaced_by`；`used_at` 唔改（寬限期唔會延長）。
+  3. 回新 access token 同新 refresh token。家族唔變，絕對壽命唔變。
+  4. 超過寬限期、或者家族已撤銷、或者子 token 已經再被輪換過，一律當重用：撤銷成個家族。
 - 登出：revoke 當前家族；「全部裝置登出」revoke 該用戶所有家族。
 - refresh 流程由平台內置 `token-refresh` pipeline 實現，用 `method` op 呼叫標咗 `capabilities: [sign-token]` 嘅 model method 簽新 access token。
 - 簽發：`sign-jwt` op 嘅 `issue-refresh` 參數決定係咪同時發 refresh token：`new-family`（登入）、`rotate`（refresh，由 `token-refresh` pipeline 注入）、`none`；由平台按呼叫來源決定，method 唔可以自己揀 `rotate`。
@@ -664,9 +744,26 @@ signature: MEUCIQ...
 | `refresh-ttl` | duration | 30d | 上限 30d（家族絕對壽命） |
 | `idle-ttl` | duration | 7d | 上限 7d |
 | `reuse-grace` | duration | 10s | 上限 10s |
-| `transport` | `body` \| `cookie` | body | cookie 時一律 `HttpOnly; Secure; SameSite=Strict; Path=/{definition}/{version}/refresh` |
+| `transport` | `body` \| `cookie` | body | cookie 時一律 `HttpOnly; Secure; SameSite=Strict; Path=/{definition}/{version}/{slug}/refresh`（決定 60，同 10.7 嘅 slug 路由一致） |
 
 - 對應 endpoint 寫法：api feature 寫「呢個係 refresh token endpoint」，lock 會有 `pipelines: [-auth, token-refresh: {...}]`，`public: true`（因為冇 access token），租戶由 slug 決定；`token-revoke` 用喺登出 endpoint，要 `auth`。
+
+- Refresh endpoint 分類（決定 72，待 Jack 確認數值）：
+  - `public: true`（因為冇 access token），租戶由 slug 決定。
+  - 唔屬 public 寫入：用戶 lock 冇寫入 step，只有平台 `refresh_store` 寫平台表，所以唔計 7.2 嘅 public 寫入每日配額，亦唔需要 captcha。
+  - 平台固定限流：IP 每分鐘 30 次、同一家族每分鐘 10 次；用 4.3 嘅 schema 寫入 lock。
+  - 最低回應耗時 300ms（同一般 public endpoint）。
+
+#### `token-revoke` pipeline 參數（決定 65）
+
+| 參數 | 類型 | 預設 | 說明 |
+| --- | --- | --- | --- |
+| `scope` | `family` \| `all` | `family` | `family`：撤銷當前 refresh token 所屬家族（登出）；`all`：撤銷該用戶所有家族（全部裝置登出） |
+| `token-source` | `body` \| `cookie` | 同 `token-refresh` 嘅 `transport` | `scope: family` 時用嚟搵家族；`scope: all` 唔需要 |
+| `clear-cookie` | boolean | `true`（cookie 時） | 回應帶 `Max-Age=0` 清除 refresh cookie，`Path` 同 `token-refresh` 一樣 |
+
+- 一定要 `auth`；只可以撤銷 `sub` 自己嘅家族；`revoke_reason` 分別寫 `logout`／`logout-all`。
+- 搵唔到 token 或者已撤銷都回 204（idempotent，唔洩漏狀態）。
 
 #### Refresh token 儲存
 
@@ -686,7 +783,7 @@ signature: MEUCIQ...
 | `used_at` | timestamp | 被用嚟輪換嘅時間 |
 | `replaced_by` | uuid | 新 token id |
 | `revoked_at` | timestamp | |
-| `revoke_reason` | string | `logout`、`logout-all`、`reuse-detected`、`erasure`、`admin` |
+| `revoke_reason` | string | `logout`、`logout-all`、`reuse-detected`、`grace-reissue`、`email-verified`、`erasure`、`admin` |
 
 - Revoke：一律 UPDATE `revoked_at` 同 `revoke_reason`（家族一次過），唔用 DELETE；過期紀錄唔刪除，冇個人資料（只有 hash 同 id），12.10 刪除時一併 revoke。
 - 只有平台專用 `refresh_store` role 可以讀寫呢張表（見 7.1）。
@@ -769,6 +866,7 @@ migration 放喺 ./migrations/main/。
   | `credential_rehash` | 只有 password 類型欄位嘅 UPDATE | 4A.2 rehash |
   | `refresh_store` | `_platform_refresh_tokens` 嘅 SELECT、INSERT、UPDATE | 4A.1 |
   | `erasure` | 個人欄位嘅 UPDATE | 12.10 |
+  | `mail_worker` | `email_outbox` 嘅 SELECT、`UPDATE(sent_at)`；匿名化 job 用 `UPDATE(email, token, recipient_hash)` | 12.11 發送同 outbox 保留期（決定 54、63、68） |
 
   全部都冇 DELETE、TRUNCATE、BYPASSRLS，全部行為寫審計記錄。
 
@@ -850,7 +948,7 @@ migration 放喺 ./migrations/main/。
 ## 9. Log 同 Manifest
 
 - log 記錄 request id、狀態碼、耗時同 stack；stack 只會寫入 log，唔會放喺回應。token、key 同 secret 一律唔會記錄。
-- `audit-log` pipeline 會記錄邊個做咗咩操作。
+- `audit-log` pipeline 會記錄邊個做咗咩操作。Audit 永遠唔記明文 email（決定 68）：email 類欄位（`format: email`）預設記 `HMAC-SHA-256(pepper, normalize(email))`，或者寫 `mask:` 記遮罩（例如 `j***@e***.com`）；驗證器見到 audit 會記 email 明文就報 error。
 - 部署時將所有 lock 編譯成 manifest，入面有 routes、pipelines、steps、provider 對應、公開 endpoint 清單、public 寫入 endpoint 清單，同埋每個 lock 嘅 id、hash 同簽名。
 - manifest 會簽名；runtime 只會載入驗證成功而且簽名有效嘅 manifest，冷啟動唔會再解析任何 md（source 或者 lock 都唔會）。
 - 編譯 manifest 前會逐個驗證 lock 嘅簽名同 hash；任何一個 lock 唔合格，成個部署失敗。
@@ -891,7 +989,7 @@ migration 放喺 ./migrations/main/。
 - 簽名錯：`signature` 驗證失敗（即係有人手改過 lock）。
 - 手改：lock 格式唔合 2A（frontmatter 欄位或者次序錯、多咗或者少咗 section、step 欄位次序錯）。
 - 重編唔一致：CI 用 lock 嘅 `compiler-hash` 重編，結果同 lock 唔一致，封鎖部署，冇 override。
-- 編譯器：`compiler-hash` 同而家 pin 嘅 model snapshot、prompt、編譯器版本唔一致；`compiler.version` major 唔一致；冇 `model-snapshot` 或者用咗浮動別名；編譯器名唔係平台登記。
+- 編譯器：`compiler-hash` 按 2A.1 標準定義重算唔一致；`model-snapshot` 唔係 provider 回報嘅 model id；`compiler.version` major 唔一致；冇 `model-snapshot` 或者用咗浮動別名；編譯器名唔係平台登記。
 - `kind` 或者 `id` 同檔案路徑唔一致；`lock-version` 唔支援。
 - 編譯器 LLM 設定（決定 57）：
   - `LLM_PROVIDER` 唔係 `openai`、`anthropic`、`gemini`。
@@ -1213,7 +1311,7 @@ signature: MEYCIQ...
 # 建立用戶
 POST。只有 admin 可以用，每分鐘最多 30 次。
 請求 body 要有 email（合法 email）同 name（1 至 50 字）。
-用 user.register 建立用戶，成功回 201 同新用戶嘅 id、email、name，並帶 Location。
+用 user.register 建立用戶（唔設密碼、未驗證），再用 user.invite 寄邀請信，成功回 201 同新用戶嘅 id、email、name，並帶 Location。
 email 已經有人用就回 409 EMAIL_TAKEN；驗證唔通過回 422。
 ```
 
@@ -1300,6 +1398,8 @@ signature: MEUCIG...
 | 409 | EMAIL_TAKEN | user.register |
 | 422 | VALIDATION_FAILED | platform |
 ````
+
+- 邀請流程（決定 69，待 Jack 確認）：admin 建立嘅用戶冇 password、`email_verified_at` 係 null，所以未接受邀請之前唔可以 login（決定 55）。完整流程見 12.11.9。
 
 ### 11.5 `api/users/v2/get-user/get-user.md`（路由 `GET /users/v2/{id}`）
 
@@ -1645,7 +1745,7 @@ api source 寫「用 user.login 驗證帳戶密碼」，編譯成：
 - token 簽發放喺 model 層 method（例如 `user.sign-token`，決定 5、30）：
   - 只有 `## Signature` 明確寫 `capabilities: [sign-token]` 嘅 model method 可以用 `sign-jwt` op；唔靠 method 名推斷（叫 `sign-token` 但冇旗標一樣唔准）。
   - capability 由 source 自然語言描述（例如「呢個 method 負責簽 token」），編譯後屬高風險安全項目。
-  - claim 白名單：method 只可以傳 `sub` 同平台允許嘅自訂 claim（例如 `sid`）；`roles` 同 `tenant_id` 由平台喺簽發時從 DB 讀（用 `sub` 搵用戶），method 唔可以傳入或者覆蓋。
+  - claim 白名單：method 只可以傳 `sub` 同平台允許嘅自訂 claim（例如 `sid`）；`roles` 由平台喺簽發時從 DB 讀（用 `sub` 喺當前租戶搵用戶）；`tenant_id` 只有一個來源：平台由 slug（public）或者已驗證 token（auth）解析出嚟嘅 `ctx.tenant_id`，唔由 client、method 或者 `users` 表提供（決定 62）。method 唔可以傳入或者覆蓋任何一個。
   - 平台自動加 `iss`、`aud`、`exp`、`nbf`、`iat`、`jti`；method 唔可以覆蓋。
   - `ttl` 有上限（access token 最多 1h）。
   - 只可以簽 JWT，alg 只准 RS256 或者 ES256；私鑰喺平台 secret，lock 只寫 `key-ref`。
@@ -1653,6 +1753,14 @@ api source 寫「用 user.login 驗證帳戶密碼」，編譯成：
   - refresh token 由 `sign-jwt` 嘅 `issue-refresh` 處理（見 4A.1）。
 - `capabilities: [set-password]`：只有標咗呢個 capability 嘅 model method 可以喺 public 路徑寫 password 欄位，值一定要係 `hash-password` 輸出（見 7.2）；已認證路徑嘅改密碼 method 同樣建議標呢個 capability，方便 review。
 - login 類 endpoint 一定同時按 IP 同帳戶限流（例如 11.2 嘅 `login-guard`），並跟 4A.3 嘅鎖定同 captcha 規則。
+
+### 12.6a 列層擁有權（決定 70，待 Jack 確認）
+
+- RLS 只保證租戶隔離；租戶內「邊個可以掂邊列」由列層擁有權規則決定。
+- model 可以喺 `## Table` 宣告 `owner-key: {欄位}`（例如 `user_id`，或者 `users` 表本身嘅 `id`）。
+- 有 `owner-key` 嘅 model：非 admin 呼叫者嘅 read／update query，驗證器要求 SQL 帶 `{owner-key} = ctx.user_id`；insert 嘅 `{owner-key}` 一定由 `ctx.user_id` 填，唔可以由 input 提供。
+- 放寬（例如「同租戶所有已登入用戶可以讀」或者「admin 可以掂任何列」）一定喺 source 明寫，lock 記 `ownership: tenant-wide` 或者 `ownership: role(admin)`，屬高風險安全項目。
+- 冇 `owner-key` 嘅 model 視為租戶共享資料，驗證器出 warning。
 
 ### 12.7 驗證規則
 
@@ -2043,7 +2151,7 @@ signature: MEYCIQ...
 
 - 預設唔會自動生成任何 CRUD。model source 要明確講（例如「提供 get、list、update」或者「提供全部 CRUD」），lock 嘅 `## CRUD` 列咗邊樣就注入邊樣。
 - CRUD 選項（喺 source 用自然語言講，編譯成 `## CRUD` 表）：
-  - `list`：`page-size`（預設 20）、`max-page-size`（預設 100，平台有上限）、`sort` 白名單、`filter` 白名單。
+  - `list`：`page-size`（預設 20）、`max-page-size`（預設 100，平台上限 500，決定 71 待 Jack 確認；超過上限驗證器報 error）、`sort` 白名單、`filter` 白名單。
   - `update`：`partial`（預設 true）。
   - `delete`：一律軟刪除，冇 `soft: false` 選項（決定 13）。
 - 注入嘅 method 名同簽名（每個都有平台產生同簽名嘅 lock，`source-type: structured`，`id` 例如 `user/crud/get`）：
@@ -2076,6 +2184,8 @@ signature: MEYCIQ...
   - 一定要寫原因同要求參照；由一個 admin 提交、另一個 admin 確認（細租戶只得一個 admin 就加 24 小時延遲生效）。
 - 流程（平台執行，唔經 lock）：
   1. 平台按 model 宣告搵出該主體所有紀錄（用 `subject-key` 欄位，例如 `user_id`）。
+     - `subject-key` grammar（決定 65）：`subject-key: {column}` 或者 `subject-key: [{column}, ...]`（任何一個符合就算）；`{column}` 只可以係 `uuid` 欄位（指向 `users.id`，`users` 表自己用 `id`），或者 `hash:{column}`（`bytea` 欄位，值係 `HMAC-SHA-256(pepper, normalize(email))`，用嚟搵冇 `user_id` 嘅列，例如 `email_outbox.recipient_hash`）。
+     - 有 `personal-fields` 但冇 `subject-key` 嘅 model，驗證器報 error。
   2. sensitive 欄位：銷毀相關 DEK，資料即時永遠讀唔返（crypto-shredding）。
   3. standard 欄位：用平台專用 erasure role 做 UPDATE，換成不可逆占位值（例如 `erased-<隨機>`），email 等唯一欄位用隨機唯一值；只准 UPDATE，冇 DELETE。
   4. 紀錄標 `erased_at`，同時軟刪除；行同關聯保留，統計唔受影響。
@@ -2097,7 +2207,7 @@ signature: MEYCIQ...
 ```markdown
 # 加 email 驗證欄位
 users 表加 email_verified_at（時間，可以冇）、email_verify_hash（bytes，唯一，可以冇）、email_verify_expires_at（時間，可以冇）。
-另外開一張 email_outbox 表：id、user_id（可以冇）、email、template、token（敏感）、sent_at、created_at。
+另外開一張 email_outbox 表：id、user_id（可以冇）、email、recipient_hash（收件人 email 嘅 hash，用嚟私隱刪除）、template、token（敏感）、sent_at、created_at。
 ```
 
 `0004-add-email-verification.lock.md`（節錄 section；frontmatter 同 2B.4 格式，`approval-ref: pr#149`，`approved-by` 兩人，`security-items` 只有 `migration-ddl` 一項）
@@ -2132,7 +2242,7 @@ users 表加 email_verified_at（時間，可以冇）、email_verify_hash（byt
 
 ### s5 ddl
 - op: ddl
-- sql: `create table email_outbox (id uuid primary key, user_id uuid null, email text not null check (char_length(email) <= 254), template text not null, token bytea null, sent_at timestamptz null)`
+- sql: `create table email_outbox (id uuid primary key, user_id uuid null, email text not null check (char_length(email) <= 254), recipient_hash bytea not null, template text not null, token bytea null, sent_at timestamptz null)`
 - source-lines: 3-3
 
 ## Verify
@@ -2149,6 +2259,7 @@ users 表加 email_verified_at（時間，可以冇）、email_verify_hash（byt
 ## Data
 - destructive: false
 - personal-fields: { email_outbox.email: standard, email_outbox.token: sensitive }
+- subject-key: { email_outbox: [user_id, hash:recipient_hash] }
 - deprecated-since: (none)
 ````
 
@@ -2176,8 +2287,9 @@ users 表加 email_verified_at（時間，可以冇）、email_verify_hash（byt
 | id | uuid | primary, default: gen | yes |
 | user_id | uuid | nullable | no |
 | email | string | format: email, max: 254, untrusted, personal: standard | no |
-| template | string | enum: [verify-email, already-registered] | no |
-| token | bytes | nullable, personal: sensitive, shred-after-send | no |
+| recipient_hash | bytes | `HMAC-SHA-256(pepper, normalize(email))`，subject-key | no |
+| template | string | enum: [verify-email, already-registered, invite] | no |
+| token | bytes | nullable, personal: sensitive, shred-after-send；值係 DEK 加密後嘅 `random-token` 明文（43 字 base64url） | no |
 | sent_at | timestamp | nullable, platform | yes |
 | created_at | timestamp | default: now | yes |
 | updated_at | timestamp | default: now | yes |
@@ -2191,7 +2303,9 @@ users 表加 email_verified_at（時間，可以冇）、email_verify_hash（byt
 ## Policies
 - rls: enable, force
 - policy: tenant_id = current_setting('app.tenant_id', false)
-- grants: app_rw [SELECT, INSERT], public_writer [INSERT(user_id, email, template, token)], mail_worker(platform) [SELECT, UPDATE(sent_at)]
+- grants: app_rw [SELECT, INSERT], public_writer [INSERT(user_id, email, recipient_hash, template, token)], mail_worker(platform) [SELECT, UPDATE(sent_at, email, token, recipient_hash)]
+- subject-key: [user_id, hash:recipient_hash]
+- retention: { after: sent_at + 30d, action: anonymize, by: mail_worker }   # 決定 68，待 Jack 確認保留期
 ````
 
 #### 12.11.3 Method：`models/email-outbox/methods/enqueue.md`
@@ -2199,8 +2313,9 @@ users 表加 email_verified_at（時間，可以冇）、email_verify_hash（byt
 ```markdown
 # enqueue
 排一封 email 入 outbox。
-輸入：user_id（uuid，可以冇）、email（合法 email）、template（verify-email 或者 already-registered）、token（敏感字串，可以冇）。
-如果冇 user_id，就用 already-registered 範本，唔放 token；有 user_id 就用 verify-email 範本。
+輸入：user_id（uuid，可以冇）、email（合法 email）、token（敏感字串，43 字 base64url，可以冇）。
+範本唔由輸入揀：如果冇 user_id，就用 already-registered 範本，唔放 token；有 user_id 就用 verify-email 範本。
+同時記低收件人 email 嘅 hash，方便私隱刪除。
 冇輸出內容。
 ```
 
@@ -2230,7 +2345,8 @@ security-items:
 signature: MEUCIQ...
 ---
 ## Signature
-- input: { user_id: { type: uuid, required: false }, email: { type: string, format: email, max: 254, required: true }, token: { type: string, sensitive: true, required: false } }
+- input: { user_id: { type: uuid, required: false }, email: { type: string, format: email, max: 254, required: true }, token: { type: string, length: 43, pattern: base64url, sensitive: true, required: false } }
+- derived: { template: { enum: [verify-email, already-registered], rule: "user_id != null → verify-email；否則 already-registered（token 唔寫入）" } }
 - output: {}
 - errors: []
 - writes: true
@@ -2239,24 +2355,34 @@ signature: MEUCIQ...
 (none)
 
 ## Steps
-### s1 query
+### s1 hash-token
+- op: hash-token
+- value: input.email
+- normalize: email               # trim + lowercase，再 HMAC-SHA-256(pepper, ...)
+- out: rh
+- source-lines: 5-5
+
+### s2 query
 - op: query
 - provider: main
 - table: email_outbox
-- sql: `insert into email_outbox (user_id, email, template, token) values ($1, $2, case when $1::uuid is null then 'already-registered' else 'verify-email' end, case when $1::uuid is null then null else $3 end)`
-- params: [input.user_id, input.email, input.token]
+- sql: `insert into email_outbox (user_id, email, recipient_hash, template, token) values ($1, $2, $4, case when $1::uuid is null then 'already-registered' else 'verify-email' end, case when $1::uuid is null then null else $3 end)`
+- params: [input.user_id, input.email, input.token, rh]
 - writes: true
-- columns: [user_id, email, template, token]
+- columns: [user_id, email, recipient_hash, template, token]
 - out: (none)
 - source-lines: 3-4
 
-### s2 respond
+### s3 respond
 - op: respond
 - value: {}
 - source-lines: 5-5
 ````
 
-- 範本選擇寫喺單一參數化 INSERT 入面，唔使條件分支 step；token 屬 sensitive，DB 入面以 crypto-shredding 加密，mail worker 發送後即時銷毀 DEK。
+- 範本選擇寫喺單一參數化 INSERT 入面，唔使條件分支 step；`template` 由 Signature 嘅 `derived` 宣告，驗證器對比 SQL 嘅 `case` 同 `derived.rule` 一致（決定 66）。
+- Token 類型統一（決定 66）：`random-token` 產生 32 bytes，對外一律係 43 字 base64url 字串（`vt.value`、email 連結、verify-email 嘅 `body.token`）；DB 只存 `bytea`：`users.email_verify_hash` 係 `HMAC-SHA-256(pepper, token)`，`email_outbox.token` 係 DEK 加密嘅明文。
+- 保留期（決定 68，待 Jack 確認）：`sent_at` 之後 30 日，`mail_worker` 將 `email` 換成遮罩、`token` 設 null（DEK 已銷毀）、`recipient_hash` 保留到 12.10 私隱刪除；未發送嘅列唔受影響。12.10 刪除時按 `user_id` 或者 `recipient_hash` 搵出所有 outbox 列一併匿名化，包括 `user_id` 係 null 嘅「已經有帳戶」通知。
+- token 屬 sensitive，DB 入面以 crypto-shredding 加密，mail worker 發送後即時銷毀 DEK。
 
 #### 12.11.4 Method：`models/user/methods/self-register.md`
 
@@ -2269,8 +2395,8 @@ signature: MEUCIQ...
 做法：
 1. 密碼一定先 hash（唔合平台密碼底線就 fail WEAK_PASSWORD）。
 2. 產生一個 email 驗證 token，24 小時有效。
-3. 建立用戶，未驗證；如果 email 已經存在就乜都唔改。
-4. 用 email-outbox.enqueue 排一封信：新用戶就係驗證信（帶 token），已存在就係「已經有帳戶」通知。
+3. 建立用戶，未驗證。如果 email 已經存在但未驗證，就用今次嘅 name、密碼同新 token 覆寫（舊 token 即時失效）；如果已經驗證就乜都唔改。
+4. 用 email-outbox.enqueue 排一封信：新用戶或者覆寫咗嘅未驗證用戶就係驗證信（帶 token），已驗證用戶就係「已經有帳戶」通知。
 5. 唔好話畀人知 email 係咪已經存在，輸出一律空。
 ```
 
@@ -2331,12 +2457,12 @@ signature: MEYCIQ...
 - op: query
 - provider: main
 - table: users
-- sql: `insert into users (email, name, password, email_verify_hash, email_verify_expires_at) values ($1, $2, $3, $4, now() + interval '24 hours') on conflict (tenant_id, email) do nothing returning id`
+- sql: `insert into users (email, name, password, email_verify_hash, email_verify_expires_at) values ($1, $2, $3, $4, now() + interval '24 hours') on conflict (tenant_id, email) do update set name = excluded.name, password = excluded.password, email_verify_hash = excluded.email_verify_hash, email_verify_expires_at = excluded.email_verify_expires_at where users.email_verified_at is null and users.deleted_at is null returning id`
 - params: [input.email, input.name, pw, vt.hash]
 - writes: true
 - columns: [email, name, password, email_verify_hash, email_verify_expires_at]
 - password-source: s1
-- out: ins                      # email 已存在時 ins.id 係 null
+- out: ins                      # email 已驗證時 ins.id 係 null；未驗證就覆寫並回 id
 - source-lines: 9-9
 
 ### s4 method
@@ -2352,6 +2478,12 @@ signature: MEYCIQ...
 - source-lines: 11-11
 ````
 
+- 防預先註冊搶帳戶（決定 67，待 Jack 確認）：
+  - 攻擊者用受害人 email 先註冊，因為冇受害人信箱而無法驗證；受害人之後註冊會覆寫 password 同 token，攻擊者設嘅密碼即時作廢。
+  - `ON CONFLICT DO UPDATE` 只准更新 `writable-columns` 入面嘅欄位，而且一定要有 `where users.email_verified_at is null`，驗證器檢查；已驗證帳戶永遠唔會被公開註冊改。
+  - 未驗證帳戶（`email_verified_at is null` 而且 `created_at` 超過 24 小時）由平台 job 用 `erasure` role 匿名化（email 換成 `erased+{id}@invalid`、password 同 token hash 清走），再 soft delete（`deleted_at`）；唔 DELETE（決定 13），email 唯一鍵即時釋放。
+  - 驗證成功（12.11.5）之後平台撤銷該用戶所有 refresh 家族（`revoke_reason: email-verified`），所以驗證前任何人建立嘅 session 都唔會延續。
+- 註冊耗時（決定 66）：s1 每次都做；`hash-password` 用平台固定大小嘅 argon2 worker pool，排隊時間同 email 存唔存在無關。最低回應耗時 300ms 由收到 request 開始計，喺所有工作（包括排隊同 hash）完成之後先補足；如果實際耗時超過 300ms，一律補到下一個 100ms 倍數，避免排隊長短透露資訊。
 - s1 每次都做（包括 email 已存在），令耗時一致；password 欄位嘅值嚟自 s1（`password-source`），合決定 47。
 - `roles` 冇寫，用 default `[]`；黑名單欄位（`roles`、`tenant_id`、`email_verified_at` 等）冇出現喺 INSERT。
 - 單一職責：自己物件只有 1 個寫入 sql；寫 email_outbox 經佢自己嘅 method（決定 3）。呼叫深度 2 層。
@@ -2486,7 +2618,7 @@ signature: MEUCIH...
 - public-writes: true
 - password-write: allow
 - role: public_writer
-- writable-columns: { users: [email, name, password, email_verify_hash, email_verify_expires_at], email_outbox: [user_id, email, template, token] }
+- writable-columns: { users: [email, name, password, email_verify_hash, email_verify_expires_at], email_outbox: [user_id, email, recipient_hash, template, token] }
 - challenge: { type: captcha, when: always }
 - external-calls: forbidden
 - daily-write-quota: platform-default     # 每租戶 1,000、每 IP 50
@@ -2508,6 +2640,7 @@ signature: MEUCIH...
 ### p4 audit-log
 - event: public-register
 - redact: [req.body.password]
+- hash: [req.body.email]           # 記 HMAC，唔記明文 email（決定 68）
 
 ## Limits
 - provider: main
@@ -2556,7 +2689,7 @@ signature: MEUCIH...
 - `cost: high`（s1 `hash-password`）令實際限流變成一半：IP 每分鐘 2 次（向下取整）、租戶每分鐘 30 次（決定 25、39）。
 - body 有 `tenant_id`、`id`、`created_by`（或者任何未宣告欄位，例如 `roles`）一律 422。
 - `WEAK_PASSWORD` 只同密碼本身有關，唔會洩露 email 係咪存在。
-- 有效權限摘要：public；role public_writer；寫 users（email、name、password、email_verify_hash、email_verify_expires_at）同 email_outbox；冇讀 output；唔簽 token；冇對外 call；captcha 每次；IP 2/min、租戶 30/min（已減半）；每日配額 1,000／租戶、50／IP；最低 300ms。
+- 有效權限摘要：public；role public_writer；寫 users（email、name、password、email_verify_hash、email_verify_expires_at；未驗證帳戶可以覆寫）同 email_outbox（包括 recipient_hash）；audit 只記 email hash；冇讀 output；唔簽 token；冇對外 call；captcha 每次；IP 2/min、租戶 30/min（已減半）；每日配額 1,000／租戶、50／IP；最低 300ms。
 
 #### 12.11.7 api：`api/auth/v1/verify-email/verify-email.md`（路由 `POST /auth/v1/{slug}/verify-email`）
 
@@ -2676,6 +2809,8 @@ signature: MEUCIA...
 
 - token 錯、過期、用過、租戶冇開 public 寫入以外嘅情況都回同一個 422 `INVALID_TOKEN`，耗時補到 300ms；token 只以 hash 比對，唔寫 log（audit redact）。
 - 驗證成功之後先可以用 11／12.8 嘅 login（決定 55，已確認）。
+- `confirm-verification` 成功嘅 UPDATE commit 之後，平台用 `refresh_store` 撤銷該用戶所有 refresh 家族（`revoke_reason: email-verified`，決定 67，待 Jack 確認）；method lock 唔需要寫，屬平台行為。
+- Audit 記 token hash 嘅前 8 字元，唔記 token 同 email。
 
 #### 12.11.8 驗證器對呢個範例檢查咗乜
 
@@ -2697,9 +2832,22 @@ signature: MEUCIA...
   - 每個 PR 都喺 5 項上限以內；後面嘅 PR 依賴前面 PR 嘅 lock hash，要等前面合併先可以確認。
   - 注意：user model 改動（新增 public 可寫欄位）本身亦係安全項目；如果計埋，PR#150 會有 5 項，仍然喺上限內。
 
+#### 12.11.9 Admin 邀請流程（決定 69，待 Jack 確認）
+
+- `user.invite`（admin 路徑，要 `auth` 同 admin role）：用 `random-token` 產生邀請 token，`users.email_verify_hash` 寫 token hash、`email_verify_expires_at` 設 72 小時後；經 `email-outbox.enqueue` 用 `invite` 範本寄出。`enqueue` 嘅 `derived.template` 規則加多一條：呼叫來源係 `user.invite` → `invite`。
+- `user.accept-invite`（public 路徑 `POST /auth/v1/{slug}/accept-invite`，body：`token`、`password`）：
+  - Signature：`capabilities: [set-password, confirm-verification]`，兩項都係高風險安全項目。
+  - Steps：`hash-password`（每次都做）→ `hash-token` → 一個 UPDATE：`update users set password = $1, email_verified_at = now(), email_verify_hash = null, email_verify_expires_at = null where email_verify_hash = $2 and email_verify_expires_at > now() and email_verified_at is null and deleted_at is null returning id`，`scope: pk`。
+  - 錯誤一律 422 `INVALID_TOKEN`（弱密碼照回 `WEAK_PASSWORD`）；冇 INSERT，challenge 可以 `type: none`，但照樣 IP 加租戶限流、audit-log（token 同 email 唔記明文）、最低 300ms。
+  - 成功之後平台撤銷該用戶所有 refresh 家族（同 12.11.7）。
+- 同一個 UPDATE 同時設 password 同 `email_verified_at`，所以 admin 建立嘅用戶喺接受邀請之前冇辦法 login，決定 55 成立。
+- 重新邀請會覆寫 token hash 同到期時間，舊邀請即時失效。
+
 ## 13. 待確認
 
 私隱法（PDPO、GDPR）部分嘅建議請法律意見覆核。
+
+另外，0.9 標「待 Jack 確認」嘅決定 67–72 等 Jack 簽核；簽核之前照用建議值。
 
 ## 14. 後續版本
 
@@ -2715,3 +2863,4 @@ signature: MEUCIA...
 - 私隱刪除嘅資料主體自助提交入口（12.10 流程已經定義，呢度只係加自助入口）。
 - Kill switch 自動觸發（例如錯誤率或者寫入量異常時自動停用）。
 - 編譯用 LLM provider 加入 `azure-openai`（要處理 deployment 名同 api-version 等設定）。
+- `openai` adapter 支援 OpenAI Responses API（reasoning model 建議用），v1 只用 Chat Completions。
