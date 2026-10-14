@@ -298,7 +298,8 @@ SELECT current_user::text, \
  COALESCE((SELECT array_agg(format('%I.%I:%I', n.nspname, c.relname, p.polname) ORDER BY 1) \
    FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
    JOIN pg_namespace n ON n.oid = c.relnamespace \
-   WHERE n.nspname LIKE 't\\_%' AND NOT ( \
+   WHERE n.nspname LIKE 't\\_%' \
+   AND has_table_privilege(current_user, c.oid, 'SELECT,INSERT,UPDATE,DELETE') AND NOT ( \
      p.polname = 'tenant_isolation' AND p.polpermissive AND p.polcmd = '*' \
      AND p.polroles = '{0}'::oid[] \
      AND pg_get_expr(p.polqual, p.polrelid) = '(tenant_id = current_setting(''app.tenant_id''::text, false))' \
