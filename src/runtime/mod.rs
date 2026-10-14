@@ -4,7 +4,7 @@ mod http;
 mod slugs;
 mod sql;
 
-pub use crud::run_method;
+pub use crud::{parse_ownership, run_method, Ownership};
 pub use exec::{etag, ExecError, MemoryExec, PgExec, QueryExec};
 pub use http::{
     hash_api_secret, resolve_pepper, router, AppState, AuthConfig, RunEnv, Slug, StoredKey,
