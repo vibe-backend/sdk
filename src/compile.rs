@@ -220,16 +220,11 @@ fn stamp_from(config: Option<&LlmConfig>) -> CompilerStamp {
             name: COMPILER_NAME.into(),
             version: COMPILER_VERSION.into(),
             model_snapshot: config.model.clone(),
-            llm_provider: config.provider.clone(),
+            llm_provider: crate::llm::lock_provider(config),
             endpoint_host: config.endpoint_host.clone(),
             endpoint_private: config.endpoint_private,
             seed: config.seed,
-            sent_params: crate::llm::model_capabilities(
-                &config.provider,
-                &config.model,
-                config.seed,
-            )
-            .to_map(),
+            sent_params: crate::llm::sent_params(config, &config.model).to_map(),
         },
         None => CompilerStamp::deterministic(),
     }
@@ -1157,16 +1152,9 @@ mod prompt_tests {
         }
     }
 
-    /// The shop test project: `tests/fixtures/shop` (after #76), or the old
-    /// `examples/shop` on branches that predate the move.
+    /// The shop test project.
     fn shop_fixture() -> std::path::PathBuf {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let fixture = root.join("tests/fixtures/shop");
-        if fixture.is_dir() {
-            fixture
-        } else {
-            root.join("examples/shop")
-        }
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shop")
     }
 
     /// Structured shop locks compiled into a temp dir.
@@ -1340,5 +1328,40 @@ mod prompt_tests {
         };
         let text = format!("{report:?}");
         assert!(text.contains("unknown method target nope.get"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+
+    #[test]
+    fn stamp_records_the_responses_style_and_its_params() {
+        let mut config = LlmConfig {
+            provider: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "sk-test-value".into(),
+            model: "gpt-5.1-2026-01-01".into(),
+            timeout: std::time::Duration::from_secs(5),
+            max_retries: 0,
+            seed: 7,
+            endpoint_host: "api.openai.com".into(),
+            endpoint_private: false,
+            api_style: "responses".into(),
+        };
+        let stamp = stamp_from(Some(&config));
+        assert_eq!(stamp.llm_provider, "openai-responses");
+        assert!(!stamp.sent_params.contains_key("seed"));
+        assert_eq!(
+            stamp
+                .sent_params
+                .get("reasoning_effort")
+                .map(String::as_str),
+            Some("none")
+        );
+        config.api_style = "chat".into();
+        let stamp = stamp_from(Some(&config));
+        assert_eq!(stamp.llm_provider, "openai");
+        assert_eq!(stamp.sent_params.get("seed").map(String::as_str), Some("7"));
     }
 }
