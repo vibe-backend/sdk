@@ -1034,7 +1034,12 @@ fn dependencies(id: &str, docs: &HashMap<String, LockDoc>) -> Result<Vec<Depende
             }
             if let Some(calls) = find_section(&doc.sections, "Calls") {
                 if let Some(list) = calls.get("methods") {
-                    for target in parse_name_list(list) {
+                    let targets = parse_name_list(list, "Calls.methods")
+                        .map_err(|err| Diag::error(&doc.meta.source, err).at_section("Calls"))?;
+                    for target in targets {
+                        if let Err(err) = crate::validate::check_method_target(&target, docs) {
+                            return Err(Diag::error(&doc.meta.source, err).at_section("Calls"));
+                        }
                         if let Some(dep) = method_id(&target) {
                             ids.push((dep, Kind::Method));
                         }
@@ -1046,7 +1051,11 @@ fn dependencies(id: &str, docs: &HashMap<String, LockDoc>) -> Result<Vec<Depende
             Some(Scope::Definition) => {
                 if let Some(providers) = find_section(&doc.sections, "Providers") {
                     if let Some(list) = providers.get("allowlist") {
-                        for name in parse_name_list(list) {
+                        let names =
+                            parse_name_list(list, "Providers.allowlist").map_err(|err| {
+                                Diag::error(&doc.meta.source, err).at_section("Providers")
+                            })?;
+                        for name in names {
                             ids.push((name, Kind::Provider));
                         }
                     }
@@ -1245,8 +1254,9 @@ fn render_inline_list(items: &[String]) -> String {
     }
 }
 
-fn parse_name_list(raw: &str) -> Vec<String> {
-    crate::lock::parse_string_list(raw).unwrap_or_default()
+/// Fail closed: a malformed list is an error, never an empty list.
+fn parse_name_list(raw: &str, what: &str) -> Result<Vec<String>, String> {
+    crate::lock::parse_string_list(raw).map_err(|_| format!("{what} must be a list like `[a, b]`"))
 }
 
 #[cfg(test)]
@@ -1414,6 +1424,52 @@ mod prompt_tests {
             .next()
             .unwrap();
         assert!(!data.contains('`'));
+    }
+
+    /// The prompt examples, written as structured sources into the shop
+    /// project, compile and pass the full validator (not just section checks).
+    #[tokio::test]
+    async fn prompt_examples_pass_full_validate() {
+        let dir = std::env::temp_dir().join(format!("vibe-examples-{}", uuid::Uuid::new_v4()));
+        copy_dir(&shop_fixture(), &dir);
+        for (kind, scope, rel) in [
+            (Kind::Method, None, "models/product/methods/example.md"),
+            (
+                Kind::Api,
+                Some(Scope::Feature),
+                "api/catalog/v1/example-list/example-list.md",
+            ),
+        ] {
+            let prompt = system_prompt(kind, scope);
+            let body = prompt.split_once("LOCK BODY:\n").expect("example").1;
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+        }
+        // The API example routes GET /catalog/v1/{slug}/products, which the
+        // shop already serves; move the example to its own path.
+        let api = dir.join("api/catalog/v1/example-list/example-list.md");
+        let text = std::fs::read_to_string(&api).unwrap();
+        std::fs::write(&api, text.replace("/products\n", "/example-products\n")).unwrap();
+        let opts = super::CompileOptions {
+            root: &dir,
+            llm: None,
+            llm_config: None,
+            check: false,
+        };
+        if let Err(report) = super::compile_project(&opts).await {
+            panic!("compile: {:?}", report.diags);
+        }
+        let vopts = crate::validate::ValidateOptions {
+            root: &dir,
+            deploy: false,
+            verify_key: None,
+        };
+        let report = match crate::validate::validate_project(&vopts) {
+            Ok(r) | Err(r) => r,
+        };
+        let errors: Vec<_> = report.errors().collect();
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[tokio::test]
