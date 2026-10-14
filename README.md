@@ -65,11 +65,13 @@ vibe serve --manifest manifest.json --project tests/fixtures/shop --memory
 
 **Breaking (#31):** `vibe manifest` without `-o` writes `./manifest.json` relative to the current working directory (same as `-o` / `serve --manifest`), not `<project>/manifest.json`.
 
-`--memory` is a dev executor. PostgreSQL uses `VIBE_DATABASE_URL` (or `DATABASE_URL`):
+`--memory` is a dev executor. PostgreSQL needs two roles. `vibe migrate` connects with the owner role (`VIBE_MIGRATE_DATABASE_URL`) and grants SELECT, INSERT and UPDATE to the runtime role named in `VIBE_RUNTIME_DB_ROLE`. `vibe serve` connects as that runtime role (`VIBE_DATABASE_URL`, or `DATABASE_URL`) and refuses to start if the role is, or can `SET ROLE` to, a superuser or BYPASSRLS role, or can own any tenant schema, relation, function or type, because row-level security would not apply. `VIBE_RUNTIME_DB_ROLE` is required:
 
 ```bash
-vibe migrate --manifest manifest.json --project tests/fixtures/shop --tenant tenant0001
-vibe serve --manifest manifest.json --project tests/fixtures/shop
+VIBE_MIGRATE_DATABASE_URL=postgres://owner@db/app VIBE_RUNTIME_DB_ROLE=vibe_app \
+  vibe migrate --manifest manifest.json --project tests/fixtures/shop --tenant tenant0001
+VIBE_DATABASE_URL=postgres://vibe_app@db/app \
+  vibe serve --manifest manifest.json --project tests/fixtures/shop
 ```
 
 Structured markdown compiles with no model call. Natural-language sources need the variables in [.env.example](.env.example). `LLM_*` wins over `OPENAI_*`. Sampling parameters are sent only when the model is in the adapter capability table. Copy `.env.example` to `.env` (gitignored) and do not put a real key in the repo.
