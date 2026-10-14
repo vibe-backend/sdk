@@ -580,17 +580,8 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
     }
-    // Validate only after authentication and authorization, so unauthenticated
-    // callers cannot probe the request schema of protected endpoints.
-    if let Err(fail) = validate_request(found.route, &body, &query, &found.params, &headers) {
-        return finish(
-            found.route,
-            &state,
-            started,
-            fail_response(found.route, fail, &request_id),
-        )
-        .await;
-    }
+    // Refresh routes answer every bad or missing token with the same 401,
+    // so they run before request-table validation (which would give 422).
     if let Some(spec) = &found.route.refresh {
         let response = refresh_response(
             &state,
@@ -603,6 +594,17 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
         return finish(found.route, &state, started, response).await;
+    }
+    // Validate only after authentication and authorization, so unauthenticated
+    // callers cannot probe the request schema of protected endpoints.
+    if let Err(fail) = validate_request(found.route, &body, &query, &found.params, &headers) {
+        return finish(
+            found.route,
+            &state,
+            started,
+            fail_response(found.route, fail, &request_id),
+        )
+        .await;
     }
     if let Some(spec) = &found.route.revoke {
         if let Err(response) = revoke_tokens(&state, spec, &principal, &body, &request_id).await {
@@ -1556,8 +1558,11 @@ async fn refresh_response(
             .unwrap_or(REFRESH_FAMILY_PER_MINUTE)
             .min(REFRESH_FAMILY_PER_MINUTE);
         let family_check = [(format!("{}:family", route.feature_id), family, per_minute)];
-        if let Some(retry) = limit_check(state, &family_check) {
-            return rate_limited_response(request_id, &retry);
+        // Same 401 as every other failure: a 429 here would tell a caller
+        // that the token exists. Only live tokens count (see refresh_family).
+        if limit_check(state, &family_check).is_some() {
+            tracing::warn!(%request_id, %tenant, "refresh family rate limit reached");
+            return invalid_refresh(request_id);
         }
     }
     let (new_token, new_hash) = super::ops::new_refresh_token(&state.auth.pepper);
@@ -1591,6 +1596,7 @@ async fn refresh_response(
                 Ok(result) if result.value.get("access_token").is_some() => {
                     let mut value = result.value;
                     value["refresh_token"] = Value::String(new_token);
+                    value["refresh_expires_in"] = Value::from(spec.idle_ttl_s);
                     json_response(StatusCode::OK, value, request_id, &[])
                 }
                 Ok(_) => {
@@ -1598,7 +1604,7 @@ async fn refresh_response(
                     invalid_refresh(request_id)
                 }
                 Err(fail) => {
-                    tracing::info!(%request_id, code = %fail.code, "refresh sign-method failed");
+                    tracing::error!(%request_id, method = %spec.sign_method, code = %fail.code, message = %fail.message, "refresh sign-method failed");
                     invalid_refresh(request_id)
                 }
             }

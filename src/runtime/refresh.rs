@@ -62,7 +62,21 @@ pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
         format!(
             "CREATE POLICY tenant_isolation ON {qualified} USING (\"tenant_id\" = current_setting('app.tenant_id', false)) WITH CHECK (\"tenant_id\" = current_setting('app.tenant_id', false))"
         ),
+        // Until the dedicated refresh-store role lands (#51), app `query`
+        // steps run as public_reader / public_writer: take away their access
+        // so only the platform (the runtime role) can reach this table.
+        format!(
+            "DO $$ DECLARE r text; BEGIN FOREACH r IN ARRAY ARRAY['public_reader','public_writer','PUBLIC'] LOOP \
+             IF r = 'PUBLIC' OR EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN \
+             EXECUTE format('REVOKE ALL ON %s FROM %s', {lit}, CASE WHEN r = 'PUBLIC' THEN 'PUBLIC' ELSE quote_ident(r) END); \
+             END IF; END LOOP; END $$",
+            lit = sql_literal(&qualified)
+        ),
     ])
+}
+
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// In-memory store logic (used by `MemoryExec`), mirroring the SQL path.
@@ -164,9 +178,24 @@ pub fn memory_rotate(
         }
         return Rotated::Invalid;
     }
-    if now >= int(&cur, "family_expires_at").unwrap_or(0)
-        || now >= int(&cur, "idle_expires_at").unwrap_or(0)
-    {
+    let expired = now >= int(&cur, "family_expires_at").unwrap_or(0)
+        || now >= int(&cur, "idle_expires_at").unwrap_or(0);
+    // A spent token is checked before expiry, so a late replay still
+    // revokes a live family.
+    let used_at = int(&cur, "used_at");
+    let old_child = text(&cur, "replaced_by");
+    let child_unused = rows
+        .iter()
+        .find(|r| text(r, "id") == old_child)
+        .is_some_and(|r| r["used_at"].is_null() && r["revoked_at"].is_null());
+    let grace_ok = matches!(used_at, Some(used) if now - used < policy.grace)
+        && cur["grace_reissued_at"].is_null()
+        && child_unused;
+    if used_at.is_some() && !grace_ok {
+        revoke_family(rows, "reuse");
+        return Rotated::Reuse { family_id: family };
+    }
+    if expired {
         return Rotated::Invalid;
     }
     let user = text(&cur, "user_id");
@@ -181,13 +210,13 @@ pub fn memory_rotate(
         now,
     );
     let child_id = text(&child, "id");
-    match int(&cur, "used_at") {
+    match used_at {
         None => {
             rows[idx].insert("used_at".into(), now.into());
             rows[idx].insert("replaced_by".into(), child_id.into());
         }
-        Some(used) if now - used < policy.grace && cur["grace_reissued_at"].is_null() => {
-            let old_child = text(&cur, "replaced_by");
+        Some(_) => {
+            // Grace reissue: only while the earlier child is still unused.
             for r in rows
                 .iter_mut()
                 .filter(|r| text(r, "id") == old_child && r["revoked_at"].is_null())
@@ -197,10 +226,6 @@ pub fn memory_rotate(
             }
             rows[idx].insert("replaced_by".into(), child_id.into());
             rows[idx].insert("grace_reissued_at".into(), now.into());
-        }
-        Some(_) => {
-            revoke_family(rows, "reuse");
-            return Rotated::Reuse { family_id: family };
         }
     }
     rows.push(child);
@@ -308,6 +333,45 @@ mod tests {
         );
         assert!(rows.iter().all(|r| !r["revoked_at"].is_null()));
         assert!(rows.iter().any(|r| r["revoke_reason"] == "reuse"));
+    }
+
+    #[test]
+    fn grace_is_refused_once_the_child_was_used() {
+        // Refresh family hardening: a grace reissue must never leave two
+        // live chains in one family.
+        let mut rows = Vec::new();
+        let fam = memory_issue(&mut rows, T, "u1", "h0", policy(), 0);
+        ok_family(memory_rotate(&mut rows, T, "h0", "h1", policy(), 1));
+        ok_family(memory_rotate(&mut rows, T, "h1", "h2", policy(), 2));
+        assert!(matches!(
+            memory_rotate(&mut rows, T, "h0", "x", policy(), 3),
+            Rotated::Reuse { family_id } if family_id == fam
+        ));
+        assert!(matches!(
+            memory_rotate(&mut rows, T, "h2", "y", policy(), 4),
+            Rotated::Invalid
+        ));
+    }
+
+    #[test]
+    fn replaying_an_expired_spent_token_still_revokes_the_family() {
+        let mut rows = Vec::new();
+        let fam = memory_issue(&mut rows, T, "u1", "h0", policy(), 0);
+        ok_family(memory_rotate(&mut rows, T, "h0", "h1", policy(), 1));
+        // h0 is idle-expired by now, h1 was refreshed in time.
+        let late = policy().idle_ttl + 5;
+        ok_family(memory_rotate(&mut rows, T, "h1", "h2", policy(), late - 10));
+        assert!(matches!(
+            memory_rotate(&mut rows, T, "h0", "x", policy(), late),
+            Rotated::Reuse { family_id } if family_id == fam
+        ));
+    }
+
+    #[test]
+    fn app_query_roles_lose_access_to_the_table() {
+        let sql = table_statements("t_tenant0001").unwrap().join("\n");
+        assert!(sql.contains("REVOKE ALL ON %s FROM %s"), "{sql}");
+        assert!(sql.contains("public_reader") && sql.contains("public_writer"));
     }
 
     #[test]

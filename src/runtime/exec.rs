@@ -204,7 +204,10 @@ impl QueryExec for MemoryExec {
             .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
         Ok(tables.get(&key(tenant_id, REFRESH_TABLE)).and_then(|rows| {
             rows.iter()
-                .find(|r| r.get("token_hash").and_then(Value::as_str) == Some(token_hash))
+                .find(|r| {
+                    r.get("token_hash").and_then(Value::as_str) == Some(token_hash)
+                        && r.get("revoked_at").is_none_or(Value::is_null)
+                })
                 .and_then(|r| r.get("family_id").and_then(Value::as_str))
                 .map(str::to_string)
         }))
@@ -534,7 +537,7 @@ impl QueryExec for PgExec {
                 tenant_id,
                 None,
                 false,
-                "SELECT family_id::text AS family_id FROM _platform_refresh_tokens WHERE token_hash = $1",
+                "SELECT family_id::text AS family_id FROM _platform_refresh_tokens WHERE token_hash = $1 AND revoked_at IS NULL",
                 vec![Some(token_hash.to_string())],
             )
             .await?;
@@ -592,15 +595,37 @@ impl QueryExec for PgExec {
         )
         .await
         .map_err(map_pg)?;
+        // Family lock: every rotation and revocation of one family takes
+        // this transaction-scoped advisory lock first, so a family revoke
+        // cannot miss a child inserted by a concurrent rotation (also with
+        // a connection pool or several instances).
+        let family_of = tx
+            .query_opt(
+                "SELECT family_id::text FROM _platform_refresh_tokens WHERE token_hash = $1",
+                &[&token_hash],
+            )
+            .await
+            .map_err(map_pg)?;
+        let Some(family_of) = family_of else {
+            return Ok(Rotated::Invalid);
+        };
+        let family_of: String = family_of.get(0);
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('vibe-refresh:' || $1))",
+            &[&family_of],
+        )
+        .await
+        .map_err(map_pg)?;
         // Row lock: concurrent presentations of one token serialise here.
         let row = tx
             .query_opt(
                 "SELECT id::text, family_id::text, user_id, revoke_reason, revoked_at IS NOT NULL, \
                  (now() >= family_expires_at OR now() >= idle_expires_at), \
                  used_at IS NOT NULL, \
-                 (used_at IS NOT NULL AND now() - used_at < make_interval(secs => $2::double precision) AND grace_reissued_at IS NULL), \
+                 (used_at IS NOT NULL AND now() - used_at < make_interval(secs => $2::double precision) AND grace_reissued_at IS NULL \
+                  AND EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = t.replaced_by AND c.used_at IS NULL AND c.revoked_at IS NULL)), \
                  replaced_by::text \
-                 FROM _platform_refresh_tokens WHERE token_hash = $1 FOR UPDATE",
+                 FROM _platform_refresh_tokens t WHERE token_hash = $1 FOR UPDATE",
                 &[&token_hash, &(policy.grace as f64)],
             )
             .await
@@ -630,15 +655,17 @@ impl QueryExec for PgExec {
             }
             return Ok(Rotated::Invalid);
         }
-        if expired {
-            return Ok(Rotated::Invalid);
-        }
+        // Spent before expired: a late replay still revokes the family. A
+        // grace reissue is allowed only while the earlier child is unused.
         if used && !in_grace {
             tx.execute(revoke_family, &[&family])
                 .await
                 .map_err(map_pg)?;
             tx.commit().await.map_err(map_pg)?;
             return Ok(Rotated::Reuse { family_id: family });
+        }
+        if expired {
+            return Ok(Rotated::Invalid);
         }
         let child = uuid::Uuid::new_v4().to_string();
         tx.execute(
@@ -687,8 +714,10 @@ impl QueryExec for PgExec {
     ) -> Result<u64, ExecError> {
         let (sql, params) = match target {
             RevokeTarget::FamilyOf { hash, user } => (
-                "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'logout' \
-                 WHERE revoked_at IS NULL AND family_id = (SELECT family_id FROM _platform_refresh_tokens WHERE token_hash = $1 AND user_id = $2) RETURNING id",
+                "WITH f AS (SELECT family_id FROM _platform_refresh_tokens WHERE token_hash = $1 AND user_id = $2), \
+                 l AS (SELECT pg_advisory_xact_lock(hashtext('vibe-refresh:' || family_id::text)) FROM f) \
+                 UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'logout' \
+                 WHERE revoked_at IS NULL AND family_id = (SELECT family_id FROM f) AND (SELECT count(*) FROM l) > 0 RETURNING id",
                 vec![Some(hash.to_string()), Some(user.to_string())],
             ),
             RevokeTarget::User(user) => (

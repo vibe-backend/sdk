@@ -118,7 +118,10 @@ struct App {
 }
 
 fn app(grace: i64) -> App {
-    let m = manifest(grace);
+    app_with(manifest(grace))
+}
+
+fn app_with(m: Manifest) -> App {
     let exec = Arc::new(MemoryExec::new());
     exec.seed(
         TENANT,
@@ -310,14 +313,83 @@ async fn family_rate_limit_is_capped() {
     let mut limited = None;
     for i in 0..11 {
         let (s, body, _) = a.refresh(&cur).await;
-        if s == StatusCode::TOO_MANY_REQUESTS {
+        if s != StatusCode::OK {
+            // Same 401 as an unknown token: no 429 that reveals the token exists.
+            let (_, unknown, _) = a.refresh("not-a-token").await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED);
+            assert_eq!(body, unknown);
             limited = Some(i);
             break;
         }
-        assert_eq!(s, StatusCode::OK, "{body}");
         cur = tok(&body, "refresh_token");
     }
     assert_eq!(limited, Some(10), "10 per family per minute");
+}
+
+#[tokio::test]
+async fn revoked_tokens_do_not_count_toward_the_family_limit() {
+    let a = app(0);
+    let r0 = tok(&a.login().await, "refresh_token");
+    let (_, body, _) = a.refresh(&r0).await;
+    let r1 = tok(&body, "refresh_token");
+    let (s, _, _) = a
+        .post(
+            "/v1/logout",
+            Some(&tok(&body, "access_token")),
+            json!({"refresh_token": r1}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    for _ in 0..12 {
+        let (s, _, _) = a.refresh(&r1).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+    let fresh = tok(&a.login().await, "refresh_token");
+    let (s, body, _) = a.refresh(&fresh).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn grace_retry_is_refused_after_the_child_was_used() {
+    let a = app(10);
+    let r0 = tok(&a.login().await, "refresh_token");
+    let (_, b1, _) = a.refresh(&r0).await;
+    let (s, b2, _) = a.refresh(&tok(&b1, "refresh_token")).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _, _) = a.refresh(&r0).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "child already used: reuse");
+    let (s, _, _) = a.refresh(&tok(&b2, "refresh_token")).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "family revoked");
+}
+
+#[tokio::test]
+async fn bad_refresh_body_is_401_not_422() {
+    // A strict request table must not turn a bad or missing token into 422.
+    let mut m = manifest(0);
+    m.routes[0].request = serde_json::from_value(json!([{"location": "body",
+        "name": "refresh_token", "ty": "string", "required": true, "min": 43, "max": 43,
+        "format": ""}]))
+    .unwrap();
+    let a = app_with(m);
+    let (_, unknown, _) = a.refresh("not-a-token").await;
+    for body in [
+        json!({}),
+        json!({"refresh_token": 5}),
+        json!({"refresh_token": "short"}),
+    ] {
+        let (s, v, _) = a.post("/auth/v1/acme/token/refresh", None, body).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{v}");
+        assert_eq!(v, unknown);
+    }
+}
+
+#[tokio::test]
+async fn refresh_response_states_the_refresh_token_expiry() {
+    let a = app(0);
+    let login = a.login().await;
+    assert_eq!(login["refresh_expires_in"], 604_800);
+    let (_, body, _) = a.refresh(&tok(&login, "refresh_token")).await;
+    assert_eq!(body["refresh_expires_in"], 604_800);
 }
 
 #[tokio::test]
@@ -547,11 +619,36 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
             .unwrap(),
         Rotated::Invalid
     );
-    // Another tenant cannot see these rows.
+    // A real second tenant (own schema, same role) cannot see these rows,
+    // and its own tokens stay in its schema.
+    let tenant2 = format!("ts{s}");
+    let schema2 = format!("t_{tenant2}");
+    for stmt in vibe::runtime::refresh::table_statements(&schema2).unwrap() {
+        admin.batch_execute(&stmt).await.unwrap();
+    }
+    admin
+        .batch_execute(&format!(
+            "GRANT USAGE ON SCHEMA {schema2} TO {role}; \
+             GRANT SELECT, INSERT, UPDATE ON {schema2}._platform_refresh_tokens TO {role};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(exec.refresh_family(&tenant2, "h1b").await.unwrap(), None);
     assert_eq!(
-        exec.refresh_family("tz00000000", "b0").await.ok().flatten(),
-        None
+        exec.refresh_rotate(&tenant2, "h1b", "w", policy)
+            .await
+            .unwrap(),
+        Rotated::Invalid
     );
+    let fam_t2 = exec
+        .refresh_issue(&tenant2, "u1", "t2tok", policy)
+        .await
+        .unwrap();
+    assert_eq!(
+        exec.refresh_family(&tenant2, "t2tok").await.unwrap(),
+        Some(fam_t2)
+    );
+    assert_eq!(exec.refresh_family(&tenant, "t2tok").await.unwrap(), None);
     // Only hashes are stored.
     let row = admin
         .query_one(
@@ -563,4 +660,93 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
         .await
         .unwrap();
     assert_eq!(row.get::<_, i64>(0), 1);
+
+    // Refresh family hardening: no grace reissue once the child was used.
+    let fam2 = exec
+        .refresh_issue(&tenant, "u1", "g0", policy)
+        .await
+        .unwrap();
+    for (from, to) in [("g0", "g1"), ("g1", "g2")] {
+        assert!(matches!(
+            exec.refresh_rotate(&tenant, from, to, policy)
+                .await
+                .unwrap(),
+            Rotated::Ok { .. }
+        ));
+    }
+    assert_eq!(
+        exec.refresh_rotate(&tenant, "g0", "gx", policy)
+            .await
+            .unwrap(),
+        Rotated::Reuse { family_id: fam2 }
+    );
+    assert_eq!(
+        exec.refresh_rotate(&tenant, "g2", "gy", policy)
+            .await
+            .unwrap(),
+        Rotated::Invalid
+    );
+    // Revoked tokens are not counted by the family limiter.
+    assert_eq!(exec.refresh_family(&tenant, "g2").await.unwrap(), None);
+
+    // Concurrent reuse and rotation on two connections: afterwards no live
+    // token may remain in the family.
+    let exec2 = PgExec::connect(url.as_str()).await.unwrap();
+    for round in 0..20 {
+        let p = format!("c{round}_");
+        exec.refresh_issue(&tenant, "u1", &format!("{p}0"), policy)
+            .await
+            .unwrap();
+        exec.refresh_rotate(&tenant, &format!("{p}0"), &format!("{p}1"), policy)
+            .await
+            .unwrap();
+        exec.refresh_rotate(&tenant, &format!("{p}1"), &format!("{p}2"), policy)
+            .await
+            .unwrap();
+        let (t0, tx, t2, t3) = (
+            format!("{p}0"),
+            format!("{p}x"),
+            format!("{p}2"),
+            format!("{p}3"),
+        );
+        let (a, b) = tokio::join!(
+            exec.refresh_rotate(&tenant, &t0, &tx, policy),
+            exec2.refresh_rotate(&tenant, &t2, &t3, policy)
+        );
+        assert!(matches!(a.unwrap(), Rotated::Reuse { .. }));
+        let _ = b.unwrap();
+        let live = admin
+            .query_one(
+                &format!(
+                    "SELECT count(*) FROM {schema}._platform_refresh_tokens \
+                     WHERE token_hash LIKE '{p}%' AND revoked_at IS NULL"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(live.get::<_, i64>(0), 0, "round {round}");
+    }
+
+    // App query roles cannot reach the table.
+    for app_role in ["public_reader", "public_writer"] {
+        let _ = admin
+            .batch_execute(&format!("CREATE ROLE {app_role} NOLOGIN"))
+            .await;
+    }
+    for stmt in vibe::runtime::refresh::table_statements(&schema).unwrap() {
+        admin.batch_execute(&stmt).await.unwrap();
+    }
+    for app_role in ["public_reader", "public_writer"] {
+        let row = admin
+            .query_one(
+                &format!(
+                    "SELECT has_table_privilege('{app_role}', '{schema}._platform_refresh_tokens', 'SELECT')"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(!row.get::<_, bool>(0), "{app_role}");
+    }
 }
