@@ -61,7 +61,7 @@ function sanitize(html) {
   return sanitizeHtml(html, {
     allowedTags: sanitizeHtml.defaults.allowedTags.concat(['h1', 'h2', 'img', 'del', 'input', 'span']),
     allowedAttributes: {
-      a: ['href', 'title', 'class'], img: ['src', 'alt', 'title'],
+      a: ['href', 'title', 'class'], img: ['src', 'alt', 'title', 'referrerpolicy', 'loading'],
       h1: ['id'], h2: ['id'], h3: ['id'], h4: ['id'], h5: ['id'], h6: ['id'],
       code: ['class'], span: ['class'], pre: ['class'], th: ['align'], td: ['align'],
       input: ['type', 'checked', 'disabled'],
@@ -69,7 +69,10 @@ function sanitize(html) {
     allowedSchemes: ['http', 'https', 'mailto'],
     allowedSchemesByTag: { img: ['http', 'https'] },
     allowProtocolRelative: false,
-    allowedClasses: { code: ['hljs', /^language-[\w+-]+$/], span: [/^hljs-[\w-]+$/, /^language_$/], a: ['anchor'] },
+    transformTags: {
+      img: (tagName, attribs) => ({ tagName, attribs: { ...attribs, referrerpolicy: 'no-referrer', loading: 'lazy' } }),
+    },
+    allowedClasses: { code: ['hljs', /^language-[\w+-]+$/], span: [/^hljs-[\w-]+$/, /^[\w-]+_{1,2}$/], a: ['anchor'] },
   });
 }
 
@@ -77,7 +80,9 @@ function sanitize(html) {
 function rewriteLink(href, sourcePath) {
   if (!href || href.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('//')) return href;
   const [p, frag = ''] = href.split(/(?=#)/);
-  const repoPath = path.posix.normalize(path.posix.join(path.posix.dirname(sourcePath), p));
+  const repoPath = p.startsWith('/')
+    ? path.posix.normalize(p).replace(/^\/+/, '') // repo-root-relative, e.g. /README.md
+    : path.posix.normalize(path.posix.join(path.posix.dirname(sourcePath), p));
   if (repoPath.startsWith('..')) return href;
   const page = pageBySource.get(repoPath);
   if (page) return `${page}.html${frag}`;

@@ -22,9 +22,10 @@ for (const f of files) {
     checked++;
     if (/^(https?:|mailto:)/i.test(url)) continue;
     if (/^[a-z][a-z0-9+.-]*:/i.test(url) || url.startsWith('//')) { console.error(`${f}: disallowed URL ${attr}="${url}"`); bad++; continue; }
-    const [p, frag] = url.split('#');
+    const [pq, frag] = url.split('#');
+    const p = pq.split('?')[0];
     const target = p ? path.resolve(path.dirname(abs), decodeURIComponent(p)) : abs;
-    if (!target.startsWith(dist) || !fs.existsSync(target)) { console.error(`${f}: broken link ${url}`); bad++; continue; }
+    if ((target !== dist && !target.startsWith(dist + path.sep)) || !fs.existsSync(target) || !fs.statSync(target).isFile()) { console.error(`${f}: broken link ${url}`); bad++; continue; }
     if (frag && target.endsWith('.html') && !idsOf(target).has(decodeURIComponent(frag))) { console.error(`${f}: missing anchor ${url}`); bad++; }
   }
 }
