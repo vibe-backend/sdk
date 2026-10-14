@@ -47,6 +47,7 @@ enum Command {
     Approve {
         #[arg(long, default_value = ".")]
         project: PathBuf,
+        /// Repeatable. High-risk locks (public endpoints, providers, and migrations) need two reviewers: `--reviewer a --reviewer b`.
         #[arg(long = "reviewer")]
         reviewers: Vec<String>,
         #[arg(long)]
@@ -82,6 +83,11 @@ enum Command {
         #[arg(long)]
         tenant: String,
     },
+    /// Register a public slug for a tenant.
+    Slug {
+        #[command(subcommand)]
+        action: SlugAction,
+    },
     /// Scan the tree for credential material.
     SecretScan {
         #[arg(long, default_value = ".")]
@@ -93,6 +99,20 @@ enum Command {
     Endpoint {
         #[command(subcommand)]
         action: EndpointAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SlugAction {
+    /// Write `.vibe/slugs.json`. High-risk public routes resolve `{slug}` from this file.
+    Add {
+        slug: String,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        public_write: bool,
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
     },
 }
 
@@ -150,6 +170,18 @@ async fn run(cli: Cli) -> Result<(), String> {
             project,
             tenant,
         } => cmd_migrate(&manifest, &project, &tenant).await,
+        Command::Slug { action } => match action {
+            SlugAction::Add {
+                slug,
+                tenant,
+                public_write,
+                project,
+            } => {
+                vibe::runtime::add_slug(&project, &slug, &tenant, public_write)?;
+                println!("added slug {slug} for tenant {tenant}");
+                Ok(())
+            }
+        },
         Command::SecretScan {
             project,
             fail_on_find,
@@ -247,7 +279,11 @@ fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
     })
     .map_err(|err| err.to_string())?;
     print_report(&report);
-    println!("validation ok");
+    if deploy {
+        println!("validation ok");
+    } else {
+        println!("validation ok; approval and signatures are checked only with --deploy");
+    }
     Ok(())
 }
 
@@ -319,17 +355,32 @@ async fn cmd_serve(
             })?;
         Arc::new(PgExec::connect(&url).await?)
     };
+    let loaded = vibe::runtime::load_project_slugs(project)?;
+    for warning in &loaded.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if loaded.slugs.is_empty()
+        && manifest
+            .routes
+            .iter()
+            .any(|route| route.public && route.path.contains("{slug}"))
+    {
+        eprintln!(
+            "warning: public routes use {{slug}} but no tenants are configured; copy slugs.example.json to .vibe/slugs.json or run `vibe slug add <slug> --tenant <id>`"
+        );
+    }
     let addr: SocketAddr = addr.parse().map_err(|err| format!("bad address: {err}"))?;
     let state = Arc::new(AppState {
         manifest,
         exec,
         auth: auth_from_env(),
-        slugs: load_slugs(project)?,
+        slugs: loaded.slugs,
         rates: std::sync::Mutex::new(HashMap::new()),
         quotas: std::sync::Mutex::new(HashMap::new()),
         disabled: load_disabled(project),
         min_override_ms: None,
         honor_test_ip: false,
+        dev_hints: memory,
     });
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr)
@@ -403,42 +454,6 @@ fn auth_from_env() -> AuthConfig {
         auth.env_name = env_name;
     }
     auth
-}
-
-fn load_slugs(project: &Path) -> Result<HashMap<String, vibe::runtime::Slug>, String> {
-    let path = project.join(".vibe").join("slugs.json");
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    let text = fs::read_to_string(&path).map_err(|err| err.to_string())?;
-    let raw: HashMap<String, SlugFile> =
-        serde_json::from_str(&text).map_err(|err| err.to_string())?;
-    Ok(raw
-        .into_iter()
-        .map(|(slug, entry)| {
-            (
-                slug,
-                vibe::runtime::Slug {
-                    tenant_id: entry.tenant_id,
-                    public_access: entry.public_access,
-                    public_write: entry.public_write,
-                },
-            )
-        })
-        .collect())
-}
-
-#[derive(serde::Deserialize)]
-struct SlugFile {
-    tenant_id: String,
-    #[serde(default = "yes")]
-    public_access: bool,
-    #[serde(default)]
-    public_write: bool,
-}
-
-fn yes() -> bool {
-    true
 }
 
 fn load_disabled(project: &Path) -> std::collections::HashSet<String> {

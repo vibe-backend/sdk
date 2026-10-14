@@ -117,6 +117,7 @@ impl QueryExec for MemoryExec {
                 expected_updated_at,
                 touched_at,
                 returning,
+                owner,
             } => {
                 let key = key(tenant_id, &table);
                 let rows = tables.get_mut(&key).ok_or(ExecError::NotFound)?;
@@ -125,6 +126,7 @@ impl QueryExec for MemoryExec {
                     .find(|row| {
                         row.get("id").and_then(Value::as_str) == Some(id.as_str())
                             && row.get("deleted_at").is_none_or(Value::is_null)
+                            && owner_matches(row, owner.as_ref())
                     })
                     .ok_or(ExecError::NotFound)?;
                 if row.get("updated_at").and_then(Value::as_str)
@@ -142,6 +144,7 @@ impl QueryExec for MemoryExec {
                 table,
                 id,
                 touched_at,
+                owner,
             } => {
                 let key = key(tenant_id, &table);
                 let rows = tables.get_mut(&key).ok_or(ExecError::NotFound)?;
@@ -150,6 +153,7 @@ impl QueryExec for MemoryExec {
                     .find(|row| {
                         row.get("id").and_then(Value::as_str) == Some(id.as_str())
                             && row.get("deleted_at").is_none_or(Value::is_null)
+                            && owner_matches(row, owner.as_ref())
                     })
                     .ok_or(ExecError::NotFound)?;
                 row.insert("deleted_at".into(), Value::String(touched_at.clone()));
@@ -158,6 +162,13 @@ impl QueryExec for MemoryExec {
             }
         }
     }
+}
+
+fn owner_matches(row: &Row, owner: Option<&(Col, Value)>) -> bool {
+    let Some((col, value)) = owner else {
+        return true;
+    };
+    row.get(&col.name) == Some(value) || values_eq(row.get(&col.name), value)
 }
 
 fn key(tenant: &str, table: &str) -> String {

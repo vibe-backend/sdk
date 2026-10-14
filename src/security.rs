@@ -9,6 +9,12 @@ pub fn extract_items(doc: &LockDoc) -> Vec<SecurityItem> {
             if crud_writes(find_section(&doc.sections, "CRUD")) {
                 push(&mut items, "write-sql", Risk::Medium);
             }
+            if let Some(table) = find_section(&doc.sections, "Table") {
+                let ownership = table.get("ownership").unwrap_or("");
+                if ownership == "tenant-wide" || ownership.starts_with("role(") {
+                    push(&mut items, "ownership", Risk::High);
+                }
+            }
         }
         Kind::Method => extract_method(&doc.sections, &mut items),
         Kind::Pipeline => {}

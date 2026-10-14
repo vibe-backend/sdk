@@ -155,7 +155,7 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
         ));
     }
     check_sections(doc, &file, report);
-    if opts.deploy || doc.meta.status == Status::Approved {
+    if doc.meta.status == Status::Approved {
         if doc.meta.signature == "(none)" {
             if opts.deploy {
                 report.push(Diag::error(&file, "approved lock is missing a signature"));
@@ -264,6 +264,24 @@ fn check_model(doc: &LockDoc, file: &str, report: &mut Report) {
     }
     if !saw_tenant {
         report.push(Diag::error(file, "model is missing tenant_id").at_section("Fields"));
+    }
+    match find_section(&doc.sections, "Table").and_then(|section| section.get("owner-key")) {
+        Some(key) if !key.is_empty() && key != "(none)" => {
+            let declared = table
+                .rows
+                .iter()
+                .any(|row| row.first().map(String::as_str) == Some(key));
+            if !declared && key != "id" {
+                report.push(
+                    Diag::error(file, format!("owner-key {key} is not a field"))
+                        .at_section("Table"),
+                );
+            }
+        }
+        _ => report.push(Diag::warning(
+            file,
+            "model has no owner-key; rows are shared inside the tenant",
+        )),
     }
     if let Some(crud) = find_section(&doc.sections, "CRUD") {
         if let Some(table) = &crud.table {

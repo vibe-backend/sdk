@@ -13,13 +13,26 @@ pub struct CallResult {
     pub status: u16,
 }
 
+/// Authenticated caller. `subject` is `ctx.user.id` (JWT `sub`, or the API key id).
+#[derive(Clone, Copy)]
+pub struct Caller<'a> {
+    pub subject: &'a str,
+    pub admin: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct CallCtx<'a> {
+    pub tenant_id: &'a str,
+    pub role: &'a str,
+    pub caller: Caller<'a>,
+}
+
 pub async fn run_method(
     manifest: &Manifest,
     exec: &dyn QueryExec,
     target: &str,
     input: &Value,
-    tenant_id: &str,
-    role: &str,
+    ctx: CallCtx<'_>,
     depth: u32,
 ) -> Result<CallResult, MethodFail> {
     if depth > 3 {
@@ -28,16 +41,16 @@ pub async fn run_method(
     let method = crate::manifest::method(manifest, target)
         .ok_or_else(|| MethodFail::code("INTERNAL", format!("unknown method {target}")))?;
     if method.crud_action.is_empty() {
-        return run_steps(manifest, exec, method, input, tenant_id, role, depth).await;
+        return run_steps(manifest, exec, method, input, ctx, depth).await;
     }
     let model = crate::manifest::model(manifest, &method.crud_model)
         .ok_or_else(|| MethodFail::code("INTERNAL", "unknown model"))?;
     match method.crud_action.as_str() {
-        "create" => create(exec, model, input, tenant_id, role).await,
-        "get" => get(exec, model, input, tenant_id, role).await,
-        "list" => list(exec, model, input, tenant_id, role).await,
-        "update" => update(exec, model, input, tenant_id, role).await,
-        "delete" => delete(exec, model, input, tenant_id, role).await,
+        "create" => create(exec, model, input, ctx).await,
+        "get" => get(exec, model, input, ctx).await,
+        "list" => list(exec, model, input, ctx).await,
+        "update" => update(exec, model, input, ctx).await,
+        "delete" => delete(exec, model, input, ctx).await,
         other => Err(MethodFail::code(
             "INTERNAL",
             format!("unknown crud {other}"),
@@ -50,8 +63,7 @@ async fn run_steps(
     exec: &dyn QueryExec,
     method: &MethodSpec,
     input: &Value,
-    tenant_id: &str,
-    role: &str,
+    ctx: CallCtx<'_>,
     depth: u32,
 ) -> Result<CallResult, MethodFail> {
     let mut vars = Map::new();
@@ -66,8 +78,7 @@ async fn run_steps(
                     exec,
                     &step.target,
                     &args,
-                    tenant_id,
-                    role,
+                    ctx,
                     depth + 1,
                 ))
                 .await?;
@@ -130,11 +141,20 @@ async fn create(
     exec: &dyn QueryExec,
     model: &ModelSpec,
     input: &Value,
-    tenant_id: &str,
-    role: &str,
+    ctx: CallCtx<'_>,
 ) -> Result<CallResult, MethodFail> {
     let obj = input.as_object().cloned().unwrap_or_default();
     reject_system(&obj)?;
+    if let Some(owner) = &model.owner_key {
+        if obj.contains_key(owner) {
+            return Err(MethodFail::code(
+                "VALIDATION_FAILED",
+                format!("{owner} cannot be written"),
+            ));
+        }
+    }
+    let tenant_id = ctx.tenant_id;
+    let role = ctx.role;
     let mut row_values: Vec<(Col, Value)> = Vec::new();
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -153,6 +173,10 @@ async fn create(
         }
         if matches!(field.name.as_str(), "deleted_at" | "erased_at") {
             row_values.push((col(field), Value::Null));
+            continue;
+        }
+        if model.owner_key.as_deref() == Some(field.name.as_str()) {
+            row_values.push((col(field), owner_value(model, field, ctx.caller)?));
             continue;
         }
         let provided = obj.get(&field.name).cloned();
@@ -228,9 +252,10 @@ async fn get(
     exec: &dyn QueryExec,
     model: &ModelSpec,
     input: &Value,
-    tenant_id: &str,
-    role: &str,
+    ctx: CallCtx<'_>,
 ) -> Result<CallResult, MethodFail> {
+    let tenant_id = ctx.tenant_id;
+    let role = ctx.role;
     let id = input
         .get("id")
         .and_then(Value::as_str)
@@ -247,7 +272,7 @@ async fn get(
                 table: model.table.clone(),
                 columns: all_cols(model),
                 id: Some(id),
-                filters: Vec::new(),
+                filters: owner_filters(model, ctx.caller),
                 sort: None,
                 limit: 1,
                 offset: 0,
@@ -265,9 +290,10 @@ async fn list(
     exec: &dyn QueryExec,
     model: &ModelSpec,
     input: &Value,
-    tenant_id: &str,
-    role: &str,
+    ctx: CallCtx<'_>,
 ) -> Result<CallResult, MethodFail> {
+    let tenant_id = ctx.tenant_id;
+    let role = ctx.role;
     let page = int_field(input, "page").unwrap_or(1);
     let page_size = int_field(input, "page_size")
         .or_else(|| int_field(input, "page-size"))
@@ -313,6 +339,7 @@ async fn list(
             filters.push((col(field), value.clone()));
         }
     }
+    filters.extend(owner_filters(model, ctx.caller));
     let rows = exec
         .execute(
             tenant_id,
@@ -354,9 +381,10 @@ async fn update(
     exec: &dyn QueryExec,
     model: &ModelSpec,
     input: &Value,
-    tenant_id: &str,
-    role: &str,
+    ctx: CallCtx<'_>,
 ) -> Result<CallResult, MethodFail> {
+    let tenant_id = ctx.tenant_id;
+    let role = ctx.role;
     let id = input
         .get("id")
         .and_then(Value::as_str)
@@ -377,7 +405,7 @@ async fn update(
             "If-Match is required",
         ));
     }
-    let current = get(exec, model, &serde_json::json!({"id": id}), tenant_id, role).await?;
+    let current = get(exec, model, &serde_json::json!({"id": id}), ctx).await?;
     let current_etag = current.etag.unwrap_or_default();
     if current_etag != if_match {
         return Err(MethodFail::code(
@@ -404,7 +432,7 @@ async fn update(
                 format!("unknown field {key}"),
             ));
         };
-        if field.system {
+        if field.system || model.owner_key.as_deref() == Some(key.as_str()) {
             return Err(MethodFail::code(
                 "VALIDATION_FAILED",
                 format!("{key} is system-owned"),
@@ -431,6 +459,7 @@ async fn update(
                 expected_updated_at: updated_at,
                 touched_at: touched,
                 returning: all_cols(model),
+                owner: owner_eq(model, ctx.caller),
             },
         )
         .await
@@ -446,9 +475,10 @@ async fn delete(
     exec: &dyn QueryExec,
     model: &ModelSpec,
     input: &Value,
-    tenant_id: &str,
-    role: &str,
+    ctx: CallCtx<'_>,
 ) -> Result<CallResult, MethodFail> {
+    let tenant_id = ctx.tenant_id;
+    let role = ctx.role;
     let id = input
         .get("id")
         .and_then(Value::as_str)
@@ -464,6 +494,7 @@ async fn delete(
             table: model.table.clone(),
             id,
             touched_at: chrono::Utc::now().to_rfc3339(),
+            owner: owner_eq(model, ctx.caller),
         },
     )
     .await
@@ -543,6 +574,38 @@ fn output_cols(model: &ModelSpec, include_sensitive: bool) -> Vec<Col> {
         .filter(|field| !field.sensitive || include_sensitive)
         .map(col)
         .collect()
+}
+
+fn owner_eq(model: &ModelSpec, caller: Caller<'_>) -> Option<(Col, Value)> {
+    if model.ownership == "tenant-wide" || caller.admin {
+        return None;
+    }
+    let key = model.owner_key.as_deref()?;
+    let field = model.fields.iter().find(|field| field.name == key)?;
+    Some((col(field), Value::String(caller.subject.to_string())))
+}
+
+fn owner_filters(model: &ModelSpec, caller: Caller<'_>) -> Vec<(Col, Value)> {
+    owner_eq(model, caller).into_iter().collect()
+}
+
+fn owner_value(
+    model: &ModelSpec,
+    field: &FieldSpec,
+    caller: Caller<'_>,
+) -> Result<Value, MethodFail> {
+    if model.ownership == "tenant-wide" && caller.subject.is_empty() {
+        return Ok(Value::Null);
+    }
+    if caller.subject.is_empty() {
+        return Err(MethodFail::code(
+            "VALIDATION_FAILED",
+            format!("{} is set from the signed-in user", field.name),
+        ));
+    }
+    let value = Value::String(caller.subject.to_string());
+    check_field(field, &value)?;
+    Ok(value)
 }
 
 fn col(field: &FieldSpec) -> Col {

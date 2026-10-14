@@ -35,11 +35,13 @@ pub enum Stmt {
         expected_updated_at: String,
         touched_at: String,
         returning: Vec<Col>,
+        owner: Option<(Col, Value)>,
     },
     SoftDelete {
         table: String,
         id: String,
         touched_at: String,
+        owner: Option<(Col, Value)>,
     },
 }
 
@@ -73,17 +75,19 @@ pub fn render(stmt: &Stmt) -> Result<(String, Vec<Option<String>>), String> {
             sets,
             expected_updated_at,
             returning,
+            owner,
             ..
-        } => render_update(table, id, sets, expected_updated_at, returning),
-        Stmt::SoftDelete { table, id, .. } => {
-            let table = quote(table)?;
-            Ok((
-                format!(
-                    "UPDATE {table} SET \"deleted_at\" = now(), \"updated_at\" = now() WHERE \"id\" = $1::uuid AND \"deleted_at\" IS NULL RETURNING \"id\"::text"
-                ),
-                vec![Some(id.clone())],
-            ))
-        }
+        } => render_update(
+            table,
+            id,
+            sets,
+            expected_updated_at,
+            returning,
+            owner.as_ref(),
+        ),
+        Stmt::SoftDelete {
+            table, id, owner, ..
+        } => render_soft_delete(table, id, owner.as_ref()),
     }
 }
 
@@ -173,12 +177,45 @@ fn render_select(
     Ok((sql, params))
 }
 
+fn render_soft_delete(
+    table: &str,
+    id: &str,
+    owner: Option<&(Col, Value)>,
+) -> Result<(String, Vec<Option<String>>), String> {
+    let table = quote(table)?;
+    let mut params = vec![Some(id.to_string())];
+    let owner_sql = owner_predicate(owner, &mut params)?;
+    Ok((
+        format!(
+            "UPDATE {table} SET \"deleted_at\" = now(), \"updated_at\" = now() WHERE \"id\" = $1::uuid AND \"deleted_at\" IS NULL{owner_sql} RETURNING \"id\"::text"
+        ),
+        params,
+    ))
+}
+
+fn owner_predicate(
+    owner: Option<&(Col, Value)>,
+    params: &mut Vec<Option<String>>,
+) -> Result<String, String> {
+    let Some((col, value)) = owner else {
+        return Ok(String::new());
+    };
+    params.push(json_text(value));
+    Ok(format!(
+        " AND {} = ${}::{}",
+        quote(&col.name)?,
+        params.len(),
+        cast(&col.ty)
+    ))
+}
+
 fn render_update(
     table: &str,
     id: &str,
     sets: &[(Col, Value)],
     expected_updated_at: &str,
     returning: &[Col],
+    owner: Option<&(Col, Value)>,
 ) -> Result<(String, Vec<Option<String>>), String> {
     let table = quote(table)?;
     let mut params = Vec::new();
@@ -196,13 +233,14 @@ fn render_update(
     let id_n = params.len();
     params.push(Some(expected_updated_at.to_string()));
     let ts_n = params.len();
+    let owner_sql = owner_predicate(owner, &mut params)?;
     let ret = returning
         .iter()
         .map(|col| Ok(format!("{}::text", quote(&col.name)?)))
         .collect::<Result<Vec<_>, String>>()?
         .join(", ");
     let sql = format!(
-        "UPDATE {table} SET {} WHERE \"id\" = ${id_n}::uuid AND \"updated_at\" = ${ts_n}::timestamptz AND \"deleted_at\" IS NULL RETURNING {ret}",
+        "UPDATE {table} SET {} WHERE \"id\" = ${id_n}::uuid AND \"updated_at\" = ${ts_n}::timestamptz AND \"deleted_at\" IS NULL{owner_sql} RETURNING {ret}",
         assigns.join(", ")
     );
     Ok((sql, params))
@@ -337,11 +375,19 @@ mod tests {
             table: "products".into(),
             id: "11111111-1111-1111-1111-111111111111".into(),
             touched_at: "2026-10-14T00:00:00Z".into(),
+            owner: Some((
+                Col {
+                    name: "user_id".into(),
+                    ty: "string".into(),
+                },
+                json!("user-1"),
+            )),
         })
         .unwrap();
         let lower = sql.to_ascii_lowercase();
         assert!(lower.starts_with("update"));
         assert!(lower.contains("set \"deleted_at\""));
+        assert!(lower.contains("\"user_id\""));
         assert!(!lower.contains("delete from"));
     }
 

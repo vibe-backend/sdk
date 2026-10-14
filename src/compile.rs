@@ -400,9 +400,34 @@ fn normalize_model(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Dia
             );
         }
     }
+    let owner_key = find_section(&doc.sections, "Table")
+        .and_then(|section| section.get("owner-key"))
+        .filter(|value| !value.is_empty() && *value != "(none)")
+        .map(str::to_string);
+    if let Some(key) = &owner_key {
+        if key != "id"
+            && !user_rows
+                .iter()
+                .any(|row| row.first().map(String::as_str) == Some(key.as_str()))
+        {
+            diags.push(
+                Diag::error(&source.rel, format!("owner-key {key} is not a field"))
+                    .at_section("Table"),
+            );
+        }
+    }
     if !diags.is_empty() {
         return Err(diags);
     }
+    let user_rows: Vec<Vec<String>> = user_rows
+        .into_iter()
+        .map(|mut row| {
+            if owner_key.as_deref() == Some(row[0].as_str()) {
+                row[3] = "yes".into();
+            }
+            row
+        })
+        .collect();
     let mut rows = vec![field_row("id", "uuid", "primary, default: gen", "yes")];
     rows.extend(user_rows);
     rows.push(field_row("created_at", "timestamp", "default: now", "yes"));
@@ -921,6 +946,7 @@ fn semantic_check(doc: &LockDoc, sources: &[SourceFile], report: &mut Report) {
     require(&["call", "http", "對外", "外部"], "external-call");
     require(&["password", "密碼"], "password-write");
     require(&["write", "寫", "public", "公開"], "public-writes");
+    require(&["ownership", "tenant-wide", "owner"], "ownership");
 }
 
 fn lock_rel(source_rel: &str) -> String {

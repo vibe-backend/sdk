@@ -76,6 +76,8 @@ pub struct AppState {
     pub disabled: HashSet<String>,
     pub min_override_ms: Option<u64>,
     pub honor_test_ip: bool,
+    /// When set, an unknown public slug explains how to register it.
+    pub dev_hints: bool,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -221,6 +223,12 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                 }
             }
             _ => {
+                let unknown = !state.slugs.contains_key(&slug);
+                let message = if state.dev_hints && unknown {
+                    format!("Not found. Unknown slug `{slug}`; run `vibe slug add {slug} --tenant <id>` or copy slugs.example.json to .vibe/slugs.json")
+                } else {
+                    "Not found".into()
+                };
                 return finish(
                     found.route,
                     &state,
@@ -228,7 +236,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     error_response(
                         StatusCode::NOT_FOUND,
                         "NOT_FOUND",
-                        "Not found",
+                        &message,
                         &request_id,
                         &[],
                     ),
@@ -422,8 +430,14 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     state.exec.as_ref(),
                     &step.target,
                     &args,
-                    &principal.tenant_id,
-                    role,
+                    crud::CallCtx {
+                        tenant_id: &principal.tenant_id,
+                        role,
+                        caller: crud::Caller {
+                            subject: &principal.subject,
+                            admin: principal.roles.iter().any(|role| role == "admin"),
+                        },
+                    },
                     1,
                 )
                 .await

@@ -82,7 +82,9 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         ],
         env_name: "test".into(),
     };
-    let mut slugs = std::collections::HashMap::new();
+    let loaded = vibe::runtime::load_project_slugs(&root).unwrap();
+    assert!(loaded.slugs.contains_key("acme"));
+    let mut slugs = loaded.slugs;
     slugs.insert(
         "shopslug1".into(),
         Slug {
@@ -117,6 +119,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         disabled: std::collections::HashSet::new(),
         min_override_ms: Some(0),
         honor_test_ip: true,
+        dev_hints: true,
     });
     let app = router(state);
 
@@ -124,9 +127,10 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     assert_eq!(health.status, StatusCode::OK);
     assert_eq!(health.json["status"], "ok");
 
-    let staff_token = token(&["staff"], "tenant0001");
-    let customer_token = token(&["customer"], "tenant0001");
-    let other_token = token(&["staff"], "tenant0002");
+    let staff_token = token("staff-user", &["staff"], "tenant0001");
+    let customer_token = token("customer-1", &["customer"], "tenant0001");
+    let other_token = token("other-user", &["staff"], "tenant0002");
+    let admin_token = token("admin-user", &["admin"], "tenant0001");
     let staff = bearer(&staff_token);
     let customer = bearer(&customer_token);
     let other = bearer(&other_token);
@@ -199,8 +203,16 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
 
     let missing_slug = send(&app, "GET", "/catalog/v1/nosuchslug/products", None, None).await;
     assert_eq!(missing_slug.status, StatusCode::NOT_FOUND);
+    assert!(missing_slug.json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("vibe slug add"));
     let hidden = send(&app, "GET", "/catalog/v1/hidden000/products", None, None).await;
     assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    assert_eq!(hidden.json["error"]["message"], "Not found");
+    let acme = send(&app, "GET", "/catalog/v1/acme/products", None, None).await;
+    assert_eq!(acme.status, StatusCode::OK);
+    assert_eq!(acme.json["items"].as_array().unwrap().len(), 0);
 
     let page = send(
         &app,
@@ -349,18 +361,38 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     assert_eq!(exported_by_write.status, StatusCode::OK);
 
     let product_id = second.json["id"].as_str().unwrap();
+    let spoofed = send(
+        &app,
+        "POST",
+        "/shop/v1/cart-items",
+        Some(customer.clone()),
+        Some(json!({"product_id": product_id, "qty": 1, "user_id": "staff-user"})),
+    )
+    .await;
+    assert_eq!(spoofed.status, StatusCode::UNPROCESSABLE_ENTITY);
+
     let cart = send(
         &app,
         "POST",
         "/shop/v1/cart-items",
-        Some(customer),
+        Some(customer.clone()),
         Some(json!({"product_id": product_id, "qty": 2})),
     )
     .await;
     assert_eq!(cart.status, StatusCode::CREATED);
+    assert_eq!(cart.json["user_id"], "customer-1");
     let cart_id = cart.json["id"].as_str().unwrap();
 
     let mine = send(
+        &app,
+        "GET",
+        "/shop/v1/cart-items",
+        Some(customer.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(mine.json["items"].as_array().unwrap().len(), 1);
+    let staff_view = send(
         &app,
         "GET",
         "/shop/v1/cart-items",
@@ -368,11 +400,14 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         None,
     )
     .await;
-    assert_eq!(mine.json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(staff_view.json["items"].as_array().unwrap().len(), 0);
+    let admin = bearer(&admin_token);
+    let admin_view = send(&app, "GET", "/shop/v1/cart-items", Some(admin), None).await;
+    assert_eq!(admin_view.json["items"].as_array().unwrap().len(), 1);
     let theirs = send(&app, "GET", "/shop/v1/cart-items", Some(other), None).await;
     assert_eq!(theirs.json["items"].as_array().unwrap().len(), 0);
 
-    let dropped = send(
+    let stolen = send(
         &app,
         "DELETE",
         &format!("/shop/v1/cart-items/{cart_id}"),
@@ -380,7 +415,97 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         None,
     )
     .await;
+    assert_eq!(stolen.status, StatusCode::NOT_FOUND);
+    let dropped = send(
+        &app,
+        "DELETE",
+        &format!("/shop/v1/cart-items/{cart_id}"),
+        Some(customer),
+        None,
+    )
+    .await;
     assert_eq!(dropped.status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn approve_with_one_reviewer_writes_nothing() {
+    let root = copy_shop();
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|err| panic!("{err}"));
+    let before = lock_snapshot(&root);
+    let key = sign::generate_key();
+    let err = approve_project(&ApproveOptions {
+        root: &root,
+        reviewers: &["jack".into()],
+        reason: "local test",
+        approval_ref: "local",
+        commit: "local",
+        now: "2026-10-14T00:00:00Z",
+        signing_key: &key,
+    })
+    .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("high-risk lock") && text.contains("needs 2 reviewers"),
+        "{text}"
+    );
+    assert!(text.contains("pass --reviewer twice"), "{text}");
+    assert!(
+        text.contains("public endpoint") || text.contains("provider") || text.contains("migration"),
+        "{text}"
+    );
+    assert_eq!(before, lock_snapshot(&root));
+
+    let validate_err = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+        root: &root,
+        deploy: true,
+        verify_key: Some(&key.verifying_key()),
+    })
+    .unwrap_err();
+    let validate_text = validate_err.to_string();
+    assert!(
+        validate_text.contains("lock is not approved"),
+        "{validate_text}"
+    );
+    assert!(
+        !validate_text.contains("missing a signature"),
+        "{validate_text}"
+    );
+}
+
+fn lock_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    collect_locks(root, root, &mut files);
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
+fn collect_locks(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_locks(&path, root, out);
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) == Some("md")
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".lock.md"))
+        {
+            let rel = path.strip_prefix(root).unwrap().display().to_string();
+            out.push((rel, fs::read(&path).unwrap()));
+        }
+    }
 }
 
 fn copy_shop() -> PathBuf {
@@ -427,7 +552,7 @@ fn api_key(key_id: &str, secret: &str) -> String {
     format!("X-API-Key: mbk_test_{key_id}_{secret}")
 }
 
-fn token(roles: &[&str], tenant: &str) -> String {
+fn token(sub: &str, roles: &[&str], tenant: &str) -> String {
     #[derive(Serialize)]
     struct Claims<'a> {
         sub: &'a str,
@@ -441,7 +566,7 @@ fn token(roles: &[&str], tenant: &str) -> String {
     }
     let now = chrono::Utc::now().timestamp();
     let claims = Claims {
-        sub: "user-1",
+        sub,
         exp: now + 600,
         iat: now,
         nbf: now,

@@ -100,6 +100,12 @@ pub struct ModelSpec {
     pub crud: Vec<String>,
     pub list: ListOpts,
     pub sensitive_output: Vec<String>,
+    /// Column filled from `ctx.user.id` and used to scope non-admin reads and writes.
+    #[serde(default)]
+    pub owner_key: Option<String>,
+    /// Explicit relaxation: `tenant-wide` or `role(admin)`.
+    #[serde(default)]
+    pub ownership: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -319,6 +325,15 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
             }
         }
     }
+    let table_section = find_section(&doc.sections, "Table");
+    let owner_key = table_section
+        .and_then(|section| section.get("owner-key"))
+        .filter(|value| !value.is_empty() && *value != "(none)")
+        .map(str::to_string);
+    let ownership = table_section
+        .and_then(|section| section.get("ownership"))
+        .unwrap_or("")
+        .to_string();
     let mut crud = Vec::new();
     let mut list = ListOpts::default();
     let mut sensitive_output = Vec::new();
@@ -356,6 +371,8 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
         crud,
         list,
         sensitive_output,
+        owner_key,
+        ownership,
     }
 }
 
