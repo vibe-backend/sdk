@@ -1001,6 +1001,13 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
     {
         problems.push("UPDATE needs a WHERE clause".into());
     }
+    if !migration {
+        for problem in crate::sqlpolicy::problems(trimmed) {
+            if !problems.contains(&problem) {
+                problems.push(problem);
+            }
+        }
+    }
     // Param hygiene for reads and writes, including WITH … forms.
     if !migration
         && (crate::security::sql_writes(trimmed)

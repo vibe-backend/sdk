@@ -17,6 +17,7 @@ pub mod scan;
 pub mod secret;
 pub mod security;
 pub mod sign;
+pub mod sqlpolicy;
 pub mod validate;
 
 pub use compile::{compile_project, CompileOptions, CompileOutput};
