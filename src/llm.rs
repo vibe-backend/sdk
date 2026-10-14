@@ -33,6 +33,8 @@ pub struct LlmRequest {
     pub model: String,
     pub seed: u64,
     pub timeout: Duration,
+    /// Shared per-source / per-run cap on attempts and time (#83).
+    pub budget: Option<std::sync::Arc<crate::llm_budget::CallBudget>>,
 }
 
 #[derive(Clone, Debug)]
@@ -627,10 +629,59 @@ impl LlmAdapter for HttpAdapter {
     async fn compile(&self, request: &LlmRequest) -> Result<LlmResponse, String> {
         let mut attempt = 0u32;
         let max = self.config.max_retries;
+        let started = std::time::Instant::now();
+        let deadline = retry_deadline();
         loop {
-            match self.compile_once(request).await {
+            // Every attempt reserves from the shared budget and may not run
+            // past the retry deadline or the budget's time left.
+            let mut window = deadline.saturating_sub(started.elapsed());
+            if let Some(budget) = &request.budget {
+                match budget.reserve() {
+                    Ok(left) => window = window.min(left),
+                    Err(why) => return Err(why),
+                }
+            }
+            if window.is_zero() {
+                return Err(format!(
+                    "LLM retry deadline {}s reached",
+                    deadline.as_secs()
+                ));
+            }
+            let attempt_result =
+                match tokio::time::timeout(window, self.compile_once(request)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(CallError {
+                        message: format!(
+                            "LLM call stopped after {}ms: deadline or budget reached",
+                            window.as_millis()
+                        ),
+                        retryable: false,
+                        retry_after: None,
+                    }),
+                };
+            match attempt_result {
                 Ok(response) => return Ok(response),
                 Err(err) if err.retryable && attempt < max => {
+                    // 408/429/5xx/network/timeouts: honor Retry-After, else
+                    // exponential backoff with jitter (#83); never past the
+                    // overall deadline or the budget.
+                    let delay = err.retry_after.unwrap_or_else(|| retry_delay(attempt));
+                    let budget_left = request
+                        .budget
+                        .as_ref()
+                        .map(|b| b.remaining())
+                        .unwrap_or(Duration::MAX);
+                    if started.elapsed() + delay >= deadline || delay >= budget_left {
+                        return Err(redact(
+                            &format!(
+                                "{} (gave up: retry deadline {}s or LLM budget reached)",
+                                err.message,
+                                deadline.as_secs()
+                            ),
+                            &[&self.config.api_key],
+                        ));
+                    }
+                    tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
                 Err(err) => {
@@ -641,9 +692,35 @@ impl LlmAdapter for HttpAdapter {
     }
 }
 
+/// Delay before retry `attempt` (0-based): 1s, 2s, 4s, ... capped at 16s,
+/// plus up to 25% jitter so parallel runs do not retry in lockstep.
+pub fn retry_delay(attempt: u32) -> std::time::Duration {
+    let base_ms = 1_000u64.saturating_mul(1 << attempt.min(4));
+    let jitter = (uuid::Uuid::new_v4().as_u128() % (base_ms as u128 / 4 + 1)) as u64;
+    std::time::Duration::from_millis(base_ms + jitter)
+}
+
 struct CallError {
     message: String,
     retryable: bool,
+    retry_after: Option<std::time::Duration>,
+}
+
+/// Total time one LLM call may spend retrying (`LLM_RETRY_DEADLINE`
+/// seconds, default 120, max 600).
+pub fn retry_deadline() -> std::time::Duration {
+    let secs = std::env::var("LLM_RETRY_DEADLINE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|n| n.min(600))
+        .unwrap_or(120);
+    std::time::Duration::from_secs(secs)
+}
+
+/// `Retry-After` in delta-seconds (HTTP-dates are ignored), capped at 60s.
+pub fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    let secs: u64 = value.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(secs.min(60)))
 }
 
 impl HttpAdapter {
@@ -663,8 +740,14 @@ impl HttpAdapter {
         let response = builder.send().await.map_err(|err| CallError {
             message: mask_secrets(&format!("LLM request failed: {err}"), &self.config.api_key),
             retryable: true,
+            retry_after: None,
         })?;
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after);
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -674,6 +757,7 @@ impl HttpAdapter {
         let bytes = response.bytes().await.map_err(|err| CallError {
             message: mask_secrets(&format!("LLM response body: {err}"), &self.config.api_key),
             retryable: true,
+            retry_after: None,
         })?;
         if !status.is_success() {
             return Err(CallError {
@@ -684,7 +768,8 @@ impl HttpAdapter {
                     &bytes,
                     &self.config.api_key,
                 ),
-                retryable: status.is_server_error() || status.as_u16() == 429,
+                retryable: status.is_server_error() || matches!(status.as_u16(), 408 | 429),
+                retry_after,
             });
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| CallError {
@@ -696,6 +781,7 @@ impl HttpAdapter {
                 &self.config.api_key,
             ),
             retryable: false,
+            retry_after: None,
         })?;
         let parsed = match self.config.provider.as_str() {
             ANTHROPIC => parse_anthropic(&value),
@@ -708,6 +794,7 @@ impl HttpAdapter {
         .map_err(|message| CallError {
             message: mask_secrets(&message, &self.config.api_key),
             retryable: false,
+            retry_after: None,
         })?;
         if let Some(reported) = &parsed.model_reported {
             if reported != &request.model && !reported.is_empty() {
@@ -717,6 +804,7 @@ impl HttpAdapter {
                         request.model
                     ),
                     retryable: false,
+                    retry_after: None,
                 });
             }
         }
@@ -1046,6 +1134,7 @@ mod tests {
             model: "vendor-model-2026-09-01".into(),
             seed: 0,
             timeout: Duration::from_secs(1),
+            budget: None,
         };
         let unknown = model_capabilities(OPENAI, &request.model, 0);
         assert!(unknown.is_empty());
@@ -1240,6 +1329,7 @@ mod responses_tests {
                 model: model.into(),
                 seed: 7,
                 timeout: Duration::from_secs(5),
+                budget: None,
             };
             let err = adapter.compile(&request).await.unwrap_err();
             assert!(err.contains(&status.to_string()), "{status}: {err}");
@@ -1279,6 +1369,7 @@ mod responses_tests {
                 model: model.into(),
                 seed: config.seed,
                 timeout: config.timeout,
+                budget: None,
             };
             let (_, body, _) = openai_responses_call(&config, &request);
             let stamp = params.to_map();
@@ -1374,6 +1465,7 @@ mod responses_tests {
             model: model.into(),
             seed: 7,
             timeout: Duration::from_secs(5),
+            budget: None,
         };
         *reply.lock().unwrap() =
             json!({"status": "completed", "model": model, "output_text": "## A"});
@@ -1403,6 +1495,7 @@ mod responses_tests {
             model: "gpt-5.1-2026-01-01".into(),
             seed: 0,
             timeout: Duration::from_secs(1),
+            budget: None,
         };
         let body = openai_responses_body(&request, &model_capabilities(OPENAI, "gpt-5.1", 0));
         assert_eq!(body["instructions"], "sys");

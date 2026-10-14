@@ -35,11 +35,24 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
     let mut ordered: Vec<String> = Vec::new();
     // id -> English normalization used only by the keyword checks.
     let mut english: HashMap<String, String> = HashMap::new();
+    // (cache key, LLM sections) for sources whose fresh LLM output compiled.
+    // Written only once the source also passes semantic_check (below).
+    let mut pending_cache: HashMap<String, (String, String)> = HashMap::new();
+    let budget = std::sync::Arc::new(crate::llm_budget::CallBudget::from_env());
+    if let Err(err) = crate::lockcommit::recover(opts.root) {
+        report.push(Diag::error(
+            "compile",
+            format!("cannot recover an interrupted lock commit: {err}"),
+        ));
+        return Err(report);
+    }
 
     let mut ranked = sources.clone();
     ranked.sort_by_key(|source| (rank(source), source.rel.clone()));
 
     for source in &ranked {
+        // One budget per source: compile, format re-prompts and translation.
+        budget.begin_source();
         let hits = scan::scan_text(&source.combined_text());
         for hit in &hits {
             let diag = if hit.fatal {
@@ -79,19 +92,34 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                 }
             }
         } else {
-            match llm_sections(opts, source, &docs).await {
-                Ok((sections, fingerprint)) => {
-                    if let Some(fingerprint) = fingerprint {
-                        report.push(Diag::warning(
-                            &source.rel,
-                            format!("openai system_fingerprint {fingerprint}"),
-                        ));
+            let key = cache_key(opts, source, &docs);
+            if let Some(sections) = key.as_deref().and_then(|k| read_cache(opts.root, k)) {
+                report.push(Diag::warning(
+                    &source.rel,
+                    "using cached LLM output (.vibe/cache); it is normalized and checked like a fresh one",
+                ));
+                sections
+            } else {
+                match llm_sections(opts, source, &docs, &budget).await {
+                    Ok((sections, fingerprint)) => {
+                        if let Some(key) = &key {
+                            pending_cache.insert(
+                                source.id.clone(),
+                                (key.clone(), crate::lock::render_sections(&sections)),
+                            );
+                        }
+                        if let Some(fingerprint) = fingerprint {
+                            report.push(Diag::warning(
+                                &source.rel,
+                                format!("openai system_fingerprint {fingerprint}"),
+                            ));
+                        }
+                        sections
                     }
-                    sections
-                }
-                Err(diag) => {
-                    report.push(diag);
-                    continue;
+                    Err(diag) => {
+                        report.push(diag);
+                        continue;
+                    }
                 }
             }
         };
@@ -121,7 +149,7 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
             });
         }
         if !structured && needs_translation(&source.combined_text()) {
-            match translate_source(opts, source).await {
+            match translate_source(opts, source, &budget).await {
                 Ok(text) => {
                     english.insert(source.id.clone(), text);
                 }
@@ -135,15 +163,15 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         docs.insert(source.id.clone(), doc);
     }
 
-    if report.has_errors() {
-        return Err(report);
-    }
-
+    // #83: one failing source no longer blocks the others. Sources that
+    // failed above are not in `docs`; failures below are tracked per id.
+    let mut failed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for id in &ordered {
         let deps = match dependencies(id, &docs) {
             Ok(deps) => deps,
             Err(diag) => {
                 report.push(diag);
+                failed.insert(id.clone());
                 continue;
             }
         };
@@ -166,14 +194,34 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         items.sort_by(|a, b| a.item.cmp(&b.item));
         items.dedup_by(|a, b| a.item == b.item);
         doc.meta.security_items = items;
+        let before = report.errors().count();
         semantic_check(&docs[id], &ranked, &english, &mut report);
+        if report.errors().count() > before {
+            failed.insert(id.clone());
+        } else if let Some((key, text)) = pending_cache.remove(id) {
+            // Cache only output that compiled and passed semantic_check.
+            write_cache(opts.root, &key, &text);
+        }
     }
 
-    if report.has_errors() {
+    // #83 (PM option b): the official locks are all-or-nothing. Any failure
+    // leaves every lock on disk untouched; successful LLM outputs stay in
+    // `.vibe/cache` so a rerun does not pay for them again.
+    if report.has_errors() || !failed.is_empty() {
+        let bad: std::collections::BTreeSet<String> =
+            report.errors().map(|diag| diag.file.clone()).collect();
+        report.push(Diag::warning(
+            "compile",
+            format!(
+                "no locks written; {} file(s) failed: {}",
+                bad.len(),
+                bad.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
         return Err(report);
     }
-
     let mut files = Vec::new();
+    let mut writes: Vec<(std::path::PathBuf, String)> = Vec::new();
     for id in &ordered {
         let doc = &docs[id];
         let rel = lock_rel(&doc.meta.source);
@@ -203,15 +251,71 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                 }
                 Err(_) => report.push(Diag::error(&rel, "lock is missing for determinism check")),
             }
-        } else if let Err(err) = fs::write(&path, &text) {
-            report.push(Diag::error(&rel, format!("cannot write lock: {err}")));
+        } else {
+            writes.push((path, text));
         }
         files.push(rel);
     }
     if report.has_errors() {
         return Err(report);
     }
+    if let Err(err) = crate::lockcommit::commit_journaled(opts.root, &writes) {
+        report.push(Diag::error(
+            "compile",
+            format!("cannot write locks (none changed): {err}"),
+        ));
+        return Err(report);
+    }
     Ok(CompileOutput { files, report })
+}
+
+pub(crate) fn commit_locks(writes: &[(std::path::PathBuf, String)]) -> std::io::Result<()> {
+    crate::lockcommit::commit(writes)
+}
+
+/// `.vibe/cache/llm/<key>.md` key: everything that can change the LLM output
+/// (system prompt incl. prompt version, input incl. source and dependency
+/// context, provider, endpoint host, model, seed, sent params, compiler).
+fn cache_key(
+    opts: &CompileOptions<'_>,
+    source: &SourceFile,
+    docs: &HashMap<String, LockDoc>,
+) -> Option<String> {
+    let config = opts.llm_config?;
+    let stamp = stamp_from(Some(config));
+    let material = serde_json::json!({
+        "compiler": compiler_hash(&stamp),
+        "prompt": PROMPT_VERSION,
+        "system": system_prompt(source.kind, source.scope),
+        "input": llm_input(source, docs),
+        "model": config.model,
+        "provider": config.provider,
+        "host": config.endpoint_host,
+        "seed": config.seed,
+        "sent": stamp.sent_params,
+    });
+    Some(crate::hashutil::sha256_hex(material.to_string().as_bytes()))
+}
+
+fn cache_path(root: &Path, key: &str) -> std::path::PathBuf {
+    root.join(".vibe")
+        .join("cache")
+        .join("llm")
+        .join(format!("{key}.md"))
+}
+
+fn read_cache(root: &Path, key: &str) -> Option<Vec<Section>> {
+    let text = fs::read_to_string(cache_path(root, key)).ok()?;
+    crate::lock::parse_sections(&text).ok()
+}
+
+fn write_cache(root: &Path, key: &str, text: &str) {
+    let path = cache_path(root, key);
+    if let Some(dir) = path.parent() {
+        if fs::create_dir_all(dir).is_ok() {
+            let _ = commit_locks(&[(path, text.to_string())]);
+        }
+    }
 }
 
 fn rank(source: &SourceFile) -> u8 {
@@ -247,6 +351,7 @@ async fn llm_sections(
     opts: &CompileOptions<'_>,
     source: &SourceFile,
     docs: &HashMap<String, LockDoc>,
+    budget: &std::sync::Arc<crate::llm_budget::CallBudget>,
 ) -> Result<(Vec<Section>, Option<String>), Diag> {
     let adapter = opts
         .llm
@@ -272,6 +377,7 @@ async fn llm_sections(
             model: config.model.clone(),
             seed: config.seed,
             timeout: config.timeout,
+            budget: Some(budget.clone()),
         };
         let response = adapter
             .compile(&request)
@@ -383,7 +489,11 @@ fn needs_translation(text: &str) -> bool {
 
 /// English normalization for the keyword checks (#37). Cached in
 /// `.vibe/cache/translate/`; any failure fails the source (no bypass).
-async fn translate_source(opts: &CompileOptions<'_>, source: &SourceFile) -> Result<String, Diag> {
+async fn translate_source(
+    opts: &CompileOptions<'_>,
+    source: &SourceFile,
+    budget: &std::sync::Arc<crate::llm_budget::CallBudget>,
+) -> Result<String, Diag> {
     let fail = |why: String| {
         Diag::error(
             &source.rel,
@@ -422,6 +532,7 @@ async fn translate_source(opts: &CompileOptions<'_>, source: &SourceFile) -> Res
         model: config.model.clone(),
         seed: config.seed,
         timeout: config.timeout,
+        budget: Some(budget.clone()),
     };
     let response = adapter.compile(&request).await.map_err(fail)?;
     let text = strip_fence(&response.text);
@@ -1644,6 +1755,44 @@ fn render_inline_list(items: &[String]) -> String {
 
 fn parse_name_list(raw: &str) -> Vec<String> {
     crate::lock::parse_string_list(raw).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::commit_locks;
+    use std::fs;
+
+    #[test]
+    fn failed_commit_leaves_every_lock_untouched() {
+        let dir = std::env::temp_dir().join(format!("vibe-commit-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.lock.md");
+        fs::write(&a, "old").unwrap();
+        // Second target's directory does not exist, so staging fails.
+        let b = dir.join("missing/b.lock.md");
+        let err = commit_locks(&[(a.clone(), "new".into()), (b.clone(), "new".into())]);
+        assert!(err.is_err());
+        assert_eq!(fs::read_to_string(&a).unwrap(), "old");
+        assert!(!b.exists());
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, ["a.lock.md"], "{names:?}");
+    }
+
+    #[test]
+    fn commit_replaces_all() {
+        let dir = std::env::temp_dir().join(format!("vibe-commit-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.lock.md");
+        fs::write(&a, "old").unwrap();
+        let b = dir.join("b.lock.md");
+        commit_locks(&[(a.clone(), "A".into()), (b.clone(), "B".into())]).unwrap();
+        assert_eq!(fs::read_to_string(&a).unwrap(), "A");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "B");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+    }
 }
 
 #[cfg(test)]
