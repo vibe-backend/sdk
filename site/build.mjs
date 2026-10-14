@@ -6,7 +6,7 @@
 //   zh-hant/...     Traditional Chinese pages
 //
 // Docs are generated at build time from every docs/spec-v*.md (one page per version, plus
-// docs/spec/latest/ = newest) and docs/best-practices/*.md.
+// docs/spec/latest/ = newest non-draft) and docs/best-practices/*.md.
 // Translations live in a mirrored tree: docs/<locale>/<same relative path>, for example
 // docs/zh-hant/best-practices/rate-limit.md. When a locale has no translation, the original
 // is shown with a notice banner in that locale.
@@ -129,9 +129,11 @@ const semver = (v) => v.split('.').map(Number);
 const cmpVer = (a, b) => { const x = semver(a), y = semver(b); for (let i = 0; i < Math.max(x.length, y.length); i++) { const d = (y[i] || 0) - (x[i] || 0); if (d) return d; } return 0; };
 const specVersions = fs.readdirSync(path.join(root, 'docs')).map((f) => /^spec-v(\d+(?:\.\d+){0,2})\.md$/.exec(f)).filter(Boolean)
   .map((m) => m[1]).sort(cmpVer);
-const LATEST = specVersions[0];
+// A spec marked `<!-- spec-status: draft -->` is built at its own URL but never becomes /latest/.
+const isDraftSpec = (v) => /^<!--\s*spec-status:\s*draft\s*-->\s*$/m.test(fs.readFileSync(path.join(root, 'docs', `spec-v${v}.md`), 'utf8'));
+const LATEST = specVersions.find((v) => !isDraftSpec(v));
 for (const v of specVersions) {
-  docs.push({ slug: `spec-v${v}`, rel: `docs/spec/v${v}/index.html`, group: 'spec', version: v, isLatest: v === LATEST, source: `docs/spec-v${v}.md` });
+  docs.push({ slug: `spec-v${v}`, rel: `docs/spec/v${v}/index.html`, group: 'spec', version: v, isLatest: v === LATEST, isDraft: isDraftSpec(v), source: `docs/spec-v${v}.md` });
 }
 if (exists('docs/best-practices')) {
   const files = fs.readdirSync(path.join(root, 'docs/best-practices')).filter((f) => f.endsWith('.md'));
@@ -285,7 +287,7 @@ function specChrome(loc, fromRel, d) {
     ? `<span class="cur" aria-current="page">v${esc(x.version)}${x.isLatest ? ` <em>${esc(t.latest)}</em>` : ''}</span>`
     : `<a href="${relHref(fromRel, x.isLatest ? LATEST_REL : x.rel)}">v${esc(x.version)}${x.isLatest ? ` <em>${esc(t.latest)}</em>` : ''}</a>`).join('');
   const picker = `<nav class="versions" aria-label="${esc(t.versions)}">${seg}</nav>`;
-  const banner = d.isLatest ? '' : `<div class="notice old" role="note"><strong>${esc(t.olderVersion)}</strong> ${esc(t.olderText(d.version, LATEST))} <a href="${relHref(fromRel, LATEST_REL)}">${esc(t.goLatest(LATEST))}</a></div>`;
+  const banner = d.isLatest ? '' : `<div class="notice old" role="note"><strong>${esc(d.isDraft ? t.draftVersion : t.olderVersion)}</strong> ${esc(d.isDraft ? t.draftText(d.version, LATEST) : t.olderText(d.version, LATEST))} <a href="${relHref(fromRel, LATEST_REL)}">${esc(t.goLatest(LATEST))}</a></div>`;
   return picker + banner;
 }
 
