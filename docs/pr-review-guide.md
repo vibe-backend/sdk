@@ -1,15 +1,16 @@
 # PR review 指引（草稿，配合 spec v1.8 決定 29、37、83、89）
 
-v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9C）。人手 review 改由 Git 平台負責；以下係建議設定（以 GitHub 為例）。標「計劃中」嘅指令係 v1.8 設計，未實作。
+v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9C）。人手 review 改由 Git 平台負責；以下係建議設定（以 GitHub rulesets 為例；`vibe build --release-approval` 只認 ruleset，唔認舊式 branch protection）。標「計劃中」嘅指令係 v1.8 設計，未實作。
 
-## 1. Branch protection 或者 ruleset（`main`）
+## 1. Ruleset（`main`）
 
+- 用 repository ruleset（target：`main`，enforcement：Active）設定以下規則，唔好用舊式 branch protection。
 - 開 **Require a pull request before merging**，唔准直接 push 去 `main`。
 - **Required approvals**：最少 1 個。
 - 開 **Dismiss stale pull request approvals when new commits are pushed**（取代 v1.7 嘅「確認綁定 commit hash」）。
 - 開 **Require approval of the most recent reviewable push**，最後 push 嘅人唔可以自己批准。
 - 開 **Require review from Code Owners**。
-- 開 **Do not allow bypassing the above settings**，admin 都唔例外。
+- **Bypass list 留空**，admin 都唔例外（release build 讀到 bypass actors 唔係空就會失敗）。
 
 ## 2. CODEOWNERS（必須，spec 決定 29、37）
 

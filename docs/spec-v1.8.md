@@ -677,9 +677,13 @@ Release build 喺 `main` 或者 `v*` tag 上跑，build 緊嘅 commit（`B = git
 2. 每個 commit 加入排除名單：
    - `author` 嘅 user（`author.id`）。
    - `committer` 嘅 user（`committer.id`）。例外：committer login 係 `web-flow`（GitHub 網頁或者 API 代為 commit）時唔加 `web-flow`，因為真正做嘢嘅人就係 author，已經加咗。
-   - Commit message 入面每個 `Co-authored-by: Name <email>` trailer：email 係 `{id}+{login}@users.noreply.github.com` 或者 `{login}@users.noreply.github.com` 就對返嗰個 user；其他 email 用 commit 本身已經對到嘅 author／committer email 對（同一個 email 就同一個 user）。
-   - 對唔到 user 嘅 co-author email **唔加入排除名單，但會記錄喺部署報告**（SDK 冇可靠方法由 email 搵 user；呢個係已知限制，待產品經理確認）。
-   - `author` 或者 `committer` 係 null（email 對唔到 GitHub user）嘅 commit：記錄，唔失敗。
+   - Commit message 入面每個 `Co-authored-by: Name <email>` trailer，只用兩個方法對 user：
+     - email 係 `{id}+{login}@users.noreply.github.com` 或者 `{login}@users.noreply.github.com`，就對返嗰個 user。
+     - email 同同一個 PR 入面某個 commit 嘅 `commit.author.email`／`commit.committer.email` 一樣，而嗰個 commit 有 `author.login`／`committer.login`，就對返嗰個 user。
+     - 絕對唔用 `GET /search/users` 或者其他搜尋去由 email 估 user。
+   - **對唔到 user**（co-author email 用上面方法對唔到，或者任何 commit 嘅 `author`／`committer` 係 null）：
+     - 有高風險 `security-items` 嘅 release build：**失敗（fail closed）**，因為排除名單唔完整。
+     - 其他 build：只記錄喺部署報告。
 3. 再加 PR 作者（第 2 步 `user.id`）同 `env:` run 嘅 `triggering_actor`、`actor`。
 4. 排除名單入面嘅任何人做批准人都唔計。
 5. 最近一次 push 嘅人 REST API 睇唔到，所以**一定要喺 `main` 開 Require approval of the most recent reviewable push**，由 GitHub 喺 merge 前強制（見第 7 節）。
@@ -690,7 +694,12 @@ Release build 喺 `main` 或者 `v*` tag 上跑，build 緊嘅 commit（`B = git
 2. **揀檔**：喺 `P` 按次序 `.github/CODEOWNERS` → `CODEOWNERS`（root）→ `docs/CODEOWNERS`，用第一個存在嘅，只用一個檔（同 GitHub 一樣）。三個都冇就失敗。
 3. **改 CODEOWNERS 本身係高風險**：PR 改咗三個位置任何一個 CODEOWNERS 檔（新增、修改、刪除、改名），一律當高風險 `security-items`，要 2 個合資格批准人，而且批准人要係 `P` 版本 CODEOWNERS 入面呢個檔路徑嘅 owner。
 4. **配對**：跟 GitHub 語法（大致同 gitignore 一樣），**最後一行配對到嘅 pattern 贏**；嗰行冇 owner 就代表冇 owner。高風險路徑冇 owner 就失敗。
-5. **無效內容**：無效嘅行好似 GitHub 咁跳過，同埋記錄喺部署報告；但係如果成個檔無效（唔係 UTF-8、超過 3 MB、或者一行有效規則都冇），就失敗。Email owner（`user@example.com`）SDK 對唔到 user，當呢個 owner 唔存在。
+5. **GitHub 嘅 CODEOWNERS 語法例外**（SDK 自己實作 GitHub 嘅 CODEOWNERS 規則，唔係直接用通用 gitignore library）：
+   - 唔支援 `\#` escape（`#` 開頭一定係註解）、唔支援 `!` 否定、唔支援 `[ ]` 字元範圍；有呢啲嘅行當無效，跳過同記錄。
+   - 路徑分大小寫。
+   - 其他無效嘅行都好似 GitHub 咁跳過同記錄；成個檔無效（唔係 UTF-8，或者一行有效規則都冇）就失敗。
+   - 另外 call `GET /repos/{owner}/{repo}/codeowners/errors?ref=<P>`：`errors` 唔係空 array 就失敗（同時記錄每個 error 嘅 `line`、`kind`）；呢個 call 只係用嚟檢查錯誤，owner 配對仍然由 SDK 自己計。
+   - **Email owner**（`user@example.com`）當冇 owner：一條高風險路徑嘅 owner 如果全部都係 email，就當冇 owner，build 失敗。
 6. **Owner 判斷**：
    - `@username`：批准人 login 一樣先算（比較時唔分大小寫，再用 user id 記錄）。
    - `@org/team-slug`：用 `GET /orgs/{org}/teams/{team_slug}/memberships/{username}` 確認，要 200 而且 `state: active`；404 代表唔係成員，`pending` 唔算。呢個 endpoint 要用有 organization **Members: read** 權限嘅 GitHub App installation token，`GITHUB_TOKEN` 做唔到。冇 App token 時，任何由 team 擁有嘅高風險路徑一律失敗（fail closed）。
@@ -707,6 +716,7 @@ Branch rule 檢查（`main`）：
 
 - 用 `GET /repos/{owner}/{repo}/rules/branches/main`（rulesets，有 `metadata: read` 就讀到），一定要有 active 嘅 `pull_request` rule，而且 `parameters.require_last_push_approval` 係 `true`。
 - 我哋揀 **rulesets 做唯一接受嘅來源**：舊式 branch protection（`GET /repos/{owner}/{repo}/branches/{branch}/protection`）要 repo admin 權限先讀到，release workflow 唔應該攞 admin。所以呢個設定一定要用 ruleset 開；rulesets 搵唔到就失敗（待產品經理確認）。
+- **Bypass actors（已知限制）**：`rules/branches/main` 唔會回 `bypass_actors`。每條 rule 有 `ruleset_id`，SDK 會試 `GET /repos/{owner}/{repo}/rulesets/{ruleset_id}`：token 讀到 `bypass_actors`（GitHub 只會畀對 ruleset 有寫權限嘅人睇）而且唔係空，高風險 release build 就失敗；回應冇 `bypass_actors`（權限唔夠）就只記錄喺部署報告。
 
 #### 8. Token、權限同錯誤處理
 
