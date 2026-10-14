@@ -99,4 +99,32 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
         deploy: false,
     })
     .unwrap_or_else(|err| panic!("{err}"));
+
+    // A hand edit of a natural-language lock (cannot be recompiled offline)
+    // must not pass deploy validation or reach a manifest.
+    let deploy = || {
+        validate_project(&ValidateOptions {
+            root: &root,
+            deploy: true,
+        })
+    };
+    let before = deploy();
+    if let Err(err) = &before {
+        assert!(!err.to_string().contains("hand-edited"), "{err}");
+    }
+    let lock = root.join("models/product/product.lock.md");
+    let edited =
+        text.replacen("max: 40", "max: 100000", 1)
+            .replacen("required, unique,", "required,", 1);
+    assert_ne!(edited, text);
+    fs::write(&lock, edited).unwrap();
+    let err = deploy().unwrap_err().to_string();
+    assert!(err.contains("models/product/product.lock.md"), "{err}");
+    assert!(err.contains("hand-edited"), "{err}");
+    fs::create_dir_all(root.join(".vibe")).unwrap();
+    let key = vibe::sign::generate_key();
+    let err = vibe::manifest::manifest_from_project(&root, &key)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("hand-edited"), "{err}");
 }

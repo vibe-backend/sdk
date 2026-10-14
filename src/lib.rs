@@ -5,9 +5,11 @@
 
 #![allow(clippy::result_large_err)]
 
+pub mod buildrecord;
 pub mod compile;
 pub mod diag;
 pub mod discover;
+pub mod fsutil;
 pub mod hashutil;
 pub mod llm;
 pub mod lock;

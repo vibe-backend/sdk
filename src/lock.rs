@@ -177,6 +177,8 @@ pub struct Meta {
     /// `signature`, item `approved-by`) found while parsing. They are ignored
     /// and never rendered; the validator reports them as warnings.
     pub legacy_fields: Vec<String>,
+    /// Value of a legacy v1.7 `status:` field, if present.
+    pub legacy_status: Option<String>,
 }
 
 impl Meta {
@@ -199,6 +201,7 @@ impl Meta {
             compiler_hash: String::new(),
             security_items: Vec::new(),
             legacy_fields: Vec::new(),
+            legacy_status: None,
         }
     }
 }
@@ -720,6 +723,10 @@ fn parse_meta(front: &str) -> Result<Meta, String> {
         compiler_hash: get("compiler-hash")?,
         security_items: security,
         legacy_fields,
+        legacy_status: fields
+            .iter()
+            .find(|(key, _)| key == "status")
+            .map(|(_, value)| value.trim().to_string()),
     })
 }
 

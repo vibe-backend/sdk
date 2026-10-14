@@ -14,7 +14,11 @@ use sqlparser::parser::Parser;
 pub fn problems(sql: &str) -> Vec<String> {
     let statements = match Parser::parse_sql(&PostgreSqlDialect {}, sql) {
         Ok(statements) => statements,
-        Err(err) => return vec![format!("SQL does not parse under the allowlist parser: {err}")],
+        Err(err) => {
+            return vec![format!(
+                "SQL does not parse under the allowlist parser: {err}"
+            )]
+        }
     };
     if statements.len() != 1 {
         return vec!["SQL must be a single statement".into()];
@@ -99,7 +103,11 @@ fn always_true(expr: &Expr) -> bool {
             op: UnaryOperator::Not,
             expr,
         } => always_false(expr),
-        Expr::BinaryOp { left, op: Or, right } => always_true(left) || always_true(right),
+        Expr::BinaryOp {
+            left,
+            op: Or,
+            right,
+        } => always_true(left) || always_true(right),
         Expr::BinaryOp {
             left,
             op: And,
@@ -107,8 +115,7 @@ fn always_true(expr: &Expr) -> bool {
         } => always_true(left) && always_true(right),
         Expr::BinaryOp { left, op, right } => {
             // Fail closed: comparing constants, or a value with itself.
-            (is_const(left) && is_const(right))
-                || (left == right && matches!(op, Eq | GtEq | LtEq))
+            (is_const(left) && is_const(right)) || (left == right && matches!(op, Eq | GtEq | LtEq))
         }
         Expr::IsNotNull(inner) => is_const(inner),
         _ => false,
@@ -124,8 +131,16 @@ fn always_false(expr: &Expr) -> bool {
             op: UnaryOperator::Not,
             expr,
         } => always_true(expr),
-        Expr::BinaryOp { left, op: And, right } => always_false(left) || always_false(right),
-        Expr::BinaryOp { left, op: Or, right } => always_false(left) && always_false(right),
+        Expr::BinaryOp {
+            left,
+            op: And,
+            right,
+        } => always_false(left) || always_false(right),
+        Expr::BinaryOp {
+            left,
+            op: Or,
+            right,
+        } => always_false(left) && always_false(right),
         Expr::BinaryOp { left, op, right } => left == right && matches!(op, NotEq | Gt | Lt),
         _ => false,
     }

@@ -31,6 +31,8 @@ pub struct ValidateOptions<'a> {
 pub struct LoadedProject {
     pub sources: Vec<SourceFile>,
     pub lock_texts: Vec<Option<String>>,
+    /// `.vibe/build-record.json` as read with the locks (None when missing).
+    pub build_record: Option<String>,
 }
 
 /// Discovers sources and reads every lock once.
@@ -40,9 +42,11 @@ pub fn load_project(root: &Path) -> Result<LoadedProject, Report> {
         .iter()
         .map(|source| fs::read_to_string(root.join(lock_rel(&source.rel))).ok())
         .collect();
+    let build_record = fs::read_to_string(root.join(crate::buildrecord::PATH)).ok();
     Ok(LoadedProject {
         sources,
         lock_texts,
+        build_record,
     })
 }
 
@@ -85,6 +89,11 @@ pub fn validate_loaded(
         };
         check_lock(&doc, source, opts, &mut report);
         docs.insert(source.id.clone(), doc);
+    }
+    check_dependencies(&docs, sources, &mut report);
+    check_inherited_auth(&docs, sources, &mut report);
+    if opts.deploy {
+        crate::buildrecord::check(loaded, &mut report);
     }
     check_orphans(opts.root, sources, &mut report);
     check_routes(&docs, &mut report);
@@ -226,11 +235,157 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
         }
     }
     check_sections(doc, &file, report);
-    for field in &doc.meta.legacy_fields {
+    if !doc.meta.legacy_fields.is_empty() {
+        let fields: Vec<String> = doc
+            .meta
+            .legacy_fields
+            .iter()
+            .map(|field| format!("`{field}`"))
+            .collect();
         report.push(Diag::warning(
             &file,
-            format!("`{field}` is no longer used (v1.8 has no lock approval or lock signature) and is ignored; recompile to drop it"),
+            format!(
+                "legacy approval fields are ignored: {}; recompile to drop them",
+                fields.join(", ")
+            ),
         ));
+    }
+    if let Some(status) = &doc.meta.legacy_status {
+        if opts.deploy && status != "approved" {
+            report.push(Diag::error(
+                &file,
+                format!("lock has legacy `status: {status}`; it cannot be deployed until it is recompiled from a reviewed source"),
+            ));
+        }
+    }
+}
+
+/// Deterministic auth policy: a feature lock may narrow, never widen, the
+/// auth its definition/version locks declare. Removing roles, changing the
+/// mode, or dropping the auth pipeline without `-auth` (which is itself a
+/// high-risk `auth-removed` item) fails closed.
+fn check_inherited_auth(
+    docs: &HashMap<String, LockDoc>,
+    sources: &[SourceFile],
+    report: &mut Report,
+) {
+    fn auth_blocks(doc: &LockDoc) -> Vec<&crate::lock::Block> {
+        find_section(&doc.sections, "Pipelines")
+            .map(|s| {
+                s.blocks
+                    .iter()
+                    .filter(|b| {
+                        let name = b.heading.split_whitespace().last().unwrap_or("");
+                        name == "auth" || name == "-auth"
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let roles_of = |block: &crate::lock::Block| -> Option<Vec<String>> {
+        let raw = block_val(block, "roles");
+        if raw.trim().is_empty() {
+            return Some(Vec::new());
+        }
+        crate::lock::parse_string_list(&raw).ok()
+    };
+    for source in sources {
+        let Some(doc) = docs.get(&source.id) else {
+            continue;
+        };
+        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+            continue;
+        }
+        let file = lock_rel(&source.rel);
+        let mut inherited: Option<(String, Vec<String>)> = None;
+        for dep in &doc.meta.dependencies {
+            let Some(parent) = docs.get(&dep.id) else {
+                continue;
+            };
+            if parent.meta.kind != Kind::Api {
+                continue;
+            }
+            for block in auth_blocks(parent) {
+                if let Some(roles) = roles_of(block) {
+                    inherited = Some((block_val(block, "mode"), roles));
+                }
+            }
+        }
+        let Some((mode, roles)) = inherited else {
+            continue;
+        };
+        let own = auth_blocks(doc);
+        if own.iter().any(|b| b.heading.ends_with("-auth")) {
+            continue; // explicit removal, reported as a high-risk item
+        }
+        let Some(block) = own.first() else {
+            report.push(Diag::error(
+                &file,
+                "inherited auth pipeline is missing (use `-auth` to remove it explicitly)",
+            ));
+            continue;
+        };
+        if block_val(block, "mode") != mode {
+            // A different mode (e.g. api-key with scopes) is a declared
+            // override; inherited roles do not apply to it.
+            continue;
+        }
+        match roles_of(block) {
+            None => report.push(Diag::error(&file, "auth roles cannot be parsed")),
+            Some(own_roles) if !roles.is_empty() && own_roles.is_empty() => {
+                report.push(Diag::error(
+                    &file,
+                    format!(
+                        "auth roles are missing; inherited roles are [{}]",
+                        roles.join(", ")
+                    ),
+                ))
+            }
+            Some(own_roles) if !roles.is_empty() => {
+                if let Some(extra) = own_roles.iter().find(|r| !roles.contains(r)) {
+                    report.push(Diag::error(
+                        &file,
+                        format!(
+                            "auth role {extra} widens the inherited roles [{}]",
+                            roles.join(", ")
+                        ),
+                    ));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// Every `dependencies` hash must equal the dependency's current content
+/// hash (spec 10.1 "stale").
+fn check_dependencies(
+    docs: &HashMap<String, LockDoc>,
+    sources: &[SourceFile],
+    report: &mut Report,
+) {
+    for source in sources {
+        let Some(doc) = docs.get(&source.id) else {
+            continue;
+        };
+        for dep in &doc.meta.dependencies {
+            match docs.get(&dep.id) {
+                None => report.push(Diag::error(
+                    lock_rel(&source.rel),
+                    format!("dependency {} has no lock", dep.id),
+                )),
+                Some(target) if crate::lock::content_hash(target) != dep.hash => {
+                    report.push(Diag::error(
+                        lock_rel(&source.rel),
+                        format!(
+                            "dependency {} hash does not match its lock (stale or edited); run `vibe compile`",
+                            dep.id
+                        ),
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
     }
 }
 
@@ -1327,5 +1482,57 @@ mod tests {
         assert!(!crate::security::sql_writes(
             "SELECT note = 'update me' FROM t"
         ));
+    }
+
+    fn method_with_sql(sql: &str) -> LockDoc {
+        use crate::lock::{Block, Bullet, Meta};
+        let bullet = |key: &str, value: &str| Bullet {
+            key: key.into(),
+            value: value.into(),
+        };
+        LockDoc {
+            meta: Meta::pending(
+                Kind::Method,
+                None,
+                "product/zero-price",
+                "models/product/methods/zero-price/zero-price.md",
+            ),
+            sections: vec![Section {
+                name: "Steps".into(),
+                bullets: vec![],
+                table: None,
+                blocks: vec![Block {
+                    heading: "s1".into(),
+                    bullets: vec![
+                        bullet("op", "query"),
+                        bullet("sql", sql),
+                        bullet("params", "[input.id]"),
+                        bullet("scope", "pk"),
+                    ],
+                }],
+                none: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn hand_edited_tautological_update_fails_the_method_check() {
+        let mut report = Report::new();
+        check_method(
+            &method_with_sql("UPDATE products SET price_cents = 0 WHERE true OR id = $1"),
+            "zero-price.lock.md",
+            &mut report,
+        );
+        let text = report.to_string();
+        assert!(text.contains("WHERE is always true"), "{text}");
+        assert!(report.has_errors());
+
+        let mut report = Report::new();
+        check_method(
+            &method_with_sql("UPDATE products SET price_cents = 0 WHERE id = $1"),
+            "zero-price.lock.md",
+            &mut report,
+        );
+        assert!(!report.to_string().contains("always true"), "{report}");
     }
 }

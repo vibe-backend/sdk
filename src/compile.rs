@@ -41,7 +41,7 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         &HashMap::new(),
     )
     .await?;
-    write_or_check(opts, &docs, &ordered, &mut report)
+    write_or_check(opts, &sources, &docs, &ordered, &mut report)
 }
 
 /// Recompiles structured sources in memory, without an LLM and without
@@ -224,44 +224,62 @@ async fn compile_docs(
 
 fn write_or_check(
     opts: &CompileOptions<'_>,
+    sources: &[SourceFile],
     docs: &HashMap<String, LockDoc>,
     ordered: &[String],
     report: &mut Report,
 ) -> Result<CompileOutput, Report> {
     let mut files = Vec::new();
+    let mut texts: HashMap<String, String> = HashMap::new();
+    let mut record = std::collections::BTreeMap::new();
     for id in ordered {
         let doc = &docs[id];
         let rel = lock_rel(&doc.meta.source);
-        let path = opts.root.join(&rel);
         let text = render_lock(doc);
-        if opts.check {
-            match fs::read_to_string(&path) {
-                Ok(existing) => {
-                    if let Ok(parsed) = crate::lock::parse_lock(&existing) {
-                        let same_items = security::same_items(
-                            &parsed.meta.security_items,
-                            &doc.meta.security_items,
-                        );
-                        if content_hash(&parsed) != content_hash(doc)
-                            || parsed.meta.compiler_hash != doc.meta.compiler_hash
-                            || parsed.meta.source_hash != doc.meta.source_hash
-                            || !same_items
-                        {
-                            report.push(Diag::error(
-                                &rel,
-                                "recompile does not match the lock on disk",
-                            ));
-                        }
-                    } else {
-                        report.push(Diag::error(&rel, "existing lock cannot be parsed"));
-                    }
-                }
-                Err(_) => report.push(Diag::error(&rel, "lock is missing for determinism check")),
-            }
-        } else if let Err(err) = fs::write(&path, &text) {
-            report.push(Diag::error(&rel, format!("cannot write lock: {err}")));
-        }
+        record.insert(rel.clone(), crate::buildrecord::lock_hash(&text));
+        texts.insert(rel.clone(), text);
         files.push(rel);
+    }
+    if opts.check {
+        // Verify the build result and the deploy policy in memory; the locks
+        // on disk (if any) are not consulted and nothing is written.
+        let loaded = crate::validate::LoadedProject {
+            sources: sources.to_vec(),
+            lock_texts: sources
+                .iter()
+                .map(|source| texts.get(&lock_rel(&source.rel)).cloned())
+                .collect(),
+            build_record: serde_json::to_string(&crate::buildrecord::BuildRecord {
+                version: 1,
+                locks: record,
+            })
+            .ok(),
+        };
+        let (result, _) = crate::validate::validate_loaded(
+            &crate::validate::ValidateOptions {
+                root: opts.root,
+                deploy: true,
+            },
+            &loaded,
+        );
+        match result {
+            Ok(found) => report.diags.extend(found.diags),
+            Err(found) => report.diags.extend(found.diags),
+        }
+    } else {
+        for rel in &files {
+            if let Err(err) = fs::write(opts.root.join(rel), &texts[rel]) {
+                report.push(Diag::error(rel, format!("cannot write lock: {err}")));
+            }
+        }
+        if !report.has_errors() {
+            if let Err(err) = crate::buildrecord::write(opts.root, record) {
+                report.push(Diag::error(
+                    crate::buildrecord::PATH,
+                    format!("cannot write build record: {err}"),
+                ));
+            }
+        }
     }
     let report = std::mem::take(report);
     if report.has_errors() {

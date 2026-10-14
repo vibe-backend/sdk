@@ -498,23 +498,21 @@ async fn legacy_approval_fields_are_ignored_with_a_warning() {
     fs::write(&lock, &legacy).unwrap();
     let report = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
         root: &root,
-        deploy: true,
+        deploy: false,
     })
     .unwrap_or_else(|err| panic!("{err}"));
     let text = report.to_string();
+    let file = "api/catalog/v1/get-product/get-product.lock.md";
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains(file)).collect();
+    assert_eq!(lines.len(), 1, "one summary line per file: {text}");
     for field in [
         "status",
         "approved-by",
         "signature",
         "security-items approved-by",
     ] {
-        assert!(
-            text.contains(&format!("`{field}` is no longer used")),
-            "{field}: {text}"
-        );
+        assert!(lines[0].contains(&format!("`{field}`")), "{field}: {text}");
     }
-    let key = sign::generate_key();
-    manifest_from_project(&root, &key).unwrap_or_else(|err| panic!("{err}"));
 }
 
 fn copy_shop() -> PathBuf {
@@ -866,13 +864,15 @@ async fn deploy_validate_rejects_a_hand_edited_lock() {
     tamper_product_lock(&root);
     let text = deploy_validate(&root).unwrap_err().to_string();
     assert!(text.contains(PRODUCT_LOCK), "{text}");
-    assert!(text.contains("does not match a recompile"), "{text}");
-    // Plain (non-deploy) validation keeps working for local edits.
-    vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+    assert!(text.contains("hand-edited"), "{text}");
+    // Dependents' hashes go stale, which plain validation also reports.
+    let text = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
         root: &root,
         deploy: false,
     })
-    .unwrap_or_else(|err| panic!("{err}"));
+    .unwrap_err()
+    .to_string();
+    assert!(text.contains("dependency product hash"), "{text}");
 }
 
 #[tokio::test]
@@ -881,7 +881,7 @@ async fn manifest_refuses_a_hand_edited_lock_and_writes_nothing() {
     tamper_product_lock(&root);
     let key = sign::generate_key();
     let err = manifest_from_project(&root, &key).unwrap_err().to_string();
-    assert!(err.contains("does not match a recompile"), "{err}");
+    assert!(err.contains("hand-edited"), "{err}");
     let out = root.join("out/manifest.json");
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_vibe"))
         .args(["manifest", "--project"])
@@ -941,4 +941,81 @@ async fn manifest_with_only_warnings_builds_and_reports_them() {
     assert!(!report.has_errors());
     let key = sign::generate_key();
     manifest_from_project(&root, &key).unwrap_or_else(|err| panic!("{err}"));
+}
+
+/// Rewrites the build record so only the targeted check can fail.
+fn rerecord(root: &Path) {
+    let loaded = vibe::validate::load_project(root).unwrap();
+    let mut locks = std::collections::BTreeMap::new();
+    for (source, text) in loaded.sources.iter().zip(&loaded.lock_texts) {
+        if let Some(text) = text {
+            let rel = source.rel.trim_end_matches(".md").to_string() + ".lock.md";
+            locks.insert(rel, vibe::buildrecord::lock_hash(text));
+        }
+    }
+    vibe::buildrecord::write(root, locks).unwrap();
+}
+
+#[tokio::test]
+async fn legacy_rejected_or_pending_locks_cannot_deploy() {
+    for status in ["rejected", "pending"] {
+        let root = compiled_shop().await;
+        let lock = root.join("api/catalog/v1/get-product/get-product.lock.md");
+        let text = fs::read_to_string(&lock).unwrap();
+        fs::write(
+            &lock,
+            text.replacen(
+                "security-items:",
+                &format!("status: {status}\nsecurity-items:"),
+                1,
+            ),
+        )
+        .unwrap();
+        rerecord(&root);
+        let err = deploy_validate(&root).unwrap_err().to_string();
+        assert!(err.contains(&format!("legacy `status: {status}`")), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn tampered_dependency_hash_fails_deploy_and_manifest() {
+    let root = compiled_shop().await;
+    let lock = root.join("api/catalog/v1/get-product/get-product.lock.md");
+    let text = fs::read_to_string(&lock).unwrap();
+    let start = text.find("{ id: product, kind: model, hash: ").unwrap();
+    let line_end = start + text[start..].find('}').unwrap();
+    let edited = format!(
+        "{}{{ id: product, kind: model, hash: sha256:deadbeef {}",
+        &text[..start],
+        &text[line_end..]
+    );
+    fs::write(&lock, edited).unwrap();
+    rerecord(&root);
+    let err = deploy_validate(&root).unwrap_err().to_string();
+    assert!(
+        err.contains("dependency product hash does not match"),
+        "{err}"
+    );
+    let key = sign::generate_key();
+    let err = manifest_from_project(&root, &key).unwrap_err().to_string();
+    assert!(
+        err.contains("dependency product hash does not match"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn removing_roles_from_a_lock_cannot_deploy() {
+    let root = compiled_shop().await;
+    let lock = root.join("api/catalog/v1/create-product/create-product.lock.md");
+    let text = fs::read_to_string(&lock).unwrap();
+    assert!(text.contains("- roles: [staff]\n"));
+    fs::write(&lock, text.replacen("- roles: [staff]\n", "", 1)).unwrap();
+    // Even with a forged build record the policy check refuses it.
+    rerecord(&root);
+    let err = deploy_validate(&root).unwrap_err().to_string();
+    assert!(err.contains("create-product.lock.md"), "{err}");
+    assert!(err.contains("roles"), "{err}");
+    let key = sign::generate_key();
+    assert!(manifest_from_project(&root, &key).is_err());
 }

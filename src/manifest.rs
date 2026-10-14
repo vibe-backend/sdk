@@ -264,17 +264,7 @@ pub fn manifest_from_loaded(
 
 pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), Report> {
     let json = serde_json::to_vec_pretty(manifest).map_err(|err| single(err.to_string()))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| single(err.to_string()))?;
-    }
-    // Write to a temp file and rename, so a failure never leaves a partial
-    // manifest behind.
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    if let Err(err) = fs::write(&tmp, json).and_then(|_| fs::rename(&tmp, path)) {
-        let _ = fs::remove_file(&tmp);
-        return Err(single(err.to_string()));
-    }
-    Ok(())
+    crate::fsutil::write_atomic(path, &json).map_err(|err| single(err.to_string()))
 }
 
 pub fn read_manifest(path: &Path, key: &VerifyingKey) -> Result<Manifest, Report> {
