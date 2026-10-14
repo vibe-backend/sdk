@@ -10,7 +10,7 @@ use vibe::discover;
 use vibe::llm::{self, HttpAdapter, LlmAdapter};
 use vibe::lock::is_structured_source;
 use vibe::manifest::{self, read_manifest};
-use vibe::runtime::{bootstrap_statements, router, AppState, AuthConfig, Col, PgExec, QueryExec};
+use vibe::runtime::{router, AppState, AuthConfig, PgExec, QueryExec};
 use vibe::secret::secret_scan;
 use vibe::sign;
 use vibe::validate::{validate_project, ValidateOptions};
@@ -395,7 +395,9 @@ async fn cmd_serve(
             .map_err(|_| {
                 "set VIBE_DATABASE_URL or pass --memory for the dev executor".to_string()
             })?;
-        Arc::new(PgExec::connect(&url).await?)
+        let pg = PgExec::connect(&url).await?;
+        pg.check_runtime_role().await?;
+        Arc::new(pg)
     };
     let loaded = vibe::runtime::load_project_slugs(project, memory)?;
     for warning in &loaded.warnings {
@@ -448,47 +450,30 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
     }
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
-    let url = std::env::var("VIBE_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .map_err(|_| "VIBE_DATABASE_URL is required".to_string())?;
+    // Migrations need the table-owner role; serving must not use it.
+    let url = std::env::var("VIBE_MIGRATE_DATABASE_URL").map_err(|_| {
+        "VIBE_MIGRATE_DATABASE_URL is required (the owner role used for DDL; `vibe serve` uses a separate non-owner VIBE_DATABASE_URL)".to_string()
+    })?;
+    let runtime_role = std::env::var("VIBE_RUNTIME_DB_ROLE").map_err(|_| {
+        "VIBE_RUNTIME_DB_ROLE is required (the non-owner role `vibe serve` connects as; it is granted SELECT, INSERT, UPDATE)".to_string()
+    })?;
     let exec = PgExec::connect(&url).await?;
-    let schema = format!("t_{tenant}");
-    for model in &manifest.models {
-        let fields: Vec<Col> = model
-            .fields
-            .iter()
-            .map(|field| Col {
-                name: field.name.clone(),
-                ty: field.ty.clone(),
-            })
-            .collect();
-        let uniques: Vec<String> = model
-            .fields
-            .iter()
-            .filter(|field| field.unique)
-            .map(|field| field.name.clone())
-            .collect();
-        let statements = bootstrap_statements(&schema, &model.table, &fields, &uniques)?;
-        exec.batch(&statements).await?;
-        println!("bootstrapped {}.{}", schema, model.table);
+    for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant, &runtime_role).await? {
+        println!("{line}");
     }
-    // Migrations run in the tenant schema, never `public`.
-    let quoted = vibe::runtime::quote_ident(&schema)?;
-    for migration in &manifest.migrations {
-        let mut statements = vec![
-            format!("CREATE SCHEMA IF NOT EXISTS {quoted}"),
-            format!("SET search_path TO {quoted}"),
-        ];
-        statements.extend(migration.statements.iter().cloned());
-        statements.push("RESET search_path".into());
-        exec.batch(&statements).await?;
-        println!("applied {}", migration.id);
-    }
-    // Last, so the privilege revoke also overrides any schema-wide grant
-    // (`GRANT ... ON ALL TABLES IN SCHEMA`) made earlier in this run.
+    // Last: the revoke is table-level (on `_platform_refresh_tokens` only).
+    // `GRANT ... ON ALL TABLES IN SCHEMA` in a migration expands to per-table
+    // grants when it runs, so revoking afterwards removes those as well.
+    exec.check_role_separation_for(Some(&runtime_role)).await?;
     if manifest.routes.iter().any(|r| r.refresh.is_some()) {
+        let schema = format!("t_{tenant}");
         exec.batch(&vibe::runtime::refresh::table_statements(&schema)?)
             .await?;
+        exec.batch(&vibe::runtime::refresh::runtime_grant_statements(
+            &schema,
+            &runtime_role,
+        )?)
+        .await?;
         println!("bootstrapped {schema}._platform_refresh_tokens");
     }
     Ok(())

@@ -820,6 +820,11 @@ fn app_sql_cannot_reach_the_refresh_table() {
         "SELECT token_hash FROM t_tenant0001._platform_refresh_tokens",
         "UPDATE _platform_refresh_tokens SET revoked_at = NULL WHERE id = $1",
         "SELECT id FROM users WHERE id IN (SELECT user_id FROM _platform_refresh_tokens)",
+        "TABLE _platform_refresh_tokens",
+        "SELECT id FROM users UNION TABLE _platform_refresh_tokens",
+        "SELECT id FROM users UNION ALL TABLE _platform_refresh_tokens",
+        "SELECT id FROM users EXCEPT TABLE _platform_refresh_tokens",
+        "INSERT INTO users (id) TABLE _platform_refresh_tokens",
     ] {
         assert!(vibe::sqlguard::query_problem(sql).is_some(), "{sql}");
     }

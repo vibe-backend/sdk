@@ -87,6 +87,23 @@ pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
     ])
 }
 
+/// Grants the runtime role (the only role that should reach the table) what
+/// the refresh store needs, and re-checks that no app query role can reach it.
+pub fn runtime_grant_statements(schema: &str, runtime_role: &str) -> Result<Vec<String>, String> {
+    let qualified = format!("{}._platform_refresh_tokens", super::sql::quote(schema)?);
+    let role = super::sql::quote(runtime_role)?;
+    if ["public_reader", "public_writer", "app_rw"].contains(&runtime_role) {
+        return Err(format!("{runtime_role} cannot be the runtime role"));
+    }
+    Ok(vec![
+        format!(
+            "GRANT USAGE ON SCHEMA {} TO {role}",
+            super::sql::quote(schema)?
+        ),
+        format!("GRANT SELECT, INSERT, UPDATE ON {qualified} TO {role}"),
+    ])
+}
+
 fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
