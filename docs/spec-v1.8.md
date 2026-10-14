@@ -187,7 +187,7 @@
 | 77 | SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 刪除 `status`、`approval-mode`、`approved-by`、`approved-at`、`approval-ref`、`approved-commit`；SDK 讀到呢啲舊欄位（包括舊 lock 嘅 `approval-ref`，同決定 90 嘅 build 旗標 `--release-approval` 係兩回事）會忽略並出 warning，唔再以佢哋做部署條件。取代決定 10、11、16（人手 review 部分）、20（人手確認部分）、28、33。 | 已確認（產品經理 2026-10-14） | 2A.1、2A.5、10.1 |
 | 78 | `security-items` 保留，但改為資訊性：驗證器 deterministic 抽出、寫入 lock 同部署報告，方便 PR 高亮同 label；唔再要求逐項確認人、原因、兩個非作者，亦冇每個 PR 5 項上限。取代決定 19（確認部分）、34。 | 待產品經理確認 | 2A.5、10.10 |
 | 79 | Lock 唔再有 `signature`（lock 完整性靠 `source-hash`、依賴 hash、compiler-hash 同 CI 重編）；manifest 照樣簽名，由 `vibe build` 用 build key 簽：release 用受保護 ref 加 GitHub environment 嘅 OIDC 綁定 KMS key（決定 89），本機用 dev key。Production runtime 只信任平台 pin 死嘅 release 公鑰，dev key 永遠唔信任。 | 已確認（產品經理 2026-10-14） | 2A.1、9、9B、10.1 |
-| 80 | 建議 `*.lock.md` 同 source 一齊 commit，令 PR diff 睇到編譯結果；CI 重編決定性檢查保留，唔一致照樣封鎖部署，冇 override。 | 待產品經理確認 | 2A.6、2C.3 |
+| 80 | （v1.8 決定 113 修訂：CI 重編比對唔再係部署條件）建議 `*.lock.md` 同 source 一齊 commit，令 PR diff 睇到編譯結果；CI 重編決定性檢查保留，唔一致照樣封鎖部署，冇 override。 | 待產品經理確認 | 2A.6、2C.3 |
 | 81 | CLI 所有指令嘅 `--project` 預設係目前目錄（cwd）。 | 待產品經理確認 | 2C.1 |
 | 82 | README 快速開始簡化做兩行：`vibe dev` 加一個 `curl`。 | 待產品經理確認 | 2C.1 |
 | 83 | 接受「未經人手 review 嘅 LLM 輸出可以直接部署」嘅剩餘風險（見 9C）；人手 review 由用戶喺 Git 平台用 rulesets（分支規則） 自行設定（指引見 [`pr-review-guide.md`](pr-review-guide.md)）；但 release 層面仍然有決定 89–93 嘅硬性要求（受保護 environment、高風險要 approval 參照、CODEOWNERS）。 | 已確認（產品經理 2026-10-14） | 9C |
@@ -204,7 +204,7 @@
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 待產品經理確認 | 文件標頭、網站 |
 | 95 | create-user 邀請失敗：`user.invite` 嘅 enqueue（s4）失敗時，create-user 回 503 `INVITE_DELIVERY_FAILED`（只帶 `Retry-After`，body 唔帶 `user_id`），唔回 201／200；因為 s2 已經輪換咗 token 但信冇寄出，用戶手上冇有效連結，恢復方法係重試 create-user（決定 85）或者 re-invite（決定 86），兩者都會發新 token 同新信。同 issue #26（auth flow 實作）相關。v1.8 修訂（決定 99，已確認（產品經理 2026-10-14））：成個 request 喺同一個 transaction，enqueue 失敗會 rollback 埋 token 輪換同用戶建立；邀請信經 transactional outbox：`email_outbox` 列同其他寫入喺同一個 transaction 寫入，commit 之後先由 mail worker 寄出，commit 之前永遠唔寄；rollback 會連 outbox 列一齊丟棄。 | 待產品經理確認 | 11.4、11.4a |
 | 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i) 做**臨時方案**）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。高風險 `--release-approval` 係計劃中、未實作，實作後先額外把關。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，同時開返 Prevent self-review。另外 live `release` environment `can_admins_bypass` 而家係 `true`，Jack 負責關閉。高風險 release build 用只有 Administration: read 嘅專用 GitHub App 讀呢個 ruleset，讀唔到、`bypass_actors` 唔係空、唔係 active、缺少三條 rule、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass，SDK 唔檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval`（未實作）實作後會獨立驗證 PR review（2C.3a）。普通 build 只記錄。 | 待產品經理確認 | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
-| 97 | 租戶隔離身份（v1 blocker）：runtime 每個 request 喺 transaction 入面先 `SET LOCAL ROLE tenant_<id>`，再執行 lock SQL；每個租戶一個 role（`NOINHERIT`、只有自己 schema 嘅權限、唔係其他 role 嘅成員）；app 連線 role 對任何租戶 schema 冇直接權限；`app.tenant_id` 之類 GUC 只可以輔助（例如 log），永遠唔係身份來源。安全細節經私人 security advisory 處理。 補充（已確認（產品經理 2026-10-14），Code Reviewer）：唔用 `SET LOCAL ROLE`；runtime 用每個租戶（同 role 類別）自己嘅連線池，直接以 `LOGIN` 租戶 role 登入；runtime 連線 role 同租戶 role 之間冇任何 membership，所以喺租戶 role 入面冇辦法切返其他身份。平台表（refresh token、idempotency、outbox）只喺租戶自己 schema，租戶 role 讀唔到任何跨租戶共用表。 | 已確認（產品經理 2026-10-14） | 7.1、7.1a、9C |
+| 97 | 租戶隔離身份（v1 blocker）：runtime 為每個（租戶、role 類別）開獨立連線池，直接以 `LOGIN` 租戶 role 登入再執行 lock SQL；runtime 連線 role 同租戶 role 之間冇任何 membership，租戶連線入面冇辦法切返其他身份（唔用 `SET LOCAL ROLE`；除非之後證明 PostgreSQL 17 嘅 `SET LOCAL ROLE` 不可逆）。租戶 role `NOINHERIT`、只有自己 schema 嘅權限、唔係其他 role 嘅成員；憑證只存 runtime secret store。平台表（refresh token、idempotency、outbox）只喺租戶自己 schema，租戶 role 讀唔到任何跨租戶共用表。`app.tenant_id` 之類 GUC 只可以輔助（例如 log），永遠唔係身份來源。安全細節經私人 security advisory 處理。 | 已確認（產品經理 2026-10-14） | 7.1、7.1a、9C |
 | 98 | Lock SQL parser 白名單：用 PostgreSQL 解析器（例如 `pg_query`）解析，只准單一 DML statement；禁止 `SET`／`RESET`／`SET ROLE`／`DO`／`COPY`／`BEGIN`／`COMMIT`／`SAVEPOINT` 等 transaction 同 session 控制、schema-qualified 名稱；function 只准白名單（`set_config`、`current_setting`、`dblink` 等唔喺白名單）；解析失敗即 fail closed。Conformance 要有跨租戶負面測試。 補充（已確認（產品經理 2026-10-14），Code Reviewer）：function 白名單係正面清單，冇列就禁止（動態 SQL、introspection、讀檔、large object、連外 function 全部唔喺入面）；lock SQL 唔可以改任何 GUC（所有 `set_config`、`SET`、`RESET`）；唔可以引用平台表；migration 同樣用 parser 檢查（禁止 `SECURITY DEFINER`、非白名單語言嘅 function／trigger、`ALTER ROLE`／`GRANT`、改 GUC）；全部 fail closed，並有對應負面測試。 | 已確認（產品經理 2026-10-14） | 2A.4、7.1a、10.1 |
 | 99 | 跨 model transaction：一個 request = 一個 runtime 管理嘅 transaction（`READ COMMITTED`）；用戶 SQL 控制唔到 transaction 邊界；庫存扣減用條件 UPDATE（`WHERE stock >= qty`）再檢查 affected rows，唔夠就 409 同 rollback；冇跨 request、跨 DB 或者分散式 transaction；寫入按固定次序、喺租戶 role 之下執行。取代 7.1「每個 query 獨立 transaction」。 | 已確認（產品經理 2026-10-14） | 7.1、7.4、12.6 |
 | 100 | Transaction 超時同衝突：預設 `statement_timeout` 5s、transaction 總時間 10s、`idle_in_transaction_session_timeout` 5s；超時 rollback，回 504 `TX_TIMEOUT`。Deadlock（`40P01`）同 serialization failure（`40001`）回 503 `TX_CONFLICT`，body `retryable: true`，帶 `Retry-After: 1`；平台永遠唔會自動重試非冪等寫入。 | 已確認（產品經理 2026-10-14） | 7.4、8 |
@@ -220,6 +220,10 @@
 | 110 | 高風險 release build 唔可以用翻譯 cache，一定重新翻譯。 | 已確認（產品經理 2026-10-14） | 2.1a、2C.3 |
 | 111 | 翻譯 call 計入 #92 P5 每次編譯 LLM call 上限；超過即編譯失敗。 | 已確認（產品經理 2026-10-14） | 2.1a |
 | 112 | 修訂決定 16：高風險欄位（寫入、公開、auth、secret）一定要喺 source frontmatter 宣告；宣告同譯文唔一致，或者偵測到未宣告嘅高風險行為，即 fail closed，錯誤訊息講明缺咗邊個宣告。關鍵字檢查係一致性檢查（縱深防禦），唔係唯一防線。api feature 唔再做寫入 sql 關鍵字檢查（由已檢查嘅 method lock 繼承）。 | 已確認（產品經理 2026-10-14） | 2.2、2.1a、2A.7 |
+| 113 | 部署來源（issue #97，取代 lock 簽名做閘門）：runtime／部署只接受 CI 喺 `release` environment 由 source 重新 build 嘅 artifact，帶 GitHub artifact attestation（build provenance，SLSA），綁定 repo、workflow 路徑、受保護 ref 同 commit SHA；再加現有 KMS manifest 簽名。部署器驗證 attestation、manifest 簽名同 subject digest，任何一樣失敗即拒絕。Repo 入面嘅 lock 只係 review 副本，永遠唔係部署輸入；唔做「重編再同 repo lock 比對」（LLM 唔決定性）。注意：KMS key 嘅建立、權限同輪換喺實際部署之前要 Jack 本人批准（唔喺產品經理代決範圍）。CI 重編再比對唔再係部署條件（修訂決定 80 同 2A.6）。 | 已確認（產品經理 2026-10-14） | 2C.3b、9C、10.1 |
+| 114 | 部署前 deterministic policy 檢查（對 artifact）：roles、寫入、public、auth 一定要等於決定 112 嘅 frontmatter 宣告；SQL 通過決定 98 parser 白名單；UPDATE 一定要有引用主鍵／唯一鍵或者宣告篩選欄位、而且綁參數嘅 WHERE；保守規則拒絕冇 WHERE、常數或者恆真條件；判斷唔到即 fail closed；任何錯誤即 fail closed。 | 已確認（產品經理 2026-10-14） | 2C.3b、10.1 |
+| 115 | CODEOWNERS 唔再係主要閘門（決定 77 已經移除人手確認），只係建議。 | 已確認（產品經理 2026-10-14） | 2C.3b、9C |
+| 116 | Artifact 同 repo lock 嘅差異：release job 產生 artifact 同 repo lock 嘅 deterministic diff（SQL 先經 parse tree 正規化，只係格式唔同唔計），放入 job summary 並 attest；高風險 release 嘅 diff 涉及 roles、寫入、public、auth 或者 SQL 就失敗，錯誤訊息講明 artifact 同 repo lock 喺邊度唔同（lock id、section、step），直到 repo lock 更新到一致。 | 已確認（產品經理 2026-10-14） | 2C.3b |
 
 ## 1. 目錄同命名
 
@@ -518,6 +522,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - Model snapshot 淘汰（決定 35）：平台承諾宣布淘汰後最少保留 12 個月；項目有 90 日遷移窗口，窗口內舊 lock 照常有效、照常可以部署；窗口完結前未遷移，部署會被封鎖（runtime 已部署嘅 manifest 照常運作）。
 - 編譯一定要盡量 deterministic：固定 prompt、固定 snapshot；`temperature`、`top_p`、`seed` 等參數只喺 model capability 支援時先送固定值（決定 58，見 2A.8.6），唔支援就唔送，唔可以強送。決定性唔靠參數保證，靠 CI 重編比對。CI 會用 lock 記錄嘅 `compiler-hash` 重編一次比對；唔一致就**封鎖部署，冇任何 override**。
 - 翻譯（2.1a，決定 108–111）：譯文同 `translation` 欄位唔計入 `source-hash` 同 `compiler-hash`，所以翻譯 prompt 或者翻譯 model 改咗唔會令 lock 過時；但編譯（包括 `vibe build` 同 CI 重編）一定會用當前設定重新做翻譯同一致性檢查，失敗即封鎖。
+- **決定 113 修訂**：CI 重編再同 repo lock 比對（包括 `vibe build --check-determinism`）唔再係部署條件，只係資訊性訊號；部署只接受 CI 由 source 重新 build 嘅 artifact（2C.3b）。本文其他講「重編比對封鎖部署」嘅地方，一律以呢條為準。
 - 唔准手改 lock：要改就改 source 再重新編譯。Lock 冇簽名（決定 79），手改嘅 lock 會喺 CI 重編決定性檢查（2A.6）失敗，封鎖部署。
 
 ### 2A.7 獨立驗證器同編譯器隔離
@@ -858,6 +863,47 @@ Release ruleset 檢查（`v*` tag，決定 96）：
 - 任何 API 錯誤、404（除咗第 6 節 team membership 嘅 404 代表「唔係成員」）、403、rate limit（429，或者 `x-ratelimit-remaining: 0`）、分頁未讀完、回應格式唔啱，一律當驗證失敗（fail closed），唔會 retry 到放寬。
 - 驗證結果（PR 號碼、`B`、`H`、`P`、tree sha、用咗邊個 CODEOWNERS 檔、排除名單、對唔到嘅 co-author email、每個批准人嘅 login、id、來源同時間）寫入 manifest 同部署報告。
 - `release` environment 一定要設 **Required reviewers**（Jack）、**Prevent self-review 關閉**（決定 96：所有 agent 用 `j113203` push，開咗 Jack 就批唔到）、**Deployment branches and tags** 揀 Selected 而且只加 tag 規則 `v*`，同埋**唔好開 Allow administrators to bypass configured protection rules**（見 [`pr-review-guide.md`](pr-review-guide.md)）。
+
+### 2C.3b 部署來源同部署前檢查（決定 113–116，issue #97）
+
+v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 build 嘅 artifact」加 attestation 同 deterministic policy 檢查。
+
+#### 1. 部署輸入（決定 113，已確認（產品經理 2026-10-14））
+
+- Runtime 同部署器**只**接受 CI 喺 `release` environment 由 source 重新 build（`vibe build`，包括重新編譯）嘅 artifact（manifest 同佢包含嘅 lock 內容）。
+- Artifact 一定要有 GitHub artifact attestation（build provenance，predicate `https://slsa.dev/provenance/v1`），綁定：repo、workflow 路徑（例如 `.github/workflows/release.yml`）、受保護 ref（`refs/tags/v*`，決定 96）、commit SHA；runner 一定係 GitHub-hosted。
+- 另外照樣要有 KMS manifest 簽名（決定 79、89、92）。**KMS key 嘅建立、權限同輪換，喺實際部署之前一定要 Jack 本人批准**，唔喺產品經理代決範圍。
+- 部署器全部驗證，任何一樣失敗即拒絕部署：
+  - Attestation：例如 `gh attestation verify <artifact> --repo <owner>/<repo> --signer-workflow <owner>/<repo>/.github/workflows/release.yml --source-ref refs/tags/<tag> --source-digest <commit sha> --deny-self-hosted-runners`，或者用 sigstore 驗證同樣條件。
+  - Manifest 簽名用 pin 死嘅 release public key（決定 92）。
+  - Attestation 嘅 subject digest 一定等於實際部署嘅 artifact digest。
+- **Repo 入面嘅 `*.lock.md` 只係 review 副本**，永遠唔係部署輸入；部署器唔讀 repo lock。
+- 唔做「CI 重編再同 repo lock 逐字比對」做部署條件：LLM 輸出唔決定性，比對會隨機失敗；安全靠第 2 節嘅 deterministic 檢查。
+
+#### 2. 部署前 policy 檢查（決定 114，已確認（產品經理 2026-10-14））
+
+對 artifact 入面每個 lock 做 deterministic 檢查（普通程式、唔用 LLM），任何錯誤即 fail closed：
+
+- `roles`、寫入（`writes`）、`public`／`public-writes`、`auth` 一定要等於 source frontmatter 宣告（決定 112）；唔一致即失敗。
+- 所有 SQL 通過決定 98 嘅 parser 白名單（7.1a）。
+- `UPDATE`（`DELETE` 永遠唔准，決定 13）一定要有 `WHERE`，而且：
+  - 常數摺疊之後，條件唔可以係常數（例如恆真或者恆假）。
+  - 最少有一個「欄位 = 參數」或者「欄位同參數比較」，而嗰個欄位係主鍵、唯一鍵、或者 lock 宣告咗嘅篩選欄位。
+  - `OR` 任何一邊摺疊之後係恆真，即拒絕。
+  - 規則判斷唔到（例如太複雜嘅表達式），一律 fail closed。
+- 呢個檢查喺 release job 同部署器都做；部署器發現唔通過就拒絕，唔信 CI 結果。
+
+#### 3. CODEOWNERS（決定 115，已確認（產品經理 2026-10-14））
+
+- 決定 77 已經移除人手確認，CODEOWNERS 唔再係主要閘門，只係建議（仍然建議保護 `migrations/`、`.github/`、`.compiler/` 等路徑，見 [`pr-review-guide.md`](pr-review-guide.md)）。
+
+#### 4. Artifact 同 repo lock 嘅差異（決定 116，已確認（產品經理 2026-10-14））
+
+- 部署嘅 artifact 係新一次 LLM build，可能同已 review 嘅 repo lock 唔同。所以 release job 一定要：
+  - 產生 artifact 同 repo lock 嘅 deterministic diff（按 lock id 排序，逐 section 比對），寫入 job summary，同埋對 diff 檔做 attestation。
+  - SQL 先用 PostgreSQL 解析器轉成 parse tree 再正規化比對；只係空白、大小寫、換行等格式唔同唔算差異。
+  - 高風險 release：diff 涉及 roles、寫入、public、auth 或者任何 SQL，即失敗，直到 repo lock 更新到同 artifact 一致（即係重新 review）。錯誤訊息一定要講明喺邊度唔同：lock id、section、step 編號同欄位（例如 `cart-item/methods/add` 嘅 `## Steps` s2 SQL WHERE 唔同）。
+  - 其他 diff（例如描述文字）只顯示，唔阻擋。
 
 ### 2C.4 In-memory 執行器（決定 74，待產品經理確認）
 
@@ -1399,7 +1445,7 @@ migration 放喺 ./migrations/main/。
 仍然有效嘅防線：
 
 - 獨立 deterministic 驗證器（2A.7、第 10 節）：op 白名單、RLS、public 寫入規則、黑名單欄位、capability 規則、密碼同驗證寫入規則、語意一致性檢查；唔通過就唔可以 build。
-- CI 重編決定性檢查（2A.6）：lock 一定係 pin 死嘅編譯器喺 CI 重編得返嘅結果，冇人可以手改 lock 偷運邏輯；冇 override。
+- 部署來源（決定 113–116，取代 CI 重編決定性檢查做部署條件，見 2C.3b）：只接受 CI 由 source 重新 build、有 attestation 同 KMS 簽名嘅 artifact，部署前做 deterministic policy 檢查。舊條：CI 重編決定性檢查（2A.6）：lock 一定係 pin 死嘅編譯器喺 CI 重編得返嘅結果，冇人可以手改 lock 偷運邏輯；冇 override。
 - 資料庫層：每個 request 一個 transaction 加租戶 role（決定 97、99）、parser 白名單（決定 98）、`FORCE ROW LEVEL SECURITY`、non-owner role、column grant、冇 DELETE／TRUNCATE／DDL（7.1）。
 - Runtime 限制：只載入簽咗名嘅 manifest、唔解析 md、冇 `LLM_*`、對外 call 白名單、kill switch（9A）、固定最低回應耗時、配額同限流。
 - Manifest 簽名（決定 79、89、92、96）：release 只由受專用 release ruleset（bypass 一定要空）保護嘅 `v*` tag 出；release key 只喺受保護 tag 加有 required reviewers 嘅 GitHub environment，經 OIDC 綁定 KMS 使用；CI 冇 key 就失敗，唔 fallback；production 只信 pin 死嘅 release 公鑰，dev key 永遠唔信任。
@@ -3495,7 +3541,7 @@ security-items:
 
 私隱法（PDPO、GDPR）部分嘅建議請法律意見覆核。
 
-另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–112 已經由產品經理確認）；確認之前 v1.7 定稿照樣有效。
+另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–116 已經由產品經理確認）；確認之前 v1.7 定稿照樣有效。
 
 ## 14. 後續版本
 
