@@ -515,6 +515,14 @@ async fn cmd_serve(
     let key = manifest_key(project, run_env)?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
     check_deployable(&manifest, run_env)?;
+    // Decision 91: a manifest that is not `build-mode: dev` is production;
+    // the in-memory executor is refused, with no override.
+    if memory && manifest.provenance.build_mode != "dev" {
+        return Err(format!(
+            "--memory is a development executor and is refused for a `build-mode: {}` manifest; use PostgreSQL",
+            manifest.provenance.build_mode
+        ));
+    }
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::new())
     } else {
