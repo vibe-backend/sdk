@@ -110,6 +110,7 @@ pub struct AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    super::ops::warm_up();
     Router::new().fallback(handle).with_state(state)
 }
 
@@ -1607,6 +1608,7 @@ fn platform_status(code: &str) -> StatusCode {
         "FORBIDDEN" => StatusCode::FORBIDDEN,
         "UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
         "BAD_REQUEST" => StatusCode::BAD_REQUEST,
+        "SERVICE_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

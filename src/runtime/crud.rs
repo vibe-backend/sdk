@@ -7,6 +7,7 @@ use crate::manifest::{FieldSpec, Manifest, MethodSpec, ModelSpec};
 use super::exec::{etag, ExecError, QueryExec, Row};
 use super::sql::{Col, Sort, Stmt};
 
+#[derive(Debug)]
 pub struct CallResult {
     pub value: Value,
     pub etag: Option<String>,
@@ -116,7 +117,7 @@ async fn run_steps(
                     "hash-password" => super::ops::hash_password_op(step, &vars).await?,
                     "random-token" => super::ops::random_token(step, ctx)?,
                     "hash-token" => super::ops::hash_token(step, &vars, ctx)?,
-                    _ => super::ops::sign_jwt(method, step, &vars, ctx)?,
+                    _ => super::ops::sign_jwt(manifest, exec, method, step, &vars, ctx).await?,
                 };
                 if !step.out.is_empty() && step.out != "(none)" {
                     vars.insert(step.out.clone(), value.clone());

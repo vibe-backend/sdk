@@ -13,7 +13,7 @@ pub use http::{
     detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router, ApiKeyFile, AppState,
     AuthConfig, RunEnv, SigningKey, Slug, StoredKey, REQUEST_TYPES,
 };
-pub use ops::load_signing_keys;
+pub use ops::{custom_claim_problem, load_signing_keys};
 
 /// argon2id hash with the platform floor (for seeding test data).
 pub fn hash_password_for_tests(plain: &str) -> String {

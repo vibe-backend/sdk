@@ -20,10 +20,24 @@ fn argon_slots() -> &'static tokio::sync::Semaphore {
     SLOTS.get_or_init(|| tokio::sync::Semaphore::new(4))
 }
 
+/// Builds the dummy hash at startup so the first login does not pay for it.
+pub fn warm_up() {
+    let _ = dummy_hash();
+}
+
 /// Compared against when the user does not exist, so both paths cost the same.
 fn dummy_hash() -> &'static str {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| hash_password("dummy-password-for-timing").expect("dummy hash"))
+}
+
+/// Waits at most 5 s for an argon2 slot; a saturated instance answers 503.
+async fn argon_slot() -> Result<tokio::sync::SemaphorePermit<'static>, MethodFail> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), argon_slots().acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(internal("argon2 pool closed")),
+        Err(_) => Err(MethodFail::code("SERVICE_UNAVAILABLE", "Service is busy")),
+    }
 }
 
 fn opt<'a>(step: &'a StepSpec, key: &str) -> &'a str {
@@ -38,10 +52,25 @@ fn eval(expr: &str, vars: &Map<String, Value>) -> Result<Value, MethodFail> {
     eval_expr(expr, vars).map_err(internal)
 }
 
-fn hmac_hex(pepper: &[u8], value: &str) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(pepper).expect("hmac key");
-    mac.update(value.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
+fn hmac(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
+    mac.update(value);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Token hashes use a key derived from the pepper, never the pepper itself,
+/// so they cannot collide with other pepper uses (API-key hashes).
+fn token_key(pepper: &[u8]) -> Vec<u8> {
+    hmac(pepper, b"vibe/token-hash/v1")
+}
+
+/// HMAC-SHA-256 of a token as a PostgreSQL `bytea` literal (`\x...`), which
+/// a text-format parameter binds to a `bytea` column (decision 66).
+fn token_hash(pepper: &[u8], value: &str) -> String {
+    format!(
+        "\\x{}",
+        hex::encode(hmac(&token_key(pepper), value.as_bytes()))
+    )
 }
 
 fn as_param(value: Value) -> Option<String> {
@@ -76,12 +105,25 @@ pub async fn query(
     if step.table.starts_with("_platform") || step.sql.to_ascii_lowercase().contains("_platform_") {
         return Err(internal("platform tables cannot be queried"));
     }
+    let writes = crate::validate::sql_writes(&step.sql);
+    if writes && !step.writes {
+        return Err(internal("query writes but the step is not marked writes"));
+    }
+    if crate::validate::writable_cte(&step.sql) {
+        return Err(internal("data-modifying WITH queries are not allowed"));
+    }
+    // Spec §12.8: queries run as public_reader, or public_writer for writes.
+    let role = if writes {
+        "public_writer"
+    } else {
+        "public_reader"
+    };
     let mut params = Vec::with_capacity(step.params.len());
     for expr in &step.params {
         params.push(as_param(eval(expr, vars)?));
     }
     let rows = exec
-        .raw(ctx.tenant_id, &step.sql, params)
+        .raw(ctx.tenant_id, role, writes, &step.sql, params)
         .await
         .map_err(|err| match err {
             ExecError::Message(msg) if msg.contains("--memory") => internal(msg),
@@ -118,10 +160,7 @@ pub async fn verify_password(
             (dummy_hash().to_string(), false)
         }
     };
-    let _slot = argon_slots()
-        .acquire()
-        .await
-        .map_err(|_| internal("argon2 pool closed"))?;
+    let _slot = argon_slot().await?;
     let ok = tokio::task::spawn_blocking(move || {
         use argon2::password_hash::{PasswordHash, PasswordVerifier};
         let Ok(parsed) = PasswordHash::new(&hash) else {
@@ -143,36 +182,28 @@ pub async fn hash_password_op(
 ) -> Result<Value, MethodFail> {
     let plain = eval(opt(step, "plain"), vars)?;
     let plain = plain.as_str().unwrap_or("").to_string();
-    let _slot = argon_slots()
-        .acquire()
-        .await
-        .map_err(|_| internal("argon2 pool closed"))?;
+    let _slot = argon_slot().await?;
     let hash = tokio::task::spawn_blocking(move || hash_password(&plain))
         .await
         .map_err(|_| internal("argon2 task failed"))??;
     Ok(Value::String(hash))
 }
 
-/// `random-token`: `{value, hash}`; `value` is base64url (sensitive), `hash`
-/// is HMAC-SHA-256(pepper, value) hex, the same as `hash-token` of `value`.
+/// `random-token`: `{value, hash}`. `value` is 32 random bytes, base64url
+/// (sensitive); `hash` is HMAC-SHA-256 under the token key as a `bytea`
+/// literal, the same as `hash-token` of `value`.
 pub fn random_token(step: &StepSpec, ctx: CallCtx<'_>) -> Result<Value, MethodFail> {
-    let bytes: usize = match opt(step, "bytes") {
-        "" => 32,
-        raw => raw
-            .parse()
-            .map_err(|_| internal("random-token bytes must be a number"))?,
-    };
-    if !(16..=64).contains(&bytes) {
-        return Err(internal("random-token bytes must be 16..=64"));
+    if !matches!(opt(step, "bytes"), "" | "32") {
+        return Err(internal("random-token is always 32 bytes"));
     }
-    let mut buf = vec![0u8; bytes];
+    let mut buf = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut buf);
-    let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf);
-    let hash = hmac_hex(&ctx.auth.pepper, &value);
+    let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
+    let hash = token_hash(&ctx.auth.pepper, &value);
     Ok(serde_json::json!({"value": value, "hash": hash}))
 }
 
-/// `hash-token`: HMAC-SHA-256(pepper, value) hex; `normalize: email` trims and
+/// `hash-token`: HMAC-SHA-256 under the token key, as a `bytea` literal; `normalize: email` trims and
 /// lowercases first.
 pub fn hash_token(
     step: &StepSpec,
@@ -188,27 +219,61 @@ pub fn hash_token(
         "email" => text.trim().to_lowercase(),
         other => return Err(internal(format!("unknown normalize {other}"))),
     };
-    Ok(Value::String(hmac_hex(&ctx.auth.pepper, &text)))
+    Ok(Value::String(token_hash(&ctx.auth.pepper, &text)))
 }
 
-/// Claims the platform sets; a method's `claims` may not name them.
-const PLATFORM_CLAIMS: &[&str] = &[
-    "iss",
-    "aud",
-    "exp",
-    "nbf",
-    "iat",
-    "jti",
-    "tenant_id",
-    "roles",
-    "scope",
-    "scp",
-];
+/// Custom claim names a `sign-jwt` step may set: declared in `custom-claims`,
+/// a plain identifier, not a reserved JWT claim and not a roles claim.
+pub fn custom_claim_problem(
+    name: &str,
+    declared: &[String],
+    roles_claims: &[&str],
+) -> Option<String> {
+    if !declared.iter().any(|d| d == name) {
+        return Some(format!("claim {name} is not declared in custom-claims"));
+    }
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Some(format!("custom claim {name} must be a plain identifier"));
+    }
+    let lower = name.to_ascii_lowercase();
+    if crate::manifest::RESERVED_JWT_CLAIMS.contains(&lower.as_str()) || lower == "roles" {
+        return Some(format!("claim {name} is set by the platform"));
+    }
+    // A roles claim may be a dotted path (`realm_access.roles`): its first
+    // segment is off limits too.
+    if roles_claims.iter().any(|rc| {
+        let rc = rc.to_ascii_lowercase();
+        rc == lower || rc.split('.').next() == Some(lower.as_str())
+    }) {
+        return Some(format!("claim {name} is a configured roles claim"));
+    }
+    None
+}
 
-/// `sign-jwt`: only in methods with `capabilities: [sign-token]`. `tenant_id`
-/// is always the request's tenant (decision 62); iss/aud come from the
-/// runtime; ttl is capped at 1 h.
-pub fn sign_jwt(
+/// Every roles claim the runtime reads: the global one and per-route ones.
+fn roles_claims<'a>(
+    manifest: &'a crate::manifest::Manifest,
+    auth: &'a super::http::AuthConfig,
+) -> Vec<&'a str> {
+    let mut out = vec![auth.roles_claim.as_str(), "roles"];
+    out.extend(
+        manifest
+            .routes
+            .iter()
+            .map(|r| r.roles_claim.as_str())
+            .filter(|c| !c.is_empty()),
+    );
+    out
+}
+
+/// `sign-jwt`: only in methods with `capabilities: [sign-token]`. `sub` comes
+/// from `claims`; roles are read by the platform from `users.roles` for that
+/// `sub` (spec §12.8), never from the lock. Other claims must be declared in
+/// `custom-claims`. `tenant_id` is the request's tenant (decision 62); iss/aud
+/// come from the runtime; ttl is capped at 1 h.
+pub async fn sign_jwt(
+    manifest: &crate::manifest::Manifest,
+    exec: &dyn QueryExec,
     method: &MethodSpec,
     step: &StepSpec,
     vars: &Map<String, Value>,
@@ -217,11 +282,16 @@ pub fn sign_jwt(
     if !method.capabilities.iter().any(|c| c == "sign-token") {
         return Err(internal("sign-jwt requires capabilities: [sign-token]"));
     }
+    if !opt(step, "roles").is_empty() {
+        return Err(internal(
+            "sign-jwt roles are read from users.roles by the platform; remove `roles`",
+        ));
+    }
     match opt(step, "issue-refresh") {
-        "" | "none" | "platform-decided" => {}
+        "" | "none" => {}
         other => {
             return Err(internal(format!(
-                "issue-refresh {other} is not supported yet"
+                "issue-refresh {other} is not supported by this runtime yet"
             )))
         }
     }
@@ -246,30 +316,41 @@ pub fn sign_jwt(
     if ttl_ms == 0 || ttl_ms > 3_600_000 {
         return Err(internal("access token ttl must be within 1h"));
     }
+    let declared = match opt(step, "custom-claims") {
+        "" => Vec::new(),
+        raw => crate::lock::parse_string_list(raw).map_err(internal)?,
+    };
+    let reserved_roles = roles_claims(manifest, ctx.auth);
     let mut claims = Map::new();
+    let mut sub = String::new();
     if !opt(step, "claims").is_empty() {
         let pairs = crate::lock::parse_inline_map(opt(step, "claims")).map_err(internal)?;
         for (name, expr) in pairs {
-            if PLATFORM_CLAIMS.contains(&name.as_str()) {
-                return Err(internal(format!("claim {name} is set by the platform")));
+            let value = eval(&expr, vars)?;
+            if name == "sub" {
+                sub = value.as_str().unwrap_or("").to_string();
+                continue;
             }
-            claims.insert(name, eval(&expr, vars)?);
+            if let Some(problem) = custom_claim_problem(&name, &declared, &reserved_roles) {
+                return Err(internal(problem));
+            }
+            claims.insert(name, value);
         }
     }
-    let sub = claims.get("sub").and_then(Value::as_str).unwrap_or("");
     if sub.is_empty() {
         return Err(internal("sign-jwt needs a sub claim"));
     }
-    let roles = match opt(step, "roles") {
-        "" => Value::Array(Vec::new()),
-        expr => match eval(expr, vars)? {
-            Value::Array(items) if items.iter().all(Value::is_string) => Value::Array(items),
-            Value::Null => Value::Array(Vec::new()),
-            _ => return Err(internal("roles must be a list of strings")),
-        },
-    };
+    let roles = exec
+        .user_roles(ctx.tenant_id, &sub)
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = ?err, "sign-jwt roles lookup failed");
+            internal("sign-jwt roles lookup failed")
+        })?
+        .ok_or_else(|| internal("sign-jwt sub is not a user"))?;
     let now = chrono::Utc::now().timestamp();
     let ttl = (ttl_ms / 1000) as i64;
+    claims.insert("sub".into(), sub.into());
     claims.insert("iss".into(), ctx.auth.iss.clone().into());
     claims.insert("aud".into(), ctx.auth.aud.clone().into());
     claims.insert("iat".into(), now.into());
@@ -277,7 +358,10 @@ pub fn sign_jwt(
     claims.insert("exp".into(), (now + ttl).into());
     claims.insert("jti".into(), uuid::Uuid::new_v4().to_string().into());
     claims.insert("tenant_id".into(), ctx.tenant_id.into());
-    claims.insert(ctx.auth.roles_claim.clone(), roles);
+    claims.insert(
+        ctx.auth.roles_claim.clone(),
+        Value::Array(roles.into_iter().map(Value::String).collect()),
+    );
     let mut header = jsonwebtoken::Header::new(alg);
     header.kid = Some(key.kid.clone());
     let token = jsonwebtoken::encode(&header, &Value::Object(claims), &key.key)

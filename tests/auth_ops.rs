@@ -122,7 +122,34 @@ async fn random_token_hash_matches_hash_token_and_email_normalizes() {
     assert_eq!(out["vt"]["value"].as_str().unwrap().len(), 43);
     assert_eq!(out["vt"]["hash"], out["h1"]);
     assert_eq!(out["e1"], out["e2"]);
-    assert_eq!(out["h1"].as_str().unwrap().len(), 64);
+    // bytea literal of a 32-byte HMAC, keyed by a key derived from the
+    // pepper (not the pepper itself).
+    let h1 = out["h1"].as_str().unwrap();
+    assert!(h1.starts_with("\\x") && h1.len() == 66, "{h1}");
+    let plain = {
+        use hmac::{Hmac, Mac};
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&auth().pepper).unwrap();
+        mac.update(out["vt"]["value"].as_str().unwrap().as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    };
+    assert_ne!(
+        &h1[2..],
+        plain,
+        "token hashes are domain-separated from the pepper"
+    );
+}
+
+#[tokio::test]
+async fn random_token_is_always_32_bytes() {
+    let m = method_manifest(
+        &[],
+        json!([
+            step("random-token", "vt", json!({"opts": {"bytes": "16"}})),
+            respond("vt")
+        ]),
+    );
+    let err = run(&m, &MemoryExec::new(), json!({})).await.unwrap_err();
+    assert!(err.1.contains("32 bytes"), "{err:?}");
 }
 
 #[tokio::test]
@@ -167,59 +194,288 @@ async fn hash_and_verify_password_with_dummy_hash_for_missing_users() {
     assert_eq!(weak.0, "WEAK_PASSWORD");
 }
 
+fn sign_steps(opts: Value) -> Value {
+    let mut all = json!({"alg": "ES256", "key-ref": "JWT_SIGNING_KEY", "ttl": "15m"});
+    for (k, v) in opts.as_object().unwrap() {
+        all[k] = v.clone();
+    }
+    json!([
+        step("sign-jwt", "tok", json!({ "opts": all })),
+        respond("tok")
+    ])
+}
+
+/// A memory store with user u1 holding roles [staff].
+fn users() -> MemoryExec {
+    let exec = MemoryExec::new();
+    exec.seed(
+        "tenant0001",
+        "users",
+        json!({"id": "u1", "tenant_id": "tenant0001", "roles": ["staff"]})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    exec
+}
+
+fn decode(token: &str) -> jsonwebtoken::TokenData<Value> {
+    let mut v = Validation::new(Algorithm::ES256);
+    v.set_issuer(&["https://auth.localhost/shop"]);
+    v.set_audience(&["shop"]);
+    jsonwebtoken::decode::<Value>(
+        token,
+        &DecodingKey::from_ec_pem(PUBLIC_PEM.as_bytes()).unwrap(),
+        &v,
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 async fn sign_jwt_requires_capability_and_sets_platform_claims() {
-    let steps = |claims: &str| {
-        json!([
-            step(
-                "sign-jwt",
-                "tok",
-                json!({"opts": {"alg": "ES256", "key-ref": "JWT_SIGNING_KEY",
-                "claims": claims, "roles": "input.roles", "ttl": "15m"}})
-            ),
-            respond("tok"),
-        ])
-    };
-    let no_cap = method_manifest(&[], steps("{ sub: input.sub }"));
-    assert!(run(&no_cap, &MemoryExec::new(), json!({"sub": "u1"}))
-        .await
-        .is_err());
+    let no_cap = method_manifest(&[], sign_steps(json!({"claims": "{ sub: input.sub }"})));
+    assert!(run(&no_cap, &users(), json!({"sub": "u1"})).await.is_err());
     for reserved in [
         "{ sub: input.sub, tenant_id: input.t }",
         "{ sub: input.sub, aud: input.t }",
     ] {
-        let m = method_manifest(&["sign-token"], steps(reserved));
-        let err = run(&m, &MemoryExec::new(), json!({"sub": "u1", "t": "x"}))
+        let m = method_manifest(
+            &["sign-token"],
+            sign_steps(json!({"claims": reserved, "custom-claims": "[tenant_id, aud]"})),
+        );
+        let err = run(&m, &users(), json!({"sub": "u1", "t": "x"}))
             .await
             .unwrap_err();
         assert!(err.1.contains("set by the platform"), "{err:?}");
     }
-    let m = method_manifest(&["sign-token"], steps("{ sub: input.sub }"));
+    let m = method_manifest(
+        &["sign-token"],
+        sign_steps(json!({"claims": "{ sub: input.sub }"})),
+    );
     let out = run(
         &m,
-        &MemoryExec::new(),
-        json!({"sub": "u1", "roles": ["staff"], "tenant_id": "evil0001"}),
+        &users(),
+        json!({"sub": "u1", "roles": ["admin"], "tenant_id": "evil0001"}),
     )
     .await
     .unwrap();
     assert_eq!(out["token_type"], "Bearer");
     assert_eq!(out["expires_in"], 900);
-    let mut v = Validation::new(Algorithm::ES256);
-    v.set_issuer(&["https://auth.localhost/shop"]);
-    v.set_audience(&["shop"]);
-    let data = jsonwebtoken::decode::<Value>(
-        out["access_token"].as_str().unwrap(),
-        &DecodingKey::from_ec_pem(PUBLIC_PEM.as_bytes()).unwrap(),
-        &v,
-    )
-    .unwrap();
+    let data = decode(out["access_token"].as_str().unwrap());
     assert_eq!(
         data.claims["tenant_id"], "tenant0001",
         "tenant from ctx only"
     );
     assert_eq!(data.claims["sub"], "u1");
-    assert_eq!(data.claims["roles"], json!(["staff"]));
+    assert_eq!(
+        data.claims["roles"],
+        json!(["staff"]),
+        "roles from users.roles"
+    );
     assert_eq!(data.header.kid.as_deref(), Some("local"));
+}
+
+#[tokio::test]
+async fn sign_jwt_roles_never_come_from_the_lock_or_input() {
+    // A lock that tries to pass roles through is refused outright.
+    let m = method_manifest(
+        &["sign-token"],
+        sign_steps(json!({"claims": "{ sub: input.sub }", "roles": "input.roles"})),
+    );
+    let err = run(&m, &users(), json!({"sub": "u1", "roles": ["admin"]}))
+        .await
+        .unwrap_err();
+    assert!(err.1.contains("users.roles"), "{err:?}");
+    // A sub that is not a user gets no token.
+    let m = method_manifest(
+        &["sign-token"],
+        sign_steps(json!({"claims": "{ sub: input.sub }"})),
+    );
+    let err = run(&m, &users(), json!({"sub": "ghost"}))
+        .await
+        .unwrap_err();
+    assert!(err.1.contains("not a user"), "{err:?}");
+}
+
+#[tokio::test]
+async fn sign_jwt_custom_claims_are_an_allowlist_without_roles_claims() {
+    let claims =
+        |c: &str, declared: &str| sign_steps(json!({"claims": c, "custom-claims": declared}));
+    // Undeclared claim.
+    let m = method_manifest(
+        &["sign-token"],
+        claims("{ sub: input.sub, plan: input.p }", "[]"),
+    );
+    let err = run(&m, &users(), json!({"sub": "u1", "p": "pro"}))
+        .await
+        .unwrap_err();
+    assert!(err.1.contains("not declared"), "{err:?}");
+    // Declared claim is signed.
+    let m = method_manifest(
+        &["sign-token"],
+        claims("{ sub: input.sub, plan: input.p }", "[plan]"),
+    );
+    let out = run(&m, &users(), json!({"sub": "u1", "p": "pro"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        decode(out["access_token"].as_str().unwrap()).claims["plan"],
+        "pro"
+    );
+    // The configured roles claim (VIBE_JWT_ROLES_CLAIM) can never be set,
+    // even when declared.
+    let mut a = auth();
+    a.roles_claim = "groups".into();
+    let m = method_manifest(
+        &["sign-token"],
+        claims("{ sub: input.sub, groups: input.g }", "[groups]"),
+    );
+    let err = run_method(
+        &m,
+        &users(),
+        "t.run",
+        &json!({"sub": "u1", "g": ["admin"]}),
+        ctx(&a, "tenant0001"),
+        0,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.message.contains("roles claim"), "{err:?}");
+    // Nor a per-route roles-claim (first segment of a dotted path).
+    let mut m = method_manifest(
+        &["sign-token"],
+        claims(
+            "{ sub: input.sub, realm_access: input.g }",
+            "[realm_access]",
+        ),
+    );
+    let mut route = fixture().routes[0].clone();
+    route.roles_claim = "realm_access.roles".into();
+    m.routes.push(route);
+    let err = run(
+        &m,
+        &users(),
+        json!({"sub": "u1", "g": {"roles": ["admin"]}}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.1.contains("roles claim"), "{err:?}");
+}
+
+#[tokio::test]
+async fn sign_jwt_refuses_issue_refresh_until_supported() {
+    let m = method_manifest(
+        &["sign-token"],
+        sign_steps(json!({"claims": "{ sub: input.sub }", "issue-refresh": "platform-decided"})),
+    );
+    let err = run(&m, &users(), json!({"sub": "u1"})).await.unwrap_err();
+    assert!(err.1.contains("issue-refresh"), "{err:?}");
+}
+
+/// The runtime's own JWT verification accepts what sign-jwt issues: a
+/// role-gated route lets the signed token through.
+#[tokio::test]
+async fn signed_token_round_trips_through_runtime_verification() {
+    let m = method_manifest(
+        &["sign-token"],
+        sign_steps(json!({"claims": "{ sub: input.sub }"})),
+    );
+    let exec = users();
+    let out = run(&m, &exec, json!({"sub": "u1"})).await.unwrap();
+    let token = out["access_token"].as_str().unwrap().to_string();
+    let mut gated = fixture();
+    gated.routes = vec![serde_json::from_value(json!({
+        "method": "GET", "path": "/v1/me", "feature_id": "me/v1/get",
+        "public": false, "auth_removed": false, "auth_mode": "jwt", "roles": ["staff"],
+        "scopes": [], "rates": [], "body_limit": 4096, "request": [],
+        "transform_in": "{}", "transform_out": "result",
+        "steps": [step("respond", "", json!({"status": 204}))],
+        "errors": [], "min_response_ms": 0, "public_writes": false, "challenge_type": "none",
+        "challenge_when": "always", "deprecated": false, "sunset": ""
+    }))
+    .unwrap()];
+    let app = router(Arc::new(AppState {
+        manifest: gated,
+        exec: Arc::new(exec),
+        auth: auth(),
+        slugs: HashMap::new(),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
+        trusted_proxies: Vec::new(),
+        disabled: std::collections::HashSet::new(),
+        min_override_ms: None,
+        honor_test_ip: true,
+        dev_hints: false,
+    }));
+    let call = |bearer: String| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .uri("/v1/me")
+                    .header("authorization", bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+    };
+    assert_eq!(
+        call(format!("Bearer {token}")).await,
+        StatusCode::NO_CONTENT
+    );
+    let mut tampered = token.clone();
+    tampered.pop();
+    tampered.push(if token.ends_with('A') { 'B' } else { 'A' });
+    assert_eq!(
+        call(format!("Bearer {tampered}")).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn query_rejects_data_modifying_with_and_unmarked_writes() {
+    for (sql, writes) in [
+        (
+            "with x as (insert into users (email) values ($1) returning id) select id from x",
+            false,
+        ),
+        (
+            "with x as (update users set email = $1 where id = $1 returning id) select * from x",
+            false,
+        ),
+        ("insert into users (email) values ($1)", false),
+    ] {
+        let m = method_manifest(
+            &[],
+            json!([
+                step(
+                    "query",
+                    "u",
+                    json!({"sql": sql, "params": ["input.e"], "table": "users", "writes": writes})
+                ),
+                respond("u")
+            ]),
+        );
+        let err = run(&m, &MemoryExec::new(), json!({"e": "x"}))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.1.contains("--memory"),
+            "rejected before execution: {sql} {err:?}"
+        );
+    }
+    assert!(vibe::validate::writable_cte(
+        "WITH x AS (DELETE FROM users RETURNING id) SELECT id FROM x"
+    ));
+    assert!(!vibe::validate::writable_cte(
+        "select id from users where email = $1"
+    ));
+    assert!(!vibe::validate::writable_cte(
+        "update users set email = $1 where id = $2"
+    ));
 }
 
 #[test]
@@ -249,8 +505,19 @@ async fn query_steps_need_postgres() {
 
 // ---- PostgreSQL ----
 
-async fn pg_app() -> Option<(axum::Router, tokio_postgres::Client, String)> {
-    let admin_url = std::env::var("VIBE_TEST_PG_ADMIN_URL").ok()?;
+/// Serialises fixture setup: the query roles are cluster-wide.
+static PG_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// `None` locally without VIBE_TEST_PG_ADMIN_URL; in CI (`CI` set) a missing
+/// database is a failure, not a skip.
+async fn pg_app() -> Option<(axum::Router, tokio_postgres::Client, String, String)> {
+    let Ok(admin_url) = std::env::var("VIBE_TEST_PG_ADMIN_URL") else {
+        if std::env::var_os("CI").is_some() {
+            panic!("VIBE_TEST_PG_ADMIN_URL must be set in CI; Postgres tests cannot be skipped");
+        }
+        return None;
+    };
+    let _setup = PG_SETUP.lock().await;
     let (admin, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
         .await
         .unwrap();
@@ -269,6 +536,7 @@ async fn pg_app() -> Option<(axum::Router, tokio_postgres::Client, String)> {
     let mut url = url::Url::parse(&admin_url).unwrap();
     url.set_username(&app_role).unwrap();
     url.set_password(Some("pw")).unwrap();
+    let app_url = url.to_string();
     let exec = PgExec::connect(url.as_str()).await.unwrap();
     let mut slugs = HashMap::new();
     slugs.insert(
@@ -292,7 +560,7 @@ async fn pg_app() -> Option<(axum::Router, tokio_postgres::Client, String)> {
         honor_test_ip: true,
         dev_hints: false,
     }));
-    Some((app, admin, tenant))
+    Some((app, admin, tenant, app_url))
 }
 
 async fn login(app: &axum::Router, email: &str, password: &str) -> (StatusCode, Value, u128) {
@@ -327,7 +595,7 @@ async fn login(app: &axum::Router, email: &str, password: &str) -> (StatusCode, 
 
 #[tokio::test]
 async fn login_requires_verified_email_and_hides_why_it_failed() {
-    let Some((app, admin, tenant)) = pg_app().await else {
+    let Some((app, admin, tenant, _)) = pg_app().await else {
         eprintln!("VIBE_TEST_PG_ADMIN_URL not set; skipping Postgres test");
         return;
     };
@@ -375,4 +643,71 @@ async fn login_requires_verified_email_and_hides_why_it_failed() {
     );
     assert_eq!(wrong, unknown, "same body for unknown user");
     assert!(wrong.to_string().contains("INVALID_CREDENTIALS"), "{wrong}");
+}
+
+#[tokio::test]
+async fn query_runs_as_public_reader_in_a_read_only_transaction() {
+    let Some((_app, _admin, tenant, url)) = pg_app().await else {
+        eprintln!("VIBE_TEST_PG_ADMIN_URL not set; skipping Postgres test");
+        return;
+    };
+    let exec = PgExec::connect(&url).await.unwrap();
+    let m = method_manifest(
+        &[],
+        json!([
+            step(
+                "query",
+                "u",
+                json!({"table": "users",
+                "sql": "select current_user::text as who, current_setting('transaction_read_only') as ro"})
+            ),
+            respond("u")
+        ]),
+    );
+    let auth = auth();
+    let out = run_method(&m, &exec, "t.run", &json!({}), ctx(&auth, &tenant), 0)
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(out, json!({"who": "public_reader", "ro": "on"}));
+}
+
+/// Cross-tenant read through a query step that rewrites `app.tenant_id`.
+/// Known v1 blocker: the structural fix (per-tenant DB role + SQL parser
+/// allowlist) waits on a pending spec change; un-ignore when it lands.
+#[tokio::test]
+#[ignore = "pending spec: per-tenant role isolation for query steps"]
+async fn query_cannot_read_another_tenant() {
+    let Some((_app, admin, tenant_a, url)) = pg_app().await else {
+        return;
+    };
+    let Some((_app_b, _, tenant_b, _)) = pg_app().await else {
+        return;
+    };
+    admin
+        .execute(
+            &format!(
+                "INSERT INTO t_{tenant_b}.users (tenant_id, email) VALUES ($1, 'secret@b.example')"
+            ),
+            &[&tenant_b],
+        )
+        .await
+        .unwrap();
+    let exec = PgExec::connect(&url).await.unwrap();
+    let sql = format!(
+        "select email from t_{tenant_b}.users where set_config('app.tenant_id', '{tenant_b}', true) is not null"
+    );
+    let m = method_manifest(
+        &[],
+        json!([
+            step("query", "u", json!({"table": "users", "sql": sql})),
+            respond("u")
+        ]),
+    );
+    let auth = auth();
+    let out = run_method(&m, &exec, "t.run", &json!({}), ctx(&auth, &tenant_a), 0).await;
+    assert!(
+        !matches!(&out, Ok(r) if r.value.to_string().contains("secret@b.example")),
+        "tenant {tenant_a} read tenant {tenant_b}: {out:?}"
+    );
 }

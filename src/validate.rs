@@ -404,6 +404,35 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                     Diag::error(file, "sign-jwt key must be a key-ref").at_step(&block.heading),
                 );
             }
+            if !block_val(block, "roles").is_empty() {
+                report.push(
+                    Diag::error(
+                        file,
+                        "sign-jwt roles come from users.roles (read by the platform); remove `roles`",
+                    )
+                    .at_step(&block.heading),
+                );
+            }
+            if !matches!(block_val(block, "issue-refresh").as_str(), "" | "none") {
+                report.push(
+                    Diag::error(
+                        file,
+                        "sign-jwt issue-refresh is not supported by this runtime yet",
+                    )
+                    .at_step(&block.heading),
+                );
+            }
+            let declared = crate::lock::parse_string_list(&block_val(block, "custom-claims"))
+                .unwrap_or_default();
+            if let Ok(pairs) = crate::lock::parse_inline_map(&block_val(block, "claims")) {
+                for (name, _) in pairs.iter().filter(|(name, _)| name != "sub") {
+                    if let Some(problem) =
+                        crate::runtime::custom_claim_problem(name, &declared, &["roles"])
+                    {
+                        report.push(Diag::error(file, problem).at_step(&block.heading));
+                    }
+                }
+            }
             if let Some(ms) = crate::llm::parse_duration_ms(&block_val(block, "ttl")) {
                 if ms > 3_600_000 {
                     report.push(
@@ -416,6 +445,20 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
         if op == "query" {
             let sql = block_val(block, "sql").trim_matches('`').to_string();
             saw_write |= sql_writes(&sql);
+            if sql_writes(&sql) && block_val(block, "writes") != "true" {
+                report.push(
+                    Diag::error(file, "a query step that writes needs writes: true")
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+            }
+            if writable_cte(&sql) {
+                report.push(
+                    Diag::error(file, "data-modifying WITH queries are not allowed")
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+            }
             for problem in sql_problems(&sql, &block_val(block, "params"), false) {
                 report.push(
                     Diag::error(file, problem)
@@ -902,6 +945,7 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
     }
     if !migration
         && (lower.starts_with("select")
+            || lower.starts_with("with")
             || lower.starts_with("insert")
             || lower.starts_with("update"))
     {
@@ -928,7 +972,16 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
     problems
 }
 
-fn sql_writes(sql: &str) -> bool {
+/// A SELECT/WITH query that also modifies data (`WITH x AS (INSERT ...)`),
+/// which would write inside a read step. Conservative: any DML keyword in a
+/// statement that does not itself start with INSERT/UPDATE counts.
+pub fn writable_cte(sql: &str) -> bool {
+    static DML: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\b(insert|update|delete|merge)\b").expect("regex"));
+    !sql_writes(sql) && DML.is_match(sql)
+}
+
+pub fn sql_writes(sql: &str) -> bool {
     let lower = sql.trim().trim_matches('`').to_ascii_lowercase();
     lower.starts_with("insert") || lower.starts_with("update")
 }
