@@ -197,12 +197,12 @@
 | 87 | 11.3 `_version` 同 11.4 create-user 嘅 rate-limit 補 `key`（分別係 `user` 同 `user`），合 4.3 schema；冇 `key` 嘅 rate-limit 係驗證器 error。 | 待產品經理確認 | 11.3、11.4、10.3 |
 | 88 | Admin 建立用戶時遇到自己註冊緊（未驗證、冇密碼）嘅同一個 email：當同一個用戶處理，邀請 token 取代註冊 token（`email_verify_purpose` 變 `invite`），用戶只會收到邀請信。 | 待產品經理確認 | 11.4 |
 | 89 | 產品經理基線 1：release manifest 只可以喺有專用 release ruleset 嘅 `v*` tag（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；真正閘門係要 Jack 批准嘅 `release` environment）（v1.8 修訂：唔再由 `main` 直接出 release，見決定 96）、經有 required reviewers（Jack）、只准 `v*` tag、唔准 admin bypass 嘅 GitHub environment `release`（Prevent self-review 關閉，見決定 96）、用 OIDC 綁定嘅 KMS key 簽；依賴 issue #28（release.yml 加固）完成先可以出第一個 release。 | 待產品經理確認 | 2C.3、9B、9C |
-| 90 | 產品經理基線 2：release build 有高風險 `security-items` 就 fail closed，除非提供有效嘅 `--release-approval`（`pr:<n>`、`env:<run_id>` 或者兩者合併）。驗證（2C.3a）：搵返 build commit 屬於嘅唯一 merged PR，批准一定要喺 PR 最後 head SHA 上，而 build commit 嘅 tree 要同 PR head 一樣（要開 Require branches to be up to date）；合資格批准人要有 write 權限、唔喺排除名單（PR 所有 commit 嘅 author、committer、對到嘅 co-author、PR 作者、env run 觸發者）、唔係 bot，高風險路徑要係 CODEOWNER（由 PR base 讀，SDK 自己計；team owner 要 GitHub App token，冇就失敗；改 CODEOWNERS 本身係高風險）；`main` 一定要用 ruleset 開 Require approval of the most recent reviewable push；唔支援 merge queue；高風險要 2 個唔同批准人（PR review 同 environment approval 合併計）；任何 API 錯誤即失敗。Release environment 嘅 Prevent self-review 由決定 96 改為關閉；env run 觸發者嘅批准唔計入合資格批准人。批准參照寫入 manifest 同部署報告（同已移除嘅 lock `approval-ref` 無關）。 | 待產品經理確認 | 2A.5、2C.3a、9C |
+| 90 | 產品經理基線 2（同決定 118 對齊）：release build 有高風險 `security-items` 就 fail closed，除非提供有效嘅 `--release-approval`（`env:<run_id>`，可以加 `pr:<n>`）。`--release-approval` **唔數 PR review 做批准**；真正批准係 `release` environment 由 Jack 批准（決定 118）。佢只驗證 deterministic 前置條件同批准存在（2C.3a）：`tree(B) == tree(H)`、build commit 喺 `main`、ruleset 同 CODEOWNERS 設定、attestation 輸入（repo、workflow、tag、commit SHA）一致，同埋呢個 run 有 `release` environment 嘅 approved 紀錄；任何 API 錯誤即失敗。驗證結果寫入 manifest 同部署報告。 | 已確認（產品經理 2026-10-14） | 2A.5、2C.3a、9C |
 | 91 | 產品經理基線 3：production 一律拒絕 in-memory 資料庫，啟動直接報錯退出；冇任何 override 旗標。Production 定義只睇 build-mode 同環境：manifest 唔係 `build-mode: dev`，或者 `VIBE_ENV=production`。Listen 地址唔係 loopback（例如 Docker 入面 `vibe dev` 綁 `0.0.0.0`）只會警告，唔會拒絕；Docker 入面請明確設 `VIBE_ENV=development`。 | 待產品經理確認 | 2C.4、9C |
 | 92 | 產品經理基線 4：CI release build 攞唔到 KMS key 就失敗，永遠唔 fallback 去 dev key；production runtime 只信任平台 pin 死嘅 release 公鑰，dev key 永遠唔信任。 | 待產品經理確認 | 2C.2、2C.3、9B |
 | 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；`vibe build` release 模式檢查 CODEOWNERS 覆蓋路徑，冇就失敗。 | 已確認（產品經理 2026-10-14）：CODEOWNERS required 係 source PR 合併條件 | 2A.7、9B |
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 待產品經理確認 | 文件標頭、網站 |
-| 95 | create-user 邀請失敗：`user.invite` 嘅 enqueue（s4）失敗時，create-user 回 503 `INVITE_DELIVERY_FAILED`（只帶 `Retry-After`，body 唔帶 `user_id`），唔回 201／200；因為 s2 已經輪換咗 token 但信冇寄出，用戶手上冇有效連結，恢復方法係重試 create-user（決定 85）或者 re-invite（決定 86），兩者都會發新 token 同新信。同 issue #26（auth flow 實作）相關。v1.8 修訂（決定 99，已確認（產品經理 2026-10-14））：成個 request 喺同一個 transaction，enqueue 失敗會 rollback 埋 token 輪換同用戶建立；邀請信經 transactional outbox：`email_outbox` 列同其他寫入喺同一個 transaction 寫入，commit 之後先由 mail worker 寄出，commit 之前永遠唔寄；rollback 會連 outbox 列一齊丟棄。 | 待產品經理確認 | 11.4、11.4a |
+| 95 | create-user 邀請（v1.8 修訂）：邀請信寫入 transactional outbox（同其他寫入同一個 transaction）之後，create-user 同 re-invite 回 **202**，body 帶 `user_id` 同 `invite_status: invite_pending`。Mail worker 喺背景寄同重試；超過重試上限標 `delivery_failed`。邀請狀態（`invite_pending`／`sent`／`delivery_failed`）可以查詢，亦可以經 re-invite 重寄。只有 transaction 失敗（outbox 冇寫入，成個 request rollback，決定 99）先回 503 `INVITE_NOT_QUEUED`（帶 `Retry-After`）。`INVITE_DELIVERY_FAILED` 唔再係 503 錯誤碼，改為狀態值 `delivery_failed`。同 issue #26 相關。 | 已確認（產品經理 2026-10-14） | 11.4、11.4a、11.4b |
 | 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i) 做**臨時方案**）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。高風險 `--release-approval` 係計劃中、未實作，實作後先額外把關。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，同時開返 Prevent self-review。另外 live `release` environment `can_admins_bypass` 而家係 `true`，Jack 負責關閉。高風險 release build 用只有 Administration: read 嘅專用 GitHub App 讀呢個 ruleset，讀唔到、`bypass_actors` 唔係空、唔係 active、缺少三條 rule、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass，SDK 唔檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval`（未實作）實作後會獨立驗證 PR review（2C.3a）。普通 build 只記錄。 | 待產品經理確認 | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
 | 97 | 租戶隔離身份（v1 blocker）：runtime 為每個（租戶、role 類別）開獨立連線池，直接以 `LOGIN` 租戶 role 登入再執行 lock SQL；runtime 連線 role 同租戶 role 之間冇任何 membership，租戶連線入面冇辦法切返其他身份（唔用 `SET LOCAL ROLE`；除非之後證明 PostgreSQL 17 嘅 `SET LOCAL ROLE` 不可逆）。租戶 role `NOINHERIT`、只有自己 schema 嘅權限、唔係其他 role 嘅成員；憑證只存 runtime secret store。平台表（refresh token、idempotency、outbox）只喺租戶自己 schema，租戶 role 讀唔到任何跨租戶共用表。`app.tenant_id` 之類 GUC 只可以輔助（例如 log），永遠唔係身份來源。安全細節經私人 security advisory 處理。 | 已確認（產品經理 2026-10-14） | 7.1、7.1a、9C |
 | 98 | Lock SQL parser 白名單：用 PostgreSQL 解析器（例如 `pg_query`）解析，只准單一 DML statement；禁止 transaction 控制、身份切換語句、會話設定修改同 schema-qualified 名稱；function 同 type 只准白名單；解析失敗即 fail closed。Conformance 要有跨租戶負面測試。 補充（已確認（產品經理 2026-10-14），Code Reviewer）：function 白名單係正面清單，冇列就禁止（動態 SQL／XML 查詢函數、introspection、取檔／外連函數、large object 全部唔喺入面）；lock SQL 唔可以有任何會話設定修改；唔可以引用平台表；migration 同樣用 parser 檢查（禁止提權 function、非白名單語言嘅 function／trigger、role 同權限操作、會話設定修改）；全部 fail closed，並有對應負面測試。 | 已確認（產品經理 2026-10-14） | 2A.4、7.1a、10.1 |
@@ -742,7 +742,7 @@ jobs:
 
 - 一個指令做晒（決定 76）：
   0. **只讀一次**（決定 102）：開始時將所有 source、lock 同依賴讀入記憶體，記低每個檔嘅 hash。之後驗證、manifest、部署報告同簽名全部用呢份記憶體內容，唔再由磁碟讀；第 1 步重編寫返嘅 lock 亦用寫入時嗰份記憶體內容繼續。完成前再比對磁碟 hash，唔一致就失敗，唔會出部分輸出（issue #34）。Release build 永遠唔由磁碟讀 lock：所有 lock 喺呢次 build 由 source 重新編譯，只存喺記憶體同 build 輸出（決定 113、117）。
-  1. 編譯 lock（dev／本地：source 或者依賴 hash 變咗、或者 compiler-hash 輸入變咗先編譯；release：全部編譯），寫入工作目錄嘅 `*.lock.md`（已 gitignore，決定 117）。
+  1. 編譯 lock（dev／本地：source 或者依賴 hash 變咗、或者 compiler-hash 輸入變咗先編譯；release：全部編譯），寫入本地 build 目錄（例如 `.vibe/build/`）或者 release artifact，**永遠唔寫返 repo**（lock 已 gitignore，決定 117）；全部或者冇（all-or-nothing），任何一步失敗都唔會留低部分輸出。
   2. 跑驗證器（第 10 節全部檢查）；任何 error 即刻失敗。高風險 release build 嘅翻譯一律重新做，唔用翻譯 cache（決定 110）。
   3. 產生 manifest，用 build key 簽（決定 79、89、92）：release build 一定要用受保護 CI environment 嘅 KMS key；攞唔到 KMS key 就失敗，永遠唔 fallback 去 dev key（決定 92）。只有明確 `--dev` 先用 dev key，並標 `build-mode: dev`。
   4. 輸出部署報告（10.10）同安全項目清單。Release build 遇到高風險安全項目，冇有效嘅 `--release-approval` 就失敗（決定 90，驗證規則見 2C.3a）。
@@ -750,14 +750,14 @@ jobs:
 - 選項：`--labels`（輸出建議 PR label）、`--dev`、`-o manifest.json`。
 - 冇 reviewer 步驟（審核由 Git 平台設定負責）；lock 唔 commit（決定 117）。`--check-determinism` 已移除（決定 117）。
 
-### 2C.3a `--release-approval` 驗證（決定 90，待產品經理確認）
+### 2C.3a `--release-approval` 驗證（決定 90，已確認（產品經理 2026-10-14），同決定 118 對齊）
 
-只喺 release build 有高風險 `security-items` 時要求；冇提供或者任何一步失敗，build 失敗，冇 override。以下 API 路徑已經按 docs.github.com（REST API 2026-03-10）核對。
+只喺 release build 有高風險 `security-items` 時要求；冇提供或者任何一步失敗，build 失敗，冇 override。**`--release-approval` 唔數 PR review 或者批准人數目**；真正批准係 `release` environment 由 Jack 批准（決定 118）。佢只驗證 deterministic 前置條件同呢個批准存在。以下 API 路徑已經按 docs.github.com（REST API 2026-03-10）核對。
 
 #### 1. 參照格式
 
-- `--release-approval pr:<number>`、`env:<run_id>`，或者兩者合併 `pr:<number>,env:<run_id>`。
-- 高風險要 2 個唔同嘅合資格批准人：PR review 同 environment approval 嘅批准人合併計，**按 GitHub user id 去重**（唔用 login，因為 login 可以改名）。
+- `--release-approval env:<run_id>` 一定要有；可以加 `pr:<number>`（`pr:<number>,env:<run_id>`），用嚟指定 tree 綁定用邊個 PR。
+- 冇批准人數目要求；PR review 唔計做批准。
 
 #### 2. 搵返 build 緊嘅 commit 屬於邊個 PR（SHA 綁定）
 
@@ -769,42 +769,25 @@ Release build 只喺 `v*` tag 上跑（決定 96），build 緊嘅 commit（`B =
 4. Tag 一定要指向 `main` 上嘅 commit：`B` 一定要喺 `main` 上。`GET /repos/{owner}/{repo}/compare/main...{B}` 嘅 `status` 一定要係 `identical` 或者 `behind`；`ahead` 或者 `diverged` 就失敗。
 5. **唔支援 merge queue**：merge queue 會喺 `gh-readonly-queue/*` 砌新 commit，同上面嘅 tree 規則對唔上。用 merge queue 嘅 repo，高風險 release build 一律失敗（待產品經理確認）。
 
-#### 3. PR review（`pr:`）
+#### 3. PR review（唔計做批准）
 
-- `GET /repos/{owner}/{repo}/pulls/{number}/reviews`，一定要用 `per_page=100` 分頁攞晒。
-- 每個 reviewer（按 user id）只睇佢最後一個唔係 `COMMENTED` 嘅 review：
-  - 係 `APPROVED` 而且 `commit_id == H` 先算。
-  - 最後一個係 `DISMISSED` 或者 `CHANGES_REQUESTED`，之前嘅 approval 作廢。
-  - `commit_id` 唔係 `H`（即係批准咗舊 push）唔算。
+- PR review 由 Git 平台 ruleset 喺 merge 前把關（決定 93，source PR 合併條件）；`--release-approval` 唔讀、唔數 PR review。
 
-#### 4. Environment approval（`env:`）
+#### 4. Environment approval（`env:`，真正批准）
 
-- 批准人由 `GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals` 攞（唔用 OIDC claims 判斷批准人）；只算 `state: approved` 而且 `environments` 包括 `release` 嘅紀錄。
-- `GET /repos/{owner}/{repo}/actions/runs/{run_id}`：`head_sha` 一定要等於 `B`；呢個 run 嘅 `triggering_actor` 同 `actor` 都加入排除名單（第 5 節），佢哋批准唔計。
-- `main`／tag 上嘅 run，PR 作者同 push 過嘅人用第 2 步搵到嘅 merged PR 判斷（第 5 節）。
+- `GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals`：一定要有 `state: approved` 而且 `environments` 包括 `release` 嘅紀錄（唔用 OIDC claims 判斷）。冇就失敗。
+- `GET /repos/{owner}/{repo}/actions/runs/{run_id}`：`head_sha` 一定要等於 `B`，workflow 路徑一定要等於 attestation 用嘅 release workflow。
+- 批准人、時間同 run id 寫入 manifest 同部署報告（審計用）；唔做排除名單、唔數人數（決定 96：所有 agent 用 `j113203`，Jack 批准自己帳戶觸發嘅 run 係已接受嘅做法）。
 
-#### 5. 排除名單（作者、committer、co-author）
+#### 5. Attestation 輸入一致
 
-1. `GET /repos/{owner}/{repo}/pulls/{number}/commits`，用 `per_page=100` 分頁攞晒。呢個 endpoint 最多只會列 250 個 commit，所以 PR 有超過 250 個 commit（`GET /repos/{owner}/{repo}/pulls/{number}` 嘅 `commits` 大過 250）就失敗。
-2. 每個 commit 加入排除名單：
-   - `author` 嘅 user（`author.id`）。
-   - `committer` 嘅 user（`committer.id`）。例外：committer login 係 `web-flow`（GitHub 網頁或者 API 代為 commit）時唔加 `web-flow`，因為真正做嘢嘅人就係 author，已經加咗。
-   - Commit message 入面每個 `Co-authored-by: Name <email>` trailer，只用兩個方法對 user：
-     - email 係 `{id}+{login}@users.noreply.github.com` 或者 `{login}@users.noreply.github.com`，就對返嗰個 user。
-     - email 同同一個 PR 入面某個 commit 嘅 `commit.author.email`／`commit.committer.email` 一樣，而嗰個 commit 有 `author.login`／`committer.login`，就對返嗰個 user。
-     - 絕對唔用 `GET /search/users` 或者其他搜尋去由 email 估 user。
-   - **對唔到 user**（co-author email 用上面方法對唔到，或者任何 commit 嘅 `author`／`committer` 係 null）：
-     - 有高風險 `security-items` 嘅 release build：**失敗（fail closed）**，因為排除名單唔完整。
-     - 其他 build：只記錄喺部署報告。
-3. 再加 PR 作者（第 2 步 `user.id`）同 `env:` run 嘅 `triggering_actor`、`actor`。
-4. 排除名單入面嘅任何人做批准人都唔計。
-5. 最近一次 push 嘅人 REST API 睇唔到，所以**一定要喺 `main` 開 Require approval of the most recent reviewable push**，由 GitHub 喺 merge 前強制（見第 7 節）。
+- `--release-approval` 用嘅 repo、workflow 路徑、`refs/tags/v<version>` 同 commit SHA `B`，一定要同決定 113 attestation 嘅輸入一樣；唔一樣就失敗。
 
-#### 6. CODEOWNERS（SDK 自己計，唔用 GitHub API）
+#### 6. CODEOWNERS 設定檢查（SDK 自己計，唔用 GitHub API；只檢查設定，唔數批准人）
 
 1. **讀 PR base 嘅版本**：CODEOWNERS 由 `P`（PR `base.sha`，merge 前受保護 `main`）讀，唔係由 `B` 讀；咁 PR 自己改 CODEOWNERS 都唔會影響今次驗證。
 2. **揀檔**：喺 `P` 按次序 `.github/CODEOWNERS` → `CODEOWNERS`（root）→ `docs/CODEOWNERS`，用第一個存在嘅，只用一個檔（同 GitHub 一樣）。三個都冇就失敗。
-3. **改 CODEOWNERS 本身係高風險**：PR 改咗三個位置任何一個 CODEOWNERS 檔（新增、修改、刪除、改名），一律當高風險 `security-items`，要 2 個合資格批准人，而且批准人要係 `P` 版本 CODEOWNERS 入面呢個檔路徑嘅 owner。
+3. **改 CODEOWNERS 本身係高風險**：PR 改咗三個位置任何一個 CODEOWNERS 檔（新增、修改、刪除、改名），一律當高風險 `security-items`；`P` 版本 CODEOWNERS 一定要覆蓋呢個檔路徑。
 4. **配對**：跟 GitHub 語法（大致同 gitignore 一樣），**最後一行配對到嘅 pattern 贏**；嗰行冇 owner 就代表冇 owner。高風險路徑冇 owner 就失敗。
 5. **GitHub 嘅 CODEOWNERS 語法例外**（SDK 自己實作 GitHub 嘅 CODEOWNERS 規則，唔係直接用通用 gitignore library）：
    - 唔支援 `\#` escape（`#` 開頭一定係註解）、唔支援 `!` 否定、唔支援 `[ ]` 字元範圍；有呢啲嘅行當無效，跳過同記錄。
@@ -812,17 +795,9 @@ Release build 只喺 `v*` tag 上跑（決定 96），build 緊嘅 commit（`B =
    - 其他無效嘅行都好似 GitHub 咁跳過同記錄；成個檔無效（唔係 UTF-8、檔案大過或者等於 3 MB、或者一行有效規則都冇）就失敗。GitHub 文件（[About code owners](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners#codeowners-file-size)）講明 CODEOWNERS 一定要細過 3 MB，超過就唔會載入，即係冇 code owner；GitHub 文件冇講 `codeowners/errors` 會唔會報呢個情況，所以 SDK 喺 `P` 自己檢查檔案大小，唔靠 errors API。
    - 另外 call `GET /repos/{owner}/{repo}/codeowners/errors?ref=<P>`：`errors` 唔係空 array 就失敗（同時記錄每個 error 嘅 `line`、`kind`）；呢個 call 只係用嚟檢查錯誤，owner 配對仍然由 SDK 自己計。
    - **Email owner**（`user@example.com`）當冇 owner：一條高風險路徑嘅 owner 如果全部都係 email，就當冇 owner，build 失敗。
-6. **Owner 判斷**：
-   - `@username`：批准人 login 一樣先算（比較時唔分大小寫，再用 user id 記錄）。
-   - `@org/team-slug`：用 `GET /orgs/{org}/teams/{team_slug}/memberships/{username}` 確認，要 200 而且 `state: active`；404 代表唔係成員，`pending` 唔算。呢個 endpoint 要用有 organization **Members: read** 權限嘅 GitHub App installation token，`GITHUB_TOKEN` 做唔到。冇 App token 時，任何由 team 擁有嘅高風險路徑一律失敗（fail closed）。
+6. 只檢查高風險路徑喺 `P` 版本有有效 owner（唔係淨係 email）；唔檢查邊個批准過。
 
-#### 7. 合資格批准人（全部成立先計）
-
-- 有 write 或以上權限：`GET /repos/{owner}/{repo}/collaborators/{username}/permission` 回 `permission` 係 `write` 或者 `admin`（maintain 會顯示做 write）。
-- 唔喺第 5 節嘅排除名單。
-- 唔係 bot：`user.type` 唔係 `Bot`，login 唔以 `[bot]` 結尾。
-- 高風險路徑：係第 6 節計出嚟嘅 owner。
-- **Machine user 偵測唔到**：用普通帳戶嘅自動化（machine user）喺 API 上同真人一樣，SDK 分唔到；要靠組織政策唔好畀 machine user write 權限同 CODEOWNERS 身份（已知限制）。
+#### 7. Ruleset 設定檢查
 
 Branch rule 檢查（`main`）：
 
@@ -830,8 +805,8 @@ Branch rule 檢查（`main`）：
 - 同一個回應一定要有 active 嘅 `required_status_checks` rule，`parameters.strict_required_status_checks_policy` 係 `true`，而且 `parameters.required_status_checks` 唔係空 array（GitHub 規定要最少一個 status check 呢個設定先生效）；冇就失敗。
 - 我哋揀 **rulesets 做唯一接受嘅來源**：舊式 branch protection（`GET /repos/{owner}/{repo}/branches/{branch}/protection`）要 repo admin 權限先讀到，release workflow 唔應該攞 admin。所以呢個設定一定要用 ruleset 開；rulesets 搵唔到就失敗（待產品經理確認）。
 - **`main` 嘅 `bypass_actors` 唔再檢查（決定 96 修訂，待產品經理確認）**：`main` ruleset 可以保留 OrganizationAdmin bypass（例如 ruleset 25057946），日常 `--admin` merge 唔變。上面兩條係**一定要有嘅設定**，但 SDK 唔會讀 `main` ruleset 嘅 `bypass_actors`，有 bypass 都唔會令 build 失敗。點解仍然安全：
-  - `--release-approval`（計劃中、**未實作**；實作之前呢點唔成立）自己驗證 PR review：批准一定要喺 PR 最後 head `H` 上、由合資格批准人做、高風險要 2 個（第 2–7 節）。Admin 用 bypass merge 而冇合資格批准，release build 照樣失敗，出唔到高風險 release。
-  - CODEOWNERS 照樣由 PR `base.sha` 讀（第 6 節），admin bypass 改唔到今次驗證用嘅 owner（`--release-approval` 未實作，實作之前唔成立，今日冇保護）。
+  - `--release-approval`（計劃中、**未實作**；實作之前呢點唔成立）唔數 PR review；高風險 release 嘅真正批准係 `release` environment 由 Jack 批准（決定 118）。
+  - CODEOWNERS 設定由 PR `base.sha` 讀（第 6 節），admin bypass 改唔到今次檢查用嘅設定（未實作，今日冇保護）。
   - 剩餘風險：admin bypass 可以跳過 up-to-date 規則（PR 冇 rebase 就 merge）。呢個情況下 merge commit 嘅 tree 通常同 `H` 唔一樣，第 2 節嘅 `tree(B) == tree(H)` 檢查會失敗，所以都出唔到高風險 release；代價係要重新開 PR 再批准。呢個緩解靠 `tree(B) == tree(H)` 檢查，而呢個檢查係 `--release-approval` 嘅一部分，同樣未實作，實作之前唔成立，今日冇保護。
 
 Release ruleset 檢查（`v*` tag，決定 96）：
@@ -850,7 +825,7 @@ Release ruleset 檢查（`v*` tag，決定 96）：
   6. Organization 層級 tag ruleset（`source_type: Organization`）一樣用 repo endpoint 讀。
 - **點解仍然要求 bypass 空**：冇 `creation` rule 之後，開 tag 唔使 bypass，所以空 bypass 唔會阻住 release；保持空代表連 admin 都唔可以移或者刪已經開咗嘅 `v*` tag，`B` 同 tag 嘅對應唔會事後被改。
 - **剩餘風險（Jack 已接受）**：所有 agent 都用 `j113203` push，live `release` environment 嘅 reviewer 都係 `j113203`，而且 `prevent_self_review: false`。所以**任何用 `j113203` 嘅 agent 都可以開 `v*` tag，再自己批准 release**；開 tag 本身唔會發佈，但發佈只係多一步 `j113203` 自己批准。
-- **而家冇額外保護**：`--release-approval`（第 2–7 節）係 v1.8 設計，**未實作**，今日唔會擋任何 release。實作之後，高風險 release 先會要 2 個合資格 PR reviewer（`j113203` 觸發 run 嘅 env 批准會被第 5 節排除）。
+- **而家冇額外保護**：`--release-approval`（第 2–7 節）係 v1.8 設計，**未實作**，今日唔會擋任何 release。實作之後，佢驗證前置條件同 `release` environment 批准存在，唔數 reviewer。
 - **Admin bypass 保持開啟**：`release` environment `can_admins_bypass: true` 由 Jack 直接決定保留，係 Jack 已接受嘅風險：admin 可以跳過 environment 批准。SDK 唔要求關閉，亦唔改 live 設定。
 - **目標方案 (iii)（取代臨時方案 (i)，未生效）**：專用 release GitHub App 係**唯一**開 `v*` tag 嘅 actor（加返 `creation` rule，bypass list 只放呢個 App），同時 `release` environment 開返 **Prevent self-review**。生效之前 SDK 照 (i) 檢查（bypass 空、唔要求 `creation`）。
 
@@ -863,7 +838,7 @@ Release ruleset 檢查（`v*` tag，決定 96）：
   - 減低風險：mint token 時用 `repositories` 同 `permissions` 參數收窄到呢個 repo 同最少權限；token 只喺 `release` environment 嘅 job 入面 mint，用完唔寫 log、唔寫入 manifest；App private key 放 environment secret。
 - 有 team owner 時要另外一個 GitHub App installation token（repo：Contents、Pull requests、Actions、Metadata read；organization：Members read），唔可以有寫權限。
 - 任何 API 錯誤、404（除咗第 6 節 team membership 嘅 404 代表「唔係成員」）、403、rate limit（429，或者 `x-ratelimit-remaining: 0`）、分頁未讀完、回應格式唔啱，一律當驗證失敗（fail closed），唔會 retry 到放寬。
-- 驗證結果（PR 號碼、`B`、`H`、`P`、tree sha、用咗邊個 CODEOWNERS 檔、排除名單、對唔到嘅 co-author email、每個批准人嘅 login、id、來源同時間）寫入 manifest 同部署報告。
+- 驗證結果（PR 號碼、`B`、`H`、`P`、tree sha、用咗邊個 CODEOWNERS 檔、ruleset id、attestation 輸入、environment 批准人嘅 login、id 同時間）寫入 manifest 同部署報告。
 - `release` environment 一定要設 **Required reviewers**（Jack）、**Prevent self-review 關閉**（決定 96：所有 agent 用 `j113203` push，開咗 Jack 就批唔到）、**Deployment branches and tags** 揀 Selected 而且只加 tag 規則 `v*`，同埋 **Allow administrators to bypass configured protection rules** 保持開啟（Jack 決定保留，已接受風險：admin 可以跳過 `release` environment 嘅批准，即係跳過真正閘門）（見 [`pr-review-guide.md`](pr-review-guide.md)）。
 
 ### 2C.3b 部署來源同部署前檢查（決定 113–116，issue #97）
@@ -1218,7 +1193,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 
 - 平台底線：最少 12 個字元，最多 256 個字元；冇強制複雜度規則；一定做洩漏密碼檢查。
 - 洩漏密碼檢查用 k-anonymity range query：只送密碼 SHA-1 嘅頭 5 個 hex 字元，開啟 padding（`Add-Padding: true`），令回應大小唔洩漏結果；比對喺本地做，明文同完整 hash 唔會離開平台。
-- 洩漏密碼服務用唔到（timeout 或者錯誤）時 fail closed，回 503（待產品經理確認：會影響註冊同改密碼嘅可用性）。
+- 洩漏密碼服務用唔到（timeout 或者錯誤）時 fail closed（已確認（產品經理 2026-10-14））：只影響註冊同改密碼，**登入唔受影響**（登入唔做洩漏檢查）；用短 timeout（例如 2 秒）；觸發告警；回 503，帶 `Retry-After`。
 - `hash-password` op 喺 hash 之前強制檢查底線：長度唔喺 12–256 字元之內 fail `WEAK_PASSWORD`（422）；喺洩漏密碼清單搵到 fail `BREACHED_PASSWORD`（422，#90）。
 - 錯誤回應、log 同錯誤訊息一律唔可以回顯密碼（明文、hash 或者 hash 前綴都唔得）。
 - Argon2id 參數（決定 46）：memory 64 MiB（65536 KiB）、iterations 3、parallelism 1、salt 16 byte（CSPRNG，每個密碼唔同）、輸出 32 byte；用 PHC 字串格式儲存（`$argon2id$v=19$m=65536,t=3,p=1$<salt>$<hash>`），所以參數跟住 hash 走。
@@ -1467,8 +1442,8 @@ migration 放喺 ./migrations/main/。
 - 資料庫層：每個 request 一個 transaction 加租戶 role（決定 97、99）、parser 白名單（決定 98）、`FORCE ROW LEVEL SECURITY`、non-owner role、column grant、冇 DELETE／TRUNCATE／DDL（7.1）。
 - Runtime 限制：只載入簽咗名嘅 manifest、唔解析 md、冇 `LLM_*`、對外 call 白名單、kill switch（9A）、固定最低回應耗時、配額同限流。
 - Manifest 簽名（決定 79、89、92、96）：release 只由有專用 release ruleset（bypass 一定要空）嘅 `v*` tag 出（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；真正閘門係要 Jack 批准嘅 `release` environment）；release key 只喺 `v*` tag 加有 required reviewers（Jack）嘅 GitHub environment，經 OIDC 綁定 KMS 使用；CI 冇 key 就失敗，唔 fallback；production 只信 pin 死嘅 release 公鑰，dev key 永遠唔信任。
-- 高風險 fail closed（決定 90）：release build 有高風險安全項目就要有效嘅 `--release-approval`（2 個唔同嘅合資格批准人，批准喺 PR 最後 head SHA 上，build commit tree 同 PR head 一樣，批准人唔喺作者／committer／co-author 排除名單，高風險路徑係 PR base CODEOWNERS 嘅 owner；見 2C.3a），先可以出 release manifest。
-- `main` ruleset 可以有 admin bypass（決定 96 修訂）：日常 `--admin` merge 唔受影響；`--release-approval` 實作之後，高風險 release 先會獨立驗證 PR review 同 tree 相等，令 admin bypass merge 出唔到高風險 release（`--release-approval` 未實作，實作之前唔成立，今日冇保護）。
+- 高風險 fail closed（決定 90）：release build 有高風險安全項目就要有效嘅 `--release-approval`（唔數 PR review；驗證 `tree(B) == tree(H)`、ruleset 同 CODEOWNERS 設定、attestation 輸入，同埋 `release` environment 有 Jack 嘅批准；見 2C.3a、決定 118），先可以出 release manifest。
+- `main` ruleset 可以有 admin bypass（決定 96 修訂）：日常 `--admin` merge 唔受影響；`--release-approval` 實作之後，高風險 release 先會驗證 tree 相等同 `release` environment 批准存在，令 admin bypass merge 出唔到高風險 release（`--release-approval` 未實作，實作之前唔成立，今日冇保護）。
 - CODEOWNERS 必須（決定 29、37、93）：release build 檢查覆蓋路徑。
 - Production 一律拒絕 in-memory，冇 override（決定 91）。
 - `/latest/` 永遠唔係草稿（決定 94）。
@@ -1890,10 +1865,10 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" 
 | 409 | EMAIL_TAKEN | user.register |
 | 409 | ALREADY_ACTIVE | user.invite |
 | 422 | VALIDATION_FAILED | platform |
-| 503 | INVITE_DELIVERY_FAILED | user.invite |
+| 503 | INVITE_NOT_QUEUED | user.invite（outbox 冇寫入，transaction rollback） |
 ````
 
-- 邀請失敗（決定 95，待產品經理確認）：s2 `user.invite` 入面 enqueue 失敗，create-user 回 503 `INVITE_DELIVERY_FAILED`（header 帶 `Retry-After`；body 只有錯誤碼，唔帶 `user_id`，因為錯誤映射攞唔到之前 step 嘅輸出），唔回 201／200。Admin 用同一個 email 重試 create-user（決定 85，會回原有 id），或者按 email 搵用戶再 call re-invite。v1.8 起成個 request 喺同一個 transaction（決定 99），enqueue 失敗會 rollback 埋 s1 同 token UPDATE，唔會留低半完成狀態。邀請信經 transactional outbox：`email_outbox` 列同其他寫入喺同一個 transaction 寫入，commit 之後先由 mail worker 寄出，commit 之前永遠唔寄；rollback 會連 outbox 列一齊丟棄；恢復方法係重試 create-user 或者 call re-invite（11.4b），兩者都發新 token 同新信。實作見 issue #26。
+- 邀請（決定 95，已確認（產品經理 2026-10-14））：邀請信寫入 transactional outbox，`email_outbox` 列同其他寫入喺同一個 transaction 寫入；commit 之後 create-user 回 **202**，body `{ user_id, invite_status: "invite_pending" }`。Mail worker commit 之後先寄，commit 之前永遠唔寄；失敗按退避重試，超過重試上限將邀請狀態標 `delivery_failed`（狀態值，唔係錯誤碼）。Admin 可以查詢用戶嘅邀請狀態（`invite_pending`／`sent`／`delivery_failed`），亦可以 call re-invite（11.4b）重寄（發新 token 同新信）。只有 transaction 失敗（outbox 冇寫入）先回 503 `INVITE_NOT_QUEUED`（帶 `Retry-After`），成個 request rollback（決定 99），唔會留低半完成狀態。實作見 issue #26。
 - 失敗恢復（決定 85，待產品經理確認）：v1.8 起一個 request 一個 transaction（決定 99），s2 失敗會 rollback s1；但 commit 之後先失敗（例如回應途中斷線）或者舊資料仍然可能有「已建立、未邀請」嘅用戶。Admin 用同一個 body 重試 create-user：`user.register` 對已存在、未驗證、冇密碼嘅用戶回原有 id（`created: false`），s2 重新寄邀請，回 200；或者用 11.4b 嘅 re-invite endpoint。
 - `EMAIL_TAKEN`（決定 84，待產品經理確認）：只限 admin（已認證、`roles: [admin]`、按用戶限流、audit-log），admin 本身可以列出租戶用戶，所以 409 唔當 enumeration 洩漏；public 註冊（12.11）照樣唔分辨。
 - 同一個 email 自己註冊緊（未驗證、冇密碼）：當同一個用戶，邀請 token 取代註冊 token（決定 88，待產品經理確認）。
@@ -2004,7 +1979,7 @@ security-items:
 ## Signature
 - input: { user_id: { type: uuid, required: true } }
 - output: {}
-- errors: [ALREADY_ACTIVE, INVITE_DELIVERY_FAILED]
+- errors: [ALREADY_ACTIVE, INVITE_NOT_QUEUED]
 - writes: true
 
 ## Calls
@@ -2050,7 +2025,7 @@ security-items:
 ````
 
 - 用 `app_rw`（已認證 admin 路徑），唔係 public role。
-- s4 失敗（outbox insert 錯誤）：method fail `INVITE_DELIVERY_FAILED`（決定 95）；成個 request rollback（決定 99），s2 嘅 token 輪換都唔會生效，舊邀請連結照樣有效（如果未過期）；重試或者 re-invite 會發新連結。
+- s4 失敗（outbox insert 錯誤）：method fail `INVITE_NOT_QUEUED`（503，決定 95）；寄信失敗唔會令 method fail，只會喺背景重試，超過上限標 `delivery_failed`；成個 request rollback（決定 99），s2 嘅 token 輪換都唔會生效，舊邀請連結照樣有效（如果未過期）；重試或者 re-invite 會發新連結。
 - 用戶唔存在同已驗證都回 `ALREADY_ACTIVE`（admin 路徑，404／409 分唔分冇私隱影響；揀一個錯誤碼令 lock 簡單）。
 
 ### 11.4b Re-invite：`api/users/v2/re-invite/re-invite.md`（路由 `POST /users/v2/{id}/invite`，決定 86，待產品經理確認）
@@ -2136,7 +2111,7 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 寄邀請" }]
 | --- | --- | --- |
 | 409 | ALREADY_ACTIVE | user.invite |
 | 422 | VALIDATION_FAILED | platform |
-| 503 | INVITE_DELIVERY_FAILED | user.invite |
+| 503 | INVITE_NOT_QUEUED | user.invite（outbox 冇寫入，transaction rollback） |
 ````
 
 - 503 時可以直接重試，每次重試都發新 token（決定 95）。

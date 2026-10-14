@@ -56,7 +56,9 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - 唔好用 merge queue：高風險 release build 唔支援（spec 2C.3a）。
 - 一定要喺 ruleset 嘅 **Require status checks to pass** 入面開 **Require branches to be up to date before merging**（`strict_required_status_checks_policy`，最少要有一個 required status check 先生效）：`vibe build --release-approval` 會比較 build commit 同 PR head 嘅 tree，冇開呢個設定就可能唔一樣，release build 會失敗（spec 2C.3a）。
 
-## 4. 高風險 label 要兩個 approval
+## 4. 高風險 label 要兩個 approval（可選，source PR 合併層面）
+
+呢個係 Git 平台層面嘅可選 PR 設定，同 `--release-approval` 無關；release 嘅真正批准係 `release` environment（spec 決定 118）。
 
 GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自訂 required status check：
 
@@ -75,12 +77,12 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
 ## 6. Release environment 同 KMS（spec 決定 89、92）
 
 - 開一個 `release` environment，設 **Required reviewers**；**Deployment branches and tags** 揀 Selected branches and tags，只加 tag 規則 `v*`（唔加任何 branch），即係只准受 release ruleset 保護嘅 `v*` tag 部署。
-- `release` environment **Required reviewers** 係 `j113203`（Jack）；**Prevent self-review 關閉**（spec 決定 96）。所有 agent 都用 `j113203` push，所以 agent 觸發嘅 release 可以由同一個帳戶自己批准；呢個風險 Jack 已經接受。`--release-approval` 未實作；實作後 `j113203` 觸發 run 嘅 env 批准唔計入高風險 2 人。
+- `release` environment **Required reviewers** 係 `j113203`（Jack）；**Prevent self-review 關閉**（spec 決定 96）。所有 agent 都用 `j113203` push，所以 agent 觸發嘅 release 可以由同一個帳戶自己批准；呢個風險 Jack 已經接受。`--release-approval` 未實作；實作後佢唔數 reviewer，只驗證前置條件同 `release` environment 批准存在（spec 決定 90、118）。
 - `release` environment 嘅 **Allow administrators to bypass configured protection rules** 保持開啟（Jack 決定）。剩餘風險：admin 可以跳過 required reviewers；Jack 已接受。
-- 改 CODEOWNERS（`.github/`、root、`docs/` 任何一個）一律當高風險，要 2 個批准。
+- 改 CODEOWNERS（`.github/`、root、`docs/` 任何一個）一律當高風險；release 時真正批准係 `release` environment（Jack）。
 - CODEOWNERS 用 team（`@org/team`）嘅話，release workflow 要用 GitHub App installation token（organization Members: read，其他只讀），`GITHUB_TOKEN` 查唔到 team 成員；冇就失敗。
 - Machine user（普通帳戶做自動化）SDK 分唔到係唔係真人，唔好畀佢哋 write 權限或者 CODEOWNERS 身份。
-- 高風險 release 要用 `vibe build --release-approval pr:<number>`、`env:<run_id>` 或者 `pr:<number>,env:<run_id>`（計劃中）。Build 會經 GitHub REST API 驗證：build commit 屬於唯一一個 merged PR、批准喺 PR 最後 head SHA 上而且 tree 一樣、批准人有 write 權限、唔係 PR 任何 commit 嘅 author／committer／co-author、唔係 PR 作者或者 env run 觸發者、唔係 bot、高風險路徑要係 CODEOWNER（由 PR base 讀），同埋有 2 個唔同批准人（PR review 同 environment approval 合併計）。
+- 高風險 release 要用 `vibe build --release-approval env:<run_id>`（可以加 `pr:<number>`，計劃中）。Build 唔數 PR review 或者批准人數目；只驗證：build commit 屬於唯一一個 merged PR 而且 tree 同 PR head 一樣、build commit 喺 `main`、ruleset 同 CODEOWNERS 設定、attestation 輸入一致，同埋呢個 run 有 `release` environment（Jack）嘅批准（spec 決定 90、118）。
 - Release workflow 嘅 token 權限：
 
   ```yaml
