@@ -46,11 +46,13 @@ enum Command {
         /// Output path, relative to the current directory (like `serve --manifest`).
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
-        /// Release build: signs with VIBE_RELEASE_SIGNING_KEY only and fails on
-        /// high-risk items without --release-approval.
+        /// Release build: signs with VIBE_RELEASE_SIGNING_KEY only, never reads
+        /// .env, requires an allowlisted LLM host, and fails closed on
+        /// high-risk items until release-environment approval verification (#80).
         #[arg(long)]
         release: bool,
-        /// Reference to the approval of this release's high-risk items.
+        /// Recorded for audit only. It is not accepted as approval: the approval
+        /// is the `release` environment approval (decision 90/118, #80).
         #[arg(long)]
         release_approval: Option<String>,
         /// Source commit to record (default: GITHUB_SHA or `git rev-parse HEAD`).
@@ -318,11 +320,16 @@ async fn cmd_manifest(
     // files from disk; a dev manifest uses the locks `vibe compile` wrote
     // (checked against the build record).
     let loaded = if release {
-        load_dotenv(project);
-        // The release environment provides the compiler key as VIBE_LLM_API_KEY.
+        // A release build never reads the project .env: every input comes
+        // from the release environment.
         let mut env = llm::env_map_from_process();
         if let Some(key) = env.get("VIBE_LLM_API_KEY").cloned() {
             env.entry("LLM_API_KEY".into()).or_insert(key);
+        }
+        // No LLM key (VIBE_LLM_API_KEY or LLM_API_KEY) is ever sent to a
+        // host outside the release allowlist.
+        if let Ok(config) = llm::load_llm_config(&env, true) {
+            llm::check_release_endpoint(&config)?;
         }
         let config = llm::load_llm_config(&env, true).ok();
         let adapter = match &config {
@@ -371,7 +378,8 @@ fn print_high_risk(manifest: &manifest::Manifest) {
 }
 
 /// Manifest verifying key. Production trusts only the pinned release key
-/// (VIBE_MANIFEST_PUBKEY or one compiled in); the project's
+/// (one compiled in with VIBE_RELEASE_PUBKEY, which VIBE_MANIFEST_PUBKEY
+/// cannot override, else VIBE_MANIFEST_PUBKEY); the project's
 /// `.vibe/signing.pub` is accepted in development only.
 fn manifest_key(
     project: &Path,

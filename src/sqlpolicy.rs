@@ -3,11 +3,12 @@
 //! Every non-migration statement must parse (PostgreSQL dialect) as exactly
 //! one allowlisted statement: a query (`SELECT`, `WITH ...`), `INSERT`, or
 //! `UPDATE`. `UPDATE` and `DELETE`, including ones nested in CTEs, need a
-//! `WHERE` that is not trivially true (`where true`, `1 = 1`, `x = x`,
-//! `... or true`, constant comparisons). Anything that does not parse fails
-//! closed.
+//! `WHERE` that passes an allowlist: every OR branch must compare a column
+//! with a placeholder or a session setting, and every other conjunct must be
+//! a plain column restriction. Everything else is rejected, and anything
+//! that does not parse fails closed.
 
-use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, UnaryOperator, Value};
+use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, Value};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -75,73 +76,130 @@ fn check_set(body: &SetExpr, out: &mut Vec<String>) {
 fn check_where(kind: &str, selection: Option<&Expr>, out: &mut Vec<String>) {
     match selection {
         None => out.push(format!("{kind} needs a WHERE clause")),
-        Some(expr) if always_true(expr) => {
-            out.push(format!("{kind} WHERE is always true (`{expr}`)"))
-        }
+        Some(expr) if !scoped(expr) => out.push(format!(
+            "{kind} WHERE is always true or not allowlisted (`{expr}`): every OR branch must compare a column with a placeholder or a session setting"
+        )),
         Some(_) => {}
     }
 }
 
-fn is_const(expr: &Expr) -> bool {
-    match expr {
-        Expr::Value(Value::Placeholder(_)) => false,
-        Expr::Value(_) => true,
-        Expr::Nested(inner) => is_const(inner),
-        Expr::UnaryOp { expr, .. } => is_const(expr),
-        Expr::Cast { expr, .. } => is_const(expr),
-        _ => false,
-    }
+/// Allowlist: the predicate is split into OR branches; each branch is an AND
+/// of conjuncts. Every branch needs an anchor (`column = $n`,
+/// `column = ANY($n)`, or `column = current_setting(...)`), and every other
+/// conjunct must be a plain column restriction. Anything else is rejected.
+fn scoped(expr: &Expr) -> bool {
+    let mut branches = Vec::new();
+    split(expr, BinaryOperator::Or, &mut branches);
+    branches.iter().all(|branch| {
+        let mut conjuncts = Vec::new();
+        split(branch, BinaryOperator::And, &mut conjuncts);
+        conjuncts.iter().any(|c| anchor(c)) && conjuncts.iter().all(|c| anchor(c) || restriction(c))
+    })
 }
 
-fn always_true(expr: &Expr) -> bool {
-    use BinaryOperator::*;
+fn split<'a>(expr: &'a Expr, op: BinaryOperator, out: &mut Vec<&'a Expr>) {
     match expr {
-        Expr::Value(Value::Boolean(true)) => true,
-        Expr::Nested(inner) | Expr::IsTrue(inner) | Expr::IsNotFalse(inner) => always_true(inner),
-        Expr::IsFalse(inner) | Expr::IsNotTrue(inner) => always_false(inner),
-        Expr::UnaryOp {
-            op: UnaryOperator::Not,
-            expr,
-        } => always_false(expr),
-        Expr::BinaryOp {
-            left,
-            op: Or,
-            right,
-        } => always_true(left) || always_true(right),
-        Expr::BinaryOp {
-            left,
-            op: And,
-            right,
-        } => always_true(left) && always_true(right),
-        Expr::BinaryOp { left, op, right } => {
-            // Fail closed: comparing constants, or a value with itself.
-            (is_const(left) && is_const(right)) || (left == right && matches!(op, Eq | GtEq | LtEq))
+        Expr::Nested(inner) => split(inner, op, out),
+        Expr::BinaryOp { left, op: o, right } if *o == op => {
+            split(left, op.clone(), out);
+            split(right, op, out);
         }
-        Expr::IsNotNull(inner) => is_const(inner),
+        other => out.push(other),
+    }
+}
+
+fn unnest(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Nested(inner) => unnest(inner),
+        other => other,
+    }
+}
+
+fn is_column(expr: &Expr) -> bool {
+    matches!(
+        unnest(expr),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+    )
+}
+
+fn is_placeholder(expr: &Expr) -> bool {
+    match unnest(expr) {
+        Expr::Value(Value::Placeholder(_)) => true,
+        Expr::Cast { expr, .. } => is_placeholder(expr),
         _ => false,
     }
 }
 
-fn always_false(expr: &Expr) -> bool {
+/// `current_setting('<literal>'[, <bool literal>])`, optionally cast.
+fn is_setting(expr: &Expr) -> bool {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    match unnest(expr) {
+        Expr::Cast { expr, .. } => is_setting(expr),
+        Expr::Function(f) => {
+            if !f.name.to_string().eq_ignore_ascii_case("current_setting") {
+                return false;
+            }
+            let FunctionArguments::List(list) = &f.args else {
+                return false;
+            };
+            !list.args.is_empty()
+                && list.args.len() <= 2
+                && list.args.iter().enumerate().all(|(i, arg)| match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(v))) => {
+                        if i == 0 {
+                            matches!(v, Value::SingleQuotedString(_))
+                        } else {
+                            matches!(v, Value::Boolean(_))
+                        }
+                    }
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
+}
+
+fn is_literal(expr: &Expr) -> bool {
+    match unnest(expr) {
+        Expr::Value(Value::Placeholder(_)) | Expr::Value(Value::Boolean(_)) => false,
+        Expr::Value(Value::Null) => false,
+        Expr::Value(_) => true,
+        Expr::Cast { expr, .. } => is_literal(expr),
+        _ => false,
+    }
+}
+
+fn anchor(expr: &Expr) -> bool {
+    match unnest(expr) {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            (is_column(left) && (is_placeholder(right) || is_setting(right)))
+                || (is_column(right) && (is_placeholder(left) || is_setting(left)))
+        }
+        Expr::AnyOp {
+            left,
+            compare_op: BinaryOperator::Eq,
+            right,
+            ..
+        } => is_column(left) && is_placeholder(right),
+        _ => false,
+    }
+}
+
+fn restriction(expr: &Expr) -> bool {
     use BinaryOperator::*;
-    match expr {
-        Expr::Value(Value::Boolean(false)) | Expr::Value(Value::Null) => true,
-        Expr::Nested(inner) => always_false(inner),
-        Expr::UnaryOp {
-            op: UnaryOperator::Not,
-            expr,
-        } => always_true(expr),
+    let operand = |e: &Expr| is_placeholder(e) || is_setting(e) || is_literal(e);
+    match unnest(expr) {
         Expr::BinaryOp {
             left,
-            op: And,
+            op: Eq | NotEq | Lt | LtEq | Gt | GtEq,
             right,
-        } => always_false(left) || always_false(right),
-        Expr::BinaryOp {
-            left,
-            op: Or,
-            right,
-        } => always_false(left) && always_false(right),
-        Expr::BinaryOp { left, op, right } => left == right && matches!(op, NotEq | Gt | Lt),
+        } => (is_column(left) && operand(right)) || (is_column(right) && operand(left)),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => is_column(inner),
+        Expr::InList { expr, list, .. } => is_column(expr) && list.iter().all(operand),
         _ => false,
     }
 }
@@ -183,8 +241,59 @@ mod tests {
             "UPDATE products SET price_cents = 0 WHERE NOT false",
             "UPDATE products SET price_cents = 0 WHERE 'a' <> 'b'",
             "DELETE FROM products WHERE 1 = 1",
+            "UPDATE products SET price_cents = 0 WHERE NOT (1 = 0)",
+            "UPDATE products SET price_cents = 0 WHERE 'a' LIKE 'a'",
+            "UPDATE products SET price_cents = 0 WHERE 1 IN (1, 2)",
+            "UPDATE products SET price_cents = 0 WHERE 2 BETWEEN 1 AND 3",
+            "UPDATE products SET price_cents = 0 WHERE 't'::boolean",
+            "UPDATE products SET price_cents = 0 WHERE COALESCE(true, id = $1)",
+            "UPDATE products SET price_cents = 0 WHERE CASE WHEN true THEN true ELSE false END",
+            "UPDATE products SET price_cents = 0 WHERE EXISTS (SELECT 1)",
+            "UPDATE products SET price_cents = 0 WHERE (SELECT true)",
+            "UPDATE products SET price_cents = 0 WHERE id IS NOT NULL",
+            "UPDATE products SET price_cents = 0 WHERE id = id + 0",
+            "UPDATE products SET price_cents = 0 WHERE x > 0 OR x <= 0",
+            "UPDATE products SET price_cents = 0 WHERE lower('a') = 'a'",
+            "UPDATE products SET price_cents = 0 WHERE id = $1 OR id IS NOT NULL",
+            "UPDATE products SET price_cents = 0 WHERE id = $1 OR lower('a') = 'a'",
+            "DELETE FROM products WHERE EXISTS (SELECT 1)",
         ] {
             assert!(rejected(sql).contains("always true"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_tautologies_inside_cte_updates() {
+        for cond in [
+            "NOT (1 = 0)",
+            "'a' LIKE 'a'",
+            "1 IN (1)",
+            "2 BETWEEN 1 AND 3",
+            "'t'::boolean",
+            "COALESCE(true, false)",
+            "CASE WHEN true THEN true END",
+            "EXISTS (SELECT 1)",
+            "(SELECT true)",
+            "id IS NOT NULL",
+            "id = id + 0",
+            "x > 0 OR x <= 0",
+            "lower('a') = 'a'",
+        ] {
+            let sql = format!(
+                "WITH x AS (UPDATE products SET price_cents = 0 WHERE {cond} RETURNING id) SELECT id FROM x"
+            );
+            assert!(rejected(&sql).contains("always true"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn accepts_anchored_restrictions() {
+        for sql in [
+            "UPDATE carts SET qty = $1 WHERE id = $2::uuid AND deleted_at IS NULL AND version = $3",
+            "UPDATE orders SET status = 'paid' WHERE id = $1 AND status IN ('pending', 'unpaid')",
+            "UPDATE t SET a = $1 WHERE id = ANY($2) OR owner_id = current_setting('app.user_id', false)::uuid",
+        ] {
+            assert!(problems(sql).is_empty(), "{sql}: {:?}", problems(sql));
         }
     }
 
