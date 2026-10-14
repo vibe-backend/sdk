@@ -47,7 +47,7 @@ pub const NETWORK_CAP: usize = SHARD_CAPACITY / 10;
 /// clients have used up everything else.
 pub const RESERVE: usize = SHARD_CAPACITY / 10;
 pub const RESERVE_OWNER_CAP: usize = 5;
-pub const RESERVE_NETWORK_CAP: usize = 50;
+pub const RESERVE_NETWORK_CAP: usize = 10;
 
 /// A map with a fixed capacity and least-recently-used eviction.
 pub struct BoundedMap<V> {
@@ -971,5 +971,188 @@ mod tests {
     fn owner_levels_nest() {
         assert_eq!(owner_levels("2001:db8:1::/48")[1], "2001:db8::/32");
         assert_eq!(owner_levels("198.51.100.7")[1], "198.51.100.0/24");
+    }
+
+    /// Saturation events: `(target, reason, refused)` per log line.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<(String, String, u64)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct V(String, u64);
+            impl tracing::field::Visit for V {
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    if f.name() == "reason" {
+                        self.0 = v.to_string();
+                    }
+                }
+                fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                    if f.name() == "refused" {
+                        self.1 = v;
+                    }
+                }
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            }
+            let mut v = V(String::new(), 0);
+            event.record(&mut v);
+            self.0
+                .lock()
+                .unwrap()
+                .push((event.metadata().target().to_string(), v.0, v.1));
+        }
+    }
+
+    fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<(String, String, u64)>) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let cap = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let events = cap.0.lock().unwrap().clone();
+        (out, events)
+    }
+
+    fn allowed(d: RateDecision) -> bool {
+        matches!(d, RateDecision::Allow)
+    }
+
+    /// 10 addresses in each of `nets` /24s (`100.{n}.0.0/24`), each pinning
+    /// OWNER_CAP buckets. Returns the number of refused new keys.
+    fn fill_29_24s(rates: &mut RateBuckets, shard: &str, nets: usize, now: Instant) -> usize {
+        let mut refused = 0;
+        for n in 0..nets {
+            for host in 0..10 {
+                let owner = format!("100.{n}.0.{host}");
+                for k in 0..OWNER_CAP {
+                    if !allowed(rates.check(
+                        &[(shard.to_string(), format!("{owner}-{k}"), 1)],
+                        &owner,
+                        now,
+                    )) {
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        refused
+    }
+
+    #[test]
+    fn saturation_log_has_stable_target_each_reason_and_is_rate_limited() {
+        let now = Instant::now();
+        let target = "vibe::rate_limit_saturation";
+        // owner_cap: one address over OWNER_CAP, refused twice in one minute
+        // (one line), then again after the window (a second line counting
+        // the refusals since the first).
+        let (_, events) = capture(|| {
+            let mut rates = RateBuckets::default();
+            let shard = "s".to_string();
+            for i in 0..OWNER_CAP + 2 {
+                rates.check(&[(shard.clone(), format!("k{i}"), 1)], "192.0.2.1", now);
+            }
+            let later = now + WINDOW;
+            rates.check(&[(shard.clone(), "x1".into(), 1)], "192.0.2.1", later);
+            rates.check(&[(shard.clone(), "x2".into(), 1)], "192.0.2.1", later);
+        });
+        let ours: Vec<_> = events.iter().filter(|e| e.0 == target).collect();
+        assert_eq!(ours.len(), 1, "{events:?}");
+        assert_eq!(ours[0].1, "owner_cap");
+        assert_eq!(ours[0].2, 1);
+        // A second line only after a minute, counting every refusal since
+        // the first. Address A is refused at `now` (line 1); B fills its
+        // buckets 30s later and is refused twice (no line), then once more a
+        // minute after line 1 while its buckets are still live (line 2).
+        let (_, events) = capture(|| {
+            let mut rates = RateBuckets::default();
+            let shard = "s";
+            let a = "192.0.2.1";
+            let b = "198.51.100.1";
+            pinned_fill(&mut rates, shard, a, OWNER_CAP + 1, a, now);
+            let t = now + std::time::Duration::from_secs(30);
+            pinned_fill(&mut rates, shard, b, OWNER_CAP + 2, b, t);
+            rates.check(&[(shard.into(), "x".into(), 1)], b, now + WINDOW);
+        });
+        let ours: Vec<_> = events.iter().filter(|e| e.0 == target).collect();
+        assert_eq!(ours.len(), 2, "{events:?}");
+        assert!(ours.iter().all(|e| e.1 == "owner_cap"));
+        assert_eq!(ours[1].2, 3, "refusals since the previous line");
+
+        // network_cap: 11 addresses of one /24.
+        let (_, events) = capture(|| {
+            let mut rates = RateBuckets::default();
+            for host in 0..11 {
+                let owner = format!("198.51.100.{host}");
+                pinned_fill(&mut rates, "s", &owner, OWNER_CAP, &owner, now);
+            }
+        });
+        let reasons: Vec<_> = events.iter().filter(|e| e.0 == target).collect();
+        assert_eq!(reasons.len(), 1, "{events:?}");
+        assert_eq!(reasons[0].1, "network_cap");
+
+        // reserve, then pinned: 9 /24s fill everything but the reserve, the
+        // next heavy client is refused (reserve); small clients fill the
+        // reserve with pinned buckets and the next new key is refused
+        // (pinned).
+        let (_, events) = capture(|| {
+            let mut rates = RateBuckets::default();
+            fill_29_24s(&mut rates, "a", 9, now);
+            assert_eq!(rates.shards["a"].map.len(), SHARD_CAPACITY - RESERVE);
+            pinned_fill(
+                &mut rates,
+                "a",
+                "100.200.0.1",
+                RESERVE_OWNER_CAP + 1,
+                "r",
+                now,
+            );
+            let mut rates = RateBuckets::default();
+            fill_29_24s(&mut rates, "b", 9, now);
+            for n in 0..RESERVE / RESERVE_OWNER_CAP {
+                let owner = format!("172.{}.{}.1", 16 + n / 256, n % 256);
+                pinned_fill(&mut rates, "b", &owner, RESERVE_OWNER_CAP, &owner, now);
+            }
+            assert_eq!(rates.shards["b"].map.len(), SHARD_CAPACITY);
+            assert!(!allowed(rates.check(
+                &[("b".into(), "late".into(), 1)],
+                "8.8.8.8",
+                now
+            )));
+        });
+        let got: Vec<_> = events
+            .iter()
+            .filter(|e| e.0 == target)
+            .map(|e| e.1.as_str())
+            .collect();
+        assert_eq!(got, vec!["reserve", "pinned"], "{events:?}");
+    }
+
+    #[test]
+    fn two_hundred_ninety_ips_across_29_24s_cannot_saturate_a_shard() {
+        // Review scenario: 10 addresses in each of 29 /24s, every address
+        // pinning OWNER_CAP buckets. NETWORK_CAP stops each /24 and the
+        // reserve keeps room for new clients.
+        let now = Instant::now();
+        let shard = "login:input.email";
+        let mut rates = RateBuckets::default();
+        let refused = fill_29_24s(&mut rates, shard, 29, now);
+        let len = rates.shards[shard].map.len();
+        assert!(len < SHARD_CAPACITY, "shard is full: {len}");
+        assert!(refused >= 29 * 10 * OWNER_CAP - SHARD_CAPACITY);
+        for user in 0..20 {
+            let owner = format!("203.0.{user}.7");
+            assert!(
+                allowed(rates.check(&[(shard.into(), format!("new-{user}"), 5)], &owner, now)),
+                "new user {user}"
+            );
+        }
+        let v6 = ip_bucket("2a00:1450:4001::1".parse().unwrap());
+        assert!(allowed(rates.check(
+            &[(shard.into(), "new-v6".into(), 5)],
+            &owner_of(&v6),
+            now
+        )));
     }
 }

@@ -17,7 +17,7 @@ Before the first `v*` tag. Items 1–2 are repository settings decided by the pr
 
 ## Rate-limit capacity limits (#71, #73)
 
-The in-memory limiter keeps at most 10,000 active buckets per `(route, key type)` shard (`SHARD_CAPACITY`). A single client network may own at most 100 of them (`OWNER_CAP`: one IPv4 address or one IPv6 /48), a wider network at most 1,000 (`NETWORK_CAP`: one IPv4 /24 or IPv6 /32), and the last 1,000 slots (`RESERVE`) only go to clients that hold fewer than 5 buckets (and whose wider network holds fewer than 50).
+The in-memory limiter keeps at most 10,000 active buckets per `(route, key type)` shard (`SHARD_CAPACITY`). A single client network may own at most 100 of them (`OWNER_CAP`: one IPv4 address or one IPv6 /48), a wider network at most 1,000 (`NETWORK_CAP`: one IPv4 /24 or IPv6 /32), and the last 1,000 slots (`RESERVE`) only go to clients that hold fewer than 5 buckets (and whose wider network holds fewer than 10, `RESERVE_NETWORK_CAP`), so 29 /24s with 10 busy addresses each cannot fill a shard; it takes over 100 wider networks.
 
 These caps bound one network, not a distributed client. In review, 290 IPv4 addresses spread over 29 /24 networks filled a 10,000-slot shard with at-limit buckets: 50 of 50 new users then got 429 on that route, and the route recovered once the 60-second window passed. An attacker with a few hundred addresses across a few dozen /24s can therefore block new clients on one route (existing clients and other routes are unaffected) for as long as they keep refreshing their buckets. Mitigations outside the SDK: rate limiting at the load balancer or CDN, and a WAF for the public routes.
 
