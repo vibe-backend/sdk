@@ -25,6 +25,8 @@ jobs:
         with:
           args: --offline --no-progress --include-fragments './**/*.md'
           fail: true
+      - name: Check zh-hant code blocks match English
+        run: python3 scripts/check-zh-code-blocks.py
 
   rust:
     name: Rust fmt / clippy / test
