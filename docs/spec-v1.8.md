@@ -203,7 +203,7 @@
 | 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；`vibe build` release 模式檢查 CODEOWNERS 覆蓋路徑，冇就失敗。 | 待產品經理確認 | 2A.7、9B |
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 待產品經理確認 | 文件標頭、網站 |
 | 95 | create-user 邀請失敗：`user.invite` 嘅 enqueue（s4）失敗時，create-user 回 503 `INVITE_DELIVERY_FAILED`（只帶 `Retry-After`，body 唔帶 `user_id`），唔回 201／200；因為 s2 已經輪換咗 token 但信冇寄出，用戶手上冇有效連結，恢復方法係重試 create-user（決定 85）或者 re-invite（決定 86），兩者都會發新 token 同新信。同 issue #26（auth flow 實作）相關。 | 待產品經理確認 | 11.4、11.4a |
-| 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i)）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。把關靠 `release` environment（Jack 做 required reviewer，Prevent self-review 關閉）同高風險 `--release-approval`。高風險 release build 用只有 Administration: read 嘅專用 GitHub App 讀呢個 ruleset，讀唔到、`bypass_actors` 唔係空、唔係 active、缺少三條 rule、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass，SDK 唔檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval` 會獨立驗證 PR review（2C.3a）。普通 build 只記錄。 | 待產品經理確認 | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
+| 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i)）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。高風險 `--release-approval` 係計劃中、未實作，實作後先額外把關。計劃 (iii)：喺 (i) 之上再加專用 release GitHub App 開 tag（未生效）。高風險 release build 用只有 Administration: read 嘅專用 GitHub App 讀呢個 ruleset，讀唔到、`bypass_actors` 唔係空、唔係 active、缺少三條 rule、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass，SDK 唔檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval`（未實作）實作後會獨立驗證 PR review（2C.3a）。普通 build 只記錄。 | 待產品經理確認 | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
 
 ## 1. 目錄同命名
 
@@ -719,7 +719,7 @@ Branch rule 檢查（`main`）：
 - 同一個回應一定要有 active 嘅 `required_status_checks` rule，`parameters.strict_required_status_checks_policy` 係 `true`，而且 `parameters.required_status_checks` 唔係空 array（GitHub 規定要最少一個 status check 呢個設定先生效）；冇就失敗。
 - 我哋揀 **rulesets 做唯一接受嘅來源**：舊式 branch protection（`GET /repos/{owner}/{repo}/branches/{branch}/protection`）要 repo admin 權限先讀到，release workflow 唔應該攞 admin。所以呢個設定一定要用 ruleset 開；rulesets 搵唔到就失敗（待產品經理確認）。
 - **`main` 嘅 `bypass_actors` 唔再檢查（決定 96 修訂，待產品經理確認）**：`main` ruleset 可以保留 OrganizationAdmin bypass（例如 ruleset 25057946），日常 `--admin` merge 唔變。上面兩條係**一定要有嘅設定**，但 SDK 唔會讀 `main` ruleset 嘅 `bypass_actors`，有 bypass 都唔會令 build 失敗。點解仍然安全：
-  - `--release-approval` 自己驗證 PR review：批准一定要喺 PR 最後 head `H` 上、由合資格批准人做、高風險要 2 個（第 2–7 節）。Admin 用 bypass merge 而冇合資格批准，release build 照樣失敗，出唔到高風險 release。
+  - `--release-approval`（計劃中、**未實作**；實作之前呢點唔成立）自己驗證 PR review：批准一定要喺 PR 最後 head `H` 上、由合資格批准人做、高風險要 2 個（第 2–7 節）。Admin 用 bypass merge 而冇合資格批准，release build 照樣失敗，出唔到高風險 release。
   - CODEOWNERS 照樣由 PR `base.sha` 讀（第 6 節），admin bypass 改唔到今次驗證用嘅 owner。
   - 剩餘風險：admin bypass 可以跳過 up-to-date 規則（PR 冇 rebase 就 merge）。呢個情況下 merge commit 嘅 tree 通常同 `H` 唔一樣，第 2 節嘅 `tree(B) == tree(H)` 檢查會失敗，所以都出唔到高風險 release；代價係要重新開 PR 再批准。
 
@@ -738,7 +738,9 @@ Release ruleset 檢查（`v*` tag，決定 96）：
   5. 其他 build：只記錄搵到嘅 ruleset 同 `bypass_actors` 內容或者「讀唔到」。
   6. Organization 層級 tag ruleset（`source_type: Organization`）一樣用 repo endpoint 讀。
 - **點解仍然要求 bypass 空**：冇 `creation` rule 之後，開 tag 唔使 bypass，所以空 bypass 唔會阻住 release；保持空代表連 admin 都唔可以移或者刪已經開咗嘅 `v*` tag，`B` 同 tag 嘅對應唔會事後被改。
-- **剩餘風險**：所有 agent 都用 `j113203` push，任何有 write 權限嘅 agent 都可以開 `v*` tag。開 tag 本身唔會發佈：release workflow 嘅發佈 job 要經 `release` environment，由 Jack 批准；高風險 release 仲要通過 `--release-approval`（第 2–7 節）。因為 Prevent self-review 關閉，Jack 可以批准自己（`j113203`）觸發嘅 run；呢個 env 批准會被第 5 節排除（run 觸發者），所以唔計入高風險 2 人，高風險 release 仍然要 2 個合資格 PR reviewer。
+- **剩餘風險（Jack 已接受）**：所有 agent 都用 `j113203` push，live `release` environment 嘅 reviewer 都係 `j113203`，而且 `prevent_self_review: false`。所以**任何用 `j113203` 嘅 agent 都可以開 `v*` tag，再自己批准 release**；開 tag 本身唔會發佈，但發佈只係多一步 `j113203` 自己批准。
+- **而家冇額外保護**：`--release-approval`（第 2–7 節）係 v1.8 設計，**未實作**，今日唔會擋任何 release。實作之後，高風險 release 先會要 2 個合資格 PR reviewer（`j113203` 觸發 run 嘅 env 批准會被第 5 節排除）。
+- **計劃 (iii)（喺 (i) 之上，未生效）**：之後加一個專用 release GitHub App 開 `v*` tag（bypass list 只放呢個 App，屆時配合 `creation` rule），令 tag 唔再由 `j113203` 開；生效之前 SDK 照 (i) 檢查（bypass 空、唔要求 `creation`）。
 
 #### 8. Token、權限同錯誤處理
 
