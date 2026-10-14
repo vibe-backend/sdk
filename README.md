@@ -22,12 +22,14 @@ curl http://localhost:8080/catalog/v1/acme/items
 **Database roles.** `public_reader`, `public_writer` and `app_rw` must never be members of the runtime role (directly or through other roles): `vibe serve` and `vibe migrate` refuse to start if they are, and migrate fails if any of them can still reach `_platform_refresh_tokens` after its revoke. Migrate revokes access on the tables it creates; schema-level or default-privilege grants added by hand afterwards (for example `GRANT ALL ON ALL TABLES IN SCHEMA …` or `ALTER DEFAULT PRIVILEGES`) can re-open that access, so re-run `vibe migrate` after changing grants.
 
 **Registration and verification (#26, part 3).** The fixture `tests/fixtures/auth-app` implements spec §12.11 end to end:
+
 - `POST /auth/v1/{slug}/register` takes only email and name (decision 67). It always runs one upsert plus one outbox insert and answers the same 202 body whether the email is new, unverified, verified or invited (decision 56).
 - Re-registering an unverified email only rotates its token, so the old link stops working; a verified user or one with a pending invite gets an "already registered" notice instead.
 - `POST /auth/v1/{slug}/verify-email` runs `user.complete-verification`. It always hashes the password first, then sets `password` and `email_verified_at` in one UPDATE.
 - After a successful verification the platform revokes every refresh family of that user (`email-verified`). Admin invites (decision 69) use the same route and method.
 
 Runtime rules:
+
 - A `query` that writes `password` needs `capabilities: [set-password]`, and one that writes `email_verified_at` needs `confirm-verification` (checked by validate and at runtime).
 - Public response floors pad a response that runs past the floor up to the next 100 ms (decision 66).
 - Expressions accept quoted string literals (`purpose: 'invite'`).
