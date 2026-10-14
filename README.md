@@ -2,7 +2,18 @@
 
 Rust SDK and `vibe` CLI for a markdown-driven serverless backend. Source files under `providers/`, `models/`, `migrations/`, and `api/` compile into structured `{name}.lock.md` files and a signed manifest. The HTTP runtime loads that manifest. It does not interpret natural language.
 
-The specification is [docs/spec-v1.7.md](docs/spec-v1.7.md).
+The specification is [docs/spec-v1.7.md](docs/spec-v1.7.md). The draft [docs/spec-v1.8.md](docs/spec-v1.8.md) is under review.
+
+## v1.8 設計（實作中）
+
+The commands below are the v1.8 design and are not implemented yet. Until then, use the steps in the next sections.
+
+```bash
+vibe dev
+curl http://localhost:8080/catalog/v1/acme/items
+```
+
+`vibe dev` will use an in-memory database for development and testing only; all data is lost when the server stops.
 
 ## Install
 
