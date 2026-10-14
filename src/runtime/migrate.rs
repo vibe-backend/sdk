@@ -269,6 +269,27 @@ async fn protect_schema(exec: &PgSession, schema: &str) -> Result<Vec<String>, S
             unsafe_rels.join(", ")
         ));
     }
+    // SECURITY DEFINER code runs as its owner, so it can change
+    // `app.tenant_id` mid-transaction and read or copy other tenants' rows.
+    let definer = exec
+        .query_texts(
+            "SELECT format('function %I(%s)', p.proname, pg_get_function_identity_arguments(p.oid)) \
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = $1 AND p.prosecdef \
+             UNION ALL \
+             SELECT format('trigger %I on %I (%s)', t.tgname, c.relname, t.tgfoid::regproc::text) \
+             FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_proc p ON p.oid = t.tgfoid \
+             WHERE n.nspname = $1 AND NOT t.tgisinternal AND p.prosecdef ORDER BY 1",
+            schema,
+        )
+        .await?;
+    if !definer.is_empty() {
+        return Err(format!(
+            "{schema}: SECURITY DEFINER functions and triggers are not allowed; they run as their owner and can switch app.tenant_id ({})",
+            definer.join(", ")
+        ));
+    }
     let missing = exec
         .query_texts(
             "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
