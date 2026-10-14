@@ -746,3 +746,43 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
     let mine = send(&app, "GET", "/shop/v1/cart-items", Some(customer), None).await;
     assert_eq!(mine.json["items"].as_array().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn manifest_output_is_relative_to_the_current_directory() {
+    let root = copy_shop();
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|err| panic!("{err}"));
+    let key = sign::load_or_create(&root).unwrap();
+    approve_project(&ApproveOptions {
+        root: &root,
+        reviewers: &["ada@example.com".into(), "grace@example.com".into()],
+        reason: "cli path test",
+        approval_ref: "local",
+        commit: "local",
+        now: "2026-10-14T00:00:00Z",
+        signing_key: &key,
+    })
+    .unwrap_or_else(|err| panic!("{err}"));
+    let cwd = std::env::temp_dir().join(format!("vibe-cwd-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&cwd).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_vibe"))
+        .args(["manifest", "--project"])
+        .arg(&root)
+        .args(["-o", "out.json"])
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(cwd.join("out.json").exists());
+    assert!(!root.join("out.json").exists());
+}

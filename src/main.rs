@@ -59,6 +59,7 @@ enum Command {
     Manifest {
         #[arg(long, default_value = ".")]
         project: PathBuf,
+        /// Output path, relative to the current directory (like `serve --manifest`).
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
     },
@@ -324,11 +325,8 @@ fn cmd_approve(
 fn cmd_manifest(project: &Path, output: &Path) -> Result<(), String> {
     let key = sign::load_or_create(project).map_err(|err| err.to_string())?;
     let manifest = manifest::manifest_from_project(project, &key).map_err(|err| err.to_string())?;
-    let path = if output.is_absolute() {
-        output.to_path_buf()
-    } else {
-        project.join(output)
-    };
+    // Relative to the current directory, like `vibe serve --manifest` (#31).
+    let path = output.to_path_buf();
     manifest::write_manifest(&path, &manifest).map_err(|err| err.to_string())?;
     println!("wrote {}", path.display());
     Ok(())
