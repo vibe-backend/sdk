@@ -380,6 +380,14 @@ impl PgExec {
         }
     }
 
+    /// Runs exactly one SQL command over the extended protocol; the server
+    /// rejects text that contains more than one.
+    pub async fn execute_one(&self, statement: &str) -> Result<(), String> {
+        let client = self.client.lock().await;
+        client.execute(statement, &[]).await.map_err(pg_error)?;
+        Ok(())
+    }
+
     /// Runs a query returning one text column.
     pub async fn query_texts(&self, sql: &str, param: &str) -> Result<Vec<String>, String> {
         let client = self.client.lock().await;
