@@ -138,6 +138,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_or_broken_runtime_slugs_fail() {
+        for (name, text) in [
+            ("empty", ""),
+            ("broken", "{not json"),
+            ("bad-tenant", r#"{"acme": {"tenant_id": "X"}}"#),
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("vibe-slugs-{name}-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(root.join(".vibe")).unwrap();
+            fs::write(root.join(".vibe/slugs.json"), text).unwrap();
+            assert!(load_project_slugs(&root, false).is_err(), "{name}");
+            assert!(load_project_slugs(&root, true).is_err(), "{name} (memory)");
+        }
+    }
+
+    #[test]
     fn example_is_ignored_unless_allowed() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/shop");
         let loaded = load_project_slugs(&root, false).unwrap();

@@ -343,6 +343,15 @@ async fn cmd_serve(
     if let Some(name) = llm::runtime_llm_env_present() {
         return Err(format!("runtime environment must not contain {name}"));
     }
+    let run_env =
+        vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), memory);
+    if memory && !run_env.is_dev() {
+        return Err(format!(
+            "--memory is a development executor and is refused when VIBE_ENV is {:?}; use PostgreSQL",
+            std::env::var("VIBE_ENV").unwrap_or_default()
+        ));
+    }
+    let auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
     let exec: Arc<dyn QueryExec> = if memory {
@@ -373,7 +382,7 @@ async fn cmd_serve(
     let state = Arc::new(AppState {
         manifest,
         exec,
-        auth: auth_from_env()?,
+        auth,
         slugs: loaded.slugs,
         rates: std::sync::Mutex::new(HashMap::new()),
         quotas: std::sync::Mutex::new(HashMap::new()),
@@ -433,7 +442,7 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
     Ok(())
 }
 
-fn auth_from_env() -> Result<AuthConfig, String> {
+fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
     let mut auth = AuthConfig::anonymous();
     if let Ok(pem) = std::env::var("VIBE_JWT_PUBLIC_KEY_PEM") {
         auth.public_pem = pem.replace("\\n", "\n");
@@ -447,9 +456,11 @@ fn auth_from_env() -> Result<AuthConfig, String> {
     if let Ok(kid) = std::env::var("VIBE_JWT_KID") {
         auth.kid = kid;
     }
-    let vibe_env = std::env::var("VIBE_ENV").ok();
+    let vibe_env = std::env::var("VIBE_ENV")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase());
     let pepper = std::env::var("VIBE_API_KEY_PEPPER").ok();
-    let (pepper, warning) = vibe::runtime::resolve_pepper(vibe_env.as_deref(), pepper.as_deref())?;
+    let (pepper, warning) = vibe::runtime::resolve_pepper(run_env, pepper.as_deref())?;
     if let Some(warning) = warning {
         eprintln!("warning: {warning}");
     }
@@ -493,10 +504,8 @@ fn load_dotenv(project: &Path) {
 fn ci_or_prod() -> bool {
     std::env::var("CI").ok().as_deref() == Some("true")
         || std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
-        || matches!(
-            std::env::var("VIBE_ENV").as_deref(),
-            Ok("production") | Ok("ci")
-        )
+        || !vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), true)
+            .is_dev()
 }
 
 fn print_report(report: &vibe::Report) {
