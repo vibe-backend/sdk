@@ -87,6 +87,7 @@ impl AuthConfig {
                 if self.route_jwks.contains_key(&uri) {
                     continue;
                 }
+                // Route URIs come from locks: public hosts only, no dev exception.
                 let source = super::jwks::HttpsJwks::new(&uri)
                     .map_err(|err| format!("{} {}: {err}", route.method, route.path))?;
                 self.route_jwks

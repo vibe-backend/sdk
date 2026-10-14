@@ -377,7 +377,7 @@ fn is_loopback(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
-fn is_private_host(host: &str) -> bool {
+pub(crate) fn is_private_host(host: &str) -> bool {
     let host = host.trim_matches(['[', ']']);
     if host.eq_ignore_ascii_case("localhost")
         || host.ends_with(".localhost")

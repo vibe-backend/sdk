@@ -938,6 +938,13 @@ pub fn jwt_override_problem(
                 if !url.username().is_empty() || url.password().is_some() {
                     return Some(format!("{name} must not carry credentials"));
                 }
+                if crate::runtime::jwks::non_public_host(url.host_str().unwrap_or("")) {
+                    // Locks ship to production: no private/loopback/link-local
+                    // issuers (the derived {iss}/.well-known/jwks.json too).
+                    return Some(format!(
+                        "{name} host must be public (not loopback, private or link-local)"
+                    ));
+                }
                 if name == "jwks-uri" && url.fragment().is_some() {
                     return Some("jwks-uri must not have a fragment".into());
                 }
@@ -967,7 +974,9 @@ mod jwt_override_tests {
 
     #[test]
     fn overrides_are_validated() {
-        let ok = |i, a, j| jwt_override_problem(i, a, j, false, "jwt").is_none();
+        fn ok(i: &str, a: &str, j: &str) -> bool {
+            jwt_override_problem(i, a, j, false, "jwt").is_none()
+        }
         assert!(ok("", "", ""));
         assert!(ok("https://idp.example.com/t1", "shop", ""));
         assert!(ok(
@@ -990,6 +999,25 @@ mod jwt_override_tests {
         assert!(!ok("idp.example.com", "", ""));
         assert!(!ok("", "a b", ""));
         assert!(!ok("", "a,b", ""));
+        assert!(!ok("", "[a,b]", ""));
+        assert!(!ok(
+            "https://idp.example.com",
+            "",
+            "https://u:p@idp.example.com/k"
+        ));
+        for host in [
+            "https://127.0.0.1",
+            "https://localhost",
+            "https://169.254.169.254",
+            "https://10.1.2.3",
+            "https://[::1]",
+        ] {
+            assert!(!ok(host, "", ""), "iss {host}");
+            assert!(
+                !ok("https://idp.example.com", "", &format!("{host}/k")),
+                "jwks {host}"
+            );
+        }
         assert!(jwt_override_problem("https://i.example.com", "", "", true, "jwt").is_some());
         assert!(jwt_override_problem("https://i.example.com", "", "", false, "api-key").is_some());
     }

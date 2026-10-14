@@ -552,6 +552,28 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
             }
         }
         for block in &pipes.blocks {
+            if pipeline_name(&block.heading) != "auth" {
+                continue;
+            }
+            let get = |k: &str| {
+                block
+                    .bullets
+                    .iter()
+                    .find(|b| b.key == k)
+                    .map(|b| b.value.trim().to_string())
+                    .unwrap_or_default()
+            };
+            if let Some(problem) = crate::manifest::jwt_override_problem(
+                &get("iss"),
+                &get("aud"),
+                &get("jwks-uri"),
+                auth_removed,
+                &auth_mode,
+            ) {
+                report.push(Diag::error(file, problem).at_section("Pipelines"));
+            }
+        }
+        for block in &pipes.blocks {
             let name = pipeline_name(&block.heading);
             if name == "auth" {
                 if let Some(roles) = block.bullets.iter().find(|b| b.key == "roles") {
