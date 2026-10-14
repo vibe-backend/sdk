@@ -455,6 +455,33 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
         }
     }
     if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
+        let auth_removed = pipes.blocks.iter().any(|block| {
+            let name = pipeline_name(&block.heading);
+            name == "-auth"
+                || (name == "auth"
+                    && block
+                        .bullets
+                        .iter()
+                        .any(|b| b.key == "removed" && b.value == "true"))
+        });
+        let auth_mode = pipes
+            .blocks
+            .iter()
+            .filter(|block| pipeline_name(&block.heading) == "auth")
+            .find_map(|block| block.bullets.iter().find(|b| b.key == "mode"))
+            .map(|b| b.value.clone())
+            .unwrap_or_else(|| "jwt".into());
+        for block in &pipes.blocks {
+            if pipeline_name(&block.heading) == "rate-limit" {
+                if let Some(key) = block.bullets.iter().find(|b| b.key == "key") {
+                    if let Err(err) =
+                        crate::manifest::check_rate_key(&key.value, auth_removed, &auth_mode)
+                    {
+                        report.push(Diag::error(file, err).at_section("Pipelines"));
+                    }
+                }
+            }
+        }
         for block in &pipes.blocks {
             let name = pipeline_name(&block.heading);
             if name == "auth" {

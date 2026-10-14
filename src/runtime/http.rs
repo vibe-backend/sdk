@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 
 type HttpResponse = Response<Body>;
@@ -76,6 +77,8 @@ pub struct AppState {
     pub disabled: HashSet<String>,
     pub min_override_ms: Option<u64>,
     pub honor_test_ip: bool,
+    /// Proxies whose `X-Forwarded-For` is trusted. Empty = use the peer address.
+    pub trusted_proxies: Vec<IpAddr>,
     /// When set, an unknown public slug explains how to register it.
     pub dev_hints: bool,
 }
@@ -148,7 +151,11 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         );
     }
     let headers = header_map(req.headers());
-    let ip = client_ip(&headers, state.honor_test_ip);
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip());
+    let ip = client_ip(&headers, peer, &state.trusted_proxies, state.honor_test_ip);
     let body_limit = found.route.body_limit as usize;
     let bytes = match axum::body::to_bytes(req.into_body(), body_limit.saturating_add(1)).await {
         Ok(bytes) => bytes,
@@ -298,7 +305,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             .await;
         }
     }
-    if let Some(retry) = rate_limited(&state, found.route, &ip, &principal.tenant_id) {
+    if let Some(retry) = rate_limited(&state, found.route, &ip, &principal, &body) {
         return finish(
             found.route,
             &state,
@@ -314,6 +321,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         .await;
     }
     if found.route.public_writes && quota_exhausted(&state, &principal.tenant_id, &ip) {
+        let retry = seconds_until_utc_midnight().to_string();
         return finish(
             found.route,
             &state,
@@ -323,7 +331,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                 "RATE_LIMITED",
                 "Public write quota is exhausted",
                 &request_id,
-                &[("retry-after", "3600")],
+                &[("retry-after", retry.as_str())],
             ),
         )
         .await;
@@ -870,33 +878,118 @@ fn scope_allows(scopes: &[String], definition: &str, write: bool) -> bool {
     })
 }
 
-fn rate_limited(state: &AppState, route: &RouteSpec, ip: &str, tenant: &str) -> Option<String> {
+/// Maximum number of rate/quota buckets kept in memory. When full, expired
+/// buckets are pruned; if still full, new buckets are refused (fail closed).
+pub const MAX_BUCKETS: usize = 100_000;
+const WINDOW: Duration = Duration::from_secs(60);
+
+fn rate_bucket(
+    key: &str,
+    route: &RouteSpec,
+    ip: &str,
+    principal: &Principal,
+    body: &Value,
+    pepper: &[u8],
+) -> String {
+    let tenant = &principal.tenant_id;
+    let feature = &route.feature_id;
+    let field = match key {
+        "tenant" => return format!("tenant:{tenant}:{feature}"),
+        "user" | "api-key" => return format!("{key}:{tenant}:{}:{feature}", principal.subject),
+        "account" => Some("email"),
+        _ => key.strip_prefix("input."),
+    };
+    match field {
+        Some(field) => {
+            // Normalize, then HMAC so the plaintext is never stored (§4.3).
+            let raw = body
+                .get(field)
+                .map(|v| match v {
+                    Value::String(s) => s.trim().to_lowercase(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            format!(
+                "input:{tenant}:{field}:{}:{feature}",
+                hmac_hex(pepper, &raw)
+            )
+        }
+        None => format!("ip:{ip}:{feature}"),
+    }
+}
+
+/// Seconds until the oldest hit leaves the window (at least 1).
+fn retry_after(oldest: Instant, now: Instant) -> u64 {
+    let elapsed = now.duration_since(oldest);
+    let remaining = WINDOW.saturating_sub(elapsed);
+    (remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)).max(1)
+}
+
+fn rate_limited(
+    state: &AppState,
+    route: &RouteSpec,
+    ip: &str,
+    principal: &Principal,
+    body: &Value,
+) -> Option<String> {
     if route.rates.is_empty() {
         return None;
     }
-    let mut rates = state.rates.lock().ok()?;
+    let Ok(mut rates) = state.rates.lock() else {
+        return Some("1".into());
+    };
     let now = Instant::now();
-    for rate in &route.rates {
-        let bucket = match rate.key.as_str() {
-            "tenant" => format!("tenant:{tenant}:{}", route.feature_id),
-            "account" => format!("account:{tenant}:{}", route.feature_id),
-            _ => format!("ip:{ip}:{}", route.feature_id),
-        };
-        let hits = rates.entry(bucket).or_default();
-        hits.retain(|at| now.duration_since(*at) < Duration::from_secs(60));
-        if hits.len() as u32 >= rate.per_minute {
-            return Some("60".into());
+    let buckets: Vec<(String, u32)> = route
+        .rates
+        .iter()
+        .map(|rate| {
+            (
+                rate_bucket(&rate.key, route, ip, principal, body, &state.auth.pepper),
+                rate.per_minute,
+            )
+        })
+        .collect();
+    let mut worst: Option<u64> = None;
+    for (bucket, limit) in &buckets {
+        if let Some(hits) = rates.get_mut(bucket) {
+            hits.retain(|at| now.duration_since(*at) < WINDOW);
+            if hits.len() as u32 >= *limit {
+                let wait = hits.first().map(|t| retry_after(*t, now)).unwrap_or(1);
+                worst = Some(worst.map_or(wait, |w| w.max(wait)));
+            }
         }
-        hits.push(now);
+    }
+    if let Some(wait) = worst {
+        return Some(wait.to_string());
+    }
+    if rates.len() + buckets.len() > MAX_BUCKETS {
+        rates.retain(|_, hits| {
+            hits.retain(|at| now.duration_since(*at) < WINDOW);
+            !hits.is_empty()
+        });
+        if rates.len() + buckets.len() > MAX_BUCKETS {
+            return Some(WINDOW.as_secs().to_string());
+        }
+    }
+    for (bucket, _) in buckets {
+        rates.entry(bucket).or_default().push(now);
     }
     None
 }
 
+fn seconds_until_utc_midnight() -> i64 {
+    let now = chrono::Utc::now();
+    let tomorrow = (now.date_naive() + chrono::Days::new(1))
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight")
+        .and_utc();
+    (tomorrow - now).num_seconds().max(1)
+}
+
 fn quota_exhausted(state: &AppState, tenant: &str, ip: &str) -> bool {
     let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let mut quotas = match state.quotas.lock() {
-        Ok(quotas) => quotas,
-        Err(_) => return false,
+    let Ok(mut quotas) = state.quotas.lock() else {
+        return true;
     };
     let tenant_key = format!("tenant:{tenant}:{day}");
     let ip_key = format!("ip:{ip}:{day}");
@@ -905,21 +998,49 @@ fn quota_exhausted(state: &AppState, tenant: &str, ip: &str) -> bool {
     if tenant_count >= 1000 || ip_count >= 50 {
         return true;
     }
+    if quotas.len() + 2 > MAX_BUCKETS {
+        let suffix = format!(":{day}");
+        quotas.retain(|key, _| key.ends_with(&suffix));
+        if quotas.len() + 2 > MAX_BUCKETS {
+            return true;
+        }
+    }
     *quotas.entry(tenant_key).or_insert(0) += 1;
     *quotas.entry(ip_key).or_insert(0) += 1;
     false
 }
 
-fn client_ip(headers: &BTreeMap<String, String>, honor_test_ip: bool) -> String {
+/// Client IP: the peer address, unless the peer is a trusted proxy, in which
+/// case the rightmost `X-Forwarded-For` hop that is not a trusted proxy.
+fn client_ip(
+    headers: &BTreeMap<String, String>,
+    peer: Option<IpAddr>,
+    trusted: &[IpAddr],
+    honor_test_ip: bool,
+) -> String {
     if honor_test_ip {
         if let Some(ip) = headers.get("x-vibe-test-ip") {
             return ip.clone();
         }
     }
-    headers
-        .get("x-forwarded-for")
-        .cloned()
-        .unwrap_or_else(|| "0.0.0.0".into())
+    let Some(peer) = peer else {
+        return "0.0.0.0".into();
+    };
+    if !trusted.contains(&peer) {
+        return peer.to_string();
+    }
+    let Some(xff) = headers.get("x-forwarded-for") else {
+        return peer.to_string();
+    };
+    let mut last = peer;
+    for hop in xff.rsplit(',') {
+        match hop.trim().parse::<IpAddr>() {
+            Ok(ip) if trusted.contains(&ip) => last = ip,
+            Ok(ip) => return ip.to_string(),
+            Err(_) => return last.to_string(),
+        }
+    }
+    last.to_string()
 }
 
 fn header_map(headers: &HeaderMap) -> BTreeMap<String, String> {
@@ -1097,4 +1218,89 @@ fn empty_response(
     response
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn xff(v: &str) -> BTreeMap<String, String> {
+        let mut h = BTreeMap::new();
+        h.insert("x-forwarded-for".to_string(), v.to_string());
+        h
+    }
+
+    #[test]
+    fn xff_ignored_without_trusted_proxy() {
+        let got = client_ip(&xff("1.2.3.4"), Some(ip("9.9.9.9")), &[], false);
+        assert_eq!(got, "9.9.9.9");
+    }
+
+    #[test]
+    fn xff_rightmost_untrusted_hop() {
+        let trusted = [ip("10.0.0.1"), ip("10.0.0.2")];
+        let got = client_ip(
+            &xff("6.6.6.6, 5.5.5.5, 10.0.0.2"),
+            Some(ip("10.0.0.1")),
+            &trusted,
+            false,
+        );
+        assert_eq!(got, "5.5.5.5", "spoofed leftmost entry must be ignored");
+    }
+
+    #[test]
+    fn retry_after_counts_down() {
+        let now = Instant::now();
+        let oldest = now - Duration::from_secs(45);
+        assert_eq!(retry_after(oldest, now), 15);
+        assert_eq!(retry_after(now, now), 60);
+        assert_eq!(retry_after(now - Duration::from_secs(70), now), 1);
+    }
+
+    #[test]
+    fn buckets_follow_the_key() {
+        let route = RouteSpec {
+            feature_id: "f".into(),
+            ..test_route()
+        };
+        let p = Principal {
+            tenant_id: "tenant0001".into(),
+            subject: "u1".into(),
+            roles: vec![],
+            scopes: vec![],
+        };
+        let body = json!({"email": " A@X.COM "});
+        let pep = b"p";
+        assert!(rate_bucket("user", &route, "1.1.1.1", &p, &body, pep).contains(":u1:"));
+        assert!(rate_bucket("tenant", &route, "1.1.1.1", &p, &body, pep).starts_with("tenant:"));
+        let a = rate_bucket("input.email", &route, "1.1.1.1", &p, &body, pep);
+        let b = rate_bucket(
+            "input.email",
+            &route,
+            "2.2.2.2",
+            &p,
+            &json!({"email": "a@x.com"}),
+            pep,
+        );
+        assert_eq!(a, b, "normalized input key is IP independent");
+        assert!(!a.contains("a@x.com"), "plaintext must not be stored");
+        assert_eq!(a, rate_bucket("account", &route, "3.3.3.3", &p, &body, pep));
+        assert!(rate_bucket("ip", &route, "1.1.1.1", &p, &body, pep).starts_with("ip:1.1.1.1"));
+    }
+
+    fn test_route() -> RouteSpec {
+        serde_json::from_value(json!({
+            "method": "GET", "path": "/", "feature_id": "f", "public": false,
+            "auth_removed": false, "auth_mode": "jwt", "roles": [], "scopes": [],
+            "rates": [], "body_limit": 0, "request": [], "transform_in": "",
+            "transform_out": "", "steps": [], "errors": [], "min_response_ms": 0,
+            "public_writes": false, "challenge_type": "", "challenge_when": "",
+            "deprecated": false, "sunset": ""
+        }))
+        .unwrap()
+    }
 }

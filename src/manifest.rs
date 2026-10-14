@@ -56,6 +56,35 @@ pub struct RateSpec {
     pub key: String,
 }
 
+/// Checks a `rate-limit` key against spec §4.3. Supported here: `ip`,
+/// `tenant`, `user` (needs auth), `api-key` (needs api-key auth),
+/// `input.{field}`, and the legacy login-guard `account` (= `input.email`).
+/// `family` needs the platform `token-refresh` pipeline, which this runtime
+/// does not provide, so it is rejected rather than silently keyed by IP.
+pub fn check_rate_key(key: &str, auth_removed: bool, auth_mode: &str) -> Result<(), String> {
+    match key {
+        "ip" | "tenant" | "account" => Ok(()),
+        "user" if auth_removed => Err("rate-limit key `user` needs auth".into()),
+        "user" => Ok(()),
+        "api-key" if auth_removed || auth_mode != "api-key" => {
+            Err("rate-limit key `api-key` needs `auth: { mode: api-key }`".into())
+        }
+        "api-key" => Ok(()),
+        "family" => Err("rate-limit key `family` is only valid with token-refresh, which this runtime does not support".into()),
+        _ => match key.strip_prefix("input.") {
+            Some(field)
+                if !field.is_empty()
+                    && field
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                Ok(())
+            }
+            _ => Err(format!("unknown rate-limit key `{key}`")),
+        },
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ReqField {
     pub location: String,
@@ -494,6 +523,10 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
             }
         }
     }
+    for rate in &rates {
+        check_rate_key(&rate.key, auth_removed, &auth_mode)
+            .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
+    }
     let body_limit = find_section(&doc.sections, "Limits")
         .and_then(|s| s.get("body"))
         .map(validate::parse_bytes)
@@ -718,4 +751,22 @@ pub fn method<'a>(manifest: &'a Manifest, target: &str) -> Option<&'a MethodSpec
 
 pub fn json_null() -> Value {
     Value::Null
+}
+
+#[cfg(test)]
+mod rate_key_tests {
+    use super::check_rate_key;
+
+    #[test]
+    fn accepts_spec_keys_and_rejects_others() {
+        for ok in ["ip", "tenant", "user", "input.email", "account"] {
+            assert!(check_rate_key(ok, false, "jwt").is_ok(), "{ok}");
+        }
+        assert!(check_rate_key("api-key", false, "api-key").is_ok());
+        assert!(check_rate_key("api-key", false, "jwt").is_err());
+        assert!(check_rate_key("user", true, "jwt").is_err());
+        for bad in ["family", "req.ip", "input.", "input.a-b", "everyone"] {
+            assert!(check_rate_key(bad, false, "jwt").is_err(), "{bad}");
+        }
+    }
 }

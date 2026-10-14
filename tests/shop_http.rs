@@ -119,6 +119,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         disabled: std::collections::HashSet::new(),
         min_override_ms: Some(0),
         honor_test_ip: true,
+        trusted_proxies: Vec::new(),
         dev_hints: true,
     });
     let app = router(state);

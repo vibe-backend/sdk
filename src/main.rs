@@ -380,6 +380,7 @@ async fn cmd_serve(
         disabled: load_disabled(project),
         min_override_ms: None,
         honor_test_ip: false,
+        trusted_proxies: trusted_proxies_from_env()?,
         dev_hints: memory,
     });
     let app = router(state);
@@ -387,9 +388,12 @@ async fn cmd_serve(
         .await
         .map_err(|err| err.to_string())?;
     println!("listening on {addr}");
-    axum::serve(listener, app)
-        .await
-        .map_err(|err| err.to_string())
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|err| err.to_string())
 }
 
 async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Result<(), String> {
@@ -454,6 +458,22 @@ fn auth_from_env() -> AuthConfig {
         auth.env_name = env_name;
     }
     auth
+}
+
+/// `VIBE_TRUSTED_PROXIES`: comma-separated proxy IPs whose
+/// `X-Forwarded-For` is honoured. Unset = trust no proxy (use the peer).
+fn trusted_proxies_from_env() -> Result<Vec<std::net::IpAddr>, String> {
+    let Ok(raw) = std::env::var("VIBE_TRUSTED_PROXIES") else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse()
+                .map_err(|_| format!("VIBE_TRUSTED_PROXIES: invalid IP {s}"))
+        })
+        .collect()
 }
 
 fn load_disabled(project: &Path) -> std::collections::HashSet<String> {
