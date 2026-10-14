@@ -22,6 +22,7 @@ fn config(base_url: &str, max_retries: u32) -> LlmConfig {
         seed: 0,
         endpoint_host: "127.0.0.1".into(),
         endpoint_private: false,
+        api_style: "chat".into(),
     }
 }
 
@@ -38,7 +39,7 @@ fn project() -> std::path::PathBuf {
     fs::create_dir_all(root.join("providers")).unwrap();
     fs::write(
         root.join("providers/main.md"),
-        include_str!("../examples/shop/providers/main.md"),
+        include_str!("fixtures/shop/providers/main.md"),
     )
     .unwrap();
     root
