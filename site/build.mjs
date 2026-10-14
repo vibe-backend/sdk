@@ -25,7 +25,7 @@ const root = path.resolve(here, '..');
 const out = path.join(here, 'dist');
 const src = path.join(here, 'src');
 const REPO = 'https://github.com/vibe-backend/sdk';
-const SITE_URL = (process.env.SITE_URL || 'https://vibe-backend.github.io/sdk/').replace(/\/?$/, '/');
+const SITE_URL = (process.env.SITE_URL || 'https://vibe-backend.github.io/').replace(/\/?$/, '/');
 const locales = Object.keys(LOCALES);
 
 const slugify = (s) => s.toLowerCase().trim()
