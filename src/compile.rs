@@ -36,7 +36,13 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
     // (cache key, LLM sections) for sources whose fresh LLM output compiled.
     // Written only once the source also passes semantic_check (below).
     let mut pending_cache: HashMap<String, (String, String)> = HashMap::new();
-    let budget = std::sync::Arc::new(crate::llm_budget::CallBudget::from_env());
+    let budget = match crate::llm_budget::CallBudget::from_env() {
+        Ok(budget) => std::sync::Arc::new(budget),
+        Err(err) => {
+            report.push(Diag::error("compile", format!("invalid LLM budget: {err}")));
+            return Err(report);
+        }
+    };
     if let Err(err) = crate::lockcommit::recover(opts.root) {
         report.push(Diag::error(
             "compile",

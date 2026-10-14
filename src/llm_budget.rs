@@ -29,26 +29,40 @@ impl Default for Limits {
     }
 }
 
+/// Config may lower any limit freely, but may raise it to at most this
+/// multiple of the default. A value above the cap, zero, or a value that
+/// does not parse fails the run instead of being clamped or ignored.
+pub const MAX_RAISE_FACTOR: u64 = 2;
+
 impl Limits {
-    pub fn from_env() -> Self {
-        let num = |name: &str, default: u64, max: u64| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .map(|n| n.min(max))
-                .unwrap_or(default)
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Read the limits through `get` (the environment in production).
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let num = |name: &str, default: u64| -> Result<u64, String> {
+            let Some(raw) = get(name) else {
+                return Ok(default);
+            };
+            let cap = default * MAX_RAISE_FACTOR;
+            let n = raw.trim().parse::<u64>().map_err(|_| {
+                format!("{name} must be a whole number between 1 and {cap}, got {raw:?}")
+            })?;
+            if n == 0 || n > cap {
+                return Err(format!(
+                    "{name} must be between 1 and {cap} (default {default}, hard cap {MAX_RAISE_FACTOR}x), got {n}"
+                ));
+            }
+            Ok(n)
         };
         let d = Self::default();
-        Self {
-            source_calls: num("LLM_MAX_CALLS_PER_SOURCE", d.source_calls as u64, 100) as u32,
-            run_calls: num("LLM_MAX_CALLS_PER_RUN", d.run_calls as u64, 10_000) as u32,
-            source_time: Duration::from_secs(num(
-                "LLM_SOURCE_DEADLINE",
-                d.source_time.as_secs(),
-                3600,
-            )),
-            run_time: Duration::from_secs(num("LLM_RUN_DEADLINE", d.run_time.as_secs(), 86_400)),
-        }
+        Ok(Self {
+            source_calls: num("LLM_MAX_CALLS_PER_SOURCE", d.source_calls as u64)? as u32,
+            run_calls: num("LLM_MAX_CALLS_PER_RUN", d.run_calls as u64)? as u32,
+            source_time: Duration::from_secs(num("LLM_SOURCE_DEADLINE", d.source_time.as_secs())?),
+            run_time: Duration::from_secs(num("LLM_RUN_DEADLINE", d.run_time.as_secs())?),
+        })
     }
 }
 
@@ -80,8 +94,8 @@ impl CallBudget {
         }
     }
 
-    pub fn from_env() -> Self {
-        Self::new(Limits::from_env())
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self::new(Limits::from_env()?))
     }
 
     /// Start the per-source counters for the next source.
@@ -142,6 +156,79 @@ impl CallBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn limits(pairs: &[(&str, &str)]) -> Result<Limits, String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Limits::from_lookup(|name| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        })
+    }
+
+    #[test]
+    fn defaults_when_unset() {
+        let l = limits(&[]).unwrap();
+        assert_eq!(l.source_calls, 8);
+        assert_eq!(l.run_calls, 200);
+        assert_eq!(l.source_time, Duration::from_secs(300));
+        assert_eq!(l.run_time, Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn config_may_lower_freely() {
+        let l = limits(&[
+            ("LLM_MAX_CALLS_PER_SOURCE", "1"),
+            ("LLM_MAX_CALLS_PER_RUN", "5"),
+            ("LLM_SOURCE_DEADLINE", "10"),
+            ("LLM_RUN_DEADLINE", "60"),
+        ])
+        .unwrap();
+        assert_eq!(l.source_calls, 1);
+        assert_eq!(l.run_calls, 5);
+        assert_eq!(l.source_time, Duration::from_secs(10));
+        assert_eq!(l.run_time, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn raising_up_to_twice_the_default_is_allowed() {
+        let l = limits(&[
+            ("LLM_MAX_CALLS_PER_SOURCE", "16"),
+            ("LLM_MAX_CALLS_PER_RUN", "400"),
+            ("LLM_SOURCE_DEADLINE", "600"),
+            ("LLM_RUN_DEADLINE", "3600"),
+        ])
+        .unwrap();
+        assert_eq!(l.source_calls, 16);
+        assert_eq!(l.run_calls, 400);
+        assert_eq!(l.source_time, Duration::from_secs(600));
+        assert_eq!(l.run_time, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn above_the_hard_cap_fails() {
+        for (name, v) in [
+            ("LLM_MAX_CALLS_PER_SOURCE", "17"),
+            ("LLM_MAX_CALLS_PER_RUN", "401"),
+            ("LLM_SOURCE_DEADLINE", "601"),
+            ("LLM_RUN_DEADLINE", "3601"),
+        ] {
+            let err = limits(&[(name, v)]).unwrap_err();
+            assert!(err.contains(name) && err.contains("hard cap"), "{err}");
+        }
+    }
+
+    #[test]
+    fn invalid_values_fail() {
+        for v in ["", "abc", "-1", "1.5", "0", "99999999999999999999999"] {
+            let err = limits(&[("LLM_MAX_CALLS_PER_SOURCE", v)]).unwrap_err();
+            assert!(err.contains("LLM_MAX_CALLS_PER_SOURCE"), "{v}: {err}");
+        }
+    }
 
     #[test]
     fn caps_calls_per_source_and_run() {

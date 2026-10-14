@@ -16,10 +16,10 @@ There is no source `.md` for this: the endpoint is configuration, not a definiti
 | `LLM_MODEL` | yes | a model id / snapshot id the provider documents as **non-floating** (Decision 58) |
 | `LLM_TIMEOUT` | no | default 60s, max 300s |
 | `LLM_RETRY_DEADLINE` | no | total seconds one LLM call may spend retrying, default 120, max 600 |
-| `LLM_MAX_CALLS_PER_SOURCE` | no | HTTP attempts one source may make, counting retries, default 8 |
-| `LLM_MAX_CALLS_PER_RUN` | no | HTTP attempts one `vibe compile` may make, default 200 |
-| `LLM_SOURCE_DEADLINE` | no | seconds one source may spend in LLM calls, default 300 |
-| `LLM_RUN_DEADLINE` | no | seconds one run may spend in LLM calls, default 1800 |
+| `LLM_MAX_CALLS_PER_SOURCE` | no | HTTP attempts one source may make, counting retries and translation, default 8, max 16 |
+| `LLM_MAX_CALLS_PER_RUN` | no | HTTP attempts one `vibe compile` may make, default 200, max 400 |
+| `LLM_SOURCE_DEADLINE` | no | seconds one source may spend in LLM calls, default 300, max 600 |
+| `LLM_RUN_DEADLINE` | no | seconds one run may spend in LLM calls, default 1800, max 3600 |
 | `LLM_MAX_RETRIES` | no | retries for network errors, timeouts, 408, 429 and 5xx with exponential backoff (1s, 2s, 4s, … capped at 16s, plus jitter), default 2, max 5; a `Retry-After` header (seconds, capped at 60) replaces the backoff; 400/401/403/404 are never retried |
 | `LLM_SEED` | no | sent only if the model supports seed; default `0`; counted in `compiler-hash` either way |
 | `LLM_ALLOW_PRIVATE_HOST` | no | default `false`; local development only |
