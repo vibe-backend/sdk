@@ -13,7 +13,9 @@ vibe dev
 curl http://localhost:8080/catalog/v1/acme/items
 ```
 
-`vibe dev` will use an in-memory database for development and testing only; all data is lost when the server stops.
+`vibe dev` will use an in-memory database for development and testing only; all data is lost when the server stops. It enforces tenant isolation and the role and column grants the same way PostgreSQL does for the SQL vibe generates (including the SELECT privilege PostgreSQL needs for columns in `WHERE` and `RETURNING`), and refuses with `MEMORY_UNSUPPORTED_SQL` anything it cannot model: any RLS setting or policy other than the standard tenant policy, and grants for other roles.
+
+Updates need `If-Match`: the api lock must map `req.header.if-match` to the method input `if_match` in its request table. Without that mapping the method never sees the header, so updates through that api cannot pass the version check.
 
 ## Install
 
@@ -59,7 +61,7 @@ vibe serve --manifest manifest.json --project tests/fixtures/shop --memory
 
 **Breaking (#31):** `vibe manifest` without `-o` writes `./manifest.json` relative to the current working directory (same as `-o` / `serve --manifest`), not `<project>/manifest.json`.
 
-`--memory` is a dev executor. PostgreSQL needs two roles. `vibe migrate` connects with the owner role (`VIBE_MIGRATE_DATABASE_URL`) and grants SELECT, INSERT and UPDATE to the runtime role named in `VIBE_RUNTIME_DB_ROLE`. `vibe serve` connects as that runtime role (`VIBE_DATABASE_URL`, or `DATABASE_URL`) and refuses to start if the role is, or can `SET ROLE` to, a superuser or BYPASSRLS role, or can own any tenant schema, relation, function or type, because row-level security would not apply. `VIBE_RUNTIME_DB_ROLE` is required:
+`--memory` is a dev executor. PostgreSQL needs an owner login, a runtime login, and three NOLOGIN runtime roles: `app_rw`, `public_reader` and `public_writer`. An operator creates the roles once and grants them to the runtime login (`GRANT app_rw, public_reader, public_writer TO vibe_app WITH INHERIT FALSE, SET TRUE`). `vibe migrate` connects with the owner role (`VIBE_MIGRATE_DATABASE_URL`) and gives each runtime role exactly the table and column grants from the model locks (`## Policies` `grants:`). The runtime login named in `VIBE_RUNTIME_DB_ROLE` gets no table privileges of its own. `vibe serve` connects as that login (`VIBE_DATABASE_URL`, or `DATABASE_URL`) and runs every statement after `SET LOCAL ROLE` to the role the route uses. It refuses to start if the login cannot switch to the three roles, or if it is, or can `SET ROLE` to, a superuser or BYPASSRLS role, or can own any tenant schema, relation, function or type, because row-level security would not apply. A statement the role is not allowed to run returns 403 `FORBIDDEN`; the details are only logged. `VIBE_RUNTIME_DB_ROLE` is required:
 
 ```bash
 VIBE_MIGRATE_DATABASE_URL=postgres://owner@db/app VIBE_RUNTIME_DB_ROLE=vibe_app \

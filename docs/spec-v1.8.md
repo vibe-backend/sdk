@@ -767,14 +767,17 @@ Release ruleset 檢查（`v*` tag，決定 96）：
   - Production（manifest 唔係 `build-mode: dev`，或者 `VIBE_ENV=production`）一律拒絕 in-memory：啟動直接報錯退出，冇任何 override 旗標（決定 91）。
   - 只係 listen 地址唔係 loopback（例如 Docker 入面 `vibe dev --addr 0.0.0.0:8080`）唔算 production，只出警告；Docker 入面請明確設 `VIBE_ENV=development`，`vibe dev` 本身產生 `build-mode: dev` manifest，所以照樣准用 in-memory。
 - **一定要模擬嘅語意**（令 dev 行為同 production 一致）：
-  - 租戶隔離（RLS＋FORCE）：每個 statement 一定帶 `tenant_id`；冇設 tenant 就報錯（同 `current_setting('app.tenant_id', false)` 一樣），唔係回空；讀寫只見同一 tenant 嘅列；INSERT 嘅 `tenant_id` 由執行器注入，SQL 或者 input 帶 `tenant_id` 一律拒絕。
+  - 租戶隔離（RLS＋FORCE，標準 `tenant_isolation` policy）：每個 statement 一定帶有效 tenant；兩個執行器（in-memory 同 PostgreSQL）都喺執行之前拒絕冇效或者冇 tenant 嘅 statement。注意：PostgreSQL 本身喺 pooled connection 上面，如果之前嘅 transaction 定義過呢個設定，冇設 tenant 會讀到 `''`，回 0 列而唔係報錯；所以呢個保證靠執行器，唔靠 database（有 PostgreSQL 測試記錄呢個行為）。讀寫只見同一 tenant 嘅列；INSERT 嘅 `tenant_id` 由執行器注入，input 帶 `tenant_id` 一律拒絕，就算係同一個 tenant 都一樣（INSERT 回 RLS violation，UPDATE 回 permission denied，同 PostgreSQL 一樣，HTTP 403 `FORBIDDEN`）。
+  - 冇對應到嘅寫入：UPDATE 冇列符合（唔存在、其他 tenant、其他 owner 或者版本過期）回 precondition failed，軟刪除冇列符合回 not found，兩個執行器一樣。
   - Role grant：每個 statement 用 lock 指定嘅 role（`app_rw`、`public_reader`、`public_writer`）執行，按 model lock `## Policies` 嘅 grant 檢查表級 SELECT／INSERT／UPDATE；冇權限回同 production 一樣嘅 `permission denied` 錯誤類別。
-  - Column grant：INSERT／UPDATE 嘅每個欄位要喺該 role 嘅 column grant 入面；`writable-columns` 同 `effective-grant` 同 production 一樣檢查。
+  - Column grant：INSERT／UPDATE 嘅每個欄位要喺該 role 嘅 column grant 入面；`WHERE`、`RETURNING`、filter 同 sort 用到嘅欄位要有 SELECT（同 PostgreSQL 一樣）。兩個執行器同 `vibe migrate` 用同一個 effective grant：表級 UPDATE 收窄做所有欄位減 `id`、`tenant_id`、`created_at`；有 INSERT 就加平台寫嘅欄位（`id`、`tenant_id`、`created_at`、`updated_at`、owner key）；有 UPDATE 就加 `updated_at`；有寫權限就加 SELECT `id`、`updated_at`、`deleted_at`、owner key；有 SELECT 就加 `id`、`deleted_at`。冇權限統一回 `permission denied for table ...`（PostgreSQL 欄位權限唔夠都係咁報）。同一個 role 寫兩次 grant 會累加，同 PostgreSQL 一樣。
   - 所有 runtime role 冇 DELETE、TRUNCATE、DDL。
   - 唯一鍵（包括 `(tenant_id, email)`）、NOT NULL、CHECK（`char_length`、enum）、`ON CONFLICT ... DO UPDATE ... WHERE`、`RETURNING`、軟刪除、If-Match／ETag 版本檢查。
   - 每個 query 獨立 commit（同 7.1 一樣），令失敗恢復行為（例如 11.4 重試）一致。
 - **已知語意差異**（喺 terminal 啟動訊息同文件列明）：
   - 只支援 lock 白名單用到嘅 SQL 子集；任意 SQL 函數、複雜 JOIN／subquery、window function 未必支援，唔支援就報 `MEMORY_UNSUPPORTED_SQL`，唔會靜靜錯。
+  - 冇完整 policy 模型：只模擬編譯器產生嘅標準 policy（`rls: enable, force` 加 `tenant_id = current_setting('app.tenant_id', false)`，USING 同 WITH CHECK 一樣，PERMISSIVE，FOR ALL）。其他 policy（RESTRICTIVE、分命令、USING 同 WITH CHECK 唔同、DELETE）、owner／superuser／`BYPASSRLS`／冇 FORCE，同埋三個 runtime role 以外嘅 grant，`vibe dev` 啟動時一律報 `MEMORY_UNSUPPORTED_SQL`（fail closed）；production 由 `check_runtime_role` 拒絕呢類 connection role。
+  - 現時嘅 tenant 模型（共用 runtime login 加 `app.tenant_id` 設定）會由每個 tenant 獨立 login pool 取代（決定 97／98）；到時呢節嘅 tenant 語意要跟住更新。
   - 冇真正並發隔離（全部 statement 串行），所以 race condition（例如 refresh 寬限期兩個並發請求）喺 in-memory 測唔出。
   - `now()`、`interval` 用 process 時鐘；collation、排序同大小寫比較用 Unicode code point，可能同 PostgreSQL locale 唔同。
   - CTE 只支援 11.4a 嗰個「insert CTE + 同表 SELECT」固定模式。
@@ -1092,10 +1095,10 @@ migration 放喺 ./migrations/main/。
 
 - 每次 query 都喺自己嘅 transaction 入面執行：先 `BEGIN`，再 `SET LOCAL app.tenant_id`，然後執行 query，最後 `COMMIT`。就算用 PgBouncer transaction mode 都唔會漏。
 - 每張表都一定要有 `tenant_id` 欄位，要 `ENABLE` 同 `FORCE ROW LEVEL SECURITY`。
-- RLS policy 一律用 `tenant_id = current_setting('app.tenant_id', false)`；冇設定 tenant 嘅話，query 會直接報錯，唔會回空結果。
+- RLS policy 一律用 `tenant_id = current_setting('app.tenant_id', false)`。執行器一定先驗證 tenant 先至執行；database 層面，新 connection 冇設定會報錯，但 pooled connection 如果之前定義過呢個設定，會讀到 `''`，回 0 列。呢個共用 login 加設定嘅模型會由每個 tenant 獨立 login pool 取代（決定 97／98）。
 - `search_path` 由平台固定產生：schema 模式係 `t_{tenant_id}`，唔包括 `public`；`public` schema 嘅 CREATE 權限要收走。
 - 連線 role 唔可以係表嘅 owner，亦唔可以有 `BYPASSRLS`。
-  - SDK 實作：`vibe migrate` 用 `VIBE_MIGRATE_DATABASE_URL`（owner role）連線，並將 `SELECT`、`INSERT`、`UPDATE` 授權畀 `VIBE_RUNTIME_DB_ROLE`（必填），收走 tenant schema 嘅 `CREATE`，並用 `ALTER DEFAULT PRIVILEGES` 令之後 migration 建嘅表都有同樣授權。跑完 migration 之後，schema 入面每張表都會 `ENABLE` + `FORCE ROW LEVEL SECURITY` 同埋加 tenant policy；冇 `tenant_id` 欄嘅表、view、materialized view 或 foreign table 會令 migrate 失敗。`vibe serve` 用 `VIBE_DATABASE_URL`（runtime role）連線，啟動時檢查：如果呢個 role 係（或者可以 `SET ROLE` 成為，即 `pg_has_role(..., 'MEMBER')`）superuser 或者 `BYPASSRLS` role，或者可以擁有任何 tenant schema、relation、function 或 type，又或者可以存取任何冇 `ENABLE` + `FORCE ROW LEVEL SECURITY` 嘅 tenant relation，就拒絕啟動。
+  - SDK 實作：`vibe migrate` 用 `VIBE_MIGRATE_DATABASE_URL`（owner role）連線，按 model lock `## Policies` `grants:` 計出嘅 effective grant，將表級同欄位級權限授權畀三個 NOLOGIN runtime role（`app_rw`、`public_reader`、`public_writer`，由 operator 建立並 `GRANT` 畀 runtime login），runtime login（`VIBE_RUNTIME_DB_ROLE`，必填）本身冇任何表權限；收走 tenant schema 嘅 `CREATE`；migration 建嘅其他表預設冇任何授權。`vibe serve` 每個 statement 都喺 transaction 入面 `SET LOCAL ROLE` 做路由用嘅 role 先執行。跑完 migration 之後，schema 入面每張表都會 `ENABLE` + `FORCE ROW LEVEL SECURITY` 同埋加 tenant policy；冇 `tenant_id` 欄嘅表、view、materialized view 或 foreign table 會令 migrate 失敗。`vibe serve` 用 `VIBE_DATABASE_URL`（runtime role）連線，啟動時檢查：如果呢個 role 係（或者可以 `SET ROLE` 成為，即 `pg_has_role(..., 'MEMBER')`）superuser 或者 `BYPASSRLS` role，或者可以擁有任何 tenant schema、relation、function 或 type，又或者可以（直接或者經 `SET ROLE`）存取任何冇 `ENABLE` + `FORCE ROW LEVEL SECURITY` 嘅 tenant relation，又或者唔可以 `SET ROLE` 做三個 runtime role，就拒絕啟動。
 - 所有 runtime DB role（`app_rw`、`public_reader`、`public_writer`）都冇 `DELETE`、`TRUNCATE`、DDL 權限（決定 27）。
 - 平台專用 role（用戶 lock 唔可以用）：
 
