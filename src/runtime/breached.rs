@@ -23,6 +23,10 @@ use sha1::{Digest, Sha1};
 pub const DEFAULT_RANGE_URL: &str = "https://api.pwnedpasswords.com/range/";
 /// Default lookup timeout (`VIBE_BREACHED_PASSWORDS_TIMEOUT_MS`).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Smallest accepted lookup timeout.
+pub const MIN_TIMEOUT: Duration = Duration::from_millis(100);
+/// Largest accepted lookup timeout.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(30);
 /// Real padded responses are ~30–40 KB.
 const MAX_BODY: usize = 256 * 1024;
 /// With `Add-Padding`, a genuine response has hundreds of lines.
@@ -275,8 +279,13 @@ impl RangeApi {
 
     /// Per-lookup timeout (connect + response), 100 ms ..= 30 s.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout.clamp(Duration::from_millis(100), Duration::from_secs(30));
+        self.timeout = timeout.clamp(MIN_TIMEOUT, MAX_TIMEOUT);
         self
+    }
+
+    /// The per-lookup timeout in use.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     pub fn with_fallback(mut self, list: OfflineList) -> Self {
@@ -495,6 +504,21 @@ impl BreachedConfig {
                 .filter(|n| *n >= 1)
                 .ok_or("VIBE_BREACHED_PASSWORDS_MIN_COUNT must be a whole number >= 1")?,
         };
+        let timeout = match var("VIBE_BREACHED_PASSWORDS_TIMEOUT_MS") {
+            None => DEFAULT_TIMEOUT,
+            Some(raw) => raw
+                .parse::<u64>()
+                .ok()
+                .map(Duration::from_millis)
+                .filter(|t| (MIN_TIMEOUT..=MAX_TIMEOUT).contains(t))
+                .ok_or_else(|| {
+                    format!(
+                        "VIBE_BREACHED_PASSWORDS_TIMEOUT_MS must be a whole number of milliseconds from {} to {}",
+                        MIN_TIMEOUT.as_millis(),
+                        MAX_TIMEOUT.as_millis()
+                    )
+                })?,
+        };
         let source = match (file, url) {
             (Some(_), Some(_)) => {
                 return Err(
@@ -513,7 +537,8 @@ impl BreachedConfig {
             }
             (None, url) => {
                 let mut api =
-                    RangeApi::new(url.as_deref().unwrap_or(DEFAULT_RANGE_URL), production)?;
+                    RangeApi::new(url.as_deref().unwrap_or(DEFAULT_RANGE_URL), production)?
+                        .with_timeout(timeout);
                 if let Some(path) = fallback {
                     api = api.with_fallback(OfflineList::load(&path)?);
                 }

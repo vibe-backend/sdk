@@ -547,3 +547,28 @@ async fn crud_create_checks_field_rules_before_hashing() {
     .unwrap_err();
     assert_eq!(err.code, "VALIDATION_FAILED");
 }
+
+#[test]
+fn lookup_timeout_setting() {
+    use std::time::Duration;
+    let timeout_of = |value: Option<&'static str>| {
+        let get = move |name: &str| match (name, value) {
+            ("VIBE_BREACHED_PASSWORDS_TIMEOUT_MS", Some(v)) => Some(v.to_string()),
+            _ => None,
+        };
+        BreachedConfig::from_env(&get, true).map(|config| match config.source {
+            BreachedSource::Range(api) => api.timeout(),
+            BreachedSource::Offline(_) => unreachable!(),
+        })
+    };
+    assert_eq!(timeout_of(None).unwrap(), Duration::from_millis(3000));
+    assert_eq!(timeout_of(Some("100")).unwrap(), Duration::from_millis(100));
+    assert_eq!(
+        timeout_of(Some(" 1500 ")).unwrap(),
+        Duration::from_millis(1500)
+    );
+    assert_eq!(timeout_of(Some("30000")).unwrap(), Duration::from_secs(30));
+    for bad in ["0", "99", "30001", "-5", "1.5", "3s", "abc"] {
+        assert!(timeout_of(Some(bad)).is_err(), "accepted {bad}");
+    }
+}
