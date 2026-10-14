@@ -229,6 +229,30 @@ async fn zh_hant_sample_shop_compiles_and_validates() {
             .count(),
         4
     );
+    // D109: the lock stamps only prompt version, provider/model and the hash
+    // of the translation; the text itself is never in the lock.
+    let text = translation("商品目錄");
+    let raw = fs::read_to_string(root.join("models/product/product.lock.md")).unwrap();
+    assert!(!raw.contains(text), "translated text leaked into the lock");
+    assert!(!raw.contains("Product catalog"), "{raw}");
+    let stamp = product.meta.translation.clone().expect("translation stamp");
+    assert_eq!(
+        stamp.prompt_version,
+        vibe::compile::TRANSLATE_PROMPT_VERSION
+    );
+    assert_eq!(stamp.llm_provider, "openai");
+    assert_eq!(stamp.model_snapshot, "gpt-test-2026-01-01");
+    assert_eq!(stamp.hash, vibe::hashutil::sha256_prefixed(text.as_bytes()));
+    // The full text goes to the audit hook for the release audit artifact.
+    let audit = fs::read_to_string(
+        root.join(vibe::compile::TRANSLATION_AUDIT_DIR)
+            .join("product.txt"),
+    )
+    .unwrap();
+    assert!(
+        audit.contains(text) && audit.contains(&stamp.hash),
+        "{audit}"
+    );
 }
 
 fn config() -> LlmConfig {
