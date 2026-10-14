@@ -202,13 +202,13 @@
 | 92 | 產品經理基線 4：CI release build 攞唔到 KMS key 就失敗，永遠唔 fallback 去 dev key；production runtime 只信任平台 pin 死嘅 release 公鑰，dev key 永遠唔信任。 | 待產品經理確認 | 2C.2、2C.3、9B |
 | 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；`vibe build` release 模式檢查 CODEOWNERS 覆蓋路徑，冇就失敗。 | 待產品經理確認 | 2A.7、9B |
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 待產品經理確認 | 文件標頭、網站 |
-| 95 | create-user 邀請失敗：`user.invite` 嘅 enqueue（s4）失敗時，create-user 回 503 `INVITE_DELIVERY_FAILED`（只帶 `Retry-After`，body 唔帶 `user_id`），唔回 201／200；因為 s2 已經輪換咗 token 但信冇寄出，用戶手上冇有效連結，恢復方法係重試 create-user（決定 85）或者 re-invite（決定 86），兩者都會發新 token 同新信。同 issue #26（auth flow 實作）相關。 | 待產品經理確認 | 11.4、11.4a |
+| 95 | create-user 邀請失敗：`user.invite` 嘅 enqueue（s4）失敗時，create-user 回 503 `INVITE_DELIVERY_FAILED`（只帶 `Retry-After`，body 唔帶 `user_id`），唔回 201／200；因為 s2 已經輪換咗 token 但信冇寄出，用戶手上冇有效連結，恢復方法係重試 create-user（決定 85）或者 re-invite（決定 86），兩者都會發新 token 同新信。同 issue #26（auth flow 實作）相關。v1.8 修訂（決定 99，已確認（產品經理 2026-10-14））：成個 request 喺同一個 transaction，enqueue 失敗會 rollback 埋 token 輪換同用戶建立；邀請信經 transactional outbox：`email_outbox` 列同其他寫入喺同一個 transaction 寫入，commit 之後先由 mail worker 寄出，commit 之前永遠唔寄；rollback 會連 outbox 列一齊丟棄。 | 待產品經理確認 | 11.4、11.4a |
 | 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i) 做**臨時方案**）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。高風險 `--release-approval` 係計劃中、未實作，實作後先額外把關。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，同時開返 Prevent self-review。另外 live `release` environment `can_admins_bypass` 而家係 `true`，Jack 負責關閉。高風險 release build 用只有 Administration: read 嘅專用 GitHub App 讀呢個 ruleset，讀唔到、`bypass_actors` 唔係空、唔係 active、缺少三條 rule、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass，SDK 唔檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval`（未實作）實作後會獨立驗證 PR review（2C.3a）。普通 build 只記錄。 | 待產品經理確認 | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
 | 97 | 租戶隔離身份（v1 blocker）：runtime 每個 request 喺 transaction 入面先 `SET LOCAL ROLE tenant_<id>`，再執行 lock SQL；每個租戶一個 role（`NOINHERIT`、只有自己 schema 嘅權限、唔係其他 role 嘅成員）；app 連線 role 對任何租戶 schema 冇直接權限；`app.tenant_id` 之類 GUC 只可以輔助（例如 log），永遠唔係身份來源。安全細節經私人 security advisory 處理。 | 已確認（產品經理 2026-10-14） | 7.1、7.1a、9C |
 | 98 | Lock SQL parser 白名單：用 PostgreSQL 解析器（例如 `pg_query`）解析，只准單一 DML statement；禁止 `SET`／`RESET`／`SET ROLE`／`DO`／`COPY`／`BEGIN`／`COMMIT`／`SAVEPOINT` 等 transaction 同 session 控制、schema-qualified 名稱；function 只准白名單（`set_config`、`current_setting`、`dblink` 等唔喺白名單）；解析失敗即 fail closed。Conformance 要有跨租戶負面測試。 | 已確認（產品經理 2026-10-14） | 2A.4、7.1a、10.1 |
 | 99 | 跨 model transaction：一個 request = 一個 runtime 管理嘅 transaction（`READ COMMITTED`）；用戶 SQL 控制唔到 transaction 邊界；庫存扣減用條件 UPDATE（`WHERE stock >= qty`）再檢查 affected rows，唔夠就 409 同 rollback；冇跨 request、跨 DB 或者分散式 transaction；寫入按固定次序、喺租戶 role 之下執行。取代 7.1「每個 query 獨立 transaction」。 | 已確認（產品經理 2026-10-14） | 7.1、7.4、12.6 |
 | 100 | Transaction 超時同衝突：預設 `statement_timeout` 5s、transaction 總時間 10s、`idle_in_transaction_session_timeout` 5s；超時 rollback，回 504 `TX_TIMEOUT`。Deadlock（`40P01`）同 serialization failure（`40001`）回 503 `TX_CONFLICT`，body `retryable: true`，帶 `Retry-After: 1`；平台永遠唔會自動重試非冪等寫入。 | 已確認（產品經理 2026-10-14） | 7.4、8 |
-| 101 | 瀏覽器 refresh cookie（issue #78）：refresh token 放 `HttpOnly; Secure; SameSite=Strict` cookie，用 `__Host-` 前綴；每次 refresh 輪換，偵測重用撤銷成個家族；refresh 同 logout 要 CSRF 防護（`Origin` 白名單檢查加 SameSite）；access token 唔放 cookie；logout 清 cookie 同撤銷家族。`__Host-` 規定 `Path=/`，同「Path 限定 refresh endpoint」衝突，揀 `__Host-`（見 4A.1a）。 | 已確認（產品經理 2026-10-14）；`Path` 取捨待產品經理確認 | 4A.1、4A.1a |
+| 101 | 瀏覽器 refresh cookie（issue #78）：refresh token 放 `__Host-vibe_rt_{slug}` cookie（`HttpOnly; Secure; Path=/`，冇 `Domain`）；產品經理確認防 subdomain 覆蓋比限定 Path 重要。兩個模式：預設 `same-site`（`SameSite=Strict`）；明確開嘅 `cross-site`（`SameSite=None`），一定要同時有嚴格 `Origin` 白名單（完全相等、唔准 `*`）同 `X-Vibe-CSRF` 自訂 header 檢查（強制 CORS preflight），缺任何一樣 build／部署失敗。每次 refresh 輪換，重用撤銷成個家族；access token 唔放 cookie；CORS credentials 只限 refresh 同 logout；logout 清 cookie 同撤銷家族。 | 已確認（產品經理 2026-10-14） | 4A.1、4A.1a |
 | 102 | Build TOCTOU：`vibe build` 只讀一次 source 同 lock 入記憶體，驗證同之後所有 build 步驟（manifest、報告、簽名）都用同一份內容；之後檔案改動唔會影響今次 build。 | 已確認（產品經理 2026-10-14） | 2C.3 |
 
 ## 1. 目錄同命名
@@ -985,13 +985,19 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 瀏覽器 client：access token 只放記憶體（唔放 cookie、唔放 localStorage），refresh token 放 cookie；重新載入頁面時 call refresh endpoint 攞新 access token。
 
 - **Endpoint**：`POST /{definition}/{version}/{slug}/refresh`（`token-refresh`，`transport: cookie`）同 `POST /{definition}/{version}/{slug}/logout`（`token-revoke`）。Refresh 回 body `{ "access_token", "expires_in" }`，新 refresh token 只喺 `Set-Cookie`。
-- **Cookie 屬性**：`__Host-vibe_rt_{slug}=<token>; HttpOnly; Secure; SameSite=Strict; Path=/`，冇 `Domain`，`Max-Age` 唔超過家族剩餘絕對壽命。
-  - `__Host-` 前綴保證 cookie 只屬於呢個 host、一定 Secure，防止 subdomain 寫入或者覆蓋 cookie；但瀏覽器規定 `__Host-` cookie 一定要 `Path=/`，所以唔可以再限定 `Path` 去 refresh endpoint。我哋揀 `__Host-`：`Path` 唔係安全邊界，而 `HttpOnly` 已經令 JS 讀唔到；server 只喺 refresh 同 logout 讀呢個 cookie，其他 endpoint 一律忽略。Cookie 名包括 slug，同一個 host 多個租戶唔會撞（待產品經理確認呢個取捨）。
-  - 用 `SameSite=Strict`：前端同 API 一定要同 site（例如 `app.example.com` 同 `api.example.com`）。跨 site 前端 v1.8 唔支援 cookie transport。
+- **Cookie 屬性**：`__Host-vibe_rt_{slug}=<token>; HttpOnly; Secure; SameSite=<模式>; Path=/`，冇 `Domain`，`Max-Age` 唔超過家族剩餘絕對壽命。
+  - `__Host-` 前綴保證 cookie 只屬於呢個 host、一定 Secure，防止 subdomain 寫入或者覆蓋 cookie；但瀏覽器規定 `__Host-` cookie 一定要 `Path=/`，所以唔可以再限定 `Path` 去 refresh endpoint。我哋揀 `__Host-`：`Path` 唔係安全邊界，而 `HttpOnly` 已經令 JS 讀唔到；server 只喺 refresh 同 logout 讀呢個 cookie，其他 endpoint 一律忽略。Cookie 名包括 slug，同一個 host 多個租戶唔會撞。產品經理已確認：防止 subdomain 覆蓋 cookie 比限定 Path 重要（2026-10-14）。
+- **兩個模式**（`token-refresh` 參數 `cookie-mode`）：
+  - **`same-site`（預設）**：`SameSite=Strict`。前端同 API 一定要同 site（例如 `app.example.com` 同 `api.example.com`）。
+  - **`cross-site`（要明確開）**：`SameSite=None`，畀唔同 site 嘅前端用。一定要**同時**有：
+    1. 嚴格 `Origin` 白名單（完全相等，唔准 `*` 或者 wildcard，最少一個 origin）；同埋
+    2. 自訂 header CSRF 檢查：refresh 同 logout 一定要帶 `X-Vibe-CSRF: 1`，冇就回 403。自訂 header 令瀏覽器一定先做 CORS preflight，跨 site 表單或者簡單請求帶唔到。
+  - 開咗 `cross-site` 但缺少任何一樣，驗證器報 error，`vibe build` 同部署一律失敗。
+  - `same-site` 模式都會檢查 `Origin` 白名單；`X-Vibe-CSRF` 可選。
 - **輪換同重用偵測**：跟 4A.1，每次 refresh 輪換；偵測到重用已失效 token（寬限期外）撤銷成個家族，同時回 `Set-Cookie` 清除 cookie。
-- **CSRF**：refresh 同 logout 一定要有 `Origin` header，而且喺租戶設定嘅前端 origin 白名單入面（完全相等，唔准 wildcard）；冇 `Origin` 或者唔喺白名單回 403，唔讀 cookie。加上 `SameSite=Strict` 做雙重防護。只接受 `POST`。
-- **CORS**：只對白名單 origin 回 `Access-Control-Allow-Origin: <origin>`（唔准 `*`）、`Access-Control-Allow-Credentials: true`、`Vary: Origin`；只限 refresh 同 logout endpoint。
-- **Logout**：撤銷當前家族，回 `Set-Cookie: __Host-vibe_rt_{slug}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict` 清除 cookie；cookie 無效都照樣清除，回 204。
+- **CSRF**：refresh 同 logout 一定要有 `Origin` header，而且喺租戶設定嘅前端 origin 白名單入面（完全相等，唔准 wildcard）；冇 `Origin` 或者唔喺白名單回 403，唔讀 cookie。`same-site` 模式再加 `SameSite=Strict`；`cross-site` 模式再加 `X-Vibe-CSRF` header 檢查。只接受 `POST`。
+- **CORS**：只對白名單 origin 回 `Access-Control-Allow-Origin: <origin>`（唔准 `*`）、`Access-Control-Allow-Credentials: true`、`Vary: Origin`；`cross-site` 模式 preflight 回 `Access-Control-Allow-Headers` 包括 `X-Vibe-CSRF`。Credentials **只限** refresh 同 logout endpoint，其他 endpoint 一律唔回 `Access-Control-Allow-Credentials`。
+- **Logout**：撤銷當前家族，回 `Set-Cookie: __Host-vibe_rt_{slug}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=<模式>` 清除 cookie；cookie 無效都照樣清除，回 204。
 - Refresh 回應帶 `Cache-Control: no-store`。
 
 #### `token-refresh` pipeline 參數（決定 45）
@@ -1003,6 +1009,8 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 | `idle-ttl` | duration | 7d | 上限 7d |
 | `reuse-grace` | duration | 10s | 上限 10s |
 | `transport` | `body` \| `cookie` | body | cookie 時跟 4A.1a（決定 101 修訂決定 60） |
+| `cookie-mode` | `same-site` \| `cross-site` | same-site | 只限 `transport: cookie`；`cross-site` 要同時有 `allowed-origins` 同 `X-Vibe-CSRF` 檢查，否則 build 失敗（4A.1a） |
+| `allowed-origins` | origin 列表 | 必填（cookie） | 完全相等，唔准 `*` 或者 wildcard |
 
 - 對應 endpoint 寫法：api feature 寫「呢個係 refresh token endpoint」，lock 會有 `pipelines: [-auth, token-refresh: {...}]`，`public: true`（因為冇 access token），租戶由 slug 決定；`token-revoke` 用喺登出 endpoint，要 `auth`。
 
@@ -1198,6 +1206,7 @@ migration 放喺 ./migrations/main/。
 - 所有寫入喺租戶 role 之下、按 lock 入面固定嘅 step 次序執行，減少 deadlock。
 - 庫存類扣減用條件 UPDATE，例如 `UPDATE ... SET stock = stock - $qty WHERE id = $id AND stock >= $qty`，再檢查 affected rows；唔夠就成個 transaction rollback，回 409（錯誤碼由 lock 宣告，例如 `INSUFFICIENT_STOCK`）。
 - 唔支援跨 request、跨 DB 或者分散式 transaction；需要跨 request 嘅流程用 outbox 之類非同步做法。
+- 外部副作用（例如寄 email）一律用 transactional outbox：outbox 列喺同一個 transaction 寫入，commit 之後先處理；commit 之前永遠唔做；rollback 連 outbox 列一齊丟棄。
 - 超時預設（決定 100）：`statement_timeout` 5s、transaction 總時間 10s、`idle_in_transaction_session_timeout` 5s。超時即 rollback，回 504 `TX_TIMEOUT`。
 - 衝突：deadlock（SQLSTATE `40P01`）同 serialization failure（`40001`）rollback，回 503 `TX_CONFLICT`，body 帶 `retryable: true`，header `Retry-After: 1`。
 - 平台永遠唔會自動重試非冪等寫入；client 要自己決定重試（建議用 idempotency key）。
@@ -1710,7 +1719,7 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" 
 | 503 | INVITE_DELIVERY_FAILED | user.invite |
 ````
 
-- 邀請失敗（決定 95，待產品經理確認）：s2 `user.invite` 入面 enqueue 失敗，create-user 回 503 `INVITE_DELIVERY_FAILED`（header 帶 `Retry-After`；body 只有錯誤碼，唔帶 `user_id`，因為錯誤映射攞唔到之前 step 嘅輸出），唔回 201／200。Admin 用同一個 email 重試 create-user（決定 85，會回原有 id），或者按 email 搵用戶再 call re-invite。v1.8 起成個 request 喺同一個 transaction（決定 99），enqueue 失敗會 rollback 埋 s1 同 token UPDATE，唔會留低半完成狀態；恢復方法係重試 create-user 或者 call re-invite（11.4b），兩者都發新 token 同新信。實作見 issue #26。
+- 邀請失敗（決定 95，待產品經理確認）：s2 `user.invite` 入面 enqueue 失敗，create-user 回 503 `INVITE_DELIVERY_FAILED`（header 帶 `Retry-After`；body 只有錯誤碼，唔帶 `user_id`，因為錯誤映射攞唔到之前 step 嘅輸出），唔回 201／200。Admin 用同一個 email 重試 create-user（決定 85，會回原有 id），或者按 email 搵用戶再 call re-invite。v1.8 起成個 request 喺同一個 transaction（決定 99），enqueue 失敗會 rollback 埋 s1 同 token UPDATE，唔會留低半完成狀態。邀請信經 transactional outbox：`email_outbox` 列同其他寫入喺同一個 transaction 寫入，commit 之後先由 mail worker 寄出，commit 之前永遠唔寄；rollback 會連 outbox 列一齊丟棄；恢復方法係重試 create-user 或者 call re-invite（11.4b），兩者都發新 token 同新信。實作見 issue #26。
 - 失敗恢復（決定 85，待產品經理確認）：v1.8 起一個 request 一個 transaction（決定 99），s2 失敗會 rollback s1；但 commit 之後先失敗（例如回應途中斷線）或者舊資料仍然可能有「已建立、未邀請」嘅用戶。Admin 用同一個 body 重試 create-user：`user.register` 對已存在、未驗證、冇密碼嘅用戶回原有 id（`created: false`），s2 重新寄邀請，回 200；或者用 11.4b 嘅 re-invite endpoint。
 - `EMAIL_TAKEN`（決定 84，待產品經理確認）：只限 admin（已認證、`roles: [admin]`、按用戶限流、audit-log），admin 本身可以列出租戶用戶，所以 409 唔當 enumeration 洩漏；public 註冊（12.11）照樣唔分辨。
 - 同一個 email 自己註冊緊（未驗證、冇密碼）：當同一個用戶，邀請 token 取代註冊 token（決定 88，待產品經理確認）。
@@ -1867,7 +1876,7 @@ security-items:
 ````
 
 - 用 `app_rw`（已認證 admin 路徑），唔係 public role。
-- s4 失敗（outbox insert 錯誤）：method fail `INVITE_DELIVERY_FAILED`（決定 95）；s2 已 commit，所以呢個用戶嘅舊邀請已經失效，要重試或者 re-invite 先有新連結。
+- s4 失敗（outbox insert 錯誤）：method fail `INVITE_DELIVERY_FAILED`（決定 95）；成個 request rollback（決定 99），s2 嘅 token 輪換都唔會生效，舊邀請連結照樣有效（如果未過期）；重試或者 re-invite 會發新連結。
 - 用戶唔存在同已驗證都回 `ALREADY_ACTIVE`（admin 路徑，404／409 分唔分冇私隱影響；揀一個錯誤碼令 lock 簡單）。
 
 ### 11.4b Re-invite：`api/users/v2/re-invite/re-invite.md`（路由 `POST /users/v2/{id}/invite`，決定 86，待產品經理確認）
@@ -3357,7 +3366,7 @@ security-items:
 
 私隱法（PDPO、GDPR）部分嘅建議請法律意見覆核。
 
-另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–102 已經由產品經理確認，決定 101 嘅 `Path` 取捨除外）；確認之前 v1.7 定稿照樣有效。
+另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–102 已經由產品經理確認）；確認之前 v1.7 定稿照樣有效。
 
 ## 14. 後續版本
 
