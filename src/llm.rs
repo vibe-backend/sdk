@@ -583,12 +583,27 @@ impl LlmAdapter for HttpAdapter {
     async fn compile(&self, request: &LlmRequest) -> Result<LlmResponse, String> {
         let mut attempt = 0u32;
         let max = self.config.max_retries;
+        let started = std::time::Instant::now();
+        let deadline = retry_deadline();
         loop {
             match self.compile_once(request).await {
                 Ok(response) => return Ok(response),
                 Err(err) if err.retryable && attempt < max => {
-                    // 429/5xx/timeouts: exponential backoff with jitter (#83).
-                    tokio::time::sleep(retry_delay(attempt)).await;
+                    // 408/429/5xx/network/timeouts: honor Retry-After, else
+                    // exponential backoff with jitter (#83); never past the
+                    // overall deadline.
+                    let delay = err.retry_after.unwrap_or_else(|| retry_delay(attempt));
+                    if started.elapsed() + delay > deadline {
+                        return Err(redact(
+                            &format!(
+                                "{} (gave up: retry deadline {}s reached)",
+                                err.message,
+                                deadline.as_secs()
+                            ),
+                            &[&self.config.api_key],
+                        ));
+                    }
+                    tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
                 Err(err) => {
@@ -610,6 +625,24 @@ pub fn retry_delay(attempt: u32) -> std::time::Duration {
 struct CallError {
     message: String,
     retryable: bool,
+    retry_after: Option<std::time::Duration>,
+}
+
+/// Total time one LLM call may spend retrying (`LLM_RETRY_DEADLINE`
+/// seconds, default 120, max 600).
+pub fn retry_deadline() -> std::time::Duration {
+    let secs = std::env::var("LLM_RETRY_DEADLINE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|n| n.min(600))
+        .unwrap_or(120);
+    std::time::Duration::from_secs(secs)
+}
+
+/// `Retry-After` in delta-seconds (HTTP-dates are ignored), capped at 60s.
+pub fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    let secs: u64 = value.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(secs.min(60)))
 }
 
 impl HttpAdapter {
@@ -626,8 +659,14 @@ impl HttpAdapter {
         let response = builder.send().await.map_err(|err| CallError {
             message: mask_secrets(&format!("LLM request failed: {err}"), &self.config.api_key),
             retryable: true,
+            retry_after: None,
         })?;
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after);
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -637,6 +676,7 @@ impl HttpAdapter {
         let bytes = response.bytes().await.map_err(|err| CallError {
             message: mask_secrets(&format!("LLM response body: {err}"), &self.config.api_key),
             retryable: true,
+            retry_after: None,
         })?;
         if !status.is_success() {
             return Err(CallError {
@@ -648,6 +688,7 @@ impl HttpAdapter {
                     &self.config.api_key,
                 ),
                 retryable: status.is_server_error() || matches!(status.as_u16(), 408 | 429),
+                retry_after,
             });
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| CallError {
@@ -659,6 +700,7 @@ impl HttpAdapter {
                 &self.config.api_key,
             ),
             retryable: false,
+            retry_after: None,
         })?;
         let parsed = match self.config.provider.as_str() {
             ANTHROPIC => parse_anthropic(&value),
@@ -668,6 +710,7 @@ impl HttpAdapter {
         .map_err(|message| CallError {
             message,
             retryable: false,
+            retry_after: None,
         })?;
         if let Some(reported) = &parsed.model_reported {
             if reported != &request.model && !reported.is_empty() {
@@ -677,6 +720,7 @@ impl HttpAdapter {
                         request.model
                     ),
                     retryable: false,
+                    retry_after: None,
                 });
             }
         }
