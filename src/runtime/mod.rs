@@ -10,6 +10,7 @@ pub use crud::{parse_ownership, run_method, Ownership};
 pub use exec::{etag, role_allows, ExecError, MemoryExec, PgExec, QueryExec, RoleStatus};
 pub use http::{
     hash_api_secret, resolve_pepper, router, AppState, AuthConfig, RunEnv, Slug, StoredKey,
+    REQUEST_TYPES,
 };
 pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
 pub use migrate::migrate_tenant;
