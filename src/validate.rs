@@ -66,6 +66,8 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
     check_routes(&docs, &mut report);
     check_calls(&docs, &mut report);
     check_migrations(&docs, &mut report);
+    check_feature_method_writes(&docs, &mut report);
+    check_security_items_enriched(&docs, &source_by_id, opts, &mut report);
     if opts.deploy {
         check_approval_set(&docs, &source_by_id, opts, &mut report);
     }
@@ -136,23 +138,26 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
             format!("sections must be exactly {}", order.join(", ")),
         ));
     }
-    let mut expected = security::extract_items(doc);
-    if scan::scan_text(&source.combined_text())
-        .iter()
-        .any(|hit| !hit.fatal)
-    {
-        expected.push(crate::lock::SecurityItem {
-            item: "prompt-injection".into(),
-            risk: crate::lock::Risk::Medium,
-            reason: String::new(),
-            approved_by: Vec::new(),
-        });
-    }
-    if !security::same_items(&expected, &doc.meta.security_items) {
-        report.push(Diag::error(
-            &file,
-            "security-items do not match the validator extraction",
-        ));
+    // Features are re-checked after all locks load (method write enrichment).
+    if !(doc.meta.kind == Kind::Api && doc.meta.scope == Some(Scope::Feature)) {
+        let mut expected = security::extract_items(doc);
+        if scan::scan_text(&source.combined_text())
+            .iter()
+            .any(|hit| !hit.fatal)
+        {
+            expected.push(crate::lock::SecurityItem {
+                item: "prompt-injection".into(),
+                risk: crate::lock::Risk::Medium,
+                reason: String::new(),
+                approved_by: Vec::new(),
+            });
+        }
+        if !security::same_items(&expected, &doc.meta.security_items) {
+            report.push(Diag::error(
+                &file,
+                "security-items do not match the validator extraction",
+            ));
+        }
     }
     check_sections(doc, &file, report);
     if doc.meta.status == Status::Approved {
@@ -259,6 +264,25 @@ fn check_model(doc: &LockDoc, file: &str, report: &mut Report) {
                             .at_section("Fields"),
                     );
                 }
+            }
+        }
+        let rules = row.get(2).map(String::as_str).unwrap_or("");
+        for key in ["min", "max"] {
+            if let Some(problem) = bad_number_rule(rules, key) {
+                report.push(
+                    Diag::error(file, format!("field {name}: {problem}")).at_section("Fields"),
+                );
+            }
+        }
+        if let (Some(min), Some(max)) = (rule_number(rules, "min"), rule_number(rules, "max")) {
+            if min > max {
+                report.push(
+                    Diag::error(
+                        file,
+                        format!("field {name}: min ({min}) is greater than max ({max})"),
+                    )
+                    .at_section("Fields"),
+                );
             }
         }
     }
@@ -438,9 +462,12 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                 }
             }
         }
+        if block_val(block, "writes") == "true" {
+            saw_write = true;
+        }
         if op == "query" {
             let sql = block_val(block, "sql").trim_matches('`').to_string();
-            saw_write |= sql_writes(&sql);
+            saw_write |= crate::security::sql_writes(&sql);
             for problem in sql_problems(&sql, &block_val(block, "params"), false) {
                 report.push(
                     Diag::error(file, problem)
@@ -448,20 +475,36 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                         .at_section("Steps"),
                 );
             }
-            if sql_writes(&sql)
-                && block_val(block, "scope").is_empty()
-                && sql.to_ascii_lowercase().starts_with("update")
-            {
-                report.push(
-                    Diag::error(file, "UPDATE needs scope: pk or scope: rls")
-                        .at_step(&block.heading),
-                );
+            if crate::security::sql_writes(&sql) && block_val(block, "scope").is_empty() {
+                let cleaned = crate::security::strip_sql_noise(&sql).to_ascii_lowercase();
+                if cleaned.contains("update") {
+                    report.push(
+                        Diag::error(file, "UPDATE needs scope: pk or scope: rls")
+                            .at_step(&block.heading),
+                    );
+                }
             }
         }
     }
     if !writes && saw_write {
         report
             .push(Diag::error(file, "writes: false but a step writes SQL").at_section("Signature"));
+    }
+    if writes && !saw_write {
+        // Also count explicit writes: true steps without detectable SQL verbs.
+        let marked = steps
+            .blocks
+            .iter()
+            .any(|b| block_val(b, "writes") == "true");
+        if !marked {
+            report.push(
+                Diag::error(
+                    file,
+                    "writes: true but no step writes SQL or sets writes: true",
+                )
+                .at_section("Signature"),
+            );
+        }
     }
 }
 
@@ -839,23 +882,36 @@ fn walk_locks(dir: &Path, root: &Path, expected: &HashSet<String>, report: &mut 
 pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
     let mut problems = Vec::new();
     let trimmed = sql.trim().trim_matches('`').trim();
+    let cleaned = crate::security::strip_sql_noise(trimmed);
+    let lower = cleaned.to_ascii_lowercase();
+    // Allow `;` only inside DO $$ … $$ procedural bodies.
     if trimmed.contains(';') {
-        problems.push("SQL must be a single statement".into());
+        let raw_lower = trimmed.to_ascii_lowercase();
+        let do_body = raw_lower.contains("do $$") || raw_lower.contains("do $");
+        if !do_body {
+            problems.push("SQL must be a single statement".into());
+        }
     }
-    if FORBIDDEN_SQL.is_match(trimmed) {
+    if FORBIDDEN_SQL.is_match(&cleaned) {
         problems.push("DELETE, TRUNCATE, GRANT, and REVOKE are forbidden".into());
     }
-    if !migration && DDL_SQL.is_match(trimmed) {
+    static SELECT_INTO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bselect\b[^;]*\binto\b").expect("regex"));
+    if !migration && (DDL_SQL.is_match(&cleaned) || SELECT_INTO.is_match(&cleaned)) {
         problems.push("DDL is only allowed in migration locks".into());
     }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("update") && !lower.contains(" where ") {
+    if crate::security::sql_writes(trimmed)
+        && lower.contains("update")
+        && !lower.contains(" where ")
+    {
         problems.push("UPDATE needs a WHERE clause".into());
     }
+    // Param hygiene for reads and writes, including WITH … forms.
     if !migration
-        && (lower.starts_with("select")
-            || lower.starts_with("insert")
-            || lower.starts_with("update"))
+        && (crate::security::sql_writes(trimmed)
+            || lower.trim_start().starts_with("select")
+            || lower.trim_start().starts_with("with")
+            || lower.trim_start().starts_with("("))
     {
         let nums: Vec<usize> = PARAM
             .captures_iter(trimmed)
@@ -878,11 +934,6 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
         }
     }
     problems
-}
-
-fn sql_writes(sql: &str) -> bool {
-    let lower = sql.trim().trim_matches('`').to_ascii_lowercase();
-    lower.starts_with("insert") || lower.starts_with("update")
 }
 
 fn known_type(ty: &str) -> bool {
@@ -916,6 +967,21 @@ fn rule_number(rules: &str, key: &str) -> Option<i64> {
                 .trim_matches(|c| c == '[' || c == ']')
                 .parse()
                 .ok();
+        }
+    }
+    None
+}
+
+/// `min:` / `max:` present but not an integer — fail closed (do not ignore).
+fn bad_number_rule(rules: &str, key: &str) -> Option<String> {
+    for part in rules.split(',') {
+        let part = part.trim();
+        let Some(rest) = part.strip_prefix(&format!("{key}:")) else {
+            continue;
+        };
+        let raw = rest.trim().trim_matches(|c| c == '[' || c == ']');
+        if raw.is_empty() || raw.parse::<i64>().is_err() {
+            return Some(format!("{key} value `{raw}` is not an integer"));
         }
     }
     None
@@ -1039,6 +1105,83 @@ pub fn parse_bytes(raw: &str) -> u64 {
     raw.parse().unwrap_or(0)
 }
 
+fn check_feature_method_writes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    for doc in docs.values() {
+        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+            continue;
+        }
+        let file = lock_rel(&doc.meta.source);
+        let public =
+            find_section(&doc.sections, "Access").and_then(|s| s.get("public")) == Some("true");
+        let public_writes = find_section(&doc.sections, "Access")
+            .and_then(|s| s.get("public-writes"))
+            == Some("true");
+        let Some(steps) = find_section(&doc.sections, "Steps") else {
+            continue;
+        };
+        for block in &steps.blocks {
+            let target = block_val(block, "target");
+            if target.is_empty() {
+                continue;
+            }
+            if !security::method_doc_writes(docs, &target) {
+                continue;
+            }
+            if public && !public_writes {
+                report.push(
+                    Diag::error(
+                        &file,
+                        format!(
+                            "public feature calls write method `{target}`; set public-writes: true"
+                        ),
+                    )
+                    .at_step(&block.heading)
+                    .at_section("Access"),
+                );
+            }
+        }
+    }
+}
+
+fn check_security_items_enriched(
+    docs: &HashMap<String, LockDoc>,
+    sources: &HashMap<String, SourceFile>,
+    opts: &ValidateOptions<'_>,
+    report: &mut Report,
+) {
+    let _ = opts;
+    for doc in docs.values() {
+        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+            continue;
+        }
+        let Some(source) = sources.get(&doc.meta.id) else {
+            continue;
+        };
+        let file = lock_rel(&source.rel);
+        let mut expected = security::extract_items(doc);
+        security::enrich_feature_writes(doc, docs, &mut expected);
+        if scan::scan_text(&source.combined_text())
+            .iter()
+            .any(|hit| !hit.fatal)
+        {
+            expected.push(crate::lock::SecurityItem {
+                item: "prompt-injection".into(),
+                risk: crate::lock::Risk::Medium,
+                reason: String::new(),
+                approved_by: Vec::new(),
+            });
+        }
+        expected.sort_by(|a, b| a.item.cmp(&b.item));
+        expected.dedup_by(|a, b| a.item == b.item);
+        if !security::same_items(&expected, &doc.meta.security_items) {
+            report.push(Diag::error(
+                &file,
+                "security-items do not match the validator extraction",
+            ));
+        }
+    }
+}
+
 fn lock_rel(source_rel: &str) -> String {
     source_rel.trim_end_matches(".md").to_string() + ".lock.md"
 }
@@ -1057,5 +1200,31 @@ mod tests {
     fn update_without_where_is_rejected() {
         let problems = sql_problems("update users set name = $1", "[input.name]", false);
         assert!(problems.iter().any(|p| p.contains("WHERE")));
+    }
+
+    #[test]
+    fn with_update_is_a_write_and_needs_where() {
+        let sql = "WITH x AS (SELECT 1) UPDATE products SET price_cents = 0";
+        assert!(crate::security::sql_writes(sql));
+        let problems = sql_problems(sql, "[]", false);
+        assert!(problems.iter().any(|p| p.contains("WHERE")), "{problems:?}");
+    }
+
+    #[test]
+    fn select_into_is_ddl_outside_migrations() {
+        let problems = sql_problems("SELECT * INTO tmp FROM products", "[]", false);
+        assert!(problems.iter().any(|p| p.contains("DDL")), "{problems:?}");
+    }
+
+    #[test]
+    fn comments_do_not_trigger_forbidden_or_writes() {
+        let problems = sql_problems("SELECT 1 -- delete later", "[]", false);
+        assert!(
+            !problems.iter().any(|p| p.contains("DELETE")),
+            "{problems:?}"
+        );
+        assert!(!crate::security::sql_writes(
+            "SELECT note = 'update me' FROM t"
+        ));
     }
 }
