@@ -68,6 +68,8 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
     check_refresh_sign_methods(&docs, &mut report);
     check_migrations(&docs, &mut report);
     check_feature_method_writes(&docs, &mut report);
+    let env_roles_claim = std::env::var("VIBE_JWT_ROLES_CLAIM").ok();
+    check_claims_vs_roles_claims(&docs, env_roles_claim.as_deref(), &mut report);
     check_security_items_enriched(&docs, &source_by_id, opts, &mut report);
     if opts.deploy {
         check_approval_set(&docs, &source_by_id, opts, &mut report);
@@ -481,6 +483,24 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
             let declared = crate::lock::parse_string_list(&block_val(block, "custom-claims"))
                 .unwrap_or_default();
             if let Ok(pairs) = crate::lock::parse_inline_map(&block_val(block, "claims")) {
+                let rows: Vec<String> = steps
+                    .blocks
+                    .iter()
+                    .take_while(|b| b.heading != block.heading)
+                    .filter(|b| block_val(b, "op") == "query")
+                    .map(|b| block_val(b, "out"))
+                    .filter(|o| !o.is_empty())
+                    .collect();
+                match pairs.iter().find(|(name, _)| name == "sub") {
+                    Some((_, expr)) => {
+                        if let Some(problem) = crate::runtime::sub_source_problem(expr, &rows) {
+                            report.push(Diag::error(file, problem).at_step(&block.heading));
+                        }
+                    }
+                    None => report.push(
+                        Diag::error(file, "sign-jwt needs a sub claim").at_step(&block.heading),
+                    ),
+                }
                 for (name, _) in pairs.iter().filter(|(name, _)| name != "sub") {
                     if let Some(problem) =
                         crate::runtime::custom_claim_problem(name, &declared, &["roles"])
@@ -503,27 +523,29 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
         }
         if op == "query" {
             let sql = block_val(block, "sql").trim_matches('`').to_string();
-            saw_write |= crate::security::sql_writes(&sql);
-            if plain_write(&sql) && block_val(block, "writes") != "true" {
-                report.push(
-                    Diag::error(file, "a query step that writes needs writes: true")
-                        .at_step(&block.heading)
-                        .at_section("Steps"),
-                );
-            }
-            if let Some(problem) = crate::sqlguard::query_problem(&sql) {
-                report.push(
+            // Structural checks from the parse tree (sqlguard).
+            match crate::sqlguard::analyze(&sql) {
+                Ok(info) => {
+                    saw_write |= info.writes;
+                    if info.writes && block_val(block, "writes") != "true" {
+                        report.push(
+                            Diag::error(file, "a query step that writes needs writes: true")
+                                .at_step(&block.heading)
+                                .at_section("Steps"),
+                        );
+                    }
+                    if info.targets_rows && block_val(block, "scope").is_empty() {
+                        report.push(
+                            Diag::error(file, "UPDATE/DELETE needs scope: pk or scope: rls")
+                                .at_step(&block.heading),
+                        );
+                    }
+                }
+                Err(problem) => report.push(
                     Diag::error(file, problem)
                         .at_step(&block.heading)
                         .at_section("Steps"),
-                );
-            }
-            if writable_cte(&sql) {
-                report.push(
-                    Diag::error(file, "data-modifying WITH queries are not allowed")
-                        .at_step(&block.heading)
-                        .at_section("Steps"),
-                );
+                ),
             }
             for problem in sql_problems(&sql, &block_val(block, "params"), false) {
                 report.push(
@@ -531,15 +553,6 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                         .at_step(&block.heading)
                         .at_section("Steps"),
                 );
-            }
-            if crate::security::sql_writes(&sql) && block_val(block, "scope").is_empty() {
-                let cleaned = crate::security::strip_sql_noise(&sql).to_ascii_lowercase();
-                if cleaned.contains("update") {
-                    report.push(
-                        Diag::error(file, "UPDATE needs scope: pk or scope: rls")
-                            .at_step(&block.heading),
-                    );
-                }
             }
         }
     }
@@ -858,6 +871,75 @@ fn check_migration_sql(doc: &LockDoc, file: &str, report: &mut Report) {
             report.push(
                 Diag::error(file, "CREATE INDEX must be CONCURRENTLY").at_step(&block.heading),
             );
+        }
+    }
+}
+
+/// Every roles claim the runtime may read: `roles`, `VIBE_JWT_ROLES_CLAIM`
+/// and each route's `roles-claim`.
+pub fn configured_roles_claims(
+    docs: &HashMap<String, LockDoc>,
+    env_claim: Option<&str>,
+) -> Vec<String> {
+    let mut out = vec!["roles".to_string()];
+    out.extend(
+        env_claim
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string),
+    );
+    for doc in docs.values() {
+        if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
+            for block in &pipes.blocks {
+                let claim = block_val(block, "roles-claim");
+                if !claim.is_empty() {
+                    out.push(claim);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A `sign-jwt` custom claim may not share a name with any roles claim.
+fn check_claims_vs_roles_claims(
+    docs: &HashMap<String, LockDoc>,
+    env_claim: Option<&str>,
+    report: &mut Report,
+) {
+    let claims = configured_roles_claims(docs, env_claim);
+    let claims: Vec<&str> = claims.iter().map(String::as_str).collect();
+    for doc in docs.values().filter(|d| d.meta.kind == Kind::Method) {
+        let Some(steps) = find_section(&doc.sections, "Steps") else {
+            continue;
+        };
+        for block in steps
+            .blocks
+            .iter()
+            .filter(|b| block_val(b, "op") == "sign-jwt")
+        {
+            let declared = crate::lock::parse_string_list(&block_val(block, "custom-claims"))
+                .unwrap_or_default();
+            let Ok(pairs) = crate::lock::parse_inline_map(&block_val(block, "claims")) else {
+                continue;
+            };
+            for name in declared.iter().chain(pairs.iter().map(|(n, _)| n)) {
+                if name == "sub" {
+                    continue;
+                }
+                let all_declared = std::slice::from_ref(name);
+                if let Some(problem) =
+                    crate::runtime::custom_claim_problem(name, all_declared, &claims)
+                {
+                    if crate::runtime::custom_claim_problem(name, all_declared, &["roles"])
+                        .is_none()
+                    {
+                        report.push(Diag::error(&doc.meta.source, problem).at_step(&block.heading));
+                    }
+                }
+            }
         }
     }
 }
