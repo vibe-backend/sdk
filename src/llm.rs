@@ -108,6 +108,27 @@ pub fn model_capabilities(provider: &str, model: &str, seed: u64) -> SentParams 
     SentParams::default()
 }
 
+/// Sampling parameters for one config and model, by API style. This is the
+/// single map both the request body and the lock's `sent-params` stamp use.
+/// The Responses API has no `seed`, so it is dropped for `responses`.
+pub fn sent_params(config: &LlmConfig, model: &str) -> SentParams {
+    let mut params = model_capabilities(&config.provider, model, config.seed);
+    if config.provider == OPENAI && config.api_style == "responses" {
+        params.seed = None;
+    }
+    params
+}
+
+/// Provider name recorded in the lock: `openai-responses` when the OpenAI
+/// Responses API is used (#40), otherwise the provider itself.
+pub fn lock_provider(config: &LlmConfig) -> String {
+    if config.provider == OPENAI && config.api_style == "responses" {
+        "openai-responses".into()
+    } else {
+        config.provider.clone()
+    }
+}
+
 pub fn sampling_registered(provider: &str, model: &str) -> bool {
     !model_capabilities(provider, model, 0).is_empty()
 }
@@ -767,7 +788,7 @@ fn openai_call(
     request: &LlmRequest,
 ) -> (String, Value, Vec<(&'static str, String)>) {
     let url = join_url(&config.base_url, "chat/completions");
-    let params = model_capabilities(&config.provider, &request.model, config.seed);
+    let params = sent_params(config, &request.model);
     let body = openai_body(request, &params);
     let headers = vec![("Authorization", format!("Bearer {}", config.api_key))];
     (url, body, headers)
@@ -778,7 +799,7 @@ fn anthropic_call(
     request: &LlmRequest,
 ) -> (String, Value, Vec<(&'static str, String)>) {
     let url = join_url(&config.base_url, "v1/messages");
-    let params = model_capabilities(&config.provider, &request.model, config.seed);
+    let params = sent_params(config, &request.model);
     let body = anthropic_body(request, &params);
     let headers = vec![
         ("x-api-key", config.api_key.clone()),
@@ -795,7 +816,7 @@ fn gemini_call(
         &config.base_url,
         &format!("models/{}:generateContent", request.model),
     );
-    let params = model_capabilities(GEMINI, &request.model, config.seed);
+    let params = sent_params(config, &request.model);
     let body = gemini_body(request, &params);
     let headers = vec![("x-goog-api-key", config.api_key.clone())];
     (url, body, headers)
@@ -834,6 +855,7 @@ pub fn openai_responses_body(request: &LlmRequest, params: &SentParams) -> Value
     });
     apply_number(&mut body, "temperature", params.temperature.as_deref());
     apply_number(&mut body, "top_p", params.top_p.as_deref());
+    apply_number(&mut body, "seed", params.seed.as_deref());
     if let Some(effort) = &params.reasoning_effort {
         body["reasoning"] = json!({"effort": effort});
     }
@@ -845,14 +867,36 @@ fn openai_responses_call(
     request: &LlmRequest,
 ) -> (String, Value, Vec<(&'static str, String)>) {
     let url = join_url(&config.base_url, "responses");
-    let params = model_capabilities(&config.provider, &request.model, config.seed);
+    let params = sent_params(config, &request.model);
     let body = openai_responses_body(request, &params);
     let headers = vec![("Authorization", format!("Bearer {}", config.api_key))];
     (url, body, headers)
 }
 
 /// Reads `output_text`, or concatenates `output[].content[]` text parts.
+/// A response with `status: incomplete`, `failed` or `error`, or a non-null
+/// `error`, is an error even when some text was produced.
 pub fn parse_openai_responses(value: &Value) -> Result<LlmResponse, String> {
+    let status = value["status"].as_str().unwrap_or("");
+    if status == "incomplete" {
+        let reason = value["incomplete_details"]["reason"]
+            .as_str()
+            .unwrap_or("unknown");
+        return Err(format!("openai responses output is incomplete ({reason})"));
+    }
+    if matches!(status, "failed" | "error") || !value["error"].is_null() {
+        let error = &value["error"];
+        let code = error["code"].as_str().unwrap_or("unknown");
+        let message: String = error["message"]
+            .as_str()
+            .unwrap_or("no message")
+            .chars()
+            .take(200)
+            .collect();
+        return Err(format!(
+            "openai responses returned an error ({code}): {message}"
+        ));
+    }
     let text = if let Some(text) = value["output_text"].as_str() {
         text.to_string()
     } else {
@@ -1138,6 +1182,153 @@ mod failure_message_tests {
 #[cfg(test)]
 mod responses_tests {
     use super::*;
+
+    fn responses_config(model: &str) -> LlmConfig {
+        LlmConfig {
+            provider: OPENAI.into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "sk-test-value".into(),
+            model: model.into(),
+            timeout: Duration::from_secs(5),
+            max_retries: 0,
+            seed: 7,
+            endpoint_host: "api.openai.com".into(),
+            endpoint_private: false,
+            api_style: "responses".into(),
+        }
+    }
+
+    #[test]
+    fn stamp_and_body_share_one_capability_map() {
+        for model in [
+            "gpt-5.1-2026-01-01",
+            "gpt-5.2-2026-01-01",
+            "gpt-4o-2024-08-06",
+        ] {
+            let config = responses_config(model);
+            let params = sent_params(&config, model);
+            assert!(params.seed.is_none(), "responses never sends seed");
+            let request = LlmRequest {
+                system: "s".into(),
+                input: "i".into(),
+                model: model.into(),
+                seed: config.seed,
+                timeout: config.timeout,
+            };
+            let (_, body, _) = openai_responses_call(&config, &request);
+            let stamp = params.to_map();
+            for (key, field) in [
+                ("temperature", "temperature"),
+                ("top_p", "top_p"),
+                ("seed", "seed"),
+            ] {
+                assert_eq!(
+                    stamp.contains_key(key),
+                    body.get(field).is_some(),
+                    "{model} {key}"
+                );
+            }
+            assert_eq!(
+                stamp.contains_key("reasoning_effort"),
+                body.get("reasoning").is_some(),
+                "{model}"
+            );
+        }
+        let mut chat = responses_config("gpt-5.1-2026-01-01");
+        chat.api_style = "chat".into();
+        assert_eq!(sent_params(&chat, &chat.model).seed.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn lock_provider_records_the_api_style() {
+        let mut config = responses_config("gpt-5.1-2026-01-01");
+        assert_eq!(lock_provider(&config), "openai-responses");
+        config.api_style = "chat".into();
+        assert_eq!(lock_provider(&config), "openai");
+    }
+
+    #[test]
+    fn incomplete_and_error_statuses_are_errors() {
+        let err = parse_openai_responses(&json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output_text": "## partial"
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("incomplete") && err.contains("max_output_tokens"),
+            "{err}"
+        );
+        for value in [
+            json!({"status": "failed", "error": {"code": "server_error", "message": "boom"}}),
+            json!({"status": "error", "error": {"code": "server_error", "message": "boom"}}),
+            json!({"error": {"code": "server_error", "message": "boom"}, "output_text": "x"}),
+        ] {
+            let err = parse_openai_responses(&value).unwrap_err();
+            assert!(
+                err.contains("server_error") && err.contains("boom"),
+                "{err}"
+            );
+        }
+        assert!(parse_openai_responses(
+            &json!({"status": "completed", "error": null, "output_text": "ok"})
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn responses_adapter_against_a_mock_server() {
+        use axum::{routing::post, Json, Router};
+        let reply = std::sync::Arc::new(std::sync::Mutex::new(Value::Null));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let app = {
+            let reply = reply.clone();
+            let seen = seen.clone();
+            Router::new().route(
+                "/v1/responses",
+                post(move |Json(body): Json<Value>| {
+                    let reply = reply.clone();
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(body);
+                        Json(reply.lock().unwrap().clone())
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let model = "gpt-5.1-2026-01-01";
+        let mut config = responses_config(model);
+        config.base_url = format!("http://{addr}/v1");
+        let adapter = HttpAdapter::new(config).unwrap();
+        let request = LlmRequest {
+            system: "sys".into(),
+            input: "in".into(),
+            model: model.into(),
+            seed: 7,
+            timeout: Duration::from_secs(5),
+        };
+        *reply.lock().unwrap() =
+            json!({"status": "completed", "model": model, "output_text": "## A"});
+        assert_eq!(adapter.compile(&request).await.unwrap().text, "## A");
+        let body = seen.lock().unwrap()[0].clone();
+        assert_eq!(body["instructions"], "sys");
+        assert!(body.get("seed").is_none());
+        *reply.lock().unwrap() = json!({
+            "status": "incomplete", "model": model,
+            "incomplete_details": {"reason": "max_output_tokens"}, "output_text": "## A"
+        });
+        let err = adapter.compile(&request).await.unwrap_err();
+        assert!(err.contains("incomplete"), "{err}");
+        *reply.lock().unwrap() = json!({
+            "status": "failed", "model": model,
+            "error": {"code": "server_error", "message": "boom"}
+        });
+        let err = adapter.compile(&request).await.unwrap_err();
+        assert!(err.contains("server_error"), "{err}");
+    }
 
     #[test]
     fn responses_body_and_parse() {
