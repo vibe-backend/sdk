@@ -10,7 +10,7 @@ added only when the corresponding PR is merged to `main`.
 - **Ownership (#53):** The implicit admin ownership bypass is removed. Models that need admin-wide access must declare `ownership: role(admin)`. `owner-key: id` is only allowed on user-like models.
 - **Environment / slugs / pepper (#52):** Unknown `VIBE_ENV` values are treated as production. With PostgreSQL, unset `VIBE_ENV` is production. `--memory` is refused outside development. Outside development, `VIBE_API_KEY_PEPPER` is required (≥ 32 bytes). Missing, empty, or malformed `.vibe/slugs.json` fails closed (only `--memory` falls back to `slugs.example.json`).
 - **Manifest path (#62):** `vibe manifest` without `-o` writes `./manifest.json` in the current working directory, not `<project>/manifest.json`.
-- **Rate limits (#54):** Rate-limit keys follow the spec: `account` is rejected (use `input.<field>` together with an `ip` limit), `family` is rejected until token refresh lands (#26), and only `per-minute` limits are accepted (1–10000). Behind a proxy, the client IP comes from forwarded headers only when the peer is a trusted proxy.
+- **Rate limits (#54):** Rate-limit keys follow the spec: a limit keyed by `account` or `input.<field>` must be paired with an `ip` limit on the same route, `family` is rejected until token refresh lands (#26), and only `per-minute` limits are accepted (1–10000). Behind a proxy, the client IP comes from forwarded headers only when the peer is a trusted proxy.
 
 <!--
 Pending — add each entry only when its PR merges:
