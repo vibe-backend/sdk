@@ -1,8 +1,10 @@
-# 認證 pipeline：JWT
+# Auth pipeline：JWT
 
 ## 用途
 
-要求某個 API 定義下的每個端點都必須帶有效的 JWT。`auth` 是內建 pipeline（§4），其 lock 由平台提供並簽名；你只需要啟用它並傳入參數（例如 `mode`、`roles`）。在 `_definition.md` 宣告一次，所有版本和 feature 都會繼承（§3），有需要時再按 feature 收窄角色。
+要求 API 定義下的每個 endpoint 都帶有效的 JWT。`auth` 是內置 pipeline（§4），其 lock 由平台提供並簽名；你只需啟用它並傳入參數（`mode`、`roles`，以及選填的 `iss`、`aud`、`jwks-uri`）（§4.1、Decision 44）。在 `_definition.md` 宣告一次，即由所有 version 和 feature 繼承（§3），需要時再按 feature 限制 roles。
+
+範例 feature 是 §11.4 的 admin **create-user** endpoint。v1.7 起它不再設定密碼：它建立一個未驗證、沒有密碼的用戶，並寄出**邀請**（Decision 69）。
 
 ## 自然語言 source 範例
 
@@ -19,14 +21,14 @@ All endpoints require JWT authentication.
 ```text
 # Create user
 POST. Only admin may use it, at most 30 requests per minute.
-The request body must contain email (valid email), name (1 to 50 characters) and password (12 to 256 characters).
-Create the user with user.register; on success return 201 with the new user's id, email and name, plus Location.
-If the email is already taken return 409 EMAIL_TAKEN; a weak or breached password returns 422 WEAK_PASSWORD; validation failure returns 422.
+The request body must contain email (valid email) and name (1 to 50 characters).
+Create the user with user.register (no password, unverified), then send an invitation with user.invite; on success return 201 with the new user's id, email and name, plus Location.
+If the email is already taken return 409 EMAIL_TAKEN; validation failure returns 422.
 ```
 
 ## 編譯後的 lock md 範例
 
-`api/users/_definition.lock.md`（僅列 section；frontmatter 依 §2A.1，`kind: api`、`scope: definition`）
+`api/users/_definition.lock.md`（僅列出 section；frontmatter 依照 §2A.1，`kind: api`、`scope: definition`）
 
 ````markdown
 ## Providers
@@ -42,6 +44,8 @@ If the email is already taken return 409 EMAIL_TAKEN; a weak or breached passwor
 - body: 1MB
 ````
 
+沒有指定 `iss`／`aud`／`jwks-uri` 時使用平台預設值：`iss` = `https://auth.{platform-domain}/{project}`、`aud` = `{project}`、`jwks-uri` = `{iss}/.well-known/jwks.json`（§4.1）。
+
 `api/users/v2/create-user/create-user.lock.md`
 
 ````markdown
@@ -54,10 +58,11 @@ source: api/users/v2/create-user/create-user.md
 source-hash: sha256:7f02...aa
 source-type: natural
 dependencies:
+  - { id: user/methods/invite, kind: method, hash: sha256:<...> }
   - { id: user/methods/register, kind: method, hash: sha256:c3e1...90 }
   - { id: users/_definition, kind: api, hash: sha256:11ab...3c }
   - { id: users/v2/_version, kind: api, hash: sha256:0d9e...51 }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01 }
+compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
 status: approved
 approval-mode: manual
@@ -83,6 +88,7 @@ signature: MEUCIG...
 
 ### p2 rate-limit
 - per-minute: 30
+- key: user
 
 ## Limits
 - provider: main
@@ -91,18 +97,17 @@ signature: MEUCIG...
 
 ## Request
 | field | type | rules | required |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | body.email | string | format: email | yes |
 | body.name | string | min: 1, max: 50 | yes |
-| body.password | string | min: 12, max: 256 | yes |
 
 ## Response
 | status | schema | headers |
-|---|---|---|
+| --- | --- | --- |
 | 201 | { id, email, name } | Location |
 
 ## Transform
-- in: { email: req.body.email, name: req.body.name, password: req.body.password }
+- in: { email: req.body.email, name: req.body.name }
 - out: { id: u.id, email: u.email, name: u.name }
 
 ## Steps
@@ -113,7 +118,14 @@ signature: MEUCIG...
 - out: u
 - source-lines: 4-4
 
-### s2 respond
+### s2 method
+- op: method
+- target: user.invite
+- args: { id: u.id }
+- out: (none)
+- source-lines: 4-4
+
+### s3 respond
 - op: respond
 - status: 201
 - value: transform.out
@@ -122,24 +134,37 @@ signature: MEUCIG...
 
 ## Errors
 | status | code | from |
-|---|---|---|
+| --- | --- | --- |
 | 409 | EMAIL_TAKEN | user.register |
-| 422 | WEAK_PASSWORD | user.register |
 | 422 | VALIDATION_FAILED | platform |
 ````
 
+> ⚠️ 規格本身 §11.4 的 lock 只有 `user.register` 一個 step，但它的 source 寫明「再用 user.invite 寄邀請信」。省略邀請 step 的 lock 會比 source **少**；本頁加上 `s2`，令 lock 與 source 及 Decision 69 一致。`user.invite` 的輸入（`{ id }`）和 `key: user` 限流鍵僅作示意，見規格缺口。
+
+## 邀請流程（Decision 69、§12.11.9）
+
+1. Admin 呼叫 create-user → `user.register` 建立**沒有密碼**、`email_verified_at = null` 的用戶（自 migration `0004` 起 `password` 欄位可為 null，§12.11.1）。
+2. `user.invite` 用 `random-token` 產生 token，把其 hash 寫入 `users.email_verify_hash`，`email_verify_expires_at` 設為 **72 小時**後，`email_verify_purpose = invite`，再經 `email-outbox.enqueue`（lock 寫死 `purpose: invite`）以 `invite` 範本排入郵件。
+3. 用戶打開邀請連結，在與自行註冊相同的設定密碼頁設定密碼，頁面送到 `POST /auth/v1/{slug}/verify-email` → `user.complete-verification`。一個 UPDATE 同時設定 `password` **和** `email_verified_at`；之後撤銷所有 refresh token 家族（Decision 67）。見 [user-register.md](user-register.md)。
+4. 在此之前用戶沒有密碼且未驗證，因此無法登入（Decision 55）。
+5. 重新邀請會覆寫 token hash 和到期時間，舊邀請即時失效。過期未接受的邀請，由與未驗證自行註冊相同的清理 job 匿名化並軟刪除（§12.11.4）。
+6. 有未過期邀請的電郵被公開註冊時，邀請不受影響；註冊者只會收到中性的「已經有帳戶」通知（§12.11.4）。
+
 ## 安全考量
 
-- **預設拒絕**：除非明確移除，每個端點都會經過 `auth`；移除它（`-auth`）必須同時設定 `public: true`（§3、§4、§10.3）。
-- **次序**：`auth` 必須在每個 `method` 步驟及所有其他邏輯之前執行（`## Order` 宣告 `must-run: first`）（§4）。
-- **演算法**：只允許 RS256 和 ES256；禁止 `none`，也不可與 HS 混用。必須驗證 `iss`、`aud`、`exp` 和 `nbf`。支援 JWKS 輪換及快取 TTL（§4）。使用其他演算法或缺少 claim 檢查屬於部署錯誤（§10.3）。
-- **角色**：`roles-claim` 預設為 `roles`；`roles: []` 屬於錯誤（§4）。新增、修改、放寬或移除角色檢查屬於**高風險**安全項目，需要兩位非作者確認（§2A.5）。
-- **注入 context**：認證成功後，`auth` 會注入 `ctx.tenant_id` 和 `ctx.user`；業務邏輯不能修改它們（§4、§12.5）。method 不會繼承 api pipeline，只會收到 `ctx`（§12.5）。
-- **錯誤**：未認證／token 無效回傳 401，並附 `WWW-Authenticate`（RFC 6750）；已認證但無權限回傳 403（§0.1、§8）。認證失敗時絕不區分「用戶不存在」和「憑證錯誤」（§8）。
-- **日誌**：token 永遠不會寫入日誌（§9）。
+- **預設拒絕**：除非明確移除，每個 endpoint 都經過 `auth`；移除（`-auth`）必須同時 `public: true`（§3、§4、§10.3）。
+- **次序**：`auth` 最先執行（`must-run: first`，§4.4）。
+- **JWT 驗證**（§4.1、Decision 44）：`iss` 必須完全相等；`aud` 必須包含設定值；`jwks-uri` 必須是 https；JWKS 快取 10 分鐘，遇到未知 `kid` 即重新拉取（同一 issuer 最少相隔 60 秒），拉取失敗時最多沿用舊快取 1 小時，之後所有 token 回 401；`exp`／`nbf`／`iat` 容許 60 秒時鐘偏差；alg 只准 ES256 或 RS256（RSA 至少 2048 bit），禁止 `none`／HS*，header 必須有 `kid`；`exp` 距離 `iat` 超過 1 小時的 token 一律拒絕。
+- 修改 `iss`、`aud` 或 `jwks-uri`（例如接外部 IdP）屬**高風險**安全項目（§2A.5）。
+- **Roles**：`roles-claim` 預設為 `roles`；`roles: []` 報 error（§4）。新增、修改或放寬 role 檢查屬高風險（§2A.5）。
+- **Context**：`auth` 注入 `ctx.tenant_id` 和 `ctx.user`；Logic 不可修改（§4、§12.5）。
+- **Admin 不設密碼**：admin 永遠不會設定或看到用戶的密碼；用戶經邀請連結自行設定（Decision 69）。admin 路徑經認證且只限 admin，因此可以回 409 `EMAIL_TAKEN`；公開路徑則永遠不可以（§12.11）。
+- **錯誤**：缺少或無效 token 回 401 並帶 `WWW-Authenticate`（RFC 6750），role 不足回 403（§8）。
+- Token 永不寫入 log（§9）。
 
 ## 規格缺口
 
-- 規格只展示了 `mode: jwt` 和 `roles` 這兩個 `auth` 參數。`auth` pipeline 的 `## Parameters` schema 中，issuer、audience、JWKS URL 及 JWKS 快取 TTL 的參數名稱**未有規定**（內建 lock 由平台提供）。請勿在 source 中自行杜撰，應向平台查詢內建 `auth` 的參數 schema。
-- 規格自己在 §11.4 的 `create-user` 範例沒有 `password`，但用戶需要密碼才能登入；本頁加上了這個欄位，使呼叫符合 `user.register` 的 `## Signature`（見 [user-register.md](user-register.md)）。至於由管理員建立的用戶是否應改為收到重設密碼連結，規格未有規定。
-- `roles-claim` 如何覆寫（lock 中的參數名稱）未有展示。
+- §11.4 的 lock 省略了其 source 描述的 `user.invite` step（lock 比 source 少）。本頁已補上。
+- 規格沒有提供 `user.register`（admin）或 `user.invite` 的 lock；它們的 `## Signature`（例如邀請的輸入）**未有規定**。
+- §11.4 的 `p2 rate-limit` 沒有 `key`，但 §4.3 規定 `key` 必填。本頁的 `key: user` 屬假設。
+- 未規定邀請排入失敗時 create-user 是否仍回 201，亦未規定兩個 step 是否原子（v1 沒有 transaction 區塊，§14）。

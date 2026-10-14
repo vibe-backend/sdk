@@ -70,7 +70,7 @@ subject erase --subject <id> --reason "..."
 - grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT]
 ````
 
-> ⚠️ `personal: sensitive | standard`、`subject-key` 及 `erased_at` 系統欄位的 lock 語法**規格中沒有展示**；這裡參照 §12.8 的 `## Fields` 表格寫法示意。
+欄位規則中的 `personal: standard | sensitive` 依照 v1.7 的 `user` 和 `email-outbox` lock（§12.8、§12.11.2）。`subject-key` 依照 Decision 65 的語法（§12.10）：`subject-key: {column}` 或 `subject-key: [{column}, ...]`（任一符合即算），其中 `{column}` 是指向 `users.id` 的 `uuid` 欄位（`users` 表用其本身的 `id`），或 `hash:{column}`，即存放 `HMAC-SHA-256(pepper, normalize(email))` 的 `bytea` 欄位，供沒有 `user_id` 的資料列使用（例如 `email_outbox.recipient_hash`）。有個人欄位但沒有 `subject-key` 的 model 屬 validator 錯誤。`erased_at` 在 v1.7 是平台系統欄位（F5）。
 
 ## 安全考量
 
@@ -82,14 +82,15 @@ subject erase --subject <id> --reason "..."
 - **備份**：經 shredding 的欄位在備份中無法讀取；一般欄位會在 35 日備份保留期屆滿後消失；還原備份時，會先重播刪除紀錄才重新開放（§12.10）。
 - **日誌**：個人資料絕不可寫入日誌；日誌只保留假名化 id，保留 30 日（§12.10）。
 - **不可重新寫入**：lock 不可再對已刪除記錄寫入個人欄位（§12.10）。
+- **電郵 outbox**（Decision 68）：`email_outbox` 資料列帶有 `recipient_hash`，因此即使沒有 `user_id` 的資料列（「已有帳戶」通知）也能在刪除時找到並匿名化；無論如何，`sent_at` 後 30 日郵件 worker 都會遮蓋電郵並把 token 設為 null（§12.11.3）。
+- **審計絕不儲存明文電郵**（只存 HMAC 雜湊或遮蓋值）（Decision 68）。
 - 敏感欄位也應同時標記 `sensitive: true`，使其不會出現在 `list` 輸出、filter 和 sort 中（§12.9）。
 - `DELETE` 在任何地方仍然禁止（§2A.4）。
 - 規格 §13 要求就《個人資料（私隱）條例》／GDPR 方面進行法律審閱；本頁並非法律意見。
 
 ## 規格缺口
 
-- `personal`、`subject-key` 和 `erased_at` 的 lock 語法**未有規定**。
-- `sensitive: true`（§12.9）與 `personal: sensitive`（§12.10）是同一個標記還是互相獨立，**並不明確**。
-- **其他** model 中的當事人記錄是否透過各 model 自己的 `subject-key` 宣告串連起來，規格有所暗示但沒有明言。
-- §14（「之後版本」）仍列有「正式私隱刪除流程及 CLI」，與 §0.4 Decision 42 及 §12.10 所述已定案的內容互相矛盾。請把 `subject erase` CLI 視為可能尚未提供。
-- 對管理員而言，已刪除的記錄與 `unique` 約束以及 `get` 之間如何互動（記錄已軟刪除，所以會被排除）未有規定。
+- `sensitive: true`（§12.9，令欄位不出現在 list／filter／sort）與 `personal: sensitive`（§12.10，crypto-shredding）是同一個標記還是互相獨立，**並不明確**；本頁兩者都設定。
+- `subject-key` 的位置在各範例中不一致：在 migration 的 `## Data` section（§12.11.1）、在 model 的 `## Policies`（§12.11.2），以及作為欄位規則（`recipient_hash` 一列）。哪一個具權威性沒有說明。
+- 已刪除記錄與 `unique` 約束之間如何互動（日後重用同一電郵）未有規定。
+- §14 現在只把資料當事人**自助**提交入口列為未來工作（Decision 50）；§12.10 中租戶管理員的 `subject erase` CLI 流程是已定義的途徑。

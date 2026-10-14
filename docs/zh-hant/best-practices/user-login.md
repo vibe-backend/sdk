@@ -2,7 +2,9 @@
 
 ## 用途
 
-以電郵加密碼認證用戶，並回傳 access token。`user.login` 是一個 model method；它透過 `method` op 呼叫 `user.sign-token`（唯一可以簽發 token 的 method）。它經由一個**公開**的 api feature 提供（用戶此時尚未登入），因此寫入 `last_login_at` 屬於公開寫入（§12.8）。
+以電郵加密碼認證**已驗證**的用戶，並回傳 access token 和 refresh token。`user.login` 是一個 model method；它透過 `method` op 呼叫 `user.sign-token`（唯一可以簽發 token 的 method）。它經由一個**公開**的 api feature 提供（用戶此時尚未登入），因此寫入 `last_login_at` 屬於公開寫入（§12.8）。
+
+在 v1.7，登入只接受電郵已驗證的用戶（`email_verified_at is not null`）；未驗證的用戶會收到與密碼錯誤完全相同的 401 `INVALID_CREDENTIALS`（Decision 55）。由於公開註冊和 admin 邀請都在同一條 UPDATE 中設定 `password` 和 `email_verified_at`（Decisions 67、69），帳戶要麼兩者皆有，要麼兩者皆無。見 [user-register.md](user-register.md)。
 
 ## 自然語言 source 範例
 
@@ -12,13 +14,13 @@
 # login
 Log in with email and password.
 Input: email (valid email, required), password (1 to 256 characters, required).
-Output: user (id, email, name, roles) and token.
+Output: user (id, email, name, roles), token and refresh_token.
 
 Steps:
-1. Find the user by email.
+1. Find the user by email; only verified, non-deleted users count.
 2. Compare the password; if the user is not found or the password is wrong, fail INVALID_CREDENTIALS.
 3. On success record the last login time.
-4. Sign a token with user.sign-token and return user and token.
+4. Sign tokens with user.sign-token and return user, token and refresh_token.
 ```
 
 `api/auth/v1/login/login.md`（路由 `POST /auth/v1/{slug}/login`）
@@ -31,7 +33,7 @@ This endpoint writes data (records the last login time); public writes are allow
 Protect with login-guard: 10 per IP per minute, 5 per account per minute; also at most 300 per tenant per minute.
 
 Request body: email (valid email, required), password (1 to 256 characters, required).
-Log in with user.login; on success return 200 with token and user (id, email, name, roles).
+Log in with user.login; on success return 200 with token, refresh_token and user (id, email, name, roles).
 Wrong credentials return 401 INVALID_CREDENTIALS; validation failure returns 422.
 ```
 
@@ -201,22 +203,24 @@ signature: MEUCIQ...
 
 上面的 `INVALID_CREDENTIALS` 就是 `user.login` 自行定義的錯誤碼（見 method lock 前的注意事項）。
 
-model lock 必須授予 `public_writer [UPDATE(last_login_at)]`，並把 `last_login_at` 標記為 `public-writable`（§12.8），這本身也是一項高風險的 `public-writable-column` 項目。
+model lock 把 `last_login_at` 標記為 `public-writable`，並在 `public_writer` 授權中包含 `UPDATE(last_login_at)`（§12.8），這本身也是一項高風險的 `public-writable-column` 項目。由登入呼叫 `user.sign-token` 會令 `sign-jwt` 在**新家族**中簽發 refresh token（`issue-refresh: new-family`，由平台按呼叫來源決定，§4A.1）。
 
 ## 安全考量
 
+- **必須已驗證電郵**（Decision 55）：s1 查詢過濾 `email_verified_at is not null`；未驗證（或從未接受邀請）的用戶會落入同一條 `missing-user: dummy-hash` 路徑，因此耗時和回應都與密碼錯誤相同。
 - **防止帳戶枚舉**：`verify-password` 以固定時間比較；用戶不存在時，平台會與一個假雜湊值比較（`missing-user: dummy-hash`）。兩種情況都回傳相同的 `INVALID_CREDENTIALS`（§12.6、§8）。
 - **固定回應耗時**：登入類端點（任何含 `verify-password` 步驟的端點）會補足到 **500ms**（`min-response: 500ms`）；實際超過只會發出 warning（§0.1、§7.2、Decision 36）。
-- **帳戶鎖定**：15 分鐘內失敗 5 次，帳戶鎖定 15 分鐘；同一帳戶或同一 IP 在 15 分鐘內失敗 3 次後須通過 captcha；鎖定期間的回應與密碼錯誤完全相同（401 `INVALID_CREDENTIALS`，補足到 500ms）；經電郵重設連結可即時解鎖；鎖定與解鎖都會審計，並通知用戶（§4A.3）。
+- **帳戶鎖定**：15 分鐘內失敗 5 次，帳戶鎖定 15 分鐘；同一帳戶或同一 IP 在 15 分鐘內失敗 3 次後須通過 captcha（`challenge: { type: captcha, when: after-failures, after-failures: 3 }`，Decision 49）；鎖定期間的回應與密碼錯誤完全相同（401 `INVALID_CREDENTIALS`，補足到 500ms）；經電郵重設連結可即時解鎖；鎖定與解鎖都會審計，並通知用戶（§4A.3）。
 - **限流**：登入必須按 IP **和**按帳戶限流（例如 `login-guard`，每個 IP 每分鐘 10 次）（§4A.3、§12.6）。`verify-password` 屬 `cost: high`，在公開路徑上自動只有端點上限的一半（§7.2）。
 - **公開寫入**：只有 `last_login_at` 可以寫入；`UPDATE` 使用 `scope: pk`（§7.2）。
-- `password` 欄位只可在提供給 `verify-password` 時被選取（§10.8）；`login-guard` 會在審計中遮蓋 `req.body.password`（§11.2）。
+- `password` 欄位只可在提供給 `verify-password` 時被選取（§10.8）；`login-guard` 會遮蓋 `req.body.password`，並只記錄電郵的 HMAC（Decision 68、§11.2）。
 - 排除已軟刪除的用戶（`deleted_at is null`）。
+- **密碼雜湊**（Decision 46）：argon2id m=64 MiB、t=3、p=1；登入成功時若已存的 PHC 參數不同，平台以 `credential_rehash` role 自動重新雜湊（§4A.2）。lock 不需宣告這項寫入。
+- **Refresh token**：與 access token 一併回傳；只以 HMAC 雜湊存在 `_platform_refresh_tokens`（Decision 45）。見 [refresh-token-rotation.md](refresh-token-rotation.md)。
 - 審核重點：`public: true`、`-auth`、`public-writes: true`（每項都屬高風險，需兩位確認），以及寫入 SQL（中風險）（§12.8）。
 
 ## 規格缺口
 
-- 規格的登入範例只回傳 access token；**沒有**展示在登入時簽發 **refresh token**，也沒有說明 refresh token 家族如何建立（見 [refresh-token-rotation.md](refresh-token-rotation.md)）。
-- argon2id 參數，以及參數變更後在登入時重新雜湊，**未有規定**（§12.2）（由規格負責人決定）。
-- 鎖定狀態／失敗次數如何儲存，以及 `challenge: captcha-after-3-failures` 如何與步驟互動，屬平台內部事宜，未以 lock 的形式規定。
-- §12.8 使用了 `role: public_reader + public_writer` 和 `challenge: captcha-after-3-failures`，但它們不在 §7.2 的 `challenge: captcha | pow` 列舉值之內；規格照原樣使用。
+- 鎖定狀態和失敗次數如何儲存，以及 `challenge: { when: after-failures }` 相對於步驟如何評估，屬平台內部事宜，未以 lock 的形式表達。
+- §12.8 使用了 `role: public_reader + public_writer`，但 `role` 值的語法在其他地方沒有定義。
+- `login-guard` 的帳戶 key 是 `input.email`（§11.2），而登入 method 的輸入亦是 `email`；pipeline 如何在 method 執行前解析 `input.*`（相對於 `req.body.email`）沒有明確說明。

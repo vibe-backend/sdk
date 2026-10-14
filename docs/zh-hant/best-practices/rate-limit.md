@@ -98,9 +98,7 @@ signature: MEYCIQ...
 - source-lines: 4-4
 ````
 
-> ⚠️ **私隱：** 這個規格範例（§11.2）以明文審計 `req.body.email`。§12.10 規定個人資料絕不可寫入日誌，只可保留假名化 id。審計紀錄並未明言等同日誌，但請把這點視為衝突：在規格釐清前，最好不要審計原始電郵（見規格缺口）。
->
-> ⚠️ **Key 正規化：** 像 `req.body.email` 這樣的帳戶 key，在計數前應先正規化（例如去除前後空白、轉為小寫），否則攻擊者可以利用大小寫變化繞過每個帳戶的限流。規格沒有在 `rate-limit-check` 中定義正規化。
+帳戶 key `input.email` 會先正規化（去除前後空白、轉為小寫）再做 HMAC；明文永不儲存（§4.3）。審計步驟只記錄電郵的 HMAC，絕不記錄明文（Decision 68）。
 
 feature 層級的 IP 加租戶限流（`## Pipelines` 節錄）：
 
@@ -114,6 +112,19 @@ feature 層級的 IP 加租戶限流（`## Pipelines` 節錄）：
 - key: tenant
 ````
 
+## 參數 schema（§4.3、Decision 65）
+
+| 參數 | 類型 | 必填 | 說明 |
+| --- | --- | --- | --- |
+| `per-minute` / `per-hour` / `per-day` | 正整數 | 必須剛好一個 | 每個 step 一個時間窗 |
+| `key` | `ip` \| `tenant` \| `user` \| `api-key` \| `family` \| `input.{field}` | 是 | `user` 需要 `auth`；`family` 只配合 `token-refresh`；`input.{field}` 先正規化再做 HMAC |
+| `burst` | 正整數 | 否 | 預設為時間窗上限，不可超過它 |
+| `fail` | 錯誤碼 | 否 | 預設 `RATE_LIMITED`（429 加 `Retry-After`） |
+
+計數使用按 `tenant_id` 儲存的滑動時間窗。`key: ip` 使用平台按受信任 proxy 設定解析出的 IP，絕不採用用戶端提供的 header。一個端點可以有多個 `rate-limit` step；超出任何一個都會拒絕請求。
+
+pipeline lock 的 `## Order` 只取一個 `must-run:` 值：`first`（只限 `auth` 或取代它的平台 pipeline）、`before-steps`、`after-steps`、`last` 或 `any`（§4.4）。
+
 ## 安全考量
 
 - 超出限流時回傳 **429**，並附 `Retry-After`（由平台加上）（§8）。
@@ -126,9 +137,6 @@ feature 層級的 IP 加租戶限流（`## Pipelines` 節錄）：
 
 ## 規格缺口
 
-- 內建 `rate-limit` pipeline 的完整參數 schema 尚未公開；範例中只出現 `per-minute` 和 `key`（`ip`、`tenant`）。每秒／每小時的時間窗及突發（burst）設定**未有規定**。
-- 省略 `key` 時的預設值（例如上面的 `_version` 只有 `per-minute`）**未有規定**。
-- `login-guard` 宣告 `must-run: before-steps`，而 `auth` 使用 `must-run: first`；`## Order` 的完整取值範圍沒有列出。
-- 限流的平台上限未有規定。
-- **私隱衝突**：§11.2 的 `login-guard` 審計 `req.body.email`（個人資料，依 §12.10 屬 `personal: standard`），但 §12.10 禁止在日誌中出現個人資料，並要求刪除審計只用假名化 id。`audit` 紀錄是否算作日誌，以及 `audit` 是否支援把欄位假名化，**未有規定**；應由規格負責人決定。
-- `rate-limit-check` key 的正規化（大小寫、空白、Unicode）**未有規定**。
+- 規格自己的 `_version` 範例（§11.3）寫的 `rate-limit` 只有 `per-minute` 而沒有 `key`，但 §4.3 規定 `key` 必填；本頁加上了 `key: ip`。
+- 時間窗上限的平台最大值**未有規定**（只展示了 `login-guard` 本身 `## Parameters` 的 min／max）。
+- pipeline 中的 `input.{field}` 指的是請求 body 還是被呼叫 method 的輸入，沒有明確說明（§11.2 在 `req.body.email` 請求中使用 `input.email`）。
