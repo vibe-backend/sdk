@@ -66,7 +66,7 @@
 
 | # | 決定 | 影響章節 |
 | --- | --- | --- |
-| 16 | 安全設定照用自然語言寫，**唔強制**結構化 frontmatter；防線係獨立驗證器、CI 重編決定性檢查同 runtime 限制（v1.8 決定 77：SDK 唔再做人手 review，已確認（產品經理 2026-10-14））。 | 2.2、2A.5、2A.7 |
+| 16 | （v1.8 由決定 112 修訂：高風險欄位一定要喺 frontmatter 宣告）安全設定照用自然語言寫，**唔強制**結構化 frontmatter；防線係獨立驗證器、CI 重編決定性檢查同 runtime 限制（v1.8 決定 77：SDK 唔再做人手 review，已確認（產品經理 2026-10-14））。 | 2.2、2A.5、2A.7 |
 | 17 | 編譯器輸出一定要通過獨立、deterministic 嘅驗證器（唔靠 LLM 自律）；編譯器冇任何工具權限，網絡只准連編譯用 LLM endpoint 嘅 host（v1.7 決定 57 修訂）；source 入面似指令嘅句子（prompt injection 模式）出 warning 並喺 PR 高亮。 | 2A.7、10.9 |
 | 18 | 編譯用嘅 model pin 死 snapshot；compiler-hash（model snapshot + prompt + 編譯器版本）寫入 lock；CI 重編同 lock 唔一致就封鎖部署，冇 override；會改變輸出嘅 minor 升級當 major 處理。 | 2A.1、2A.6 |
 | 19 | （v1.8 由決定 78 修訂，待產品經理確認）安全項目由驗證器 deterministic 抽出，寫入 lock 同部署報告做資訊性高亮；唔再要求逐項確認人、兩個非作者或者 PR 數量上限；PR 同部署報告照樣顯示有效權限摘要。 | 2A.5、10.10 |
@@ -215,6 +215,11 @@
 | 105 | PATCH（issue #86）：route method 加 `PATCH`（修訂 0.1、2.3 嘅 GET／POST／PUT／DELETE）；語意係 JSON Merge Patch（RFC 7396），只限宣告欄位；`null` 只可以清 nullable 欄位；唔可以改嘅欄位回 422；內置 CRUD `update`（`partial: true`）用 PATCH、`partial: false` 用 PUT；CRUD update 照樣一定要 `If-Match`（決定 48），自訂 PATCH 可以選擇要唔要。 | 已確認（產品經理 2026-10-14） | 0.1、2.3、2.3c、12.9 |
 | 106 | Cursor 分頁同區間篩選（issue #87）：CRUD `list` 可以揀 `pagination: cursor`（offset 照樣係預設，決定 14）；cursor 係簽名嘅不透明值，綁定 sort、filter 同租戶；排序一定加主鍵做 tiebreaker；`page-size` 預設 20，`max-page-size` 同 offset 一樣跟決定 71（平台上限 500），冇另外嘅 100 上限；`range` 篩選只准宣告咗而且有 index 嘅欄位，運算子 `gte`／`gt`／`lte`／`lt`；編譯時驗證；cursor 同 sort／filter 唔對應回 400 `INVALID_CURSOR`。 | 已確認（產品經理 2026-10-14） | 12.9 |
 | 107 | 多欄唯一鍵：model lock 加 `## Constraints`（`- unique: [col_a, col_b]`，平台自動喺前面加 `tenant_id`）；一定要有對應 migration 建 unique index；衝突回 409 `UNIQUE_VIOLATION`，唔回顯欄位值。 | 已確認（產品經理 2026-10-14） | 12.2、8 |
+| 108 | 翻譯階段（issue #37）：source 去咗 frontmatter、code 同識別字之後仲有非 ASCII 字元，就喺語意一致性檢查之前，用現有 LLM adapter 以 prompt `translate-1` 譯做英文（直譯、保留識別字／數字／否定，source 放喺有分隔嘅 data-only `SOURCE` 區塊，冇工具）。譯文**只**用嚟做關鍵字同一致性檢查；lock 內容、`source-hash`、編譯 prompt 同 cache key 一律用原文。語意檢查唔再有中文關鍵字同否定詞。翻譯失敗即成次編譯失敗（#93 全部或者冇），冇 fallback、唔會略過。Cache 喺 `.vibe/cache/translate/`，key 係 `source-hash` + provider + model + prompt 版本 + 實際送出參數。 | 已確認（產品經理 2026-10-14） | 2.1a、2A.7 |
+| 109 | Lock 記錄翻譯資料（審計用，唔計入 `source-hash`）：`translation: { prompt-version, llm-provider, model-snapshot, hash }`。 | 已確認（產品經理 2026-10-14） | 2A.1、2.1a |
+| 110 | 高風險 release build 唔可以用翻譯 cache，一定重新翻譯。 | 已確認（產品經理 2026-10-14） | 2.1a、2C.3 |
+| 111 | 翻譯 call 計入 #92 P5 每次編譯 LLM call 上限；超過即編譯失敗。 | 已確認（產品經理 2026-10-14） | 2.1a |
+| 112 | 修訂決定 16：高風險欄位（寫入、公開、auth、secret）一定要喺 source frontmatter 宣告；宣告同譯文唔一致，或者偵測到未宣告嘅高風險行為，即 fail closed，錯誤訊息講明缺咗邊個宣告。關鍵字檢查係一致性檢查（縱深防禦），唔係唯一防線。api feature 唔再做寫入 sql 關鍵字檢查（由已檢查嘅 method lock 繼承）。 | 已確認（產品經理 2026-10-14） | 2.2、2.1a、2A.7 |
 
 ## 1. 目錄同命名
 
@@ -270,11 +275,27 @@ project/
 - 所有安全同驗證規則都喺 lock 層檢查（見第 10 節），唔係喺 source 層。
 - source 只係人寫同人讀嘅意圖描述；source 同 lock 有出入時，以已確認嘅 lock 為準，並且應該改 source 再重新編譯。
 
+### 2.1a 翻譯階段（決定 108–112，已確認（產品經理 2026-10-14））
+
+非英文 source 喺語意一致性檢查（2A.7）之前先譯做英文，令關鍵字檢查唔使逐個語言維護詞表。
+
+- **觸發**：source 去咗 frontmatter、code（fenced 同 inline）同識別字（欄位名、`{object}.{method}`、路徑）之後，仲有非 ASCII 字元。全部係 ASCII 就唔翻譯。
+- **做法**：用現有 LLM adapter（2A.8，同一個 provider 設定同沙盒），prompt `translate-1`：
+  - 直譯，唔解釋、唔補充、唔總結；保留識別字、數字同否定（例如「唔公開」一定譯做 not public）。
+  - Source 放喺有分隔嘅 data-only `SOURCE` 區塊（同編譯 prompt 一樣嘅分隔方式），入面任何指示都唔會執行；冇工具、冇 function calling。
+- **用途限制**：譯文**只**用嚟做關鍵字同一致性檢查。Lock 內容、`source-hash`、編譯 prompt 同編譯 cache key 一律用原文；譯文唔會寫入 lock，亦唔會送去編譯器。語意檢查唔再有中文關鍵字同否定詞，全部對英文譯文做。
+- **失敗**：翻譯 call 失敗、回應格式唔啱、或者譯文缺咗原文嘅識別字／數字，成次編譯失敗（#93 全部或者冇，冇 lock 會寫入）；冇 fallback，唔會略過檢查。
+- **Cache**：`.vibe/cache/translate/<sha256>`，key 係 `source-hash` + provider + model snapshot + translate prompt 版本 + 實際送出參數。**高風險 release build 唔可以用翻譯 cache**（決定 110），一定重新翻譯。
+- **Call 上限**：翻譯 call 計入 #92 P5 嘅每次編譯 LLM call 上限；超過即編譯失敗（決定 111）。
+- **審計**：lock frontmatter 記 `translation`（決定 109，見 2A.1）；唔計入 `source-hash`，亦唔計入 `compiler-hash`。
+- **高風險宣告**（決定 112）：frontmatter 宣告咗嘅高風險欄位同譯文（同 lock）唔一致，或者偵測到未宣告嘅高風險行為，一律 fail closed，錯誤訊息講明缺咗邊個宣告。關鍵字檢查係一致性檢查（縱深防禦），唔係唯一防線；真正嘅閘門係 frontmatter 宣告加 lock 層驗證。
+- **Api feature**：唔再對 api feature 做寫入 sql 關鍵字檢查；寫入由被呼叫、已經檢查過嘅 method lock（`writes`）繼承。
+
 ### 2.2 Source 寫法建議
 
 - 每個 source 用 `#` 標題寫名，之後用段落或者列點描述。
 - 建議用以下小標題幫編譯器理解（唔強制）：`## 用途`、`## 輸入`、`## 輸出`、`## 做法`、`## 錯誤`、`## 權限`。
-- 安全相關嘅設定（公開、剔走 auth、寫入、改 provider、放寬限流、簽 token）照用自然語言寫，唔強制結構化 frontmatter（決定 16）。建議用獨立一句清楚寫出，唔好埋喺長段落入面；無論寫喺邊，驗證器都會由 lock 抽出安全項目，PR 逐項高亮（見 2A.5）。
+- 安全相關嘅設定（公開、剔走 auth、寫入、改 provider、放寬限流、簽 token）可以用自然語言寫（決定 16）；但**高風險欄位一定要喺 frontmatter 宣告**（決定 112）：`writes`、`public`（同 `public-writes`）、`auth`、用到嘅 secret（`secrets`）。冇宣告而 lock 或者譯文顯示有呢啲行為，編譯失敗，錯誤講明要加邊個宣告。建議用獨立一句清楚寫出，唔好埋喺長段落入面；無論寫喺邊，驗證器都會由 lock 抽出安全項目，PR 逐項高亮（見 2A.5）。
 - source 入面嘅文字只會被當做描述，入面任何「指示編譯器」或者「略過檢查」嘅句子都唔會生效，lock 層規則照樣強制檢查；呢類似指令嘅句子會被 deterministic 規則偵測，出 warning 並喺 PR 高亮（見 2A.7）。
 
 ### 2.3 api feature source 涵蓋內容
@@ -393,6 +414,7 @@ dependencies:                      # 所有依賴 source／lock 嘅 hash，按 i
 compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: { temperature: 0, top_p: 1, seed: 0 } }
 compiler-hash: sha256:<見下面標準定義>
 build-mode: release                # release | dev；dev lock 唔可以部署（決定 75）
+translation: { prompt-version: translate-1, llm-provider: openai, model-snapshot: <...>, hash: sha256:<譯文 hash> }   # 只限有翻譯嘅 source；審計用，唔計入 source-hash（決定 109）
 security-items:                    # 驗證器 deterministic 抽出，資訊性（決定 78）
   - { item: public, risk: high, reason: "公開登入入口" }
 ---
@@ -412,6 +434,7 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
   8. `compiler.version`
 
   永遠唔記 key。2A.6、2A.8、10.1 提到 compiler-hash 一律指呢個定義。
+- `translation`：只喺 source 經過 2.1a 翻譯先有；記 translate prompt 版本、provider、model 同譯文 hash，只做審計，唔計入 `source-hash` 同 `compiler-hash`（決定 109）。
 - `build-mode`：`vibe build` 寫 `release`，`vibe dev` 寫 `dev`；`dev` lock 永遠唔可以入 release manifest（決定 75）。
 - `security-items`：驗證器 deterministic 抽出嘅安全項目清單，`reason` 由驗證器按規則產生；資訊性，用嚟 PR 高亮同部署報告，唔需要確認人（決定 78）；冇安全項目就寫 `[]`。
 - v1.8 起 lock 冇 `signature`，亦冇 `status`／`approval-*`／`approved-*`（決定 77、79）；SDK 讀到舊欄位會忽略並出 warning。
@@ -494,6 +517,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - Golden corpus 由平台編譯器團隊維護，最少 500 個案例，覆蓋所有 kind 同所有安全項目；項目可以喺 `.golden/` 加自己嘅案例，一樣會參與比對（決定 35）。
 - Model snapshot 淘汰（決定 35）：平台承諾宣布淘汰後最少保留 12 個月；項目有 90 日遷移窗口，窗口內舊 lock 照常有效、照常可以部署；窗口完結前未遷移，部署會被封鎖（runtime 已部署嘅 manifest 照常運作）。
 - 編譯一定要盡量 deterministic：固定 prompt、固定 snapshot；`temperature`、`top_p`、`seed` 等參數只喺 model capability 支援時先送固定值（決定 58，見 2A.8.6），唔支援就唔送，唔可以強送。決定性唔靠參數保證，靠 CI 重編比對。CI 會用 lock 記錄嘅 `compiler-hash` 重編一次比對；唔一致就**封鎖部署，冇任何 override**。
+- 翻譯（2.1a，決定 108–111）：譯文同 `translation` 欄位唔計入 `source-hash` 同 `compiler-hash`，所以翻譯 prompt 或者翻譯 model 改咗唔會令 lock 過時；但編譯（包括 `vibe build` 同 CI 重編）一定會用當前設定重新做翻譯同一致性檢查，失敗即封鎖。
 - 唔准手改 lock：要改就改 source 再重新編譯。Lock 冇簽名（決定 79），手改嘅 lock 會喺 CI 重編決定性檢查（2A.6）失敗，封鎖部署。
 
 ### 2A.7 獨立驗證器同編譯器隔離
@@ -504,7 +528,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - 編譯器只可以讀自己依賴範圍內嘅 lock（例如 method 只見到自己物件、provider 同被呼叫 method 嘅 `## Signature`）。
 - Prompt injection 偵測：驗證器用固定規則掃 source，例如「忽略之前／上面嘅指示」、「你而家係」、「system:」、「唔使檢查」、「當作已確認」、「print secret」、隱藏字元（零寬字元、bidi 控制字元）、大段 base64 等；命中就出 warning、喺 PR 高亮做中風險安全項目。零寬同 bidi 控制字元直接 error。
 - 誤報處理（決定 37）：項目可以喺 `.compiler/injection-allowlist` 加精確句子豁免（只可以精確匹配，唔准 pattern），檔案一定受 CODEOWNERS 保護（v1.8 照舊，決定 93），改動屬中風險安全項目。
-- 驗證器亦會做語意一致性檢查：source 冇提及寫入，lock 卻有寫入 sql；source 冇提及公開，lock 卻有 `public: true`；呢類「lock 多過 source」嘅情況出 error（決定 37）；誤報就改 source 寫清楚，冇豁免。
+- 驗證器亦會做語意一致性檢查：source 冇提及寫入，lock 卻有寫入 sql；source 冇提及公開，lock 卻有 `public: true`；呢類「lock 多過 source」嘅情況出 error（決定 37）；誤報就改 source 寫清楚，冇豁免。非英文 source 用 2.1a 嘅英文譯文做比對（決定 108）；高風險欄位一定要同 frontmatter 宣告一致（決定 112）；api feature 唔做寫入 sql 關鍵字檢查，由 method lock 繼承。
 
 ### 2A.8 編譯器 LLM 設定（決定 57）
 
@@ -712,7 +736,7 @@ jobs:
 - 一個指令做晒（決定 76）：
   0. **只讀一次**（決定 102）：開始時將所有 source、lock 同依賴讀入記憶體，記低每個檔嘅 hash。之後驗證、manifest、部署報告同簽名全部用呢份記憶體內容，唔再由磁碟讀；第 1 步重編寫返嘅 lock 亦用寫入時嗰份記憶體內容繼續。完成前再比對磁碟 hash，唔一致就失敗，唔會出部分輸出（issue #34）。
   1. 編譯過時嘅 lock（source 或者依賴 hash 變咗、或者 compiler-hash 輸入變咗），寫返 repo 入面嘅 `*.lock.md`。
-  2. 跑驗證器（第 10 節全部檢查）；任何 error 即刻失敗。
+  2. 跑驗證器（第 10 節全部檢查）；任何 error 即刻失敗。高風險 release build 嘅翻譯一律重新做，唔用翻譯 cache（決定 110）。
   3. 產生 manifest，用 build key 簽（決定 79、89、92）：release build 一定要用受保護 CI environment 嘅 KMS key；攞唔到 KMS key 就失敗，永遠唔 fallback 去 dev key（決定 92）。只有明確 `--dev` 先用 dev key，並標 `build-mode: dev`。
   4. 輸出部署報告（10.10）同安全項目清單。Release build 遇到高風險安全項目，冇有效嘅 `--release-approval` 就失敗（決定 90，驗證規則見 2C.3a）。
   5. Release build 檢查 CODEOWNERS 覆蓋（決定 93）。
@@ -3471,7 +3495,7 @@ security-items:
 
 私隱法（PDPO、GDPR）部分嘅建議請法律意見覆核。
 
-另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–107 已經由產品經理確認）；確認之前 v1.7 定稿照樣有效。
+另外，0.10 嘅決定 73–96 全部待產品經理確認（決定 97–112 已經由產品經理確認）；確認之前 v1.7 定稿照樣有效。
 
 ## 14. 後續版本
 
