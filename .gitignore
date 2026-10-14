@@ -12,3 +12,6 @@ target/
 # Node (site/)
 node_modules/
 site/dist/
+
+# Generated locks: built by `vibe compile` / the release build, never committed
+*.lock.md

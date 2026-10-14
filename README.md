@@ -48,6 +48,7 @@ A checkout with Rust 1.89 can also build the binary with `cargo build --release 
 The shop demo is moving to [vibe-backend/sample-shop](https://github.com/vibe-backend/sample-shop). That repository currently contains only the frontend; the vibe backend project will be added there later. Until then, the small shop project used by this repo's tests, [tests/fixtures/shop](tests/fixtures/shop), is the runnable example. From a checkout of this repo with Rust 1.89 (`rust-version` in `Cargo.toml`; `rust-toolchain.toml` pins the same channel), replace `tests/fixtures/shop` with your own project path as needed:
 
 ```bash
+vibe keygen --project tests/fixtures/shop
 vibe compile --project tests/fixtures/shop
 vibe validate --project tests/fixtures/shop --deploy
 vibe manifest --project tests/fixtures/shop -o manifest.json
@@ -69,7 +70,7 @@ The runtime refuses to start when `LLM_*` or `OPENAI_*` is set. Public catalog r
 
 Per-IP rate limits and public-write quotas use the TCP peer address. Set `VIBE_TRUSTED_PROXIES` (comma-separated IPs or CIDR blocks, e.g. `10.0.0.0/8,2001:db8::/32`) behind a load balancer. `X-Forwarded-For` is honoured only from those proxies, and the rightmost hop that is not a trusted proxy counts. Hops may carry a port (`1.2.3.4:5678`, `[2001:db8::1]:443`), and IPv4-mapped IPv6 addresses count as IPv4. IPv6 clients are limited per /64. Rate and quota state is kept per route and key type with a fixed capacity; when a shard is full, its least recently used bucket is evicted, so flooding never blocks other clients.
 
-Locks carry no approval or signature (spec v1.8). Review happens in pull requests; see [docs/pr-review-guide.md](docs/pr-review-guide.md). `security-items` in a lock are informational. The manifest is still signed.
+Locks are build output: they are not committed (`*.lock.md` is gitignored) and carry no approval or signature (spec v1.8). Deployments use only the manifest built and attested in the protected `release` environment (`vibe manifest --release`); see [docs/ci/README.md](docs/ci/README.md). Review happens in pull requests; see [docs/pr-review-guide.md](docs/pr-review-guide.md). `security-items` in a lock are informational. The manifest is still signed.
 
 ```bash
 cargo fmt --all -- --check

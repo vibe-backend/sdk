@@ -46,7 +46,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     .await
     .unwrap_or_else(|err| panic!("{err}"));
 
-    let key = sign::load_or_create(&root).unwrap();
+    let key = sign::create_dev_key(&root).unwrap();
     let manifest = manifest_from_project(&root, &key).unwrap_or_else(|err| panic!("{err}"));
     assert!(manifest.routes.iter().any(|route| route.public));
     assert!(manifest
@@ -686,7 +686,7 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
     })
     .await
     .unwrap_or_else(|err| panic!("{err}"));
-    let key = sign::load_or_create(&root).unwrap();
+    let key = sign::create_dev_key(&root).unwrap();
     let manifest = manifest_from_project(&root, &key).unwrap_or_else(|err| panic!("{err}"));
     let cart_model = manifest
         .models
@@ -826,6 +826,7 @@ async fn validator_reports_every_broken_file_at_once() {
 #[tokio::test]
 async fn manifest_output_is_relative_to_the_current_directory() {
     let root = compiled_shop().await;
+    sign::create_dev_key(&root).unwrap();
     let cwd = std::env::temp_dir().join(format!("vibe-cwd-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&cwd).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_vibe"))
@@ -1018,4 +1019,268 @@ async fn removing_roles_from_a_lock_cannot_deploy() {
     assert!(err.contains("roles"), "{err}");
     let key = sign::generate_key();
     assert!(manifest_from_project(&root, &key).is_err());
+}
+
+fn vibe_cli(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> (bool, String) {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_vibe"));
+    cmd.args(args).current_dir(root);
+    for key in [
+        "VIBE_ENV",
+        "VIBE_MANIFEST_PUBKEY",
+        "VIBE_RELEASE_SIGNING_KEY",
+        "GITHUB_SHA",
+        "LLM_API_KEY",
+        "VIBE_LLM_API_KEY",
+        "OPENAI_API_KEY",
+    ] {
+        cmd.env_remove(key);
+    }
+    for (key, _) in std::env::vars() {
+        if key.starts_with("LLM_") || key.starts_with("OPENAI_") {
+            cmd.env_remove(key);
+        }
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    (
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+#[tokio::test]
+async fn manifest_never_creates_a_key_and_keygen_writes_0600() {
+    let root = compiled_shop().await;
+    let (ok, out) = vibe_cli(&root, &["manifest", "--project", "."], &[]);
+    assert!(!ok);
+    assert!(out.contains("no signing key"), "{out}");
+    assert!(!root.join(".vibe/signing.key").exists());
+    let (ok, out) = vibe_cli(&root, &["keygen", "--project", "."], &[]);
+    assert!(ok, "{out}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(root.join(".vibe/signing.key"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        fs::set_permissions(
+            root.join(".vibe/signing.key"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let (ok, out) = vibe_cli(&root, &["manifest", "--project", "."], &[]);
+        assert!(!ok);
+        assert!(out.contains("must be mode 0600"), "{out}");
+    }
+    let (ok, out) = vibe_cli(&root, &["keygen", "--project", "."], &[]);
+    assert!(!ok && out.contains("not overwriting"), "{out}");
+}
+
+#[tokio::test]
+async fn approve_is_gone_with_a_pointer_to_its_replacement() {
+    let root = copy_shop();
+    let (ok, out) = vibe_cli(&root, &["approve", "--reviewer", "a@x"], &[]);
+    assert!(!ok);
+    assert!(out.contains("removed in v1.8"), "{out}");
+    assert!(out.contains("pull request"), "{out}");
+}
+
+#[tokio::test]
+async fn release_build_without_its_key_fails() {
+    let root = copy_shop();
+    let (ok, out) = vibe_cli(&root, &["manifest", "--project", ".", "--release"], &[]);
+    assert!(!ok);
+    assert!(out.contains("VIBE_RELEASE_SIGNING_KEY"), "{out}");
+}
+
+fn release_key_hex() -> (String, String) {
+    let key = sign::generate_key();
+    (
+        hex::encode(key.to_bytes()),
+        hex::encode(key.verifying_key().to_bytes()),
+    )
+}
+
+#[tokio::test]
+async fn release_build_ignores_lock_files_in_the_repo() {
+    // (b) An old or hand-edited lock committed to the repo is never a
+    // release input: the release build compiles from source in memory.
+    let root = compiled_shop().await;
+    tamper_product_lock(&root);
+    rerecord(&root);
+    let (secret, public) = release_key_hex();
+    let (ok, out) = vibe_cli(
+        &root,
+        &[
+            "manifest",
+            "--project",
+            ".",
+            "--release",
+            "--release-approval",
+            "pr:1",
+            "--commit",
+            "abc123",
+            "-o",
+            "release.json",
+        ],
+        &[("VIBE_RELEASE_SIGNING_KEY", &secret)],
+    );
+    assert!(ok, "{out}");
+    let key =
+        ed25519_dalek::VerifyingKey::from_bytes(&hex::decode(&public).unwrap().try_into().unwrap())
+            .unwrap();
+    let manifest = vibe::manifest::read_manifest(&root.join("release.json"), &key).unwrap();
+    let json = serde_json::to_string(&manifest.routes).unwrap()
+        + &serde_json::to_string(&manifest.models).unwrap();
+    assert!(
+        !json.contains("100000"),
+        "repo lock leaked into the release"
+    );
+    let p = &manifest.provenance;
+    assert_eq!(p.build_mode, "release");
+    assert_eq!(p.commit, "abc123");
+    assert_eq!(p.release_approval.as_deref(), Some("pr:1"));
+    let product = p.locks.iter().find(|l| l.id == "product").unwrap();
+    let on_disk = fs::read_to_string(root.join(PRODUCT_LOCK)).unwrap();
+    assert_ne!(product.lock_sha256, vibe::buildrecord::lock_hash(&on_disk));
+    assert!(product.content_hash.starts_with("sha256:"));
+    assert!(product.source_hash.starts_with("sha256:"));
+    assert!(product.compiler_hash.starts_with("sha256:"));
+    assert!(!p.high_risk().is_empty());
+    // The same old lock cannot reach a dev manifest either.
+    sign::create_dev_key(&root).unwrap();
+    let (ok, out) = vibe_cli(&root, &["manifest", "--project", "."], &[]);
+    assert!(!ok, "{out}");
+}
+
+#[tokio::test]
+async fn release_build_is_immune_to_lock_edits_during_the_build() {
+    // (a) Locks are compiled, validated, hashed and signed in memory in one
+    // process; writing a lock file mid-build changes nothing.
+    let root = copy_shop();
+    let (loaded, _) = vibe::compile::compile_in_memory(&root, None, None)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+    // Mid-build: drop a hand-edited lock (and a forged record) on disk.
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .unwrap();
+    tamper_product_lock(&root);
+    rerecord(&root);
+    let key = sign::generate_key();
+    let manifest = vibe::manifest::build_signed(
+        &root,
+        &loaded,
+        &key,
+        &vibe::manifest::BuildInfo {
+            release: true,
+            release_approval: Some("pr:1".into()),
+            commit: "abc".into(),
+        },
+    )
+    .unwrap_or_else(|err| panic!("{err}"));
+    let json = serde_json::to_string(&manifest.models).unwrap();
+    assert!(!json.contains("100000"), "mid-build edit leaked");
+    let product = manifest
+        .provenance
+        .locks
+        .iter()
+        .find(|l| l.id == "product")
+        .unwrap();
+    let on_disk = fs::read_to_string(root.join(PRODUCT_LOCK)).unwrap();
+    assert_ne!(product.lock_sha256, vibe::buildrecord::lock_hash(&on_disk));
+}
+
+#[tokio::test]
+async fn release_build_with_high_risk_items_needs_an_approval() {
+    let root = copy_shop();
+    let (loaded, _) = vibe::compile::compile_in_memory(&root, None, None)
+        .await
+        .unwrap();
+    let key = sign::generate_key();
+    let err = vibe::manifest::build_signed(
+        &root,
+        &loaded,
+        &key,
+        &vibe::manifest::BuildInfo {
+            release: true,
+            release_approval: None,
+            commit: String::new(),
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("high-risk items and no release approval"),
+        "{err}"
+    );
+    assert!(err.contains("public"), "{err}");
+}
+
+#[tokio::test]
+async fn production_runs_only_attested_release_manifests() {
+    let root = compiled_shop().await;
+    let key = sign::generate_key();
+    let dev = manifest_from_project(&root, &key).unwrap();
+    assert_eq!(dev.provenance.build_mode, "dev");
+    assert!(!dev.provenance.locks.is_empty());
+    vibe::manifest::check_deployable(&dev, true).unwrap();
+    let err = vibe::manifest::check_deployable(&dev, false).unwrap_err();
+    assert!(err.contains("only release manifests"), "{err}");
+    let mut forged = dev.clone();
+    forged.provenance.build_mode = "release".into();
+    let err = vibe::manifest::check_deployable(&forged, false).unwrap_err();
+    assert!(err.contains("without a release approval"), "{err}");
+}
+
+#[tokio::test]
+async fn production_serve_ignores_the_project_public_key() {
+    let root = compiled_shop().await;
+    sign::create_dev_key(&root).unwrap();
+    let (ok, out) = vibe_cli(&root, &["manifest", "--project", "."], &[]);
+    assert!(ok, "{out}");
+    let (ok, out) = vibe_cli(
+        &root,
+        &["serve", "--project", ".", "--addr", "127.0.0.1:0"],
+        &[
+            ("VIBE_ENV", "production"),
+            (
+                "VIBE_API_KEY_PEPPER",
+                "0123456789abcdef0123456789abcdef0123",
+            ),
+            ("VIBE_DATABASE_URL", "postgres://invalid.invalid/x"),
+        ],
+    );
+    assert!(!ok);
+    assert!(out.contains("no pinned manifest key"), "{out}");
+    // With the dev key pinned, the dev manifest is still refused.
+    let public = fs::read_to_string(root.join(".vibe/signing.pub")).unwrap();
+    let (ok, out) = vibe_cli(
+        &root,
+        &["serve", "--project", ".", "--addr", "127.0.0.1:0"],
+        &[
+            ("VIBE_ENV", "production"),
+            (
+                "VIBE_API_KEY_PEPPER",
+                "0123456789abcdef0123456789abcdef0123",
+            ),
+            ("VIBE_DATABASE_URL", "postgres://invalid.invalid/x"),
+            ("VIBE_MANIFEST_PUBKEY", public.trim()),
+        ],
+    );
+    assert!(!ok);
+    assert!(out.contains("only release manifests"), "{out}");
 }

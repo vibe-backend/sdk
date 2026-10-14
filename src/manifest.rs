@@ -21,7 +21,58 @@ pub struct Manifest {
     pub models: Vec<ModelSpec>,
     pub methods: Vec<MethodSpec>,
     pub migrations: Vec<MigrationSpec>,
+    /// Signed record of what the manifest was built from (spec 10.1, 10.10).
+    #[serde(default)]
+    pub provenance: Provenance,
     pub signature: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Provenance {
+    /// `release` or `dev`.
+    pub build_mode: String,
+    /// Source commit (`GITHUB_SHA`, `--commit`, or `git rev-parse HEAD`).
+    pub commit: String,
+    /// One entry per lock, sorted by id.
+    pub locks: Vec<LockProvenance>,
+    /// Every security item of every lock, sorted.
+    pub security_items: Vec<ItemProvenance>,
+    /// Release approval reference given for high-risk items (decision 90).
+    pub release_approval: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LockProvenance {
+    pub id: String,
+    pub lock_sha256: String,
+    pub content_hash: String,
+    pub source_hash: String,
+    pub compiler_hash: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ItemProvenance {
+    pub lock: String,
+    pub item: String,
+    pub risk: String,
+}
+
+impl Provenance {
+    pub fn high_risk(&self) -> Vec<&ItemProvenance> {
+        self.security_items
+            .iter()
+            .filter(|item| item.risk == "high")
+            .collect()
+    }
+}
+
+/// How a manifest is built.
+#[derive(Clone, Debug, Default)]
+pub struct BuildInfo {
+    /// Release build: high-risk items need `release_approval` (decision 90).
+    pub release: bool,
+    pub release_approval: Option<String>,
+    pub commit: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -252,14 +303,96 @@ pub fn manifest_from_loaded(
     loaded: &validate::LoadedProject,
     signing_key: &SigningKey,
 ) -> Result<Manifest, Report> {
+    build_signed(root, loaded, signing_key, &BuildInfo::default())
+}
+
+/// Validates (deploy rules) and builds the manifest from exactly the loaded
+/// lock texts; nothing is re-read. Records provenance and, for a release
+/// build, fails closed on high-risk items without a release approval.
+pub fn build_signed(
+    root: &Path,
+    loaded: &validate::LoadedProject,
+    signing_key: &SigningKey,
+    info: &BuildInfo,
+) -> Result<Manifest, Report> {
     let (result, docs) = validate::validate_loaded(&ValidateOptions { root, deploy: true }, loaded);
     result?;
     let mut manifest = build_manifest(&docs)?;
+    let mut locks = Vec::new();
+    let mut items = Vec::new();
+    for (source, text) in loaded.sources.iter().zip(&loaded.lock_texts) {
+        let (Some(text), Some(doc)) = (text, docs.get(&source.id)) else {
+            continue;
+        };
+        locks.push(LockProvenance {
+            id: doc.meta.id.clone(),
+            lock_sha256: crate::buildrecord::lock_hash(text),
+            content_hash: crate::lock::content_hash(doc),
+            source_hash: doc.meta.source_hash.clone(),
+            compiler_hash: doc.meta.compiler_hash.clone(),
+        });
+        for item in &doc.meta.security_items {
+            items.push(ItemProvenance {
+                lock: doc.meta.id.clone(),
+                item: item.item.clone(),
+                risk: item.risk.as_str().to_string(),
+            });
+        }
+    }
+    locks.sort_by(|a, b| a.id.cmp(&b.id));
+    items.sort_by(|a, b| (&a.lock, &a.item).cmp(&(&b.lock, &b.item)));
+    manifest.provenance = Provenance {
+        build_mode: if info.release { "release" } else { "dev" }.into(),
+        commit: info.commit.clone(),
+        locks,
+        security_items: items,
+        release_approval: info
+            .release_approval
+            .clone()
+            .filter(|r| !r.trim().is_empty()),
+    };
+    if info.release && manifest.provenance.release_approval.is_none() {
+        let high: Vec<String> = manifest
+            .provenance
+            .high_risk()
+            .iter()
+            .map(|item| format!("{} ({})", item.lock, item.item))
+            .collect();
+        if !high.is_empty() {
+            return Err(single(format!(
+                "release build has high-risk items and no release approval: {}; pass --release-approval <ref>",
+                high.join(", ")
+            )));
+        }
+    }
     manifest.signature = String::new();
     let bytes =
         serde_json::to_vec(&manifest).map_err(|err| single(format!("manifest json: {err}")))?;
     manifest.signature = sign::sign_bytes(&bytes, signing_key);
     Ok(manifest)
+}
+
+/// Outside development only release manifests run (decisions 79, 90, 91):
+/// built with `vibe manifest --release` (compiled in memory in the release
+/// environment) and, if they have high-risk items, carrying a release
+/// approval.
+pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), String> {
+    if development {
+        return Ok(());
+    }
+    let provenance = &manifest.provenance;
+    if provenance.build_mode != "release" {
+        return Err(
+            "only release manifests (`vibe manifest --release`) can run outside development".into(),
+        );
+    }
+    if provenance.locks.is_empty() {
+        return Err("manifest has no lock provenance".into());
+    }
+    if !provenance.high_risk().is_empty() && provenance.release_approval.is_none() {
+        return Err("manifest has high-risk items without a release approval".into());
+    }
+    Ok(())
 }
 
 pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), Report> {
@@ -327,6 +460,7 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
         return Err(report);
     }
     Ok(Manifest {
+        provenance: Provenance::default(),
         manifest_version: MANIFEST_VERSION,
         routes,
         models,

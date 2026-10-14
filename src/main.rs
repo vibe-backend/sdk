@@ -27,7 +27,7 @@ enum Command {
     Compile {
         #[arg(long, default_value = ".")]
         project: PathBuf,
-        /// Recompile and fail if the locks differ. Does not write.
+        /// Build in memory and run the deploy policy. Ignores and does not write lock files.
         #[arg(long)]
         check: bool,
     },
@@ -46,6 +46,27 @@ enum Command {
         /// Output path, relative to the current directory (like `serve --manifest`).
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
+        /// Release build: signs with VIBE_RELEASE_SIGNING_KEY only and fails on
+        /// high-risk items without --release-approval.
+        #[arg(long)]
+        release: bool,
+        /// Reference to the approval of this release's high-risk items.
+        #[arg(long)]
+        release_approval: Option<String>,
+        /// Source commit to record (default: GITHUB_SHA or `git rev-parse HEAD`).
+        #[arg(long)]
+        commit: Option<String>,
+    },
+    /// Create a development manifest signing key (.vibe/signing.key, mode 0600).
+    Keygen {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Removed in v1.8.
+    #[command(hide = true)]
+    Approve {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        _args: Vec<String>,
     },
     /// Serve HTTP from a signed manifest.
     Serve {
@@ -137,7 +158,19 @@ async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Compile { project, check } => cmd_compile(&project, check).await,
         Command::Validate { project, deploy } => cmd_validate(&project, deploy),
-        Command::Manifest { project, output } => cmd_manifest(&project, &output),
+        Command::Manifest {
+            project,
+            output,
+            release,
+            release_approval,
+            commit,
+        } => cmd_manifest(&project, &output, release, release_approval, commit).await,
+        Command::Keygen { project } => {
+            sign::create_dev_key(&project)?;
+            println!("wrote {}", project.join(".vibe/signing.key").display());
+            Ok(())
+        }
+        Command::Approve { .. } => Err("`vibe approve` was removed in v1.8: locks carry no approval. Review the source in a pull request; release builds (`vibe manifest --release`) require --release-approval for high-risk items.".into()),
         Command::Serve {
             manifest,
             project,
@@ -256,14 +289,117 @@ fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_manifest(project: &Path, output: &Path) -> Result<(), String> {
-    let key = sign::load_or_create(project).map_err(|err| err.to_string())?;
-    let manifest = manifest::manifest_from_project(project, &key).map_err(|err| err.to_string())?;
+async fn cmd_manifest(
+    project: &Path,
+    output: &Path,
+    release: bool,
+    release_approval: Option<String>,
+    commit: Option<String>,
+) -> Result<(), String> {
+    let key = if release {
+        sign::load_release_key()?
+    } else {
+        sign::load_dev_key(project)?
+    };
+    let commit = commit
+        .or_else(|| std::env::var("GITHUB_SHA").ok())
+        .or_else(|| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(project)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        })
+        .unwrap_or_default();
+    // A release build compiles from source in memory and never reads lock
+    // files from disk; a dev manifest uses the locks `vibe compile` wrote
+    // (checked against the build record).
+    let loaded = if release {
+        load_dotenv(project);
+        // The release environment provides the compiler key as VIBE_LLM_API_KEY.
+        let mut env = llm::env_map_from_process();
+        if let Some(key) = env.get("VIBE_LLM_API_KEY").cloned() {
+            env.entry("LLM_API_KEY".into()).or_insert(key);
+        }
+        let config = llm::load_llm_config(&env, true).ok();
+        let adapter = match &config {
+            Some(config) => Some(HttpAdapter::new(config.clone()).map_err(|err| err.to_string())?),
+            None => None,
+        };
+        let (loaded, report) = vibe::compile::compile_in_memory(
+            project,
+            adapter.as_ref().map(|a| a as &dyn LlmAdapter),
+            config.as_ref(),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        print_report(&report);
+        loaded
+    } else {
+        vibe::validate::load_project(project).map_err(|err| err.to_string())?
+    };
+    let info = manifest::BuildInfo {
+        release,
+        release_approval,
+        commit,
+    };
+    let manifest =
+        manifest::build_signed(project, &loaded, &key, &info).map_err(|err| err.to_string())?;
+    print_high_risk(&manifest);
     // Relative to the current directory, like `vibe serve --manifest` (#31).
     let path = output.to_path_buf();
     manifest::write_manifest(&path, &manifest).map_err(|err| err.to_string())?;
     println!("wrote {}", path.display());
     Ok(())
+}
+
+fn print_high_risk(manifest: &manifest::Manifest) {
+    let high = manifest.provenance.high_risk();
+    if high.is_empty() {
+        return;
+    }
+    eprintln!("high-risk items ({}):", high.len());
+    for item in high {
+        eprintln!("  {} {}", item.lock, item.item);
+    }
+    if let Some(reference) = &manifest.provenance.release_approval {
+        eprintln!("release approval: {reference}");
+    }
+}
+
+/// Manifest verifying key. Production trusts only the pinned release key
+/// (VIBE_MANIFEST_PUBKEY or one compiled in); the project's
+/// `.vibe/signing.pub` is accepted in development only.
+fn manifest_key(
+    project: &Path,
+    run_env: vibe::runtime::RunEnv,
+) -> Result<ed25519_dalek::VerifyingKey, String> {
+    if let Some(key) = sign::pinned_public_key()? {
+        return Ok(key);
+    }
+    if !run_env.is_dev() {
+        return Err("no pinned manifest key: set VIBE_MANIFEST_PUBKEY to the release public key (the project's .vibe/signing.pub is not trusted outside development)".into());
+    }
+    eprintln!("warning: verifying the manifest with the development key in .vibe/signing.pub");
+    sign::load_dev_public(project)
+}
+
+fn check_deployable(
+    manifest: &manifest::Manifest,
+    run_env: vibe::runtime::RunEnv,
+) -> Result<(), String> {
+    let provenance = &manifest.provenance;
+    tracing::info!(
+        build_mode = %provenance.build_mode,
+        commit = %provenance.commit,
+        locks = provenance.locks.len(),
+        high_risk = provenance.high_risk().len(),
+        "manifest provenance"
+    );
+    manifest::check_deployable(manifest, run_env.is_dev())
 }
 
 async fn cmd_serve(
@@ -284,8 +420,9 @@ async fn cmd_serve(
         ));
     }
     let auth = auth_from_env(run_env)?;
-    let key = sign::load_public(project).map_err(|err| err.to_string())?;
+    let key = manifest_key(project, run_env)?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
+    check_deployable(&manifest, run_env)?;
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::new())
     } else {
@@ -345,8 +482,10 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
     {
         return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
     }
-    let key = sign::load_public(project).map_err(|err| err.to_string())?;
+    let run_env = vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), false);
+    let key = manifest_key(project, run_env)?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
+    check_deployable(&manifest, run_env)?;
     let url = std::env::var("VIBE_DATABASE_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
         .map_err(|_| "VIBE_DATABASE_URL is required".to_string())?;

@@ -44,6 +44,48 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
     write_or_check(opts, &sources, &docs, &ordered, &mut report)
 }
 
+/// Compiles every source in memory and returns the result as a
+/// [`crate::validate::LoadedProject`] (rendered lock texts plus their build
+/// record). Nothing is read from or written to the lock files on disk, so a
+/// release build never trusts committed locks and an edit to a lock file
+/// during the build cannot reach its output (decisions 113, 118).
+pub async fn compile_in_memory(
+    root: &Path,
+    llm: Option<&dyn LlmAdapter>,
+    llm_config: Option<&LlmConfig>,
+) -> Result<(crate::validate::LoadedProject, Report), Report> {
+    let sources = discover::discover(root)?;
+    let opts = CompileOptions {
+        root,
+        llm,
+        llm_config,
+        check: true,
+    };
+    let (docs, ordered, report) = compile_docs(&sources, opts, &HashMap::new()).await?;
+    let mut texts: HashMap<String, String> = HashMap::new();
+    let mut record = std::collections::BTreeMap::new();
+    for id in &ordered {
+        let doc = &docs[id];
+        let rel = lock_rel(&doc.meta.source);
+        let text = render_lock(doc);
+        record.insert(rel.clone(), crate::buildrecord::lock_hash(&text));
+        texts.insert(rel, text);
+    }
+    let loaded = crate::validate::LoadedProject {
+        lock_texts: sources
+            .iter()
+            .map(|source| texts.get(&lock_rel(&source.rel)).cloned())
+            .collect(),
+        sources,
+        build_record: serde_json::to_string(&crate::buildrecord::BuildRecord {
+            version: 1,
+            locks: record,
+        })
+        .ok(),
+    };
+    Ok((loaded, report))
+}
+
 /// Recompiles structured sources in memory, without an LLM and without
 /// touching the disk. Natural-language sources cannot be recompiled offline,
 /// so their parsed locks are passed in `natural` and used as-is (they still
