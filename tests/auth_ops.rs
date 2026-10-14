@@ -11,6 +11,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 use vibe::manifest::Manifest;
+use vibe::runtime::refresh::{RefreshPolicy, RevokeTarget, Rotated};
 use vibe::runtime::{
     router, run_method, AppState, AuthConfig, CallCtx, Caller, ExecError, MemoryExec, PgExec,
     QueryExec, Row, Slug, Stmt,
@@ -247,6 +248,45 @@ impl QueryExec for Lookup {
         user_id: &str,
     ) -> Result<Option<Vec<String>>, ExecError> {
         self.0.user_roles(tenant_id, user_id).await
+    }
+    async fn refresh_issue(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        token_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<String, ExecError> {
+        self.0
+            .refresh_issue(tenant_id, user_id, token_hash, policy)
+            .await
+    }
+
+    async fn refresh_rotate(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<Rotated, ExecError> {
+        self.0
+            .refresh_rotate(tenant_id, token_hash, new_hash, policy)
+            .await
+    }
+
+    async fn refresh_revoke(
+        &self,
+        tenant_id: &str,
+        target: RevokeTarget<'_>,
+    ) -> Result<u64, ExecError> {
+        self.0.refresh_revoke(tenant_id, target).await
+    }
+
+    async fn refresh_family(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        self.0.refresh_family(tenant_id, token_hash).await
     }
 }
 
@@ -976,4 +1016,47 @@ async fn writing_query_needs_a_method_marked_writes() {
     m.methods[0].writes = false;
     let err = run(&m, &users(), json!({"n": "x"})).await.unwrap_err();
     assert!(err.1.contains("method is not marked writes"), "{err:?}");
+}
+
+/// App query roles may not inherit the runtime role; migrate and startup
+/// both refuse such a setup.
+#[tokio::test]
+async fn query_roles_cannot_inherit_the_runtime_role() {
+    let Some((_app, admin, tenant, url)) = pg_app().await else {
+        return;
+    };
+    let app_role = url::Url::parse(&url).unwrap().username().to_string();
+    let schema = format!("t_{tenant}");
+    let statements = vibe::runtime::refresh::table_statements(&schema).unwrap();
+    for statement in &statements {
+        admin.batch_execute(statement).await.unwrap();
+    }
+    admin
+        .batch_execute(&format!(
+            "DO $$ BEGIN CREATE ROLE app_rw NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
+             GRANT SELECT ON {schema}._platform_refresh_tokens TO {app_role}; \
+             GRANT {app_role} TO app_rw"
+        ))
+        .await
+        .unwrap();
+    let startup = PgExec::connect(&url).await.err();
+    let mut migrate = Ok(());
+    for statement in &statements {
+        if let Err(err) = admin.batch_execute(statement).await {
+            migrate = Err(err.to_string());
+            break;
+        }
+    }
+    admin
+        .batch_execute(&format!("REVOKE {app_role} FROM app_rw"))
+        .await
+        .unwrap();
+    let startup = startup.expect("startup must refuse");
+    assert!(startup.contains("app_rw"), "{startup}");
+    let migrate = format!("{:?}", migrate.expect_err("migrate must refuse"));
+    assert!(
+        migrate.contains("re-run migrate") || migrate.contains("db error"),
+        "{migrate}"
+    );
+    assert!(PgExec::connect(&url).await.is_ok());
 }

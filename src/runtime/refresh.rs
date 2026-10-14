@@ -75,6 +75,11 @@ pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
             "DO $$ DECLARE r text; BEGIN FOREACH r IN ARRAY ARRAY['public_reader','public_writer','app_rw','PUBLIC'] LOOP \
              IF r = 'PUBLIC' OR EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN \
              EXECUTE format('REVOKE ALL ON %s FROM %s', {lit}, CASE WHEN r = 'PUBLIC' THEN 'PUBLIC' ELSE quote_ident(r) END); \
+             END IF; END LOOP; \
+             FOREACH r IN ARRAY ARRAY['public_reader','public_writer','app_rw'] LOOP \
+             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) \
+             AND has_table_privilege(r, {lit}, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') THEN \
+             RAISE EXCEPTION 'role % can still reach % (through role membership or a grant); revoke it and re-run migrate', r, {lit}; \
              END IF; END LOOP; END $$",
             lit = sql_literal(&qualified)
         ),
