@@ -8,7 +8,7 @@ Require a valid JWT on every endpoint of an API definition. `auth` is a built-in
 
 `api/users/_definition.md`
 
-```
+```text
 # users
 User management API. Allowed providers: main and enterprise; default is main.
 All endpoints require JWT authentication.
@@ -16,7 +16,7 @@ All endpoints require JWT authentication.
 
 `api/users/v2/create-user/create-user.md` (route `POST /users/v2/create-user`)
 
-```
+```text
 # Create user
 POST. Only admin may use it, at most 30 requests per minute.
 The request body must contain email (valid email), name (1 to 50 characters) and password (12 to 256 characters).

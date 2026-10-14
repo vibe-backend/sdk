@@ -8,14 +8,14 @@ Bound request rates per IP, per tenant and per account using the built-in `rate-
 
 `api/users/v1/_version.md`
 
-```
+```text
 # users v1
 At most 60 requests per minute. This version is deprecated and will be retired on 2027-06-30.
 ```
 
 `pipelines/login-guard.md` (custom pipeline)
 
-```
+```text
 # login-guard
 Login protection: at most 10 per minute per IP, at most 5 per minute per email.
 Parameters: ip-per-minute (integer, default 10), account-per-minute (integer, default 5).
@@ -24,7 +24,7 @@ Must run before all methods, and record an audit entry (without the password).
 
 Feature using both IP and tenant keys (from `submit-review.md`):
 
-```
+```text
 At most 5 per minute per IP and at most 100 per minute per tenant.
 ```
 
@@ -99,7 +99,7 @@ signature: MEYCIQ...
 ````
 
 > ⚠️ **Privacy:** this spec example (§11.2) audits `req.body.email` in plain form. §12.10 says personal data must never be logged and only pseudonymized ids may be kept. Audit records are not explicitly the same as logs, but treat this as a conflict: prefer not auditing raw email until the spec clarifies (see Spec gaps).
-
+>
 > ⚠️ **Key normalization:** an account key like `req.body.email` should be normalized (e.g. trimmed, lower-cased) before counting, or attackers bypass the per-account limit with case variants. The spec does not define normalization in `rate-limit-check`.
 
 Feature-level IP + tenant limits (excerpt of `## Pipelines`):

@@ -8,13 +8,13 @@ Prevent lost updates when two clients edit the same record concurrently. The inj
 
 `models/user/user.md` (relevant line)
 
-```
+```text
 Provide get, list and update CRUD. update is a partial update.
 ```
 
 `api/users/v2/update-user/update-user.md` (route `PUT /users/v2/{id}`)
 
-```
+```text
 # Update user
 PUT, path /users/v2/{id}, id is a uuid. Requires JWT; only admin may use it.
 Body: name (1 to 50 characters, optional) and updated_at (timestamp, required — the version the client last read).
@@ -98,7 +98,6 @@ User not found returns 404 NOT_FOUND. If someone else changed the user in the me
 
 - **Same-tenant IDOR**: RLS only isolates tenants. Without a role or ownership check, any authenticated user of the tenant could update any user by id. This example restricts the endpoint to `roles: [admin]` (a high-risk `roles` security item). The spec defines **no row-ownership mechanism** (e.g. "only the owner may update"), see Spec gaps.
 - **PUT with partial semantics**: the injected `update` has PATCH semantics (§12.9), but v1 only supports GET/POST/PUT/DELETE (§0.1), so PUT is used for a partial update. Document this for clients.
-
 - Map `CONFLICT` to **409** in `## Errors`; an unmapped method error becomes 500 `INTERNAL` and raises a warning (§8, §10.9, §12.4).
 - System fields `id`, `tenant_id`, `created_at`, `updated_at`, `deleted_at` cannot be written from input (§12.9). The client-supplied `updated_at` is only the expected version for comparison, not a value written.
 - `password` fields are hashed automatically on update (§12.9).

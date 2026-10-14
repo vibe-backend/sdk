@@ -8,7 +8,7 @@ Allow unauthenticated visitors to create or update data (e.g. submitting a revie
 
 `api/catalog/v1/submit-review/submit-review.md` (route `POST /catalog/v1/{slug}/reviews`)
 
-```
+```text
 # Submit review
 POST, path /catalog/v1/{slug}/reviews, public, no auth, tenant is determined by slug.
 Visitors may leave reviews, so this writes data and requires captcha.
@@ -19,7 +19,7 @@ Create the review with review.submit; on success return 201 with id. If the item
 
 ## Compiled lock md example
 
-`api/catalog/v1/submit-review/submit-review.lock.md` (sections only; frontmatter per §2A.1 with `kind: api`, `scope: feature`; security items `public`, `auth-removed`, `public-writes` (high risk) plus `write-sql` for the new INSERT in `review.submit` and `output-new-field` for the new response field (medium risk). That is 5 items, exactly the per-PR cap (Decision 34), so ship model changes such as the `untrusted` comment column in a separate PR)
+`api/catalog/v1/submit-review/submit-review.lock.md` (sections only; frontmatter per §2A.1 with `kind: api`, `scope: feature`; security items on **this** lock: `public`, `auth-removed`, `public-writes` (high risk) and `output-new-field` for the new response field (medium risk)). The `write-sql` item (medium) for the new INSERT belongs to the `review.submit` **method** lock, not this api lock. The cap of 5 security items applies to **all locks in the same PR together** (Decision 34), so this api lock plus `review.submit` total 5 items. The `review` model's public-writable / `untrusted` fields are a further security item and must be merged and deployed in an **earlier PR**.
 
 ````markdown
 ## Route
@@ -101,7 +101,7 @@ Create the review with review.submit; on success return 201 with id. If the item
 
 ## Security considerations
 
-- **Two switches**: the tenant must enable `public_access` **and** `public_write_access`. `public_write_access` can only be enabled by a tenant admin in the platform UI — no API, CLI or source (Decisions 26, 41). Otherwise the same 404 is returned.
+- **Two switches**: the tenant must enable `public_access` **and** `public_write_access`. `public_write_access` can only be enabled by a tenant admin in the platform UI — no API, CLI or source (Decisions 26, 41). A tenant that has not enabled `public_access`, and a tenant that has `public_access` but not `public_write_access`, both get the **identical 404 body**, padded to the same fixed minimum (300ms), so callers cannot tell which switch is off (§7.2).
 - **Per-endpoint opt-in**: `public-writes: true` in `## Access` (high risk) (§7.2).
 - **Role and grants**: separate `public_writer` role; grants generated from the lock, limited to the exact tables, **columns** and operations used (§7.2, §10.7).
 - **Operations**: only `INSERT` and `UPDATE`, only on `writable-columns`. `UPDATE` must have `WHERE` with primary key or RLS (§7.2).
@@ -113,7 +113,7 @@ Create the review with review.submit; on success return 201 with id. If the item
 - **Audit**: `audit-log` cannot be removed from public-write endpoints (§10.3).
 - **Untrusted content**: public-written fields are `untrusted: true` in the model; all outputs (including authenticated reads) are output-encoded per Content-Type; every field needs a length cap and arrays a count cap (Decision 24).
 - **External calls**: forbidden on public paths unless `external-calls: allow` (high risk) (§7.2).
-- **Fixed min response**: 300ms for general public endpoints (§0.1).
+- **Fixed min response**: 300ms for general public endpoints, applied to the 404 responses above as well, so timing does not reveal tenant or switch state (§0.1, §7.2, Decision 36).
 - Deploy report lists all public-write endpoints and writable columns, with a warning (§7.2, §10.9).
 - Residual risk (captcha bypass, spam) is to be handled by a future content-moderation hook (§14).
 

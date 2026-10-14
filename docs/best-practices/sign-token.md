@@ -8,7 +8,7 @@ Centralize JWT issuance in a single model method flagged with `capabilities: [si
 
 `models/user/methods/sign-token.md`
 
-```
+```text
 # sign-token
 Sign an access token for a user.
 This method is responsible for signing tokens.

@@ -8,7 +8,7 @@ Expose a paginated list of records using the platform-injected `list` CRUD metho
 
 `models/user/user.md`
 
-```
+```text
 # user
 User data, stored in the users table of provider main.
 
@@ -25,7 +25,7 @@ Provide get, list and update CRUD. list defaults to 20 per page, at most 100, ca
 
 `api/users/v2/list-users/list-users.md` (route `GET /users/v2/list-users`)
 
-```
+```text
 # List users
 GET. Requires JWT; admin only.
 Query: page (integer, starting at 1), page-size (integer, 1 to 100), sort (created_at or name), email (filter, optional).

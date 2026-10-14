@@ -8,7 +8,7 @@ Authenticate machine-to-machine callers with an API key instead of a user JWT. A
 
 `api/partners/_definition.md`
 
-```
+```text
 # partners
 Partner integration API. Only uses provider main.
 All endpoints require API key authentication.
@@ -16,7 +16,7 @@ All endpoints require API key authentication.
 
 `api/partners/v1/list-orders/list-orders.md` (route `GET /partners/v1/list-orders`)
 
-```
+```text
 # List partner orders
 GET. Requires an API key. At most 60 requests per minute.
 Query: page (integer, from 1) and page-size (integer).

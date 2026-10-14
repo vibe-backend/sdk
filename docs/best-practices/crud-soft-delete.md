@@ -8,7 +8,7 @@ Delete records without destroying data. In this platform **every delete is a sof
 
 `models/note/note.md`
 
-```
+```text
 # note
 User notes, stored in the notes table of provider main.
 
@@ -22,7 +22,7 @@ Provide all CRUD. list defaults to 20 per page, at most 100, can sort by created
 
 `api/notes/v1/delete-note/delete-note.md` (route `DELETE /notes/v1/{id}`)
 
-```
+```text
 # Delete note
 DELETE, path /notes/v1/{id}, id is a uuid. Requires JWT; only admin may use it.
 Delete the note with note.delete and return 204.
@@ -139,7 +139,6 @@ If you write a custom deletion method, it must be an `UPDATE`, for example:
 ## Security considerations
 
 - **Same-tenant IDOR**: RLS isolates tenants only. Without a role/ownership check any authenticated tenant user could delete any note by id. This example uses `roles: [admin]` (high-risk `roles` item). The spec defines **no row-ownership mechanism** for notes owned by a user, see Spec gaps.
-
 - `DELETE` SQL must never appear in any lock; DB roles have no `DELETE`/`TRUNCATE` privilege (§2A.4, §7.1, §10.8). There is no `soft: false` option (§12.9).
 - `deleted_at` is a system field: it cannot be written from request input (§12.9) and is on the public-write blacklist (§7.2).
 - Soft-deleted rows are excluded automatically by injected `get`/`list`. **Custom methods must exclude them themselves** (e.g. `deleted_at is null`, as `user.login` does in §12.8).

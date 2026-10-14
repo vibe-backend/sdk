@@ -8,7 +8,7 @@ Honor data-subject erasure requests (e.g. PDPO, GDPR) **without** ever enabling 
 
 `models/customer/customer.md`
 
-```
+```text
 # customer
 Customer profiles, stored in the customers table of provider main.
 
@@ -27,7 +27,7 @@ Provide get, list and update CRUD. list defaults to 20 per page, at most 100, so
 
 Erasure is triggered outside source, by a tenant admin:
 
-```
+```text
 subject erase --subject <id> --reason "..."
 ```
 

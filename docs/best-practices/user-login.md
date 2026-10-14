@@ -8,7 +8,7 @@ Authenticate a user with email + password and return an access token. `user.logi
 
 `models/user/methods/login.md`
 
-```
+```text
 # login
 Log in with email and password.
 Input: email (valid email, required), password (1 to 256 characters, required).
@@ -23,7 +23,7 @@ Steps:
 
 `api/auth/v1/login/login.md` (route `POST /auth/v1/{slug}/login`)
 
-```
+```text
 # Login
 POST, path /auth/v1/{slug}/login.
 Public, no auth, tenant is determined by slug.

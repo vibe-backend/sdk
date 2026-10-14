@@ -8,7 +8,7 @@ Create a new user account in one model method that enforces email uniqueness and
 
 `models/user/methods/register.md`
 
-```
+```text
 # register
 Register a new user.
 Input: email (valid email, required), name (1 to 50 characters, required), password (required).
@@ -105,7 +105,7 @@ signature: MEUCIQ...
 - System fields (`id`, `tenant_id`, `created_at`, ...) are never written from input; `tenant_id` comes from the RLS context (§7.1, §12.9).
 - Map method errors in the api lock: `EMAIL_TAKEN` → 409, `WEAK_PASSWORD` → 422; unmapped errors become 500 (§12.4).
 - **Public self-signup** (a public endpoint calling `user.register`) is a public write with INSERT, so it requires `public-writes: true`, `challenge: captcha | pow`, IP + tenant rate limits, daily quota, `audit-log` and `writable-columns` (§7.2). `roles` is blacklisted for public writes, so a public signup must never set roles. See [public-writes.md](public-writes.md).
-- Email-existence leak: `EMAIL_TAKEN` reveals that an address is registered. The spec mandates anti-enumeration for login (§8, §12.6) but not for registration — decide consciously for public signup.
+- **Email-existence leak / public signup response**: `EMAIL_TAKEN` (409) reveals that an address is registered. For **public** self-signup, recommended practice (outside the spec) is to always return the same **202 Accepted** response and then notify by email ("finish signing up" for new addresses, "you already have an account" for existing ones), so the HTTP response never reveals account existence. v1.5 mandates anti-enumeration for login only (§8, §12.6) and defines no email-sending op, so this flow is **not specified** (see Spec gaps). The admin-only `create-user` example may keep 409.
 - Single responsibility: one write SQL to one table — compliant (§12.3a).
 
 ## Spec gaps
@@ -115,4 +115,5 @@ signature: MEUCIQ...
 - Whether `input.password` should carry `min: 12` in `## Signature` or the check lives only in `hash-password` is not specified.
 - §7.2 blacklists `password` for public writes "except login-class handled by the platform `hash-password`"; whether public **registration** counts as "login-class" is **ambiguous** (§7.2 defines login-class as endpoints with a `verify-password` step).
 - **Duplicate check vs. soft delete**: s1 intentionally does **not** filter `deleted_at is null`, because the `unique` constraint on `email` still covers soft-deleted rows and the INSERT would fail anyway. Whether a soft-deleted (or erased, §12.10, which replaces email with a random unique value) user's email can be re-registered is **not specified**.
+- **Public signup anti-enumeration**: v1.5 has no 202-then-email pattern and no op to send email from a method; how to implement it is **not specified**.
 - **argon2id parameters and rehash**: §12.2 says the platform manages argon2id parameters, but the values and whether hashes are transparently re-hashed on login when parameters change are **not specified** (spec owner).

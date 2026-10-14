@@ -8,7 +8,7 @@ Keep access tokens short-lived (≤ 1h) while letting clients stay signed in, us
 
 `api/auth/v1/refresh/refresh.md` (route `POST /auth/v1/{slug}/refresh`)
 
-```
+```text
 # Refresh token
 POST, path /auth/v1/{slug}/refresh.
 Public, no auth (the caller only holds a refresh token), tenant is determined by slug.
@@ -75,7 +75,7 @@ An invalid, expired, revoked or reused refresh token returns 401 INVALID_CREDENT
 | 422 | VALIDATION_FAILED | platform |
 ````
 
-> ⚠️ The `token-refresh` pipeline is platform-provided and its `## Parameters` schema is **not published in the spec**. `sign-method`, the response field names, `public-writes: false`, and an empty `## Steps` are **assumptions** for illustration; see Spec gaps.
+> ⚠️ The `token-refresh` pipeline is platform-provided and its `## Parameters` schema is **not published in the spec**. `sign-method`, the response field names, `public-writes: false`, and an empty `## Steps` are **assumptions** for illustration. `INVALID_CREDENTIALS` in `## Errors` is a **self-defined error code** chosen for this example (reusing the login code); the spec defines no error codes for `token-refresh`. See Spec gaps.
 
 ## Security considerations
 

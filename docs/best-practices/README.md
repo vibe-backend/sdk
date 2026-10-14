@@ -14,6 +14,7 @@ Each page has the same structure:
 
 ## Conventions used in examples
 
+- Approver names (`jack@example`, `mei@example`), PR numbers (`pr#121` …) and commit ids in lock frontmatter are **fictional**, copied in style from the spec examples.
 - Hashes, signatures and commit ids are shortened placeholders (`sha256:9a1c...e2`, `MEUCIQ...`), exactly as in the spec examples.
 - When a lock is shown as an excerpt ("sections only"), the frontmatter follows §2A.1 exactly; api locks additionally carry `scope:` (§2A.3).
 - Sections not used by a lock are written as `(none)` (§2A.2).
@@ -21,7 +22,7 @@ Each page has the same structure:
 ## Index
 
 | Topic | Page |
-|---|---|
+| --- | --- |
 | Auth pipeline – JWT | [auth-jwt.md](auth-jwt.md) |
 | Auth pipeline – API key | [auth-api-key.md](auth-api-key.md) |
 | CRUD – offset pagination | [crud-offset-pagination.md](crud-offset-pagination.md) |
@@ -34,6 +35,7 @@ Each page has the same structure:
 | Rate limiting | [rate-limit.md](rate-limit.md) |
 | Public writes | [public-writes.md](public-writes.md) |
 | Privacy deletion (crypto-shredding + anonymization) | [privacy-deletion.md](privacy-deletion.md) |
+| LLM provider setup (compiler endpoint) | [llm-provider-setup.md](llm-provider-setup.md) |
 
 ## Cross-cutting rules (apply to every page)
 
