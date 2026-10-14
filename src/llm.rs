@@ -22,6 +22,8 @@ pub struct LlmConfig {
     pub seed: u64,
     pub endpoint_host: String,
     pub endpoint_private: bool,
+    /// OpenAI API style: `chat` (default) or `responses` (`LLM_API_STYLE`, #40).
+    pub api_style: String,
 }
 
 #[derive(Clone, Debug)]
@@ -249,6 +251,25 @@ pub fn load_llm_config(
     if report.has_errors() {
         return Err(report);
     }
+    let api_style = env
+        .get("LLM_API_STYLE")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "chat".into());
+    if !matches!(api_style.as_str(), "chat" | "responses") {
+        report.push(Diag::error(
+            "env",
+            "LLM_API_STYLE must be chat or responses",
+        ));
+        return Err(report);
+    }
+    if api_style == "responses" && provider != OPENAI {
+        report.push(Diag::error(
+            "env",
+            "LLM_API_STYLE=responses is only valid with LLM_PROVIDER=openai",
+        ));
+        return Err(report);
+    }
     Ok(LlmConfig {
         provider,
         base_url,
@@ -259,6 +280,7 @@ pub fn load_llm_config(
         seed,
         endpoint_host: host,
         endpoint_private: private,
+        api_style,
     })
 }
 
@@ -569,6 +591,7 @@ impl LlmAdapter for HttpAdapter {
         match self.config.provider.as_str() {
             ANTHROPIC => "anthropic",
             GEMINI => "gemini",
+            _ if self.config.api_style == "responses" => "openai-responses",
             _ => "openai",
         }
     }
@@ -607,6 +630,9 @@ impl HttpAdapter {
         let (url, body, headers) = match self.config.provider.as_str() {
             ANTHROPIC => anthropic_call(&self.config, request),
             GEMINI => gemini_call(&self.config, request),
+            _ if self.config.api_style == "responses" => {
+                openai_responses_call(&self.config, request)
+            }
             _ => openai_call(&self.config, request),
         };
         let mut builder = self.client.post(&url).json(&body);
@@ -653,6 +679,7 @@ impl HttpAdapter {
         let parsed = match self.config.provider.as_str() {
             ANTHROPIC => parse_anthropic(&value),
             GEMINI => parse_gemini(&value),
+            _ if self.config.api_style == "responses" => parse_openai_responses(&value),
             _ => parse_openai(&value),
         }
         .map_err(|message| CallError {
@@ -793,6 +820,62 @@ fn parse_openai(value: &Value) -> Result<LlmResponse, String> {
         text,
         model_reported,
         system_fingerprint,
+    })
+}
+
+/// Body for `POST /v1/responses` (#40). Sampling params are sent the same way
+/// as chat; `reasoning_effort` maps to `reasoning.effort`.
+pub fn openai_responses_body(request: &LlmRequest, params: &SentParams) -> Value {
+    let mut body = json!({
+        "model": request.model,
+        "instructions": request.system,
+        "input": request.input,
+        "store": false
+    });
+    apply_number(&mut body, "temperature", params.temperature.as_deref());
+    apply_number(&mut body, "top_p", params.top_p.as_deref());
+    if let Some(effort) = &params.reasoning_effort {
+        body["reasoning"] = json!({"effort": effort});
+    }
+    body
+}
+
+fn openai_responses_call(
+    config: &LlmConfig,
+    request: &LlmRequest,
+) -> (String, Value, Vec<(&'static str, String)>) {
+    let url = join_url(&config.base_url, "responses");
+    let params = model_capabilities(&config.provider, &request.model, config.seed);
+    let body = openai_responses_body(request, &params);
+    let headers = vec![("Authorization", format!("Bearer {}", config.api_key))];
+    (url, body, headers)
+}
+
+/// Reads `output_text`, or concatenates `output[].content[]` text parts.
+pub fn parse_openai_responses(value: &Value) -> Result<LlmResponse, String> {
+    let text = if let Some(text) = value["output_text"].as_str() {
+        text.to_string()
+    } else {
+        let mut out = String::new();
+        for item in value["output"].as_array().into_iter().flatten() {
+            if item["type"].as_str().is_some_and(|t| t != "message") {
+                continue;
+            }
+            for part in item["content"].as_array().into_iter().flatten() {
+                if let Some(t) = part["text"].as_str() {
+                    out.push_str(t);
+                }
+            }
+        }
+        out
+    };
+    if text.is_empty() {
+        return Err("openai responses output has no text".into());
+    }
+    Ok(LlmResponse {
+        text,
+        model_reported: value["model"].as_str().map(str::to_string),
+        system_fingerprint: None,
     })
 }
 
@@ -1049,5 +1132,61 @@ mod failure_message_tests {
             assert!(!m.contains("tOk"), "{m}");
             assert!(m.contains("***"), "{m}");
         }
+    }
+}
+
+#[cfg(test)]
+mod responses_tests {
+    use super::*;
+
+    #[test]
+    fn responses_body_and_parse() {
+        let request = LlmRequest {
+            system: "sys".into(),
+            input: "in".into(),
+            model: "gpt-5.1-2026-01-01".into(),
+            seed: 0,
+            timeout: Duration::from_secs(1),
+        };
+        let body = openai_responses_body(&request, &model_capabilities(OPENAI, "gpt-5.1", 0));
+        assert_eq!(body["instructions"], "sys");
+        assert_eq!(body["input"], "in");
+        assert_eq!(body["reasoning"]["effort"], "none");
+        assert!(body.get("messages").is_none());
+        let parsed = parse_openai_responses(&json!({
+            "model": "m",
+            "output": [{"type": "reasoning"}, {"type": "message", "content": [
+                {"type": "output_text", "text": "## A"}, {"type": "output_text", "text": "\n- k: v"}
+            ]}]
+        }))
+        .unwrap();
+        assert_eq!(parsed.text, "## A\n- k: v");
+        assert_eq!(
+            parse_openai_responses(&json!({"output_text": "x"}))
+                .unwrap()
+                .text,
+            "x"
+        );
+        assert!(parse_openai_responses(&json!({"output": []})).is_err());
+    }
+
+    #[test]
+    fn api_style_is_validated() {
+        let env = |style: &str, provider: &str| {
+            HashMap::from([
+                ("LLM_PROVIDER".to_string(), provider.to_string()),
+                ("LLM_API_KEY".to_string(), "sk-test-value".to_string()),
+                ("LLM_MODEL".to_string(), "gpt-test-2026-01-01".to_string()),
+                ("LLM_API_STYLE".to_string(), style.to_string()),
+            ])
+        };
+        assert_eq!(
+            load_llm_config(&env("responses", "openai"), false)
+                .unwrap()
+                .api_style,
+            "responses"
+        );
+        assert!(load_llm_config(&env("bogus", "openai"), false).is_err());
+        assert!(load_llm_config(&env("responses", "gemini"), false).is_err());
     }
 }
