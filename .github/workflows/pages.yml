@@ -48,7 +48,7 @@ jobs:
         run: npm run check-links
       - name: Keep /sample-shop/ free for vibe-backend/sample-shop
         run: |
-          if [ -e site/dist/sample-shop ] || [ -e site/dist/sample-shop.html ]; then
+          if [ -e site/dist/sample-shop ] || [ -L site/dist/sample-shop ] || [ -e site/dist/sample-shop.html ]; then
             echo "Refusing to publish: org site must not claim /sample-shop/ (owned by vibe-backend/sample-shop)."
             exit 1
           fi
