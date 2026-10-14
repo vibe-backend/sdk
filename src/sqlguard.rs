@@ -79,6 +79,11 @@ impl Visitor for Guard {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if let SetExpr::Select(select) = &*query.body {
+            if select.into.is_some() {
+                return self.fail("SELECT ... INTO is not allowed".into());
+            }
+        }
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
                 if !matches!(
@@ -124,6 +129,21 @@ impl Visitor for Guard {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        let cast_type = match expr {
+            Expr::Cast { data_type, .. } | Expr::TypedString { data_type, .. } => {
+                Some(data_type.to_string())
+            }
+            _ => None,
+        };
+        if let Some(ty) = cast_type {
+            // Object-identifier types (regclass, regproc, …) turn strings into
+            // catalog references.
+            let ty = ty.to_ascii_lowercase();
+            let base = ty.rsplit('.').next().unwrap_or(&ty);
+            if base.starts_with("reg") || base == "oid" || base == "name" {
+                return self.fail(format!("cast to {ty} is not allowed in lock SQL"));
+            }
+        }
         if let Expr::Function(func) = expr {
             let ok = func.name.0.len() == 1 && {
                 let ident = &func.name.0[0];
@@ -135,6 +155,43 @@ impl Visitor for Guard {
             }
         }
         ControlFlow::Continue(())
+    }
+}
+
+/// What a `query` step's SQL does, from its parse tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqlInfo {
+    /// INSERT, UPDATE or DELETE.
+    pub writes: bool,
+    /// UPDATE or DELETE (needs a row scope).
+    pub targets_rows: bool,
+}
+
+/// Checks `sql` against the allowlist and describes it.
+pub fn analyze(sql: &str) -> Result<SqlInfo, String> {
+    if let Some(problem) = query_problem(sql) {
+        return Err(problem);
+    }
+    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(|e| e.to_string())?;
+    let statement = &statements[0];
+    Ok(SqlInfo {
+        writes: !matches!(statement, Statement::Query(_)),
+        targets_rows: matches!(statement, Statement::Update { .. } | Statement::Delete(_)),
+    })
+}
+
+/// Whether a single statement yields rows (a query, or a write with
+/// RETURNING), from its parse tree. Unparseable SQL yields no rows.
+pub fn returns_rows(sql: &str) -> bool {
+    let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+        return false;
+    };
+    match statements.as_slice() {
+        [Statement::Query(_)] => true,
+        [Statement::Insert(insert)] => insert.returning.is_some(),
+        [Statement::Update { returning, .. }] => returning.is_some(),
+        [Statement::Delete(delete)] => delete.returning.is_some(),
+        _ => false,
     }
 }
 
@@ -163,7 +220,46 @@ pub fn query_problem(sql: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::query_problem;
+    use super::{analyze, query_problem, SqlInfo};
+
+    #[test]
+    fn returns_rows_reads_returning_from_the_parse_tree() {
+        use super::returns_rows;
+        assert!(returns_rows("select 1"));
+        assert!(returns_rows("insert into t (a) values ($1) returning id"));
+        assert!(!returns_rows("insert into t (a) values ('returning')"));
+        assert!(returns_rows(
+            "update t set a = 1 where id = $1 returning id"
+        ));
+        assert!(!returns_rows("delete from t where id = $1"));
+    }
+
+    #[test]
+    fn analyze_reads_the_statement_kind() {
+        let read = SqlInfo {
+            writes: false,
+            targets_rows: false,
+        };
+        assert_eq!(analyze("select 1 as x"), Ok(read));
+        assert_eq!(
+            analyze("insert into t (updated_at) values (now())"),
+            Ok(SqlInfo {
+                writes: true,
+                targets_rows: false
+            })
+        );
+        assert_eq!(
+            analyze("update t set v = 1 where id = $1"),
+            Ok(SqlInfo {
+                writes: true,
+                targets_rows: true
+            })
+        );
+        assert_eq!(
+            analyze("with x as (select 1 as a) select a from x"),
+            Ok(read)
+        );
+    }
 
     #[test]
     fn ordinary_lock_sql_passes() {
@@ -200,6 +296,11 @@ mod tests {
             "with d as (delete from users returning id) select * from d",
             "do $$ begin end $$",
             "copy users to stdout",
+            "select * into tmp_copy from users",
+            "select 'x'::regclass",
+            "select cast('x' as regproc)",
+            "select count(*) from users where tableoid = '_platform_refresh_tokens'::regclass",
+            "select regclass 'users'",
         ] {
             assert!(query_problem(sql).is_some(), "accepted: {sql}");
         }

@@ -108,19 +108,19 @@ pub async fn query(
     {
         return Err(internal(problem));
     }
-    if step.table.starts_with("_platform") || step.sql.to_ascii_lowercase().contains("_platform_") {
+    if step.table.starts_with("_platform") {
         return Err(internal("platform tables cannot be queried"));
     }
-    // Parser allowlist: one statement, plain tables, allowlisted functions.
-    if let Some(problem) = crate::sqlguard::query_problem(&step.sql) {
-        return Err(internal(problem));
-    }
-    let writes = crate::validate::plain_write(&step.sql);
+    // Parser allowlist and statement kind (no substring heuristics).
+    let info = crate::sqlguard::analyze(&step.sql).map_err(internal)?;
+    let writes = info.writes;
     if writes && !step.writes {
         return Err(internal("query writes but the step is not marked writes"));
     }
-    if crate::validate::writable_cte(&step.sql) {
-        return Err(internal("data-modifying WITH queries are not allowed"));
+    if (writes || step.writes) && !method.writes {
+        return Err(internal(
+            "query writes but the method is not marked writes: true",
+        ));
     }
     // Spec §12.8: queries run as public_reader, or public_writer for writes.
     let role = if writes {
@@ -151,6 +151,25 @@ pub async fn query(
         .unwrap_or(Value::Null))
 }
 
+/// Longest password accepted anywhere (spec §4A.2 floor: 12..=256).
+pub const MAX_PASSWORD_CHARS: usize = 256;
+
+/// Only hashes made with the platform's own argon2id parameters verify.
+fn pinned_hash(hash: &str) -> bool {
+    use argon2::password_hash::PasswordHash;
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    use super::crud::{ARGON2_M_COST, ARGON2_P_COST, ARGON2_T_COST};
+    let param = |name: &str| parsed.params.get_decimal(name);
+    parsed.algorithm.as_str() == "argon2id"
+        && parsed.version == Some(0x13)
+        && param("m") == Some(ARGON2_M_COST)
+        && param("t") == Some(ARGON2_T_COST)
+        && param("p") == Some(ARGON2_P_COST)
+        && parsed.hash.is_some_and(|h| h.len() == 32)
+}
+
 /// `verify-password`: constant-time argon2id check. A missing hash (no such
 /// user) is compared against a dummy hash and always fails.
 pub async fn verify_password(
@@ -160,8 +179,15 @@ pub async fn verify_password(
     let hash = eval(opt(step, "hash"), vars)?;
     let plain = eval(opt(step, "plain"), vars)?;
     let plain = plain.as_str().unwrap_or("").to_string();
+    // Same upper bound as the password floor; longer input never matches.
+    let in_bounds = plain.chars().count() <= MAX_PASSWORD_CHARS;
+    let plain = if in_bounds { plain } else { String::new() };
     let (hash, real) = match hash.as_str() {
-        Some(h) if !h.is_empty() => (h.to_string(), true),
+        Some(h) if !h.is_empty() && pinned_hash(h) => (h.to_string(), in_bounds),
+        Some(h) if !h.is_empty() => {
+            tracing::warn!("stored password hash does not use the platform argon2id parameters");
+            (dummy_hash().to_string(), false)
+        }
         _ => {
             if opt(step, "missing-user") != "dummy-hash" {
                 return Err(internal("verify-password needs missing-user: dummy-hash"));
@@ -259,6 +285,29 @@ pub fn custom_claim_problem(
     None
 }
 
+/// Outputs of `query` steps that run before `step`.
+pub fn row_outputs(steps: &[StepSpec], step: &StepSpec) -> Vec<String> {
+    steps
+        .iter()
+        .take_while(|s| !std::ptr::eq(*s, step))
+        .filter(|s| s.op == "query" && !s.out.is_empty())
+        .map(|s| s.out.clone())
+        .collect()
+}
+
+/// `sub` must be a field of a row a `query` step read (`u.id`).
+pub fn sub_source_problem(expr: &str, rows: &[String]) -> Option<String> {
+    let expr = expr.trim().trim_matches('`');
+    let Some((root, field)) = expr.split_once('.') else {
+        return Some("sign-jwt sub must be a field of a query step result".into());
+    };
+    let plain = |p: &str| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !rows.iter().any(|r| r == root) || !field.split('.').all(plain) {
+        return Some("sign-jwt sub must be a field of a query step result".into());
+    }
+    None
+}
+
 /// Every roles claim the runtime reads: the global one and per-route ones.
 fn roles_claims<'a>(
     manifest: &'a crate::manifest::Manifest,
@@ -335,6 +384,12 @@ pub async fn sign_jwt(
     if !opt(step, "claims").is_empty() {
         let pairs = crate::lock::parse_inline_map(opt(step, "claims")).map_err(internal)?;
         for (name, expr) in pairs {
+            if name == "sub" {
+                if let Some(problem) = sub_source_problem(&expr, &row_outputs(&method.steps, step))
+                {
+                    return Err(internal(problem));
+                }
+            }
             let value = eval(&expr, vars)?;
             if name == "sub" {
                 sub = value.as_str().unwrap_or("").to_string();

@@ -11,8 +11,10 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 use vibe::manifest::Manifest;
+use vibe::runtime::refresh::{RefreshPolicy, RevokeTarget, Rotated};
 use vibe::runtime::{
-    router, run_method, AppState, AuthConfig, CallCtx, Caller, MemoryExec, PgExec, QueryExec, Slug,
+    router, run_method, AppState, AuthConfig, CallCtx, Caller, ExecError, MemoryExec, PgExec,
+    QueryExec, Row, Slug, Stmt,
 };
 
 const PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
@@ -64,7 +66,7 @@ fn method_manifest(capabilities: &[&str], steps: Value) -> Manifest {
     let mut m = fixture();
     m.routes.clear();
     m.methods = vec![serde_json::from_value(json!({
-        "target": "t.run", "writes": false, "input": [], "errors": [],
+        "target": "t.run", "writes": steps.as_array().is_some_and(|a| a.iter().any(|s| s["writes"] == true)), "input": [], "errors": [],
         "capabilities": capabilities, "crud_model": "", "crud_action": "", "steps": steps
     }))
     .unwrap()];
@@ -201,13 +203,95 @@ fn sign_steps(opts: Value) -> Value {
         all[k] = v.clone();
     }
     json!([
+        step(
+            "query",
+            "u",
+            json!({"table": "users", "sql": "select id::text as id from users where id::text = $1",
+                   "params": ["input.sub"]})
+        ),
         step("sign-jwt", "tok", json!({ "opts": all })),
         respond("tok")
     ])
 }
 
-/// A memory store with user u1 holding roles [staff].
-fn users() -> MemoryExec {
+/// Memory store whose `query` steps return one row `{id: <first param>}`
+/// (stands in for a users lookup; the memory executor does not run SQL).
+struct Lookup(MemoryExec);
+
+#[async_trait::async_trait]
+impl QueryExec for Lookup {
+    async fn execute(
+        &self,
+        tenant_id: &str,
+        role: &str,
+        stmt: Stmt,
+    ) -> Result<Vec<Row>, ExecError> {
+        self.0.execute(tenant_id, role, stmt).await
+    }
+
+    async fn raw(
+        &self,
+        _tenant_id: &str,
+        _role: &str,
+        _writes: bool,
+        _sql: &str,
+        params: Vec<Option<String>>,
+    ) -> Result<Vec<Row>, ExecError> {
+        let mut row = Row::new();
+        row.insert("id".into(), params.into_iter().next().flatten().into());
+        Ok(vec![row])
+    }
+
+    async fn user_roles(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, ExecError> {
+        self.0.user_roles(tenant_id, user_id).await
+    }
+    async fn refresh_issue(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        token_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<String, ExecError> {
+        self.0
+            .refresh_issue(tenant_id, user_id, token_hash, policy)
+            .await
+    }
+
+    async fn refresh_rotate(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<Rotated, ExecError> {
+        self.0
+            .refresh_rotate(tenant_id, token_hash, new_hash, policy)
+            .await
+    }
+
+    async fn refresh_revoke(
+        &self,
+        tenant_id: &str,
+        target: RevokeTarget<'_>,
+    ) -> Result<u64, ExecError> {
+        self.0.refresh_revoke(tenant_id, target).await
+    }
+
+    async fn refresh_family(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        self.0.refresh_family(tenant_id, token_hash).await
+    }
+}
+
+/// A store with user u1 holding roles [staff].
+fn users() -> Lookup {
     let exec = MemoryExec::new();
     exec.seed(
         "tenant0001",
@@ -217,7 +301,7 @@ fn users() -> MemoryExec {
             .unwrap()
             .clone(),
     );
-    exec
+    Lookup(exec)
 }
 
 fn decode(token: &str) -> jsonwebtoken::TokenData<Value> {
@@ -234,11 +318,11 @@ fn decode(token: &str) -> jsonwebtoken::TokenData<Value> {
 
 #[tokio::test]
 async fn sign_jwt_requires_capability_and_sets_platform_claims() {
-    let no_cap = method_manifest(&[], sign_steps(json!({"claims": "{ sub: input.sub }"})));
+    let no_cap = method_manifest(&[], sign_steps(json!({"claims": "{ sub: u.id }"})));
     assert!(run(&no_cap, &users(), json!({"sub": "u1"})).await.is_err());
     for reserved in [
-        "{ sub: input.sub, tenant_id: input.t }",
-        "{ sub: input.sub, aud: input.t }",
+        "{ sub: u.id, tenant_id: input.t }",
+        "{ sub: u.id, aud: input.t }",
     ] {
         let m = method_manifest(
             &["sign-token"],
@@ -251,7 +335,7 @@ async fn sign_jwt_requires_capability_and_sets_platform_claims() {
     }
     let m = method_manifest(
         &["sign-token"],
-        sign_steps(json!({"claims": "{ sub: input.sub }"})),
+        sign_steps(json!({"claims": "{ sub: u.id }"})),
     );
     let out = run(
         &m,
@@ -285,7 +369,7 @@ async fn sign_jwt_roles_never_come_from_the_lock_or_input() {
     // A lock that tries to pass roles through is refused outright.
     let m = method_manifest(
         &["sign-token"],
-        sign_steps(json!({"claims": "{ sub: input.sub }", "roles": "input.roles"})),
+        sign_steps(json!({"claims": "{ sub: u.id }", "roles": "input.roles"})),
     );
     let err = run(&m, &users(), json!({"sub": "u1", "roles": ["admin"]}))
         .await
@@ -294,7 +378,7 @@ async fn sign_jwt_roles_never_come_from_the_lock_or_input() {
     // A sub that is not a user gets no token.
     let m = method_manifest(
         &["sign-token"],
-        sign_steps(json!({"claims": "{ sub: input.sub }"})),
+        sign_steps(json!({"claims": "{ sub: u.id }"})),
     );
     let err = run(&m, &users(), json!({"sub": "ghost"}))
         .await
@@ -309,7 +393,7 @@ async fn sign_jwt_custom_claims_are_an_allowlist_without_roles_claims() {
     // Undeclared claim.
     let m = method_manifest(
         &["sign-token"],
-        claims("{ sub: input.sub, plan: input.p }", "[]"),
+        claims("{ sub: u.id, plan: input.p }", "[]"),
     );
     let err = run(&m, &users(), json!({"sub": "u1", "p": "pro"}))
         .await
@@ -318,7 +402,7 @@ async fn sign_jwt_custom_claims_are_an_allowlist_without_roles_claims() {
     // Declared claim is signed.
     let m = method_manifest(
         &["sign-token"],
-        claims("{ sub: input.sub, plan: input.p }", "[plan]"),
+        claims("{ sub: u.id, plan: input.p }", "[plan]"),
     );
     let out = run(&m, &users(), json!({"sub": "u1", "p": "pro"}))
         .await
@@ -333,7 +417,7 @@ async fn sign_jwt_custom_claims_are_an_allowlist_without_roles_claims() {
     a.roles_claim = "groups".into();
     let m = method_manifest(
         &["sign-token"],
-        claims("{ sub: input.sub, groups: input.g }", "[groups]"),
+        claims("{ sub: u.id, groups: input.g }", "[groups]"),
     );
     let err = run_method(
         &m,
@@ -349,10 +433,7 @@ async fn sign_jwt_custom_claims_are_an_allowlist_without_roles_claims() {
     // Nor a per-route roles-claim (first segment of a dotted path).
     let mut m = method_manifest(
         &["sign-token"],
-        claims(
-            "{ sub: input.sub, realm_access: input.g }",
-            "[realm_access]",
-        ),
+        claims("{ sub: u.id, realm_access: input.g }", "[realm_access]"),
     );
     let mut route = fixture().routes[0].clone();
     route.roles_claim = "realm_access.roles".into();
@@ -371,7 +452,7 @@ async fn sign_jwt_custom_claims_are_an_allowlist_without_roles_claims() {
 async fn sign_jwt_refuses_issue_refresh_until_supported() {
     let m = method_manifest(
         &["sign-token"],
-        sign_steps(json!({"claims": "{ sub: input.sub }", "issue-refresh": "platform-decided"})),
+        sign_steps(json!({"claims": "{ sub: u.id }", "issue-refresh": "platform-decided"})),
     );
     let err = run(&m, &users(), json!({"sub": "u1"})).await.unwrap_err();
     assert!(err.1.contains("issue-refresh"), "{err:?}");
@@ -383,7 +464,7 @@ async fn sign_jwt_refuses_issue_refresh_until_supported() {
 async fn signed_token_round_trips_through_runtime_verification() {
     let m = method_manifest(
         &["sign-token"],
-        sign_steps(json!({"claims": "{ sub: input.sub }"})),
+        sign_steps(json!({"claims": "{ sub: u.id }"})),
     );
     let exec = users();
     let out = run(&m, &exec, json!({"sub": "u1"})).await.unwrap();
@@ -848,4 +929,143 @@ async fn expressions_accept_quoted_string_literals() {
     );
     let out = run(&m, &MemoryExec::new(), json!({"x": 1})).await.unwrap();
     assert_eq!(out, json!({"purpose": "invite", "note": "a b", "who": 1}));
+}
+
+#[tokio::test]
+async fn verify_password_only_accepts_platform_hashes_within_bounds() {
+    let verify = |hash: &str| {
+        method_manifest(
+            &[],
+            json!([
+                step(
+                    "verify-password",
+                    "ok",
+                    json!({"opts": {"hash": hash, "plain": "input.pw", "missing-user": "dummy-hash"}})
+                ),
+                respond("{ok: ok}"),
+            ]),
+        )
+    };
+    // A valid argon2id hash of the same password, but with other parameters.
+    let weak_params = {
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        let salt = SaltString::encode_b64(b"0123456789abcdef").unwrap();
+        let argon = argon2::Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            argon2::Params::new(8, 1, 1, Some(32)).unwrap(),
+        );
+        argon
+            .hash_password(b"correct horse battery", &salt)
+            .unwrap()
+            .to_string()
+    };
+    let out = run(
+        &verify("input.h"),
+        &MemoryExec::new(),
+        json!({"pw": "correct horse battery", "h": weak_params}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, json!({"ok": false}));
+    // Over the 256-character bound never matches, even with the right hash.
+    let long = "a".repeat(300);
+    let m = method_manifest(
+        &[],
+        json!([
+            step(
+                "hash-password",
+                "pw",
+                json!({"opts": {"plain": "input.short"}})
+            ),
+            step(
+                "verify-password",
+                "ok",
+                json!({"opts": {"hash": "pw", "plain": "input.pw", "missing-user": "dummy-hash"}})
+            ),
+            respond("{ok: ok}"),
+        ]),
+    );
+    let out = run(
+        &m,
+        &MemoryExec::new(),
+        json!({"short": "correct horse battery", "pw": long}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, json!({"ok": false}));
+}
+
+#[tokio::test]
+async fn sign_jwt_sub_follows_the_claims_source_rules() {
+    for claims in [
+        "{ sub: input.sub }",
+        "{ sub: ctx.user.sub }",
+        "{ sub: 'u1' }",
+    ] {
+        let m = method_manifest(&["sign-token"], sign_steps(json!({"claims": claims})));
+        let err = run(&m, &users(), json!({"sub": "u1"})).await.unwrap_err();
+        assert!(err.1.contains("query step result"), "{claims}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn writing_query_needs_a_method_marked_writes() {
+    let mut m = method_manifest(
+        &[],
+        json!([
+            step(
+                "query",
+                "u",
+                json!({"table": "users", "writes": true,
+                       "sql": "update users set name = $1 where id::text = $1", "params": ["input.n"]})
+            ),
+            respond("u")
+        ]),
+    );
+    m.methods[0].writes = false;
+    let err = run(&m, &users(), json!({"n": "x"})).await.unwrap_err();
+    assert!(err.1.contains("method is not marked writes"), "{err:?}");
+}
+
+/// App query roles may not inherit the runtime role; migrate and startup
+/// both refuse such a setup.
+#[tokio::test]
+async fn query_roles_cannot_inherit_the_runtime_role() {
+    let Some((_app, admin, tenant, url)) = pg_app().await else {
+        return;
+    };
+    let app_role = url::Url::parse(&url).unwrap().username().to_string();
+    let schema = format!("t_{tenant}");
+    let statements = vibe::runtime::refresh::table_statements(&schema).unwrap();
+    for statement in &statements {
+        admin.batch_execute(statement).await.unwrap();
+    }
+    admin
+        .batch_execute(&format!(
+            "DO $$ BEGIN CREATE ROLE app_rw NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
+             GRANT SELECT ON {schema}._platform_refresh_tokens TO {app_role}; \
+             GRANT {app_role} TO app_rw"
+        ))
+        .await
+        .unwrap();
+    let startup = PgExec::connect(&url).await.err();
+    let mut migrate = Ok(());
+    for statement in &statements {
+        if let Err(err) = admin.batch_execute(statement).await {
+            migrate = Err(err
+                .as_db_error()
+                .map_or_else(|| err.to_string(), |e| e.message().to_string()));
+            break;
+        }
+    }
+    admin
+        .batch_execute(&format!("REVOKE {app_role} FROM app_rw"))
+        .await
+        .unwrap();
+    let startup = startup.expect("startup must refuse");
+    assert!(startup.contains("app_rw"), "{startup}");
+    let migrate = format!("{:?}", migrate.expect_err("migrate must refuse"));
+    assert!(migrate.contains("re-run migrate"), "{migrate}");
+    assert!(PgExec::connect(&url).await.is_ok());
 }

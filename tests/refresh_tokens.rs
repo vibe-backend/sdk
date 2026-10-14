@@ -62,8 +62,11 @@ fn manifest(grace: i64) -> Manifest {
             "target": "auth.sign", "writes": false, "input": [], "errors": [],
             "capabilities": ["sign-token"], "crud_model": "", "crud_action": "",
             "steps": [
+                step("query", "u", json!({"table": "users",
+                    "sql": "select id::text as id from users where id::text = $1",
+                    "params": ["input.user_id"]})),
                 step("sign-jwt", "tok", json!({"opts": {"alg": "ES256", "key-ref": "JWT_SIGNING_KEY",
-                    "claims": "{ sub: input.user_id }", "ttl": "15m", "issue-refresh": "platform-decided"}})),
+                    "claims": "{ sub: u.id }", "ttl": "15m", "issue-refresh": "platform-decided"}})),
                 step("respond", "", json!({"value": "tok", "status": 200}))
             ]
         }))
@@ -123,6 +126,7 @@ fn app(grace: i64) -> App {
 
 fn app_with(m: Manifest) -> App {
     let exec = Arc::new(MemoryExec::new());
+    exec.stub_queries("id");
     exec.seed(
         TENANT,
         "users",

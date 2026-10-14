@@ -132,37 +132,26 @@ impl tokio_postgres::types::ToSql for TextParam {
     tokio_postgres::types::to_sql_checked!();
 }
 
-/// Statements whose rows can be read: SELECT/WITH, or a write with RETURNING.
-fn returns_rows(sql: &str) -> bool {
-    // Drop quoted literals so a string containing "returning" cannot flip it.
-    let mut clean = String::new();
-    let mut quoted = false;
-    for c in sql.chars() {
-        if c == '\'' {
-            quoted = !quoted;
-            clean.push(' ');
-        } else if !quoted {
-            clean.push(c.to_ascii_lowercase());
-        }
-    }
-    let head = clean.trim_start();
-    head.starts_with("select")
-        || head.starts_with("with")
-        || clean
-            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .any(|w| w == "returning")
-}
-
 const REFRESH_TABLE: &str = "_platform_refresh_tokens";
 
 #[derive(Default)]
 pub struct MemoryExec {
     tables: Mutex<BTreeMap<String, Vec<Row>>>,
+    /// Test stub for `query` steps (the memory executor runs no SQL).
+    query_stub: Mutex<Option<String>>,
 }
 
 impl MemoryExec {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Tests only: every `query` step returns one row `{column: <first
+    /// param>}` instead of the PostgreSQL-only error (a stand-in lookup).
+    pub fn stub_queries(&self, column: &str) {
+        if let Ok(mut stub) = self.query_stub.lock() {
+            *stub = Some(column.to_string());
+        }
     }
 
     /// Adds a row to a tenant table directly (dev data and tests).
@@ -175,6 +164,25 @@ impl MemoryExec {
 
 #[async_trait]
 impl QueryExec for MemoryExec {
+    async fn raw(
+        &self,
+        _tenant_id: &str,
+        _role: &str,
+        _writes: bool,
+        _sql: &str,
+        params: Vec<Option<String>>,
+    ) -> Result<Vec<Row>, ExecError> {
+        let stub = self.query_stub.lock().ok().and_then(|s| s.clone());
+        let Some(column) = stub else {
+            return Err(ExecError::Message(
+                "query steps need PostgreSQL; the --memory executor does not run them".into(),
+            ));
+        };
+        let mut row = Row::new();
+        row.insert(column, params.into_iter().next().flatten().into());
+        Ok(vec![row])
+    }
+
     async fn user_roles(
         &self,
         tenant_id: &str,
@@ -457,9 +465,35 @@ impl PgExec {
                 tracing::error!(%err, "postgres connection ended");
             }
         });
-        Ok(Self {
+        let exec = Self {
             client: tokio::sync::Mutex::new(client),
-        })
+        };
+        exec.check_role_separation().await?;
+        Ok(exec)
+    }
+
+    /// The app query roles must never act as the runtime role: none of
+    /// public_reader, public_writer or app_rw may be a member of it,
+    /// directly or through other roles (that would hand them the runtime's
+    /// platform-table access).
+    pub async fn check_role_separation(&self) -> Result<(), String> {
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                "SELECT r.rolname::text FROM pg_roles r \
+                 WHERE r.rolname = ANY(ARRAY['public_reader','public_writer','app_rw']) \
+                 AND pg_has_role(r.oid, (SELECT oid FROM pg_roles WHERE rolname = current_user), 'MEMBER')",
+                &[],
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        if let Some(row) = rows.first() {
+            let role: String = row.get(0);
+            return Err(format!(
+                "database role {role} is a member of the runtime role; revoke that membership (it would let app queries reach platform tables)"
+            ));
+        }
+        Ok(())
     }
 
     pub async fn batch(&self, statements: &[String]) -> Result<(), String> {
@@ -852,7 +886,7 @@ impl PgExec {
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p as _).collect();
         let body = sql.trim().trim_end_matches(';');
-        let rows = if returns_rows(body) {
+        let rows = if crate::sqlguard::returns_rows(body) {
             // Every column comes back as JSON, whatever its type.
             let wrapped = format!("WITH q AS ({body}) SELECT row_to_json(q)::text FROM q");
             tx.query(&wrapped, &refs).await.map_err(map_pg)?
