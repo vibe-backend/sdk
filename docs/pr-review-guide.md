@@ -27,7 +27,7 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 
 - CODEOWNERS 入面嘅用戶或者 team 一定要對 repo 有 **write** 權限，否則 GitHub 唔會當佢係 code owner，required review 會失效。
 - `.compiler/injection-allowlist` 喺 `/.compiler/` 之下，一定受保護（決定 37）。
-- 計劃中：`vibe build` release 模式會檢查 CODEOWNERS 覆蓋晒以上路徑，冇就失敗（決定 89e）。
+- 計劃中：`vibe build` release 模式會檢查 CODEOWNERS 覆蓋晒以上路徑，冇就失敗（決定 93）。
 - 一定要將 lock 同 source 一齊 commit（決定 80），reviewer 先睇到 LLM 實際編譯咗乜。
 
 ## 3. Required status checks
@@ -53,7 +53,7 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
 - 唔好用 `pull_request_target` 執行 PR 入面嘅 code。
 - Fork PR 唔跑需要 `LLM_API_KEY` 嘅重編步驟（spec 2A.8.8 已經跳過）。
 
-## 6. Release environment 同 KMS（spec 決定 89a、89d）
+## 6. Release environment 同 KMS（spec 決定 89、92）
 
 - 開一個 `release` environment，設 **Required reviewers**，只准受保護 ref（`main`、受 ruleset 保護嘅 `v*` tag）部署。
 - Release manifest 簽名 key 放喺 KMS，用 GitHub OIDC 綁定 `release` environment 同 ref 先可以用；唔好將 key 放做 repository secret。
