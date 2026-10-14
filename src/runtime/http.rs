@@ -977,6 +977,9 @@ fn verify_jwt(auth: &AuthConfig, token: &str) -> Result<Principal, AuthError> {
     if data.claims.exp.saturating_sub(data.claims.iat) > 3600 {
         return Err(AuthError::unauthorized("Bearer"));
     }
+    if !super::slugs::valid_tenant(&data.claims.tenant_id) {
+        return Err(AuthError::unauthorized("Bearer"));
+    }
     Ok(Principal {
         tenant_id: data.claims.tenant_id,
         subject: data.claims.sub,
@@ -1014,6 +1017,9 @@ fn verify_api_key(auth: &AuthConfig, token: &str) -> Result<Principal, AuthError
         return Err(AuthError::unauthorized("ApiKey"));
     }
     if record.expires_unix < chrono::Utc::now().timestamp() {
+        return Err(AuthError::unauthorized("ApiKey"));
+    }
+    if !super::slugs::valid_tenant(&record.tenant_id) {
         return Err(AuthError::unauthorized("ApiKey"));
     }
     Ok(Principal {

@@ -243,6 +243,9 @@ impl QueryExec for PgExec {
         stmt: Stmt,
     ) -> Result<Vec<Row>, ExecError> {
         let _ = role;
+        if !super::slugs::valid_tenant(tenant_id) {
+            return Err(ExecError::Message("invalid tenant id".into()));
+        }
         let (sql, params) = sql::render(&stmt).map_err(ExecError::Message)?;
         let returning = returning_cols(&stmt);
         let mut client = self.client.lock().await;
@@ -250,7 +253,7 @@ impl QueryExec for PgExec {
             .transaction()
             .await
             .map_err(|err| ExecError::Message(err.to_string()))?;
-        let schema = format!("t_{tenant_id}");
+        let schema = format!("\"t_{tenant_id}\"");
         tx.query(
             "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true)",
             &[&tenant_id, &schema],

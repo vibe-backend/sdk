@@ -181,6 +181,28 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         array_body.json["error"]["message"],
         "body must be a JSON object"
     );
+    for bad_tenant in [
+        "zzzzzzzz, t_tenant0001",
+        "TENANT0001",
+        "short",
+        "tenant0001\"",
+        "",
+    ] {
+        let bad = bearer(&token("staff-user", &["staff"], bad_tenant));
+        let rejected = send(
+            &app,
+            "POST",
+            "/catalog/v1/products",
+            Some(bad),
+            Some(product("sku-bad", "Bad", 1)),
+        )
+        .await;
+        assert_eq!(
+            rejected.status,
+            StatusCode::UNAUTHORIZED,
+            "tenant claim {bad_tenant:?} must be rejected"
+        );
+    }
 
     let created = send(
         &app,
