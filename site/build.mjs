@@ -422,7 +422,7 @@ for (const loc of locales) {
     count++;
   }
 
-  const cards = docs.map((d) => `<a class="card" href="${relHref('docs/index.html', d.isLatest ? LATEST_REL : d.rel)}"><small>${esc(t.docs[d.group])}${d.isLatest ? ` · ${esc(t.docs.latest)}` : d.group === 'spec' ? ` · ${esc(t.docs.olderVersion)}` : ''}</small><h3>${esc(docTitle(d, loc))}</h3><p><code>${esc(d.variants[loc].source)}</code></p></a>`).join('');
+  const cards = docs.map((d) => `<a class="card" href="${relHref('docs/index.html', d.isLatest ? LATEST_REL : d.rel)}"><small>${esc(t.docs[d.group])}${d.isLatest ? ` · ${esc(t.docs.latest)}` : d.group === 'spec' ? ` · ${esc(d.isDraft ? t.docs.draftVersion : t.docs.olderVersion)}` : ''}</small><h3>${esc(docTitle(d, loc))}</h3><p><code>${esc(d.variants[loc].source)}</code></p></a>`).join('');
   write(`${loc}/docs/index.html`, layout({
     loc, rel: 'docs/index.html', title: t.docs.title, active: 'docs', sidebar: docsSidebar(loc, 'docs/index.html', 'index'),
     body: `<h1>${t.docs.title}</h1><p class="lead">${t.docs.intro}</p>${docs.length ? `<div class="cards">${cards}</div>` : `<p>${t.docs.empty}</p>`}`,

@@ -19,7 +19,7 @@
 ### v1.8（草稿，2026-10-14）
 
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 compiler-hash 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。
-- 新增 `vibe build`：一個指令做晒編譯、驗證同 manifest（類似 `nest build`），冇 reviewer 步驟（決定 76，見 2C.3）。
+- 新增 `vibe build`：一個指令做晒編譯、驗證同 manifest（類似 `nest build`），冇 reviewer 步驟（審核由 Git 平台設定負責，決定 76，見 2C.3）。
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣由 build／CI key 簽名（決定 77–80）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
 - 新增產品經理六條基線做決定 89–94（release 簽名只限受保護 ref 加 required-reviewer environment、高風險 fail closed、production 拒絕 in-memory、冇 KMS key 就失敗、決定 29／37 恢復、`/latest/` 永遠唔係草稿），同決定 95（create-user 邀請失敗處理）。
 - 建議 lock 同 source 一齊 commit，PR diff 睇到 lock；CI 重編決定性檢查保留（決定 80）。
@@ -183,8 +183,8 @@
 | 73 | `vibe dev`：本地 web API server，唔使預先編譯。Request 嚟到先按路由搵 `.md`，第一次用先編譯成 lock，cache key 係 source hash 加全部依賴 hash 加 compiler-hash 輸入；file watch 偵測到改動就重編受影響嘅 lock；驗證器每次編譯同每次載入 cache 都跑，唔通過就回 500 並喺 terminal 報錯。 | 待產品經理確認 | 2C.2 |
 | 74 | 正式支援 in-memory 資料庫（Jack 新要求，取代原本「預設內嵌 PostgreSQL」）：`vibe dev` 預設用 in-memory，`vibe serve --memory` 亦用同一個 in-memory 執行器。In-memory 只限開發同測試，server 一停所有資料即刻消失。喺非 dev build-mode 或者 production 環境一律拒絕 in-memory，啟動報錯退出，冇 override（決定 91）。因為 in-memory 係預設 dev 路徑，執行器一定要模擬租戶隔離（RLS＋FORCE 語意）、role grant 同 column grant，令 dev 行為同 production 一致；已知語意差異喺 2C.4 列明；CI 整合測試照樣要對真 PostgreSQL 跑。內嵌 PostgreSQL 保留做 opt-in `--db postgres`，用嚟做保真度測試。 | 待產品經理確認 | 2C.2、2C.4 |
 | 75 | Dev 編譯嘅 lock 同 manifest 一律唔可以部署：lock 記 `build-mode: dev`，manifest 用本機 dev key 簽；production runtime 只接受 build／CI key 簽嘅 manifest。2A.8 嘅本地 LLM http 規則只喺 dev 適用。 | 待產品經理確認 | 2C.2、2A.8.4 |
-| 76 | `vibe build`：一個指令做晒編譯（只編譯過時嘅 lock）、驗證、manifest 產生同簽名，冇 reviewer 步驟；`--check-determinism` 用喺 CI。 | 待產品經理確認 | 2C.3 |
-| 77 | SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 刪除 `status`、`approval-mode`、`approved-by`、`approved-at`、`approval-ref`、`approved-commit`；SDK 讀到呢啲舊欄位會忽略並出 warning，唔再以佢哋做部署條件。取代決定 10、11、16（人手 review 部分）、20（人手確認部分）、28、33。 | 待產品經理確認 | 2A.1、2A.5、10.1 |
+| 76 | `vibe build`：一個指令做晒編譯（只編譯過時嘅 lock）、驗證、manifest 產生同簽名，冇 reviewer 步驟（審核由 Git 平台設定負責）；`--check-determinism` 用喺 CI。 | 待產品經理確認 | 2C.3 |
+| 77 | SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 刪除 `status`、`approval-mode`、`approved-by`、`approved-at`、`approval-ref`、`approved-commit`；SDK 讀到呢啲舊欄位（包括舊 lock 嘅 `approval-ref`，同決定 90 嘅 build 旗標 `--release-approval` 係兩回事）會忽略並出 warning，唔再以佢哋做部署條件。取代決定 10、11、16（人手 review 部分）、20（人手確認部分）、28、33。 | 待產品經理確認 | 2A.1、2A.5、10.1 |
 | 78 | `security-items` 保留，但改為資訊性：驗證器 deterministic 抽出、寫入 lock 同部署報告，方便 PR 高亮同 label；唔再要求逐項確認人、原因、兩個非作者，亦冇每個 PR 5 項上限。取代決定 19（確認部分）、34。 | 待產品經理確認 | 2A.5、10.10 |
 | 79 | Lock 唔再有 `signature`（lock 完整性靠 `source-hash`、依賴 hash、compiler-hash 同 CI 重編）；manifest 照樣簽名，由 `vibe build` 用 build key 簽：release 用受保護 ref 加 GitHub environment 嘅 OIDC 綁定 KMS key（決定 89），本機用 dev key。Production runtime 只信任平台 pin 死嘅 release 公鑰，dev key 永遠唔信任。 | 待產品經理確認 | 2A.1、9、9B、10.1 |
 | 80 | 建議 `*.lock.md` 同 source 一齊 commit，令 PR diff 睇到編譯結果；CI 重編決定性檢查保留，唔一致照樣封鎖部署，冇 override。 | 待產品經理確認 | 2A.6、2C.3 |
@@ -197,12 +197,12 @@
 | 87 | 11.3 `_version` 同 11.4 create-user 嘅 rate-limit 補 `key`（分別係 `user` 同 `user`），合 4.3 schema；冇 `key` 嘅 rate-limit 係驗證器 error。 | 待產品經理確認 | 11.3、11.4、10.3 |
 | 88 | Admin 建立用戶時遇到自己註冊緊（未驗證、冇密碼）嘅同一個 email：當同一個用戶處理，邀請 token 取代註冊 token（`email_verify_purpose` 變 `invite`），用戶只會收到邀請信。 | 待產品經理確認 | 11.4 |
 | 89 | 產品經理基線 1：release manifest 只可以喺受保護 ref（`main` 或者受 ruleset 保護嘅 `v*` tag）、經有 required reviewers 嘅 GitHub environment（例如 `release`）、用 OIDC 綁定嘅 KMS key 簽；依賴 issue #28（release.yml 加固）完成先可以出第一個 release。 | 待產品經理確認 | 2C.3、9B、9C |
-| 90 | 產品經理基線 2：release build 有高風險 `security-items` 就 fail closed，除非提供 `--approval-ref`（PR approval 或者 environment approval id）；approval 參照寫入 manifest 同部署報告。 | 待產品經理確認 | 2A.5、2C.3、9C |
-| 91 | 產品經理基線 3：production 一律拒絕 in-memory 資料庫，啟動直接報錯退出；冇任何 override 旗標。Production 定義：manifest 唔係 `build-mode: dev`、或者 `VIBE_ENV=production`、或者 listen 唔係 loopback。 | 待產品經理確認 | 2C.4、9C |
+| 90 | 產品經理基線 2：release build 有高風險 `security-items` 就 fail closed，除非提供 `--release-approval <ref>`（PR review id 或者 environment deployment approval）。驗證：build 經 GitHub API 攞 PR review，或者經 OIDC claims 攞 environment deployment approval；一定要存在、狀態係 APPROVED、綁定正喺 build 嘅 commit SHA（即係最新 push）；批准人唔可以係 PR 作者或者最後 push 嘅人；高風險要 2 個唔同嘅合資格批准人；任何一項唔合就 build 失敗。Release environment 一定要開 **Prevent self-review**。批准參照寫入 manifest 同部署報告（同已移除嘅 lock `approval-ref` 無關）。 | 待產品經理確認 | 2A.5、2C.3、9C |
+| 91 | 產品經理基線 3：production 一律拒絕 in-memory 資料庫，啟動直接報錯退出；冇任何 override 旗標。Production 定義只睇 build-mode 同環境：manifest 唔係 `build-mode: dev`，或者 `VIBE_ENV=production`。Listen 地址唔係 loopback（例如 Docker 入面 `vibe dev` 綁 `0.0.0.0`）只會警告，唔會拒絕；Docker 入面請明確設 `VIBE_ENV=development`。 | 待產品經理確認 | 2C.4、9C |
 | 92 | 產品經理基線 4：CI release build 攞唔到 KMS key 就失敗，永遠唔 fallback 去 dev key；production runtime 只信任平台 pin 死嘅 release 公鑰，dev key 永遠唔信任。 | 待產品經理確認 | 2C.2、2C.3、9B |
 | 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；`vibe build` release 模式檢查 CODEOWNERS 覆蓋路徑，冇就失敗。 | 待產品經理確認 | 2A.7、9B |
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 待產品經理確認 | 文件標頭、網站 |
-| 95 | create-user 邀請失敗：`user.invite` 嘅 enqueue（s4）失敗時，create-user 回 503 `INVITE_DELIVERY_FAILED`（帶 `Retry-After` 同 `user_id`），唔回 201／200；因為 s2 已經輪換咗 token 但信冇寄出，用戶手上冇有效連結，恢復方法係重試 create-user（決定 85）或者 re-invite（決定 86），兩者都會發新 token 同新信。同 issue #26（auth flow 實作）相關。 | 待產品經理確認 | 11.4、11.4a |
+| 95 | create-user 邀請失敗：`user.invite` 嘅 enqueue（s4）失敗時，create-user 回 503 `INVITE_DELIVERY_FAILED`（只帶 `Retry-After`，body 唔帶 `user_id`），唔回 201／200；因為 s2 已經輪換咗 token 但信冇寄出，用戶手上冇有效連結，恢復方法係重試 create-user（決定 85）或者 re-invite（決定 86），兩者都會發新 token 同新信。同 issue #26（auth flow 實作）相關。 | 待產品經理確認 | 11.4、11.4a |
 
 ## 1. 目錄同命名
 
@@ -251,8 +251,8 @@ project/
 ### 2.1 三段流程
 
 1. **Source（`{name}.md`）**：用自然語言寫，講清楚「要做咩」。可以有選填嘅結構化 frontmatter（例如 `method: POST`），但唔係必須。
-2. **Lock（`{name}.lock.md`）**：編譯器將 source 編譯成固定格式嘅結構化 markdown（格式見 2A）。lock 經確認同簽名之後先算生效。
-3. **Manifest**：部署時將所有已確認、簽名有效嘅 lock 合併編譯成一份簽名 manifest。runtime 只載入 manifest。
+2. **Lock（`{name}.lock.md`）**：編譯器將 source 編譯成固定格式嘅結構化 markdown（格式見 2A）。lock 通過驗證器同 CI 重編決定性檢查，而且被收入 release 簽名嘅 manifest 之後先算生效（決定 77、79）。
+3. **Manifest**：`vibe build` 將所有通過驗證嘅 lock 合併成一份 manifest，用 release key 簽名（決定 79、89）。runtime 只載入 manifest。
 
 - runtime 永遠唔會解譯自然語言，亦唔會讀 source `.md`；lock md 係 runtime 嘅唯一依據（經 manifest 載入）。
 - 所有安全同驗證規則都喺 lock 層檢查（見第 10 節），唔係喺 source 層。
@@ -633,10 +633,24 @@ jobs:
   1. 編譯過時嘅 lock（source 或者依賴 hash 變咗、或者 compiler-hash 輸入變咗），寫返 repo 入面嘅 `*.lock.md`。
   2. 跑驗證器（第 10 節全部檢查）；任何 error 即刻失敗。
   3. 產生 manifest，用 build key 簽（決定 79、89、92）：release build 一定要用受保護 CI environment 嘅 KMS key；攞唔到 KMS key 就失敗，永遠唔 fallback 去 dev key（決定 92）。只有明確 `--dev` 先用 dev key，並標 `build-mode: dev`。
-  4. 輸出部署報告（10.10）同安全項目清單。Release build 遇到高風險安全項目，冇 `--approval-ref` 就失敗（決定 90）。
+  4. 輸出部署報告（10.10）同安全項目清單。Release build 遇到高風險安全項目，冇有效嘅 `--release-approval` 就失敗（決定 90，驗證規則見 2C.3a）。
   5. Release build 檢查 CODEOWNERS 覆蓋（決定 93）。
 - 選項：`--check-determinism`（CI 用；重編所有 natural lock，同 repo 入面嘅 lock 唔一致就失敗，冇 override）、`--labels`（輸出建議 PR label）、`--dev`、`-o manifest.json`。
-- 冇 reviewer 步驟；建議 lock 同 source 一齊 commit（決定 80）。
+- 冇 reviewer 步驟（審核由 Git 平台設定負責）；建議 lock 同 source 一齊 commit（決定 80）。
+
+### 2C.3a `--release-approval` 驗證（決定 90，待產品經理確認）
+
+- 只喺 release build 有高風險 `security-items` 時要求；冇提供或者驗證失敗，build 失敗，冇 override。
+- 參照來源（二揀一）：
+  - PR review：`--release-approval pr:<number>`；build 用 GitHub API（`GET /repos/{owner}/{repo}/pulls/{number}/reviews`）攞 review。
+  - Environment deployment approval：`--release-approval env:<run_id>`；build 讀 OIDC token claims（`environment`、`ref`、`sha`、`run_id`）同 GitHub API 嘅 deployment approval 紀錄。
+- 全部條件一定要成立：
+  1. 參照存在，狀態係 `APPROVED`（之後被 dismiss 或者改成 changes requested 就唔算）。
+  2. 批准綁定正喺 build 嘅 commit SHA（PR 最新 push 嘅 head SHA，或者 OIDC claim 嘅 `sha`），同 `git rev-parse HEAD` 一樣。
+  3. 批准人唔係 PR 作者，亦唔係最後 push 嘅人。
+  4. 高風險要 2 個唔同嘅合資格批准人。
+- 驗證結果（批准人、SHA、時間）寫入 manifest 同部署報告。
+- `release` environment 一定要開 **Prevent self-review**（見 [`pr-review-guide.md`](pr-review-guide.md)）。
 
 ### 2C.4 In-memory 執行器（決定 74，待產品經理確認）
 
@@ -647,7 +661,8 @@ jobs:
   - 喺 stderr 印顯眼警告（多行、紅色），內容包括「IN-MEMORY DATABASE：所有資料喺 server 停止時消失，唔可以用喺 production」；
   - health endpoint（`/_health`）回 `"db": "memory"` 同 `"warning": "in-memory database, data is lost on stop"`；
   - 每分鐘喺 log 寫一次 `warn` 級別嘅同一句。
-  - Production（非 dev build-mode、`VIBE_ENV=production` 或者非 loopback）一律拒絕 in-memory：啟動直接報錯退出，冇任何 override 旗標（決定 91）。
+  - Production（manifest 唔係 `build-mode: dev`，或者 `VIBE_ENV=production`）一律拒絕 in-memory：啟動直接報錯退出，冇任何 override 旗標（決定 91）。
+  - 只係 listen 地址唔係 loopback（例如 Docker 入面 `vibe dev --addr 0.0.0.0:8080`）唔算 production，只出警告；Docker 入面請明確設 `VIBE_ENV=development`，`vibe dev` 本身產生 `build-mode: dev` manifest，所以照樣准用 in-memory。
 - **一定要模擬嘅語意**（令 dev 行為同 production 一致）：
   - 租戶隔離（RLS＋FORCE）：每個 statement 一定帶 `tenant_id`；冇設 tenant 就報錯（同 `current_setting('app.tenant_id', false)` 一樣），唔係回空；讀寫只見同一 tenant 嘅列；INSERT 嘅 `tenant_id` 由執行器注入，SQL 或者 input 帶 `tenant_id` 一律拒絕。
   - Role grant：每個 statement 用 lock 指定嘅 role（`app_rw`、`public_reader`、`public_writer`）執行，按 model lock `## Policies` 嘅 grant 檢查表級 SELECT／INSERT／UPDATE；冇權限回同 production 一樣嘅 `permission denied` 錯誤類別。
@@ -1119,7 +1134,7 @@ migration 放喺 ./migrations/main/。
 - 資料庫層：每個 query 獨立 transaction、`FORCE ROW LEVEL SECURITY`、non-owner role、column grant、冇 DELETE／TRUNCATE／DDL（7.1）。
 - Runtime 限制：只載入簽咗名嘅 manifest、唔解析 md、冇 `LLM_*`、對外 call 白名單、kill switch（9A）、固定最低回應耗時、配額同限流。
 - Manifest 簽名（決定 79、89、92）：release key 只喺受保護 ref 加有 required reviewers 嘅 GitHub environment，經 OIDC 綁定 KMS 使用；CI 冇 key 就失敗，唔 fallback；production 只信 pin 死嘅 release 公鑰，dev key 永遠唔信任。
-- 高風險 fail closed（決定 90）：release build 有高風險安全項目就要 `--approval-ref`，即係最少有一次 PR 或者 environment 人手批准先可以出 release manifest。
+- 高風險 fail closed（決定 90）：release build 有高風險安全項目就要有效嘅 `--release-approval`（2 個唔同、非作者、非最後 push 者、綁定同一 commit SHA 嘅 APPROVED 批准），先可以出 release manifest。
 - CODEOWNERS 必須（決定 29、37、93）：release build 檢查覆蓋路徑。
 - Production 一律拒絕 in-memory，冇 override（決定 91）。
 - `/latest/` 永遠唔係草稿（決定 94）。
@@ -1544,7 +1559,7 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" 
 | 503 | INVITE_DELIVERY_FAILED | user.invite |
 ````
 
-- 邀請失敗（決定 95，待產品經理確認）：s2 `user.invite` 入面 enqueue 失敗，create-user 回 503 `INVITE_DELIVERY_FAILED`（body 帶 `user_id`，header 帶 `Retry-After`），唔回 201／200。因為 `user.invite` 嘅 token UPDATE 已經 commit，舊 token 失效而新 token 冇寄出；恢復方法係重試 create-user 或者 call re-invite（11.4b），兩者都發新 token 同新信。實作見 issue #26。
+- 邀請失敗（決定 95，待產品經理確認）：s2 `user.invite` 入面 enqueue 失敗，create-user 回 503 `INVITE_DELIVERY_FAILED`（header 帶 `Retry-After`；body 只有錯誤碼，唔帶 `user_id`，因為錯誤映射攞唔到之前 step 嘅輸出），唔回 201／200。Admin 用同一個 email 重試 create-user（決定 85，會回原有 id），或者按 email 搵用戶再 call re-invite。因為 `user.invite` 嘅 token UPDATE 已經 commit，舊 token 失效而新 token 冇寄出；恢復方法係重試 create-user 或者 call re-invite（11.4b），兩者都發新 token 同新信。實作見 issue #26。
 - 失敗恢復（決定 85，待產品經理確認）：7.1 每個 query 獨立 commit，所以 s1 成功、s2 失敗（例如 DB 斷線）會留低「已建立、未邀請」嘅用戶。Admin 用同一個 body 重試 create-user：`user.register` 對已存在、未驗證、冇密碼嘅用戶回原有 id（`created: false`），s2 重新寄邀請，回 200；或者用 11.4b 嘅 re-invite endpoint。
 - `EMAIL_TAKEN`（決定 84，待產品經理確認）：只限 admin（已認證、`roles: [admin]`、按用戶限流、audit-log），admin 本身可以列出租戶用戶，所以 409 唔當 enumeration 洩漏；public 註冊（12.11）照樣唔分辨。
 - 同一個 email 自己註冊緊（未驗證、冇密碼）：當同一個用戶，邀請 token 取代註冊 token（決定 88，待產品經理確認）。

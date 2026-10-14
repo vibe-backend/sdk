@@ -56,6 +56,8 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
 ## 6. Release environment 同 KMS（spec 決定 89、92）
 
 - 開一個 `release` environment，設 **Required reviewers**，只准受保護 ref（`main`、受 ruleset 保護嘅 `v*` tag）部署。
+- `release` environment 一定要開 **Prevent self-review**，觸發部署嘅人唔可以自己批准（spec 決定 90）。
+- 高風險 release 要用 `vibe build --release-approval pr:<number>` 或者 `env:<run_id>`（計劃中）：build 會經 GitHub API／OIDC 驗證批准係 APPROVED、綁定同一 commit SHA、批准人唔係作者或者最後 push 嘅人、而且有 2 個唔同批准人。
 - Release manifest 簽名 key 放喺 KMS，用 GitHub OIDC 綁定 `release` environment 同 ref 先可以用；唔好將 key 放做 repository secret。
 - CI release build 攞唔到 KMS key 就失敗，唔可以 fallback 去 dev key。
 - 詳細加固步驟見 issue #28。
