@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: DavidAnson/markdownlint-cli2-action@v20
+      - uses: DavidAnson/markdownlint-cli2-action@v24
         with:
           globs: "**/*.md"
       - uses: lycheeverse/lychee-action@v2
@@ -40,6 +40,8 @@ jobs:
           components: rustfmt, clippy
       - if: steps.detect.outputs.present == 'true'
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
       - if: steps.detect.outputs.present == 'true'
         run: cargo fmt --all -- --check
       - if: steps.detect.outputs.present == 'true'
@@ -65,6 +67,6 @@ jobs:
           context: .
           push: false
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max' || '' }}
       - if: steps.detect.outputs.present != 'true'
         run: echo "No Dockerfile yet; skipping Docker build."
