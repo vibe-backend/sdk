@@ -2,7 +2,7 @@
 
 <!-- spec-status: draft -->
 >
-> 狀態：草稿，喺 v1.7 定稿基礎上修改，基準係 vibe-backend/sdk main `4239c95` 嘅 `docs/spec-v1.7.md`（相對 merge commit `df378ce`，只有第 1 節目錄改成樹狀圖，已經包含喺本稿）。新決定 73–95 全部待產品經理確認；確認之前 v1.7 照樣係有效定稿。網站 `/latest/` 照樣指 v1.7（呢份文件有 `spec-status: draft` 標記，build 時唔會成為 latest，決定 94）。
+> 狀態：草稿，喺 v1.7 定稿基礎上修改，基準係 vibe-backend/sdk main `4239c95` 嘅 `docs/spec-v1.7.md`（相對 merge commit `df378ce`，只有第 1 節目錄改成樹狀圖，已經包含喺本稿）。新決定 73–96 全部待產品經理確認；確認之前 v1.7 照樣係有效定稿。網站 `/latest/` 照樣指 v1.7（呢份文件有 `spec-status: draft` 標記，build 時唔會成為 latest，決定 94）。
 >
 > 核心架構：所有定義（model、method、api、pipeline、provider、migration）嘅 source `.md` 一律用自然語言寫。編譯流程係「自然語言 source `.md` → 結構化 lock markdown（`{name}.lock.md`）→ 簽名 manifest」。lock md 係 runtime 唯一依據，runtime 永遠唔會解譯自然語言。
 >
