@@ -498,3 +498,52 @@ async fn timeout_is_configurable() {
         Ok(false)
     );
 }
+
+#[tokio::test]
+async fn range_api_names_must_resolve_to_public_addresses() {
+    use vibe::runtime::breached::PublicResolver;
+    let strict = PublicResolver {
+        allow_loopback: false,
+    };
+    let err = strict.resolve_checked("localhost").await.unwrap_err();
+    assert!(err.contains("non-public"), "{err}");
+    let local = PublicResolver {
+        allow_loopback: true,
+    };
+    assert!(local.resolve_checked("localhost").await.is_ok());
+}
+
+/// Field rules apply to the password as sent, not to its (longer) hash.
+#[tokio::test]
+async fn crud_create_checks_field_rules_before_hashing() {
+    let auth = auth(BreachedConfig::builtin());
+    let mut m = manifest();
+    let pw = m.models[0]
+        .fields
+        .iter_mut()
+        .find(|f| f.name == "password")
+        .unwrap();
+    pw.max = Some(64);
+    let exec = MemoryExec::new();
+    run_method(
+        &m,
+        &exec,
+        "account.create",
+        &json!({"email": "a@x", "password": CLEAN}),
+        ctx(&auth),
+        0,
+    )
+    .await
+    .unwrap();
+    let err = run_method(
+        &m,
+        &exec,
+        "account.create",
+        &json!({"email": "b@x", "password": "x".repeat(65)}),
+        ctx(&auth),
+        0,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, "VALIDATION_FAILED");
+}

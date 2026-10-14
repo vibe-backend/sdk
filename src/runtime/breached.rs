@@ -121,6 +121,47 @@ pub fn non_public_host(host: &str) -> bool {
         || lower.ends_with(".internal")
 }
 
+/// DNS resolver for the range API: every address a name resolves to must be
+/// public (loopback allowed only for local test servers), so names such as
+/// `169.254.169.254.nip.io` cannot reach internal hosts. The connection uses
+/// only the checked addresses (no second lookup).
+#[derive(Clone, Copy, Debug)]
+pub struct PublicResolver {
+    pub allow_loopback: bool,
+}
+
+impl PublicResolver {
+    /// Resolves `host` and keeps it only if every address is allowed.
+    pub async fn resolve_checked(&self, host: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 0))
+            .await
+            .map_err(|_| "breached-password host does not resolve".to_string())?
+            .collect();
+        if addrs.is_empty() {
+            return Err("breached-password host does not resolve".into());
+        }
+        for addr in &addrs {
+            let ip = addr.ip();
+            let ok = !non_public_host(&ip.to_string()) || (self.allow_loopback && ip.is_loopback());
+            if !ok {
+                return Err("breached-password host resolves to a non-public address".into());
+            }
+        }
+        Ok(addrs)
+    }
+}
+
+impl reqwest::dns::Resolve for PublicResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let this = *self;
+        Box::pin(async move {
+            let addrs = this.resolve_checked(name.as_str()).await?;
+            let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(iter)
+        })
+    }
+}
+
 fn is_loopback(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     bare == "localhost" || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
@@ -211,6 +252,9 @@ impl RangeApi {
             .timeout(DEFAULT_TIMEOUT)
             .user_agent(concat!("vibe-sdk/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(std::sync::Arc::new(PublicResolver {
+                allow_loopback: local_test,
+            }))
             .build()
             .map_err(|err| err.to_string())?;
         let mut url = url.to_string();

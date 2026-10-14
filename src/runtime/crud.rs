@@ -210,12 +210,14 @@ async fn create(
             ));
         }
         let mut value = provided.unwrap_or(Value::Null);
+        // Field rules apply to what the caller sent (as on update), then the
+        // password is hashed for storage.
+        check_field(field, &value)?;
         if field.ty == "password" && value.is_string() {
             value = Value::String(
                 super::ops::hash_new_password(ctx.auth, value.as_str().unwrap_or("")).await?,
             );
         }
-        check_field(field, &value)?;
         if field.unique && !value.is_null() {
             let existing = exec
                 .execute(
