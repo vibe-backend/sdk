@@ -17,7 +17,8 @@ pub struct CallResult {
 #[derive(Clone, Copy)]
 pub struct Caller<'a> {
     pub subject: &'a str,
-    pub admin: bool,
+    /// Roles from the verified principal; used only for `ownership: role(..)`.
+    pub roles: &'a [String],
 }
 
 #[derive(Clone, Copy)]
@@ -272,7 +273,7 @@ async fn get(
                 table: model.table.clone(),
                 columns: all_cols(model),
                 id: Some(id),
-                filters: owner_filters(model, ctx.caller),
+                filters: owner_filters(model, ctx.caller)?,
                 sort: None,
                 limit: 1,
                 offset: 0,
@@ -339,7 +340,7 @@ async fn list(
             filters.push((col(field), value.clone()));
         }
     }
-    filters.extend(owner_filters(model, ctx.caller));
+    filters.extend(owner_filters(model, ctx.caller)?);
     let rows = exec
         .execute(
             tenant_id,
@@ -459,7 +460,7 @@ async fn update(
                 expected_updated_at: updated_at,
                 touched_at: touched,
                 returning: all_cols(model),
-                owner: owner_eq(model, ctx.caller),
+                owner: owner_eq(model, ctx.caller)?,
             },
         )
         .await
@@ -494,7 +495,7 @@ async fn delete(
             table: model.table.clone(),
             id,
             touched_at: chrono::Utc::now().to_rfc3339(),
-            owner: owner_eq(model, ctx.caller),
+            owner: owner_eq(model, ctx.caller)?,
         },
     )
     .await
@@ -576,17 +577,72 @@ fn output_cols(model: &ModelSpec, include_sensitive: bool) -> Vec<Col> {
         .collect()
 }
 
-fn owner_eq(model: &ModelSpec, caller: Caller<'_>) -> Option<(Col, Value)> {
-    if model.ownership == "tenant-wide" || caller.admin {
-        return None;
-    }
-    let key = model.owner_key.as_deref()?;
-    let field = model.fields.iter().find(|field| field.name == key)?;
-    Some((col(field), Value::String(caller.subject.to_string())))
+/// Parsed `ownership` relaxation of a model (spec §12.6a, Decision 70).
+#[derive(Debug, PartialEq)]
+pub enum Ownership<'a> {
+    /// No relaxation: non-bypass callers are scoped to `owner-key = ctx.user.id`.
+    Owner,
+    TenantWide,
+    /// Callers holding this role are not owner-scoped.
+    Role(&'a str),
 }
 
-fn owner_filters(model: &ModelSpec, caller: Caller<'_>) -> Vec<(Col, Value)> {
-    owner_eq(model, caller).into_iter().collect()
+pub fn parse_ownership(raw: &str) -> Result<Ownership<'_>, String> {
+    let raw = raw.trim();
+    match raw {
+        "" | "(none)" | "owner" => Ok(Ownership::Owner),
+        "tenant-wide" => Ok(Ownership::TenantWide),
+        _ => {
+            let role = raw
+                .strip_prefix("role(")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .map(str::trim)
+                .filter(|role| {
+                    !role.is_empty()
+                        && role.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')
+                        })
+                })
+                .ok_or_else(|| format!("unknown ownership {raw:?}"))?;
+            Ok(Ownership::Role(role))
+        }
+    }
+}
+
+/// Owner filter for reads, updates and deletes. Fails closed: an unknown
+/// `ownership` value or an `owner-key` that does not resolve to a column is an
+/// internal error, never "no filter".
+fn owner_eq(model: &ModelSpec, caller: Caller<'_>) -> Result<Option<(Col, Value)>, MethodFail> {
+    let Some(key) = model.owner_key.as_deref() else {
+        return Ok(None);
+    };
+    let ownership = parse_ownership(&model.ownership)
+        .map_err(|err| MethodFail::code("INTERNAL", format!("model {}: {err}", model.id)))?;
+    match ownership {
+        Ownership::TenantWide => return Ok(None),
+        Ownership::Role(role) if caller.roles.iter().any(|have| have == role) => return Ok(None),
+        _ => {}
+    }
+    let column = match model.fields.iter().find(|field| field.name == key) {
+        Some(field) => col(field),
+        // Only the `users` table may use its own primary key (spec §12.6a).
+        None if key == "id" && model.table == "users" => Col {
+            name: "id".into(),
+            ty: "uuid".into(),
+        },
+        None => {
+            return Err(MethodFail::code(
+                "INTERNAL",
+                format!("model {}: owner-key {key} is not a field", model.id),
+            ))
+        }
+    };
+    // An empty subject matches no rows, so anonymous callers see nothing.
+    Ok(Some((column, Value::String(caller.subject.to_string()))))
+}
+
+fn owner_filters(model: &ModelSpec, caller: Caller<'_>) -> Result<Vec<(Col, Value)>, MethodFail> {
+    Ok(owner_eq(model, caller)?.into_iter().collect())
 }
 
 fn owner_value(
@@ -594,7 +650,10 @@ fn owner_value(
     field: &FieldSpec,
     caller: Caller<'_>,
 ) -> Result<Value, MethodFail> {
-    if model.ownership == "tenant-wide" && caller.subject.is_empty() {
+    let tenant_wide = parse_ownership(&model.ownership)
+        .map_err(|err| MethodFail::code("INTERNAL", format!("model {}: {err}", model.id)))?
+        == Ownership::TenantWide;
+    if tenant_wide && caller.subject.is_empty() {
         return Ok(Value::Null);
     }
     if caller.subject.is_empty() {
@@ -942,4 +1001,91 @@ pub fn req_var(
             .collect(),
     );
     serde_json::json!({"body": body, "query": query, "path": path, "header": header})
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::manifest::{FieldSpec, ListOpts, ModelSpec};
+
+    fn model(owner_key: Option<&str>, ownership: &str) -> ModelSpec {
+        ModelSpec {
+            id: "cart-item".into(),
+            provider: "main".into(),
+            table: "cart_items".into(),
+            fields: vec![FieldSpec {
+                name: "user_id".into(),
+                ty: "string".into(),
+                required: true,
+                unique: false,
+                primary: false,
+                system: true,
+                sensitive: false,
+                nullable: false,
+                min: None,
+                max: None,
+                format: String::new(),
+            }],
+            crud: vec![],
+            list: ListOpts::default(),
+            sensitive_output: vec![],
+            owner_key: owner_key.map(str::to_string),
+            ownership: ownership.into(),
+        }
+    }
+
+    fn caller<'a>(subject: &'a str, roles: &'a [String]) -> Caller<'a> {
+        Caller { subject, roles }
+    }
+
+    #[test]
+    fn parses_ownership_values() {
+        assert_eq!(parse_ownership(""), Ok(Ownership::Owner));
+        assert_eq!(parse_ownership("tenant-wide"), Ok(Ownership::TenantWide));
+        assert_eq!(
+            parse_ownership("role(support)"),
+            Ok(Ownership::Role("support"))
+        );
+        for bad in ["role()", "role(a b)", "admin", "everyone"] {
+            assert!(parse_ownership(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn admin_is_not_hardcoded() {
+        let admin = vec!["admin".to_string()];
+        let filter = owner_eq(&model(Some("user_id"), ""), caller("u1", &admin)).unwrap();
+        assert!(
+            filter.is_some(),
+            "admin must not bypass without ownership: role(admin)"
+        );
+    }
+
+    #[test]
+    fn role_ownership_bypasses_only_that_role() {
+        let support = vec!["support".to_string()];
+        let admin = vec!["admin".to_string()];
+        let m = model(Some("user_id"), "role(support)");
+        assert!(owner_eq(&m, caller("u1", &support)).unwrap().is_none());
+        assert!(owner_eq(&m, caller("u1", &admin)).unwrap().is_some());
+    }
+
+    #[test]
+    fn unresolved_owner_key_fails_closed() {
+        let err = owner_eq(&model(Some("missing"), ""), caller("u1", &[])).unwrap_err();
+        assert_eq!(err.code, "INTERNAL");
+        let err = owner_eq(&model(Some("user_id"), "bogus"), caller("u1", &[])).unwrap_err();
+        assert_eq!(err.code, "INTERNAL");
+    }
+
+    #[test]
+    fn id_owner_key_is_only_for_users() {
+        let err = owner_eq(&model(Some("id"), ""), caller("u1", &[])).unwrap_err();
+        assert_eq!(err.code, "INTERNAL", "cart_items may not use owner-key: id");
+        let mut users = model(Some("id"), "");
+        users.table = "users".into();
+        let (column, value) = owner_eq(&users, caller("u1", &[])).unwrap().unwrap();
+        assert_eq!(column.name, "id");
+        assert_eq!(value, Value::String("u1".into()));
+    }
 }
