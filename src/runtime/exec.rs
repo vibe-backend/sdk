@@ -99,27 +99,6 @@ impl tokio_postgres::types::ToSql for TextParam {
     tokio_postgres::types::to_sql_checked!();
 }
 
-/// Statements whose rows can be read: SELECT/WITH, or a write with RETURNING.
-fn returns_rows(sql: &str) -> bool {
-    // Drop quoted literals so a string containing "returning" cannot flip it.
-    let mut clean = String::new();
-    let mut quoted = false;
-    for c in sql.chars() {
-        if c == '\'' {
-            quoted = !quoted;
-            clean.push(' ');
-        } else if !quoted {
-            clean.push(c.to_ascii_lowercase());
-        }
-    }
-    let head = clean.trim_start();
-    head.starts_with("select")
-        || head.starts_with("with")
-        || clean
-            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .any(|w| w == "returning")
-}
-
 #[derive(Default)]
 pub struct MemoryExec {
     tables: Mutex<BTreeMap<String, Vec<Row>>>,
@@ -496,7 +475,7 @@ impl PgExec {
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p as _).collect();
         let body = sql.trim().trim_end_matches(';');
-        let rows = if returns_rows(body) {
+        let rows = if crate::sqlguard::returns_rows(body) {
             // Every column comes back as JSON, whatever its type.
             let wrapped = format!("WITH q AS ({body}) SELECT row_to_json(q)::text FROM q");
             tx.query(&wrapped, &refs).await.map_err(map_pg)?
