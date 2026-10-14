@@ -84,6 +84,36 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new().fallback(handle).with_state(state)
 }
 
+/// Minimum API-key pepper length in production.
+pub const MIN_PEPPER_BYTES: usize = 32;
+
+/// Resolves the API-key pepper. In production (`VIBE_ENV` = `live` or
+/// `production`) a missing or short pepper is an error; elsewhere the
+/// public dev pepper is used with a warning.
+pub fn resolve_pepper(
+    vibe_env: Option<&str>,
+    pepper: Option<&str>,
+) -> Result<(Vec<u8>, Option<String>), String> {
+    let production = matches!(vibe_env, Some("live") | Some("production"));
+    match pepper {
+        Some(p) if p.len() >= MIN_PEPPER_BYTES => Ok((p.as_bytes().to_vec(), None)),
+        Some(_) if production => Err(format!(
+            "VIBE_API_KEY_PEPPER must be at least {MIN_PEPPER_BYTES} bytes when VIBE_ENV is live/production"
+        )),
+        Some(p) => Ok((
+            p.as_bytes().to_vec(),
+            Some(format!("VIBE_API_KEY_PEPPER is shorter than {MIN_PEPPER_BYTES} bytes")),
+        )),
+        None if production => Err(
+            "VIBE_API_KEY_PEPPER is required when VIBE_ENV is live/production".to_string(),
+        ),
+        None => Ok((
+            b"dev-pepper".to_vec(),
+            Some("VIBE_API_KEY_PEPPER is not set; using the public dev pepper".to_string()),
+        )),
+    }
+}
+
 struct Principal {
     tenant_id: String,
     subject: String,
@@ -1097,4 +1127,28 @@ fn empty_response(
     response
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+#[cfg(test)]
+mod pepper_tests {
+    use super::resolve_pepper;
+
+    #[test]
+    fn production_requires_a_long_pepper() {
+        assert!(resolve_pepper(Some("live"), None).is_err());
+        assert!(resolve_pepper(Some("production"), Some("short")).is_err());
+        let long = "x".repeat(32);
+        let (p, warn) = resolve_pepper(Some("live"), Some(&long)).unwrap();
+        assert_eq!(p, long.as_bytes());
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn dev_falls_back_with_warning() {
+        let (p, warn) = resolve_pepper(Some("test"), None).unwrap();
+        assert_eq!(p, b"dev-pepper");
+        assert!(warn.is_some());
+        let (_, warn) = resolve_pepper(None, Some("short")).unwrap();
+        assert!(warn.is_some());
+    }
 }

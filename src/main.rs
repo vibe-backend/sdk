@@ -355,7 +355,7 @@ async fn cmd_serve(
             })?;
         Arc::new(PgExec::connect(&url).await?)
     };
-    let loaded = vibe::runtime::load_project_slugs(project)?;
+    let loaded = vibe::runtime::load_project_slugs(project, memory)?;
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
@@ -373,7 +373,7 @@ async fn cmd_serve(
     let state = Arc::new(AppState {
         manifest,
         exec,
-        auth: auth_from_env(),
+        auth: auth_from_env()?,
         slugs: loaded.slugs,
         rates: std::sync::Mutex::new(HashMap::new()),
         quotas: std::sync::Mutex::new(HashMap::new()),
@@ -433,7 +433,7 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
     Ok(())
 }
 
-fn auth_from_env() -> AuthConfig {
+fn auth_from_env() -> Result<AuthConfig, String> {
     let mut auth = AuthConfig::anonymous();
     if let Ok(pem) = std::env::var("VIBE_JWT_PUBLIC_KEY_PEM") {
         auth.public_pem = pem.replace("\\n", "\n");
@@ -447,13 +447,17 @@ fn auth_from_env() -> AuthConfig {
     if let Ok(kid) = std::env::var("VIBE_JWT_KID") {
         auth.kid = kid;
     }
-    if let Ok(pepper) = std::env::var("VIBE_API_KEY_PEPPER") {
-        auth.pepper = pepper.into_bytes();
+    let vibe_env = std::env::var("VIBE_ENV").ok();
+    let pepper = std::env::var("VIBE_API_KEY_PEPPER").ok();
+    let (pepper, warning) = vibe::runtime::resolve_pepper(vibe_env.as_deref(), pepper.as_deref())?;
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning}");
     }
-    if let Ok(env_name) = std::env::var("VIBE_ENV") {
+    auth.pepper = pepper;
+    if let Some(env_name) = vibe_env {
         auth.env_name = env_name;
     }
-    auth
+    Ok(auth)
 }
 
 fn load_disabled(project: &Path) -> std::collections::HashSet<String> {

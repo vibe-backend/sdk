@@ -24,18 +24,27 @@ fn yes() -> bool {
     true
 }
 
-/// Load `.vibe/slugs.json`, or `slugs.example.json` when the runtime file is absent.
-pub fn load_project_slugs(project: &Path) -> Result<SlugLoad, String> {
+/// Load `.vibe/slugs.json`. `slugs.example.json` is used only when
+/// `allow_example` is set (the in-memory dev executor); otherwise a missing
+/// runtime file means no tenants, so public slug routes fail closed (404).
+pub fn load_project_slugs(project: &Path, allow_example: bool) -> Result<SlugLoad, String> {
     let runtime = project.join(".vibe").join("slugs.json");
     let example = project.join("slugs.example.json");
     let (path, fallback) = if runtime.exists() {
         (runtime, false)
-    } else if example.exists() {
+    } else if allow_example && example.exists() {
         (example, true)
     } else {
+        let mut warnings = Vec::new();
+        if example.exists() {
+            warnings.push(format!(
+                ".vibe/slugs.json is missing; ignoring {} outside --memory, so public slug routes return 404",
+                example.display()
+            ));
+        }
         return Ok(SlugLoad {
             slugs: HashMap::new(),
-            warnings: Vec::new(),
+            warnings,
         });
     };
     let text = fs::read_to_string(&path).map_err(|err| err.to_string())?;
@@ -129,9 +138,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn example_is_ignored_unless_allowed() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/shop");
+        let loaded = load_project_slugs(&root, false).unwrap();
+        assert!(loaded.slugs.is_empty());
+        assert!(loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("return 404")));
+    }
+
+    #[test]
     fn example_shop_slug_resolves_acme() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/shop");
-        let loaded = load_project_slugs(&root).unwrap();
+        let loaded = load_project_slugs(&root, true).unwrap();
         let acme = loaded.slugs.get("acme").expect("acme slug");
         assert_eq!(acme.tenant_id, "acme0001");
         assert!(acme.public_access);
