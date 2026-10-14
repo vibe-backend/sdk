@@ -203,7 +203,7 @@
 | 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；`vibe build` release 模式檢查 CODEOWNERS 覆蓋路徑，冇就失敗。 | 待產品經理確認 | 2A.7、9B |
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 待產品經理確認 | 文件標頭、網站 |
 | 95 | create-user 邀請失敗：`user.invite` 嘅 enqueue（s4）失敗時，create-user 回 503 `INVITE_DELIVERY_FAILED`（只帶 `Retry-After`，body 唔帶 `user_id`），唔回 201／200；因為 s2 已經輪換咗 token 但信冇寄出，用戶手上冇有效連結，恢復方法係重試 create-user（決定 85）或者 re-invite（決定 86），兩者都會發新 token 同新信。同 issue #26（auth flow 實作）相關。 | 待產品經理確認 | 11.4、11.4a |
-| 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i)）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。高風險 `--release-approval` 係計劃中、未實作，實作後先額外把關。計劃 (iii)：喺 (i) 之上再加專用 release GitHub App 開 tag（未生效）。高風險 release build 用只有 Administration: read 嘅專用 GitHub App 讀呢個 ruleset，讀唔到、`bypass_actors` 唔係空、唔係 active、缺少三條 rule、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass，SDK 唔檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval`（未實作）實作後會獨立驗證 PR review（2C.3a）。普通 build 只記錄。 | 待產品經理確認 | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
+| 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i) 做**臨時方案**）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。高風險 `--release-approval` 係計劃中、未實作，實作後先額外把關。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，同時開返 Prevent self-review。另外 live `release` environment `can_admins_bypass` 而家係 `true`，Jack 負責關閉。高風險 release build 用只有 Administration: read 嘅專用 GitHub App 讀呢個 ruleset，讀唔到、`bypass_actors` 唔係空、唔係 active、缺少三條 rule、或者冇 target 到今次 build 嘅 tag 就失敗；唔設白名單。`main` ruleset 可以保留 OrganizationAdmin bypass，SDK 唔檢查 `main` 嘅 `bypass_actors`，因為 `--release-approval`（未實作）實作後會獨立驗證 PR review（2C.3a）。普通 build 只記錄。 | 待產品經理確認 | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
 
 ## 1. 目錄同命名
 
@@ -725,7 +725,7 @@ Branch rule 檢查（`main`）：
 
 Release ruleset 檢查（`v*` tag，決定 96）：
 
-- **現行設定**（產品經理代 Jack 決定採用 (i)）：專用 tag ruleset `refs/tags/v*` 只有 `update`、`deletion`、`non_fast_forward`，**冇 `creation` rule**，`bypass_actors` 係空。任何有 write 權限嘅人都可以開 `v*` tag；tag 開咗之後冇人（包括 admin）可以移、刪或者 force push。
+- **現行設定（臨時方案 (i)）**（產品經理代 Jack 決定）：專用 tag ruleset `refs/tags/v*` 只有 `update`、`deletion`、`non_fast_forward`，**冇 `creation` rule**，`bypass_actors` 係空。任何有 write 權限嘅人都可以開 `v*` tag；tag 開咗之後冇人（包括 admin）可以移、刪或者 force push。
 - GitHub 冇 `rules/branches` 咁嘅 tag 版 endpoint（REST 只有 `GET /repos/{owner}/{repo}/rules/branches/{branch}`），所以：
   1. `GET /repos/{owner}/{repo}/rulesets?targets=tag&includes_parents=true`，分頁攞晒，攞所有 tag ruleset 嘅 `id`。
   2. 用專用 GitHub App 嘅 installation token（見第 8 節）逐個 call `GET /repos/{owner}/{repo}/rulesets/{ruleset_id}`。
@@ -740,7 +740,8 @@ Release ruleset 檢查（`v*` tag，決定 96）：
 - **點解仍然要求 bypass 空**：冇 `creation` rule 之後，開 tag 唔使 bypass，所以空 bypass 唔會阻住 release；保持空代表連 admin 都唔可以移或者刪已經開咗嘅 `v*` tag，`B` 同 tag 嘅對應唔會事後被改。
 - **剩餘風險（Jack 已接受）**：所有 agent 都用 `j113203` push，live `release` environment 嘅 reviewer 都係 `j113203`，而且 `prevent_self_review: false`。所以**任何用 `j113203` 嘅 agent 都可以開 `v*` tag，再自己批准 release**；開 tag 本身唔會發佈，但發佈只係多一步 `j113203` 自己批准。
 - **而家冇額外保護**：`--release-approval`（第 2–7 節）係 v1.8 設計，**未實作**，今日唔會擋任何 release。實作之後，高風險 release 先會要 2 個合資格 PR reviewer（`j113203` 觸發 run 嘅 env 批准會被第 5 節排除）。
-- **計劃 (iii)（喺 (i) 之上，未生效）**：之後加一個專用 release GitHub App 開 `v*` tag（bypass list 只放呢個 App，屆時配合 `creation` rule），令 tag 唔再由 `j113203` 開；生效之前 SDK 照 (i) 檢查（bypass 空、唔要求 `creation`）。
+- **Live 設定同要求唔一致**：`release` environment `can_admins_bypass` 而家係 `true`（admin 可以跳過 environment 批准），要求係關閉；由 Jack 修正，SDK spec 唔改 live 設定。
+- **目標方案 (iii)（取代臨時方案 (i)，未生效）**：專用 release GitHub App 係**唯一**開 `v*` tag 嘅 actor（加返 `creation` rule，bypass list 只放呢個 App），同時 `release` environment 開返 **Prevent self-review**。生效之前 SDK 照 (i) 檢查（bypass 空、唔要求 `creation`）。
 
 #### 8. Token、權限同錯誤處理
 

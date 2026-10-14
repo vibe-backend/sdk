@@ -6,7 +6,7 @@ Before the first `v*` tag. Items 1–2 are repository settings decided by the pr
    - Gating today: creating a tag does not publish anything; the publishing job runs in the `release` environment, whose only reviewer is `j113203` with `prevent_self_review: false`.
    - **Residual risk (accepted by Jack):** all agents push as `j113203`, so any `j113203` agent can create a `v*` tag **and self-approve the release**.
    - `vibe build --release-approval` (spec §2C.3a) is designed but **not implemented yet**; it provides no protection today.
-   - Planned (iii), on top of (i), not in effect: a dedicated release GitHub App creates `v*` tags, so tags are no longer created by `j113203`.
+   - Option (i) is a **temporary** scheme. Target (iii), not in effect: a dedicated release GitHub App is the sole `v*` tag creator, and `prevent_self_review` is turned on.
    - The existing `main` ruleset (25057946, "main protection") keeps its OrganizationAdmin bypass; it does not apply to `v*` tags (spec decision 96).
 2. **Environment `release`** — Settings → Environments → `release`. Live: reviewer `j113203`, `prevent_self_review: false` (all agents push as `j113203`), deployments limited to the `v*` tag pattern. Required but **not yet set live**: disable administrator bypass (`can_admins_bypass` is currently `true`). The release job in `.github/workflows/release.yml` uses this environment.
 3. **Pinned actions and runners** — `release.yml` pins `actions/checkout`, `upload-artifact`, `download-artifact`, `attest-build-provenance`, and `dtolnay/rust-toolchain` to full commit SHAs; runners are pinned images (no `*-latest`); checkout uses `persist-credentials: false`.

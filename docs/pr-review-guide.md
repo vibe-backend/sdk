@@ -21,7 +21,8 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - Release 只可以由 `v*` tag 出，tag 一定要指向 `main` 上嘅 commit。
 - 把關：開 tag 唔會自動發佈；發佈 job 要經 `release` environment 批准（live reviewer：`j113203`，`prevent_self_review: false`）。`--release-approval` 係計劃中、**未實作**，今日唔提供任何保護。
 - **剩餘風險（Jack 已接受）**：所有 agent 都用 `j113203` push，任何 `j113203` agent 都可以開 `v*` tag **再自己批准 release**。
-- 計劃 (iii)（喺 (i) 之上，未生效）：之後由專用 release GitHub App 開 tag，tag 唔再由 `j113203` 開。
+- 以上係**臨時方案 (i)**。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一開 `v*` tag 嘅 actor，同時開返 Prevent self-review。
+- Live `release` environment `can_admins_bypass` 而家係 `true`，要關閉（Jack 負責）。
 - 讀 ruleset 嘅專用 GitHub App：只裝喺呢個 repo，喺 `release` environment job 入面 mint installation token：
   - 權限只畀 repository **Administration: read** 同 **Metadata: read**；**唔畀 Administration: write**。
   - GitHub 只會將 `bypass_actors` 回畀對 ruleset 有寫權限嘅 caller；如果 read 睇唔到，高風險 release build 會失敗，要另外搵產品經理批准，唔好自己加權限。
