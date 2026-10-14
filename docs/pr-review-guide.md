@@ -1,4 +1,4 @@
-# PR review 指引（草稿，配合 spec v1.8 決定 29、37、83、89）
+# PR review 指引（草稿，配合 spec v1.8 決定 29、37、83、89、96）
 
 v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9C）。人手 review 改由 Git 平台負責；以下係建議設定（以 GitHub rulesets 為例；`vibe build --release-approval` 只認 ruleset，唔認舊式 branch protection）。標「計劃中」嘅指令係 v1.8 設計，未實作。
 
@@ -10,7 +10,16 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - 開 **Dismiss stale pull request approvals when new commits are pushed**（取代 v1.7 嘅「確認綁定 commit hash」）。
 - 開 **Require approval of the most recent reviewable push**，最後 push 嘅人唔可以自己批准。
 - 開 **Require review from Code Owners**。
-- **Bypass list 一定要留空**，admin 都唔例外。高風險 release build 會讀每個相關 ruleset 嘅 `bypass_actors`，讀唔到或者唔係空就失敗；唔設白名單（spec 決定 96，待產品經理確認）。
+- **Bypass list**：`main` ruleset 可以保留 OrganizationAdmin bypass（日常 `--admin` merge 唔變；spec 決定 96 修訂，待產品經理確認）。SDK 唔會檢查 `main` 嘅 bypass；高風險 release 由 `--release-approval` 獨立驗證 PR review 同 tree 相等，admin bypass merge 出唔到高風險 release。
+- 以上 required review 同 up-to-date 設定照樣一定要開。
+
+## 1A. Release tag ruleset（`v*`，spec 決定 96）
+
+- 另開一個 **tag ruleset**（target：Tag，enforcement：Active），target `refs/tags/v*`（UI 入面 include pattern `v*`）。
+- 開 **Restrict creations**、**Restrict updates**、**Restrict deletions**、**Block force pushes**。
+- **Bypass list 一定要留空**，admin 都唔例外；唔設白名單。高風險 release build 會讀呢個 ruleset，讀唔到、唔係空、唔係 Active、或者冇 target 到今次嘅 tag 就失敗。
+- Release 只可以由 `v*` tag 出，tag 一定要指向 `main` 上嘅 commit。
+- **注意（待產品經理確認）**：Restrict creations 加上空 bypass list，即係**冇人可以開 `v*` tag**（包括 admin 同 App）。第一個 release 之前要決定：唔開 Restrict creations（tag 開咗就改唔到、刪唔到），定係每次 release 暫時改 ruleset。見 spec 2C.3a.7。
 - 為咗讀到 `bypass_actors`，要開一個專用 GitHub App，只裝喺呢個 repo，喺 release workflow 嘅 `release` environment job 入面 mint installation token：
   - GitHub 只會將 `bypass_actors` 回畀對 ruleset 有寫權限嘅 caller。先試 repository **Administration: read**；實測讀唔到就要 **Administration: write**（呢個權限可以改 repo 設定，要產品經理確認）。
   - 加 **Metadata: read**（預設）；唔好加其他權限。
@@ -63,7 +72,7 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
 
 ## 6. Release environment 同 KMS（spec 決定 89、92）
 
-- 開一個 `release` environment，設 **Required reviewers**，只准受保護 ref（`main`、受 ruleset 保護嘅 `v*` tag）部署。
+- 開一個 `release` environment，設 **Required reviewers**；**Deployment branches and tags** 揀 Selected branches and tags，只加 tag 規則 `v*`（唔加任何 branch），即係只准受 release ruleset 保護嘅 `v*` tag 部署。
 - `release` environment 一定要開 **Prevent self-review**，觸發部署嘅人唔可以自己批准（spec 決定 90）。
 - `release` environment **唔好開 Allow administrators to bypass configured protection rules**，否則 admin 可以跳過 required reviewers。
 - 改 CODEOWNERS（`.github/`、root、`docs/` 任何一個）一律當高風險，要 2 個批准。
