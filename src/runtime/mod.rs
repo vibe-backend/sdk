@@ -12,7 +12,10 @@ pub use crud::{
     check_expr, check_when, parse_ownership, run_method, when_problem, CallCtx, CallResult, Caller,
     MethodFail, Ownership,
 };
-pub use exec::{etag, role_allows, ExecError, MemoryExec, PgExec, QueryExec, RoleStatus, Row};
+pub use exec::{
+    etag, role_allows, ExecError, MemoryExec, PgExec, PgOptions, PgSession, QueryExec, RoleStatus,
+    Row,
+};
 pub use http::{
     detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router, ApiKeyFile, AppState,
     AuthConfig, RunEnv, SigningKey, Slug, StoredKey, REQUEST_TYPES,
