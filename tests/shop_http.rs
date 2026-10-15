@@ -1078,6 +1078,16 @@ async fn route_jwt_overrides_end_to_end() {
             Algorithm::ES256,
         ),
         (
+            "future iat beyond leeway",
+            json!({"iat": now + 61, "exp": now + 900}),
+            Algorithm::ES256,
+        ),
+        (
+            "exp before iat",
+            json!({"iat": now, "exp": now - 1, "nbf": now - 600}),
+            Algorithm::ES256,
+        ),
+        (
             "bad tenant",
             json!({"tenant_id": "x, t_other"}),
             Algorithm::ES256,

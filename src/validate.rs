@@ -1321,7 +1321,7 @@ fn bad_number_rule(rules: &str, key: &str) -> Option<String> {
 /// cannot parse, a validate step without `when`/`fail`, a bad status.
 fn api_step_problems(block: &crate::lock::Block, op: &str) -> Vec<String> {
     let allowed: &[&str] = match op {
-        "method" => &["target", "args", "out"],
+        "method" => &["target", "args", "out", "cost"],
         "validate" => &["when", "fail"],
         "respond" => &["value", "status"],
         "transform" => &[],

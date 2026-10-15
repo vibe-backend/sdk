@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use crate::manifest::{Manifest, RouteSpec};
+use crate::manifest::{Manifest, RouteSpec, StepSpec};
 
 use super::crud::{self, MethodFail};
 use super::exec::QueryExec;
@@ -1264,7 +1264,11 @@ fn verify_jwt(
     validation.validate_nbf = true;
     let data = jsonwebtoken::decode::<Claims>(token, key, &validation)
         .map_err(|_| AuthError::unauthorized("Bearer"))?;
-    if data.claims.exp.saturating_sub(data.claims.iat) > 3600 {
+    if !valid_jwt_times(
+        data.claims.iat,
+        data.claims.exp,
+        chrono::Utc::now().timestamp(),
+    ) {
         return Err(AuthError::unauthorized("Bearer"));
     }
     if !super::slugs::valid_tenant(&data.claims.tenant_id) {
@@ -1282,6 +1286,10 @@ fn verify_jwt(
 }
 
 /// Walks a dotted path (`realm_access.roles`) or a URL-style claim key.
+fn valid_jwt_times(iat: i64, exp: i64, now: i64) -> bool {
+    iat <= now + 60 && exp >= iat && exp - iat <= 3600
+}
+
 fn claim_value<'a>(extra: &'a HashMap<String, Value>, path: &str) -> Option<&'a Value> {
     if path.contains("://") {
         return extra.get(path);
@@ -1441,6 +1449,27 @@ fn scope_allows(scopes: &[String], definition: &str, write: bool) -> bool {
 
 /// Shard and bucket for one rate-limit step. Shards are per route and key
 /// type, so flooding one key type cannot evict another's buckets.
+fn effective_rate_limit(per_minute: u32, high_cost: bool) -> u32 {
+    if high_cost {
+        (per_minute / 2).max(1)
+    } else {
+        per_minute
+    }
+}
+
+fn step_has_high_cost(step: &StepSpec) -> bool {
+    step.opts.get("cost").is_some_and(|cost| cost == "high")
+}
+
+fn route_has_high_cost(manifest: &Manifest, route: &RouteSpec) -> bool {
+    route.steps.iter().any(|step| {
+        step_has_high_cost(step)
+            || (step.op == "method"
+                && crate::manifest::method(manifest, &step.target)
+                    .is_some_and(|method| method.steps.iter().any(step_has_high_cost)))
+    })
+}
+
 fn rate_bucket(
     key: &str,
     route: &RouteSpec,
@@ -1501,8 +1530,10 @@ fn rate_limited(
         .map(|(index, rate)| {
             let (shard, key) =
                 rate_bucket(&rate.key, route, ip, principal, body, &state.auth.pepper);
+            let limit =
+                effective_rate_limit(rate.per_minute, route_has_high_cost(&state.manifest, route));
             // Each block is its own limit, even when two share a key.
-            (format!("{shard}#{index}"), key, rate.per_minute)
+            (format!("{shard}#{index}"), key, limit)
         })
         .collect();
     let Ok(mut rates) = state.rates.lock() else {
@@ -1782,6 +1813,25 @@ mod rate_tests {
     fn xff_ignored_without_trusted_proxy() {
         let got = client_ip(&xff("1.2.3.4"), Some(ip("9.9.9.9")), &[], false);
         assert_eq!(got, "9.9.9.9");
+    }
+
+    #[test]
+    fn high_cost_rate_limit_is_halved_once_with_a_floor() {
+        assert_eq!(effective_rate_limit(10, true), 5);
+        assert_eq!(effective_rate_limit(5, true), 2);
+        assert_eq!(effective_rate_limit(1, true), 1);
+        assert_eq!(effective_rate_limit(10, false), 10);
+    }
+
+    #[test]
+    fn jwt_time_claims_enforce_future_leeway_order_and_ttl() {
+        let now = 1_700_000_000;
+        assert!(valid_jwt_times(now + 60, now + 61, now));
+        assert!(!valid_jwt_times(now + 61, now + 62, now));
+        assert!(valid_jwt_times(now, now, now));
+        assert!(!valid_jwt_times(now, now - 1, now));
+        assert!(valid_jwt_times(now - 3600, now, now));
+        assert!(!valid_jwt_times(now - 3601, now, now));
     }
 
     #[test]
