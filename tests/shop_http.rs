@@ -1088,6 +1088,11 @@ async fn route_jwt_overrides_end_to_end() {
             Algorithm::ES256,
         ),
         (
+            "extreme timestamps overflow ttl",
+            json!({"iat": i64::MIN, "exp": i64::MAX, "nbf": now - 600}),
+            Algorithm::ES256,
+        ),
+        (
             "bad tenant",
             json!({"tenant_id": "x, t_other"}),
             Algorithm::ES256,

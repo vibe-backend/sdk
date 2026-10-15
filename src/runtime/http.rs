@@ -1287,7 +1287,10 @@ fn verify_jwt(
 
 /// Walks a dotted path (`realm_access.roles`) or a URL-style claim key.
 fn valid_jwt_times(iat: i64, exp: i64, now: i64) -> bool {
-    iat <= now + 60 && exp >= iat && exp - iat <= 3600
+    iat <= now + 60
+        && exp
+            .checked_sub(iat)
+            .is_some_and(|ttl| (0..=3600).contains(&ttl))
 }
 
 fn claim_value<'a>(extra: &'a HashMap<String, Value>, path: &str) -> Option<&'a Value> {
@@ -1832,6 +1835,8 @@ mod rate_tests {
         assert!(!valid_jwt_times(now, now - 1, now));
         assert!(valid_jwt_times(now - 3600, now, now));
         assert!(!valid_jwt_times(now - 3601, now, now));
+        assert!(!valid_jwt_times(i64::MIN, i64::MAX, now));
+        assert!(!valid_jwt_times(i64::MAX, i64::MIN, now));
     }
 
     #[test]
