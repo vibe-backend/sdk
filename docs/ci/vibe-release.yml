@@ -22,7 +22,7 @@ permissions:
   contents: read
 
 env:
-  VIBE_SDK_REV: 0000000000000000000000000000000000000000 # pin: full sdk commit SHA
+  VIBE_SDK_REV: c4ba25f31a21c9b7bbaee205c07cfe71fc3d9e0a # pin: full sdk commit SHA
 
 jobs:
   install:
