@@ -23,7 +23,9 @@ on:
 permissions:
   contents: read
 
+
 env:
+  VIBE_SDK_REV: 937e5d29d9eb71940cc59dc4f39ce25ae47031e3 # pin: full sdk commit SHA
   # The identity a release must carry. Keep in sync with the runtime's
   # VIBE_RELEASE_REPO / VIBE_RELEASE_WORKFLOW (defaults shown).
   VIBE_RELEASE_REPO: vibe-backend/sdk
@@ -40,7 +42,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install vibe
-        run: cargo install --locked --git https://github.com/vibe-backend/sdk vibe
+        run: cargo install --locked --git https://github.com/vibe-backend/sdk --rev "$VIBE_SDK_REV" vibe
       - name: Build preview and policy report (informational)
         run: |
           set -o pipefail
@@ -72,7 +74,7 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
             || { echo "::error::$GITHUB_REF_NAME is not on main"; exit 1; }
       - name: Install vibe
-        run: cargo install --locked --git https://github.com/vibe-backend/sdk vibe
+        run: cargo install --locked --git https://github.com/vibe-backend/sdk --rev "$VIBE_SDK_REV" vibe
       - name: Release build (compile in memory, policy; no signing key)
         env:
           VIBE_LLM_API_KEY: ${{ secrets.VIBE_LLM_API_KEY }}
