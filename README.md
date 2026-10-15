@@ -103,3 +103,7 @@ Required CI checks are **Markdown lint & link check** and **Rust fmt / clippy / 
 - **CI** (`.github/workflows/ci.yml`, on PRs and pushes to `main`): Markdown lint + local link check; Rust 1.89 `cargo check --locked`, `fmt`, `clippy`, and `test` once a `Cargo.toml` exists.
 - **Release** (`.github/workflows/release.yml`, on tags `v*`): builds `vibe` for Linux x86_64 and aarch64, macOS x86_64 and aarch64, and Windows x86_64. Archives are `tar.gz` (Unix) or `zip` (Windows), plus `SHA256SUMS`, on a GitHub Release. Nothing is pushed to GHCR or crates.io.
 - **CD** (`.github/workflows/cd.yml`): GHCR image publishing is disabled.
+
+## Binary installation
+
+Use the checksum- and provenance-verified install/upgrade/remove manager documented in [docs/install.md](docs/install.md). Production installs should pin an explicit release version.
