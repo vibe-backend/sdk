@@ -36,6 +36,7 @@ pub struct LlmRequest {
     pub seed: u64,
     pub timeout: Duration,
     /// Shared per-source / per-run cap on attempts and time (#83).
+    /// `None` uses the default bound for this call, including transport retries.
     pub budget: Option<std::sync::Arc<crate::llm_budget::CallBudget>>,
 }
 
@@ -314,12 +315,22 @@ pub async fn call_budgeted(
     adapter: &dyn LlmAdapter,
     request: &LlmRequest,
 ) -> Result<LlmResponse, String> {
+    let mut bounded = request.clone();
+    bounded.budget.get_or_insert_with(|| {
+        std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+            crate::llm_budget::Limits::default(),
+        ))
+    });
+    let request = &bounded;
     if !adapter.enforces_budget() {
         if let Some(budget) = &request.budget {
             budget.reserve()?;
         }
     }
-    adapter.compile(request).await
+    let left = request.budget.as_ref().expect("default budget").remaining();
+    tokio::time::timeout(left, adapter.compile(request))
+        .await
+        .map_err(|_| "LLM time budget spent".to_string())?
 }
 
 pub struct FakeAdapter<F>
@@ -821,6 +832,13 @@ impl LlmAdapter for HttpAdapter {
     }
 
     async fn compile(&self, request: &LlmRequest) -> Result<LlmResponse, String> {
+        let mut bounded = request.clone();
+        bounded.budget.get_or_insert_with(|| {
+            std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))
+        });
+        let request = &bounded;
         let mut attempt = 0u32;
         let max = self.config.max_retries;
         let started = std::time::Instant::now();
@@ -1268,6 +1286,30 @@ pub fn runtime_llm_env_present() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_without_budget_has_default_bound() {
+        let adapter = FakeAdapter {
+            responder: |request: &LlmRequest| {
+                let budget = request.budget.as_ref().expect("default bound");
+                let mut available = 0;
+                while budget.reserve().is_ok() {
+                    available += 1;
+                }
+                assert!(available < crate::llm_budget::Limits::default().source_calls);
+                Ok("done".into())
+            },
+        };
+        let request = LlmRequest {
+            system: String::new(),
+            input: String::new(),
+            model: "test".into(),
+            seed: 0,
+            timeout: Duration::from_secs(1),
+            budget: None,
+        };
+        assert!(call_budgeted(&adapter, &request).await.is_ok());
+    }
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

@@ -106,15 +106,27 @@ pub fn guide(kind: Kind, scope: Option<Scope>) -> String {
 /// Bounded number of format-repair re-prompts (`LLM_FORMAT_RETRIES`, 0–5, default 2).
 /// An invalid value (not an integer, negative, or above 5) is an error.
 pub fn format_retries() -> Result<u32, String> {
-    parse_format_retries(std::env::var("LLM_FORMAT_RETRIES").ok().as_deref())
+    match std::env::var("LLM_FORMAT_RETRIES") {
+        Ok(raw) => parse_format_retries(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => parse_format_retries(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("LLM_FORMAT_RETRIES must contain only ASCII digits".into())
+        }
+    }
 }
 
 pub const MAX_FORMAT_RETRIES: u32 = 5;
 
 pub fn parse_format_retries(value: Option<&str>) -> Result<u32, String> {
     let Some(raw) = value else { return Ok(2) };
-    match raw.trim().parse::<u32>() {
-        Ok(n) if n <= MAX_FORMAT_RETRIES => Ok(n),
+    match raw.parse::<u32>() {
+        Ok(n)
+            if !raw.is_empty()
+                && raw.bytes().all(|b| b.is_ascii_digit())
+                && n <= MAX_FORMAT_RETRIES =>
+        {
+            Ok(n)
+        }
         _ => Err(format!(
             "LLM_FORMAT_RETRIES must be an integer from 0 to {MAX_FORMAT_RETRIES} (got {:?})",
             raw
@@ -133,14 +145,27 @@ mod format_retries_tests {
 
     #[test]
     fn valid_values_are_accepted() {
-        for (v, n) in [("0", 0), ("3", 3), (" 5 ", 5)] {
+        for (v, n) in [("0", 0), ("3", 3), ("5", 5)] {
             assert_eq!(parse_format_retries(Some(v)), Ok(n));
         }
     }
 
     #[test]
     fn invalid_values_fail() {
-        for v in ["", "abc", "-1", "6", "100", "2.5", "99999999999"] {
+        for v in [
+            "+1",
+            " 1",
+            "1 ",
+            "１",
+            "١",
+            "",
+            "abc",
+            "-1",
+            "6",
+            "100",
+            "2.5",
+            "99999999999",
+        ] {
             let err = parse_format_retries(Some(v)).unwrap_err();
             assert!(err.contains("LLM_FORMAT_RETRIES"), "{v}: {err}");
         }

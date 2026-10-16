@@ -2200,6 +2200,7 @@ dependencies = [
  "hex",
  "hmac",
  "jsonwebtoken",
+ "libc",
  "rand",
  "regex",
  "reqwest",

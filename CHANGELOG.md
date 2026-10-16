@@ -24,7 +24,10 @@ added only when the corresponding PR is merged to `main`.
 
 ### Fixed
 
-- **Chinese sources (#92):** The English normalization used by the security keyword check no longer fails a source when Chinese text remains in the translation. The check reads the translation together with the original source and still fails when a declared item is not supported by the source.
+- Security keyword checks require support in the original source, including Chinese wording; translations cannot supply support.
+- LLM dump writes refuse symbolic links, use private permissions and redact known keys, tokens and authorization headers.
+- `LLM_FORMAT_RETRIES` accepts only ASCII digits within its supported range and rejects invalid values.
+- Public LLM requests without an explicit budget receive a default bound.
 - **Postgres TLS (#174):** `TlsMode::Require` (`sslmode=require`) previously did not enable TLS for database connections. It now requires TLS and fails to connect if the server does not offer it. `sslrootcert` is honored, and an unreadable or empty `sslrootcert` file is reported as an error.
 
 ### Breaking

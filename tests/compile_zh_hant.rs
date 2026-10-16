@@ -364,3 +364,82 @@ async fn chinese_left_in_translation_is_not_an_error() {
     })
     .unwrap_or_else(|err| panic!("{err}"));
 }
+
+async fn check_source_keywords(translated_keyword: bool) {
+    let root = fixture();
+    let path = root.join("models/product/product.md");
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        text.replace("屬於整個商店（租戶）共享的資料。", "商品有名稱與價格。"),
+    )
+    .unwrap();
+    let adapter = FakeAdapter {
+        responder: move |request: &LlmRequest| {
+            if request.system == vibe::compile::TRANSLATE_PROMPT
+                && request.input.contains("商品目錄")
+            {
+                Ok(if translated_keyword {
+                    "Product catalog shared by the whole store."
+                } else {
+                    "Product catalog with names and prices."
+                }
+                .into())
+            } else {
+                responder(request)
+            }
+        },
+    };
+    let config = config();
+    let report = compile_project(&CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&config),
+        check: false,
+    })
+    .await
+    .err()
+    .expect("unsupported claim must fail");
+    assert!(
+        report
+            .to_string()
+            .contains("lock declares ownership but the source does not mention it"),
+        "{report}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn keyword_check_uses_source() {
+    check_source_keywords(false).await;
+}
+
+#[tokio::test]
+async fn keyword_check_uses_source_with_translation() {
+    check_source_keywords(true).await;
+}
+
+#[tokio::test]
+async fn supported_chinese_source_compiles() {
+    let root = fixture();
+    let adapter = FakeAdapter {
+        responder: |request: &LlmRequest| {
+            if request.system == vibe::compile::TRANSLATE_PROMPT {
+                Ok("商品與購物車。".into())
+            } else {
+                responder(request)
+            }
+        },
+    };
+    let config = config();
+    let out = compile_project(&CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&config),
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|report| panic!("{report}"));
+    assert_eq!(out.files.len(), 7);
+    fs::remove_dir_all(root).unwrap();
+}

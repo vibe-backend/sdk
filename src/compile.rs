@@ -33,7 +33,7 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
     let stamp = stamp_from(opts.llm_config);
     let mut docs: HashMap<String, LockDoc> = HashMap::new();
     let mut ordered: Vec<String> = Vec::new();
-    // id -> English normalization used only by the keyword checks.
+    // Translation audit text, never used to authorize security claims.
     let mut english: HashMap<String, String> = HashMap::new();
     // (cache key, LLM sections) for sources whose fresh LLM output compiled.
     // Written only once the source also passes semantic_check (below).
@@ -496,10 +496,92 @@ pub(crate) fn dump_llm_output(
     secrets: &[&str],
 ) -> std::io::Result<std::path::PathBuf> {
     let path = dump_llm_path(root, rel, attempt);
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+    use std::io::Write;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut dir = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(root)?;
+        for name in [".vibe", "llm-dump"] {
+            let name = std::ffi::CString::new(name).expect("literal");
+            // All child operations are relative to a held directory descriptor.
+            let created = unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o700) };
+            if created < 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let fd = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            dir = unsafe { fs::File::from_raw_fd(fd) };
+            if unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        let name = std::ffi::CString::new(path.file_name().expect("dump name").as_encoded_bytes())?;
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        file
+    };
+    #[cfg(not(unix))]
+    let mut file = {
+        return Err(std::io::Error::other(
+            "LLM dumps require secure file creation support",
+        ));
+        #[allow(unreachable_code)]
+        fs::File::create(&path)?
+    };
+    let mut known: Vec<String> = std::env::vars()
+        .filter(|(name, _)| {
+            name.contains("API_KEY") || name.contains("TOKEN") || name.contains("SECRET")
+        })
+        .map(|(_, value)| value)
+        .filter(|v| !v.is_empty())
+        .collect();
+    known.extend(secrets.iter().map(|v| v.to_string()));
+    // Longest values first so overlapping credentials are removed completely.
+    known.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    let mut text = raw.to_string();
+    for secret in known {
+        if !secret.is_empty() {
+            text = text.replace(&secret, "[redacted]");
+        }
     }
-    fs::write(&path, crate::llm::redact(raw, secrets))?;
+    for pattern in [
+        r"(?im)authorization\s*:[^\r\n]*",
+        r"(?i)bearer\s+[a-z0-9._~+/=-]+",
+        r"\b(?:sk-|xai-|ghp_)[A-Za-z0-9_-]+",
+    ] {
+        text = regex::Regex::new(pattern)
+            .expect("redaction pattern")
+            .replace_all(&text, "[redacted]")
+            .into_owned();
+    }
+    file.write_all(text.as_bytes())?;
     Ok(path)
 }
 
@@ -510,6 +592,7 @@ mod dump_tests {
     #[test]
     fn dump_writes_redacted_response() {
         let dir = std::env::temp_dir().join(format!("vibe-dump-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
         let path =
             dump_llm_output(&dir, "api/a/b.md", 2, "## X\nkey sk-secret", &["sk-secret"]).unwrap();
         assert!(path.starts_with(dir.join(".vibe/llm-dump")));
@@ -517,6 +600,59 @@ mod dump_tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("sk-secret") && text.contains("[redacted]"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("vibe-dump-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join(".vibe")).unwrap();
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join(".vibe/llm-dump")).unwrap();
+        assert!(dump_llm_output(&root, "a.md", 1, "text", &[]).is_err());
+        fs::remove_file(root.join(".vibe/llm-dump")).unwrap();
+        fs::create_dir(root.join(".vibe/llm-dump")).unwrap();
+        let target = outside.join("target");
+        fs::write(&target, "original").unwrap();
+        symlink(&target, dump_llm_path(&root, "a.md", 1)).unwrap();
+        assert!(dump_llm_output(&root, "a.md", 1, "text", &[]).is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "original");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_permissions_and_redaction() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("vibe-dump-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let path = dump_llm_output(
+            &root,
+            "a.md",
+            1,
+            "sk-value xai-value ghp_value Bearer abc.def\nAuthorization: Basic abc\nknown",
+            &["known"],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let text = fs::read_to_string(path).unwrap();
+        for value in ["sk-value", "xai-value", "ghp_value", "abc", "known"] {
+            assert!(!text.contains(value), "{text}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1504,7 +1640,7 @@ fn method_id(target: &str) -> Option<String> {
 fn semantic_check(
     doc: &LockDoc,
     sources: &[SourceFile],
-    english: &HashMap<String, String>,
+    _english: &HashMap<String, String>,
     report: &mut Report,
 ) {
     let Some(source) = sources.iter().find(|source| source.id == doc.meta.id) else {
@@ -1515,14 +1651,8 @@ fn semantic_check(
         return;
     }
     report.extend(frontmatter_security_check(doc, source));
-    // #37 point 1-4: the keyword check is English-only and reads the English
-    // normalization of the source (the source itself when already English).
-    let original = strip_source_frontmatter(&source.combined_text()).to_string();
-    let text = match english.get(&source.id) {
-        Some(translated) => format!("{translated}\n\n{original}"),
-        None => original,
-    }
-    .to_lowercase();
+    // Only the original source can support a security claim.
+    let text = strip_source_frontmatter(&source.combined_text()).to_lowercase();
     if source_type_natural(source) {
         report.extend(declaration_check(doc, source, &text));
     }
@@ -1536,7 +1666,7 @@ fn semantic_check(
             ));
         }
     };
-    require(&["public"], "public");
+    require(&["public", "公開"], "public");
     // `### -auth` is checked against the mandatory `auth:` declaration in
     // declaration_check, not accepted on a keyword (D16 as amended).
     // API features have no SQL of their own: `write-sql` on a feature is
@@ -1544,12 +1674,19 @@ fn semantic_check(
     if doc.meta.kind != Kind::Api {
         require(WRITE_WORDS, "write-sql");
     }
-    require(&["sign", "token"], "sign-token");
-    require(&["call", "http", "external"], "external-call");
-    require(&["password"], "password-write");
-    require(&["write", "public"], "public-writes");
+    require(&["sign", "token", "簽署", "簽章", "權杖"], "sign-token");
+    require(
+        &["call", "http", "external", "呼叫", "外部"],
+        "external-call",
+    );
+    require(&["password", "密碼"], "password-write");
+    require(&["write", "public", "寫入", "公開"], "public-writes");
     require(
         &[
+            "共享",
+            "擁有者",
+            "所有權",
+            "全店",
             "ownership",
             "tenant-wide",
             "owner",
@@ -1571,13 +1708,28 @@ const AUTH_REMOVAL_WORDS: &[&str] = &[
     "without authentication",
     "no login",
     "without login",
+    "無需驗證",
+    "不需登入",
+    "移除驗證",
+    "取消驗證",
 ];
 
 const WRITE_WORDS: &[&str] = &[
-    "write", "insert", "update", "create", "delete", "save", "add", "store", "record",
+    "write", "insert", "update", "create", "delete", "save", "add", "store", "record", "寫入",
+    "新增", "更新", "刪除", "儲存", "加入", "記錄",
 ];
 
-const SECRET_WORDS: &[&str] = &["secret", "signing key", "private key", "key-ref"];
+const SECRET_WORDS: &[&str] = &[
+    "secret",
+    "signing key",
+    "private key",
+    "key-ref",
+    "金鑰",
+    "私鑰",
+    "密鑰",
+    "加密",
+    "簽章金鑰",
+];
 
 fn source_type_natural(source: &SourceFile) -> bool {
     !is_structured_source(&source.combined_text())
@@ -1620,7 +1772,7 @@ fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
 
 /// #37 point 5 (PM-approved; D16 amendment pending in the next spec PR):
 /// natural-language sources must declare high-risk fields in frontmatter.
-/// Fails closed when a declaration disagrees with the lock or the English
+/// Fails closed when a declaration disagrees with the lock or the source
 /// text, or when nothing is declared but either shows the behavior.
 fn declaration_check(doc: &LockDoc, source: &SourceFile, english: &str) -> Vec<Diag> {
     let front: HashMap<String, String> = source_frontmatter(&source.text).into_iter().collect();
@@ -1629,7 +1781,12 @@ fn declaration_check(doc: &LockDoc, source: &SourceFile, english: &str) -> Vec<D
     let mut checks: Vec<(&str, bool, bool, &str)> = Vec::new(); // key, lock says, text says, risky value
     match doc.meta.kind {
         Kind::Api if doc.meta.scope == Some(Scope::Feature) => {
-            checks.push(("public", has_item("public"), says(&["public"]), "true"));
+            checks.push((
+                "public",
+                has_item("public"),
+                says(&["public", "公開"]),
+                "true",
+            ));
             checks.push((
                 "auth",
                 has_item("auth-removed"),
@@ -1767,8 +1924,9 @@ pub(crate) fn affirms(text: &str, word: &str) -> bool {
         }
         let head = &text[..at];
         let clause_start = head
-            .rfind(['.', ';', '!', '?', '\n'])
-            .map(|i| i + 1)
+            .rmatch_indices(['.', ';', '!', '?', '\n', '。', '；', '！', '？'])
+            .next()
+            .map(|(i, c)| i + c.len())
             .unwrap_or(0);
         let mut clause = &head[clause_start..];
         if let Some(i) = clause.rfind(" but ") {
@@ -1778,7 +1936,11 @@ pub(crate) fn affirms(text: &str, word: &str) -> bool {
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '\''))
             .filter(|w| NEGATORS.contains(w) || w.ends_with("n't") || *w == "non")
             .count();
-        if negations % 2 == 1 {
+        let chinese_negated = !word.is_ascii()
+            && ["不", "無", "未", "禁止", "毋須"]
+                .iter()
+                .any(|n| clause.contains(n));
+        if negations % 2 == 1 || chinese_negated {
             continue;
         }
         return true;
@@ -2415,7 +2577,7 @@ mod security_tests {
     }
 
     #[test]
-    fn declarations_are_checked_against_the_translation() {
+    fn declarations_use_source() {
         let (doc, sources) = feature("---\npublic: false\nauth: jwt\n---\n列出商品\n", PRIVATE);
         let mut english = HashMap::new();
         english.insert(
@@ -2425,11 +2587,7 @@ mod security_tests {
         let mut report = Report::new();
         semantic_check(&doc, &sources, &english, &mut report);
         let errs: Vec<String> = report.errors().map(|d| d.message.clone()).collect();
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("`public: false` does not match the source text")),
-            "{errs:?}"
-        );
+        assert!(errs.is_empty(), "{errs:?}");
         // No declaration at all, translation shows public + auth removal.
         let (doc, sources) = feature("列出商品\n", PUBLIC);
         english.insert(
@@ -2446,7 +2604,7 @@ mod security_tests {
         );
         assert!(
             errs.iter()
-                .any(|e| e.contains("missing frontmatter declaration `auth: removed`")),
+                .any(|e| e.contains("lock declares public but the source does not mention it")),
             "{errs:?}"
         );
     }
