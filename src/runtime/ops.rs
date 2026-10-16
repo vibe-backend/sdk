@@ -356,7 +356,8 @@ pub async fn sign_jwt(
         .get(key_ref)
         .ok_or_else(|| internal(format!("signing key {key_ref} is not loaded")))?;
     let alg = match opt(step, "alg") {
-        "ES256" => jsonwebtoken::Algorithm::ES256,
+        // Decision 139: ES256 when `alg` is omitted.
+        "ES256" | "" => jsonwebtoken::Algorithm::ES256,
         "RS256" => jsonwebtoken::Algorithm::RS256,
         other => return Err(internal(format!("unsupported alg {other}"))),
     };
@@ -436,6 +437,43 @@ pub async fn sign_jwt(
     }))
 }
 
+/// Loads a P-256 private key from PKCS#8 PEM, checking it at load time.
+// The hand-written P-256 checks in eckey are defense-in-depth only to report
+// errors early at startup; authoritative parsing and verification is done by
+// jsonwebtoken (aws_lc_rs).
+pub fn ec_signing_key_from_pem(pem: &[u8]) -> Result<jsonwebtoken::EncodingKey, String> {
+    let text = std::str::from_utf8(pem).map_err(|_| "invalid PEM encoding".to_string())?;
+    let der = super::eckey::p256_private(text)
+        .map_err(|p| super::http::ec_problem_message("private key", p))?;
+    let key = jsonwebtoken::EncodingKey::from_ec_der(&der);
+    check_signing_key(&key, jsonwebtoken::Algorithm::ES256)?;
+    Ok(key)
+}
+
+/// Loads PKCS#8 DER with the same validation and test signature as PEM.
+/// Raw SEC1 DER is not supported by the signing backend.
+pub fn ec_signing_key_from_der(der: &[u8]) -> Result<jsonwebtoken::EncodingKey, String> {
+    super::eckey::p256_private_der(der)
+        .map_err(|p| super::http::ec_problem_message("private key", p))?;
+    let key = jsonwebtoken::EncodingKey::from_ec_der(der);
+    check_signing_key(&key, jsonwebtoken::Algorithm::ES256)?;
+    Ok(key)
+}
+
+/// Signs a fixed test payload so an unusable key fails at load time.
+fn check_signing_key(
+    key: &jsonwebtoken::EncodingKey,
+    alg: jsonwebtoken::Algorithm,
+) -> Result<(), String> {
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(alg),
+        &serde_json::json!({ "check": true }),
+        key,
+    )
+    .map(|_| ())
+    .map_err(|err| format!("private key is not usable for {alg:?}: {err}"))
+}
+
 /// Startup: every `sign-jwt` key-ref must be loadable from the environment
 /// variable of the same name (a private PEM matching the step's alg).
 pub fn load_signing_keys(
@@ -459,14 +497,20 @@ pub fn load_signing_keys(
                     )
                 })?;
             let (alg, key) = match opt(step, "alg") {
-                "ES256" => (
+                // Decision 139: ES256 when `alg` is omitted.
+                "ES256" | "" => (
                     jsonwebtoken::Algorithm::ES256,
-                    jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()),
+                    ec_signing_key_from_pem(pem.as_bytes()),
                 ),
-                "RS256" => (
-                    jsonwebtoken::Algorithm::RS256,
-                    jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()),
-                ),
+                "RS256" => {
+                    // Decision 139: RS256 signing keys need >= 2048 bits.
+                    super::rsakey::check_rsa_pem(&key_ref, &pem)?;
+                    (
+                        jsonwebtoken::Algorithm::RS256,
+                        jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())
+                            .map_err(|_| "invalid RSA private key".to_string()),
+                    )
+                }
                 other => return Err(format!("{}: unsupported alg {other}", method.target)),
             };
             let key = key.map_err(|err| format!("{key_ref}: {err}"))?;
