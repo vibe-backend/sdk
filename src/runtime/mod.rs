@@ -20,8 +20,16 @@ pub use exec::{
     Row,
 };
 pub use http::{
-    detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router, ApiKeyFile, AppState,
-    AuthConfig, RunEnv, SigningKey, Slug, StoredKey, REQUEST_TYPES,
+    check_test_ip_override, detect_jwt_alg, hash_api_secret, honor_test_ip_from_env, load_api_keys,
+    resolve_pepper, router, ApiKeyFile, AppState, AuthConfig, RunEnv, SigningKey, Slug, StoredKey,
+    REQUEST_TYPES, TEST_IP_OVERRIDE_AVAILABLE,
+};
+pub use limiter::{
+    active_tenants_alerts, counter_slot_refusals, saturation_refusals, slot_refused_metrics,
+    slot_refused_total, slot_refused_within_floor_total, LimiterMemory, NetLimits, ProxyNet,
+    QuotaBuckets, RateBuckets, ACTIVE_TENANTS_ALERT, BUCKET_BYTES, COUNTER_SLOT_BYTES,
+    FLOOR_RESERVE_BYTES, FLOOR_SLOT_BYTES, HIT_BYTES, MAX_EXPECTED_TENANTS, MAX_PLATFORM_FACTOR,
+    PLATFORM_SLOT_FLOOR, QUOTA_ENTRY_BYTES, TABLE_MEMORY_MAX_BYTES,
 };
 pub use ops::{custom_claim_problem, load_signing_keys, sub_source_problem};
 pub use sql::Stmt;
@@ -30,7 +38,6 @@ pub use sql::Stmt;
 pub fn hash_password_for_tests(plain: &str) -> String {
     crud::hash_password(plain).expect("hash")
 }
-pub use limiter::{saturation_refusals, ProxyNet, QuotaBuckets, RateBuckets};
 pub use migrate::migrate_tenant;
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
 pub use sql::{

@@ -153,8 +153,33 @@ pub struct AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    if let Err(err) = check_test_ip_override(state.honor_test_ip) {
+        panic!("{err}");
+    }
     super::ops::warm_up();
     Router::new().fallback(handle).with_state(state)
+}
+
+/// Whether the test-only client IP override (`honor_test_ip`, header
+/// `x-vibe-test-ip`) can take effect: debug builds only. Release builds
+/// always ignore the header.
+pub const TEST_IP_OVERRIDE_AVAILABLE: bool = cfg!(debug_assertions);
+
+/// Reads `VIBE_HONOR_TEST_IP`. When set to `true`, client IPs may be
+/// overridden via the `x-vibe-test-ip` header (debug builds only; see
+/// [`check_test_ip_override`]).
+pub fn honor_test_ip_from_env() -> bool {
+    std::env::var("VIBE_HONOR_TEST_IP").as_deref() == Ok("true")
+}
+
+/// Startup check: `honor_test_ip` may only be set in debug builds.
+pub fn check_test_ip_override(honor_test_ip: bool) -> Result<(), String> {
+    if honor_test_ip && !TEST_IP_OVERRIDE_AVAILABLE {
+        return Err(
+            "honor_test_ip is a test-only setting and cannot be enabled in a release build".into(),
+        );
+    }
+    Ok(())
 }
 
 /// Minimum API-key pepper length in production.
@@ -1509,7 +1534,7 @@ fn rate_limited(
     let Ok(mut rates) = state.rates.lock() else {
         return Some("1".into());
     };
-    match rates.check(&checks, &owner_of(ip), Instant::now()) {
+    match rates.check_tenant(&checks, &principal.tenant_id, &owner_of(ip), Instant::now()) {
         RateDecision::Allow => None,
         RateDecision::Limited(wait) => Some(wait.to_string()),
     }
@@ -1547,7 +1572,7 @@ fn client_ip(
     trusted: &[ProxyNet],
     honor_test_ip: bool,
 ) -> String {
-    if honor_test_ip {
+    if honor_test_ip && TEST_IP_OVERRIDE_AVAILABLE {
         if let Some(ip) = headers.get("x-vibe-test-ip") {
             return ip.clone();
         }
@@ -2642,5 +2667,48 @@ mod crypto_kats {
             mac,
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+    }
+}
+
+#[cfg(test)]
+mod test_ip_override_tests {
+    use super::*;
+
+    #[test]
+    fn test_ip_override_is_debug_only() {
+        assert_eq!(TEST_IP_OVERRIDE_AVAILABLE, cfg!(debug_assertions));
+        assert!(check_test_ip_override(false).is_ok());
+        assert_eq!(
+            check_test_ip_override(true).is_ok(),
+            cfg!(debug_assertions),
+            "release builds refuse honor_test_ip at startup"
+        );
+    }
+
+    /// Release-profile path: with the override requested, startup must Err.
+    /// Covered by `cargo test --release` (builds without debug_assertions).
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn release_build_refuses_honor_test_ip_at_startup() {
+        let err = check_test_ip_override(true).expect_err("release must refuse");
+        assert!(
+            err.contains("honor_test_ip") && err.contains("release"),
+            "{err}"
+        );
+        assert!(check_test_ip_override(false).is_ok());
+    }
+
+    #[test]
+    fn test_ip_header_is_ignored_unless_override_available() {
+        let mut headers = BTreeMap::new();
+        headers.insert("x-vibe-test-ip".to_string(), "192.0.2.55".to_string());
+        let peer = Some("198.51.100.4".parse().unwrap());
+        assert_eq!(client_ip(&headers, peer, &[], false), "198.51.100.4");
+        let expected = if TEST_IP_OVERRIDE_AVAILABLE {
+            "192.0.2.55"
+        } else {
+            "198.51.100.4"
+        };
+        assert_eq!(client_ip(&headers, peer, &[], true), expected);
     }
 }

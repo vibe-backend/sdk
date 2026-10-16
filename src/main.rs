@@ -394,6 +394,10 @@ async fn cmd_serve(
         vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?,
         !memory,
     )?;
+    // Test-only client IP override (`VIBE_HONOR_TEST_IP=true`). Debug builds
+    // honour it; release builds refuse to start when it is set.
+    let honor_test_ip = vibe::runtime::honor_test_ip_from_env();
+    vibe::runtime::check_test_ip_override(honor_test_ip)?;
     let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
@@ -489,16 +493,17 @@ async fn cmd_serve(
         .collect();
     vibe::runtime::challenge::unverified_gate(run_env, &unverified)?;
     let addr: SocketAddr = addr.parse().map_err(|err| format!("bad address: {err}"))?;
+    let rates = vibe::runtime::RateBuckets::with_limits(net_limits_from_env()?);
     let state = Arc::new(AppState {
         manifest,
         exec,
         auth,
         slugs: loaded.slugs,
-        rates: std::sync::Mutex::new(Default::default()),
-        quotas: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(vibe::runtime::QuotaBuckets::with_memory(rates.memory())),
+        rates: std::sync::Mutex::new(rates),
         disabled: load_disabled(project),
         min_override_ms: None,
-        honor_test_ip: false,
+        honor_test_ip,
         trusted_proxies: trusted_proxies_from_env()?,
         dev_hints: memory,
         challenge,
@@ -613,6 +618,55 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
         )?));
     }
     Ok(auth)
+}
+
+/// D130 limits. `VIBE_RATE_PLATFORM_FACTOR` sets the platform cap as a
+/// multiple of the tenant cap (bounded).
+/// `VIBE_RATE_EXPECTED_TENANTS` sizes the global tenant slot budget and
+/// with it the platform total (budget plus one floor per tenant) and the
+/// memory kept for per-tenant floors (at most half the cap).
+/// `VIBE_RATE_TABLE_MEMORY_MAX_BYTES` caps the estimated memory of all
+/// limiter tables combined (bounded below).
+fn net_limits_from_env() -> Result<vibe::runtime::NetLimits, String> {
+    let mut limits = vibe::runtime::NetLimits::default();
+    if let Ok(raw) = std::env::var("VIBE_RATE_PLATFORM_FACTOR") {
+        limits.platform_factor = raw
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|f| (1..=vibe::runtime::MAX_PLATFORM_FACTOR).contains(f))
+            .ok_or_else(|| {
+                format!(
+                    "VIBE_RATE_PLATFORM_FACTOR must be an integer from 1 to {}, got {raw}",
+                    vibe::runtime::MAX_PLATFORM_FACTOR
+                )
+            })?;
+    }
+    if let Ok(raw) = std::env::var("VIBE_RATE_EXPECTED_TENANTS") {
+        let tenants = raw
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|t| (1..=vibe::runtime::MAX_EXPECTED_TENANTS).contains(t))
+            .ok_or_else(|| {
+                format!(
+                    "VIBE_RATE_EXPECTED_TENANTS must be an integer from 1 to {}, got {raw}",
+                    vibe::runtime::MAX_EXPECTED_TENANTS
+                )
+            })?;
+        limits = limits.sized_for(tenants);
+    }
+    if let Ok(raw) = std::env::var("VIBE_RATE_TABLE_MEMORY_MAX_BYTES") {
+        limits.table_memory_max_bytes = raw
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|b| *b >= 1024 * 1024)
+            .ok_or_else(|| {
+                format!("VIBE_RATE_TABLE_MEMORY_MAX_BYTES must be an integer of at least 1048576, got {raw}")
+            })?;
+    }
+    Ok(limits)
 }
 
 /// `VIBE_TRUSTED_PROXIES`: comma-separated proxy IPs or CIDR blocks whose
