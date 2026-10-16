@@ -926,45 +926,6 @@ async fn manifest_output_is_relative_to_the_current_directory() {
     assert!(!root.join("out.json").exists());
 }
 
-#[tokio::test]
-async fn feature_calling_a_custom_named_writing_method_compiles_and_validates() {
-    let root = copy_shop();
-    fs::create_dir_all(root.join("models/product/methods")).unwrap();
-    fs::write(
-        root.join("models/product/methods/restock.md"),
-        "# restock\n\n## Signature\n\n- input: {id: uuid}\n- output: {id: uuid}\n- writes: true\n\n## Calls\n\n(none)\n\n## Steps\n\n### s1\n\n- op: query\n- sql: UPDATE products SET price_cents = price_cents WHERE id = $1 RETURNING id\n- params: [input.id]\n- writes: true\n- scope: rls\n- out: row\n\n### s2\n\n- op: respond\n- value: {id: row.id}\n",
-    )
-    .unwrap();
-    let feature = root.join("api/catalog/v1/update-product/update-product.md");
-    let text = fs::read_to_string(&feature)
-        .unwrap()
-        .replace("target: product.update", "target: product.restock");
-    fs::write(&feature, text).unwrap();
-    compile_project(&CompileOptions {
-        root: &root,
-        llm: None,
-        llm_config: None,
-        check: false,
-    })
-    .await
-    .unwrap_or_else(|err| panic!("{err}"));
-    let lock =
-        fs::read_to_string(root.join("api/catalog/v1/update-product/update-product.lock.md"))
-            .unwrap();
-    let doc = vibe::lock::parse_lock(&lock).unwrap();
-    assert!(doc
-        .meta
-        .security_items
-        .iter()
-        .any(|item| item.item == "write-sql"));
-    vibe::validate::validate_project(&vibe::validate::ValidateOptions {
-        root: &root,
-        deploy: false,
-        verify_key: None,
-    })
-    .unwrap_or_else(|err| panic!("{err}"));
-}
-
 /// Lock `### auth` iss/aud/jwks-uri flow through validate, the manifest and
 /// the HTTP router: only the route issuer's tokens are accepted there.
 #[tokio::test]

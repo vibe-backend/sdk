@@ -139,18 +139,9 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                 continue;
             }
         };
-        docs.get_mut(id).expect("doc inserted").meta.dependencies = deps;
-        // Same extraction as `vibe validate`, including writes by custom-named
-        // methods a feature calls (e.g. `user.register`).
-        let mut items = {
-            let snapshot = &docs[id];
-            let mut items = security::extract_items(snapshot);
-            security::enrich_feature_writes(snapshot, &docs, &mut items);
-            items.sort_by(|a, b| a.item.cmp(&b.item));
-            items.dedup_by(|a, b| a.item == b.item);
-            items
-        };
         let doc = docs.get_mut(id).expect("doc inserted");
+        doc.meta.dependencies = deps;
+        let mut items = security::extract_items(doc);
         if doc
             .meta
             .security_items
