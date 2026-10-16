@@ -20,7 +20,18 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # kept back until the RustCrypto crates (sha2, hmac, digest) can be upgraded together, see #149.
+    ignore:
+      - dependency-name: sha2
+        versions: [">=0.11"]
+      - dependency-name: hmac
+        versions: [">=0.13"]
     groups:
+      rustcrypto:
+        patterns:
+          - "sha2"
+          - "hmac"
+          - "digest"
       cargo:
         patterns: ["*"]
         update-types: ["minor", "patch"]
