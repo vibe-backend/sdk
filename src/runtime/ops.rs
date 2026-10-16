@@ -227,9 +227,8 @@ pub fn random_token(step: &StepSpec, ctx: CallCtx<'_>) -> Result<Value, MethodFa
         return Err(internal("random-token is always 32 bytes"));
     }
     let mut buf = [0u8; 32];
-    // OS CSPRNG; panics on failure, matching rand 0.8's OsRng::fill_bytes.
     rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut buf)
-        .expect("OS random number generator failed");
+        .map_err(|_| internal("random-token: system random source unavailable"))?;
     let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
     let hash = token_hash(&ctx.auth.pepper, &value);
     Ok(serde_json::json!({"value": value, "hash": hash}))
