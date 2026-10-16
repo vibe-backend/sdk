@@ -16,8 +16,37 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::manifest::ModelSpec;
 
-/// Runtime roles a statement can run as (spec §7.1/§7.2).
+/// Runtime role classes a statement can run as (spec §7.1/§7.2). In
+/// PostgreSQL each class is a separate `LOGIN` role per tenant
+/// ([`tenant_role`]); there are no shared server-wide runtime roles
+/// (decision 97).
 pub const RUNTIME_ROLES: &[&str] = &["app_rw", "public_reader", "public_writer"];
+
+/// The PostgreSQL role for one (tenant, role class) pair (decision 97):
+/// `tenant_<id>_rw`, `tenant_<id>_public_reader`, `tenant_<id>_public_writer`.
+/// Each is `LOGIN NOINHERIT`, has privileges only on `t_<id>`, and is not a
+/// member of (nor has as member) any other role. The longest name is 57
+/// bytes, under PostgreSQL's 63-byte identifier limit.
+pub fn tenant_role(tenant: &str, class: &str) -> Result<String, String> {
+    if !super::slugs::valid_tenant(tenant) {
+        return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
+    }
+    let suffix = match class {
+        "app_rw" => "rw",
+        "public_reader" => "public_reader",
+        "public_writer" => "public_writer",
+        other => return Err(format!("unknown executor role {other}")),
+    };
+    Ok(format!("tenant_{tenant}_{suffix}"))
+}
+
+/// The three [`tenant_role`]s of one tenant, in [`RUNTIME_ROLES`] order.
+pub fn tenant_roles(tenant: &str) -> Result<Vec<String>, String> {
+    RUNTIME_ROLES
+        .iter()
+        .map(|c| tenant_role(tenant, c))
+        .collect()
+}
 
 /// Columns covered by a privilege: `None` means every column.
 pub type Cols = Option<BTreeSet<String>>;
@@ -241,19 +270,21 @@ pub fn effective(model: &ModelSpec, grants: &Grants, role: &str) -> RoleGrant {
     grant
 }
 
-/// `REVOKE` + `GRANT` statements that give each runtime role exactly its
-/// [`effective`] grant on one table.
+/// `REVOKE` + `GRANT` statements that give each of the tenant's own roles
+/// ([`tenant_role`]) exactly its [`effective`] grant on one table of the
+/// tenant's schema `t_<tenant>`. Nothing is granted to any other role.
 pub fn pg_grant_statements(
-    schema: &str,
+    tenant: &str,
     model: &ModelSpec,
     grants: &Grants,
 ) -> Result<Vec<String>, String> {
     use super::sql::quote;
-    let qualified = format!("{}.{}", quote(schema)?, quote(&model.table)?);
-    let mut out = Vec::new();
+    let schema = format!("t_{tenant}");
+    let qualified = format!("{}.{}", quote(&schema)?, quote(&model.table)?);
+    let mut out = vec![format!("REVOKE ALL ON {qualified} FROM PUBLIC")];
     for role in RUNTIME_ROLES {
-        let r = quote(role)?;
-        out.push(format!("GRANT USAGE ON SCHEMA {} TO {r}", quote(schema)?));
+        let r = quote(&tenant_role(tenant, role)?)?;
+        out.push(format!("GRANT USAGE ON SCHEMA {} TO {r}", quote(&schema)?));
         out.push(format!("REVOKE ALL ON {qualified} FROM {r}"));
         let grant = effective(model, grants, role);
         for (privilege, cols) in [

@@ -5,7 +5,7 @@
 use serde_json::{json, Value};
 use tokio_postgres::{Client, NoTls};
 use vibe::manifest::Manifest;
-use vibe::runtime::{migrate_tenant, Col, PgExec, QueryExec, Stmt};
+use vibe::runtime::{migrate_tenant, Col, PgExec, QueryExec, Stmt, TenantPools};
 
 fn admin_url() -> Option<String> {
     std::env::var("VIBE_TEST_PG_ADMIN_URL").ok()
@@ -37,9 +37,22 @@ async fn create_login(admin: &Client, name: &str, extra: &str) {
         .unwrap();
 }
 
-async fn check_as(admin_url: &str, user: &str) -> Result<(), String> {
-    let exec = PgExec::connect(&url_as(admin_url, user)).await.unwrap();
-    exec.check_runtime_role().await
+/// Name of a tenant's role for a class (`tenant_<id>_rw`, ...).
+fn trole(tenant: &str, class: &str) -> String {
+    vibe::runtime::grants::tenant_role(tenant, class).unwrap()
+}
+
+/// The per-tenant migration role used by these tests.
+fn owner_of(tenant: &str) -> String {
+    format!("own_{tenant}")
+}
+
+/// Logs in as `tenant`'s role for `class` and runs the serve-time check.
+async fn check_tenant(admin_url: &str, tenant: &str, class: &str) -> Result<(), String> {
+    let exec = PgExec::connect(&url_as(admin_url, &trole(tenant, class)))
+        .await
+        .unwrap();
+    exec.check_tenant_role(tenant, class).await
 }
 
 /// Grants of the test model: full access for `app_rw`, column-limited
@@ -47,21 +60,62 @@ async fn check_as(admin_url: &str, user: &str) -> Result<(), String> {
 const GRANTS: &str =
     "app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT(body)], public_writer [INSERT(body)]";
 
-/// Runtime roles (cluster-wide, NOLOGIN). Every runtime login is granted
-/// all three and runs each statement after `SET LOCAL ROLE`.
+/// Role classes; each is a separate LOGIN role per tenant (decision 97).
 const RUNTIME_ROLES: [&str; 3] = ["app_rw", "public_reader", "public_writer"];
 
-async fn create_runtime_roles(admin: &Client, login: &str) {
-    for role in RUNTIME_ROLES {
-        admin
-            .batch_execute(&format!(
-                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') \
-                 THEN CREATE ROLE {role} NOLOGIN; END IF; END $$; \
-                 GRANT {role} TO {login} WITH INHERIT FALSE, SET TRUE"
-            ))
-            .await
-            .unwrap();
+/// What an operator pre-creates for a tenant: three LOGIN NOINHERIT tenant
+/// roles with no memberships, and a migration role that may create the
+/// tenant schema (and so owns only that schema).
+async fn ensure_tenant_roles(admin_url: &str, tenant: &str) {
+    let _guard = SETUP.lock().await;
+    let admin = connect(admin_url).await;
+    let db = admin_url
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .split('?')
+        .next()
+        .unwrap()
+        .to_string();
+    let owner = owner_of(tenant);
+    let mut sql = format!(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{owner}') \
+         THEN CREATE ROLE {owner} LOGIN PASSWORD 'pw'; END IF; END $$; \
+         GRANT CREATE ON DATABASE {db} TO {owner};"
+    );
+    for class in RUNTIME_ROLES {
+        let role = trole(tenant, class);
+        sql.push_str(&format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') \
+             THEN CREATE ROLE {role} LOGIN NOINHERIT PASSWORD 'pw'; END IF; END $$;"
+        ));
     }
+    admin.batch_execute(&sql).await.unwrap();
+}
+
+/// Creates the tenant's roles if needed and migrates as its own migration
+/// role.
+async fn migrate_as(s: &Setup, m: &Manifest, tenant: &str) -> Result<Vec<String>, String> {
+    migrate_fresh(&s.admin_url, m, tenant).await
+}
+
+async fn migrate_fresh(admin_url: &str, m: &Manifest, tenant: &str) -> Result<Vec<String>, String> {
+    ensure_tenant_roles(admin_url, tenant).await;
+    let exec = PgExec::connect(&url_as(admin_url, &owner_of(tenant)))
+        .await
+        .unwrap();
+    migrate_tenant(&exec, m, tenant).await
+}
+
+/// One pool per (tenant, class) for `tenants`, as `vibe serve` uses.
+fn pools_for(admin_url: &str, tenants: &[&str]) -> TenantPools {
+    let mut secrets = std::collections::HashMap::new();
+    for t in tenants {
+        for class in RUNTIME_ROLES {
+            secrets.insert(trole(t, class), "pw".to_string());
+        }
+    }
+    TenantPools::new(admin_url, secrets, vibe::runtime::PgOptions::default()).unwrap()
 }
 
 fn manifest() -> Manifest {
@@ -133,43 +187,16 @@ async fn setup_exclusive() -> Option<Setup> {
 }
 
 async fn setup_with(admin_url: String, guard: Guard) -> Option<Setup> {
-    let _guard = SETUP.lock().await;
     let admin = connect(&admin_url).await;
-    let s = suffix();
-    let owner = format!("own_{s}");
-    let app = format!("app_{s}");
-    create_login(&admin, &owner, "").await;
-    create_login(&admin, &app, "").await;
-    create_runtime_roles(&admin, &app).await;
-    admin
-        .batch_execute(&format!(
-            "GRANT CREATE ON DATABASE {} TO {owner}",
-            admin_url
-                .rsplit('/')
-                .next()
-                .unwrap()
-                .split('?')
-                .next()
-                .unwrap()
-        ))
-        .await
-        .unwrap();
-    let tenant = format!("tn{s}");
-    let owner_exec = PgExec::connect(&url_as(&admin_url, &owner)).await.unwrap();
-    migrate_tenant(&owner_exec, &manifest(), &tenant, &app)
-        .await
-        .unwrap();
-    // `visible_rows` reads the migration table as app_rw; the runtime only
-    // ever touches model tables, so migrate grants nothing on it.
-    admin
-        .batch_execute(&format!("GRANT SELECT ON t_{tenant}.audit_notes TO app_rw"))
+    let tenant = format!("tn{}", suffix());
+    migrate_fresh(&admin_url, &manifest(), &tenant)
         .await
         .unwrap();
     Some(Setup {
+        owner: owner_of(&tenant),
+        app: trole(&tenant, "app_rw"),
         admin_url,
         admin,
-        owner,
-        app,
         tenant,
         _guard: guard,
     })
@@ -192,52 +219,289 @@ macro_rules! require_pg {
 }
 
 #[tokio::test]
-async fn non_owner_runtime_role_is_accepted_and_limited() {
+async fn tenant_roles_are_accepted_and_limited_to_their_own_schema() {
     let s = require_pg!(setup().await);
-    check_as(&s.admin_url, &s.app).await.unwrap();
+    for class in RUNTIME_ROLES {
+        check_tenant(&s.admin_url, &s.tenant, class).await.unwrap();
+    }
     let schema = format!("t_{}", s.tenant);
+    let notes = format!("{schema}.notes");
+    let rw = trole(&s.tenant, "app_rw");
+    let reader = trole(&s.tenant, "public_reader");
+    let writer = trole(&s.tenant, "public_writer");
+    // Each tenant role has exactly the model grants on its own tables.
     let row = s
         .admin
         .query_one(
-            "SELECT has_table_privilege($1, $2, 'SELECT'), has_table_privilege($1, $2, 'INSERT'), \
-             has_table_privilege($1, $2, 'UPDATE'), has_table_privilege($1, $2, 'DELETE'), \
-             has_table_privilege($1, $2, 'TRUNCATE'), has_schema_privilege($1, $3, 'CREATE'), \
-             has_table_privilege($1, $4, 'SELECT')",
+            "SELECT has_table_privilege($1, $4, 'SELECT'), has_table_privilege($1, $4, 'INSERT'), \
+             has_table_privilege($1, $4, 'UPDATE'), has_table_privilege($1, $4, 'DELETE'), \
+             has_table_privilege($1, $4, 'TRUNCATE'), \
+             has_column_privilege($2, $4, 'body', 'SELECT'), \
+             has_column_privilege($2, $4, 'tenant_id', 'SELECT'), \
+             has_column_privilege($3, $4, 'body', 'SELECT'), \
+             has_schema_privilege($1, $5, 'CREATE'), \
+             has_table_privilege($1, $6, 'SELECT')",
             &[
-                &s.app,
-                &format!("{schema}.notes"),
+                &rw,
+                &reader,
+                &writer,
+                &notes,
                 &schema,
                 &format!("{schema}.audit_notes"),
             ],
         )
         .await
         .unwrap();
-    let flags: Vec<bool> = (0..7).map(|i| row.get(i)).collect();
+    let flags: Vec<bool> = (0..10).map(|i| row.get(i)).collect();
     assert_eq!(
         flags,
-        vec![false, false, false, false, false, false, false],
-        "the login itself has no table privileges and no CREATE"
+        vec![true, true, false, false, false, true, false, false, false, false],
+        "table-wide UPDATE is narrowed to columns (never id/tenant_id/created_at); no CREATE; \
+         migration-only tables get no grants"
     );
-    // Its statements run as app_rw, which has exactly the model grants.
-    let row = s
+    // No shared runtime role, no membership in either direction.
+    let shared: i64 = s
         .admin
         .query_one(
-            "SELECT has_table_privilege('app_rw', $1, 'SELECT'), has_table_privilege('app_rw', $1, 'INSERT'), \
-             has_table_privilege('app_rw', $1, 'UPDATE'), has_table_privilege('app_rw', $1, 'DELETE'), \
-             has_table_privilege('app_rw', $1, 'TRUNCATE'), \
-             has_column_privilege('public_reader', $1, 'body', 'SELECT'), \
-             has_column_privilege('public_reader', $1, 'tenant_id', 'SELECT'), \
-             has_column_privilege('public_writer', $1, 'body', 'SELECT')",
-            &[&format!("{schema}.notes")],
+            "SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid IN (m.member, m.roleid) \
+             WHERE r.rolname = ANY($1)",
+            &[&vec![rw.clone(), reader.clone(), writer.clone()]],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(shared, 0);
+}
+
+/// Tenant B's own login, in a separate tenant from `s.tenant` (tenant A).
+async fn second_tenant(s: &Setup) -> String {
+    let b = format!("tb{}", suffix());
+    migrate_as(s, &manifest(), &b).await.unwrap();
+    let schema = format!("t_{b}");
+    s.admin
+        .batch_execute(&format!(
+            "INSERT INTO {schema}.notes (id, tenant_id, body, created_at, updated_at) \
+             VALUES (gen_random_uuid(), '{b}', 'b-secret', now(), now()); \
+             INSERT INTO {schema}.audit_notes VALUES ('{b}', 'b-secret')"
+        ))
+        .await
+        .unwrap();
+    b
+}
+
+/// Issue #98: a tenant login cannot reach another tenant, whatever it tries
+/// inside its own connection: direct access, `SET ROLE` to the other
+/// tenant's roles or to the old shared roles, `SET SESSION AUTHORIZATION`,
+/// or changing `app.tenant_id`.
+#[tokio::test]
+async fn cross_tenant_access_fails_even_through_set_role() {
+    let s = require_pg!(setup().await);
+    let b = second_tenant(&s).await;
+    let b_schema = format!("t_{b}");
+    // Old #99-style shared roles exist on this cluster too; they must not
+    // be reachable.
+    s.admin
+        .batch_execute(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_rw') \
+             THEN CREATE ROLE app_rw NOLOGIN; END IF; END $$",
         )
         .await
         .unwrap();
-    let flags: Vec<bool> = (0..8).map(|i| row.get(i)).collect();
-    assert_eq!(
-        flags,
-        vec![true, true, false, false, false, true, false, false],
-        "table-wide UPDATE is narrowed to columns (never id/tenant_id/created_at)"
+    for class in RUNTIME_ROLES {
+        let a = connect(&url_as(&s.admin_url, &trole(&s.tenant, class))).await;
+        let attempts = [
+            format!("SELECT count(*) FROM {b_schema}.notes"),
+            format!("SELECT count(*) FROM {b_schema}.audit_notes"),
+            format!("UPDATE {b_schema}.notes SET body = 'pwned'"),
+            format!(
+                "INSERT INTO {b_schema}.notes (id, tenant_id, body, created_at, updated_at) \
+                 VALUES (gen_random_uuid(), '{b}', 'x', now(), now())"
+            ),
+            format!("SET ROLE {}", trole(&b, "app_rw")),
+            format!("SET ROLE {}", trole(&b, class)),
+            "SET ROLE app_rw".to_string(),
+            format!("SET ROLE {}", owner_of(&b)),
+            format!("SET ROLE {}", s.owner),
+            "SET ROLE postgres".to_string(),
+            format!("SET SESSION AUTHORIZATION {}", trole(&b, "app_rw")),
+            format!(
+                "BEGIN; SET LOCAL ROLE {}; SELECT count(*) FROM {b_schema}.notes",
+                trole(&b, "app_rw")
+            ),
+            format!(
+                "BEGIN; SELECT set_config('app.tenant_id', '{b}', true); \
+                 SELECT set_config('search_path', '{b_schema}', true); SELECT count(*) FROM notes"
+            ),
+        ];
+        for attempt in &attempts {
+            let got = a.batch_execute(attempt).await;
+            let _ = a.batch_execute("ROLLBACK").await;
+            let err = got.expect_err(&format!("{class}: `{attempt}` must fail"));
+            let code = err.code().map(|c| c.code().to_string()).unwrap_or_default();
+            assert!(
+                code == "42501" || code == "22023" || code == "42P01",
+                "{class}: `{attempt}`: unexpected error {err:?}"
+            );
+        }
+        // The session is still the tenant role; nothing changed identity.
+        let who: String = a
+            .query_one(
+                "SELECT session_user::text || '|' || current_user::text",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let me = trole(&s.tenant, class);
+        assert_eq!(who, format!("{me}|{me}"));
+    }
+    // B's data is untouched.
+    let body: String = s
+        .admin
+        .query_one(
+            &format!("SELECT string_agg(body, ',') FROM {b_schema}.notes"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(body, "b-secret");
+    // The executor refuses to run tenant B's statements on tenant A's pool,
+    // and the per-tenant pools keep each tenant in its own schema.
+    let a_pool = PgExec::connect(&url_as(&s.admin_url, &s.app))
+        .await
+        .unwrap();
+    let err = a_pool
+        .execute(&b, "app_rw", p_select(&["body"], None, None))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("not tenant role"), "{err:?}");
+    let pools = pools_for(&s.admin_url, &[&s.tenant, &b]);
+    assert_eq!(pools.check_all().await.unwrap(), 6);
+    let seen = pools
+        .execute(&b, "app_rw", p_select(&["body"], None, None))
+        .await
+        .unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["body"], json!("b-secret"));
+    let seen = pools
+        .execute(&s.tenant, "app_rw", p_select(&["body"], None, None))
+        .await
+        .unwrap();
+    assert!(
+        seen.iter().all(|r| r["body"] != json!("b-secret")),
+        "{seen:?}"
     );
+}
+
+/// The startup check refuses a tenant role that can reach anything outside
+/// its own tenant schema.
+#[tokio::test]
+async fn tenant_role_with_cross_tenant_reach_is_refused() {
+    let s = require_pg!(setup().await);
+    let b = second_tenant(&s).await;
+    let b_schema = format!("t_{b}");
+    let rw = trole(&s.tenant, "app_rw");
+    for (grant, revoke) in [
+        (
+            format!("GRANT USAGE ON SCHEMA {b_schema} TO {rw}"),
+            format!("REVOKE USAGE ON SCHEMA {b_schema} FROM {rw}"),
+        ),
+        (
+            format!("GRANT SELECT (body) ON {b_schema}.notes TO {rw}"),
+            format!("REVOKE SELECT (body) ON {b_schema}.notes FROM {rw}"),
+        ),
+        (
+            format!("GRANT {} TO {rw}", trole(&b, "app_rw")),
+            format!("REVOKE {} FROM {rw}", trole(&b, "app_rw")),
+        ),
+        (
+            format!("GRANT {rw} TO {}", trole(&b, "public_reader")),
+            format!("REVOKE {rw} FROM {}", trole(&b, "public_reader")),
+        ),
+        (
+            format!("CREATE TABLE public.shared_{b} (x int); GRANT SELECT ON public.shared_{b} TO PUBLIC"),
+            format!("DROP TABLE public.shared_{b}"),
+        ),
+        (format!("ALTER ROLE {rw} INHERIT"), format!("ALTER ROLE {rw} NOINHERIT")),
+        (format!("ALTER ROLE {rw} BYPASSRLS"), format!("ALTER ROLE {rw} NOBYPASSRLS")),
+    ] {
+        s.admin.batch_execute(&grant).await.unwrap();
+        let got = check_tenant(&s.admin_url, &s.tenant, "app_rw").await;
+        s.admin.batch_execute(&revoke).await.unwrap();
+        let err = got.expect_err(&format!("`{grant}` must be refused"));
+        assert!(err.contains("refusing to serve"), "{grant}: {err}");
+    }
+    check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .unwrap();
+    // A pool for one class may not be logged in as another class's role.
+    let exec = PgExec::connect(&url_as(&s.admin_url, &trole(&s.tenant, "public_reader")))
+        .await
+        .unwrap();
+    let err = exec
+        .check_tenant_role(&s.tenant, "app_rw")
+        .await
+        .unwrap_err();
+    assert!(err.contains("not the tenant role"), "{err}");
+}
+
+/// `vibe migrate` refuses a shared migration login and unsafe tenant roles.
+#[tokio::test]
+async fn migrate_requires_a_per_tenant_owner_and_safe_tenant_roles() {
+    let s = require_pg!(setup().await);
+    // s.owner owns s.tenant's schema; it may not migrate another tenant.
+    let shared = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    let other = format!("tw{}", suffix());
+    ensure_tenant_roles(&s.admin_url, &other).await;
+    let err = migrate_tenant(&shared, &manifest(), &other)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("can own schema") && err.contains(&s.tenant),
+        "{err}"
+    );
+    // Missing or unsafe tenant roles.
+    let fresh = format!("tm{}", suffix());
+    ensure_tenant_roles(&s.admin_url, &fresh).await;
+    let owner = PgExec::connect(&url_as(&s.admin_url, &owner_of(&fresh)))
+        .await
+        .unwrap();
+    let reader = trole(&fresh, "public_reader");
+    for (break_it, fix_it, expect) in [
+        (
+            format!("DROP ROLE {reader}"),
+            format!("CREATE ROLE {reader} LOGIN NOINHERIT PASSWORD 'pw'"),
+            "does not exist",
+        ),
+        (
+            format!("ALTER ROLE {reader} INHERIT"),
+            format!("ALTER ROLE {reader} NOINHERIT"),
+            "NOINHERIT",
+        ),
+        (
+            format!("ALTER ROLE {reader} NOLOGIN"),
+            format!("ALTER ROLE {reader} LOGIN"),
+            "LOGIN",
+        ),
+        (
+            format!("GRANT pg_read_all_data TO {reader}"),
+            format!("REVOKE pg_read_all_data FROM {reader}"),
+            "member",
+        ),
+    ] {
+        s.admin.batch_execute(&break_it).await.unwrap();
+        let got = migrate_tenant(&owner, &manifest(), &fresh).await;
+        s.admin.batch_execute(&fix_it).await.unwrap();
+        let err = got.expect_err(&break_it);
+        assert!(
+            err.contains(expect) && err.contains("tenant roles"),
+            "{break_it}: {err}"
+        );
+    }
+    migrate_tenant(&owner, &manifest(), &fresh).await.unwrap();
 }
 
 #[tokio::test]
@@ -291,21 +555,19 @@ async fn rls_isolates_tenants_for_the_runtime_role() {
     )
     .await
     .unwrap();
-    // The table lives in t_<tenant>; a different tenant id points the session
-    // at another schema and a different RLS value, so it must see nothing.
-    // Writing a row with someone else's tenant_id must fail WITH CHECK.
+    // The policy compares with this tenant's id as a constant: a row with
+    // someone else's tenant_id fails WITH CHECK whatever app.tenant_id says.
     let admin = &s.admin;
     let schema = format!("t_{}", s.tenant);
-    let forged = admin
+    let app = connect(&url_as(&s.admin_url, &s.app)).await;
+    let forged = app
         .batch_execute(&format!(
-            "SET ROLE {app}; BEGIN; SET LOCAL ROLE app_rw; SELECT set_config('app.tenant_id', 'othertenant1', true); \
+            "BEGIN; SELECT set_config('app.tenant_id', 'othertenant1', true); \
              INSERT INTO {schema}.notes (id, tenant_id, created_at, updated_at) \
-             VALUES (gen_random_uuid(), '{t}', now(), now()); COMMIT;",
-            app = s.app,
-            t = s.tenant
+             VALUES (gen_random_uuid(), 'othertenant1', now(), now()); COMMIT;"
         ))
         .await;
-    let _ = admin.batch_execute("ROLLBACK; RESET ROLE").await;
+    let _ = app.batch_execute("ROLLBACK").await;
     assert!(
         forged.is_err(),
         "RLS WITH CHECK must reject a forged tenant_id"
@@ -322,44 +584,71 @@ async fn rls_isolates_tenants_for_the_runtime_role() {
 #[tokio::test]
 async fn privileged_or_owning_roles_are_rejected() {
     let s = require_pg!(setup().await);
-    let x = suffix();
-    let cases = [
-        ("su", format!("su_{x}"), "SUPERUSER".to_string()),
-        ("bypass", format!("by_{x}"), "BYPASSRLS".to_string()),
-        (
-            "member-of-superuser",
-            format!("ms_{x}"),
-            "IN ROLE postgres".to_string(),
-        ),
-        (
-            "noinherit-member-of-owner",
-            format!("mo_{x}"),
-            format!("NOINHERIT IN ROLE {}", s.owner),
-        ),
-    ];
-    for (label, name, extra) in &cases {
-        create_login(&s.admin, name, extra).await;
-        let err = check_as(&s.admin_url, name)
-            .await
-            .expect_err(&format!("{label} must be rejected"));
-        assert!(err.contains("refusing to serve"), "{label}: {err}");
-    }
-    // The owner itself.
-    let err = check_as(&s.admin_url, &s.owner).await.unwrap_err();
-    assert!(
-        err.contains("tenant relation") && err.contains("tenant schema"),
-        "{err}"
-    );
-    // NOINHERIT member of a BYPASSRLS group role.
-    let group = format!("grp_{x}");
+    let group = format!("grp_{}", suffix());
     s.admin
         .batch_execute(&format!("CREATE ROLE {group} NOLOGIN BYPASSRLS"))
         .await
         .unwrap();
-    let member = format!("mb_{x}");
-    create_login(&s.admin, &member, &format!("NOINHERIT IN ROLE {group}")).await;
-    let err = check_as(&s.admin_url, &member).await.unwrap_err();
-    assert!(err.contains(&group), "{err}");
+    let cases = [
+        ("su", "SUPERUSER".to_string(), "superuser"),
+        ("bypass", "BYPASSRLS".to_string(), "BYPASSRLS"),
+        (
+            "member-of-superuser",
+            "IN ROLE postgres".to_string(),
+            "member of postgres",
+        ),
+        (
+            "noinherit-member-of-owner",
+            format!("IN ROLE {}", s.owner),
+            "member of",
+        ),
+        (
+            "member-of-bypassrls-group",
+            format!("IN ROLE {group}"),
+            &group,
+        ),
+    ];
+    for (label, extra, expect) in &cases {
+        // A tenant role for a fresh tenant, created with the bad attribute.
+        let tenant = format!("tr{}", suffix());
+        create_login(
+            &s.admin,
+            &trole(&tenant, "app_rw"),
+            &format!("NOINHERIT {extra}"),
+        )
+        .await;
+        let err = check_tenant(&s.admin_url, &tenant, "app_rw")
+            .await
+            .expect_err(&format!("{label} must be rejected"));
+        assert!(
+            err.contains("refusing to serve") && err.contains(*expect),
+            "{label}: {err}"
+        );
+    }
+    // A role that owns objects.
+    let tenant = format!("tr{}", suffix());
+    let rw = trole(&tenant, "app_rw");
+    create_login(&s.admin, &rw, "NOINHERIT").await;
+    s.admin
+        .batch_execute(&format!("CREATE TABLE public.owned_{tenant} (x int); ALTER TABLE public.owned_{tenant} OWNER TO {rw}"))
+        .await
+        .unwrap();
+    let err = check_tenant(&s.admin_url, &tenant, "app_rw")
+        .await
+        .unwrap_err();
+    s.admin
+        .batch_execute(&format!("DROP TABLE public.owned_{tenant}"))
+        .await
+        .unwrap();
+    assert!(err.contains("owns"), "{err}");
+    // Any other login (for example a shared runtime login) is refused.
+    let err = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap()
+        .check_tenant_role(&s.tenant, "app_rw")
+        .await
+        .unwrap_err();
+    assert!(err.contains("not the tenant role"), "{err}");
 }
 
 #[tokio::test]
@@ -378,15 +667,14 @@ async fn migration_tables_get_forced_rls() {
         .unwrap();
     assert!(row.get::<_, bool>(0) && row.get::<_, bool>(1) && row.get::<_, bool>(2));
     // And the runtime role is still accepted.
-    check_as(&s.admin_url, &s.app).await.unwrap();
+    check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn migration_without_tenant_id_or_with_a_view_fails() {
     let s = require_pg!(setup().await);
-    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
-        .await
-        .unwrap();
     for (stmt, expect) in [
         (
             "CREATE TABLE IF NOT EXISTS loose (x text)",
@@ -407,9 +695,7 @@ async fn migration_without_tenant_id_or_with_a_view_fails() {
         let mut m = manifest();
         m.migrations[0].statements = vec![stmt.to_string()];
         let tenant = format!("tv{}", suffix());
-        let err = migrate_tenant(&owner_exec, &m, &tenant, &s.app)
-            .await
-            .unwrap_err();
+        let err = migrate_as(&s, &m, &tenant).await.unwrap_err();
         assert!(err.contains(expect), "{stmt}: {err}");
     }
 }
@@ -419,16 +705,19 @@ async fn serve_refuses_tables_without_forced_rls() {
     let s = require_pg!(setup_exclusive().await);
     let schema = format!("t_{}", s.tenant);
     // A table added behind migrate's back gets no grants by default; one
-    // that a runtime role was granted (even a single column) is refused.
+    // that a tenant role was granted (even a single column) is refused.
     s.admin
         .batch_execute(&format!(
             "SET ROLE {owner}; CREATE TABLE {schema}.later (tenant_id text); RESET ROLE; \
-             GRANT SELECT (tenant_id) ON {schema}.later TO public_reader",
-            owner = s.owner
+             GRANT SELECT (tenant_id) ON {schema}.later TO {reader}",
+            owner = s.owner,
+            reader = trole(&s.tenant, "public_reader")
         ))
         .await
         .unwrap();
-    let err = check_as(&s.admin_url, &s.app).await.unwrap_err();
+    let err = check_tenant(&s.admin_url, &s.tenant, "public_reader")
+        .await
+        .unwrap_err();
     assert!(err.contains(&format!("{schema}.later")), "{err}");
     s.admin
         .batch_execute(&format!(
@@ -436,7 +725,9 @@ async fn serve_refuses_tables_without_forced_rls() {
         ))
         .await
         .unwrap();
-    let err = check_as(&s.admin_url, &s.app).await.unwrap_err();
+    let err = check_tenant(&s.admin_url, &s.tenant, "public_reader")
+        .await
+        .unwrap_err();
     assert!(
         err.contains("later"),
         "ENABLE without FORCE is not enough: {err}"
@@ -447,7 +738,9 @@ async fn serve_refuses_tables_without_forced_rls() {
         ))
         .await
         .unwrap();
-    check_as(&s.admin_url, &s.app).await.unwrap();
+    check_tenant(&s.admin_url, &s.tenant, "public_reader")
+        .await
+        .unwrap();
     // Leave no RLS problem behind for other tests (it has no policy).
     s.admin
         .batch_execute(&format!("DROP TABLE {schema}.later"))
@@ -537,9 +830,6 @@ fn col(name: &str, ty: &str) -> vibe::runtime::Col {
 #[tokio::test]
 async fn migration_policies_are_refused_and_nothing_is_committed() {
     let s = require_pg!(setup().await);
-    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
-        .await
-        .unwrap();
     for stmt in [
         "CREATE POLICY open ON audit_notes USING (true)",
         "CREATE POLICY narrow ON audit_notes AS RESTRICTIVE USING (true)",
@@ -547,9 +837,7 @@ async fn migration_policies_are_refused_and_nothing_is_committed() {
         let mut m = manifest();
         m.migrations[0].statements.push(stmt.to_string());
         let tenant = format!("tp{}", suffix());
-        let err = migrate_tenant(&owner_exec, &m, &tenant, &s.app)
-            .await
-            .unwrap_err();
+        let err = migrate_as(&s, &m, &tenant).await.unwrap_err();
         assert!(
             err.contains("must not create row level security policies"),
             "{stmt}: {err}"
@@ -567,7 +855,7 @@ async fn migration_policies_are_refused_and_nothing_is_committed() {
         assert_eq!(left, 0, "{stmt}: schema must be rolled back");
     }
     // The executor connection is still usable after the rollback.
-    migrate_tenant(&owner_exec, &manifest(), &format!("tq{}", suffix()), &s.app)
+    migrate_as(&s, &manifest(), &format!("tq{}", suffix()))
         .await
         .unwrap();
 }
@@ -576,38 +864,45 @@ async fn migration_policies_are_refused_and_nothing_is_committed() {
 async fn serve_refuses_extra_or_altered_policies() {
     let s = require_pg!(setup_exclusive().await);
     let schema = format!("t_{}", s.tenant);
-    check_as(&s.admin_url, &s.app).await.unwrap();
-    // Reproduce the leak first: an extra permissive policy lets the runtime
-    // role read another tenant's row.
+    check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .unwrap();
+    // Reproduce the leak first: an extra permissive policy lets the tenant
+    // role read a row that is not its tenant's.
     s.admin
         .batch_execute(&format!(
-            "INSERT INTO {schema}.audit_notes VALUES ('othertenant1', 'leak'); \
-             CREATE POLICY open ON {schema}.audit_notes USING (true)"
+            "GRANT SELECT ON {schema}.audit_notes TO {app}; \
+             INSERT INTO {schema}.audit_notes VALUES ('othertenant1', 'leak'); \
+             CREATE POLICY open ON {schema}.audit_notes USING (true)",
+            app = s.app
         ))
         .await
         .unwrap();
-    let leaked = s
-        .admin
-        .batch_execute(&format!(
-            "SET ROLE {app}; BEGIN; SET LOCAL ROLE app_rw; SELECT set_config('app.tenant_id', '{t}', true); \
-             DO $$ BEGIN IF (SELECT count(*) FROM {schema}.audit_notes) = 0 THEN RAISE EXCEPTION 'none'; END IF; END $$; \
-             COMMIT; RESET ROLE",
-            app = s.app,
-            t = s.tenant
-        ))
-        .await;
-    let _ = s.admin.batch_execute("ROLLBACK; RESET ROLE").await;
-    assert!(leaked.is_ok(), "extra permissive policy widens access");
-    let err = check_as(&s.admin_url, &s.app).await.unwrap_err();
-    assert!(
-        err.contains(&format!("{schema}.audit_notes:open")) && err.contains("OR-combined"),
-        "{err}"
-    );
+    let app = connect(&url_as(&s.admin_url, &s.app)).await;
+    let leaked: i64 = app
+        .query_one(
+            &format!("SELECT count(*) FROM {schema}.audit_notes WHERE tenant_id = 'othertenant1'"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(leaked, 1, "extra permissive policy widens access");
+    let err = check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .unwrap_err();
+    assert!(err.contains(&format!("{schema}.audit_notes:open")), "{err}");
     s.admin
-        .batch_execute(&format!("DROP POLICY open ON {schema}.audit_notes"))
+        .batch_execute(&format!(
+            "DROP POLICY open ON {schema}.audit_notes; DELETE FROM {schema}.audit_notes; \
+             REVOKE SELECT ON {schema}.audit_notes FROM {app}",
+            app = s.app
+        ))
         .await
         .unwrap();
-    check_as(&s.admin_url, &s.app).await.unwrap();
+    check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .unwrap();
     // A tenant_isolation whose expression was altered is refused as well.
     s.admin
         .batch_execute(&format!(
@@ -615,46 +910,61 @@ async fn serve_refuses_extra_or_altered_policies() {
         ))
         .await
         .unwrap();
-    let err = check_as(&s.admin_url, &s.app).await.unwrap_err();
+    let err = check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .unwrap_err();
     assert!(err.contains("notes:tenant_isolation"), "{err}");
-    // Restricted to a role instead of PUBLIC: refused.
-    s.admin
-        .batch_execute(&format!(
-            "DROP POLICY tenant_isolation ON {schema}.notes; \
-             CREATE POLICY tenant_isolation ON {schema}.notes TO {app} \
-             USING (\"tenant_id\" = current_setting('app.tenant_id', false)) \
-             WITH CHECK (\"tenant_id\" = current_setting('app.tenant_id', false))",
+    // The old GUC-based policy, or one for PUBLIC / another tenant: refused.
+    for policy in [
+        "USING (\"tenant_id\" = current_setting('app.tenant_id', false)) \
+         WITH CHECK (\"tenant_id\" = current_setting('app.tenant_id', false))"
+            .to_string(),
+        format!(
+            "TO {app} USING (\"tenant_id\" = 'othertenant1') WITH CHECK (\"tenant_id\" = 'othertenant1')",
             app = s.app
-        ))
-        .await
-        .unwrap();
-    assert!(check_as(&s.admin_url, &s.app).await.is_err());
+        ),
+    ] {
+        s.admin
+            .batch_execute(&format!(
+                "DROP POLICY tenant_isolation ON {schema}.notes; \
+                 CREATE POLICY tenant_isolation ON {schema}.notes {policy}"
+            ))
+            .await
+            .unwrap();
+        assert!(
+            check_tenant(&s.admin_url, &s.tenant, "app_rw").await.is_err(),
+            "{policy}"
+        );
+    }
     // Re-running migrate restores the canonical policy.
-    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+    migrate_as(&s, &manifest(), &s.tenant).await.unwrap();
+    check_tenant(&s.admin_url, &s.tenant, "app_rw")
         .await
         .unwrap();
-    migrate_tenant(&owner_exec, &manifest(), &s.tenant, &s.app)
-        .await
-        .unwrap();
-    check_as(&s.admin_url, &s.app).await.unwrap();
 }
 
-/// Count of rows the runtime role sees in `table` while acting as `tenant`.
-async fn visible_rows(s: &Setup, table: &str, tenant: &str) -> i64 {
-    let app = connect(&url_as(&s.admin_url, &s.app)).await;
-    app.batch_execute("BEGIN; SET LOCAL ROLE app_rw")
+/// A migration touching another tenant failed: the per-tenant migration role
+/// has no privileges there (42501 / must be owner), or vibe's own
+/// cross-tenant checks caught it.
+fn blocked(err: &str) -> bool {
+    [
+        "row level security check failed",
+        "another tenant",
+        "42501",
+        "must be owner",
+    ]
+    .iter()
+    .any(|m| err.contains(m))
+}
+
+/// Count of rows in `table` (a tenant's `audit_notes`) visible to the
+/// tenant role of `tenant`; `None` if it may not read the table at all.
+async fn visible_rows(s: &Setup, table: &str, tenant: &str) -> Option<i64> {
+    let app = connect(&url_as(&s.admin_url, &trole(tenant, "app_rw"))).await;
+    app.query_one(&format!("SELECT count(*) FROM {table}"), &[])
         .await
-        .unwrap();
-    app.query("SELECT set_config('app.tenant_id', $1, true)", &[&tenant])
-        .await
-        .unwrap();
-    let n: i64 = app
-        .query_one(&format!("SELECT count(*) FROM {table}"), &[])
-        .await
-        .unwrap()
-        .get(0);
-    app.batch_execute("ROLLBACK").await.unwrap();
-    n
+        .ok()
+        .map(|row| row.get(0))
 }
 
 #[tokio::test]
@@ -666,9 +976,6 @@ async fn migration_cannot_weaken_another_tenant() {
             "INSERT INTO {victim}.audit_notes VALUES ('{t}', 'secret')",
             t = s.tenant
         ))
-        .await
-        .unwrap();
-    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
         .await
         .unwrap();
     let attacks = [
@@ -685,13 +992,8 @@ async fn migration_cannot_weaken_another_tenant() {
         let mut m = manifest();
         m.migrations[0].statements.push(attack.clone());
         let tenant = format!("ta{}", suffix());
-        let err = migrate_tenant(&owner_exec, &m, &tenant, &s.app)
-            .await
-            .unwrap_err();
-        assert!(
-            err.contains("row level security check failed") || err.contains("another tenant"),
-            "{attack}: {err}"
-        );
+        let err = migrate_as(&s, &m, &tenant).await.unwrap_err();
+        assert!(blocked(&err), "{attack}: {err}");
         // Nothing was committed: the attacker's schema does not exist and
         // the victim is unchanged.
         let left: i64 = s
@@ -705,20 +1007,19 @@ async fn migration_cannot_weaken_another_tenant() {
             .get(0);
         assert_eq!(left, 0, "{attack}");
         assert_eq!(
-            visible_rows(&s, &format!("{victim}.audit_notes"), "othertenant1").await,
-            0,
-            "{attack}: victim rows must stay hidden from other tenants"
+            visible_rows(&s, &format!("{victim}.audit_notes"), &tenant).await,
+            None,
+            "{attack}: other tenants cannot read the victim's table"
         );
-        check_as(&s.admin_url, &s.app).await.unwrap();
+        check_tenant(&s.admin_url, &s.tenant, "app_rw")
+            .await
+            .unwrap();
     }
 }
 
 #[tokio::test]
 async fn migration_cannot_end_the_transaction() {
     let s = require_pg!(setup().await);
-    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
-        .await
-        .unwrap();
     for attack in [
         "COMMIT",
         "END",
@@ -731,9 +1032,7 @@ async fn migration_cannot_end_the_transaction() {
         let mut m = manifest();
         m.migrations[0].statements.push(attack.to_string());
         let tenant = format!("tx{}", suffix());
-        let err = migrate_tenant(&owner_exec, &m, &tenant, &s.app)
-            .await
-            .unwrap_err();
+        let err = migrate_as(&s, &m, &tenant).await.unwrap_err();
         assert!(err.contains("not allowed in migrations"), "{attack}: {err}");
         let left: i64 = s
             .admin
@@ -753,9 +1052,7 @@ async fn migration_cannot_end_the_transaction() {
         .push("CREATE PROCEDURE sneaky() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END $$".into());
     m.migrations[0].statements.push("CALL sneaky()".into());
     let tenant = format!("ty{}", suffix());
-    migrate_tenant(&owner_exec, &m, &tenant, &s.app)
-        .await
-        .unwrap_err();
+    migrate_as(&s, &m, &tenant).await.unwrap_err();
     let left: i64 = s
         .admin
         .query_one(
@@ -767,7 +1064,7 @@ async fn migration_cannot_end_the_transaction() {
         .get(0);
     assert_eq!(left, 0);
     // The executor connection still works afterwards.
-    migrate_tenant(&owner_exec, &manifest(), &format!("tz{}", suffix()), &s.app)
+    migrate_as(&s, &manifest(), &format!("tz{}", suffix()))
         .await
         .unwrap();
 }
@@ -775,14 +1072,11 @@ async fn migration_cannot_end_the_transaction() {
 #[tokio::test]
 async fn postgres_errors_carry_detail() {
     let s = require_pg!(setup().await);
-    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
-        .await
-        .unwrap();
     let mut m = manifest();
     m.migrations[0]
         .statements
         .push("ALTER TABLE no_such_table ADD COLUMN x text".into());
-    let err = migrate_tenant(&owner_exec, &m, &format!("te{}", suffix()), &s.app)
+    let err = migrate_as(&s, &m, &format!("te{}", suffix()))
         .await
         .unwrap_err();
     assert!(
@@ -834,9 +1128,6 @@ async fn smuggled_commit_after_a_dollar_identifier_is_refused() {
     // old lexer, hiding a COMMIT and a cross-tenant policy.
     let s = require_pg!(setup().await);
     let victim = format!("t_{}", s.tenant);
-    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
-        .await
-        .unwrap();
     for attack in [
         format!(
             "CREATE TABLE zq (tenant_id text, a$x$ int); COMMIT; \
@@ -847,9 +1138,7 @@ async fn smuggled_commit_after_a_dollar_identifier_is_refused() {
         let mut m = manifest();
         m.migrations[0].statements.push(attack.clone());
         let tenant = format!("td{}", suffix());
-        let err = migrate_tenant(&owner_exec, &m, &tenant, &s.app)
-            .await
-            .unwrap_err();
+        let err = migrate_as(&s, &m, &tenant).await.unwrap_err();
         assert!(
             err.contains("42601") || err.contains("multiple commands"),
             "{attack}: {err}"
@@ -883,9 +1172,6 @@ async fn smuggled_commit_after_a_dollar_identifier_is_refused() {
 async fn migration_cannot_touch_another_tenants_types_or_default_privileges() {
     let s = require_pg!(setup().await);
     let victim = format!("t_{}", s.tenant);
-    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
-        .await
-        .unwrap();
     for attack in [
         format!("ALTER DEFAULT PRIVILEGES IN SCHEMA {victim} GRANT DELETE ON TABLES TO PUBLIC"),
         format!("CREATE TYPE {victim}.mood AS ENUM ('a')"),
@@ -896,10 +1182,10 @@ async fn migration_cannot_touch_another_tenants_types_or_default_privileges() {
     ] {
         let mut m = manifest();
         m.migrations[0].statements.push(attack.clone());
-        let err = migrate_tenant(&owner_exec, &m, &format!("tf{}", suffix()), &s.app)
+        let err = migrate_as(&s, &m, &format!("tf{}", suffix()))
             .await
             .unwrap_err();
-        assert!(err.contains("another tenant"), "{attack}: {err}");
+        assert!(blocked(&err), "{attack}: {err}");
     }
 }
 
@@ -915,41 +1201,36 @@ async fn existing_rls_problems_fail_every_migration() {
         .await
         .unwrap();
     assert!(
-        check_as(&s.admin_url, &s.app).await.is_err(),
+        check_tenant(&s.admin_url, &s.tenant, "app_rw")
+            .await
+            .is_err(),
         "serve refuses"
     );
-    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
-        .await
-        .unwrap();
-    let err = migrate_tenant(&owner_exec, &manifest(), &format!("tg{}", suffix()), &s.app)
+    let err = migrate_as(&s, &manifest(), &format!("tg{}", suffix()))
         .await
         .unwrap_err();
     assert!(err.contains("already present before this run"), "{err}");
     assert!(err.contains(&victim), "{err}");
     // Migrating the affected tenant repairs it.
-    migrate_tenant(&owner_exec, &manifest(), &s.tenant, &s.app)
+    migrate_as(&s, &manifest(), &s.tenant).await.unwrap();
+    check_tenant(&s.admin_url, &s.tenant, "app_rw")
         .await
         .unwrap();
-    check_as(&s.admin_url, &s.app).await.unwrap();
 }
 
 const PENDING_ROLE_SPEC: &str =
-    "pending spec PR + PM approval: per-tenant migrate role (SET LOCAL ROLE tenant_<id>, NOINHERIT, own-schema grants only)";
+    "decision 97: each tenant migrates with its own migration role that owns only its schema";
 
 /// Migrates a fresh attacker tenant with `attack` appended; returns its schema.
 async fn attack_data(s: &Setup, attack: &[String]) -> String {
-    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
-        .await
-        .unwrap();
     let mut m = manifest();
     m.migrations[0].statements.extend(attack.iter().cloned());
     let tenant = format!("th{}", suffix());
-    let _ = migrate_tenant(&owner_exec, &m, &tenant, &s.app).await;
+    let _ = migrate_as(s, &m, &tenant).await;
     format!("t_{tenant}")
 }
 
 #[tokio::test]
-#[ignore = "pending spec: per-tenant migrate role; see PENDING_ROLE_SPEC"]
 async fn migration_cannot_read_another_tenants_rows() {
     let s = require_pg!(setup().await);
     let victim = format!("t_{}", s.tenant);
@@ -993,7 +1274,6 @@ async fn migration_cannot_read_another_tenants_rows() {
 }
 
 #[tokio::test]
-#[ignore = "pending spec: per-tenant migrate role; see PENDING_ROLE_SPEC"]
 async fn migration_cannot_write_another_tenants_rows() {
     let s = require_pg!(setup().await);
     let victim = format!("t_{}", s.tenant);
@@ -1018,10 +1298,7 @@ async fn migration_cannot_write_another_tenants_rows() {
         format!("UPDATE {victim}.audit_notes SET note = 'pwned'"),
         format!("ALTER TABLE {victim}.audit_notes FORCE ROW LEVEL SECURITY"),
     ]);
-    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
-        .await
-        .unwrap();
-    let _ = migrate_tenant(&owner_exec, &m, &format!("ti{}", suffix()), &s.app).await;
+    let _ = migrate_as(&s, &m, &format!("ti{}", suffix())).await;
     let note: String = s
         .admin
         .query_one(
@@ -1112,22 +1389,15 @@ fn p_update(id: &str, column: &str, expected: &str) -> Stmt {
 }
 
 /// Runs the same statements through the in-memory executor and PostgreSQL
-/// (as the real runtime login, with `SET LOCAL ROLE`) and requires the same
-/// outcome class for each.
+/// (through per-tenant pools logged in as each tenant role, as `vibe serve`
+/// does) and requires the same outcome class for each.
 #[tokio::test]
 async fn memory_and_postgres_agree() {
     let s = require_pg!(setup().await);
     let other = format!("to{}", suffix());
-    let owner_exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
-        .await
-        .unwrap();
-    migrate_tenant(&owner_exec, &manifest(), &other, &s.app)
-        .await
-        .unwrap();
-    let pg = PgExec::connect(&url_as(&s.admin_url, &s.app))
-        .await
-        .unwrap();
-    pg.check_runtime_role().await.unwrap();
+    migrate_as(&s, &manifest(), &other).await.unwrap();
+    let pg = pools_for(&s.admin_url, &[&s.tenant, &other]);
+    assert_eq!(pg.check_all().await.unwrap(), 6);
     let mem = vibe::runtime::MemoryExec::from_manifest(&manifest()).unwrap();
     let t = s.tenant.clone();
     let row1 = uuid::Uuid::new_v4().to_string();
@@ -1333,49 +1603,57 @@ async fn memory_and_postgres_agree() {
     }
 }
 
-/// What PostgreSQL itself does when a statement runs without the tenant
-/// setting. The executors never do this (they refuse an invalid tenant up
-/// front); the test documents the database-level behaviour on a pooled
-/// connection, where an earlier transaction already defined the setting.
+/// `app.tenant_id` is not an identity (decision 97): a tenant login sees its
+/// own rows with the setting unset or set to another tenant, and never sees
+/// another tenant's rows, on fresh and reused sessions alike.
 #[tokio::test]
-async fn missing_tenant_setting_in_postgres() {
+async fn tenant_setting_is_not_the_tenant_boundary() {
     let s = require_pg!(setup().await);
+    let b = second_tenant(&s).await;
     let schema = format!("t_{}", s.tenant);
-    let app = connect(&url_as(&s.admin_url, &s.app)).await;
-    // Fresh session: the setting was never defined, so the policy errors.
-    let fresh = app
+    s.admin
         .batch_execute(&format!(
-            "BEGIN; SET LOCAL ROLE app_rw; SELECT count(*) FROM {schema}.notes"
+            "INSERT INTO {schema}.notes (id, tenant_id, body, created_at, updated_at) \
+             VALUES (gen_random_uuid(), '{t}', 'a', now(), now())",
+            t = s.tenant
         ))
-        .await;
-    app.batch_execute("ROLLBACK").await.unwrap();
-    assert!(fresh.is_err(), "a fresh session must error");
-    // Reused session: `set_config(.., true)` left the setting defined as
-    // '' after commit, so the same query matches no tenant and returns 0
-    // rows instead of failing.
-    app.batch_execute(&format!(
-        "BEGIN; SELECT set_config('app.tenant_id', '{}', true); COMMIT",
-        s.tenant
-    ))
-    .await
-    .unwrap();
-    app.batch_execute("BEGIN; SET LOCAL ROLE app_rw")
         .await
         .unwrap();
-    let n: i64 = app
-        .query_one(&format!("SELECT count(*) FROM {schema}.notes"), &[])
+    let app = connect(&url_as(&s.admin_url, &s.app)).await;
+    let count = |sql: String| {
+        let app = &app;
+        async move { app.query_one(&sql, &[]).await.map(|r| r.get::<_, i64>(0)) }
+    };
+    // Fresh session, setting never defined: own rows are visible.
+    assert_eq!(
+        count(format!("SELECT count(*) FROM {schema}.notes"))
+            .await
+            .unwrap(),
+        1
+    );
+    // Setting pointed at tenant B: still only own rows, B's schema denied.
+    app.batch_execute(&format!("SELECT set_config('app.tenant_id', '{b}', false)"))
         .await
-        .unwrap()
-        .get(0);
-    app.batch_execute("ROLLBACK").await.unwrap();
-    assert_eq!(n, 0);
+        .unwrap();
+    assert_eq!(
+        count(format!("SELECT count(*) FROM {schema}.notes"))
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(count(format!("SELECT count(*) FROM t_{b}.notes"))
+        .await
+        .is_err());
 }
 
 #[tokio::test]
 async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
     let s = require_pg!(setup().await);
+    let tenant = format!("tc{}", suffix());
+    ensure_tenant_roles(&s.admin_url, &tenant).await;
+    let owner = owner_of(&tenant);
     let exec = PgExec::connect_with(
-        &url_as(&s.admin_url, &s.owner),
+        &url_as(&s.admin_url, &owner),
         vibe::runtime::PgOptions {
             pool_size: 1,
             statement_timeout_ms: 30_000,
@@ -1386,7 +1664,6 @@ async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
     .unwrap();
     let mut m = manifest();
     m.migrations[0].statements.push("SELECT pg_sleep(5)".into());
-    let tenant = format!("tc{}", suffix());
     // Cancel the migration while it sleeps inside its transaction, after
     // reading the pid of the backend running it from pg_stat_activity.
     let find_pid = async {
@@ -1396,7 +1673,7 @@ async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
                 .query(
                     "SELECT pid FROM pg_stat_activity WHERE usename = $1 \
                      AND state = 'active' AND query LIKE 'SELECT pg_sleep(5)%'",
-                    &[&s.owner],
+                    &[&owner],
                 )
                 .await
                 .unwrap();
@@ -1406,7 +1683,7 @@ async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     };
-    let migration = migrate_tenant(&exec, &m, &tenant, &s.app);
+    let migration = migrate_tenant(&exec, &m, &tenant);
     let sleeping_pid = tokio::select! {
         pid = tokio::time::timeout(std::time::Duration::from_secs(4), find_pid) => {
             pid.expect("the migration's pg_sleep never showed up in pg_stat_activity")

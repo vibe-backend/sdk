@@ -375,14 +375,12 @@ async fn cmd_serve(
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::from_manifest(&manifest)?)
     } else {
-        let url = std::env::var("VIBE_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .map_err(|_| {
-                "set VIBE_DATABASE_URL or pass --memory for the dev executor".to_string()
-            })?;
-        let pg = PgExec::connect_with(&url, vibe::runtime::PgOptions::from_env()?).await?;
-        pg.check_runtime_role().await?;
-        Arc::new(pg)
+        // One pool per (tenant, role class), logged in as the tenant role
+        // itself (decision 97); every configured role is checked now.
+        let pools = vibe::runtime::TenantPools::from_env()?;
+        let checked = pools.check_all().await?;
+        println!("checked {checked} tenant database role(s)");
+        Arc::new(pools)
     };
     let loaded = vibe::runtime::load_project_slugs(project, memory)?;
     for warning in &loaded.warnings {
@@ -439,11 +437,8 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
     let url = std::env::var("VIBE_MIGRATE_DATABASE_URL").map_err(|_| {
         "VIBE_MIGRATE_DATABASE_URL is required (the owner role used for DDL; `vibe serve` uses a separate non-owner VIBE_DATABASE_URL)".to_string()
     })?;
-    let runtime_role = std::env::var("VIBE_RUNTIME_DB_ROLE").map_err(|_| {
-        "VIBE_RUNTIME_DB_ROLE is required (the non-owner role `vibe serve` connects as; it is granted SELECT, INSERT, UPDATE)".to_string()
-    })?;
     let exec = PgExec::connect(&url).await?;
-    for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant, &runtime_role).await? {
+    for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant).await? {
         println!("{line}");
     }
     Ok(())

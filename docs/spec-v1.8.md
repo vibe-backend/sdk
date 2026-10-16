@@ -919,8 +919,9 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
   - 每個 request 一個 transaction（同 7.4 一樣），失敗就成個 request rollback，令失敗恢復行為（例如 11.4 重試）一致；超時同衝突錯誤碼（`TX_TIMEOUT`、`TX_CONFLICT`）一樣。
 - **已知語意差異**（喺 terminal 啟動訊息同文件列明）：
   - 只支援 lock 白名單用到嘅 SQL 子集；任意 SQL 函數、複雜 JOIN／subquery、window function 未必支援，唔支援就報 `MEMORY_UNSUPPORTED_SQL`，唔會靜靜錯。
-  - 冇完整 policy 模型：只模擬編譯器產生嘅標準 policy（`rls: enable, force` 加 `tenant_id = current_setting('app.tenant_id', false)`，USING 同 WITH CHECK 一樣，PERMISSIVE，FOR ALL）。其他 policy（RESTRICTIVE、分命令、USING 同 WITH CHECK 唔同、DELETE）、owner／superuser／`BYPASSRLS`／冇 FORCE，同埋三個 runtime role 以外嘅 grant，`vibe dev` 啟動時一律報 `MEMORY_UNSUPPORTED_SQL`（fail closed）；production 由 `check_runtime_role` 拒絕呢類 connection role。
-  - 現時嘅 tenant 模型（共用 runtime login 加 `app.tenant_id` 設定）會由每個 tenant 獨立 login pool 取代（決定 97／98）；到時呢節嘅 tenant 語意要跟住更新。
+  - 冇完整 policy 模型：只模擬編譯器產生嘅標準 policy（lock 寫 `rls: enable, force` 加 `tenant_id = current_setting('app.tenant_id', false)`；PostgreSQL 由 `vibe migrate` 換成 `TO` 該租戶三個 role、寫死租戶 id 常數嘅 `tenant_isolation`，USING 同 WITH CHECK 一樣，PERMISSIVE，FOR ALL）。其他 policy（RESTRICTIVE、分命令、USING 同 WITH CHECK 唔同、DELETE）、owner／superuser／`BYPASSRLS`／冇 FORCE，同埋三個 runtime role 類別以外嘅 grant，`vibe dev` 啟動時一律報 `MEMORY_UNSUPPORTED_SQL`（fail closed）；production 由 `check_tenant_role` 拒絕呢類租戶 role。
+  - 租戶身份（決定 97，#98 已實作）：PostgreSQL 每個（租戶、role 類別）一個連線池，直接以 `tenant_<id>_rw`／`tenant_<id>_public_reader`／`tenant_<id>_public_writer` 登入，冇 `SET ROLE`；in-memory 用 key 結構分租戶，冇 role 或者連線概念，所以「切換身份」類測試只喺 PostgreSQL 跑。
+  - 平台自動補嘅欄位權限（effective grant）：有 SELECT 嘅 role（包括 `public_reader`）會額外得到 `id`、`deleted_at` 嘅 SELECT；有寫權限嘅 role（包括 `public_writer`）會額外得到 `id`、`updated_at`、`deleted_at`（同 owner key）嘅 SELECT。原因係平台產生嘅 SQL 一定喺 `WHERE`／`RETURNING` 用到呢啲欄位，PostgreSQL 要求 SELECT 權限。即係 public reader 睇得到 row id 同係咪已刪除，public writer 讀得到 id、更新時間同刪除狀態，就算 lock 冇寫；兩個執行器同 `vibe migrate` 一樣咁做。
   - 冇真正並發隔離（全部 statement 串行），所以 race condition（例如 refresh 寬限期兩個並發請求）喺 in-memory 測唔出。
   - `now()`、`interval` 用 process 時鐘；collation、排序同大小寫比較用 Unicode code point，可能同 PostgreSQL locale 唔同。
   - CTE 只支援 11.4a 嗰個「insert CTE + 同表 SELECT」固定模式。

@@ -36,7 +36,7 @@ const STANDARD_POLICY: &str = "tenant_id = current_setting('app.tenant_id', fals
 /// per-command policies, USING vs WITH CHECK differences, DELETE), and grants
 /// for roles other than the three runtime roles. Owner/superuser, BYPASSRLS
 /// and connection pooling do not exist here; production refuses such
-/// connection roles at startup (`check_runtime_role`).
+/// tenant roles at startup (`PgExec::check_tenant_role`).
 pub struct MemoryExec {
     tables: Mutex<BTreeMap<String, Vec<Row>>>,
     models: BTreeMap<String, MemTable>,

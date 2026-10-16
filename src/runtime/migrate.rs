@@ -3,14 +3,56 @@ use crate::manifest::Manifest;
 use super::exec::{PgExec, PgSession};
 use super::grants::{parse_grants, pg_grant_statements};
 use super::slugs::valid_tenant;
-use super::sql::{
-    bootstrap_statements, quote, rls_statements, runtime_grant_statements,
-    runtime_schema_statements, Col,
-};
+use super::sql::{bootstrap_statements, quote, rls_statements, tenant_schema_statements, Col};
+
+/// Problems with a tenant's pre-created roles, as seen by the owner role
+/// (decision 97). `$1` is the tenant id; one row per problem.
+pub const TENANT_ROLE_SETUP_SQL: &str = "\
+WITH want(name) AS (SELECT unnest(ARRAY[ \
+   'tenant_' || $1::text || '_rw', 'tenant_' || $1::text || '_public_reader', \
+   'tenant_' || $1::text || '_public_writer'])) \
+SELECT format('%s: %s', w.name, p) FROM want w LEFT JOIN pg_roles r ON r.rolname = w.name, \
+ LATERAL (VALUES \
+   (CASE WHEN r.oid IS NULL THEN 'does not exist' END), \
+   (CASE WHEN NOT r.rolcanlogin THEN 'is not LOGIN' END), \
+   (CASE WHEN r.rolinherit THEN 'is not NOINHERIT' END), \
+   (CASE WHEN r.rolsuper THEN 'is a superuser' END), \
+   (CASE WHEN r.rolbypassrls THEN 'has BYPASSRLS' END), \
+   (CASE WHEN r.rolcreaterole OR r.rolcreatedb OR r.rolreplication \
+     THEN 'has CREATEROLE, CREATEDB or REPLICATION' END), \
+   (CASE WHEN EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid OR m.roleid = r.oid) \
+     THEN 'is a member of another role or has members' END)) v(p) \
+WHERE p IS NOT NULL ORDER BY 1";
+
+/// Problems with the migration login for tenant `$1` (decision 97): it must
+/// be that tenant's own migration role, so it can neither own nor use any
+/// other tenant's schema, and it must not be (or be able to become) a
+/// superuser, a BYPASSRLS role, or any tenant runtime role.
+pub const MIGRATE_ROLE_SQL: &str = "\
+SELECT x FROM ( \
+ SELECT 'is or can become a superuser or BYPASSRLS role ' || quote_ident(m.rolname) AS x \
+   FROM pg_roles m WHERE (m.rolsuper OR m.rolbypassrls) \
+   AND pg_has_role(current_user, m.oid, 'MEMBER') \
+ UNION ALL \
+ SELECT format('can own schema %I', n.nspname) FROM pg_namespace n \
+   WHERE n.nspname LIKE 't\\_%' AND n.nspname <> 't_' || $1::text \
+   AND pg_has_role(current_user, n.nspowner, 'MEMBER') \
+ UNION ALL \
+ SELECT format('can use schema %I', n.nspname) FROM pg_namespace n \
+   WHERE n.nspname LIKE 't\\_%' AND n.nspname <> 't_' || $1::text \
+   AND NOT pg_has_role(current_user, n.nspowner, 'MEMBER') \
+   AND has_schema_privilege(current_user, n.oid, 'USAGE') \
+ UNION ALL \
+ SELECT format('is or can become tenant role %I', r.rolname) FROM pg_roles r \
+   WHERE r.rolname LIKE 'tenant\\_%' AND pg_has_role(current_user, r.oid, 'MEMBER') \
+) y ORDER BY 1";
 
 /// Bootstraps one tenant schema and applies migrations, connected as the
-/// owner role. Grants the runtime role SELECT/INSERT/UPDATE only.
-/// Returns progress lines.
+/// owner role. Grants only that tenant's own roles (`tenant_<id>_rw`,
+/// `tenant_<id>_public_reader`, `tenant_<id>_public_writer`, see
+/// [`super::grants::tenant_role`]) SELECT/INSERT/UPDATE per the model
+/// grants. The roles are created by an operator beforehand; migrate refuses
+/// to run if any is missing or unsafe. Returns progress lines.
 ///
 /// Runs in one transaction: if any step (including the RLS checks) fails,
 /// nothing is committed, so a failed migration never leaves a table without
@@ -19,10 +61,23 @@ pub async fn migrate_tenant(
     exec: &PgExec,
     manifest: &Manifest,
     tenant: &str,
-    runtime_role: &str,
 ) -> Result<Vec<String>, String> {
     if !valid_tenant(tenant) {
         return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
+    }
+    let problems = exec.query_texts(MIGRATE_ROLE_SQL, tenant).await?;
+    if !problems.is_empty() {
+        return Err(format!(
+            "refusing to migrate t_{tenant}: the migration login {}; use a migration role that owns only this tenant's schema (VIBE_MIGRATE_DATABASE_URL, decision 97)",
+            problems.join(", ")
+        ));
+    }
+    let problems = exec.query_texts(TENANT_ROLE_SETUP_SQL, tenant).await?;
+    if !problems.is_empty() {
+        return Err(format!(
+            "tenant roles are not set up safely: {}; create each as `CREATE ROLE <name> LOGIN NOINHERIT PASSWORD '...'` with no other attributes and no role memberships (decision 97)",
+            problems.join("; ")
+        ));
     }
     // Refuse transaction control up front: a COMMIT inside migration SQL
     // would end vibe's transaction and commit tables before RLS is applied.
@@ -54,7 +109,7 @@ pub async fn migrate_tenant(
         session
             .batch(&[format!("SET LOCAL vibe.migrate_tx = '{marker}'")])
             .await?;
-        let log = migrate_in_tx(&session, manifest, tenant, runtime_role).await?;
+        let log = migrate_in_tx(&session, manifest, tenant).await?;
         still_in_transaction(&session, &marker).await?;
         Ok::<_, String>(log)
     }
@@ -162,7 +217,6 @@ async fn migrate_in_tx(
     exec: &PgSession,
     manifest: &Manifest,
     tenant: &str,
-    runtime_role: &str,
 ) -> Result<Vec<String>, String> {
     let mut log = Vec::new();
     let schema = format!("t_{tenant}");
@@ -184,20 +238,13 @@ async fn migrate_in_tx(
             .map(|field| field.name.clone())
             .collect();
         exec.batch(&bootstrap_statements(
-            &schema,
+            tenant,
             &model.table,
             &fields,
             &uniques,
         )?)
         .await?;
-        exec.batch(&runtime_schema_statements(&schema, runtime_role)?)
-            .await?;
-        exec.batch(&runtime_grant_statements(
-            &schema,
-            &model.table,
-            runtime_role,
-        )?)
-        .await?;
+        exec.batch(&tenant_schema_statements(tenant)?).await?;
         log.push(format!("bootstrapped {schema}.{}", model.table));
     }
     // Migration DDL names tables unqualified; resolve them in the tenant
@@ -215,16 +262,17 @@ async fn migrate_in_tx(
         exec.batch(&["RESET search_path".to_string()]).await?;
         log.push(format!("applied {}", migration.id));
     }
-    // The runtime roles get exactly the effective grants from the lock, on
-    // every run (a changed grant is applied by the next migrate).
+    // The tenant's own roles get exactly the effective grants from the lock,
+    // on every run (a changed grant is applied by the next migrate). No other
+    // role is granted anything on this schema.
     for model in &manifest.models {
         let grants = parse_grants(&model.grants)
             .map_err(|err| format!("model {}: grants: {err}", model.id))?;
-        exec.batch(&pg_grant_statements(&schema, model, &grants)?)
+        exec.batch(&pg_grant_statements(tenant, model, &grants)?)
             .await?;
         log.push(format!("granted {schema}.{}", model.table));
     }
-    log.extend(protect_schema(exec, &schema).await?);
+    log.extend(protect_schema(exec, tenant).await?);
     // Fail closed: any RLS problem in any tenant schema fails the migration,
     // whether this run introduced it or it was already there (for example
     // left by an earlier, unprotected migration). `vibe serve` refuses to
@@ -265,7 +313,8 @@ async fn migrate_in_tx(
 /// Any policy other than `tenant_isolation` fails too: permissive policies
 /// are OR-combined, so `CREATE POLICY open ON t USING (true)` in a migration
 /// would expose every tenant's rows.
-async fn protect_schema(exec: &PgSession, schema: &str) -> Result<Vec<String>, String> {
+async fn protect_schema(exec: &PgSession, tenant: &str) -> Result<Vec<String>, String> {
+    let schema = &format!("t_{tenant}");
     let unsafe_rels = exec
         .query_texts(
             "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -338,7 +387,7 @@ async fn protect_schema(exec: &PgSession, schema: &str) -> Result<Vec<String>, S
         .await?;
     let mut log = Vec::new();
     for table in tables {
-        exec.batch(&rls_statements(schema, &table)?).await?;
+        exec.batch(&rls_statements(tenant, &table)?).await?;
         log.push(format!("row level security on {schema}.{table}"));
     }
     Ok(log)
@@ -347,29 +396,22 @@ async fn protect_schema(exec: &PgSession, schema: &str) -> Result<Vec<String>, S
 /// RLS problems in every tenant schema, as `schema.table: problem`.
 /// Every table in every tenant schema (`t_%`), not just the one being
 /// migrated, must have ENABLE + FORCE RLS and exactly one policy:
-/// `tenant_isolation`, permissive, for all commands and roles, with the same
-/// expressions vibe installs. The owner role owns every tenant schema, so a
-/// migration for tenant A could otherwise weaken tenant B (e.g. `CREATE POLICY
-/// open ON t_b.notes USING (true)` or `ALTER TABLE ... NO FORCE ROW LEVEL
-/// SECURITY`), and `vibe serve` only checks at startup.
+/// `tenant_isolation`, permissive, for all commands, applying exactly to
+/// that schema's three tenant roles, comparing `tenant_id` with that
+/// schema's tenant id as a constant (decision 97). The owner role may own
+/// every tenant schema, so a migration for tenant A could otherwise weaken
+/// tenant B (e.g. `CREATE POLICY open ON t_b.notes USING (true)` or
+/// `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`), and `vibe serve` only
+/// checks at startup.
 async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>, String> {
     exec.query_texts(
-        r#"WITH ref AS (
-                 -- The expression vibe installs: this tenant's, or before it
-                 -- exists, the most common one among tenant schemas.
-                 SELECT q, w FROM (
-                   SELECT pg_get_expr(p.polqual, p.polrelid) AS q,
-                          pg_get_expr(p.polwithcheck, p.polrelid) AS w,
-                          n.nspname = $1 AS own
-                   FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
-                   JOIN pg_namespace n ON n.oid = c.relnamespace
-                   WHERE n.nspname LIKE 't\_%' AND p.polname = 'tenant_isolation') x
-                 GROUP BY q, w ORDER BY bool_or(own) DESC, count(*) DESC LIMIT 1),
-               rels AS (
+        &format!(
+            r#"WITH rels AS (
                  SELECT c.oid, format('%I.%I', n.nspname, c.relname) AS name, c.relkind,
-                        c.relrowsecurity, c.relforcerowsecurity
+                        c.relrowsecurity, c.relforcerowsecurity, substr(n.nspname, 3) AS tenant
                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname LIKE 't\_%' AND c.relkind IN ('r','p','v','m','f'))
+                 WHERE n.nspname LIKE 't\_%' AND c.relkind IN ('r','p','v','m','f')
+                 AND $1::text IS NOT NULL)
              SELECT name || ': ' || problem FROM (
                SELECT name, 'view, materialized view or foreign table' AS problem
                  FROM rels WHERE relkind IN ('v','m','f')
@@ -383,20 +425,33 @@ async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>,
                  WHERE p.polname <> 'tenant_isolation'
                UNION ALL
                SELECT r.name, 'tenant_isolation policy was altered'
-                 FROM rels r JOIN pg_policy p ON p.polrelid = r.oid, ref
-                 WHERE p.polname = 'tenant_isolation' AND (
-                   NOT p.polpermissive OR p.polcmd <> '*' OR p.polroles <> '{0}'::oid[]
-                   OR pg_get_expr(p.polqual, p.polrelid) IS DISTINCT FROM ref.q
-                   OR pg_get_expr(p.polwithcheck, p.polrelid) IS DISTINCT FROM ref.w)
+                 FROM rels r JOIN pg_policy p ON p.polrelid = r.oid
+                 WHERE p.polname = 'tenant_isolation' AND NOT ({canonical})
                UNION ALL
                SELECT r.name, 'tenant_isolation policy is missing'
                  FROM rels r WHERE r.relkind IN ('r','p') AND NOT EXISTS (
                    SELECT 1 FROM pg_policy p WHERE p.polrelid = r.oid
                    AND p.polname = 'tenant_isolation')
              ) x ORDER BY 1"#,
+            canonical = canonical_policy_sql("p", "r.tenant")
+        ),
         own_schema,
     )
     .await
+}
+
+/// SQL condition: policy `p` is the canonical `tenant_isolation` for the
+/// tenant id in SQL expression `tenant` (see `sql::rls_statements`).
+pub fn canonical_policy_sql(p: &str, tenant: &str) -> String {
+    format!(
+        "({p}.polpermissive AND {p}.polcmd = '*' \
+         AND cardinality({p}.polroles) = 3 \
+         AND (SELECT count(*) FROM pg_roles WHERE oid = ANY({p}.polroles) AND rolname IN ( \
+           'tenant_' || {tenant} || '_rw', 'tenant_' || {tenant} || '_public_reader', \
+           'tenant_' || {tenant} || '_public_writer')) = 3 \
+         AND pg_get_expr({p}.polqual, {p}.polrelid) = format('(tenant_id = %L::text)', {tenant}) \
+         AND pg_get_expr({p}.polwithcheck, {p}.polrelid) = format('(tenant_id = %L::text)', {tenant}))"
+    )
 }
 
 /// A digest of every other tenant schema's tables, columns, policies,

@@ -6,6 +6,7 @@ pub mod jwks;
 mod limiter;
 mod memory;
 mod migrate;
+mod pools;
 mod slugs;
 mod sql;
 
@@ -18,8 +19,9 @@ pub use http::{
 pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
 pub use memory::{MemoryExec, MEMORY_UNSUPPORTED_SQL};
 pub use migrate::migrate_tenant;
+pub use pools::{parse_tenant_role, TenantPools, MAX_TENANT_POOL_SIZE};
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
 pub use sql::{
-    bootstrap_statements, quote as sql_quote, runtime_grant_statements, runtime_schema_statements,
-    Col, Sort, Stmt,
+    bootstrap_statements, quote as sql_quote, rls_statements, tenant_schema_statements, Col, Sort,
+    Stmt,
 };

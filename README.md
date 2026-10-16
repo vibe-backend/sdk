@@ -61,16 +61,23 @@ vibe serve --manifest manifest.json --project tests/fixtures/shop --memory
 
 **Breaking (#31):** `vibe manifest` without `-o` writes `./manifest.json` relative to the current working directory (same as `-o` / `serve --manifest`), not `<project>/manifest.json`.
 
-`--memory` is a dev executor. PostgreSQL needs an owner login, a runtime login, and three NOLOGIN runtime roles: `app_rw`, `public_reader` and `public_writer`. An operator creates the roles once and grants them to the runtime login (`GRANT app_rw, public_reader, public_writer TO vibe_app WITH INHERIT FALSE, SET TRUE`). `vibe migrate` connects with the owner role (`VIBE_MIGRATE_DATABASE_URL`) and gives each runtime role exactly the table and column grants from the model locks (`## Policies` `grants:`). The runtime login named in `VIBE_RUNTIME_DB_ROLE` gets no table privileges of its own. `vibe serve` connects as that login (`VIBE_DATABASE_URL`, or `DATABASE_URL`) and runs every statement after `SET LOCAL ROLE` to the role the route uses. It refuses to start if the login cannot switch to the three roles, or if it is, or can `SET ROLE` to, a superuser or BYPASSRLS role, or can own any tenant schema, relation, function or type, because row-level security would not apply. A statement the role is not allowed to run returns 403 `FORBIDDEN`; the details are only logged. `VIBE_RUNTIME_DB_ROLE` is required:
+`--memory` is a dev executor. With PostgreSQL every tenant has its own database roles (spec decision 97, #98); there is no shared runtime login and no `SET ROLE`. An operator pre-creates, per tenant `<id>`:
+
+- three login roles, `tenant_<id>_rw`, `tenant_<id>_public_reader` and `tenant_<id>_public_writer`, each `LOGIN NOINHERIT PASSWORD '...'` with no other attributes and no role memberships in either direction;
+- a migration role that owns only that tenant's schema (for example `CREATE ROLE own_<id> LOGIN` plus `GRANT CREATE ON DATABASE app TO own_<id>`; it must not be a superuser, BYPASSRLS, or a member of any other tenant's roles).
+
+`vibe migrate` connects as the tenant's migration role (`VIBE_MIGRATE_DATABASE_URL`). It refuses to run if that login can own or use another tenant's schema, or if the three tenant roles are missing or unsafe. It creates `t_<id>`, gives only that tenant's three roles USAGE and exactly the table and column grants from the model locks (`## Policies` `grants:`), and installs on every table ENABLE + FORCE row-level security with a `tenant_isolation` policy `TO` those three roles that compares `tenant_id` with the tenant id as a constant. `app.tenant_id` is still set per transaction, but only for logs; it is never part of an access decision.
+
+`vibe serve` opens one pool per (tenant, role class) and logs in directly as the tenant role: `VIBE_DATABASE_URL` (or `DATABASE_URL`) names the server and database, and `VIBE_TENANT_DB_SECRETS` is the path of a JSON object mapping each tenant role to its password (`{"tenant_acme0001_rw": "...", ...}`; the user in the URL is ignored). At startup it logs in as every role in that file and refuses to start unless the role is exactly the expected tenant role, NOINHERIT, not a superuser, without BYPASSRLS, has no role memberships (so `SET ROLE` reaches nothing), owns nothing, can reach no schema or relation outside `t_<id>` (other tenants, shared tables in `public`, CREATE anywhere), and every relation in `t_<id>` has ENABLE + FORCE RLS and only the canonical policy. Each statement also checks that the connection is logged in as the right role. A statement the role is not allowed to run returns 403 `FORBIDDEN`; the details are only logged.
 
 ```bash
-VIBE_MIGRATE_DATABASE_URL=postgres://owner@db/app VIBE_RUNTIME_DB_ROLE=vibe_app \
+VIBE_MIGRATE_DATABASE_URL=postgres://own_tenant0001@db/app \
   vibe migrate --manifest manifest.json --project tests/fixtures/shop --tenant tenant0001
-VIBE_DATABASE_URL=postgres://vibe_app@db/app \
+VIBE_DATABASE_URL=postgres://db/app VIBE_TENANT_DB_SECRETS=/run/secrets/vibe-tenant-db.json \
   vibe serve --manifest manifest.json --project tests/fixtures/shop
 ```
 
-`vibe serve` uses a connection pool (`VIBE_DB_POOL_SIZE`, default 16). It waits up to `VIBE_DB_POOL_TIMEOUT_MS` (default 5000) for a free connection, and each request transaction runs with `statement_timeout` = `VIBE_DB_STATEMENT_TIMEOUT_MS` (default 5000). Connections to hosts other than localhost or loopback require TLS (certificate and hostname verified against the webpki roots) unless the URL says `sslmode=disable`. `sslmode=require`, `verify-ca` and `verify-full` always use verified TLS.
+`vibe serve` uses one connection pool per tenant role (`VIBE_DB_POOL_SIZE`, default 16, capped at 5 per pool, spec §7.1). It waits up to `VIBE_DB_POOL_TIMEOUT_MS` (default 5000) for a free connection, and each request transaction runs with `statement_timeout` = `VIBE_DB_STATEMENT_TIMEOUT_MS` (default 5000). Connections to hosts other than localhost or loopback require TLS (certificate and hostname verified against the webpki roots) unless the URL says `sslmode=disable`. `sslmode=require`, `verify-ca` and `verify-full` always use verified TLS.
 
 Structured markdown compiles with no model call. Natural-language sources need the variables in [.env.example](.env.example). `LLM_*` wins over `OPENAI_*`. Sampling parameters are sent only when the model is in the adapter capability table. Copy `.env.example` to `.env` (gitignored) and do not put a real key in the repo.
 

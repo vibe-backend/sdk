@@ -21,7 +21,19 @@ added only when the corresponding PR is merged to `main`.
 
 <!--
 Pending — add each entry only when its PR merges:
-- #51: migrate requires VIBE_MIGRATE_DATABASE_URL and VIBE_RUNTIME_DB_ROLE; no longer reads VIBE_DATABASE_URL.
+- #51: migrate requires VIBE_MIGRATE_DATABASE_URL; no longer reads VIBE_DATABASE_URL.
+- #98 (release note, Breaking): per-tenant database roles (decision 97). Before upgrading, an operator
+  must pre-create for every tenant <id>: `tenant_<id>_rw`, `tenant_<id>_public_reader` and
+  `tenant_<id>_public_writer` (each `LOGIN NOINHERIT PASSWORD ...`, no other attributes, no role
+  memberships either way) and a migration role that owns only `t_<id>` (needs CREATE on the database).
+  `vibe migrate` refuses to run without them and refuses a migration login that can own or use another
+  tenant's schema; re-run it for every tenant to replace the old `current_setting('app.tenant_id')`
+  policy with the per-tenant one. `vibe serve` needs `VIBE_TENANT_DB_SECRETS` (JSON role -> password)
+  and logs in as each tenant role; `VIBE_RUNTIME_DB_ROLE` and the shared `app_rw` / `public_reader` /
+  `public_writer` roles of #99 are no longer used (revoke and drop them). There is no
+  `GRANT ... WITH INHERIT FALSE, SET TRUE` any more, so this design adds no PostgreSQL 16+
+  requirement (that grant syntax, used by the #99 instructions, needs PG16+). On PostgreSQL 14 and
+  older, revoke CREATE on schema `public` from PUBLIC or `vibe serve` refuses to start.
 - #61: stricter lock validation — unknown step keys and unparseable expressions are errors;
   API validate steps need `when` and `fail` and now actually execute; write SQL needs
   `writes: true` and `writes: true` needs a write; SELECT INTO counts as a write and as DDL
