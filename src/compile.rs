@@ -525,7 +525,7 @@ pub(crate) fn dump_llm_output(
                 return Err(std::io::Error::last_os_error());
             }
             dir = unsafe { fs::File::from_raw_fd(fd) };
-            if unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } < 0 {
+            if created == 0 && unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } < 0 {
                 return Err(std::io::Error::last_os_error());
             }
         }
@@ -555,32 +555,7 @@ pub(crate) fn dump_llm_output(
         #[allow(unreachable_code)]
         fs::File::create(&path)?
     };
-    let mut known: Vec<String> = std::env::vars()
-        .filter(|(name, _)| {
-            name.contains("API_KEY") || name.contains("TOKEN") || name.contains("SECRET")
-        })
-        .map(|(_, value)| value)
-        .filter(|v| !v.is_empty())
-        .collect();
-    known.extend(secrets.iter().map(|v| v.to_string()));
-    // Longest values first so overlapping credentials are removed completely.
-    known.sort_by_key(|v| std::cmp::Reverse(v.len()));
-    let mut text = raw.to_string();
-    for secret in known {
-        if !secret.is_empty() {
-            text = text.replace(&secret, "[redacted]");
-        }
-    }
-    for pattern in [
-        r"(?im)authorization\s*:[^\r\n]*",
-        r"(?i)bearer\s+[a-z0-9._~+/=-]+",
-        r"\b(?:sk-|xai-|ghp_)[A-Za-z0-9_-]+",
-    ] {
-        text = regex::Regex::new(pattern)
-            .expect("redaction pattern")
-            .replace_all(&text, "[redacted]")
-            .into_owned();
-    }
+    let text = crate::llm::redact(raw, secrets);
     file.write_all(text.as_bytes())?;
     Ok(path)
 }
@@ -589,6 +564,7 @@ pub(crate) fn dump_llm_output(
 mod dump_tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn dump_writes_redacted_response() {
         let dir = std::env::temp_dir().join(format!("vibe-dump-{}", uuid::Uuid::new_v4()));
@@ -648,8 +624,108 @@ mod dump_tests {
                 & 0o777,
             0o700
         );
+        assert_eq!(
+            fs::metadata(root.join(".vibe"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         let text = fs::read_to_string(path).unwrap();
         for value in ["sk-value", "xai-value", "ghp_value", "abc", "known"] {
+            assert!(!text.contains(value), "{text}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_directories_keep_permissions_and_vibe_symlinks_are_refused() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("vibe-dump-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join(".vibe/llm-dump")).unwrap();
+        for name in [".vibe", ".vibe/llm-dump"] {
+            fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dump_llm_output(&root, "a.md", 1, "text", &[]).unwrap();
+        for name in [".vibe", ".vibe/llm-dump"] {
+            assert_eq!(
+                fs::metadata(root.join(name)).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        fs::rename(root.join(".vibe"), root.join("saved")).unwrap();
+        symlink(root.join("saved"), root.join(".vibe")).unwrap();
+        assert!(dump_llm_output(&root, "a.md", 2, "text", &[]).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_redacts_connection_strings_and_password_settings() {
+        let root = std::env::temp_dir().join(format!("vibe-dump-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let raw = "postgres://user:pgpass@host mysql://user:mysqlpass@host mongodb+srv://user:mongopass@host redis://:redispass@host DATABASE_URL=private-value\nPassword=adopass; DB_PASSWD=settingpass APP_PWD=otherpass";
+        let path = dump_llm_output(&root, "a.md", 1, raw, &[]).unwrap();
+        let text = fs::read_to_string(path).unwrap();
+        for secret in [
+            "pgpass",
+            "mysqlpass",
+            "mongopass",
+            "redispass",
+            "private-value",
+            "adopass",
+            "settingpass",
+            "otherpass",
+        ] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_redacts_password_environment_values() {
+        if std::env::var_os("VIBE_TEST_PASSWORD_DUMP").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "compile::dump_tests::dump_redacts_password_environment_values",
+                ])
+                .env("VIBE_TEST_PASSWORD_DUMP", "1")
+                .env("TEST_DB_PASSWORD", "password-value")
+                .env("TEST_DB_PASSWD", "passwd-value")
+                .env("TEST_DB_PWD", "pwd-value")
+                .env("TEST_SIGNING_KEY", "key-value")
+                .env("TEST_CLIENT_SECRET", "secret-value")
+                .env("TEST_ACCESS_TOKEN", "token-value")
+                .env("TEST_DATABASE_URL", "database-value")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("vibe-dump-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let path = dump_llm_output(
+            &root,
+            "a.md",
+            1,
+            "values: password-value passwd-value pwd-value key-value secret-value token-value database-value",
+            &[],
+        )
+        .unwrap();
+        let text = fs::read_to_string(path).unwrap();
+        for value in [
+            "password-value",
+            "passwd-value",
+            "pwd-value",
+            "key-value",
+            "secret-value",
+            "token-value",
+            "database-value",
+        ] {
             assert!(!text.contains(value), "{text}");
         }
         fs::remove_dir_all(root).unwrap();
@@ -1887,11 +1963,18 @@ fn declaration_check(doc: &LockDoc, source: &SourceFile, english: &str) -> Vec<D
 
 /// `word` occurs in `text` (lowercased) at least once in a clause that is
 /// not negated, and not as part of a longer identifier ("public-writable").
-/// A clause runs between sentence punctuation (`.;!?`, newline) or "but";
-/// it is negated when an odd number of negators precede the word in it, so
+/// Code spans and fenced blocks are excluded. Chinese negators apply across
+/// short grammatical gaps. A clause runs between sentence punctuation (`.;!?`, newline) or "but";
+/// a nearby negator applies through short grammatical gaps. An even number
+/// of English negators cancels negation, so
 /// "not a public endpoint", "must never be public" and "do not, under any
 /// circumstances, remove auth" are negated and "not unless ... not" is not.
 pub(crate) fn affirms(text: &str, word: &str) -> bool {
+    let text = regex::Regex::new(r"(?s)```.*?(?:```|$)|`+[^`]*`+")
+        .expect("code pattern")
+        .replace_all(text, " ")
+        .into_owned();
+    let text = text.as_str();
     const NEGATORS: &[&str] = &[
         "not", "no", "never", "without", "cannot", "nor", "neither", "none", "nobody",
     ];
@@ -1936,11 +2019,17 @@ pub(crate) fn affirms(text: &str, word: &str) -> bool {
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '\''))
             .filter(|w| NEGATORS.contains(w) || w.ends_with("n't") || *w == "non")
             .count();
-        let chinese_negated = !word.is_ascii()
-            && ["不", "無", "未", "禁止", "毋須"]
-                .iter()
-                .any(|n| clause.contains(n));
-        if negations % 2 == 1 || chinese_negated {
+        let english_negated = regex::Regex::new(
+            r"(?:^|[^a-z0-9_])(?:not|no|never|without|cannot|nor|neither|none|nobody|[a-z]+n't|non)(?:[\s,-]+(?:a|an|the|be|been|being|is|are|ever|require|requires|need|needs|allow|allows|use|using|under|any|circumstances)){0,5}[\s,-]*$",
+        )
+        .expect("English negation pattern")
+        .is_match(clause);
+        let chinese_negated = regex::Regex::new(
+            r"[唔不冇無毋非](?:需要|要求|允許|可以|須|需|會|是|要|用|使用|\s){0,3}$",
+        )
+        .expect("negation pattern")
+        .is_match(clause);
+        if (negations % 2 == 1 && english_negated) || chinese_negated {
             continue;
         }
         return true;
@@ -2491,6 +2580,32 @@ mod security_tests {
 
     const PUBLIC: &str = "## Access\n- public: true\n## Pipelines\n### -auth\n- removed: true\n";
     const PRIVATE: &str = "## Access\n- public: false\n## Pipelines\n### auth\n- mode: jwt\n";
+
+    #[test]
+    fn source_negation_and_code_are_excluded() {
+        for text in [
+            "唔共享",
+            "不共享",
+            "冇共享",
+            "無共享",
+            "毋共享",
+            "非共享",
+            "不需要共享",
+            "not shared",
+            "no shared",
+            "never shared",
+            "does not require shared",
+            "```\nshared 共享\n```",
+            "`shared` `共享`",
+        ] {
+            assert!(!affirms(text, "shared"), "{text}");
+            assert!(!affirms(text, "共享"), "{text}");
+        }
+        assert!(affirms("不需要登入；共享", "共享"));
+        assert!(affirms("`shared` then shared", "shared"));
+        assert!(affirms("not private and shared", "shared"));
+        assert!(affirms("不需要登入，共享", "共享"));
+    }
 
     #[test]
     fn affirms_is_clause_scoped() {

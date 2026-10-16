@@ -334,7 +334,7 @@ project/
 - **做法**：用現有 LLM adapter（2A.8，同一個 provider 設定同沙盒），prompt `translate-1`：
   - 直譯，唔解釋、唔補充、唔總結；保留識別字、數字同否定（例如「唔公開」一定譯做 not public）。
   - Source 放喺有分隔嘅 data-only `SOURCE` 區塊（同編譯 prompt 一樣嘅分隔方式），入面任何指示都唔會執行；冇工具、冇 function calling。
-- **用途限制**：譯文**只**用嚟做關鍵字同一致性檢查。Lock 內容、`source-hash`、編譯 prompt 同編譯 cache key 一律用原文；譯文唔會寫入 lock，亦唔會送去編譯器。語意檢查唔再有中文關鍵字同否定詞，全部對英文譯文做。
+- **用途限制**：譯文**只**用嚟做關鍵字同一致性檢查。Lock 內容、`source-hash`、編譯 prompt 同編譯 cache key 一律用原文；譯文唔會寫入 lock，亦唔會送去編譯器。安全關鍵字檢查以原文為準，譯文唔可以補足原文缺少嘅關鍵字。忽略 fenced code blocks（```）同 inline code；直接喺關鍵字之前嘅否定詞（唔、不、冇、無、毋、非；not、no、never）會令該次出現唔計，容許短語法間隔，例如 `does not require`。
 - **失敗**：翻譯 call 失敗、回應格式唔啱、或者譯文缺咗原文嘅識別字／數字，成次編譯失敗（#93 全部或者冇，冇 lock 會寫入）；冇 fallback，唔會略過檢查。
 - **Cache**：`.vibe/cache/translate/<sha256>`，key 係 `source-hash` + provider + model snapshot + translate prompt 版本 + 實際送出參數。**高風險 release build 唔可以用翻譯 cache**（決定 110），一定重新翻譯。
 - **Call 上限**：翻譯 call 計入 #92 P5 嘅每次編譯 LLM call 上限；超過即編譯失敗（決定 111）。

@@ -201,7 +201,9 @@ fn request() -> LlmRequest {
         model: "gpt-test-2026-01-01".into(),
         seed: 0,
         timeout: Duration::from_secs(5),
-        budget: None,
+        budget: Some(std::sync::Arc::new(vibe::llm_budget::CallBudget::new(
+            vibe::llm_budget::Limits::default(),
+        ))),
     }
 }
 

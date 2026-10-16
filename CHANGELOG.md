@@ -24,6 +24,11 @@ added only when the corresponding PR is merged to `main`.
 
 ### Fixed
 
+- Source security keyword checks exclude negated Chinese and English terms and fenced or inline code.
+- LLM dumps redact password settings and credential-bearing URLs and connection strings, preserve existing directory permissions, and refuse symlink components inside the project.
+- Calls without an explicit LLM budget share an environment-configured counter across calls.
+- The direct `libc` dependency is restricted to Unix targets.
+
 - Security keyword checks require support in the original source, including Chinese wording; translations cannot supply support.
 - LLM dump writes refuse symbolic links, use private permissions and redact known keys, tokens and authorization headers.
 - `LLM_FORMAT_RETRIES` accepts only ASCII digits within its supported range and rejects invalid values.

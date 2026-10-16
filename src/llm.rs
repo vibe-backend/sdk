@@ -36,7 +36,7 @@ pub struct LlmRequest {
     pub seed: u64,
     pub timeout: Duration,
     /// Shared per-source / per-run cap on attempts and time (#83).
-    /// `None` uses the default bound for this call, including transport retries.
+    /// `None` shares the process-wide environment-configured bound, including retries.
     pub budget: Option<std::sync::Arc<crate::llm_budget::CallBudget>>,
 }
 
@@ -310,17 +310,25 @@ pub trait LlmAdapter: Send + Sync {
     }
 }
 
+/// Calls without an explicit run budget share one process-wide budget.
+fn default_budget() -> Result<std::sync::Arc<crate::llm_budget::CallBudget>, String> {
+    static BUDGET: std::sync::OnceLock<
+        Result<std::sync::Arc<crate::llm_budget::CallBudget>, String>,
+    > = std::sync::OnceLock::new();
+    BUDGET
+        .get_or_init(|| crate::llm_budget::CallBudget::from_env().map(std::sync::Arc::new))
+        .clone()
+}
+
 /// Every LLM call goes through here so the budget holds for any adapter.
 pub async fn call_budgeted(
     adapter: &dyn LlmAdapter,
     request: &LlmRequest,
 ) -> Result<LlmResponse, String> {
     let mut bounded = request.clone();
-    bounded.budget.get_or_insert_with(|| {
-        std::sync::Arc::new(crate::llm_budget::CallBudget::new(
-            crate::llm_budget::Limits::default(),
-        ))
-    });
+    if bounded.budget.is_none() {
+        bounded.budget = Some(default_budget()?);
+    }
     let request = &bounded;
     if !adapter.enforces_budget() {
         if let Some(budget) = &request.budget {
@@ -718,13 +726,47 @@ pub fn parse_duration_ms(raw: &str) -> Option<u64> {
 }
 
 pub fn redact(text: &str, secrets: &[&str]) -> String {
-    let mut out = text.to_string();
-    for secret in secrets {
-        if secret.len() >= 8 && *secret != "replace-me" {
-            out = out.replace(secret, "[redacted]");
+    let mut known: Vec<String> = std::env::vars()
+        .filter(|(name, _)| {
+            [
+                "KEY",
+                "TOKEN",
+                "SECRET",
+                "PASSWORD",
+                "PASSWD",
+                "PWD",
+                "DATABASE_URL",
+            ]
+            .iter()
+            .any(|part| name.to_ascii_uppercase().contains(part))
+        })
+        .map(|(_, value)| value)
+        .filter(|v| !v.is_empty())
+        .collect();
+    known.extend(secrets.iter().map(|v| v.to_string()));
+    // Longest values first so overlapping credentials are removed completely.
+    known.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    let mut text = text.to_string();
+    for secret in known {
+        if !secret.is_empty() {
+            text = text.replace(&secret, "[redacted]");
         }
     }
-    out
+    for pattern in [
+        r#"(?i)[a-z][a-z0-9+.-]*://[^\s/"'<>]*@[^\s"'<>]*"#,
+        r#"(?i)\b[a-z0-9_]*(?:password|passwd|pwd)[a-z0-9_]*[\s"']*[:=]\s*(?:"[^"]*"|'[^']*'|[^;\s,}]+)"#,
+        r"(?i)\b(?:password|passwd|pwd)\s*=\s*[^;\r\n]*",
+        r#"(?i)\b[a-z0-9_]*database_url[\s"']*[:=]\s*(?:"[^"]*"|'[^']*'|[^;\s,}]+)"#,
+        r"(?im)authorization\s*:[^\r\n]*",
+        r"(?i)bearer\s+[a-z0-9._~+/=-]+",
+        r"\b(?:sk-|xai-|ghp_)[A-Za-z0-9_-]+",
+    ] {
+        text = regex::Regex::new(pattern)
+            .expect("redaction pattern")
+            .replace_all(&text, "[redacted]")
+            .into_owned();
+    }
+    text
 }
 
 pub struct HttpAdapter {
@@ -833,11 +875,9 @@ impl LlmAdapter for HttpAdapter {
 
     async fn compile(&self, request: &LlmRequest) -> Result<LlmResponse, String> {
         let mut bounded = request.clone();
-        bounded.budget.get_or_insert_with(|| {
-            std::sync::Arc::new(crate::llm_budget::CallBudget::new(
-                crate::llm_budget::Limits::default(),
-            ))
-        });
+        if bounded.budget.is_none() {
+            bounded.budget = Some(default_budget()?);
+        }
         let request = &bounded;
         let mut attempt = 0u32;
         let max = self.config.max_retries;
@@ -1287,8 +1327,74 @@ pub fn runtime_llm_env_present() -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn redact_connection_strings_and_settings() {
+        for scheme in [
+            "postgres",
+            "postgresql",
+            "mysql",
+            "mongodb+srv",
+            "redis",
+            "amqp",
+        ] {
+            let raw = format!("before {scheme}://user:credential@host/db after");
+            let text = redact(&raw, &[]);
+            assert!(!text.contains("credential"), "{scheme}: {text}");
+            assert!(text.contains("before") && text.contains("after"));
+        }
+        for raw in [
+            "Server=host;Password=ado-value;Database=db;",
+            "Server=host;Pwd=ado-value;Database=db;",
+            "Password=\"ado;value\";",
+            "DATABASE_URL=private-connection",
+            r#"{"DATABASE_URL": "private-connection"}"#,
+            "APP_DATABASE_URL='private-connection'",
+        ] {
+            let text = redact(raw, &[]);
+            assert!(!text.contains("ado-value"), "{text}");
+            assert!(!text.contains("ado;value"), "{text}");
+            assert!(!text.contains("private-connection"), "{text}");
+            assert!(text.contains("[redacted]"), "{text}");
+        }
+        assert_eq!(redact("short abc", &["abc"]), "short [redacted]");
+    }
+
     #[tokio::test]
-    async fn request_without_budget_has_default_bound() {
+    async fn default_budget_is_shared_and_configured() {
+        if std::env::var_os("VIBE_TEST_DEFAULT_BUDGET").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "llm::tests::default_budget_is_shared_and_configured",
+                ])
+                .env("VIBE_TEST_DEFAULT_BUDGET", "1")
+                .env("LLM_MAX_CALLS_PER_SOURCE", "2")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let adapter = FakeAdapter {
+            responder: |_: &LlmRequest| Ok("done".into()),
+        };
+        let request = LlmRequest {
+            system: String::new(),
+            input: String::new(),
+            model: "test".into(),
+            seed: 0,
+            timeout: Duration::from_secs(1),
+            budget: None,
+        };
+        assert!(call_budgeted(&adapter, &request).await.is_ok());
+        assert!(call_budgeted(&adapter, &request).await.is_ok());
+        assert!(call_budgeted(&adapter, &request)
+            .await
+            .unwrap_err()
+            .contains("2 calls"));
+    }
+
+    #[tokio::test]
+    async fn explicit_budget_is_enforced() {
         let adapter = FakeAdapter {
             responder: |request: &LlmRequest| {
                 let budget = request.budget.as_ref().expect("default bound");
@@ -1306,7 +1412,9 @@ mod tests {
             model: "test".into(),
             seed: 0,
             timeout: Duration::from_secs(1),
-            budget: None,
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         assert!(call_budgeted(&adapter, &request).await.is_ok());
     }
@@ -1408,7 +1516,9 @@ mod tests {
                 model: model.into(),
                 seed: 0,
                 timeout: Duration::from_secs(5),
-                budget: None,
+                budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                    crate::llm_budget::Limits::default(),
+                ))),
             };
             let (url, _, _) = gemini_call(&config, &request);
             let expected = format!(
@@ -1434,7 +1544,9 @@ mod tests {
             model: "gemini-2.5-pro-001".into(),
             seed: 0,
             timeout: Duration::from_secs(5),
-            budget: None,
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         let (url, _, _) = gemini_call(&config, &request);
         assert_eq!(
@@ -1494,7 +1606,9 @@ mod tests {
             model: "vendor-model-2026-09-01".into(),
             seed: 0,
             timeout: Duration::from_secs(1),
-            budget: None,
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         let unknown = model_capabilities(OPENAI, &request.model, 0);
         assert!(
@@ -1796,7 +1910,9 @@ mod responses_tests {
                 model: model.into(),
                 seed: 7,
                 timeout: Duration::from_secs(5),
-                budget: None,
+                budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                    crate::llm_budget::Limits::default(),
+                ))),
             };
             let err = adapter.compile(&request).await.unwrap_err();
             assert!(err.contains(&status.to_string()), "{status}: {err}");
@@ -1837,7 +1953,9 @@ mod responses_tests {
                 model: model.into(),
                 seed: config.seed,
                 timeout: config.timeout,
-                budget: None,
+                budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                    crate::llm_budget::Limits::default(),
+                ))),
             };
             let (_, body, _) = openai_responses_call(&config, &request);
             let stamp = params.to_map();
@@ -1933,7 +2051,9 @@ mod responses_tests {
             model: model.into(),
             seed: 7,
             timeout: Duration::from_secs(5),
-            budget: None,
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         *reply.lock().unwrap() =
             json!({"status": "completed", "model": model, "output_text": "## A"});
@@ -1963,7 +2083,9 @@ mod responses_tests {
             model: "gpt-5.1-2026-01-01".into(),
             seed: 0,
             timeout: Duration::from_secs(1),
-            budget: None,
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         let body = openai_responses_body(&request, &model_capabilities(OPENAI, "gpt-5.1", 0));
         assert_eq!(body["instructions"], "sys");

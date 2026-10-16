@@ -365,13 +365,13 @@ async fn chinese_left_in_translation_is_not_an_error() {
     .unwrap_or_else(|err| panic!("{err}"));
 }
 
-async fn check_source_keywords(translated_keyword: bool) {
+async fn check_source_keywords_text(translated_keyword: bool, replacement: &str) {
     let root = fixture();
     let path = root.join("models/product/product.md");
     let text = fs::read_to_string(&path).unwrap();
     fs::write(
         &path,
-        text.replace("屬於整個商店（租戶）共享的資料。", "商品有名稱與價格。"),
+        text.replace("屬於整個商店（租戶）共享的資料。", replacement),
     )
     .unwrap();
     let adapter = FakeAdapter {
@@ -411,12 +411,12 @@ async fn check_source_keywords(translated_keyword: bool) {
 
 #[tokio::test]
 async fn keyword_check_uses_source() {
-    check_source_keywords(false).await;
+    check_source_keywords_text(false, "商品有名稱與價格。").await;
 }
 
 #[tokio::test]
 async fn keyword_check_uses_source_with_translation() {
-    check_source_keywords(true).await;
+    check_source_keywords_text(true, "商品有名稱與價格。").await;
 }
 
 #[tokio::test]
@@ -442,4 +442,24 @@ async fn supported_chinese_source_compiles() {
     .unwrap_or_else(|report| panic!("{report}"));
     assert_eq!(out.files.len(), 7);
     fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn negated_and_code_keywords_do_not_support_ownership() {
+    for text in [
+        "唔共享",
+        "不共享",
+        "冇共享",
+        "無共享",
+        "毋共享",
+        "非共享",
+        "not shared",
+        "no shared",
+        "never shared",
+        "does not require shared",
+        "```\n共享 shared\n```",
+        "`共享` `shared`",
+    ] {
+        check_source_keywords_text(true, text).await;
+    }
 }
