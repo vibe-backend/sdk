@@ -39,7 +39,7 @@ SDK 目前有多個未合併且部分相互堆疊的 PR。直接在 `main` 重�
 
 - #75：reference field／expand（Draft；2026-10-16 已合併 `main` 解衝突；產品決定延至 v1.1，見下方風險）
 - #77、#95、#106：auth 三階段（#95 已合併其 base 解衝突；#77 與 `main` 仍有衝突）
-- #88：method step validator（`main` 已有對應 commit `bcf1207`；PR 本身仍為 open，待確認是否可關閉）
+- #88：method step validator（已合併入 `main`，`bcf1207`）
 - #92、#93、#96：自然語言編譯與中文 source（#92 已合併 `main` 解衝突；#93 仍需處理）
 - #99：MemoryExec RLS／grant（Draft；已合併 `main` 解衝突；其 PostgreSQL 共用 runtime login 模型與 spec v1.8 決定 97 的租戶 login role 模型不一致，需重新對齊）
 - #116：release signing（與核心 runtime 無直接依賴）
