@@ -28,12 +28,19 @@ updates:
         versions: [">=0.13"]
       - dependency-name: digest
         versions: [">=0.11"]
+      # held back with the RustCrypto upgrade, see #149.
+      - dependency-name: argon2
+        versions: [">=0.6"]
+      - dependency-name: password-hash
+        versions: [">=0.6"]
     groups:
       rustcrypto:
         patterns:
           - "sha2"
           - "hmac"
           - "digest"
+          - "argon2"
+          - "password-hash"
         update-types: ["minor", "patch"]
       cargo:
         patterns: ["*"]
