@@ -451,6 +451,7 @@ async fn signed_token_round_trips_through_runtime_verification() {
         min_override_ms: None,
         honor_test_ip: true,
         dev_hints: false,
+        challenge: None,
     }));
     let call = |bearer: String| {
         let app = app.clone();
@@ -604,6 +605,7 @@ async fn pg_app() -> Option<(axum::Router, tokio_postgres::Client, String, Strin
         min_override_ms: None,
         honor_test_ip: true,
         dev_hints: false,
+        challenge: None,
     }));
     Some((app, admin, tenant, app_url))
 }

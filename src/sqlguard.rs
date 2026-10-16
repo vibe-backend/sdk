@@ -7,8 +7,8 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, BinaryOperator, DataType, Expr, Ident, ObjectName, Query, SelectItem, SetExpr,
-    Statement, TableFactor, TimezoneInfo, Visit, Visitor,
+    ArrayElemTypeDef, BinaryOperator, DataType, Expr, Ident, ObjectName, Query, SelectItem,
+    SetExpr, Statement, TableFactor, TimezoneInfo, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -275,7 +275,10 @@ fn decode_unicode_escapes(input: &str) -> String {
 }
 
 fn normalize_type_name_parts(idents: &[Ident]) -> Option<String> {
-    let parts: Vec<String> = idents.iter().map(|i| normalize_ident_value(&i.value)).collect();
+    let parts: Vec<String> = idents
+        .iter()
+        .map(|i| normalize_ident_value(&i.value))
+        .collect();
     match parts.as_slice() {
         [base] => Some(base.clone()),
         [schema, base] if schema == "pg_catalog" => Some(base.clone()),
