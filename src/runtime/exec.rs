@@ -434,18 +434,6 @@ impl RoleStatus {
     }
 }
 
-/// Oldest supported server (`server_version_num`): PostgreSQL 16.
-pub const MIN_SERVER_VERSION_NUM: i32 = 160000;
-
-/// The error for a server older than [`MIN_SERVER_VERSION_NUM`], if any.
-pub fn server_version_problem(version_num: i32) -> Option<String> {
-    (version_num < MIN_SERVER_VERSION_NUM).then(|| {
-        format!(
-            "PostgreSQL 16 or later required (server_version_num {version_num}); upgrade the database server"
-        )
-    })
-}
-
 /// Catalog query behind [`PgExec::check_tenant_role`], run while logged in
 /// as the tenant role. `$1` is the tenant id, `$2` the expected role name.
 pub fn tenant_role_status_sql() -> String {
@@ -703,6 +691,22 @@ pub struct PgExec {
     options: PgOptions,
 }
 
+/// Lowest supported `server_version_num` (PostgreSQL 16, decision 129).
+pub const MIN_SERVER_VERSION_NUM: u32 = 160000;
+
+/// Fails closed unless `server_version_num` is PostgreSQL 16 or later.
+pub fn check_server_version(server_version_num: &str) -> Result<(), String> {
+    let num: u32 = server_version_num.trim().parse().map_err(|_| {
+        format!("PostgreSQL 16 or later required (unreadable server_version_num {server_version_num:?})")
+    })?;
+    if num < MIN_SERVER_VERSION_NUM {
+        return Err(format!(
+            "PostgreSQL 16 or later required (server_version_num is {num})"
+        ));
+    }
+    Ok(())
+}
+
 impl PgExec {
     pub async fn connect(url: &str) -> Result<Self, String> {
         Self::connect_with(url, PgOptions::default()).await
@@ -751,27 +755,19 @@ impl PgExec {
             .build()
             .map_err(|err| err.to_string())?;
         // Fail at startup, not on the first request.
-        drop(pool.get().await.map_err(pool_error)?);
+        let client = pool.get().await.map_err(pool_error)?;
+        let row = client
+            .query_one("SHOW server_version_num", &[])
+            .await
+            .map_err(|err| format!("reading PostgreSQL server version: {err}"))?;
+        check_server_version(row.get::<_, &str>(0))?;
+        drop(client);
         Ok(Self { pool, options })
     }
 
     /// The connection pool (shared with the challenge replay store).
     pub fn pool(&self) -> deadpool_postgres::Pool {
         self.pool.clone()
-    }
-
-    /// Fails with a clear error unless the server is PostgreSQL 16 or later
-    /// (the role checks read `pg_auth_members.inherit_option`/`set_option`).
-    pub async fn require_supported_server(&self) -> Result<(), String> {
-        let client = self.client().await?;
-        let row = client
-            .query_one("SELECT current_setting('server_version_num')::int", &[])
-            .await
-            .map_err(pg_error)?;
-        match server_version_problem(row.get(0)) {
-            Some(problem) => Err(problem),
-            None => Ok(()),
-        }
     }
 
     async fn client(&self) -> Result<deadpool_postgres::Object, String> {
@@ -795,7 +791,6 @@ impl PgExec {
     /// tables with the canonical policy inside it.
     pub async fn check_tenant_role(&self, tenant: &str, class: &str) -> Result<(), String> {
         let expected = super::grants::tenant_role(tenant, class)?;
-        self.require_supported_server().await?;
         let client = self.client().await?;
         let rows = client
             .query(&tenant_role_status_sql(), &[&tenant, &expected])
@@ -1312,17 +1307,6 @@ mod role_tests {
     }
 
     #[test]
-    fn old_servers_get_a_clear_error() {
-        for v in [90624, 130012, 150008, 159999] {
-            let p = server_version_problem(v).unwrap();
-            assert!(p.contains("PostgreSQL 16 or later required"), "{p}");
-        }
-        for v in [160000, 160004, 170011, 180000] {
-            assert_eq!(server_version_problem(v), None);
-        }
-    }
-
-    #[test]
     fn unsafe_roles_are_reported() {
         let s = RoleStatus {
             name: "app".into(),
@@ -1406,5 +1390,39 @@ mod tls_tests {
         assert_eq!(o.pool_size, 16);
         assert_eq!(o.statement_timeout_ms, 5_000);
         assert_eq!(o.pool_timeout_ms, 5_000);
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::check_server_version;
+
+    #[test]
+    fn postgres_below_16_is_refused() {
+        for v in ["150000", "150013", "140011", "90624", "159999"] {
+            let err = check_server_version(v).unwrap_err();
+            assert!(
+                err.contains("PostgreSQL 16 or later required"),
+                "{v}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_16_and_later_are_accepted() {
+        for v in ["160000", "160004", "170002", "180000"] {
+            check_server_version(v).unwrap();
+        }
+    }
+
+    #[test]
+    fn unreadable_version_is_refused() {
+        for v in ["", "16.4", "abc"] {
+            let err = check_server_version(v).unwrap_err();
+            assert!(
+                err.contains("PostgreSQL 16 or later required"),
+                "{v}: {err}"
+            );
+        }
     }
 }

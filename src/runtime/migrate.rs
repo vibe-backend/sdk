@@ -178,7 +178,6 @@ pub async fn migrate_tenant_recorded(
             ));
         }
     }
-    exec.require_supported_server().await?;
     let problems = exec.query_texts(MIGRATE_ROLE_SQL, tenant).await?;
     if !problems.is_empty() {
         return Err(format!(

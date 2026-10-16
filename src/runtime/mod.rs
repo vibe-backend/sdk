@@ -20,7 +20,8 @@ pub use crud::{
     MethodFail, Ownership,
 };
 pub use exec::{
-    etag, role_allows, ExecError, PgExec, PgOptions, PgSession, QueryExec, RoleStatus, Row,
+    check_server_version, etag, role_allows, ExecError, PgExec, PgOptions, PgSession, QueryExec,
+    RoleStatus, Row, MIN_SERVER_VERSION_NUM,
 };
 pub use http::{
     detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router, ApiKeyFile, AppState,
