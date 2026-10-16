@@ -112,3 +112,18 @@ fn startup_refuses_invalid_ec_key() {
     }
     load_signing_keys(&manifest, &|_| Some(PRIVATE_PEM.to_string()), "local").unwrap();
 }
+
+#[test]
+fn pem_with_data_outside_the_block_is_rejected() {
+    let trailing = format!("{PRIVATE_PEM}extra");
+    assert!(ec_signing_key_from_pem(trailing.as_bytes()).is_err());
+    let leading = format!("extra\n{PRIVATE_PEM}");
+    assert!(ec_signing_key_from_pem(leading.as_bytes()).is_err());
+}
+
+#[test]
+fn truncated_der_is_rejected() {
+    let der = der();
+    assert!(ec_signing_key_from_der(&der[..der.len() - 1]).is_err());
+    assert!(ec_signing_key_from_der(&[]).is_err());
+}
