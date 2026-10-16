@@ -1071,17 +1071,25 @@ fn check_unique_indexes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
 }
 
 /// `CREATE UNIQUE INDEX [CONCURRENTLY] [IF NOT EXISTS] [name] ON [ONLY] t (a, b) ...`
-/// → (table without schema or quotes, plain column names).
+/// → (table without quotes, plain column names).
+///
+/// Fails closed: the table must be unqualified (it resolves to the model's
+/// own schema through the migration `search_path`), and the only partial
+/// predicate accepted is `WHERE deleted_at IS NULL`; any other trailing
+/// clause means the index may not enforce the constraint.
 pub fn unique_index_of(sql: &str) -> Option<(String, Vec<String>)> {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r#"(?is)^\s*create\s+unique\s+index\s+(?:concurrently\s+)?(?:if\s+not\s+exists\s+)?(?:[\w."]+\s+)?on\s+(?:only\s+)?([\w."]+)\s*(?:using\s+\w+\s*)?\(([^)]*)\)"#,
+            r#"(?is)^\s*create\s+unique\s+index\s+(?:concurrently\s+)?(?:if\s+not\s+exists\s+)?(?:[\w."]+\s+)?on\s+(?:only\s+)?([\w."]+)\s*(?:using\s+\w+\s*)?\(([^)]*)\)\s*(?:where\s+"?deleted_at"?\s+is\s+null\s*)?;?\s*$"#,
         )
         .expect("regex")
     });
     let caps = RE.captures(sql)?;
     let unquote = |s: &str| s.trim().trim_matches('"').to_string();
-    let table = caps[1].rsplit('.').next().map(unquote)?;
+    if caps[1].contains('.') {
+        return None;
+    }
+    let table = unquote(&caps[1]);
     let cols: Vec<String> = caps[2].split(',').map(unquote).collect();
     if cols
         .iter()
@@ -1534,7 +1542,7 @@ mod tests {
     fn unique_index_sql_is_recognized() {
         let cols = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            unique_index_of("CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ix ON public.\"cart_items\" (tenant_id, \"cart_id\", product_id) WHERE deleted_at IS NULL"),
+            unique_index_of("CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ix ON \"cart_items\" (tenant_id, \"cart_id\", product_id) WHERE deleted_at IS NULL"),
             Some(("cart_items".into(), cols(&["tenant_id", "cart_id", "product_id"])))
         );
         assert_eq!(
@@ -1551,6 +1559,40 @@ mod tests {
         );
         assert_eq!(
             unique_index_of("CREATE UNIQUE INDEX ix ON t (a DESC)"),
+            None
+        );
+        assert_eq!(
+            unique_index_of("CREATE UNIQUE INDEX ix ON t (tenant_id, a);"),
+            Some(("t".into(), cols(&["tenant_id", "a"])))
+        );
+    }
+
+    #[test]
+    fn unique_index_with_other_predicate_is_rejected() {
+        assert_eq!(
+            unique_index_of("CREATE UNIQUE INDEX ix ON t (tenant_id, a) WHERE false"),
+            None
+        );
+        assert_eq!(
+            unique_index_of("CREATE UNIQUE INDEX ix ON t (tenant_id, a) WHERE status = 'x'"),
+            None
+        );
+        assert_eq!(
+            unique_index_of(
+                "CREATE UNIQUE INDEX ix ON t (tenant_id, a) WHERE deleted_at IS NULL AND a > 0"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unique_index_on_qualified_table_is_rejected() {
+        assert_eq!(
+            unique_index_of("CREATE UNIQUE INDEX ix ON other.t (tenant_id, a)"),
+            None
+        );
+        assert_eq!(
+            unique_index_of("CREATE UNIQUE INDEX ix ON \"other\".\"t\" (tenant_id, a)"),
             None
         );
     }
