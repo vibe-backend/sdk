@@ -10,7 +10,7 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - 開 **Dismiss stale pull request approvals when new commits are pushed**（取代 v1.7 嘅「確認綁定 commit hash」）。
 - 開 **Require approval of the most recent reviewable push**，最後 push 嘅人唔可以自己批准。
 - 開 **Require review from Code Owners**。
-- **Bypass list**：`main` ruleset 保留 OrganizationAdmin bypass（日常 `--admin` merge 唔變；spec 決定 96）。剩餘風險（Jack 已接受）：admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass）；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；同一個帳戶（`j113203`）可以自己批准；`release` environment admin bypass 保持開啟。
+- **Bypass list**：`main` ruleset 保留 OrganizationAdmin bypass（日常 `--admin` merge 唔變；spec 決定 96）。`bypass_actors` 唔係空係人手／文件層面已接受例外（Jack 2026-10-16，#70）：而家 SDK 同 release workflow 都唔讀 ruleset／`bypass_actors`（決定 90／#127）；如果將來 `release.yml` 加檢查，只可以係唯讀、資訊性、永遠唔會擋 release（同決定 90、第 2C.3a 對齊）；有第二個 reviewer 之後重新檢討。剩餘風險（Jack 已接受）：admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass）；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；同一個帳戶（`j113203`）可以自己批准；`release` environment admin bypass 保持開啟。
 - 以上 required review 同 up-to-date 設定照樣一定要開。
 
 ## 1A. Release tag ruleset（`v*`，spec 決定 96）
