@@ -1,0 +1,395 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vibe-backend.dev/schemas/authoring-plan-v0.1.schema.json",
+  "title": "vibe authoring plan v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "intent_digest",
+    "project_id",
+    "compiler_compat",
+    "base",
+    "resources",
+    "operations",
+    "access",
+    "assumptions",
+    "unresolved",
+    "changes",
+    "diagnostics",
+    "plan_digest"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "vibe.authoring/v0.1"
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "intent_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "project_id": {
+      "$ref": "#/$defs/digest"
+    },
+    "compiler_compat": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "base": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "$ref": "#/$defs/baseFile"
+      }
+    },
+    "resources": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/resource"
+      }
+    },
+    "operations": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "$ref": "#/$defs/operation"
+      }
+    },
+    "access": {
+      "$ref": "#/$defs/access"
+    },
+    "assumptions": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/boundedText"
+      }
+    },
+    "unresolved": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/question"
+      }
+    },
+    "changes": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "$ref": "#/$defs/sourceChange"
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "$ref": "#/$defs/diagnostic"
+      }
+    },
+    "plan_digest": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,62}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "pattern": "^(models|api|migrations)/[a-z0-9][a-z0-9_/-]*\\.md$",
+      "maxLength": 240,
+      "allOf": [
+        {
+          "not": {
+            "pattern": "(^|/)(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:[./]|$)"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(^|/)\\.\\.?(?:/|$)"
+          }
+        }
+      ]
+    },
+    "boundedText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "baseFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "digest"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "required"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "type": {
+          "enum": [
+            "text",
+            "boolean",
+            "integer",
+            "decimal",
+            "uuid",
+            "timestamp"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "default": {
+          "type": [
+            "string",
+            "boolean",
+            "integer",
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "ownership",
+        "fields"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "ownership": {
+          "enum": [
+            "authenticated_owner"
+          ]
+        },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/field"
+          }
+        }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "kind",
+        "resource",
+        "authentication",
+        "owner_scoped"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "kind": {
+          "enum": [
+            "create",
+            "get",
+            "list",
+            "update"
+          ]
+        },
+        "resource": {
+          "$ref": "#/$defs/name"
+        },
+        "authentication": {
+          "const": "required"
+        },
+        "owner_scoped": {
+          "const": true
+        },
+        "default_limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "max_limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "list"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "default_limit",
+              "max_limit"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "default_limit"
+                  ]
+                },
+                {
+                  "required": [
+                    "max_limit"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "access": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "default",
+        "public_write",
+        "tenant_scoped",
+        "least_privilege"
+      ],
+      "properties": {
+        "default": {
+          "const": "authenticated"
+        },
+        "public_write": {
+          "const": false
+        },
+        "tenant_scoped": {
+          "type": "boolean"
+        },
+        "least_privilege": {
+          "const": true
+        }
+      }
+    },
+    "question": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "prompt",
+        "safe_default"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/name"
+        },
+        "prompt": {
+          "$ref": "#/$defs/boundedText"
+        },
+        "safe_default": {
+          "$ref": "#/$defs/boundedText"
+        }
+      }
+    },
+    "sourceChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "path",
+        "resource_refs",
+        "operation_refs"
+      ],
+      "properties": {
+        "action": {
+          "enum": [
+            "create",
+            "update"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "resource_refs": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/name"
+          }
+        },
+        "operation_refs": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/name"
+          }
+        }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^AUTHORING_[A-Z0-9_]{1,63}$"
+        },
+        "severity": {
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ]
+        },
+        "message": {
+          "$ref": "#/$defs/boundedText"
+        },
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        }
+      }
+    }
+  }
+}

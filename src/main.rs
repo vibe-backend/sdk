@@ -10,7 +10,7 @@ use vibe::discover;
 use vibe::llm::{self, HttpAdapter, LlmAdapter};
 use vibe::lock::is_structured_source;
 use vibe::manifest::{self, read_manifest};
-use vibe::runtime::{bootstrap_statements, router, AppState, AuthConfig, Col, PgExec, QueryExec};
+use vibe::runtime::{router, AppState, AuthConfig, PgExec, QueryExec};
 use vibe::secret::secret_scan;
 use vibe::sign;
 use vibe::validate::{validate_project, ValidateOptions};
@@ -267,17 +267,36 @@ async fn cmd_compile(project: &Path, check: bool) -> Result<(), String> {
 }
 
 fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
+    // A missing key is one more finding, not a reason to stop before
+    // reporting everything else.
+    let mut key_problem = None;
     let key = if deploy {
-        Some(sign::load_public(project).map_err(|err| err.to_string())?)
+        match sign::load_public(project) {
+            Ok(key) => Some(key),
+            Err(err) => {
+                key_problem = Some(vibe::Diag::error(
+                    ".vibe/signing.pub",
+                    format!("cannot load the signing key: {err}"),
+                ));
+                None
+            }
+        }
     } else {
         None
     };
-    let report = validate_project(&ValidateOptions {
+    let result = validate_project(&ValidateOptions {
         root: project,
         deploy,
         verify_key: key.as_ref(),
-    })
-    .map_err(|err| err.to_string())?;
+    });
+    let report = match (result, key_problem) {
+        (Ok(report), None) => report,
+        (Ok(mut report) | Err(mut report), Some(problem)) => {
+            report.diags.insert(0, problem);
+            return Err(report.to_string());
+        }
+        (Err(report), None) => return Err(report.to_string()),
+    };
     print_report(&report);
     if deploy {
         println!("validation ok");
@@ -348,9 +367,11 @@ async fn cmd_serve(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
-    let auth = auth_from_env(run_env)?;
+    let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
+    // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
+    auth.add_route_jwks(&manifest.routes)?;
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::new())
     } else {
@@ -359,7 +380,9 @@ async fn cmd_serve(
             .map_err(|_| {
                 "set VIBE_DATABASE_URL or pass --memory for the dev executor".to_string()
             })?;
-        Arc::new(PgExec::connect(&url).await?)
+        let pg = PgExec::connect_with(&url, vibe::runtime::PgOptions::from_env()?).await?;
+        pg.check_runtime_role().await?;
+        Arc::new(pg)
     };
     let loaded = vibe::runtime::load_project_slugs(project, memory)?;
     for warning in &loaded.warnings {
@@ -412,33 +435,16 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
     }
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
-    let url = std::env::var("VIBE_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .map_err(|_| "VIBE_DATABASE_URL is required".to_string())?;
+    // Migrations need the table-owner role; serving must not use it.
+    let url = std::env::var("VIBE_MIGRATE_DATABASE_URL").map_err(|_| {
+        "VIBE_MIGRATE_DATABASE_URL is required (the owner role used for DDL; `vibe serve` uses a separate non-owner VIBE_DATABASE_URL)".to_string()
+    })?;
+    let runtime_role = std::env::var("VIBE_RUNTIME_DB_ROLE").map_err(|_| {
+        "VIBE_RUNTIME_DB_ROLE is required (the non-owner role `vibe serve` connects as; it is granted SELECT, INSERT, UPDATE)".to_string()
+    })?;
     let exec = PgExec::connect(&url).await?;
-    let schema = format!("t_{tenant}");
-    for model in &manifest.models {
-        let fields: Vec<Col> = model
-            .fields
-            .iter()
-            .map(|field| Col {
-                name: field.name.clone(),
-                ty: field.ty.clone(),
-            })
-            .collect();
-        let uniques: Vec<String> = model
-            .fields
-            .iter()
-            .filter(|field| field.unique)
-            .map(|field| field.name.clone())
-            .collect();
-        let statements = bootstrap_statements(&schema, &model.table, &fields, &uniques)?;
-        exec.batch(&statements).await?;
-        println!("bootstrapped {}.{}", schema, model.table);
-    }
-    for migration in &manifest.migrations {
-        exec.batch(&migration.statements).await?;
-        println!("applied {}", migration.id);
+    for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant, &runtime_role).await? {
+        println!("{line}");
     }
     Ok(())
 }
@@ -501,7 +507,11 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
         return Err("set either VIBE_JWT_PUBLIC_KEY_PEM or VIBE_JWT_JWKS_URI, not both".into());
     }
     if let Some(uri) = jwks_uri {
-        let source = vibe::runtime::jwks::HttpsJwks::new(&uri)?;
+        let allow_private = std::env::var("VIBE_JWT_ALLOW_PRIVATE_HOST").as_deref() == Ok("true");
+        if allow_private && !run_env.is_dev() {
+            return Err("VIBE_JWT_ALLOW_PRIVATE_HOST is only allowed in development".into());
+        }
+        let source = vibe::runtime::jwks::HttpsJwks::with_policy(&uri, allow_private)?;
         auth.jwks = Some(std::sync::Arc::new(vibe::runtime::jwks::JwksCache::new(
             std::sync::Arc::new(source),
         )));

@@ -65,8 +65,11 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
     check_orphans(opts.root, &sources, &mut report);
     check_routes(&docs, &mut report);
     check_calls(&docs, &mut report);
+    check_targets(&docs, &mut report);
     check_migrations(&docs, &mut report);
     check_refs(&docs, &mut report);
+    check_feature_method_writes(&docs, &mut report);
+    check_security_items_enriched(&docs, &source_by_id, opts, &mut report);
     if opts.deploy {
         check_approval_set(&docs, &source_by_id, opts, &mut report);
     }
@@ -137,23 +140,26 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
             format!("sections must be exactly {}", order.join(", ")),
         ));
     }
-    let mut expected = security::extract_items(doc);
-    if scan::scan_text(&source.combined_text())
-        .iter()
-        .any(|hit| !hit.fatal)
-    {
-        expected.push(crate::lock::SecurityItem {
-            item: "prompt-injection".into(),
-            risk: crate::lock::Risk::Medium,
-            reason: String::new(),
-            approved_by: Vec::new(),
-        });
-    }
-    if !security::same_items(&expected, &doc.meta.security_items) {
-        report.push(Diag::error(
-            &file,
-            "security-items do not match the validator extraction",
-        ));
+    // Features are re-checked after all locks load (method write enrichment).
+    if !(doc.meta.kind == Kind::Api && doc.meta.scope == Some(Scope::Feature)) {
+        let mut expected = security::extract_items(doc);
+        if scan::scan_text(&source.combined_text())
+            .iter()
+            .any(|hit| !hit.fatal)
+        {
+            expected.push(crate::lock::SecurityItem {
+                item: "prompt-injection".into(),
+                risk: crate::lock::Risk::Medium,
+                reason: String::new(),
+                approved_by: Vec::new(),
+            });
+        }
+        if !security::same_items(&expected, &doc.meta.security_items) {
+            report.push(Diag::error(
+                &file,
+                "security-items do not match the validator extraction",
+            ));
+        }
     }
     check_sections(doc, &file, report);
     if doc.meta.status == Status::Approved {
@@ -262,6 +268,25 @@ fn check_model(doc: &LockDoc, file: &str, report: &mut Report) {
                 }
             }
         }
+        let rules = row.get(2).map(String::as_str).unwrap_or("");
+        for key in ["min", "max"] {
+            if let Some(problem) = bad_number_rule(rules, key) {
+                report.push(
+                    Diag::error(file, format!("field {name}: {problem}")).at_section("Fields"),
+                );
+            }
+        }
+        if let (Some(min), Some(max)) = (rule_number(rules, "min"), rule_number(rules, "max")) {
+            if min > max {
+                report.push(
+                    Diag::error(
+                        file,
+                        format!("field {name}: min ({min}) is greater than max ({max})"),
+                    )
+                    .at_section("Fields"),
+                );
+            }
+        }
     }
     if !saw_tenant {
         report.push(Diag::error(file, "model is missing tenant_id").at_section("Fields"));
@@ -356,6 +381,31 @@ fn check_model(doc: &LockDoc, file: &str, report: &mut Report) {
 }
 
 fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
+    if let Some(steps) = find_section(&doc.sections, "Steps") {
+        for block in &steps.blocks {
+            let sql = block_val(block, "sql");
+            if crate::security::sql_writes(sql.trim_matches('`'))
+                && block_val(block, "writes") != "true"
+            {
+                report.push(
+                    Diag::error(file, "step SQL writes but is not marked `writes: true`")
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+            }
+            if block_val(block, "op") == "validate" {
+                if let Some(w) = block.bullets.iter().find(|b| b.key == "when") {
+                    if let Err(err) = crate::runtime::check_when(&w.value) {
+                        report.push(
+                            Diag::error(file, format!("when: {err}"))
+                                .at_step(&block.heading)
+                                .at_section("Steps"),
+                        );
+                    }
+                }
+            }
+        }
+    }
     let caps = find_section(&doc.sections, "Signature")
         .and_then(|section| section.get("capabilities"))
         .unwrap_or("");
@@ -386,6 +436,18 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                     .at_step(&block.heading),
             );
         }
+        // Ops this build executes inside methods share the API step grammar.
+        // #77 ops (query, verify-password, hash-password, random-token,
+        // hash-token, sign-jwt) keep their own checks below.
+        if matches!(op.as_str(), "method" | "validate" | "respond") {
+            for problem in api_step_problems(block, &op) {
+                report.push(
+                    Diag::error(file, problem)
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+            }
+        }
         if op == "sign-jwt" {
             if !caps.contains("sign-token") {
                 report.push(
@@ -414,9 +476,12 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                 }
             }
         }
+        if block_val(block, "writes") == "true" {
+            saw_write = true;
+        }
         if op == "query" {
             let sql = block_val(block, "sql").trim_matches('`').to_string();
-            saw_write |= sql_writes(&sql);
+            saw_write |= crate::security::sql_writes(&sql);
             for problem in sql_problems(&sql, &block_val(block, "params"), false) {
                 report.push(
                     Diag::error(file, problem)
@@ -424,20 +489,36 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                         .at_section("Steps"),
                 );
             }
-            if sql_writes(&sql)
-                && block_val(block, "scope").is_empty()
-                && sql.to_ascii_lowercase().starts_with("update")
-            {
-                report.push(
-                    Diag::error(file, "UPDATE needs scope: pk or scope: rls")
-                        .at_step(&block.heading),
-                );
+            if crate::security::sql_writes(&sql) && block_val(block, "scope").is_empty() {
+                let cleaned = crate::security::strip_sql_noise(&sql).to_ascii_lowercase();
+                if cleaned.contains("update") {
+                    report.push(
+                        Diag::error(file, "UPDATE needs scope: pk or scope: rls")
+                            .at_step(&block.heading),
+                    );
+                }
             }
         }
     }
     if !writes && saw_write {
         report
             .push(Diag::error(file, "writes: false but a step writes SQL").at_section("Signature"));
+    }
+    if writes && !saw_write {
+        // Also count explicit writes: true steps without detectable SQL verbs.
+        let marked = steps
+            .blocks
+            .iter()
+            .any(|b| block_val(b, "writes") == "true");
+        if !marked {
+            report.push(
+                Diag::error(
+                    file,
+                    "writes: true but no step writes SQL or sets writes: true",
+                )
+                .at_section("Signature"),
+            );
+        }
     }
 }
 
@@ -553,6 +634,28 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
             }
         }
         for block in &pipes.blocks {
+            if pipeline_name(&block.heading) != "auth" {
+                continue;
+            }
+            let get = |k: &str| {
+                block
+                    .bullets
+                    .iter()
+                    .find(|b| b.key == k)
+                    .map(|b| b.value.trim().to_string())
+                    .unwrap_or_default()
+            };
+            if let Some(problem) = crate::manifest::jwt_override_problem(
+                &get("iss"),
+                &get("aud"),
+                &get("jwks-uri"),
+                auth_removed,
+                &auth_mode,
+            ) {
+                report.push(Diag::error(file, problem).at_section("Pipelines"));
+            }
+        }
+        for block in &pipes.blocks {
             let name = pipeline_name(&block.heading);
             if name == "auth" {
                 if let Some(roles) = block.bullets.iter().find(|b| b.key == "roles") {
@@ -580,6 +683,25 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
                     report.push(
                         Diag::error(file, "method targets cannot include a version")
                             .at_step(&block.heading),
+                    );
+                }
+            }
+            for problem in api_step_problems(block, &op) {
+                report.push(
+                    Diag::error(file, problem)
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+            }
+        }
+    }
+    if let Some(transform) = find_section(&doc.sections, "Transform") {
+        for key in ["in", "out"] {
+            if let Some(expr) = transform.get(key) {
+                if let Err(err) = crate::runtime::check_expr(expr) {
+                    report.push(
+                        Diag::error(file, format!("transform {key}: {err}"))
+                            .at_section("Transform"),
                     );
                 }
             }
@@ -713,6 +835,109 @@ fn check_routes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
                 &doc.meta.source,
                 format!("route {key} duplicates {prev}"),
             ));
+        }
+    }
+}
+
+/// CRUD actions every model provides without a method lock.
+pub const CRUD_ACTIONS: &[&str] = &["create", "get", "list", "update", "delete"];
+
+/// A feature step target must be `object.action`, where the action is a
+/// built-in CRUD action on an existing model or an existing method lock.
+pub fn check_method_target(target: &str, docs: &HashMap<String, LockDoc>) -> Result<(), String> {
+    let target = target.trim();
+    let ident = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    let Some((object, action)) = target.split_once('.') else {
+        return Err(format!(
+            "method target {target} must look like object.action"
+        ));
+    };
+    if !ident(object) || !ident(action) {
+        return Err(format!(
+            "method target {target} must look like object.action"
+        ));
+    }
+    let method = format!("{object}/methods/{action}");
+    if docs
+        .get(&method)
+        .is_some_and(|d| d.meta.kind == Kind::Method)
+    {
+        return Ok(());
+    }
+    let model = docs.get(object).is_some_and(|d| d.meta.kind == Kind::Model);
+    if model && CRUD_ACTIONS.contains(&action) {
+        return Ok(());
+    }
+    if !model
+        && !docs
+            .keys()
+            .any(|id| id.starts_with(&format!("{object}/methods/")))
+    {
+        return Err(format!(
+            "unknown method target {target}: no model or methods named {object}"
+        ));
+    }
+    Err(format!(
+        "unknown method target {target}: {action} is not a CRUD action ({}) or a method lock",
+        CRUD_ACTIONS.join(", ")
+    ))
+}
+
+fn check_targets(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    for doc in docs.values() {
+        let feature = doc.meta.kind == Kind::Api && doc.meta.scope == Some(Scope::Feature);
+        let method = doc.meta.kind == Kind::Method;
+        if !feature && !method {
+            continue;
+        }
+        if method {
+            // Calls.methods is the static call list the runtime binds at deploy.
+            if let Some(list) = find_section(&doc.sections, "Calls").and_then(|s| s.get("methods"))
+            {
+                let targets = match crate::lock::parse_string_list(list) {
+                    Ok(targets) => targets,
+                    Err(_) => {
+                        // Fail closed: a malformed list must not skip the check.
+                        report.push(
+                            Diag::error(
+                                lock_rel(&doc.meta.source),
+                                "Calls.methods must be a list like `[object.action, ...]`",
+                            )
+                            .at_section("Calls"),
+                        );
+                        Vec::new()
+                    }
+                };
+                for target in targets {
+                    if let Err(err) = check_method_target(&target, docs) {
+                        report
+                            .push(Diag::error(lock_rel(&doc.meta.source), err).at_section("Calls"));
+                    }
+                }
+            }
+        }
+        let Some(steps) = find_section(&doc.sections, "Steps") else {
+            continue;
+        };
+        for block in &steps.blocks {
+            // In method locks only `op: method` targets are method ids;
+            // `op: call` targets are external endpoints.
+            if method && block_val(block, "op") != "method" {
+                continue;
+            }
+            if let Some(target) = block.bullets.iter().find(|b| b.key == "target") {
+                if let Err(err) = check_method_target(&target.value, docs) {
+                    report.push(
+                        Diag::error(lock_rel(&doc.meta.source), err)
+                            .at_step(&block.heading)
+                            .at_section("Steps"),
+                    );
+                }
+            }
         }
     }
 }
@@ -1054,23 +1279,36 @@ fn walk_locks(dir: &Path, root: &Path, expected: &HashSet<String>, report: &mut 
 pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
     let mut problems = Vec::new();
     let trimmed = sql.trim().trim_matches('`').trim();
+    let cleaned = crate::security::strip_sql_noise(trimmed);
+    let lower = cleaned.to_ascii_lowercase();
+    // Allow `;` only inside DO $$ … $$ procedural bodies.
     if trimmed.contains(';') {
-        problems.push("SQL must be a single statement".into());
+        let raw_lower = trimmed.to_ascii_lowercase();
+        let do_body = raw_lower.contains("do $$") || raw_lower.contains("do $");
+        if !do_body {
+            problems.push("SQL must be a single statement".into());
+        }
     }
-    if FORBIDDEN_SQL.is_match(trimmed) {
+    if FORBIDDEN_SQL.is_match(&cleaned) {
         problems.push("DELETE, TRUNCATE, GRANT, and REVOKE are forbidden".into());
     }
-    if !migration && DDL_SQL.is_match(trimmed) {
+    static SELECT_INTO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bselect\b[^;]*\binto\b").expect("regex"));
+    if !migration && (DDL_SQL.is_match(&cleaned) || SELECT_INTO.is_match(&cleaned)) {
         problems.push("DDL is only allowed in migration locks".into());
     }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("update") && !lower.contains(" where ") {
+    if crate::security::sql_writes(trimmed)
+        && lower.contains("update")
+        && !lower.contains(" where ")
+    {
         problems.push("UPDATE needs a WHERE clause".into());
     }
+    // Param hygiene for reads and writes, including WITH … forms.
     if !migration
-        && (lower.starts_with("select")
-            || lower.starts_with("insert")
-            || lower.starts_with("update"))
+        && (crate::security::sql_writes(trimmed)
+            || lower.trim_start().starts_with("select")
+            || lower.trim_start().starts_with("with")
+            || lower.trim_start().starts_with("("))
     {
         let nums: Vec<usize> = PARAM
             .captures_iter(trimmed)
@@ -1093,11 +1331,6 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
         }
     }
     problems
-}
-
-fn sql_writes(sql: &str) -> bool {
-    let lower = sql.trim().trim_matches('`').to_ascii_lowercase();
-    lower.starts_with("insert") || lower.starts_with("update")
 }
 
 fn known_type(ty: &str) -> bool {
@@ -1135,6 +1368,87 @@ fn rule_number(rules: &str, key: &str) -> Option<i64> {
         }
     }
     None
+}
+
+/// `min:` / `max:` present but not an integer — fail closed (do not ignore).
+fn bad_number_rule(rules: &str, key: &str) -> Option<String> {
+    for part in rules.split(',') {
+        let part = part.trim();
+        let Some(rest) = part.strip_prefix(&format!("{key}:")) else {
+            continue;
+        };
+        let raw = rest.trim().trim_matches(|c| c == '[' || c == ']');
+        if raw.is_empty() || raw.parse::<i64>().is_err() {
+            return Some(format!("{key} value `{raw}` is not an integer"));
+        }
+    }
+    None
+}
+
+/// What the runtime would fail on for an API feature step: unknown keys
+/// (e.g. `method:` instead of `target:`), a missing target, expressions it
+/// cannot parse, a validate step without `when`/`fail`, a bad status.
+fn api_step_problems(block: &crate::lock::Block, op: &str) -> Vec<String> {
+    let allowed: &[&str] = match op {
+        "method" => &["target", "args", "out"],
+        "validate" => &["when", "fail"],
+        "respond" => &["value", "status"],
+        "transform" => &[],
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for bullet in &block.bullets {
+        let key = bullet.key.as_str();
+        if key != "op" && key != "source-lines" && !allowed.contains(&key) {
+            let hint = if key == "method" && op == "method" {
+                " (use `target:`)"
+            } else {
+                ""
+            };
+            out.push(format!("unknown key `{key}` for op {op}{hint}"));
+        }
+    }
+    let get = |k: &str| block_val(block, k);
+    match op {
+        "method" => {
+            if get("target").trim().is_empty() {
+                out.push("method step needs `target`".into());
+            }
+            let args = get("args");
+            if !args.is_empty() && args != "transform.in" {
+                if let Err(err) = crate::runtime::check_expr(&args) {
+                    out.push(format!("args: {err}"));
+                }
+            }
+        }
+        "validate" => {
+            match block.bullets.iter().find(|b| b.key == "when") {
+                Some(w) => {
+                    if let Err(err) = crate::runtime::check_when(&w.value) {
+                        out.push(format!("when: {err}"));
+                    }
+                }
+                None => out.push("validate step needs `when`".into()),
+            }
+            if get("fail").trim().is_empty() {
+                out.push("validate step needs a `fail` error code".into());
+            }
+        }
+        "respond" => {
+            let value = get("value");
+            if !value.is_empty() && value != "transform.out" {
+                if let Err(err) = crate::runtime::check_expr(&value) {
+                    out.push(format!("value: {err}"));
+                }
+            }
+            let status = get("status");
+            if !status.is_empty() && !status.parse::<u16>().is_ok_and(|s| (100..600).contains(&s)) {
+                out.push(format!("status `{status}` is not an HTTP status"));
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 fn block_val(block: &crate::lock::Block, key: &str) -> String {
@@ -1189,6 +1503,83 @@ pub fn parse_bytes(raw: &str) -> u64 {
     raw.parse().unwrap_or(0)
 }
 
+fn check_feature_method_writes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    for doc in docs.values() {
+        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+            continue;
+        }
+        let file = lock_rel(&doc.meta.source);
+        let public =
+            find_section(&doc.sections, "Access").and_then(|s| s.get("public")) == Some("true");
+        let public_writes = find_section(&doc.sections, "Access")
+            .and_then(|s| s.get("public-writes"))
+            == Some("true");
+        let Some(steps) = find_section(&doc.sections, "Steps") else {
+            continue;
+        };
+        for block in &steps.blocks {
+            let target = block_val(block, "target");
+            if target.is_empty() {
+                continue;
+            }
+            if !security::method_doc_writes(docs, &target) {
+                continue;
+            }
+            if public && !public_writes {
+                report.push(
+                    Diag::error(
+                        &file,
+                        format!(
+                            "public feature calls write method `{target}`; set public-writes: true"
+                        ),
+                    )
+                    .at_step(&block.heading)
+                    .at_section("Access"),
+                );
+            }
+        }
+    }
+}
+
+fn check_security_items_enriched(
+    docs: &HashMap<String, LockDoc>,
+    sources: &HashMap<String, SourceFile>,
+    opts: &ValidateOptions<'_>,
+    report: &mut Report,
+) {
+    let _ = opts;
+    for doc in docs.values() {
+        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+            continue;
+        }
+        let Some(source) = sources.get(&doc.meta.id) else {
+            continue;
+        };
+        let file = lock_rel(&source.rel);
+        let mut expected = security::extract_items(doc);
+        security::enrich_feature_writes(doc, docs, &mut expected);
+        if scan::scan_text(&source.combined_text())
+            .iter()
+            .any(|hit| !hit.fatal)
+        {
+            expected.push(crate::lock::SecurityItem {
+                item: "prompt-injection".into(),
+                risk: crate::lock::Risk::Medium,
+                reason: String::new(),
+                approved_by: Vec::new(),
+            });
+        }
+        expected.sort_by(|a, b| a.item.cmp(&b.item));
+        expected.dedup_by(|a, b| a.item == b.item);
+        if !security::same_items(&expected, &doc.meta.security_items) {
+            report.push(Diag::error(
+                &file,
+                "security-items do not match the validator extraction",
+            ));
+        }
+    }
+}
+
 fn lock_rel(source_rel: &str) -> String {
     source_rel.trim_end_matches(".md").to_string() + ".lock.md"
 }
@@ -1207,5 +1598,174 @@ mod tests {
     fn update_without_where_is_rejected() {
         let problems = sql_problems("update users set name = $1", "[input.name]", false);
         assert!(problems.iter().any(|p| p.contains("WHERE")));
+    }
+
+    fn doc(kind: Kind, scope: Option<Scope>, id: &str, body: &str) -> LockDoc {
+        LockDoc {
+            meta: crate::lock::Meta::pending(kind, scope, id, format!("{id}.md")),
+            sections: crate::lock::parse_sections(body).unwrap(),
+        }
+    }
+
+    fn target_docs() -> HashMap<String, LockDoc> {
+        let mut docs = HashMap::new();
+        docs.insert("product".into(), doc(Kind::Model, None, "product", ""));
+        docs.insert(
+            "product/methods/publish".into(),
+            doc(Kind::Method, None, "product/methods/publish", ""),
+        );
+        docs
+    }
+
+    #[test]
+    fn targets_accept_crud_actions_and_method_locks() {
+        let docs = target_docs();
+        for ok in [
+            "product.list",
+            "product.create",
+            "product.get",
+            "product.publish",
+        ] {
+            assert!(check_method_target(ok, &docs).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn unknown_actions_are_rejected() {
+        let docs = target_docs();
+        let err = check_method_target("product.nonexistent", &docs).unwrap_err();
+        assert!(err.contains("product.nonexistent"), "{err}");
+        for bad in [
+            "product",
+            "product.",
+            ".list",
+            "product.list.x",
+            "order.list",
+            "product.li st",
+        ] {
+            assert!(check_method_target(bad, &docs).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn validate_reports_unknown_feature_targets() {
+        let mut docs = target_docs();
+        let body = "## Steps\n### s1\n- op: method\n- target: product.nonexistent\n";
+        docs.insert(
+            "catalog/v1/x".into(),
+            doc(Kind::Api, Some(Scope::Feature), "api/catalog/v1/x/x", body),
+        );
+        let mut report = Report::new();
+        check_targets(&docs, &mut report);
+        assert!(
+            report
+                .errors()
+                .any(|d| d.message.contains("product.nonexistent")),
+            "{:?}",
+            report.diags
+        );
+    }
+
+    #[test]
+    fn malformed_calls_methods_fails_closed() {
+        for list in ["product.publish", "[product.publish", "{ a: b }"] {
+            let mut docs = target_docs();
+            let body = format!("## Calls\n- methods: {list}\n");
+            docs.insert(
+                "product/methods/x".into(),
+                doc(Kind::Method, None, "product/methods/x", &body),
+            );
+            let mut report = Report::new();
+            check_targets(&docs, &mut report);
+            assert!(
+                report
+                    .errors()
+                    .any(|d| d.message.contains("Calls.methods must be a list")),
+                "{list}: {:?}",
+                report.diags
+            );
+        }
+    }
+
+    #[test]
+    fn validate_reports_unknown_method_lock_targets() {
+        let mut docs = target_docs();
+        let body = "## Signature\n- writes: false\n## Calls\n- methods: [product.ghost]\n## Steps\n### s1 method\n- op: method\n- target: nope.get\n- out: r\n### s2 call\n- op: call\n- target: https://example.com/hook\n";
+        docs.insert(
+            "product/methods/caller".into(),
+            doc(Kind::Method, None, "models/product/methods/caller", body),
+        );
+        let mut report = Report::new();
+        check_targets(&docs, &mut report);
+        let msgs: Vec<&str> = report.errors().map(|d| d.message.as_str()).collect();
+        assert!(msgs.iter().any(|m| m.contains("nope.get")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("product.ghost")), "{msgs:?}");
+        assert!(!msgs.iter().any(|m| m.contains("example.com")), "{msgs:?}");
+    }
+
+    #[test]
+    fn method_lock_steps_get_step_grammar_checks() {
+        let body = "## Signature\n- writes: false\n## Calls\n- methods: []\n## Steps\n### s1 method\n- op: method\n- method: product.get\n- out: r\n### s2 validate\n- op: validate\n- when: `r == null`\n### s3 respond\n- op: respond\n- value: r\n- status: 999\n";
+        let d = doc(Kind::Method, None, "models/product/methods/x", body);
+        let mut report = Report::new();
+        check_method(&d, "x.lock.md", &mut report);
+        let msgs: Vec<&str> = report.errors().map(|d| d.message.as_str()).collect();
+        for want in [
+            "unknown key `method` for op method (use `target:`)",
+            "method step needs `target`",
+            "validate step needs a `fail` error code",
+            "status `999` is not an HTTP status",
+        ] {
+            assert!(msgs.contains(&want), "{want} not in {msgs:?}");
+        }
+    }
+
+    #[test]
+    fn prompt_examples_pass_the_validator() {
+        for (kind, scope, id) in [
+            (Kind::Method, None, "product/methods/create"),
+            (Kind::Api, Some(Scope::Feature), "catalog/v1/list-products"),
+        ] {
+            let prompt = crate::compile::system_prompt(kind, scope);
+            let body = prompt.split_once("LOCK BODY:\n").expect("example").1;
+            let lock = doc(kind, scope, id, body);
+            let names: Vec<&str> = lock.sections.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, section_order(kind, scope), "{id}");
+            let mut report = Report::new();
+            check_sections(&lock, id, &mut report);
+            let errors: Vec<_> = report.errors().collect();
+            assert!(errors.is_empty(), "{id}: {errors:?}");
+            let mut docs = target_docs();
+            docs.insert(id.into(), lock);
+            let mut report = Report::new();
+            check_targets(&docs, &mut report);
+            assert!(report.errors().next().is_none(), "{id}: {:?}", report.diags);
+        }
+    }
+
+    #[test]
+    fn with_update_is_a_write_and_needs_where() {
+        let sql = "WITH x AS (SELECT 1) UPDATE products SET price_cents = 0";
+        assert!(crate::security::sql_writes(sql));
+        let problems = sql_problems(sql, "[]", false);
+        assert!(problems.iter().any(|p| p.contains("WHERE")), "{problems:?}");
+    }
+
+    #[test]
+    fn select_into_is_ddl_outside_migrations() {
+        let problems = sql_problems("SELECT * INTO tmp FROM products", "[]", false);
+        assert!(problems.iter().any(|p| p.contains("DDL")), "{problems:?}");
+    }
+
+    #[test]
+    fn comments_do_not_trigger_forbidden_or_writes() {
+        let problems = sql_problems("SELECT 1 -- delete later", "[]", false);
+        assert!(
+            !problems.iter().any(|p| p.contains("DELETE")),
+            "{problems:?}"
+        );
+        assert!(!crate::security::sql_writes(
+            "SELECT note = 'update me' FROM t"
+        ));
     }
 }
