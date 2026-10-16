@@ -2126,6 +2126,7 @@ dependencies = [
  "hex",
  "hmac",
  "jsonwebtoken",
+ "postgres-protocol",
  "rand 0.8.8",
  "regex",
  "reqwest",

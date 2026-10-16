@@ -58,6 +58,13 @@ pub fn tenant_owner_role(tenant: &str) -> Result<String, String> {
     tenant_role(tenant, "owner")
 }
 
+/// Whether `name` is a tenant owner role (`tenant_<id>_owner`).
+pub fn is_owner_role_name(name: &str) -> bool {
+    name.strip_prefix("tenant_")
+        .and_then(|rest| rest.strip_suffix("_owner"))
+        .is_some_and(|tenant| tenant_owner_role(tenant).ok().as_deref() == Some(name))
+}
+
 /// The three [`tenant_role`]s of one tenant, in [`RUNTIME_ROLES`] order.
 pub fn tenant_roles(tenant: &str) -> Result<Vec<String>, String> {
     RUNTIME_ROLES

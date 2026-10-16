@@ -841,7 +841,7 @@ async fn migration_without_tenant_id_or_with_a_view_fails() {
             "CREATE TABLE IF NOT EXISTS loose (x text)",
             "without a tenant_id",
         ),
-        ("CREATE VIEW v_notes AS SELECT * FROM notes", "views"),
+        ("CREATE VIEW v_notes AS SELECT * FROM notes", "CREATE VIEW"),
         (
             "CREATE FUNCTION steal() RETURNS bigint LANGUAGE sql SECURITY DEFINER \
              AS 'SELECT count(*) FROM notes'",
@@ -862,15 +862,8 @@ async fn migration_without_tenant_id_or_with_a_view_fails() {
         let tenant = format!("tv{}", suffix());
         let err = migrate_as(&s, &m, &tenant).await.unwrap_err();
         assert!(err.contains(expect), "{stmt}: {err}");
-        if stmt.contains("CREATE PROCEDURE") {
-            assert!(
-                err.contains("procedure "),
-                "procedure listing should say 'procedure ': {err}"
-            );
-            assert!(
-                err.contains("functions, procedures and triggers"),
-                "outer message should name procedures: {err}"
-            );
+        if !stmt.contains("loose") {
+            assert!(err.contains("not allowed in migrations"), "{stmt}: {err}");
         }
     }
 }
@@ -1014,7 +1007,7 @@ async fn migration_policies_are_refused_and_nothing_is_committed() {
         let tenant = format!("tp{}", suffix());
         let err = migrate_as(&s, &m, &tenant).await.unwrap_err();
         assert!(
-            err.contains("must not create row level security policies"),
+            err.contains("CREATE POLICY") && err.contains("not allowed in migrations"),
             "{stmt}: {err}"
         );
         // Transactional: the failed migration left no schema or tables behind.
@@ -1125,6 +1118,7 @@ fn blocked(err: &str) -> bool {
     [
         "row level security check failed",
         "another tenant",
+        "not allowed in migrations",
         "42501",
         "must be owner",
     ]
@@ -1315,7 +1309,9 @@ async fn smuggled_commit_after_a_dollar_identifier_is_refused() {
         let tenant = format!("td{}", suffix());
         let err = migrate_as(&s, &m, &tenant).await.unwrap_err();
         assert!(
-            err.contains("42601") || err.contains("multiple commands"),
+            err.contains("42601")
+                || err.contains("multiple commands")
+                || err.contains("more than one command"),
             "{attack}: {err}"
         );
         let left: i64 = s
@@ -1839,7 +1835,9 @@ async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
     .await
     .unwrap();
     let mut m = manifest();
-    m.migrations[0].statements.push("SELECT pg_sleep(5)".into());
+    m.migrations[0]
+        .statements
+        .push("INSERT INTO audit_notes SELECT 'x', pg_sleep(5)::text".into());
     // Cancel the migration while it sleeps inside its transaction, after
     // reading the pid of the backend running it from pg_stat_activity.
     let find_pid = async {
@@ -1848,7 +1846,7 @@ async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
                 .admin
                 .query(
                     "SELECT pid FROM pg_stat_activity WHERE usename = $1 \
-                     AND state = 'active' AND query LIKE 'SELECT pg_sleep(5)%'",
+                     AND state = 'active' AND query LIKE 'INSERT INTO audit_notes SELECT%'",
                     &[&owner],
                 )
                 .await
@@ -1908,4 +1906,323 @@ async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
         .await
         .unwrap();
     assert_eq!(got, vec!["none|0".to_string()]);
+}
+
+// ---- D129 owner login window, allowlist and index placement ----
+
+/// Pre-created roles with the owner NOLOGIN and no password, as operators
+/// leave it outside migrate.
+async fn ensure_nologin_owner(admin_url: &str, tenant: &str) {
+    ensure_tenant_roles(admin_url, tenant).await;
+    connect(admin_url)
+        .await
+        .batch_execute(&format!(
+            "ALTER ROLE {} NOLOGIN PASSWORD NULL",
+            owner_of(tenant)
+        ))
+        .await
+        .unwrap();
+}
+
+/// (rolcanlogin, has a password) for `role`.
+async fn login_state(admin: &Client, role: &str) -> (bool, bool) {
+    let row = admin
+        .query_one(
+            "SELECT rolcanlogin, rolpassword IS NOT NULL FROM pg_authid WHERE rolname = $1",
+            &[&role],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1))
+}
+
+async fn audit_events(admin: &Client, tenant: &str) -> Vec<String> {
+    admin
+        .query(
+            "SELECT event FROM public.vibe_migrate_audit WHERE tenant = $1 ORDER BY at, event",
+            &[&tenant],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+#[tokio::test]
+async fn migrate_opens_and_always_closes_the_owner_login_window() {
+    let s = require_pg!(setup().await);
+    let tenant = format!("tw{}", suffix());
+    let owner = owner_of(&tenant);
+    ensure_nologin_owner(&s.admin_url, &tenant).await;
+    assert_eq!(login_state(&s.admin, &owner).await, (false, false));
+    let log = vibe::runtime::migrate_with_owner_window(&s.admin_url, &manifest(), &tenant)
+        .await
+        .unwrap();
+    assert!(log.iter().any(|l| l.starts_with("verified")), "{log:?}");
+    // Success: NOLOGIN again, password removed, audited.
+    assert_eq!(login_state(&s.admin, &owner).await, (false, false));
+    let events = audit_events(&s.admin, &tenant).await;
+    assert!(
+        events.iter().any(|e| e == "migrate committed"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.contains("owner login window closed")),
+        "{events:?}"
+    );
+    check_tenant(&s.admin_url, &tenant, "app_rw").await.unwrap();
+
+    // Failure: the transaction rolls back and the window still closes.
+    let failing = format!("tw{}", suffix());
+    let failing_owner = owner_of(&failing);
+    ensure_nologin_owner(&s.admin_url, &failing).await;
+    let mut m = manifest();
+    m.migrations[0]
+        .statements
+        .push("CREATE TABLE IF NOT EXISTS loose (x text)".into());
+    let err = vibe::runtime::migrate_with_owner_window(&s.admin_url, &m, &failing)
+        .await
+        .unwrap_err();
+    assert!(err.contains("tenant_id"), "{err}");
+    assert_eq!(login_state(&s.admin, &failing_owner).await, (false, false));
+    let left: i64 = s
+        .admin
+        .query_one(
+            "SELECT count(*) FROM pg_namespace WHERE nspname = $1",
+            &[&format!("t_{failing}")],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(left, 0, "a failed migration commits nothing");
+    let events = audit_events(&s.admin, &failing).await;
+    assert!(
+        events.iter().any(|e| e.starts_with("migrate failed")),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.contains("owner login window closed")),
+        "{events:?}"
+    );
+    // A rejected statement (allowlist) also closes the window.
+    let mut m = manifest();
+    m.migrations[0]
+        .statements
+        .push("DELETE FROM audit_notes".into());
+    let err = vibe::runtime::migrate_with_owner_window(&s.admin_url, &m, &failing)
+        .await
+        .unwrap_err();
+    assert!(err.contains("not allowed in migrations"), "{err}");
+    assert_eq!(login_state(&s.admin, &failing_owner).await, (false, false));
+}
+
+#[tokio::test]
+async fn migrate_refuses_an_owner_that_can_already_log_in() {
+    let s = require_pg!(setup().await);
+    let tenant = format!("tl{}", suffix());
+    // ensure_tenant_roles leaves the owner LOGIN with a password.
+    ensure_tenant_roles(&s.admin_url, &tenant).await;
+    let err = vibe::runtime::migrate_with_owner_window(&s.admin_url, &manifest(), &tenant)
+        .await
+        .unwrap_err();
+    assert!(err.contains("can already log in"), "{err}");
+}
+
+#[tokio::test]
+async fn periodic_check_disables_and_reports_owners_that_can_log_in() {
+    let s = require_pg!(setup().await);
+    let tenant = format!("tc{}", suffix());
+    let owner = owner_of(&tenant);
+    ensure_tenant_roles(&s.admin_url, &tenant).await;
+    let admin = PgExec::connect(&s.admin_url).await.unwrap();
+
+    // While a migrate window lock is held for the owner, it is not reported.
+    let holder = connect(&s.admin_url).await;
+    holder
+        .execute(
+            "SELECT pg_advisory_lock($1, oid::bigint::bit(32)::int) FROM pg_roles WHERE rolname = $2",
+            &[&vibe::runtime::migrate::MIGRATE_LOCK_CLASS, &owner],
+        )
+        .await
+        .unwrap();
+    let open = admin
+        .query_texts(vibe::runtime::migrate::OWNER_LOGIN_SQL, "")
+        .await
+        .unwrap();
+    assert!(!open.contains(&owner), "{open:?}");
+    drop(holder);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let before = vibe::runtime::owner_login_alerts_total();
+    let found = vibe::runtime::check_owner_logins(&admin).await.unwrap();
+    assert!(found.contains(&owner), "{found:?}");
+    assert!(vibe::runtime::owner_login_alerts_total() > before);
+    assert_eq!(login_state(&s.admin, &owner).await, (false, false));
+    assert!(vibe::runtime::check_owner_logins(&admin)
+        .await
+        .unwrap()
+        .is_empty());
+    // Restore the other tests' owners (the helpers keep them LOGIN).
+    for other in found.iter().filter(|o| **o != owner) {
+        s.admin
+            .batch_execute(&format!("ALTER ROLE {other} LOGIN PASSWORD 'pw'"))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn serve_refuses_a_pool_logged_in_as_an_owner() {
+    let s = require_pg!(setup().await);
+    let exec = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    for class in RUNTIME_ROLES {
+        let err = exec.check_tenant_role(&s.tenant, class).await.unwrap_err();
+        assert!(err.contains("owner role"), "{class}: {err}");
+    }
+}
+
+/// (index name, is unique, is valid) in `schema`.
+async fn indexes(admin: &Client, schema: &str) -> Vec<(String, bool, bool)> {
+    admin
+        .query(
+            "SELECT c.relname::text, i.indisunique, i.indisvalid FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 ORDER BY 1",
+            &[&schema],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect()
+}
+
+#[tokio::test]
+async fn unique_indexes_are_transactional_and_others_concurrent_after_commit() {
+    let s = require_pg!(setup().await);
+    let mut m = manifest();
+    m.migrations[0].statements.extend([
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS audit_note_u ON audit_notes (tenant_id, note)"
+            .to_string(),
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS audit_note_p ON audit_notes (note)".to_string(),
+    ]);
+    // A later failure rolls back the UNIQUE index with everything else, and
+    // the performance index is never built.
+    let failing = format!("ti{}", suffix());
+    let mut bad = m.clone();
+    bad.migrations[0]
+        .statements
+        .push("CREATE TABLE IF NOT EXISTS loose (x text)".into());
+    migrate_as(&s, &bad, &failing).await.unwrap_err();
+    assert!(indexes(&s.admin, &format!("t_{failing}")).await.is_empty());
+
+    let tenant = format!("ti{}", suffix());
+    let log = migrate_as(&s, &m, &tenant).await.unwrap();
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("audit: built index concurrently after commit")),
+        "{log:?}"
+    );
+    let got = indexes(&s.admin, &format!("t_{tenant}")).await;
+    assert!(
+        got.contains(&("audit_note_u".into(), true, true)),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("audit_note_p".into(), false, true)),
+        "{got:?}"
+    );
+}
+
+#[tokio::test]
+async fn invalid_indexes_are_dropped_and_rebuilt_with_an_audit_entry() {
+    let s = require_pg!(setup().await);
+    let tenant = format!("tr{}", suffix());
+    let schema = format!("t_{tenant}");
+    let mut m = manifest();
+    m.migrations[0].statements.extend([
+        "CREATE UNIQUE INDEX IF NOT EXISTS audit_note_u ON audit_notes (tenant_id, note)"
+            .to_string(),
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS audit_note_p ON audit_notes (note)".to_string(),
+    ]);
+    ensure_nologin_owner(&s.admin_url, &tenant).await;
+    vibe::runtime::migrate_with_owner_window(&s.admin_url, &m, &tenant)
+        .await
+        .unwrap();
+    // Simulate failed concurrent builds: both indexes left INVALID.
+    s.admin
+        .batch_execute(&format!(
+            "UPDATE pg_index SET indisvalid = false WHERE indexrelid IN \
+             ('{schema}.audit_note_u'::regclass, '{schema}.audit_note_p'::regclass)"
+        ))
+        .await
+        .unwrap();
+    assert!(indexes(&s.admin, &schema).await.iter().any(|i| !i.2));
+    let log = vibe::runtime::migrate_with_owner_window(&s.admin_url, &m, &tenant)
+        .await
+        .unwrap();
+    for (name, when) in [
+        ("audit_note_u", "in the migration transaction"),
+        ("audit_note_p", "concurrently after commit"),
+    ] {
+        let line = format!("audit: dropped invalid index {schema}.{name}; rebuilding {when}");
+        assert!(log.contains(&line), "{line} not in {log:?}");
+    }
+    let got = indexes(&s.admin, &schema).await;
+    assert!(
+        got.contains(&("audit_note_u".into(), true, true)),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("audit_note_p".into(), false, true)),
+        "{got:?}"
+    );
+    let events = audit_events(&s.admin, &tenant).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.starts_with("dropped invalid index") && e.contains("audit_note_p")),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn tenant_pools_refuse_at_the_role_cap_without_waiting() {
+    let s = require_pg!(setup().await);
+    let pools = pools_for(&s.admin_url, &[&s.tenant]);
+    let held: Vec<_> = (0..5)
+        .map(|_| pools.acquire(&s.tenant, "app_rw").unwrap())
+        .collect();
+    let before = vibe::runtime::pool_exhausted_count(vibe::runtime::PoolScope::Role);
+    let started = std::time::Instant::now();
+    let err = pools
+        .execute(
+            &s.tenant,
+            "app_rw",
+            Stmt::Select {
+                table: "notes".into(),
+                columns: vec![],
+                id: None,
+                filters: vec![],
+                sort: None,
+                limit: 1,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, vibe::runtime::ExecError::PoolExhausted),
+        "{err:?}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_millis(200));
+    assert!(vibe::runtime::pool_exhausted_count(vibe::runtime::PoolScope::Role) > before);
+    drop(held);
 }

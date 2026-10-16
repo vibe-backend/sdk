@@ -1,5 +1,6 @@
 use crate::manifest::Manifest;
 
+use super::allowlist::{classify, rebuild_placement, Placement};
 use super::exec::{PgExec, PgSession};
 use super::grants::{parse_grants, pg_grant_statements};
 use super::slugs::valid_tenant;
@@ -136,6 +137,16 @@ pub async fn migrate_tenant(
             }
         }
     }
+    // Allowlist (spec §2B): every statement is checked, and each index is
+    // placed, before anything runs.
+    let mut placed: Vec<(String, Vec<Placement>)> = Vec::new();
+    for migration in &manifest.migrations {
+        let mut steps = Vec::new();
+        for statement in &migration.statements {
+            steps.push(classify(statement).map_err(|err| format!("{}: {err}", migration.id))?);
+        }
+        placed.push((migration.id.clone(), steps));
+    }
     // The pool hands out a different connection per call; pin one so the
     // transaction covers every statement.
     let mut session = exec.session().await?;
@@ -154,16 +165,17 @@ pub async fn migrate_tenant(
         session
             .batch(&[format!("SET LOCAL vibe.migrate_tx = '{marker}'")])
             .await?;
-        let mut log = migrate_in_tx(&session, manifest, tenant).await?;
+        let (mut log, deferred) = migrate_in_tx(&session, manifest, &placed, tenant).await?;
         log.extend(verify_tenant(&session, tenant).await?);
         still_in_transaction(&session, &marker).await?;
-        Ok::<_, String>(log)
+        Ok::<_, String>((log, deferred))
     }
     .await;
     match result {
-        Ok(log) => {
+        Ok((mut log, deferred)) => {
             session.batch(&["COMMIT".to_string()]).await?;
             session.in_transaction(false);
+            log.extend(build_indexes_after_commit(&session, tenant, &deferred).await?);
             Ok(log)
         }
         Err(err) => {
@@ -295,11 +307,20 @@ fn strip_leading_comments(mut sql: &str) -> &str {
     }
 }
 
+/// A non-unique index built `CONCURRENTLY` after the main transaction
+/// commits: (migration id or `rebuild`, SQL).
+type Deferred = Vec<(String, String)>;
+
+/// Prefix of log lines that `vibe migrate` also writes to the audit table.
+pub const AUDIT_PREFIX: &str = "audit: ";
+
 async fn migrate_in_tx(
     exec: &PgSession,
     manifest: &Manifest,
+    placed: &[(String, Vec<Placement>)],
     tenant: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Deferred), String> {
+    let mut deferred: Deferred = Vec::new();
     let mut log = Vec::new();
     let schema = format!("t_{tenant}");
     let others_before = tenant_fingerprint(exec, &schema).await?;
@@ -329,20 +350,27 @@ async fn migrate_in_tx(
         exec.batch(&tenant_schema_statements(tenant)?).await?;
         log.push(format!("bootstrapped {schema}.{}", model.table));
     }
+    // An index left INVALID by a failed concurrent build is dropped and
+    // rebuilt (spec §2B), with an audit entry.
+    log.extend(drop_invalid_indexes(exec, &schema, &mut deferred).await?);
     // Migration DDL names tables unqualified; resolve them in the tenant
     // schema; each batch sets it for the migration statements that follow.
-    for migration in &manifest.migrations {
+    for (id, steps) in placed {
         exec.batch(&[format!("SET LOCAL search_path TO {}", quote(&schema)?)])
             .await?;
-        for statement in &migration.statements {
-            // One command per call (extended protocol): the server rejects a
-            // statement that smuggles `; COMMIT; ...` after the first command.
-            exec.execute_one(statement)
-                .await
-                .map_err(|err| format!("{}: {err}", migration.id))?;
+        for step in steps {
+            match step {
+                // One command per call (extended protocol): the server
+                // rejects a statement that smuggles `; COMMIT; ...`.
+                Placement::InTransaction(sql) => exec
+                    .execute_one(sql)
+                    .await
+                    .map_err(|err| format!("{id}: {err}"))?,
+                Placement::AfterCommit(sql) => deferred.push((id.clone(), sql.clone())),
+            }
         }
         exec.batch(&["RESET search_path".to_string()]).await?;
-        log.push(format!("applied {}", migration.id));
+        log.push(format!("applied {id}"));
     }
     // The tenant's own roles get exactly the effective grants from the lock,
     // on every run (a changed grant is applied by the next migrate). No other
@@ -386,6 +414,77 @@ async fn migrate_in_tx(
             "migrations for {schema} changed another tenant's schema; a migration may only change its own tenant schema"
         ));
     }
+    Ok((log, deferred))
+}
+
+/// Indexes in `schema` that are INVALID (a failed `CREATE INDEX
+/// CONCURRENTLY`): each is dropped in the main transaction and rebuilt,
+/// UNIQUE ones right away in the transaction, others after commit.
+async fn drop_invalid_indexes(
+    exec: &PgSession,
+    schema: &str,
+    deferred: &mut Deferred,
+) -> Result<Vec<String>, String> {
+    let rows = (**exec)
+        .query(
+            "SELECT c.relname::text, pg_get_indexdef(c.oid) FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND NOT i.indisvalid ORDER BY 1",
+            &[&schema],
+        )
+        .await
+        .map_err(super::exec::pg_error)?;
+    let mut log = Vec::new();
+    for row in rows {
+        let (name, def): (String, String) = (row.get(0), row.get(1));
+        exec.batch(&[format!("DROP INDEX {}.{}", quote(schema)?, quote(&name)?)])
+            .await?;
+        let placement = rebuild_placement(&def);
+        let when = match &placement {
+            Placement::InTransaction(sql) => {
+                exec.execute_one(sql).await?;
+                "in the migration transaction"
+            }
+            Placement::AfterCommit(sql) => {
+                deferred.push(("rebuild".into(), sql.clone()));
+                "concurrently after commit"
+            }
+        };
+        log.push(format!(
+            "{AUDIT_PREFIX}dropped invalid index {schema}.{name}; rebuilding {when}"
+        ));
+    }
+    Ok(log)
+}
+
+/// Builds the deferred non-unique indexes, one audited step each, after the
+/// main transaction committed (still inside the owner login window). A
+/// failure is reported; the index it leaves INVALID is dropped and rebuilt
+/// on the next migrate.
+async fn build_indexes_after_commit(
+    exec: &PgSession,
+    tenant: &str,
+    deferred: &Deferred,
+) -> Result<Vec<String>, String> {
+    let schema = format!("t_{tenant}");
+    let mut log = Vec::new();
+    if deferred.is_empty() {
+        return Ok(log);
+    }
+    exec.batch(&[format!("SET search_path TO {}", quote(&schema)?)])
+        .await?;
+    for (id, sql) in deferred {
+        if let Err(err) = exec.execute_one(sql).await {
+            let _ = exec.batch(&["RESET search_path".to_string()]).await;
+            return Err(format!(
+                "{id}: the main migration transaction for {schema} committed, but the concurrent index step failed: {err}; an INVALID index it left is dropped and rebuilt on the next migrate"
+            ));
+        }
+        log.push(format!(
+            "{AUDIT_PREFIX}built index concurrently after commit ({id}) in {schema}"
+        ));
+    }
+    exec.batch(&["RESET search_path".to_string()]).await?;
     Ok(log)
 }
 
@@ -614,6 +713,210 @@ fn join(items: &[&String]) -> String {
         .map(|s| s.as_str())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Advisory lock class held by `vibe migrate` (on the admin connection)
+/// for the whole owner login window; the second key is the owner role oid.
+pub const MIGRATE_LOCK_CLASS: i32 = 0x5649_4245; // "VIBE"
+
+/// Owner roles that can log in while no `vibe migrate` holds their window
+/// lock: `$1` is unused (pass "").
+pub const OWNER_LOGIN_SQL: &str = "\
+SELECT r.rolname::text FROM pg_roles r \
+ WHERE r.rolname ~ '^tenant_[a-z0-9_]+_owner$' AND r.rolcanlogin AND $1::text IS NOT NULL \
+ AND NOT EXISTS (SELECT 1 FROM pg_locks l WHERE l.locktype = 'advisory' \
+   AND l.classid::bigint = 1447641669 AND l.objid = r.oid AND l.objsubid = 2 AND l.granted) \
+ ORDER BY 1";
+
+/// SQL that ends an owner login window: NOLOGIN, password removed, and any
+/// remaining owner sessions terminated.
+pub fn close_owner_window_sql(owner: &str) -> Result<Vec<String>, String> {
+    let role = quote(owner)?;
+    Ok(vec![
+        format!("ALTER ROLE {role} NOLOGIN PASSWORD NULL"),
+        format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{owner}' AND pid <> pg_backend_pid()"
+        ),
+    ])
+}
+
+/// A random one-time password (256 bits, hex). Only its SCRAM verifier is
+/// sent to the server; the password itself is never logged.
+fn one_time_password() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `admin_url` with the user and password replaced.
+fn url_with_login(admin_url: &str, user: &str, password: &str) -> Result<String, String> {
+    let mut url =
+        url::Url::parse(admin_url).map_err(|err| format!("invalid admin database URL: {err}"))?;
+    url.set_username(user)
+        .map_err(|_| "admin database URL cannot carry a user".to_string())?;
+    url.set_password(Some(password))
+        .map_err(|_| "admin database URL cannot carry a password".to_string())?;
+    Ok(url.to_string())
+}
+
+/// `vibe migrate` (spec §2B, D129): the owner role `tenant_<id>_owner` is
+/// NOLOGIN outside migrate. On the platform-admin connection this takes the
+/// tenant's window lock, gives the owner a one-time password and LOGIN, runs
+/// [`migrate_tenant`] logged in as the owner (one transaction, then the
+/// deferred concurrent indexes), and then — whether that succeeded or
+/// failed — on a separate admin connection sets the owner NOLOGIN again,
+/// removes the password, terminates owner sessions and writes the audit
+/// entries to `public.vibe_migrate_audit`.
+pub async fn migrate_with_owner_window(
+    admin_url: &str,
+    manifest: &Manifest,
+    tenant: &str,
+) -> Result<Vec<String>, String> {
+    if !valid_tenant(tenant) {
+        return Err(super::slugs::TENANT_ID_RULE.into());
+    }
+    let owner = super::grants::tenant_owner_role(tenant)?;
+    let admin = PgExec::connect(admin_url).await?;
+    let lock = admin.session().await?;
+    let state = (*lock)
+        .query(
+            "SELECT r.oid::bigint, r.rolcanlogin, pg_try_advisory_lock($2, r.oid::bigint::bit(32)::int) \
+             FROM pg_roles r WHERE r.rolname = $1",
+            &[&owner, &MIGRATE_LOCK_CLASS],
+        )
+        .await
+        .map_err(super::exec::pg_error)?;
+    let Some(row) = state.first() else {
+        return Err(format!(
+            "refusing to migrate t_{tenant}: owner role {owner} does not exist; create it NOLOGIN (decision 129)"
+        ));
+    };
+    let (can_login, locked): (bool, bool) = (row.get(1), row.get(2));
+    if !locked {
+        return Err(format!(
+            "refusing to migrate t_{tenant}: another vibe migrate holds the owner login window"
+        ));
+    }
+    if can_login {
+        return Err(format!(
+            "refusing to migrate t_{tenant}: {owner} can already log in outside a migrate window; set it NOLOGIN and investigate (see the owner login check)"
+        ));
+    }
+    let password = one_time_password();
+    let verifier = postgres_protocol::password::scram_sha_256(password.as_bytes());
+    let opened = lock
+        .batch(&[format!(
+            "ALTER ROLE {} LOGIN PASSWORD '{verifier}'",
+            quote(&owner)?
+        )])
+        .await;
+    let result = match opened {
+        Err(err) => Err(format!("could not open the owner login window: {err}")),
+        Ok(()) => {
+            async {
+                let owner_url = url_with_login(admin_url, &owner, &password)?;
+                let exec = PgExec::connect(&owner_url).await?;
+                migrate_tenant(&exec, manifest, tenant).await
+            }
+            .await
+        }
+    };
+    drop(password);
+    // finally: always, on a separate admin connection.
+    let closed = close_owner_window(admin_url, &owner, tenant, &result).await;
+    let _ = lock
+        .batch(&["SELECT pg_advisory_unlock_all()".to_string()])
+        .await;
+    drop(lock);
+    match (result, closed) {
+        (Ok(log), Ok(())) => Ok(log),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(close)) => Err(format!("{err}; additionally: {close}")),
+    }
+}
+
+async fn close_owner_window(
+    admin_url: &str,
+    owner: &str,
+    tenant: &str,
+    result: &Result<Vec<String>, String>,
+) -> Result<(), String> {
+    let mut last = String::new();
+    for _ in 0..3 {
+        let attempt = async {
+            let admin = PgExec::connect(admin_url).await?;
+            let session = admin.session().await?;
+            session.batch(&close_owner_window_sql(owner)?).await?;
+            let mut events: Vec<String> = match result {
+                Ok(log) => log
+                    .iter()
+                    .filter_map(|l| l.strip_prefix(AUDIT_PREFIX).map(str::to_string))
+                    .collect(),
+                Err(err) => vec![format!("migrate failed: {err}")],
+            };
+            if result.is_ok() {
+                events.push("migrate committed".into());
+            }
+            events.push(format!(
+                "owner login window closed: {owner} NOLOGIN, password removed"
+            ));
+            session.batch(&[AUDIT_TABLE_SQL.to_string()]).await?;
+            for event in events {
+                (*session)
+                    .execute(
+                        "INSERT INTO public.vibe_migrate_audit (tenant, event) VALUES ($1, $2)",
+                        &[&tenant, &event],
+                    )
+                    .await
+                    .map_err(super::exec::pg_error)?;
+            }
+            Ok::<_, String>(())
+        }
+        .await;
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(err) => last = err,
+        }
+    }
+    tracing::error!(
+        owner,
+        "owner login window could not be closed; the owner may still log in"
+    );
+    Err(format!(
+        "SECURITY: could not set {owner} back to NOLOGIN after migrate ({last}); run `ALTER ROLE {owner} NOLOGIN PASSWORD NULL` now"
+    ))
+}
+
+/// Audit table written by the platform-admin connection.
+pub const AUDIT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS public.vibe_migrate_audit (\
+ at timestamptz NOT NULL DEFAULT now(), tenant text NOT NULL, event text NOT NULL); \
+ REVOKE ALL ON public.vibe_migrate_audit FROM PUBLIC";
+
+/// Owner login alerts raised since process start (`vibe check-owners`).
+static OWNER_LOGIN_ALERTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Metric `vibe_db_owner_login_alerts_total`.
+pub fn owner_login_alerts_total() -> u64 {
+    OWNER_LOGIN_ALERTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Periodic owner check (spec §2B): every owner role that can log in while
+/// no migrate window is open is set NOLOGIN (password removed) and reported
+/// with an alert. Returns the roles found.
+pub async fn check_owner_logins(admin: &PgExec) -> Result<Vec<String>, String> {
+    let found = admin.query_texts(OWNER_LOGIN_SQL, "").await?;
+    for owner in &found {
+        OWNER_LOGIN_ALERTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(
+            owner = owner.as_str(),
+            vibe_db_owner_login_alerts_total = owner_login_alerts_total(),
+            "ALERT: tenant owner role can log in outside vibe migrate; setting NOLOGIN"
+        );
+        admin.batch(&close_owner_window_sql(owner)?).await?;
+    }
+    Ok(found)
 }
 
 #[cfg(test)]

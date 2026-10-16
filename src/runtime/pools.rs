@@ -19,24 +19,99 @@ use super::exec::{ExecError, PgExec, PgOptions, QueryExec, Row};
 use super::grants::{tenant_role, RUNTIME_ROLES};
 use super::sql::Stmt;
 
-/// Spec §7.1: at most 5 connections per (tenant, role class) pool.
+/// Spec §7.1 / D129: at most 5 connections per (tenant, role) pool.
 pub const MAX_TENANT_POOL_SIZE: usize = 5;
 
+/// D129: at most 15 connections in use at once per tenant, across its roles.
+pub const MAX_TENANT_CONNECTIONS: usize = 15;
+
 /// Default process-wide cap on database connections in use at once, across
-/// every tenant pool (`VIBE_DB_MAX_CONNECTIONS`).
+/// every tenant pool (`VIBE_DB_POOL_MAX_TOTAL`).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 200;
+
+/// Environment variable for the process-wide connection cap.
+pub const POOL_MAX_TOTAL_ENV: &str = "VIBE_DB_POOL_MAX_TOTAL";
 
 /// Default dev/test password file looked for under the project; its mere
 /// presence refuses a production start.
 pub const DEV_SECRETS_FILE: &str = ".vibe/tenant-db-secrets.json";
 
-/// Requests refused with `DB_POOL_EXHAUSTED` since process start.
-static POOL_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+/// Which connection limit refused a request (`scope` label of
+/// `vibe_db_pool_exhausted_total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolScope {
+    /// 5 per (tenant, role).
+    Role,
+    /// 15 per tenant.
+    Tenant,
+    /// `VIBE_DB_POOL_MAX_TOTAL` per process.
+    Process,
+}
 
-/// Metric: total requests refused because the process-wide connection cap
-/// was reached (counter, see docs/release-hardening.md).
+impl PoolScope {
+    pub const ALL: [PoolScope; 3] = [PoolScope::Role, PoolScope::Tenant, PoolScope::Process];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PoolScope::Role => "role",
+            PoolScope::Tenant => "tenant",
+            PoolScope::Process => "process",
+        }
+    }
+
+    fn counter(self) -> &'static AtomicU64 {
+        match self {
+            PoolScope::Role => &EXHAUSTED_ROLE,
+            PoolScope::Tenant => &EXHAUSTED_TENANT,
+            PoolScope::Process => &EXHAUSTED_PROCESS,
+        }
+    }
+}
+
+/// Requests refused with `DB_POOL_EXHAUSTED` since process start, per scope.
+static EXHAUSTED_ROLE: AtomicU64 = AtomicU64::new(0);
+static EXHAUSTED_TENANT: AtomicU64 = AtomicU64::new(0);
+static EXHAUSTED_PROCESS: AtomicU64 = AtomicU64::new(0);
+
+/// Metric `vibe_db_pool_exhausted_total{scope}` for one scope.
+pub fn pool_exhausted_count(scope: PoolScope) -> u64 {
+    scope.counter().load(Ordering::Relaxed)
+}
+
+/// Sum of `vibe_db_pool_exhausted_total` over every scope.
 pub fn pool_exhausted_total() -> u64 {
-    POOL_EXHAUSTED.load(Ordering::Relaxed)
+    PoolScope::ALL
+        .iter()
+        .map(|s| pool_exhausted_count(*s))
+        .sum()
+}
+
+/// `vibe_db_pool_exhausted_total` in the Prometheus text format.
+pub fn pool_exhausted_metrics() -> String {
+    let mut out = String::from(
+        "# HELP vibe_db_pool_exhausted_total Requests refused with 503 DB_POOL_EXHAUSTED.\n\
+         # TYPE vibe_db_pool_exhausted_total counter\n",
+    );
+    for scope in PoolScope::ALL {
+        out.push_str(&format!(
+            "vibe_db_pool_exhausted_total{{scope=\"{}\"}} {}\n",
+            scope.as_str(),
+            pool_exhausted_count(scope)
+        ));
+    }
+    out
+}
+
+/// Parses `VIBE_DB_POOL_MAX_TOTAL` (unset or blank: the default).
+pub fn parse_pool_max_total(value: Option<&str>) -> Result<usize, String> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(DEFAULT_MAX_CONNECTIONS),
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| format!("{POOL_MAX_TOTAL_ENV} must be a positive integer")),
+    }
 }
 
 /// `(tenant, class)` for a `tenant_<id>_<suffix>` runtime role name.
@@ -237,6 +312,9 @@ pub struct TenantPools {
     /// Connections in use at once across all pools.
     in_use: Arc<tokio::sync::Semaphore>,
     max_connections: usize,
+    /// Connections in use per (tenant, role) and per tenant.
+    role_slots: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    tenant_slots: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     pools: tokio::sync::Mutex<HashMap<String, Arc<PgExec>>>,
 }
 
@@ -273,7 +351,7 @@ impl TenantPools {
             ));
         }
         if max_connections == 0 {
-            return Err("VIBE_DB_MAX_CONNECTIONS must be a positive integer".into());
+            return Err(format!("{POOL_MAX_TOTAL_ENV} must be a positive integer"));
         }
         let mut options = options;
         options.pool_size = options.pool_size.min(MAX_TENANT_POOL_SIZE);
@@ -283,33 +361,70 @@ impl TenantPools {
             options,
             in_use: Arc::new(tokio::sync::Semaphore::new(max_connections)),
             max_connections,
+            role_slots: std::sync::Mutex::default(),
+            tenant_slots: std::sync::Mutex::default(),
             pools: tokio::sync::Mutex::default(),
         })
     }
 
     /// `VIBE_DATABASE_URL` (or `DATABASE_URL`; server and database only),
-    /// [`secret_source_from_env`], and `VIBE_DB_MAX_CONNECTIONS` (default 200).
+    /// [`secret_source_from_env`], and `VIBE_DB_POOL_MAX_TOTAL` (default 200).
     pub fn from_env(production: bool, project: &Path) -> Result<Self, String> {
         let url = std::env::var("VIBE_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .map_err(|_| {
                 "set VIBE_DATABASE_URL or pass --memory for the dev executor".to_string()
             })?;
-        let max = match std::env::var("VIBE_DB_MAX_CONNECTIONS") {
-            Ok(v) if !v.trim().is_empty() => v
-                .trim()
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n > 0)
-                .ok_or("VIBE_DB_MAX_CONNECTIONS must be a positive integer")?,
-            _ => DEFAULT_MAX_CONNECTIONS,
-        };
+        let max = parse_pool_max_total(std::env::var(POOL_MAX_TOTAL_ENV).ok().as_deref())?;
         Self::with_source(
             &url,
             secret_source_from_env(production, project)?,
             PgOptions::from_env()?,
             max,
         )
+    }
+
+    fn slot(
+        map: &std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+        key: String,
+        size: usize,
+    ) -> Arc<tokio::sync::Semaphore> {
+        let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(size)))
+            .clone()
+    }
+
+    /// One connection slot for `tenant`/`class` under all three caps, or the
+    /// scope of the first cap that is full. Never waits.
+    pub fn acquire(
+        &self,
+        tenant: &str,
+        class: &str,
+    ) -> Result<[tokio::sync::OwnedSemaphorePermit; 3], PoolScope> {
+        // Tenant first: with three role classes of 5, the tenant cap (15)
+        // is only reached when every role is full, so checking it first is
+        // what lets a full tenant be reported as `scope="tenant"`.
+        let tenant_permit = Self::slot(
+            &self.tenant_slots,
+            tenant.to_string(),
+            MAX_TENANT_CONNECTIONS,
+        )
+        .try_acquire_owned()
+        .map_err(|_| PoolScope::Tenant)?;
+        let role = Self::slot(
+            &self.role_slots,
+            format!("{tenant}\u{0}{class}"),
+            MAX_TENANT_POOL_SIZE,
+        )
+        .try_acquire_owned()
+        .map_err(|_| PoolScope::Role)?;
+        let process = self
+            .in_use
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| PoolScope::Process)?;
+        Ok([tenant_permit, role, process])
     }
 
     pub fn max_connections(&self) -> usize {
@@ -389,16 +504,20 @@ impl QueryExec for TenantPools {
         stmt: Stmt,
     ) -> Result<Vec<Row>, ExecError> {
         super::exec::role_allows(role, &stmt).map_err(super::exec::role_error)?;
-        // Process-wide cap: refuse at once instead of queueing until a
-        // timeout (D129).
-        let Ok(_permit) = self.in_use.clone().try_acquire_owned() else {
-            let total = POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::warn!(
-                max_connections = self.max_connections,
-                pool_exhausted_total = total,
-                "database connection cap reached; refusing request with DB_POOL_EXHAUSTED"
-            );
-            return Err(ExecError::PoolExhausted);
+        // Role, tenant and process caps: refuse at once instead of queueing
+        // until a timeout (D129).
+        let _permits = match self.acquire(tenant_id, role) {
+            Ok(permits) => permits,
+            Err(scope) => {
+                let total = scope.counter().fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    scope = scope.as_str(),
+                    max_connections = self.max_connections,
+                    vibe_db_pool_exhausted_total = total,
+                    "database connection limit reached; refusing request with DB_POOL_EXHAUSTED"
+                );
+                return Err(ExecError::PoolExhausted);
+            }
         };
         let pool = self
             .pool(tenant_id, role)
@@ -581,5 +700,140 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_millis(200));
         assert!(pool_exhausted_total() > before);
         drop(held);
+    }
+
+    fn capped_pools(max: usize) -> TenantPools {
+        let mut secrets = HashMap::new();
+        for tenant in ["acme0001", "beta0001"] {
+            for class in RUNTIME_ROLES {
+                secrets.insert(tenant_role(tenant, class).unwrap(), String::new());
+            }
+        }
+        TenantPools::with_source(
+            "postgres://10.255.255.1:5432/db",
+            Box::new(FileSecrets::from_map(secrets)),
+            PgOptions::default(),
+            max,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn five_per_role_then_refused_with_role_scope() {
+        let pools = capped_pools(200);
+        let held: Vec<_> = (0..5)
+            .map(|_| pools.acquire("acme0001", "app_rw").unwrap())
+            .collect();
+        assert_eq!(
+            pools.acquire("acme0001", "app_rw").err(),
+            Some(PoolScope::Role)
+        );
+        // Other roles and tenants are unaffected.
+        assert!(pools.acquire("acme0001", "public_reader").is_ok());
+        assert!(pools.acquire("beta0001", "app_rw").is_ok());
+        drop(held);
+        assert!(pools.acquire("acme0001", "app_rw").is_ok());
+    }
+
+    #[test]
+    fn fifteen_per_tenant_then_refused_with_tenant_scope() {
+        let pools = capped_pools(200);
+        let mut held = Vec::new();
+        for class in RUNTIME_ROLES {
+            for _ in 0..5 {
+                held.push(pools.acquire("acme0001", class).unwrap());
+            }
+        }
+        assert_eq!(held.len(), MAX_TENANT_CONNECTIONS);
+        for class in RUNTIME_ROLES {
+            assert_eq!(
+                pools.acquire("acme0001", class).err(),
+                Some(PoolScope::Tenant)
+            );
+        }
+        assert!(pools.acquire("beta0001", "app_rw").is_ok());
+        held.pop();
+        assert!(pools.acquire("acme0001", "public_writer").is_ok());
+    }
+
+    #[test]
+    fn process_cap_is_refused_with_process_scope() {
+        let pools = capped_pools(3);
+        let held: Vec<_> = (0..3)
+            .map(|_| pools.acquire("acme0001", "app_rw").unwrap())
+            .collect();
+        assert_eq!(
+            pools.acquire("beta0001", "app_rw").err(),
+            Some(PoolScope::Process)
+        );
+        drop(held);
+        assert!(pools.acquire("beta0001", "app_rw").is_ok());
+    }
+
+    #[tokio::test]
+    async fn every_scope_refuses_immediately_and_counts_its_metric() {
+        let select = || Stmt::Select {
+            table: "notes".into(),
+            columns: vec![],
+            id: None,
+            filters: vec![],
+            sort: None,
+            limit: 1,
+            offset: 0,
+        };
+        for scope in PoolScope::ALL {
+            let pools = capped_pools(if scope == PoolScope::Process { 1 } else { 200 });
+            let mut held = Vec::new();
+            match scope {
+                PoolScope::Role => {
+                    for _ in 0..5 {
+                        held.push(pools.acquire("acme0001", "app_rw").unwrap());
+                    }
+                }
+                PoolScope::Tenant => {
+                    for class in RUNTIME_ROLES {
+                        for _ in 0..5 {
+                            held.push(pools.acquire("acme0001", class).unwrap());
+                        }
+                    }
+                }
+                PoolScope::Process => held.push(pools.acquire("beta0001", "app_rw").unwrap()),
+            }
+            let before = pool_exhausted_count(scope);
+            let started = std::time::Instant::now();
+            let err = pools
+                .execute("acme0001", "app_rw", select())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ExecError::PoolExhausted),
+                "{scope:?}: {err:?}"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_millis(200));
+            assert!(pool_exhausted_count(scope) > before, "{scope:?}");
+            drop(held);
+        }
+        let text = pool_exhausted_metrics();
+        for scope in ["role", "tenant", "process"] {
+            assert!(
+                text.contains(&format!(
+                    "vibe_db_pool_exhausted_total{{scope=\"{scope}\"}} "
+                )),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_max_total_env_is_parsed() {
+        assert_eq!(POOL_MAX_TOTAL_ENV, "VIBE_DB_POOL_MAX_TOTAL");
+        assert_eq!(parse_pool_max_total(None), Ok(200));
+        assert_eq!(parse_pool_max_total(Some(" ")), Ok(200));
+        assert_eq!(parse_pool_max_total(Some("50")), Ok(50));
+        for bad in ["0", "-1", "x"] {
+            assert!(parse_pool_max_total(Some(bad))
+                .unwrap_err()
+                .contains("VIBE_DB_POOL_MAX_TOTAL"));
+        }
     }
 }

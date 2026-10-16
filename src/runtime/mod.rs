@@ -1,3 +1,4 @@
+pub mod allowlist;
 pub mod challenge;
 mod crud;
 mod exec;
@@ -6,7 +7,7 @@ mod http;
 pub mod jwks;
 mod limiter;
 mod memory;
-mod migrate;
+pub mod migrate;
 mod pools;
 mod slugs;
 mod sql;
@@ -20,11 +21,14 @@ pub use http::{
 };
 pub use limiter::{saturation_refusals, ProxyNet, QuotaBuckets, RateBuckets};
 pub use memory::{MemoryExec, MEMORY_UNSUPPORTED_SQL};
-pub use migrate::migrate_tenant;
+pub use migrate::{
+    check_owner_logins, migrate_tenant, migrate_with_owner_window, owner_login_alerts_total,
+};
 pub use pools::{
-    parse_tenant_role, pool_exhausted_total, secret_source, secret_source_from_env, EnvSecrets,
-    FileSecrets, TenantPools, TenantSecretSource, DEFAULT_MAX_CONNECTIONS, DEV_SECRETS_FILE,
-    MAX_TENANT_POOL_SIZE,
+    parse_pool_max_total, parse_tenant_role, pool_exhausted_count, pool_exhausted_metrics,
+    pool_exhausted_total, secret_source, secret_source_from_env, EnvSecrets, FileSecrets,
+    PoolScope, TenantPools, TenantSecretSource, DEFAULT_MAX_CONNECTIONS, DEV_SECRETS_FILE,
+    MAX_TENANT_CONNECTIONS, MAX_TENANT_POOL_SIZE, POOL_MAX_TOTAL_ENV,
 };
 pub use slugs::{add_slug, load_project_slugs, valid_tenant, SlugLoad, TENANT_ID_RULE};
 pub use sql::{

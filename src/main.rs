@@ -83,6 +83,13 @@ enum Command {
         #[arg(long)]
         tenant: String,
     },
+    /// Periodic owner check (D129): set NOLOGIN and alert on any tenant owner
+    /// role that can log in outside a `vibe migrate` window.
+    CheckOwners {
+        /// Seconds between checks; 0 checks once and exits non-zero on a finding.
+        #[arg(long, default_value_t = 0)]
+        interval: u64,
+    },
     /// Register a public slug for a tenant.
     Slug {
         #[command(subcommand)]
@@ -170,6 +177,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             project,
             tenant,
         } => cmd_migrate(&manifest, &project, &tenant).await,
+        Command::CheckOwners { interval } => cmd_check_owners(interval).await,
         Command::Slug { action } => match action {
             SlugAction::Add {
                 slug,
@@ -452,15 +460,38 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
     }
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
-    // Migrations need the table-owner role; serving must not use it.
-    let url = std::env::var("VIBE_MIGRATE_DATABASE_URL").map_err(|_| {
-        "VIBE_MIGRATE_DATABASE_URL is required (the owner role used for DDL; `vibe serve` uses a separate non-owner VIBE_DATABASE_URL)".to_string()
-    })?;
-    let exec = PgExec::connect(&url).await?;
-    for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant).await? {
+    // The owner role is NOLOGIN outside migrate; the platform-admin login
+    // opens a one-time owner login window and always closes it (D129).
+    let url = admin_url_from_env()?;
+    for line in vibe::runtime::migrate_with_owner_window(&url, &manifest, tenant).await? {
         println!("{line}");
     }
     Ok(())
+}
+
+fn admin_url_from_env() -> Result<String, String> {
+    std::env::var("VIBE_MIGRATE_ADMIN_DATABASE_URL").map_err(|_| {
+        "VIBE_MIGRATE_ADMIN_DATABASE_URL is required (a platform-admin login that may ALTER ROLE tenant_<id>_owner; the owner role is NOLOGIN outside migrate, and `vibe serve` never uses either)".to_string()
+    })
+}
+
+async fn cmd_check_owners(interval: u64) -> Result<(), String> {
+    let exec = PgExec::connect(&admin_url_from_env()?).await?;
+    loop {
+        let found = vibe::runtime::check_owner_logins(&exec).await?;
+        for owner in &found {
+            eprintln!("ALERT: owner role {owner} could log in outside vibe migrate; set NOLOGIN");
+        }
+        if interval == 0 {
+            return if found.is_empty() {
+                println!("no tenant owner role can log in");
+                Ok(())
+            } else {
+                Err(format!("{} owner role(s) could log in", found.len()))
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+    }
 }
 
 fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {

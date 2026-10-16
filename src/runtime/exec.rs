@@ -81,6 +81,16 @@ pub struct RoleStatus {
 impl RoleStatus {
     pub fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
+        // D129: a pool must never log in as a tenant owner role.
+        if [&self.session_user, &self.name]
+            .iter()
+            .any(|u| super::grants::is_owner_role_name(u))
+        {
+            out.push(format!(
+                "logs in as owner role `{}`; owner roles are for vibe migrate only and must never back a pool",
+                self.session_user
+            ));
+        }
         if self.name != self.expected || self.session_user != self.expected {
             out.push(format!(
                 "is logged in as `{}` (current user `{}`), not the tenant role `{}`",
@@ -782,6 +792,25 @@ mod role_tests {
             ..RoleStatus::default()
         };
         assert!(s.problems().is_empty());
+    }
+
+    #[test]
+    fn a_pool_logged_in_as_an_owner_role_is_refused() {
+        let s = RoleStatus {
+            name: "tenant_acme0001_owner".into(),
+            session_user: "tenant_acme0001_owner".into(),
+            expected: "tenant_acme0001_rw".into(),
+            ..RoleStatus::default()
+        };
+        let p = s.problems();
+        assert!(p[0].contains("owner role `tenant_acme0001_owner`"), "{p:?}");
+        assert!(super::super::grants::is_owner_role_name(
+            "tenant_acme_0001_owner"
+        ));
+        assert!(!super::super::grants::is_owner_role_name(
+            "tenant_acme0001_rw"
+        ));
+        assert!(!super::super::grants::is_owner_role_name("owner"));
     }
 
     #[test]
