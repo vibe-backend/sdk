@@ -23,12 +23,14 @@ use sha1::{Digest, Sha1};
 
 /// Default range API (Pwned Passwords).
 pub const DEFAULT_RANGE_URL: &str = "https://api.pwnedpasswords.com/range/";
-/// Default lookup timeout (`VIBE_BREACHED_PASSWORDS_TIMEOUT_MS`).
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Default lookup timeout (`VIBE_BREACHED_PASSWORDS_TIMEOUT_MS`): one total
+/// deadline for a lookup, covering the wait for a lookup slot, connect and
+/// the full response.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Smallest accepted lookup timeout.
 pub const MIN_TIMEOUT: Duration = Duration::from_millis(100);
 /// Largest accepted lookup timeout.
-pub const MAX_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(10);
 /// Real padded responses are ~30–40 KB.
 const MAX_BODY: usize = 256 * 1024;
 /// With `Add-Padding`, a genuine response has hundreds of lines.
@@ -53,6 +55,82 @@ const BUILTIN: &[&str] = &[
 ];
 
 type Suffixes = HashMap<[u8; 18], u64>;
+
+/// Range lookups that failed since start, across all sources in the process.
+/// Read with [`breached_lookup_failures`]; see docs/release-hardening.md.
+static LOOKUP_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of failed range lookups (outage, timeout, unexpected
+/// response). Each failure is also logged at `WARN` with target
+/// `vibe::breached_password_unavailable` for log-based alerting.
+pub fn breached_lookup_failures() -> u64 {
+    LOOKUP_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Why a range lookup failed. The text is a fixed category (plus the HTTP
+/// status or line number); upstream response content is never included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LookupError {
+    /// The total lookup deadline passed (slot wait, connect or response).
+    Timeout,
+    /// Connect or transfer error.
+    Network,
+    /// A status other than 200.
+    Status(u16),
+    /// Content type is not `text/plain`.
+    ContentType,
+    /// Body larger than the cap.
+    TooLarge,
+    /// Not valid UTF-8.
+    Encoding,
+    /// A line that is not `SUFFIX:COUNT` (1-based line number).
+    MalformedLine(usize),
+    /// Fewer entries than a padded response has.
+    TooFewEntries,
+    /// Lookup slots closed (shutdown).
+    Closed,
+}
+
+impl LookupError {
+    /// Stable category for logs and alerts.
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Network => "network",
+            Self::Status(_) => "status",
+            Self::ContentType => "content_type",
+            Self::TooLarge => "too_large",
+            Self::Encoding | Self::MalformedLine(_) | Self::TooFewEntries => "malformed",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+impl std::fmt::Display for LookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("breached-password lookup: timed out"),
+            Self::Network => f.write_str("breached-password lookup: network error"),
+            Self::Status(code) => write!(f, "breached-password lookup: HTTP {code}"),
+            Self::ContentType => {
+                f.write_str("breached-password lookup: response is not text/plain")
+            }
+            Self::TooLarge => f.write_str("breached-password lookup: response too large"),
+            Self::Encoding => f.write_str("breached-password response is not UTF-8"),
+            Self::MalformedLine(n) => write!(f, "breached-password response: malformed line {n}"),
+            Self::TooFewEntries => {
+                f.write_str("breached-password response has too few entries for a padded response")
+            }
+            Self::Closed => f.write_str("breached-password lookups closed"),
+        }
+    }
+}
+
+impl From<LookupError> for String {
+    fn from(err: LookupError) -> Self {
+        err.to_string()
+    }
+}
 
 pub struct RangeApi {
     url: String,
@@ -180,6 +258,32 @@ fn is_loopback(host: &str) -> bool {
     bare == "localhost" || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
+/// Permission check for an offline list file: the file and every directory
+/// from its parent up to `/` must not be writable by group or other. A
+/// shared sticky directory such as `/tmp` counts as too open. Returns a
+/// description of the first problem found.
+#[cfg(unix)]
+pub fn unsafe_permissions(path: &str, meta: &std::fs::Metadata) -> Result<Option<String>, String> {
+    use std::os::unix::fs::PermissionsExt;
+    if meta.permissions().mode() & 0o022 != 0 {
+        return Ok(Some("file is writable by group or other".into()));
+    }
+    let full = std::fs::canonicalize(path).map_err(|err| format!("{path}: {err}"))?;
+    for dir in full.ancestors().skip(1) {
+        let mode = std::fs::metadata(dir)
+            .map_err(|err| format!("{}: {err}", dir.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o022 != 0 {
+            return Ok(Some(format!(
+                "directory {} is writable by group or other",
+                dir.display()
+            )));
+        }
+    }
+    Ok(None)
+}
+
 impl OfflineList {
     /// One SHA-1 hex digest per line, optionally `:count`; blank lines and
     /// `#` comments are skipped. Read line by line and kept as sorted
@@ -210,21 +314,21 @@ impl OfflineList {
         Ok(Self(digests))
     }
 
-    /// Loads a list file. A file writable by group or other is refused in
-    /// production (fail closed) and only warned about elsewhere.
+    /// Loads a list file. A file, or any directory above it, writable by
+    /// group or other is refused in production (fail closed) and only warned
+    /// about elsewhere.
     pub fn load(path: &str, production: bool) -> Result<Self, String> {
         let file = std::fs::File::open(path).map_err(|err| format!("{path}: {err}"))?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let meta = file.metadata().map_err(|err| format!("{path}: {err}"))?;
-            if meta.permissions().mode() & 0o022 != 0 {
+            if let Some(problem) = unsafe_permissions(path, &meta)? {
                 if production {
                     return Err(format!(
-                        "breached-password list {path} is writable by group or other; restrict it (for example chmod 644 or 600) before starting in production"
+                        "breached-password list {path}: {problem}; restrict it (for example chmod 644 for the file and 755 for its directories) before starting in production"
                     ));
                 }
-                tracing::warn!(%path, "breached-password list is writable by group or other; restrict it (production refuses to start)");
+                tracing::warn!(%path, %problem, "breached-password list permissions are too open; restrict them (production refuses to start)");
             }
         }
         #[cfg(not(unix))]
@@ -270,7 +374,10 @@ impl RangeApi {
             return Err("breached-password URL must not carry credentials".into());
         }
         let client = reqwest::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
+            // Backstop only: each lookup runs under its own configured
+            // deadline (at most MAX_TIMEOUT), see `suffixes`.
+            .timeout(MAX_TIMEOUT)
+            .connect_timeout(MAX_TIMEOUT)
             .user_agent(concat!("vibe-sdk/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(std::sync::Arc::new(PublicResolver {
@@ -296,7 +403,8 @@ impl RangeApi {
         })
     }
 
-    /// Per-lookup timeout (connect + response), 100 ms ..= 30 s.
+    /// Total per-lookup deadline (slot wait + connect + response),
+    /// clamped to 100 ms ..= 10 s.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout.clamp(MIN_TIMEOUT, MAX_TIMEOUT);
         self
@@ -348,14 +456,23 @@ impl RangeApi {
             .map(|(_, s)| s.clone())
     }
 
-    async fn suffixes(&self, prefix: &str) -> Result<std::sync::Arc<Suffixes>, String> {
+    async fn suffixes(&self, prefix: &str) -> Result<std::sync::Arc<Suffixes>, LookupError> {
         if let Some(hit) = self.cached(prefix) {
             return Ok(hit);
         }
-        let _slot = tokio::time::timeout(self.timeout, self.slots.acquire())
+        // One deadline for the whole lookup, so waiting for a slot and the
+        // request together never exceed the configured timeout.
+        tokio::time::timeout(self.timeout, self.lookup(prefix))
             .await
-            .map_err(|_| "breached-password lookups saturated".to_string())?
-            .map_err(|_| "breached-password lookups closed".to_string())?;
+            .map_err(|_| LookupError::Timeout)?
+    }
+
+    async fn lookup(&self, prefix: &str) -> Result<std::sync::Arc<Suffixes>, LookupError> {
+        let _slot = self
+            .slots
+            .acquire()
+            .await
+            .map_err(|_| LookupError::Closed)?;
         if let Some(hit) = self.cached(prefix) {
             return Ok(hit);
         }
@@ -372,17 +489,23 @@ impl RangeApi {
         Ok(parsed)
     }
 
-    async fn fetch(&self, prefix: &str) -> Result<Suffixes, String> {
+    async fn fetch(&self, prefix: &str) -> Result<Suffixes, LookupError> {
+        let net = |err: reqwest::Error| {
+            if err.is_timeout() {
+                LookupError::Timeout
+            } else {
+                LookupError::Network
+            }
+        };
         let mut res = self
             .client
             .get(format!("{}{prefix}", self.url))
             .header("Add-Padding", "true")
-            .timeout(self.timeout)
             .send()
             .await
-            .map_err(|err| format!("breached-password lookup: {}", err.without_url()))?;
+            .map_err(net)?;
         if res.status() != reqwest::StatusCode::OK {
-            return Err(format!("breached-password lookup: HTTP {}", res.status()));
+            return Err(LookupError::Status(res.status().as_u16()));
         }
         let text_plain = res
             .headers()
@@ -390,16 +513,12 @@ impl RangeApi {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.trim().to_ascii_lowercase().starts_with("text/plain"));
         if !text_plain {
-            return Err("breached-password lookup: response is not text/plain".into());
+            return Err(LookupError::ContentType);
         }
         let mut body = Vec::new();
-        while let Some(chunk) = res
-            .chunk()
-            .await
-            .map_err(|err| format!("breached-password lookup: {}", err.without_url()))?
-        {
+        while let Some(chunk) = res.chunk().await.map_err(net)? {
             if body.len() + chunk.len() > MAX_BODY {
-                return Err("breached-password lookup: response too large".into());
+                return Err(LookupError::TooLarge);
             }
             body.extend_from_slice(&chunk);
         }
@@ -410,15 +529,16 @@ impl RangeApi {
 /// Strict range-response parse: every non-empty line is `SUFFIX:COUNT` with
 /// a 35-hex suffix and a decimal count, and there are at least
 /// [`MIN_LINES`] lines. Anything else is an error (fail closed).
-pub fn parse_range(body: &[u8]) -> Result<Suffixes, String> {
-    let text = std::str::from_utf8(body).map_err(|_| "breached-password response is not UTF-8")?;
+/// Errors name only the line number, never the line's content.
+pub fn parse_range(body: &[u8]) -> Result<Suffixes, LookupError> {
+    let text = std::str::from_utf8(body).map_err(|_| LookupError::Encoding)?;
     let mut out = Suffixes::new();
-    for line in text.lines() {
+    for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let bad = || format!("breached-password response: malformed line {line:.60}");
+        let bad = || LookupError::MalformedLine(n + 1);
         let (suffix, count) = line.split_once(':').ok_or_else(bad)?;
         if suffix.len() != 35 || count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
             return Err(bad());
@@ -430,10 +550,7 @@ pub fn parse_range(body: &[u8]) -> Result<Suffixes, String> {
         out.insert(key, count);
     }
     if out.len() < MIN_LINES {
-        return Err(format!(
-            "breached-password response has {} entries; expected a padded response",
-            out.len()
-        ));
+        return Err(LookupError::TooFewEntries);
     }
     Ok(out)
 }
@@ -494,13 +611,30 @@ impl BreachedSource {
                         .get(&suffix_key(&digest))
                         .is_some_and(|count| *count >= min_count.max(1))),
                     Err(err) => {
-                        api.failures.fetch_add(1, Ordering::Relaxed);
+                        let failures = api.failures.fetch_add(1, Ordering::Relaxed) + 1;
+                        LOOKUP_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        let status = match err {
+                            LookupError::Status(code) => code,
+                            _ => 0,
+                        };
+                        // Stable target and fields for alerting
+                        // (docs/release-hardening.md). Only a fixed category
+                        // and the status code are logged.
+                        tracing::warn!(
+                            target: "vibe::breached_password_unavailable",
+                            reason = err.category(),
+                            status,
+                            fallback = api.usable_fallback().is_some(),
+                            failures,
+                            failures_total = breached_lookup_failures(),
+                            "breached-password range lookup failed"
+                        );
                         match api.usable_fallback() {
                             Some(list) => {
-                                tracing::warn!(error = %err, complete = api.fallback_complete, "breached-password range API failed; using the offline fallback list");
+                                tracing::warn!(reason = err.category(), complete = api.fallback_complete, "breached-password range API failed; using the offline fallback list");
                                 Ok(list.contains(&digest))
                             }
-                            None => Err(err),
+                            None => Err(err.to_string()),
                         }
                     }
                 }
@@ -526,7 +660,8 @@ impl BreachedConfig {
     ///   startup fails; without a fallback an outage fails closed (503);
     /// - `VIBE_BREACHED_PASSWORDS_MIN_COUNT` (default 1, at most
     ///   [`MAX_MIN_COUNT`]),
-    ///   `VIBE_BREACHED_PASSWORDS_TIMEOUT_MS` (default 3000).
+    ///   `VIBE_BREACHED_PASSWORDS_TIMEOUT_MS` (default 2000, 100..=10000:
+    ///   one total deadline per lookup).
     pub fn from_env(
         get: &dyn Fn(&str) -> Option<String>,
         production: bool,

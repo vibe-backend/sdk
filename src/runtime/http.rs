@@ -1686,6 +1686,16 @@ fn fail_response(route: &RouteSpec, fail: MethodFail, request_id: &str) -> HttpR
             request_id,
             &[("www-authenticate", "Bearer realm=\"vibe\"")],
         )
+    } else if status == StatusCode::SERVICE_UNAVAILABLE {
+        // Retryable: a dependency (such as the breached-password check) could
+        // not answer; same short hint as other retryable 503s.
+        error_response(
+            status,
+            &fail.code,
+            &public_message(&fail),
+            request_id,
+            &[("retry-after", "1")],
+        )
     } else {
         error_response(status, &fail.code, &public_message(&fail), request_id, &[])
     }
@@ -1994,6 +2004,33 @@ mod rate_tests {
             status(check_challenge(Some(&ok), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
             Some(StatusCode::SERVICE_UNAVAILABLE)
         );
+    }
+
+    #[test]
+    fn unavailable_method_failures_carry_retry_after() {
+        let route = test_route();
+        let res = fail_response(
+            &route,
+            MethodFail::code(
+                "SERVICE_UNAVAILABLE",
+                "Password check is unavailable; try again later",
+            ),
+            "req-1",
+        );
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            res.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let res = fail_response(
+            &route,
+            MethodFail::code("BREACHED_PASSWORD", "choose another"),
+            "req-2",
+        );
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(res.headers().get("retry-after").is_none());
     }
 
     fn test_route() -> RouteSpec {

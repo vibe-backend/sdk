@@ -31,6 +31,7 @@ pub use sql::Stmt;
 pub fn hash_password_for_tests(plain: &str) -> String {
     crud::hash_password(plain).expect("hash")
 }
+pub use breached::breached_lookup_failures;
 pub use limiter::{saturation_refusals, ProxyNet, QuotaBuckets, RateBuckets};
 pub use migrate::migrate_tenant;
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};

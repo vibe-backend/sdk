@@ -287,6 +287,13 @@ async fn handler(
             ),
         )
             .into_response(),
+        "marked" => (
+            StatusCode::OK,
+            plain,
+            format!("{}UPSTREAM-MARKER-TEXT\r\n", padded_body(&prefix)),
+        )
+            .into_response(),
+        "marked500" => (StatusCode::BAD_GATEWAY, "UPSTREAM-MARKER-TEXT").into_response(),
         "short" => (StatusCode::OK, plain, format!("{}:0\r\n", "0".repeat(35))).into_response(),
         "huge" => (StatusCode::OK, plain, "0".repeat(300 * 1024)).into_response(),
         "slow" => {
@@ -561,21 +568,29 @@ fn lookup_timeout_setting() {
             BreachedSource::Offline(_) => unreachable!(),
         })
     };
-    assert_eq!(timeout_of(None).unwrap(), Duration::from_millis(3000));
+    assert_eq!(timeout_of(None).unwrap(), Duration::from_millis(2000));
     assert_eq!(timeout_of(Some("100")).unwrap(), Duration::from_millis(100));
     assert_eq!(
         timeout_of(Some(" 1500 ")).unwrap(),
         Duration::from_millis(1500)
     );
-    assert_eq!(timeout_of(Some("30000")).unwrap(), Duration::from_secs(30));
-    for bad in ["0", "99", "30001", "-5", "1.5", "3s", "abc"] {
+    assert_eq!(timeout_of(Some("10000")).unwrap(), Duration::from_secs(10));
+    for bad in ["0", "99", "10001", "30000", "-5", "1.5", "3s", "abc"] {
         assert!(timeout_of(Some(bad)).is_err(), "accepted {bad}");
     }
 }
 
+/// A list file in a private directory under the cargo target dir (not the
+/// shared temp dir, whose sticky mode counts as too open).
 fn list_file(name: &str, mode: u32) -> String {
-    let dir = std::env::temp_dir().join(format!("vibe-breached-{}-{name}", std::process::id()));
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("vibe-breached-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let path = dir.join("list.txt");
     std::fs::write(&path, sha1_hex("hunter2hunter2")).unwrap();
     #[cfg(unix)]
@@ -665,4 +680,116 @@ fn list_writable_by_group_or_other_is_refused_in_production() {
     }
     let path = list_file("owner", 0o644);
     assert!(OfflineList::load(&path, true).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn list_directory_writable_by_group_or_other_is_refused_in_production() {
+    use std::os::unix::fs::PermissionsExt;
+    for (name, mode) in [
+        ("dir-group", 0o770),
+        ("dir-other", 0o707),
+        ("dir-sticky", 0o1777),
+    ] {
+        let path = list_file(name, 0o644);
+        let dir = std::path::Path::new(&path).parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        let err = OfflineList::load(&path, true).err().unwrap();
+        assert!(err.contains("directory"), "{name}: {err}");
+        assert!(OfflineList::load(&path, false).is_ok(), "dev keeps loading");
+        let get = |n: &str| (n == "VIBE_BREACHED_PASSWORDS_FILE").then(|| path.clone());
+        assert!(BreachedConfig::from_env(&get, true).is_err());
+        assert!(BreachedConfig::from_env(&get, false).is_ok());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            OfflineList::load(&path, true).is_ok(),
+            "{name}: restricted again"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_directory_chain_is_checked() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = list_file("chain", 0o644);
+    let dir = std::path::Path::new(&path).parent().unwrap();
+    let nested = dir.join("a/b");
+    std::fs::create_dir_all(&nested).unwrap();
+    let inner = nested.join("list.txt");
+    std::fs::copy(&path, &inner).unwrap();
+    std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o644)).unwrap();
+    for d in [dir.join("a"), nested.clone()] {
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let inner = inner.to_string_lossy().into_owned();
+    assert!(OfflineList::load(&inner, true).is_ok());
+    std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let err = OfflineList::load(&inner, true).err().unwrap();
+    assert!(err.contains("directory") && err.contains("/a"), "{err}");
+    std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[tokio::test]
+async fn lookup_errors_name_only_a_category() {
+    for mode in ["marked", "marked500"] {
+        let (url, _) = server(mode, "").await;
+        let err = BreachedSource::range(&url, false)
+            .unwrap()
+            .is_breached(CLEAN, 1)
+            .await
+            .unwrap_err();
+        assert!(!err.contains("UPSTREAM-MARKER-TEXT"), "{mode}: {err}");
+    }
+    let body = format!("{}UPSTREAM-MARKER-TEXT\n", padded_body("00000"));
+    let err = parse_range(body.as_bytes()).unwrap_err();
+    assert_eq!(
+        err,
+        vibe::runtime::breached::LookupError::MalformedLine(151)
+    );
+    assert!(!err.to_string().contains("UPSTREAM"));
+}
+
+#[tokio::test]
+async fn timeout_is_one_total_deadline_and_fails_closed() {
+    let (url, _) = server("slow", "").await;
+    let api = RangeApi::new(&url, false)
+        .unwrap()
+        .with_timeout(std::time::Duration::from_millis(300));
+    let source = std::sync::Arc::new(BreachedSource::Range(Box::new(api)));
+    // More lookups than slots, distinct prefixes: queued lookups share the
+    // same deadline as the request itself.
+    let started = std::time::Instant::now();
+    let mut tasks = Vec::new();
+    for i in 0..20 {
+        let source = source.clone();
+        tasks.push(tokio::spawn(async move {
+            source
+                .is_breached(&format!("timeout-check-{i}-password"), 1)
+                .await
+        }));
+    }
+    for task in tasks {
+        let err = task.await.unwrap().unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+    }
+    assert!(started.elapsed() < std::time::Duration::from_millis(550));
+    let (url, _) = server("slow", "").await;
+    let api = RangeApi::new(&url, false)
+        .unwrap()
+        .with_timeout(std::time::Duration::from_millis(200));
+    assert_eq!(
+        hash(BreachedSource::Range(Box::new(api)), CLEAN).await,
+        Err("SERVICE_UNAVAILABLE".into())
+    );
+}
+
+#[tokio::test]
+async fn failures_feed_the_process_wide_counter() {
+    let before = vibe::runtime::breached_lookup_failures();
+    let (url, _) = server("500", "").await;
+    let source = BreachedSource::range(&url, false).unwrap();
+    assert!(source.is_breached(CLEAN, 1).await.is_err());
+    assert!(source.is_breached(CLEAN, 1).await.is_err());
+    assert!(vibe::runtime::breached_lookup_failures() >= before + 2);
 }
