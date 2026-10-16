@@ -156,11 +156,11 @@ fn default_ok(expr: &Expr) -> Result<(), String> {
                     && func.null_treatment.is_none();
                 plain_call
                     && no_args
-                    && match (name.as_deref(), &func.args) {
-                        (Some("now" | "gen_random_uuid"), FunctionArguments::List(_)) => true,
-                        (Some("current_timestamp"), FunctionArguments::None) => true,
-                        _ => false,
-                    }
+                    && matches!(
+                        (name.as_deref(), &func.args),
+                        (Some("now" | "gen_random_uuid"), FunctionArguments::List(_))
+                            | (Some("current_timestamp"), FunctionArguments::None)
+                    )
             }
             _ => false,
         };

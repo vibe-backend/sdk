@@ -563,14 +563,15 @@ pub enum TlsMode {
     Require,
 }
 
-/// Parses a URL into a tokio-postgres config, ignoring `sslmode` (which this
-/// module handles; tokio-postgres rejects `verify-ca`/`verify-full`).
+/// Parses a URL into a tokio-postgres config, ignoring `sslmode` and
+/// `sslrootcert` (which this module handles; tokio-postgres rejects
+/// `verify-ca`/`verify-full` and does not know `sslrootcert`).
 fn pg_config(url: &str) -> Result<tokio_postgres::Config, String> {
     let cleaned = match url::Url::parse(url) {
         Ok(mut u) if u.query().is_some() => {
             let pairs: Vec<(String, String)> = u
                 .query_pairs()
-                .filter(|(k, _)| k != "sslmode")
+                .filter(|(k, _)| k != "sslmode" && k != "sslrootcert")
                 .map(|(k, v)| (k.into_owned(), v.into_owned()))
                 .collect();
             if pairs.is_empty() {
@@ -587,6 +588,38 @@ fn pg_config(url: &str) -> Result<tokio_postgres::Config, String> {
         .map_err(|err| format!("invalid database URL: {err}"))?;
     config.ssl_mode(tokio_postgres::config::SslMode::Disable);
     Ok(config)
+}
+
+/// `sslrootcert=<path>`: a PEM file of CA certificates to trust instead of
+/// the webpki roots (for a private CA). Hostname verification still applies.
+fn ssl_root_cert(url: &str) -> Option<String> {
+    url::Url::parse(url).ok().and_then(|u| {
+        u.query_pairs()
+            .find(|(k, _)| k == "sslrootcert")
+            .map(|(_, v)| v.into_owned())
+    })
+}
+
+fn root_store(url: &str) -> Result<rustls::RootCertStore, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    let Some(path) = ssl_root_cert(url) else {
+        return Ok(rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        });
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in
+        CertificateDer::pem_file_iter(&path).map_err(|err| format!("sslrootcert {path}: {err}"))?
+    {
+        let cert = cert.map_err(|err| format!("sslrootcert {path}: {err}"))?;
+        roots
+            .add(cert)
+            .map_err(|err| format!("sslrootcert {path}: {err}"))?;
+    }
+    if roots.is_empty() {
+        return Err(format!("sslrootcert {path}: no certificates found"));
+    }
+    Ok(roots)
 }
 
 pub fn tls_mode(url: &str) -> Result<TlsMode, String> {
@@ -647,9 +680,11 @@ impl PgExec {
                 manager_config,
             ),
             TlsMode::Require => {
-                let roots = rustls::RootCertStore {
-                    roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-                };
+                // pg_config leaves ssl_mode at Disable, under which
+                // tokio-postgres never starts TLS even with a TLS connector.
+                let mut config = config;
+                config.ssl_mode(tokio_postgres::config::SslMode::Require);
+                let roots = root_store(url)?;
                 let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
                     rustls::crypto::ring::default_provider(),
                 ))
