@@ -5,7 +5,7 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
-- **Refresh rotation upgrade:** Run `vibe migrate` before `vibe serve` after upgrading. Reservation columns are added per tenant by migration. Pending requests return 503 `TX_CONFLICT` without clearing cookies; database/pool timeouts return 504 `TX_TIMEOUT`. Reservations without a committed child are cleared, leaving the presented token current and allowing a retry.
+- **Refresh rotation upgrade:** Run `vibe migrate` before `vibe serve` after upgrading. Reservation columns are added per tenant by migration. A request presenting a token while an earlier request for it is in progress returns a retryable 503 `TX_CONFLICT` without clearing cookies; after it completes, a presentation within the 10-second grace window follows the grace rule, and later presentations are treated as reuse and revoke the family; database/pool timeouts return 504 `TX_TIMEOUT`. Reservations without a committed child are cleared, leaving the presented token current and allowing a retry.
 
 ### Upcoming (advance notice)
 

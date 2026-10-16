@@ -332,6 +332,23 @@ async fn replaying_a_spent_token_revokes_the_family() {
 }
 
 #[tokio::test]
+async fn retry_after_ten_second_grace_revokes_family_over_http() {
+    let a = app(10);
+    let parent = tok(&a.login().await, "refresh_token");
+    let (status, first, _) = a.refresh(&parent).await;
+    assert_eq!(status, StatusCode::OK);
+    let child = tok(&first, "refresh_token");
+
+    // Start the wait after completion and exceed the whole-second grace boundary.
+    tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+    let (status, replay, _) = a.refresh(&parent).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(replay["error"]["code"], "INVALID_REFRESH_TOKEN");
+    let (status, _, _) = a.refresh(&child).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "whole family revoked");
+}
+
+#[tokio::test]
 async fn retry_within_grace_reissues_once() {
     let a = app(10);
     let r0 = tok(&a.login().await, "refresh_token");
