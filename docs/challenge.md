@@ -28,7 +28,8 @@ For each request the server:
    the provider. A verified token is kept for the 300 s token lifetime plus a
    margin; a rejected token is kept for 10 s; a reservation without an answer
    (provider unavailable) is released. When the cache (100,000 entries) is
-   full of live tokens, challenge routes answer 503.
+   full of live tokens, the spec (decision 134) answers 429 with `Retry-After`;
+   the current code still answers 503 (not yet implemented, follow-up issue to be opened).
 3. Calls `https://challenges.cloudflare.com/turnstile/v0/siteverify` with the
    secret, the token and the client IP (5 s timeout, no redirects, public
    addresses only).
@@ -91,11 +92,15 @@ Turnstile's own single-use check (`timeout-or-duplicate`) applies in addition.
 | No proof | 400 `CHALLENGE_REQUIRED` |
 | Proof rejected (forged, replayed, expired, missing or future `challenge_ts`, wrong hostname or action, per-IP or per-tenant quota reached) | 403 `CHALLENGE_FAILED` |
 | Provider or network failure only: provider unreachable, timeout, bad response, replay store unreachable (spec decision 134) | 503 `CHALLENGE_UNAVAILABLE`, `Retry-After: 5` (decision 135) |
+| Replay store full (capacity limit from traffic, not a provider failure; decision 134, PM-confirmed 2026-10-16) | 429 `CHALLENGE_RATE_LIMITED` (names pending PM confirmation), `Retry-After` = remaining validity of the oldest record, capped at 360 s, or a fixed 60 if it cannot be computed |
+
+A full replay store still fails closed: a request is never admitted without recording its replay entry. Each occurrence emits the metric `vibe_challenge_rejected_total{reason="replay_store_full"}` and raises the alert `challenge_replay_store_full` (names pending PM confirmation).
 
 Implementation status: not yet aligned with spec decisions 131, 134 and 135 (follow-up issue to be opened):
 
 - The 503 has no `Retry-After` header yet.
-- The current code also returns 503 when no verifier is configured, for a `type: pow` route, and when the replay cache or store is full. Under the spec, a missing verifier and `type: pow` are rejected at build or startup (decisions 131, 134); how a full store is classified is pending PM confirmation.
+- The current code also returns 503 when no verifier is configured and for a `type: pow` route; under the spec these are rejected at build or startup (decisions 131, 134).
+- A full replay cache or store returns 503 today; the spec requires 429 with the computed `Retry-After`, the `replay_store_full` metric and the alert (decision 134). Not yet implemented, follow-up issue to be opened.
 
 In production (`VIBE_ENV`), `vibe serve` refuses to start and `vibe validate --deploy`
 fails if any route uses `challenge ... when: always` and no verifier is configured.
