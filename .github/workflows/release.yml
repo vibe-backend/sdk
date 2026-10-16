@@ -15,6 +15,8 @@ on:
       - "src/**"
       - "scripts/vibe-install.sh"
       - "tests/install_manager.py"
+      - "scripts/ci/release-assets.sh"
+      - "tests/release_assets.sh"
 
 permissions:
   contents: read
@@ -59,6 +61,10 @@ jobs:
         run: python3 tests/install_manager.py
       - name: Shellcheck install script
         run: shellcheck scripts/vibe-install.sh
+      - name: Release asset binding tests
+        run: |
+          shellcheck scripts/ci/release-assets.sh tests/release_assets.sh
+          tests/release_assets.sh
 
   build:
     name: ${{ matrix.target }}
@@ -203,18 +209,35 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Verify SHA256SUMS
-        run: cd dist && sha256sum -c SHA256SUMS
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          path: src
+      # Uploads exactly SHA256SUMS and the files it lists, after
+      # `sha256sum -c --strict` and an exact file-set match (no dist/* glob).
       - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::Release $tag already exists; refusing to overwrite (no --clobber)."
-            exit 1
-          fi
-          gh release create "$tag" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$tag" \
-            --generate-notes
+        run: src/scripts/ci/release-assets.sh publish dist "$GITHUB_REF_NAME"
+
+  # Non-tag runs only: rehearse the release job's verify + publish step on the
+  # real build artifacts with a stub gh (contents: read, no token, no release).
+  tag-path-rehearsal:
+    name: Tag path rehearsal (stub publish)
+    needs: checksums
+    if: ${{ !cancelled() && needs.checksums.result == 'success' && github.event_name != 'push' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify real artifacts against SHA256SUMS
+        run: scripts/ci/release-assets.sh verify dist
+      - name: Rehearse publish (stub gh) and negative cases on real artifacts
+        run: tests/release_assets.sh dist
