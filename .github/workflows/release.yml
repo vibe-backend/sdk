@@ -3,6 +3,20 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Dry-run (#134): build + checksums only, contents: read, no attest/release.
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "build.rs"
+      - "src/**"
+      - "scripts/vibe-install.sh"
+      - "tests/install_manager.py"
+      - "scripts/ci/release-assets.sh"
+      - "tests/release_assets.sh"
 
 permissions:
   contents: read
@@ -18,6 +32,7 @@ concurrency:
 jobs:
   verify-tag:
     name: Tag commit is on main
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -32,14 +47,33 @@ jobs:
             exit 1
           fi
 
+  # #170: install script tests + shellcheck run on dry-run and tag paths.
+  install-script:
+    name: Install script tests & shellcheck
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install script tests
+        run: python3 tests/install_manager.py
+      - name: Shellcheck install script
+        run: shellcheck scripts/vibe-install.sh
+      - name: Release asset binding tests
+        run: |
+          shellcheck scripts/ci/release-assets.sh tests/release_assets.sh
+          tests/release_assets.sh
+
   build:
     name: ${{ matrix.target }}
     needs: verify-tag
+    # Tag push: verify-tag must succeed. Dry-run: verify-tag is skipped.
+    if: ${{ !cancelled() && (needs.verify-tag.result == 'success' || (github.event_name != 'push' && needs.verify-tag.result == 'skipped')) }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -101,14 +135,12 @@ jobs:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
           if-no-files-found: error
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: ${{ matrix.asset }}
 
-  checksums:
-    name: SHA256SUMS + provenance
-    needs: build
+  # Tag-only: build provenance for each archive (id-token lives only here).
+  attest-build:
+    name: Attest build provenance
+    needs: [build, checksums]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -119,25 +151,61 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  checksums:
+    name: SHA256SUMS
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
       - name: SHA256 checksums
         run: |
           cd dist
           sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
           mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
-      - name: Attest SHA256SUMS
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: dist/SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
           if-no-files-found: error
 
+  # Tag-only: provenance for SHA256SUMS.
+  attest-checksums:
+    name: Attest SHA256SUMS
+    needs: checksums
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: SHA256SUMS
+          path: dist
+      - name: Attest SHA256SUMS
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/SHA256SUMS
+
   # The publishing job holds only contents: write (no id-token/attestations).
   release:
     name: GitHub Release
-    needs: checksums
+    needs: [install-script, checksums, attest-build, attest-checksums]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -147,16 +215,35 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          path: src
+      # Uploads exactly SHA256SUMS and the files it lists, after
+      # `sha256sum -c --strict` and an exact file-set match (no dist/* glob).
       - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::Release $tag already exists; refusing to overwrite (no --clobber)."
-            exit 1
-          fi
-          gh release create "$tag" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$tag" \
-            --generate-notes
+        run: src/scripts/ci/release-assets.sh publish dist "$GITHUB_REF_NAME"
+
+  # Non-tag runs only: rehearse the release job's verify + publish step on the
+  # real build artifacts with a stub gh (contents: read, no token, no release).
+  tag-path-rehearsal:
+    name: Tag path rehearsal (stub publish)
+    needs: checksums
+    if: ${{ !cancelled() && needs.checksums.result == 'success' && github.event_name != 'push' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify real artifacts against SHA256SUMS
+        run: scripts/ci/release-assets.sh verify dist
+      - name: Rehearse publish (stub gh) and negative cases on real artifacts
+        run: tests/release_assets.sh dist
