@@ -27,6 +27,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Security
 
+- **JWT library (supersedes #144):** `jsonwebtoken` is upgraded from 9 to 11 with the `aws_lc_rs` backend (`default-features = false`, features `aws_lc_rs` and `use_pem`), so the `rsa` crate is no longer in the dependency tree. Building now compiles `aws-lc-sys`, which needs a C compiler (and CMake on targets without a prebuilt build path). The runtime JWT verifier rejects any configured algorithm other than ES256 and RS256. `sign-jwt` keeps supporting ES256 and RS256.
 - **Lock and manifest signatures (#167):** Lock and manifest signature verification now uses `verify_strict`; weak keys and non-canonical signatures are rejected (#151).
 
 <!--
