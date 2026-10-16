@@ -17,7 +17,7 @@ pub enum ExecError {
     Message(String),
 }
 
-/// Issuance work performed only after refresh validation, while rotation is locked.
+/// Issuance work performed only after refresh validation, without holding a rotation connection.
 #[async_trait]
 pub trait RefreshIssuer: Send + Sync {
     async fn issue(&self, user_id: &str) -> Result<Value, ExecError>;
@@ -73,7 +73,7 @@ pub trait QueryExec: Send + Sync {
     }
 
     /// Validate and detect reuse before invoking issuance. Issuance failure
-    /// leaves rotation uncommitted; reuse revocation commits without issuance.
+    /// leaves the presented token usable; reuse revocation commits without issuance.
     async fn refresh_rotate_authorized(
         &self,
         _tenant_id: &str,
@@ -91,7 +91,6 @@ pub trait QueryExec: Send + Sync {
         target: RevokeTarget<'_>,
     ) -> Result<u64, ExecError>;
 
-    /// Family id of a stored refresh token hash (for the per-family limit).
     /// Immutable subject associated with a stored token, before rotation.
     async fn refresh_subject(
         &self,
@@ -103,6 +102,7 @@ pub trait QueryExec: Send + Sync {
         ))
     }
 
+    /// Family id of a stored refresh token hash (for the per-family limit).
     async fn refresh_family(
         &self,
         tenant_id: &str,
@@ -299,13 +299,26 @@ impl QueryExec for MemoryExec {
         policy: RefreshPolicy,
         issuer: Option<&dyn RefreshIssuer>,
     ) -> Result<(Rotated, Option<Value>), ExecError> {
-        let _gate = self.refresh_gate.lock().await;
-        let (rows, rotated) = {
+        let gate = self.refresh_gate.lock().await;
+        let validated_at = chrono::Utc::now().timestamp();
+        let reservation = uuid::Uuid::new_v4().to_string();
+        let (rotated, parent) = {
             let mut tables = self
                 .tables
                 .lock()
                 .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
             let stored = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+            if stored.iter().any(|row| {
+                row["token_hash"] == token_hash
+                    && row["revoked_at"].is_null()
+                    && row
+                        .get("pending_until")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|until| until > validated_at)
+            }) {
+                // Concurrent presentations are in flight, not reuse.
+                return Ok((Rotated::Invalid, None));
+            }
             let mut rows = stored.clone();
             let rotated = super::refresh::memory_rotate(
                 &mut rows,
@@ -313,24 +326,78 @@ impl QueryExec for MemoryExec {
                 token_hash,
                 new_hash,
                 policy,
-                chrono::Utc::now().timestamp(),
+                validated_at,
             );
             if !matches!(rotated, Rotated::Ok { .. }) {
                 *stored = rows;
                 return Ok((rotated, None));
             }
-            (rows, rotated)
+            let parent = stored
+                .iter()
+                .find(|row| row["token_hash"] == token_hash)
+                .cloned()
+                .expect("validated parent");
+            if let Some(row) = stored
+                .iter_mut()
+                .find(|row| row["token_hash"] == token_hash)
+            {
+                row.insert("pending_rotation".into(), reservation.clone().into());
+                row.insert("pending_until".into(), (validated_at + 300).into());
+            }
+            (rotated, parent)
         };
-        let value = if let (Some(issuer), Rotated::Ok { user_id, .. }) = (issuer, &rotated) {
-            Some(issuer.issue(user_id).await?)
+        drop(gate);
+        let issued = if let (Some(issuer), Rotated::Ok { user_id, .. }) = (issuer, &rotated) {
+            issuer.issue(user_id).await.map(Some)
         } else {
-            None
+            Ok(None)
         };
-        self.tables
+        let _gate = self.refresh_gate.lock().await;
+        let mut tables = self
+            .tables
             .lock()
-            .map_err(|_| ExecError::Message("memory store poisoned".into()))?
-            .insert(key(tenant_id, REFRESH_TABLE), rows);
-        Ok((rotated, value))
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        let rows = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+        let mut reserved = false;
+        if let Some(row) = rows.iter_mut().find(|row| row["token_hash"] == token_hash) {
+            if row.get("pending_rotation").and_then(Value::as_str) == Some(&reservation) {
+                reserved = row
+                    .get("pending_until")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|until| until > chrono::Utc::now().timestamp());
+                row.remove("pending_rotation");
+                row.remove("pending_until");
+            }
+        }
+        let value = issued?;
+        if !reserved {
+            return Ok((Rotated::Invalid, None));
+        }
+        let current = rows.iter().find(|row| row["token_hash"] == token_hash);
+        if !current.is_some_and(|row| {
+            row["revoked_at"].is_null() && row["replaced_by"] == parent["replaced_by"]
+        }) || (!parent["used_at"].is_null()
+            && !rows.iter().any(|row| {
+                row["id"] == parent["replaced_by"]
+                    && row["used_at"].is_null()
+                    && row["revoked_at"].is_null()
+            }))
+        {
+            return Ok((Rotated::Invalid, None));
+        }
+        let rotated = super::refresh::memory_rotate(
+            rows,
+            tenant_id,
+            token_hash,
+            new_hash,
+            policy,
+            validated_at,
+        );
+        if matches!(rotated, Rotated::Ok { .. }) {
+            Ok((rotated, value))
+        } else {
+            Ok((rotated, None))
+        }
     }
 
     async fn refresh_revoke(
@@ -1252,7 +1319,7 @@ impl QueryExec for PgExec {
         let old_child: Option<String> = row.get(8);
         let family_left: i64 = row.get(9);
         let revoke_family =
-            "UPDATE _platform_refresh_tokens SET revoked_at = clock_timestamp(), revoke_reason = 'reuse' \
+            "UPDATE _platform_refresh_tokens SET revoked_at = clock_timestamp(), revoke_reason = 'reuse-detected' \
                              WHERE family_id = $1::text::uuid AND revoked_at IS NULL";
         if revoked {
             if reason.as_deref() == Some("grace-reissue") {
@@ -1262,6 +1329,17 @@ impl QueryExec for PgExec {
                 tx.commit().await.map_err(map_pg)?;
                 return Ok((Rotated::Reuse { family_id: family }, None));
             }
+            return Ok((Rotated::Invalid, None));
+        }
+        let pending: Option<String> = tx
+            .query_one(
+                "SELECT CASE WHEN pending_until > clock_timestamp() THEN pending_rotation END FROM _platform_refresh_tokens WHERE id = $1::text::uuid",
+                &[&id],
+            )
+            .await
+            .map_err(map_pg)?
+            .get(0);
+        if pending.is_some() {
             return Ok((Rotated::Invalid, None));
         }
         // Spent before expired: a late replay still revokes the family. A
@@ -1276,9 +1354,44 @@ impl QueryExec for PgExec {
         if expired {
             return Ok((Rotated::Invalid, None));
         }
-        let value = match issuer {
-            Some(issuer) => Some(issuer.issue(&user).await?),
-            None => None,
+        // A pending presentation gets 401 without revocation. No pool connection
+        // or family lock is held during issuer queries. The reservation expires
+        // after five minutes so cancellation or a process exit cannot strand it.
+        let reservation = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "UPDATE _platform_refresh_tokens SET pending_rotation = $1, pending_until = clock_timestamp() + interval '5 minutes' WHERE id = $2::text::uuid",
+            &[&reservation, &id],
+        )
+        .await
+        .map_err(map_pg)?;
+        tx.commit().await.map_err(map_pg)?;
+        drop(client);
+        let issued = match issuer {
+            Some(issuer) => issuer.issue(&user).await.map(Some),
+            None => Ok(None),
+        };
+        let mut client = self.client().await.map_err(ExecError::Message)?;
+        let tx = client.transaction().await.map_err(map_pg)?;
+        tx.query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), set_config('statement_timeout', $3, true), set_config('lock_timeout', $3, true)",
+            &[&tenant_id, &schema, &self.options.statement_timeout_ms.to_string()],
+        ).await.map_err(map_pg)?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('vibe-refresh:' || $1))",
+            &[&family],
+        )
+        .await
+        .map_err(map_pg)?;
+        let current = tx.execute(
+            "UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE id = $1::text::uuid AND pending_rotation = $2 AND revoked_at IS NULL AND pending_until > clock_timestamp() AND replaced_by IS NOT DISTINCT FROM $3::text::uuid AND (NOT $4 OR EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = $3::text::uuid AND c.used_at IS NULL AND c.revoked_at IS NULL))",
+            &[&id, &reservation, &old_child, &used],
+        ).await.map_err(map_pg)?;
+        let value = match issued {
+            Ok(value) if current == 1 => value,
+            result => {
+                tx.commit().await.map_err(map_pg)?;
+                return result.map(|_| (Rotated::Invalid, None));
+            }
         };
         let child = uuid::Uuid::new_v4().to_string();
         tx.execute(
@@ -1336,8 +1449,8 @@ impl QueryExec for PgExec {
         let tx = client.transaction().await.map_err(map_pg)?;
         let schema = format!("\"t_{tenant_id}\"");
         tx.query(
-            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true)",
-            &[&tenant_id, &schema],
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), set_config('statement_timeout', $3, true), set_config('lock_timeout', $3, true)",
+            &[&tenant_id, &schema, &self.options.statement_timeout_ms.to_string()],
         )
         .await
         .map_err(map_pg)?;

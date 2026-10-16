@@ -19,7 +19,7 @@ use subtle::ConstantTimeEq;
 use crate::manifest::{Manifest, RouteSpec};
 
 use super::crud::{self, MethodFail};
-use super::exec::QueryExec;
+use super::exec::{ExecError, QueryExec};
 use super::limiter::{
     ip_bucket, owner_of, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision,
 };
@@ -379,30 +379,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     let request_id = uuid::Uuid::new_v4().to_string();
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
-    if path == "/internal/metrics" {
-        // Use the transport peer, independent of forwarded request headers.
-        let local = req
-            .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .is_some_and(|ConnectInfo(peer)| peer.ip().is_loopback());
-        if method == "GET" && local {
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(
-                    header::CONTENT_TYPE,
-                    "text/plain; version=0.0.4; charset=utf-8",
-                )
-                .body(Body::from(super::internal_metrics()))
-                .expect("fixed metrics response");
-        }
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "NOT_FOUND",
-            "Not found",
-            &request_id,
-            &[],
-        );
-    }
+
     if path == "/health" {
         return json_response(StatusCode::OK, json!({"status": "ok"}), &request_id, &[]);
     }
@@ -663,7 +640,11 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
         if response.status() == StatusCode::UNAUTHORIZED {
-            if let Some(slug) = found.params.get("slug") {
+            if let Some(slug) = found
+                .params
+                .get("slug")
+                .filter(|slug| super::slugs::valid_slug(slug))
+            {
                 let cookie = format!(
                     "__Host-vibe_rt_{slug}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict"
                 );
@@ -941,8 +922,16 @@ async fn finish(
     route: &RouteSpec,
     state: &AppState,
     started: Instant,
-    response: HttpResponse,
+    mut response: HttpResponse,
 ) -> HttpResponse {
+    if route.refresh.is_some() || route.revoke.is_some() {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+        response
+            .headers_mut()
+            .insert(header::PRAGMA, "no-cache".parse().unwrap());
+    }
     let min_ms = state.min_override_ms.unwrap_or(if route.public {
         // Login-class endpoints (a verify-password step) pad to 500 ms so
         // timing does not reveal whether the account exists.
@@ -1693,23 +1682,27 @@ fn log_id_hash(value: &str) -> String {
         .collect()
 }
 
-fn invalid_refresh(_request_id: &str, reason: &'static str) -> HttpResponse {
+fn invalid_refresh(request_id: &str, reason: &'static str) -> HttpResponse {
     if let Ok(mut counts) = REFRESH_REJECTIONS.lock() {
         *counts.entry(reason).or_default() += 1;
     }
-    Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            r#"{"error":{"code":"INVALID_REFRESH_TOKEN","message":"Invalid refresh token"}}"#,
-        ))
-        .expect("fixed refresh response")
+    json_response(
+        StatusCode::UNAUTHORIZED,
+        serde_json::json!({"error": {"code": "INVALID_REFRESH_TOKEN", "message": "Invalid refresh token"}}),
+        request_id,
+        &[],
+    )
 }
 
-fn refresh_unavailable(request_id: &str) -> HttpResponse {
+fn refresh_unavailable(request_id: &str, err: &ExecError) -> HttpResponse {
     error_response(
         StatusCode::SERVICE_UNAVAILABLE,
-        "SERVICE_UNAVAILABLE",
+        if matches!(err, ExecError::Message(message) if message.contains("57014") || message.contains("55P03") || message.to_lowercase().contains("timeout") || message.to_lowercase().contains("timed out"))
+        {
+            "TX_TIMEOUT"
+        } else {
+            "TX_CONFLICT"
+        },
         "Token refresh is temporarily unavailable; try again later",
         request_id,
         &[("retry-after", "1")],
@@ -1760,7 +1753,7 @@ async fn refresh_response(
         Ok(family) => family,
         Err(err) => {
             tracing::error!(%request_id, tenant_hash = %log_id_hash(tenant), error = ?err, "refresh family lookup failed; failing closed");
-            return refresh_unavailable(request_id);
+            return refresh_unavailable(request_id, &err);
         }
     };
     if let Some(family) = family {
@@ -1810,7 +1803,7 @@ async fn refresh_response(
         Ok(_) => invalid_refresh(request_id, "invalid"),
         Err(err) => {
             tracing::error!(%request_id, error = ?err, "refresh rotation failed");
-            refresh_unavailable(request_id)
+            refresh_unavailable(request_id, &err)
         }
     }
 }
@@ -3133,5 +3126,59 @@ mod crypto_kats {
             mac,
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+    }
+}
+
+#[cfg(test)]
+mod refresh_response_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejection_responses_match_with_the_same_request_id() {
+        let invalid = invalid_refresh("request", "invalid");
+        let capped = invalid_refresh("request", "family_limit");
+        assert_eq!(invalid.status(), capped.status());
+        assert_eq!(invalid.headers(), capped.headers());
+        assert_eq!(invalid.headers()["x-request-id"], "request");
+        let invalid = axum::body::to_bytes(invalid.into_body(), 4096)
+            .await
+            .unwrap();
+        let capped = axum::body::to_bytes(capped.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(invalid, capped);
+    }
+
+    #[tokio::test]
+    async fn refresh_error_codes_reflect_the_store_error() {
+        for (error, code) in [
+            (ExecError::Conflict, "TX_CONFLICT"),
+            (
+                ExecError::Message("40001 serialization failure".into()),
+                "TX_CONFLICT",
+            ),
+            (
+                ExecError::Message("40P01 deadlock detected".into()),
+                "TX_CONFLICT",
+            ),
+            (
+                ExecError::Message("57014 statement canceled".into()),
+                "TX_TIMEOUT",
+            ),
+            (
+                ExecError::Message("55P03 lock unavailable".into()),
+                "TX_TIMEOUT",
+            ),
+            (ExecError::Message("pool timed out".into()), "TX_TIMEOUT"),
+        ] {
+            let response = refresh_unavailable("request", &error);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["retry-after"], "1");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"]["code"], code);
+        }
     }
 }

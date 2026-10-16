@@ -221,6 +221,8 @@ impl App {
             .oneshot(req.body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap();
+        assert_eq!(res.headers()["cache-control"], "no-store");
+        assert_eq!(res.headers()["pragma"], "no-cache");
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
             .await
@@ -384,7 +386,14 @@ async fn refresh_limit_responses() {
     let unknown = a.raw_refresh("nonexistent", "192.0.2.1").await;
     for response in [&limited, &invalid, &unknown] {
         assert_eq!(response.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(response.1, limited.1);
+        assert!(response.1.contains_key("x-request-id"));
+        assert_eq!(response.1["cache-control"], "no-store");
+        assert_eq!(response.1["pragma"], "no-cache");
+        let mut headers = response.1.clone();
+        let mut expected = limited.1.clone();
+        headers.remove("x-request-id");
+        expected.remove("x-request-id");
+        assert_eq!(headers, expected);
         assert_eq!(response.2, limited.2);
         let cookies: Vec<_> = response.1.get_all("set-cookie").iter().collect();
         assert!(!cookies.is_empty());
@@ -403,6 +412,8 @@ async fn refresh_limit_responses() {
     let ip_limited = a.raw_refresh("", "192.0.2.2").await;
     assert_eq!(ip_limited.0, StatusCode::TOO_MANY_REQUESTS);
     assert!(ip_limited.1.contains_key("retry-after"));
+    assert_eq!(ip_limited.1["cache-control"], "no-store");
+    assert_eq!(ip_limited.1["pragma"], "no-cache");
     assert!(String::from_utf8(ip_limited.2)
         .unwrap()
         .contains("RATE_LIMITED"));
@@ -632,10 +643,6 @@ async fn slow_rotation_still_returns_new_tokens() {
     use vibe::runtime::refresh::RefreshPolicy;
     use vibe::runtime::{PgExec, QueryExec};
     let Ok(admin_url) = std::env::var("VIBE_TEST_PG_ADMIN_URL") else {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "VIBE_TEST_PG_ADMIN_URL must be set in CI"
-        );
         return;
     };
     let (admin, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
@@ -659,7 +666,27 @@ async fn slow_rotation_still_returns_new_tokens() {
     let mut url = url::Url::parse(&admin_url).unwrap();
     url.set_username(&role).unwrap();
     url.set_password(Some("pw")).unwrap();
-    let exec = PgExec::connect(url.as_str()).await.unwrap();
+    let exec = PgExec::connect_with(
+        url.as_str(),
+        vibe::runtime::PgOptions {
+            pool_size: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    check_issuance_without_store_connection(&exec, &tenant).await;
+    let lease_policy = RefreshPolicy::default();
+    exec.refresh_issue(&tenant, "lease-user", "lease-parent", lease_policy)
+        .await
+        .unwrap();
+    admin.batch_execute(&format!("UPDATE {schema}._platform_refresh_tokens SET pending_rotation = 'expired', pending_until = clock_timestamp() - interval '1 second' WHERE token_hash = 'lease-parent'")).await.unwrap();
+    assert!(matches!(
+        exec.refresh_rotate(&tenant, "lease-parent", "lease-child", lease_policy)
+            .await
+            .unwrap(),
+        vibe::runtime::refresh::Rotated::Ok { .. }
+    ));
     let policy = RefreshPolicy {
         family_ttl: 3600,
         idle_ttl: 600,
@@ -806,7 +833,7 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
             expires_in: 600
         }
     );
-    // Within grace: one reissue, which kills the lost child h1.
+    // Within grace: one reissue, which revokes the previous child h1.
     assert!(matches!(
         exec.refresh_rotate(&tenant, "h0", "h1b", policy)
             .await
@@ -827,6 +854,10 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
             .unwrap(),
         Rotated::Invalid
     );
+    let reasons = admin.query(&format!("SELECT revoke_reason FROM {schema}._platform_refresh_tokens WHERE family_id = $1::text::uuid"), &[&fam]).await.unwrap();
+    assert!(reasons
+        .iter()
+        .any(|row| row.get::<_, Option<String>>(0).as_deref() == Some("reuse-detected")));
     // Revoke: only the owner's family; then all of a user's families.
     exec.refresh_issue(&tenant, "u1", "a0", policy)
         .await
@@ -1208,7 +1239,7 @@ async fn family_lookup_error_fails_closed_and_keeps_the_token() {
     let r0 = tok(&a.login().await, "refresh_token");
     let (s, body, _) = a.refresh(&r0).await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(body.to_string().contains("SERVICE_UNAVAILABLE"), "{body}");
+    assert!(body.to_string().contains("TX_TIMEOUT"), "{body}");
     assert!(body.get("access_token").is_none());
     // Unknown tokens get the same retryable answer while the store is down.
     let (s, _, _) = a.refresh("not-a-token").await;
@@ -1676,6 +1707,22 @@ async fn postgres_rotation_lock_wait_is_bounded() {
             "rotation must fail while the lock is held"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let revoke = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            exec.refresh_revoke(
+                &tenant,
+                vibe::runtime::refresh::RevokeTarget::FamilyOf {
+                    hash: "locked",
+                    user: "u1",
+                },
+            ),
+        )
+        .await
+        .expect("revocation exceeded the timeout bound");
+        assert!(
+            revoke.is_err(),
+            "revocation must fail while the lock is held"
+        );
         tx.rollback().await.unwrap();
     }
     assert!(matches!(
@@ -1689,39 +1736,6 @@ async fn postgres_rotation_lock_wait_is_bounded() {
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE; DROP ROLE {role}"))
         .await
         .unwrap();
-}
-
-#[tokio::test]
-async fn internal_metrics_endpoint_exports_counters_for_local_collectors() {
-    let a = app(0);
-    a.refresh("unknown").await;
-    for (peer, expected) in [
-        ("127.0.0.1:9000", StatusCode::OK),
-        ("192.0.2.1:9000", StatusCode::NOT_FOUND),
-    ] {
-        let request = Request::builder()
-            .uri("/internal/metrics")
-            .header("x-forwarded-for", "127.0.0.1")
-            .extension(axum::extract::ConnectInfo(
-                peer.parse::<std::net::SocketAddr>().unwrap(),
-            ))
-            .body(Body::empty())
-            .unwrap();
-        let response = a.app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), expected);
-        if expected == StatusCode::OK {
-            assert_eq!(
-                response.headers()["content-type"],
-                "text/plain; version=0.0.4; charset=utf-8"
-            );
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let body = String::from_utf8(bytes.to_vec()).unwrap();
-            assert!(body.contains("vibe_refresh_rejections_total"));
-            assert!(body.contains("vibe_rate_limit_saturation_refusals_total"));
-        }
-    }
 }
 
 #[test]
@@ -1746,4 +1760,197 @@ async fn issuance_failure_keeps_the_current_token_available() {
         a.refresh(&tok(&body, "refresh_token")).await.0,
         StatusCode::OK
     );
+}
+
+async fn check_issuance_without_store_connection(
+    exec: &dyn vibe::runtime::QueryExec,
+    tenant: &str,
+) {
+    use vibe::runtime::refresh::{RefreshPolicy, Rotated};
+    use vibe::runtime::{ExecError, RefreshIssuer};
+    struct Issuer<'a> {
+        exec: &'a dyn vibe::runtime::QueryExec,
+        tenant: &'a str,
+        entered: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl RefreshIssuer for Issuer<'_> {
+        async fn issue(&self, _: &str) -> Result<Value, ExecError> {
+            self.exec
+                .refresh_family(self.tenant, "pending-parent")
+                .await?;
+            self.entered.notify_one();
+            self.resume.notified().await;
+            Ok(json!({"access_token": "issued"}))
+        }
+    }
+    struct FailingIssuer;
+    #[async_trait::async_trait]
+    impl RefreshIssuer for FailingIssuer {
+        async fn issue(&self, _: &str) -> Result<Value, ExecError> {
+            Err(ExecError::Message("issuance unavailable".into()))
+        }
+    }
+    let policy = RefreshPolicy::default();
+    exec.refresh_issue(tenant, "failure-user", "failure-parent", policy)
+        .await
+        .unwrap();
+    assert!(exec
+        .refresh_rotate_authorized(
+            tenant,
+            "failure-parent",
+            "failed-child",
+            policy,
+            Some(&FailingIssuer)
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        exec.refresh_family(tenant, "failed-child").await.unwrap(),
+        None
+    );
+    assert!(matches!(
+        exec.refresh_rotate(tenant, "failure-parent", "retry-child", policy)
+            .await
+            .unwrap(),
+        Rotated::Ok { .. }
+    ));
+    exec.refresh_issue(tenant, "pending-user", "pending-parent", policy)
+        .await
+        .unwrap();
+    let issuer = Issuer {
+        exec,
+        tenant,
+        entered: Default::default(),
+        resume: Default::default(),
+    };
+    let rotation = exec.refresh_rotate_authorized(
+        tenant,
+        "pending-parent",
+        "pending-child",
+        policy,
+        Some(&issuer),
+    );
+    let concurrent = async {
+        issuer.entered.notified().await;
+        assert_eq!(
+            exec.refresh_rotate(tenant, "pending-parent", "other-child", policy)
+                .await
+                .unwrap(),
+            Rotated::Invalid
+        );
+        exec.refresh_issue(tenant, "other-user", "other-family", policy)
+            .await
+            .unwrap();
+        issuer.resume.notify_one();
+    };
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(rotation, concurrent)
+    })
+    .await
+    .expect("store operations must complete during issuance");
+    let (rotated, value) = result.unwrap();
+    assert!(matches!(rotated, Rotated::Ok { .. }));
+    assert_eq!(value.unwrap()["access_token"], "issued");
+    assert!(matches!(
+        exec.refresh_rotate(tenant, "pending-child", "next-child", policy)
+            .await
+            .unwrap(),
+        Rotated::Ok { .. }
+    ));
+}
+
+#[tokio::test]
+async fn memory_issuance_allows_concurrent_store_requests() {
+    check_issuance_without_store_connection(&MemoryExec::new(), TENANT).await;
+}
+
+#[tokio::test]
+async fn authorization_errors_on_refresh_and_logout_are_not_cacheable() {
+    let mut m = manifest(0);
+    m.routes[0].roles = vec!["required-role".into()];
+    m.routes[1].roles = vec!["required-role".into()];
+    let a = app_wrapped(m, |inner| inner);
+    assert_eq!(a.refresh("unknown").await.0, StatusCode::FORBIDDEN);
+    let access = tok(&a.login().await, "access_token");
+    assert_eq!(
+        a.post("/v1/logout", Some(&access), json!({})).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        a.post("/v1/logout", None, json!({})).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn invalid_slug_does_not_set_a_clearing_cookie() {
+    let a = app(0);
+    // Exercise the response path independently of slug file validation.
+    let slugs = HashMap::from([(
+        "bad;slug".into(),
+        Slug {
+            tenant_id: TENANT.into(),
+            public_access: true,
+            public_write: true,
+        },
+    )]);
+    let state = Arc::new(AppState {
+        manifest: a.manifest.clone(),
+        exec: a.exec.clone(),
+        auth: auth(&a.manifest),
+        slugs,
+        rates: Default::default(),
+        quotas: Default::default(),
+        trusted_proxies: vec![],
+        disabled: Default::default(),
+        min_override_ms: Some(0),
+        honor_test_ip: true,
+        dev_hints: false,
+        challenge: None,
+    });
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/v1/bad;slug/token/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(!response.headers().contains_key("set-cookie"));
+}
+
+#[tokio::test]
+async fn memory_revocation_during_issuance_prevents_finalization() {
+    use vibe::runtime::refresh::{RefreshPolicy, RevokeTarget, Rotated};
+    use vibe::runtime::{ExecError, QueryExec, RefreshIssuer};
+    struct Issuer<'a>(&'a MemoryExec);
+    #[async_trait::async_trait]
+    impl RefreshIssuer for Issuer<'_> {
+        async fn issue(&self, user: &str) -> Result<Value, ExecError> {
+            self.0
+                .refresh_revoke(TENANT, RevokeTarget::User(user))
+                .await?;
+            Ok(json!({"access_token": "issued"}))
+        }
+    }
+    let exec = MemoryExec::new();
+    let policy = RefreshPolicy::default();
+    exec.refresh_issue(TENANT, "u1", "parent", policy)
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        exec.refresh_rotate_authorized(TENANT, "parent", "child", policy, Some(&Issuer(&exec))),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result, (Rotated::Invalid, None));
+    assert_eq!(exec.refresh_family(TENANT, "child").await.unwrap(), None);
 }

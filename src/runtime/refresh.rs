@@ -62,6 +62,8 @@ pub const CLEANUP_MAX_BATCHES: i64 = 100;
 /// Columns the runtime role may UPDATE (rotation state and revocation).
 /// Everything else is written once by INSERT.
 pub const UPDATABLE_COLUMNS: &[&str] = &[
+    "pending_rotation",
+    "pending_until",
     "used_at",
     "replaced_by",
     "grace_reissued_at",
@@ -93,6 +95,7 @@ pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
              grace_reissued_at timestamptz, revoked_at timestamptz, revoke_reason text, \
              family_expires_at timestamptz NOT NULL, idle_expires_at timestamptz NOT NULL)"
         ),
+        format!("ALTER TABLE {qualified} ADD COLUMN IF NOT EXISTS pending_rotation text, ADD COLUMN IF NOT EXISTS pending_until timestamptz"),
         format!("CREATE INDEX IF NOT EXISTS _platform_refresh_family ON {qualified} (family_id)"),
         format!("CREATE INDEX IF NOT EXISTS _platform_refresh_user ON {qualified} (user_id)"),
         format!("CREATE INDEX IF NOT EXISTS _platform_refresh_family_expiry ON {qualified} (family_expires_at)"),
@@ -395,7 +398,7 @@ pub fn memory_rotate(
     };
     if !cur["revoked_at"].is_null() {
         if text(&cur, "revoke_reason") == "grace-reissue" {
-            revoke_family(rows, "reuse");
+            revoke_family(rows, "reuse-detected");
             return Rotated::Reuse { family_id: family };
         }
         return Rotated::Invalid;
@@ -415,7 +418,7 @@ pub fn memory_rotate(
         && cur["grace_reissued_at"].is_null()
         && child_unused;
     if used_at.is_some() && !grace_ok {
-        revoke_family(rows, "reuse");
+        revoke_family(rows, "reuse-detected");
         return Rotated::Reuse { family_id: family };
     }
     if expired {
@@ -573,7 +576,7 @@ mod tests {
             Rotated::Invalid
         );
         assert!(rows.iter().all(|r| !r["revoked_at"].is_null()));
-        assert!(rows.iter().any(|r| r["revoke_reason"] == "reuse"));
+        assert!(rows.iter().any(|r| r["revoke_reason"] == "reuse-detected"));
     }
 
     #[test]
@@ -633,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn grace_reissues_once_and_kills_the_lost_child() {
+    fn grace_reissues_once_and_revokes_the_previous_child() {
         let mut rows = Vec::new();
         let fam = memory_issue(&mut rows, T, "u1", "h0", policy(), 0);
         ok_family(memory_rotate(&mut rows, T, "h0", "h1", policy(), 1));
@@ -650,7 +653,7 @@ mod tests {
         let fam = memory_issue(&mut rows, T, "u1", "h0", policy(), 0);
         ok_family(memory_rotate(&mut rows, T, "h0", "h1", policy(), 1));
         ok_family(memory_rotate(&mut rows, T, "h0", "h1b", policy(), 3));
-        // The superseded child h1 surfacing later is theft: family revoked.
+        // Presenting the superseded child h1 later revokes the family.
         assert_eq!(
             memory_rotate(&mut rows, T, "h1", "x", policy(), 5),
             Rotated::Reuse { family_id: fam }
