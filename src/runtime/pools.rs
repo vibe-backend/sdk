@@ -78,6 +78,10 @@ pub fn pool_exhausted_count(scope: PoolScope) -> u64 {
     scope.counter().load(Ordering::Relaxed)
 }
 
+pub(crate) fn record_exhaustion(scope: PoolScope) {
+    scope.counter().fetch_add(1, Ordering::Relaxed);
+}
+
 /// Sum of `vibe_db_pool_exhausted_total` over every scope.
 pub fn pool_exhausted_total() -> u64 {
     PoolScope::ALL
@@ -665,6 +669,47 @@ impl QueryExec for TenantPools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pool_limits_apply_uniformly() {
+        use super::super::challenge::ChallengeError;
+        use super::super::replay::{PgReplayStore, ReplayStore};
+        for (maximum, classes, expected) in [
+            (200, vec!["app_rw"; 5], PoolScope::Role),
+            (
+                200,
+                RUNTIME_ROLES
+                    .iter()
+                    .flat_map(|class| vec![*class; 5])
+                    .collect(),
+                PoolScope::Tenant,
+            ),
+            (1, vec!["public_reader"], PoolScope::Process),
+        ] {
+            let pools = Arc::new(
+                TenantPools::with_source(
+                    "postgres://localhost/app",
+                    Box::new(FileSecrets::from_map(HashMap::new())),
+                    PgOptions::default(),
+                    maximum,
+                )
+                .unwrap(),
+            );
+            let permits: Vec<_> = classes
+                .iter()
+                .map(|class| pools.acquire("acme0001", class).unwrap())
+                .collect();
+            assert_eq!(pools.acquire("acme0001", "app_rw").unwrap_err(), expected);
+            let store = PgReplayStore::for_tenant_pools(pools.clone(), b"secret");
+            assert!(matches!(
+                store.reserve(&[0; 32], None, Some("acme0001")).await,
+                Err(ChallengeError::PoolExhausted)
+            ));
+            assert_eq!(pools.opens_started(), 0);
+            drop(permits);
+            assert!(pools.acquire("acme0001", "app_rw").is_ok());
+        }
+    }
 
     #[test]
     fn role_names_round_trip() {

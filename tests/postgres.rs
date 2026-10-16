@@ -166,9 +166,8 @@ struct Setup {
     _guard: Guard,
 }
 
-/// Migrations fail closed on any RLS problem in any tenant schema, and all
-/// tests share one cluster. Tests that deliberately break RLS take this lock
-/// exclusively (and repair before returning).
+/// All tests share one cluster. Tests that deliberately break RLS take this
+/// lock exclusively and repair before returning.
 ///
 /// Shared holders still interfered with each other (catalog-wide checks seeing
 /// another test's half-built tenant, and lock-order deadlocks between
@@ -462,7 +461,7 @@ async fn tenant_role_with_cross_tenant_reach_is_refused() {
 /// as a direct member of its own `_rw` role, granted `WITH ADMIN FALSE,
 /// INHERIT FALSE, SET TRUE`. Any other membership fails the startup check.
 #[tokio::test]
-async fn tenant_membership_check_allows_only_the_owner_grant() {
+async fn startup_verification_requires_membership() {
     let s = require_pg!(setup().await);
     let b = second_tenant(&s).await;
     let rw = trole(&s.tenant, "app_rw");
@@ -485,6 +484,11 @@ async fn tenant_membership_check_allows_only_the_owner_grant() {
         check_tenant(&s.admin_url, &s.tenant, class).await.unwrap();
     }
     for (name, change, repair) in [
+        (
+            "missing membership",
+            format!("REVOKE {rw} FROM {owner}"),
+            vibe::runtime::migrate::owner_membership_grant(&s.tenant).unwrap(),
+        ),
         (
             "owner in another tenant's rw",
             format!("GRANT {rw_b} TO {owner} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"),
@@ -661,8 +665,8 @@ async fn replay_table_privileges_are_exactly_select_insert() {
         ),
         (
             "app_rw",
-            format!("GRANT MAINTAIN ON {t} TO {rw}"),
-            format!("REVOKE MAINTAIN ON {t} FROM {rw}"),
+            format!("GRANT REFERENCES ON {t} TO {rw}"),
+            format!("REVOKE REFERENCES ON {t} FROM {rw}"),
         ),
         (
             "app_rw",
@@ -1621,7 +1625,7 @@ async fn migration_cannot_touch_another_tenants_types_or_default_privileges() {
 }
 
 #[tokio::test]
-async fn existing_rls_problems_fail_every_migration() {
+async fn migration_repairs_only_its_tenant() {
     let s = require_pg!(setup_exclusive().await);
     let victim = format!("t_{}", s.tenant);
     // Left behind outside vibe (e.g. by an older, unprotected migration).
@@ -1637,11 +1641,9 @@ async fn existing_rls_problems_fail_every_migration() {
             .is_err(),
         "serve refuses"
     );
-    let err = migrate_as(&s, &manifest(), &format!("tg{}", suffix()))
+    migrate_as(&s, &manifest(), &format!("tg{}", suffix()))
         .await
-        .unwrap_err();
-    assert!(err.contains("already present before this run"), "{err}");
-    assert!(err.contains(&victim), "{err}");
+        .unwrap();
     // Migrating the affected tenant repairs it.
     migrate_as(&s, &manifest(), &s.tenant).await.unwrap();
     check_tenant(&s.admin_url, &s.tenant, "app_rw")
@@ -2943,4 +2945,103 @@ async fn sslmode_require_fails_against_server_without_tls() {
             .await;
         panic!("sslmode=require must not connect to a server without TLS (ssl: {ssl:?})");
     }
+}
+
+#[tokio::test]
+async fn legacy_tenants_upgrade_in_sequence() {
+    let s = require_pg!(setup().await);
+    let other = second_tenant(&s).await;
+    for tenant in [&s.tenant, &other] {
+        s.admin
+            .batch_execute(&format!(
+                "DROP POLICY tenant_isolation ON t_{tenant}.audit_notes; \
+             CREATE POLICY tenant_isolation ON t_{tenant}.audit_notes \
+             USING (tenant_id = current_setting('app.tenant_id', false)) \
+             WITH CHECK (tenant_id = current_setting('app.tenant_id', false))"
+            ))
+            .await
+            .unwrap();
+    }
+    for tenant in [&s.tenant, &other] {
+        let owner = PgExec::connect(&url_as(&s.admin_url, &owner_of(tenant)))
+            .await
+            .unwrap();
+        migrate_tenant(&owner, &manifest(), tenant).await.unwrap();
+        check_tenant(&s.admin_url, tenant, "app_rw").await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn retention_removes_expired_rows_under_forced_rls() {
+    let s = require_pg!(setup().await);
+    let table = format!("t_{}.vibe_challenge_replay", s.tenant);
+    let owner_client = connect(&url_as(&s.admin_url, &s.owner)).await;
+    let flags = owner_client
+        .query_one(
+            "SELECT r.rolsuper, r.rolbypassrls, c.relrowsecurity, c.relforcerowsecurity \
+         FROM pg_roles r, pg_class c WHERE r.rolname = current_user AND c.oid = $1::text::regclass",
+            &[&table],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            flags.get::<_, bool>(0),
+            flags.get::<_, bool>(1),
+            flags.get::<_, bool>(2),
+            flags.get::<_, bool>(3)
+        ),
+        (false, false, true, true)
+    );
+    let rw = connect(&url_as(&s.admin_url, &s.app)).await;
+    rw.batch_execute(&format!(
+        "INSERT INTO {table} (tenant_id, key, nonce, state, expires_at) VALUES \
+         ('{}', '\\x01', '\\x01', 'verified', now() - interval '1 hour'), \
+         ('{}', '\\x02', '\\x02', 'verified', now() + interval '1 hour')",
+        s.tenant, s.tenant
+    ))
+    .await
+    .unwrap();
+    let owner = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    migrate_tenant(&owner, &manifest(), &s.tenant)
+        .await
+        .unwrap();
+    let row = s
+        .admin
+        .query_one(
+            &format!("SELECT count(*) FILTER (WHERE expires_at <= now()), count(*) FROM {table}"),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (0, 1));
+    assert!(rw
+        .execute(&format!("DELETE FROM {table}"), &[])
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn pool_limits_apply_uniformly() {
+    let s = require_pg!(setup().await);
+    let pools = std::sync::Arc::new(pools_for(&s.admin_url, &[&s.tenant]));
+    let store = PgReplayStore::for_tenant_pools(pools.clone(), b"test-secret");
+    let permits: Vec<_> = (0..5)
+        .map(|_| pools.acquire(&s.tenant, "app_rw").unwrap())
+        .collect();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        store.reserve(&token_key("limited"), None, Some(&s.tenant)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(ChallengeError::PoolExhausted)));
+    assert_eq!(pools.opens_started(), 0);
+    drop(permits);
+    store
+        .reserve(&token_key("available"), None, Some(&s.tenant))
+        .await
+        .unwrap();
 }

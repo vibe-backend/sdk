@@ -10,8 +10,8 @@ use super::sql::{bootstrap_statements, quote, rls_statements, tenant_schema_stat
 /// runtime roles and `tenant_<id>_owner`) or role `extra_oid`, other than the
 /// single allowed one (D129, #246): `tenant_<id>_owner` as a direct member of
 /// `tenant_<id>_rw` for the same id, granted `WITH ADMIN FALSE, INHERIT
-/// FALSE, SET TRUE`. One text row per membership; any row fails the caller
-/// closed. Every membership is a direct `pg_auth_members` row, so an
+/// FALSE, SET TRUE`. A missing or duplicate allowed membership also fails.
+/// One text row per problem; any row fails the caller closed. Every membership is a direct `pg_auth_members` row, so an
 /// indirect (chained) path always shows up as a row touching one of these
 /// roles. Reads `inherit_option` and `set_option`, so it needs
 /// PostgreSQL 16 or later; older servers fail the query (fail closed).
@@ -26,7 +26,12 @@ pub fn membership_problems_sql(tenant_expr: &str, extra_oid: &str) -> String {
            OR gr.rolname = ANY (ARRAY['tenant_' || {t} || '_rw', 'tenant_' || {t} || '_public_reader', \
              'tenant_' || {t} || '_public_writer', 'tenant_' || {t} || '_owner'])) \
          AND NOT (gr.rolname = 'tenant_' || {t} || '_rw' AND mr.rolname = 'tenant_' || {t} || '_owner' \
-           AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option)",
+           AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option) \
+         UNION ALL SELECT 'expected exactly one owner membership' WHERE ( \
+           SELECT count(*) FROM pg_auth_members m JOIN pg_roles mr ON mr.oid = m.member \
+           JOIN pg_roles gr ON gr.oid = m.roleid \
+           WHERE gr.rolname = 'tenant_' || {t} || '_rw' AND mr.rolname = 'tenant_' || {t} || '_owner' \
+           AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option) <> 1",
         t = tenant_expr,
     )
 }
@@ -103,6 +108,12 @@ SELECT x FROM ( \
      OR gr.rolname = 'tenant_' || $1::text || '_rw') \
    AND NOT (gr.rolname = 'tenant_' || $1::text || '_rw' AND mr.rolname = 'tenant_' || $1::text || '_owner' \
      AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option)) z \
+ UNION ALL \
+ SELECT 'expected exactly one owner membership' WHERE ( \
+   SELECT count(*) FROM pg_auth_members m JOIN pg_roles mr ON mr.oid = m.member \
+   JOIN pg_roles gr ON gr.oid = m.roleid \
+   WHERE gr.rolname = 'tenant_' || $1::text || '_rw' AND mr.rolname = 'tenant_' || $1::text || '_owner' \
+   AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option) <> 1 \
 ) y ORDER BY 1";
 
 /// Bootstraps one tenant schema and applies migrations, connected as the
@@ -463,10 +474,7 @@ async fn migrate_in_tx(
         super::replay::REPLAY_TABLE
     ));
     log.extend(protect_schema(exec, tenant).await?);
-    // Fail closed: any RLS problem in any tenant schema fails the migration,
-    // whether this run introduced it or it was already there (for example
-    // left by an earlier, unprotected migration). `vibe serve` refuses to
-    // start on the same problems.
+    // Verify this tenant; the fingerprint below protects other schemas from changes.
     let problems = rls_problems(exec, &schema).await?;
     if !problems.is_empty() {
         let new: Vec<&String> = problems
@@ -690,16 +698,9 @@ async fn protect_schema(exec: &PgSession, tenant: &str) -> Result<Vec<String>, S
     Ok(log)
 }
 
-/// RLS problems in every tenant schema, as `schema.table: problem`.
-/// Every table in every tenant schema (`t_%`), not just the one being
-/// migrated, must have ENABLE + FORCE RLS and exactly one policy:
-/// `tenant_isolation`, permissive, for all commands, applying exactly to
-/// that schema's three tenant roles, comparing `tenant_id` with that
-/// schema's tenant id as a constant (decision 97). The owner role may own
-/// every tenant schema, so a migration for tenant A could otherwise weaken
-/// tenant B (e.g. `CREATE POLICY open ON t_b.notes USING (true)` or
-/// `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`), and `vibe serve` only
-/// checks at startup.
+/// RLS problems in the tenant being migrated, as `schema.table: problem`.
+/// Other schemas may still have legacy policies; their fingerprint is checked
+/// separately to ensure this migration does not change them.
 async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>, String> {
     exec.query_texts(
         &format!(
@@ -708,7 +709,7 @@ async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>,
                         c.relrowsecurity, c.relforcerowsecurity, substr(n.nspname, 3) AS tenant
                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                  WHERE n.nspname LIKE 't\_%' AND c.relkind IN ('r','p','v','m','f')
-                 AND $1::text IS NOT NULL)
+                 AND n.nspname = $1::text)
              SELECT name || ': ' || problem FROM (
                SELECT name, 'view, materialized view or foreign table' AS problem
                  FROM rels WHERE relkind IN ('v','m','f')

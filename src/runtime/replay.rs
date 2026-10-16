@@ -227,6 +227,23 @@ pub fn ip_digest(secret: &[u8], tenant: &str, ip: &str) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+struct ReplayClient {
+    client: deadpool_postgres::Object,
+    _permits: Option<[tokio::sync::OwnedSemaphorePermit; 3]>,
+}
+
+impl std::ops::Deref for ReplayClient {
+    type Target = deadpool_postgres::Object;
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+impl std::ops::DerefMut for ReplayClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.client
+    }
+}
+
 impl PgReplayStore {
     /// `ip_secret` keys the per-tenant IP digest (the API-key pepper).
     pub fn new(pool: deadpool_postgres::Pool, ip_secret: &[u8]) -> Self {
@@ -238,12 +255,28 @@ impl PgReplayStore {
         Self::with_pools(ReplayPools::Tenants(pools), ip_secret)
     }
 
-    async fn client(&self, tenant: &str) -> Result<deadpool_postgres::Object, String> {
-        let pool = match &self.pool {
-            ReplayPools::Single(pool) => pool.clone(),
-            ReplayPools::Tenants(pools) => pools.pool(tenant, "app_rw").await?.pool(),
+    async fn client(&self, tenant: &str) -> Result<ReplayClient, ChallengeError> {
+        let (pool, permits) = match &self.pool {
+            ReplayPools::Single(pool) => (pool.clone(), None),
+            ReplayPools::Tenants(pools) => {
+                let permits = pools.acquire(tenant, "app_rw").map_err(|scope| {
+                    super::pools::record_exhaustion(scope);
+                    ChallengeError::PoolExhausted
+                })?;
+                (
+                    pools
+                        .pool(tenant, "app_rw")
+                        .await
+                        .map_err(unavailable)?
+                        .pool(),
+                    Some(permits),
+                )
+            }
         };
-        pool.get().await.map_err(|err| err.to_string())
+        Ok(ReplayClient {
+            client: pool.get().await.map_err(unavailable)?,
+            _permits: permits,
+        })
     }
 
     fn with_pools(pool: ReplayPools, ip_secret: &[u8]) -> Self {
@@ -283,7 +316,8 @@ impl PgReplayStore {
     /// DDL for one tenant's table, run inside that tenant's `vibe migrate`
     /// as the owner role (before the schema's RLS pass, which adds ENABLE +
     /// FORCE RLS and the tenant policy). The runtime role gets SELECT and
-    /// INSERT only. Also removes expired rows (as the owner).
+    /// INSERT only. Temporary owner-only SELECT/DELETE policies permit
+    /// expired-row cleanup under FORCE RLS and are removed in this transaction.
     pub fn migration_sql(tenant: &str, runtime_role: &str) -> Result<Vec<String>, String> {
         if !super::slugs::valid_tenant(tenant) {
             return Err("invalid tenant id".into());
@@ -305,7 +339,11 @@ impl PgReplayStore {
             format!("ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"),
             format!("ALTER TABLE {t} FORCE ROW LEVEL SECURITY"),
             format!("SELECT set_config('app.tenant_id', '{tenant}', true)"),
-            format!("DELETE FROM {t} WHERE expires_at <= now()"),
+            format!("CREATE POLICY replay_retention ON {t} FOR SELECT TO CURRENT_USER USING (tenant_id = '{tenant}' AND expires_at <= now())"),
+            format!("CREATE POLICY replay_retention_delete ON {t} FOR DELETE TO CURRENT_USER USING (tenant_id = '{tenant}' AND expires_at <= now())"),
+            format!("DELETE FROM {t} WHERE tenant_id = '{tenant}' AND expires_at <= now()"),
+            format!("DROP POLICY replay_retention ON {t}"),
+            format!("DROP POLICY replay_retention_delete ON {t}"),
         ])
     }
 
@@ -316,7 +354,7 @@ impl PgReplayStore {
             let client = self
                 .client(tenant)
                 .await
-                .map_err(|err| format!("challenge replay store: {err}"))?;
+                .map_err(|err| format!("challenge replay store: {err:?}"))?;
             let t = table_for(tenant).map_err(|err| format!("{err:?}"))?;
             let row = client
                 .query_one(
@@ -375,7 +413,7 @@ impl PgReplayStore {
         let t = table_for(tenant)?;
         let live = live(&t);
         let k = key.as_slice();
-        let mut client = self.client(tenant).await.map_err(unavailable)?;
+        let mut client = self.client(tenant).await?;
         // One lock per tenant serializes the checks below across instances.
         let tx = Self::begin(&mut client, tenant).await?;
         let used = Self::count(
@@ -478,7 +516,7 @@ impl ReplayStore for PgReplayStore {
         let t = table_for(tenant)?;
         let live = live(&t);
         let (k, nonce) = (slot.key.as_slice(), slot.nonce.as_slice());
-        let mut client = self.client(tenant).await.map_err(unavailable)?;
+        let mut client = self.client(tenant).await?;
         let tx = Self::begin(&mut client, tenant).await?;
         // Only this reservation, while it is still live and pending.
         let pending = Self::count(

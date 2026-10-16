@@ -364,8 +364,9 @@ pub struct RoleStatus {
     pub foreign_policies: Vec<String>,
     /// Privileges on `t_<id>.vibe_challenge_replay` that differ from the
     /// allowed set: `tenant_<id>_rw` holds exactly SELECT and INSERT
-    /// (not grantable); every other role (any tenant's, legacy shared roles
-    /// such as `app_rw`) and PUBLIC hold nothing. The owner is not listed.
+    /// (not grantable). Effective privileges are checked only for the current
+    /// role and PUBLIC; explicit table and column ACLs are also inspected for
+    /// grants to other roles. The owner's privileges are excluded.
     pub replay_privileges: Vec<String>,
 }
 

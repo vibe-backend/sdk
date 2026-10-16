@@ -492,6 +492,48 @@ fn policy_line(doc: &LockDoc, key: &str) -> String {
         .to_string()
 }
 
+/// The single value of `key` in `bullets`. A repeated key is an error.
+pub(crate) fn single_value<'a>(
+    bullets: &'a [crate::lock::Bullet],
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    let mut found = bullets.iter().filter(|b| b.key == key);
+    let first = found.next().map(|b| b.value.as_str());
+    if found.next().is_some() {
+        return Err(format!("duplicate `{key}`"));
+    }
+    Ok(first)
+}
+
+/// Strict `writes`: absent is `None`; present must be exactly `true` or
+/// `false` and appear once.
+pub(crate) fn parse_writes(bullets: &[crate::lock::Bullet]) -> Result<Option<bool>, String> {
+    match single_value(bullets, "writes")?.map(str::trim) {
+        None => Ok(None),
+        Some("true") => Ok(Some(true)),
+        Some("false") => Ok(Some(false)),
+        Some(other) => Err(format!(
+            "invalid writes `{other}`: expected `true` or `false`"
+        )),
+    }
+}
+
+/// Strict step `status`: absent is `None`; present must be a plain decimal
+/// HTTP status (100-599) and appear once.
+pub(crate) fn parse_status(bullets: &[crate::lock::Bullet]) -> Result<Option<u16>, String> {
+    let Some(raw) = single_value(bullets, "status")? else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    let valid = !raw.is_empty() && raw.len() == 3 && raw.bytes().all(|b| b.is_ascii_digit());
+    match raw.parse::<u16>() {
+        Ok(code) if valid && (100..600).contains(&code) => Ok(Some(code)),
+        _ => Err(format!(
+            "invalid status `{raw}`: expected an HTTP status (100-599)"
+        )),
+    }
+}
+
 fn method_from(doc: &LockDoc) -> Result<MethodSpec, Diag> {
     let target = doc
         .meta
@@ -500,7 +542,12 @@ fn method_from(doc: &LockDoc) -> Result<MethodSpec, Diag> {
         .map(|(object, method)| format!("{object}.{method}"))
         .unwrap_or_else(|| doc.meta.id.clone());
     let signature = find_section(&doc.sections, "Signature");
-    let writes = signature.and_then(|s| s.get("writes")) == Some("true");
+    let writes = match signature {
+        Some(sig) => parse_writes(&sig.bullets)
+            .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Signature"))?
+            .unwrap_or(false),
+        None => false,
+    };
     let mut errors = Vec::new();
     if let Some(raw) = signature.and_then(|s| s.get("errors")) {
         errors = crate::lock::parse_string_list(raw).map_err(|err| {
@@ -792,21 +839,30 @@ fn steps_from(section: Option<&crate::lock::Section>, file: &str) -> Result<Vec<
                 Diag::error(file, format!("invalid params: {err}")).at_section("Steps")
             })?;
         }
+        let step_err = |err: String| {
+            Diag::error(file, err)
+                .at_step(&block.heading)
+                .at_section("Steps")
+        };
+        let status = parse_status(&block.bullets)
+            .map_err(step_err)?
+            .unwrap_or(if op == "respond" { 200 } else { 0 });
+        let writes = parse_writes(&block.bullets)
+            .map_err(step_err)?
+            .unwrap_or(false);
         steps.push(StepSpec {
             id,
             op: op.clone(),
             target: get("target"),
             args: get("args"),
             value: get("value"),
-            status: get("status")
-                .parse()
-                .unwrap_or(if op == "respond" { 200 } else { 0 }),
+            status,
             sql: get("sql").trim_matches('`').trim().to_string(),
             params,
             out: get("out"),
             fail: get("fail"),
             when_expr: get("when"),
-            writes: get("writes") == "true",
+            writes,
             table: get("table"),
             opts: block
                 .bullets
@@ -1128,9 +1184,10 @@ mod roles_list_tests {
 
 #[cfg(test)]
 mod malformed_list_tests {
-    use super::{method_from, steps_from};
+    use super::{method_from, route_from, steps_from, MethodSpec};
     use crate::diag::Level;
-    use crate::lock::{parse_sections, Kind, LockDoc, Meta};
+    use crate::lock::{parse_sections, Kind, LockDoc, Meta, Scope};
+    use std::collections::HashMap;
 
     fn method_doc(body: &str) -> LockDoc {
         LockDoc {
@@ -1165,6 +1222,80 @@ mod malformed_list_tests {
             "## Signature\n\n- errors: []\n\n## Steps\n\n### s1\n\n- op: respond\n- params: a, b\n- status: 200\n",
         );
         let err = method_from(&doc).unwrap_err();
+        assert!(err.message.contains("invalid params"), "{err:?}");
+    }
+
+    #[test]
+    fn writes_must_be_exactly_true_or_false() {
+        for bad in ["TRUE", "yes", "1", "", "true, false"] {
+            let doc = method_doc(&format!("## Signature\n\n- writes: {bad}\n"));
+            let err = method_from(&doc).unwrap_err();
+            assert!(err.message.contains("invalid writes"), "{bad:?}: {err:?}");
+        }
+        let doc = method_doc("## Signature\n\n- writes: false\n- writes: true\n");
+        assert!(method_from(&doc)
+            .unwrap_err()
+            .message
+            .contains("duplicate `writes`"));
+        let doc = method_doc(
+            "## Signature\n\n- writes: false\n\n## Steps\n\n### s1\n\n- op: query\n- writes: True\n",
+        );
+        assert!(method_from(&doc)
+            .unwrap_err()
+            .message
+            .contains("invalid writes"));
+        let doc = method_doc("## Steps\n\n### s1\n\n- op: query\n- writes: true\n- writes: true\n");
+        assert!(method_from(&doc)
+            .unwrap_err()
+            .message
+            .contains("duplicate `writes`"));
+    }
+
+    #[test]
+    fn status_must_be_an_http_status() {
+        for bad in ["abc", "", "99", "600", "+200", "200.0", "0200", "2 00"] {
+            let doc = method_doc(&format!(
+                "## Steps\n\n### s1\n\n- op: respond\n- status: {bad}\n"
+            ));
+            let err = method_from(&doc).unwrap_err();
+            assert!(err.message.contains("invalid status"), "{bad:?}: {err:?}");
+        }
+        let doc = method_doc("## Steps\n\n### s1\n\n- op: respond\n- status: 201\n- status: 200\n");
+        assert!(method_from(&doc)
+            .unwrap_err()
+            .message
+            .contains("duplicate `status`"));
+        let doc = method_doc("## Steps\n\n### s1\n\n- op: respond\n");
+        assert_eq!(method_from(&doc).unwrap().steps[0].status, 200);
+    }
+
+    #[test]
+    fn valid_method_round_trip() {
+        let doc = method_doc(
+            "## Signature\n\n- writes: true\n- errors: [NOT_FOUND, TAKEN]\n- capabilities: [sign-token]\n\n## Steps\n\n### s1 query\n\n- op: query\n- sql: `INSERT INTO t (a, b) VALUES ($1, $2)`\n- params: [input.a, input.b]\n- writes: true\n\n### s2 respond\n\n- op: respond\n- status: 201\n",
+        );
+        let method = method_from(&doc).unwrap();
+        assert!(method.writes);
+        assert_eq!(method.errors, vec!["NOT_FOUND", "TAKEN"]);
+        assert_eq!(method.capabilities, vec!["sign-token"]);
+        assert_eq!(method.steps[0].params, vec!["input.a", "input.b"]);
+        assert!(method.steps[0].writes);
+        assert_eq!(method.steps[1].status, 201);
+        let json = serde_json::to_string(&method).unwrap();
+        let back: MethodSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn malformed_params_in_an_api_route_is_a_build_error() {
+        let doc = LockDoc {
+            meta: Meta::pending(Kind::Api, Some(Scope::Feature), "shop/api/x", "shop/api/x.md"),
+            sections: parse_sections(
+                "## Route\n\n- method: GET\n- path: /x\n\n## Steps\n\n### s1\n\n- op: respond\n- params: a, b\n",
+            )
+            .unwrap(),
+        };
+        let err = route_from(&doc, &HashMap::new()).unwrap_err();
         assert!(err.message.contains("invalid params"), "{err:?}");
     }
 

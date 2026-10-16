@@ -50,6 +50,8 @@ pub struct ChallengeContext {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChallengeError {
+    /// The database connection caps are exhausted.
+    PoolExhausted,
     /// The proof is invalid, expired, replayed or bound to something else.
     Rejected(String),
     /// The verifier could not reach a decision (provider down, timeout, bad

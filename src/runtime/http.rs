@@ -1226,10 +1226,11 @@ async fn authenticate(
         if auth.public_pem.is_empty() || kid != auth.kid {
             return Err(AuthError::unauthorized("Bearer"));
         }
-        let key = if auth.alg == Algorithm::RS256 {
-            DecodingKey::from_rsa_pem(auth.public_pem.as_bytes())
-        } else {
-            DecodingKey::from_ec_pem(auth.public_pem.as_bytes())
+        let key = match auth.alg {
+            Algorithm::RS256 => DecodingKey::from_rsa_pem(auth.public_pem.as_bytes()),
+            Algorithm::ES256 => DecodingKey::from_ec_pem(auth.public_pem.as_bytes()),
+            // `Algorithm` is non-exhaustive: anything else is rejected.
+            _ => return Err(AuthError::unauthorized("Bearer")),
         }
         .map_err(|_| AuthError::unauthorized("Bearer"))?;
         (auth.alg, key)
@@ -1771,6 +1772,15 @@ async fn check_challenge(
     };
     match verifier.verify(token, &ctx).await {
         Ok(()) => None,
+        Err(super::challenge::ChallengeError::PoolExhausted) => Some(Box::new(|request_id| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DB_POOL_EXHAUSTED",
+                "Database connection limit reached",
+                request_id,
+                &[("Retry-After", "1")],
+            )
+        })),
         Err(super::challenge::ChallengeError::Rejected(why)) => {
             tracing::info!(route = %route.feature_id, %why, "challenge rejected");
             fail(
@@ -1998,6 +2008,17 @@ mod rate_tests {
             status(check_challenge(Some(&down), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
             Some(StatusCode::SERVICE_UNAVAILABLE)
         );
+        let limited: Arc<dyn ChallengeVerifier> =
+            Arc::new(FakeVerifier(Err(ChallengeError::PoolExhausted)));
+        let response = check_challenge(Some(&limited), &route, Some(&tok), "1.2.3.4", "tenant0001")
+            .await
+            .unwrap()("request");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("DB_POOL_EXHAUSTED"));
         // `pow` has no verifier in v1: fail closed.
         route.challenge_type = "pow".into();
         assert_eq!(
