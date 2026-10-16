@@ -1951,16 +1951,25 @@ mod reservation_tests {
                 let rows = tables.get_mut(&key(tenant, REFRESH_TABLE)).unwrap();
                 rows[0].insert("pending_until".into(), 0.into());
             }
+            exec.refresh_issue(tenant, "other-user", "unrelated-parent", policy)
+                .await
+                .unwrap();
             assert!(matches!(
-                exec.refresh_rotate(tenant, "parent", "other-child", policy)
+                exec.refresh_rotate(tenant, "unrelated-parent", "unrelated-child", policy)
                     .await
                     .unwrap(),
-                Rotated::Reuse { .. }
+                Rotated::Ok { .. }
             ));
             issuer.resume.notify_one();
         };
         let (result, ()) = tokio::join!(original, concurrent);
         assert_eq!(result.unwrap().0, Rotated::Invalid);
+        assert!(matches!(
+            exec.refresh_rotate(tenant, "parent", "other-child", policy)
+                .await
+                .unwrap(),
+            Rotated::Reuse { .. }
+        ));
         assert_eq!(
             exec.refresh_family(tenant, "original-child").await.unwrap(),
             None
@@ -1969,5 +1978,87 @@ mod reservation_tests {
             exec.refresh_family(tenant, "other-child").await.unwrap(),
             None
         );
+    }
+    async fn check_expired_memory_reservation(finalize: bool) {
+        let exec = MemoryExec::new();
+        let tenant = "tenant0001";
+        let policy = RefreshPolicy::default();
+        exec.refresh_issue(tenant, "user", "parent", policy)
+            .await
+            .unwrap();
+        let issuer = Issuer {
+            entered: Default::default(),
+            resume: Default::default(),
+        };
+        let rotation =
+            exec.refresh_rotate_authorized(tenant, "parent", "child", policy, Some(&issuer));
+        tokio::pin!(rotation);
+        tokio::select! {
+            _ = issuer.entered.notified() => {},
+            result = &mut rotation => panic!("rotation completed before reservation inspection: {result:?}"),
+        }
+        {
+            let mut tables = exec.tables.lock().unwrap();
+            tables.get_mut(&key(tenant, REFRESH_TABLE)).unwrap()[0]
+                .insert("pending_until".into(), 0.into());
+        }
+        if finalize {
+            // Memory finalization has no database operation to fail. Expire its
+            // reservation to exercise a failed finalization validation instead.
+            issuer.resume.notify_one();
+            assert_eq!(rotation.await.unwrap().0, Rotated::Invalid);
+        }
+        assert!(matches!(
+            exec.refresh_rotate(tenant, "parent", "retry", policy)
+                .await
+                .unwrap(),
+            Rotated::Reuse { .. }
+        ));
+        assert_eq!(exec.refresh_family(tenant, "child").await.unwrap(), None);
+        assert_eq!(exec.refresh_family(tenant, "retry").await.unwrap(), None);
+        let tables = exec.tables.lock().unwrap();
+        let rows = &tables[&key(tenant, REFRESH_TABLE)];
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0]["revoked_at"].is_null());
+        assert!(rows[0]["replaced_by"].is_null());
+    }
+
+    #[tokio::test]
+    async fn memory_expired_reservation_presentation_revokes_family() {
+        check_expired_memory_reservation(false).await;
+    }
+
+    #[tokio::test]
+    async fn memory_finalization_failure_revokes_family() {
+        check_expired_memory_reservation(true).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_errors_are_classified_by_sqlstate() {
+        let Ok(url) = std::env::var("VIBE_TEST_PG_ADMIN_URL") else {
+            return;
+        };
+        let (admin, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        let schema = format!("mapping_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .unwrap();
+        for code in ["57014", "55P03", "23505", "40001", "40P01", "P0001"] {
+            let error = admin.batch_execute(&format!("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = '{code}', MESSAGE = 'neutral message'; END $$")).await.unwrap_err();
+            let mapped = map_pg(error);
+            match code {
+                "57014" | "55P03" => assert!(matches!(mapped, ExecError::Timeout)),
+                "23505" | "40001" | "40P01" => assert!(matches!(mapped, ExecError::Conflict)),
+                _ => assert!(matches!(mapped, ExecError::Message(_))),
+            }
+        }
+        admin
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 }
