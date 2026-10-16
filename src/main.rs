@@ -440,6 +440,11 @@ async fn cmd_build(
     if dev && release_approval.is_some() {
         return Err("--release-approval applies only to release builds; drop --dev".into());
     }
+    // Refuse a release env signing key before any compile or validate work
+    // (decisions 113, 118, 119). Dev builds ignore that variable.
+    if !dev {
+        sign::refuse_env_key_for_release()?;
+    }
     let commit = resolve_commit(project, commit);
     let loaded = compile_build(project, dev).await?;
     // Validate first: errors stop the build before any key is used.
@@ -459,11 +464,10 @@ async fn cmd_build(
     }
     // A release build never falls back to the dev key (decision 92).
     // Release builds take no key: the release job signs the written
-    // manifest keyless with Sigstore (decisions 113, 118).
+    // manifest keyless with Sigstore (decisions 113, 118, 119).
     let key = if dev {
         Some(sign::load_dev_key(project)?)
     } else {
-        sign::refuse_env_key_for_release()?;
         None
     };
     let info = manifest::BuildInfo {
@@ -556,10 +560,10 @@ fn print_high_risk(manifest: &manifest::Manifest) {
 
 /// Loads and verifies the manifest. Outside development only a keyless
 /// release manifest with a valid Sigstore bundle (`VIBE_MANIFEST_BUNDLE`, or
-/// `<manifest>.sigstore.json`) is accepted, bound to `VIBE_RELEASE_REPO`,
-/// `VIBE_RELEASE_WORKFLOW` and a `refs/tags/v*` ref. No key is trusted
-/// there. In development a manifest without a bundle is verified with a
-/// pinned key or `.vibe/signing.pub`.
+/// `<manifest>.sigstore.json`) is accepted, bound to the compiled-in release
+/// repo and workflow (overrides only when `VIBE_ENV=development`) and a
+/// `refs/tags/v*` ref. No key is trusted there. In development a manifest
+/// without a bundle is verified with a pinned key or `.vibe/signing.pub`.
 fn load_manifest(
     manifest_path: &Path,
     project: &Path,
@@ -569,7 +573,7 @@ fn load_manifest(
         .map(PathBuf::from)
         .unwrap_or_else(|| vibe::attest::default_bundle_path(manifest_path));
     if !run_env.is_dev() || bundle.exists() {
-        let policy = vibe::attest::Policy::from_env();
+        let policy = vibe::attest::Policy::from_env()?;
         let (manifest, identity) = manifest::read_release_manifest(manifest_path, &bundle, &policy)
             .map_err(|err| err.to_string())?;
         tracing::info!(

@@ -22,13 +22,15 @@ ed25519-dalek = "2"
 hex = "0.4"
 hmac = "0.12"
 jsonwebtoken = "9"
-p256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sigstore-trust-root = { version = "0.15", default-features = false }
+sigstore-types = "0.15"
+sigstore-verify = { version = "0.15", default-features = true }
 sqlparser = "0.52"
 subtle = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "net"] }
@@ -37,7 +39,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-x509-parser = "0.16"
 zeroize = "1"
 
 [dev-dependencies]

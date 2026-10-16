@@ -461,7 +461,6 @@ pub fn read_release_manifest(
             bundle.display()
         ))
     })?;
-    let identity = crate::attest::verify_bundle(&bytes, &bundle_bytes, policy).map_err(single)?;
     let manifest: Manifest =
         serde_json::from_slice(&bytes).map_err(|err| single(format!("manifest json: {err}")))?;
     if manifest.signature != crate::attest::SIGSTORE_SIGNATURE
@@ -471,7 +470,13 @@ pub fn read_release_manifest(
             "attested manifest is not a keyless release manifest".into(),
         ));
     }
-    if !manifest.provenance.commit.is_empty() && manifest.provenance.commit != identity.commit {
+    if manifest.provenance.commit.is_empty() {
+        return Err(single(
+            "manifest commit is empty; a release manifest must record its commit".into(),
+        ));
+    }
+    let identity = crate::attest::verify_bundle(&bytes, &bundle_bytes, policy).map_err(single)?;
+    if manifest.provenance.commit != identity.commit {
         return Err(single(format!(
             "manifest commit {} is not the attested commit {}",
             manifest.provenance.commit, identity.commit

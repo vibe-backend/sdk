@@ -55,9 +55,11 @@ Details, what is verified where, and what is deferred:
   release secrets).
 - `staging` and `production` environments for the deploy job.
 - Runtime configuration: ship `manifest.json.sigstore.json` next to the
-  manifest (or set `VIBE_MANIFEST_BUNDLE`). Set `VIBE_RELEASE_REPO` /
+  manifest (or set `VIBE_MANIFEST_BUNDLE`). Repo and workflow identity use the
+  compiled-in defaults (`vibe-backend/sdk`, `.github/workflows/release.yml`);
+  overrides are only accepted when `VIBE_ENV=development`.
   `VIBE_RELEASE_WORKFLOW` only if they differ from `vibe-backend/sdk` /
-  `.github/workflows/vibe-release.yml`.
+  `.github/workflows/release.yml`.
 - Make `preview` a required status check on `main`.
 
 ## Local development

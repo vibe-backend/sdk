@@ -12,6 +12,13 @@ fn copy_shop() -> PathBuf {
     root
 }
 
+fn copy_plain() -> PathBuf {
+    let root = std::env::temp_dir().join(format!("vibe-plain-{}", uuid::Uuid::new_v4()));
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plain");
+    copy_dir(&src, &root);
+    root
+}
+
 fn copy_dir(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for entry in fs::read_dir(src).unwrap() {
@@ -102,6 +109,23 @@ const BUILD: &[&str] = &[
 ];
 
 const FAIL_CLOSED: &str = "high-risk release builds fail closed";
+
+#[test]
+fn release_build_writes_a_keyless_manifest_when_there_are_no_high_risk_items() {
+    let root = copy_plain();
+    let (ok, out) = vibe(&root, BUILD, &[]);
+    assert!(ok, "{out}");
+    let manifest: vibe::Manifest =
+        serde_json::from_slice(&fs::read(root.join("out/manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest.signature, vibe::attest::SIGSTORE_SIGNATURE);
+    assert_eq!(manifest.provenance.build_mode, "release");
+    assert_eq!(manifest.provenance.commit, "abc123");
+    assert!(
+        manifest.provenance.high_risk().is_empty(),
+        "{:?}",
+        manifest.provenance.security_items
+    );
+}
 
 #[test]
 fn release_build_fails_closed_on_high_risk_even_with_an_approval_string() {

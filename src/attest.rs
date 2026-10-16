@@ -1,5 +1,5 @@
 //! Sigstore keyless verification of release manifests (spec v1.8, decisions
-//! 113 and 118).
+//! 113, 118 and 119).
 //!
 //! Release manifests carry no key signature. The release job in the
 //! `release` environment attests the manifest with
@@ -8,53 +8,40 @@
 //! transparency log entry. The output is a Sigstore bundle
 //! (`manifest.json.sigstore.json`).
 //!
-//! The deploy job verifies that bundle cryptographically with
-//! `gh attestation verify` (Fulcio chain, Rekor inclusion, identity). This
+//! The deploy job verifies that bundle with `gh attestation verify`. This
 //! module is the runtime check done again by `vibe serve` / `vibe migrate`:
 //! it fails closed unless
 //!
-//! - the DSSE envelope signature verifies with the bundle's certificate key,
-//! - the in-toto subject digest is the SHA-256 of the manifest bytes,
+//! - the Sigstore public-good trust root (embedded TUF `trusted_root.json`)
+//!   verifies the Fulcio certificate chain, the Rekor inclusion proof or SET,
+//!   and that the certificate was valid at the integrated time,
+//! - the DSSE envelope signature and in-toto subject digest match the
+//!   manifest bytes,
 //! - the certificate is a GitHub Actions OIDC identity for the pinned repo,
 //!   the pinned release workflow and a `refs/tags/v*` ref, on a GitHub-hosted
-//!   runner,
-//! - a Rekor entry is present, carries an inclusion proof or promise, was
-//!   integrated while the certificate was valid, and records this envelope's
-//!   payload and signature.
-//!
-//! Not done here (see `docs/ci/sigstore-release.md`): the Fulcio chain to the
-//! Sigstore trust root and the Rekor checkpoint/SET signatures. Those need
-//! the Sigstore TUF trust root and stay in the deploy job until the runtime
-//! adopts sigstore-rs.
+//!   runner, with the exact SAN identity required by decision 119.
 
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
+
+use sigstore_trust_root::{TrustedRoot, SIGSTORE_PRODUCTION_TRUSTED_ROOT};
+use sigstore_types::Bundle;
+use sigstore_verify::{VerificationPolicy, Verifier};
 
 pub const GITHUB_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 pub const DEFAULT_REPO: &str = "vibe-backend/sdk";
-pub const DEFAULT_WORKFLOW: &str = ".github/workflows/vibe-release.yml";
+/// Pinned release workflow path (decision 119).
+pub const DEFAULT_WORKFLOW: &str = ".github/workflows/release.yml";
 /// Value stored in `Manifest::signature` of a release manifest: the
 /// signature lives in the Sigstore bundle next to it.
 pub const SIGSTORE_SIGNATURE: &str = "sigstore-keyless";
 const SLSA_V1: &str = "https://slsa.dev/provenance/v1";
-const IN_TOTO: &str = "application/vnd.in-toto+json";
-
-// Fulcio certificate extensions (v2, DER UTF8String values).
-const OID_ISSUER: &str = "1.3.6.1.4.1.57264.1.8";
-const OID_BUILD_SIGNER_URI: &str = "1.3.6.1.4.1.57264.1.9";
-const OID_RUNNER_ENV: &str = "1.3.6.1.4.1.57264.1.11";
-const OID_SOURCE_REPO_URI: &str = "1.3.6.1.4.1.57264.1.12";
-const OID_SOURCE_DIGEST: &str = "1.3.6.1.4.1.57264.1.13";
-const OID_SOURCE_REF: &str = "1.3.6.1.4.1.57264.1.14";
 
 /// Who may have signed a release manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
     /// `owner/name`.
     pub repo: String,
-    /// Workflow path inside the repo, e.g. `.github/workflows/vibe-release.yml`.
+    /// Workflow path inside the repo, e.g. `.github/workflows/release.yml`.
     pub workflow: String,
 }
 
@@ -68,21 +55,46 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// `VIBE_RELEASE_REPO` / `VIBE_RELEASE_WORKFLOW` from the runtime
-    /// configuration, else the defaults.
-    pub fn from_env() -> Self {
-        let get = |name: &str, default: &str| {
-            std::env::var(name)
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| default.to_string())
-        };
-        Self {
-            repo: get("VIBE_RELEASE_REPO", DEFAULT_REPO),
-            workflow: get("VIBE_RELEASE_WORKFLOW", DEFAULT_WORKFLOW),
-        }
+    /// Compiled-in defaults. `VIBE_RELEASE_REPO` / `VIBE_RELEASE_WORKFLOW`
+    /// may override them only when `VIBE_ENV` is a development value;
+    /// otherwise an override is refused.
+    pub fn from_env() -> Result<Self, String> {
+        let repo = env_override("VIBE_RELEASE_REPO")?;
+        let workflow = env_override("VIBE_RELEASE_WORKFLOW")?;
+        Ok(Self {
+            repo: repo.unwrap_or_else(|| DEFAULT_REPO.to_string()),
+            workflow: workflow.unwrap_or_else(|| DEFAULT_WORKFLOW.to_string()),
+        })
     }
+
+    /// Expected certificate SAN / build-signer URI for `source_ref`.
+    pub fn expected_signer(&self, source_ref: &str) -> String {
+        format!(
+            "https://github.com/{}/{}@{}",
+            self.repo,
+            self.workflow.trim_start_matches('/'),
+            source_ref
+        )
+    }
+}
+
+fn env_override(name: &str) -> Result<Option<String>, String> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = raw.to_string_lossy();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let run_env =
+        crate::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), false);
+    if !run_env.is_dev() {
+        return Err(format!(
+            "{name} is only accepted when VIBE_ENV=development; unset it or use the compiled-in release identity"
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 /// The verified signer identity.
@@ -95,207 +107,46 @@ pub struct Identity {
     pub rekor_log_index: String,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Bundle {
-    #[serde(default)]
-    media_type: String,
-    verification_material: Material,
-    dsse_envelope: Option<Envelope>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Material {
-    certificate: Option<RawBytes>,
-    x509_certificate_chain: Option<Chain>,
-    #[serde(default)]
-    tlog_entries: Vec<TlogEntry>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawBytes {
-    raw_bytes: String,
-}
-
-#[derive(Deserialize)]
-struct Chain {
-    #[serde(default)]
-    certificates: Vec<RawBytes>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TlogEntry {
-    #[serde(default)]
-    log_index: String,
-    #[serde(default)]
-    integrated_time: String,
-    inclusion_promise: Option<serde_json::Value>,
-    inclusion_proof: Option<serde_json::Value>,
-    #[serde(default)]
-    canonicalized_body: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Envelope {
-    payload: String,
-    payload_type: String,
-    #[serde(default)]
-    signatures: Vec<EnvelopeSig>,
-}
-
-#[derive(Deserialize)]
-struct EnvelopeSig {
-    sig: String,
-}
-
-fn b64(what: &str, text: &str) -> Result<Vec<u8>, String> {
-    B64.decode(text.trim())
-        .map_err(|_| format!("sigstore bundle: {what} is not base64"))
-}
-
-/// DSSE pre-authentication encoding.
-pub fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
-    let mut out = format!(
-        "DSSEv1 {} {} {} ",
-        payload_type.len(),
-        payload_type,
-        payload.len()
-    )
-    .into_bytes();
-    out.extend_from_slice(payload);
-    out
-}
-
-/// Decodes a DER UTF8String (Fulcio v2 extension value).
-fn der_utf8(value: &[u8]) -> Option<String> {
-    let (&tag, rest) = value.split_first()?;
-    if tag != 0x0c {
-        return None;
+fn verifier() -> Result<&'static Verifier, String> {
+    static VERIFIER: OnceLock<Result<Verifier, String>> = OnceLock::new();
+    match VERIFIER.get_or_init(|| {
+        let root = TrustedRoot::from_json(SIGSTORE_PRODUCTION_TRUSTED_ROOT)
+            .map_err(|err| format!("sigstore trust root: {err}"))?;
+        Verifier::new(&root).map_err(|err| format!("sigstore verifier: {err}"))
+    }) {
+        Ok(v) => Ok(v),
+        Err(err) => Err(err.clone()),
     }
-    let (&first, rest) = rest.split_first()?;
-    let (len, body) = if first < 0x80 {
-        (first as usize, rest)
-    } else {
-        let n = (first & 0x7f) as usize;
-        if n == 0 || n > 4 || rest.len() < n {
-            return None;
-        }
-        let len = rest[..n]
-            .iter()
-            .fold(0usize, |acc, b| (acc << 8) | *b as usize);
-        (len, &rest[n..])
-    };
-    if body.len() != len {
-        return None;
-    }
-    String::from_utf8(body.to_vec()).ok()
 }
 
-/// Verifies `bundle_json` for `manifest_bytes` against `policy`.
-pub fn verify_bundle(
-    manifest_bytes: &[u8],
-    bundle_json: &[u8],
+/// Checks Fulcio CI claims against `policy` (decision 119). Used after the
+/// trust-root verification has already accepted the certificate.
+#[allow(clippy::too_many_arguments)]
+pub fn check_identity_claims(
+    identity_san: Option<&str>,
+    issuer: Option<&str>,
+    source_repository_uri: Option<&str>,
+    source_repository_ref: Option<&str>,
+    source_repository_digest: Option<&str>,
+    build_signer_uri: Option<&str>,
+    runner_environment: Option<&str>,
     policy: &Policy,
-) -> Result<Identity, String> {
-    let bundle: Bundle = serde_json::from_slice(bundle_json)
-        .map_err(|err| format!("sigstore bundle json: {err}"))?;
-    if !bundle
-        .media_type
-        .starts_with("application/vnd.dev.sigstore.bundle")
-    {
-        return Err("sigstore bundle: unexpected mediaType".into());
-    }
-    let envelope = bundle
-        .dsse_envelope
-        .ok_or("sigstore bundle: no DSSE envelope (an attestation is required)")?;
-    let material = bundle.verification_material;
-
-    // Certificate (bundle v0.3 `certificate`, v0.1/0.2 chain leaf).
-    let cert_b64 = match (&material.certificate, &material.x509_certificate_chain) {
-        (Some(cert), _) => cert.raw_bytes.clone(),
-        (None, Some(chain)) => chain
-            .certificates
-            .first()
-            .map(|c| c.raw_bytes.clone())
-            .ok_or("sigstore bundle: empty certificate chain")?,
-        _ => {
-            return Err("sigstore bundle: no signing certificate (keyless signing required)".into())
-        }
-    };
-    let cert_der = b64("certificate", &cert_b64)?;
-    let (_, cert) = x509_parser::parse_x509_certificate(&cert_der)
-        .map_err(|err| format!("sigstore bundle: certificate: {err}"))?;
-
-    // 1. Envelope signature with the certificate key.
-    let payload = b64("DSSE payload", &envelope.payload)?;
-    if envelope.payload_type != IN_TOTO {
-        return Err(format!(
-            "sigstore bundle: payload type {:?} is not in-toto",
-            envelope.payload_type
-        ));
-    }
-    let [sig] = envelope.signatures.as_slice() else {
-        return Err("sigstore bundle: expected exactly one DSSE signature".into());
-    };
-    let sig_bytes = b64("DSSE signature", &sig.sig)?;
-    let spki = cert.public_key().raw;
-    let key =
-        <p256::ecdsa::VerifyingKey as p256::pkcs8::DecodePublicKey>::from_public_key_der(spki)
-            .map_err(|_| "sigstore bundle: certificate key is not ECDSA P-256".to_string())?;
-    let signature = p256::ecdsa::Signature::from_der(&sig_bytes)
-        .map_err(|_| "sigstore bundle: DSSE signature is malformed".to_string())?;
-    p256::ecdsa::signature::Verifier::verify(
-        &key,
-        &pae(&envelope.payload_type, &payload),
-        &signature,
-    )
-    .map_err(|_| "sigstore bundle: DSSE signature does not verify".to_string())?;
-
-    // 2. Subject digest is this manifest.
-    let statement: serde_json::Value = serde_json::from_slice(&payload)
-        .map_err(|err| format!("sigstore bundle: statement json: {err}"))?;
-    if statement["predicateType"] != SLSA_V1 {
-        return Err("sigstore bundle: predicate is not SLSA provenance v1".into());
-    }
-    let digest = hex::encode(Sha256::digest(manifest_bytes));
-    let subjects = statement["subject"].as_array().cloned().unwrap_or_default();
-    if !subjects
-        .iter()
-        .any(|s| s["digest"]["sha256"].as_str() == Some(digest.as_str()))
-    {
-        return Err(format!(
-            "sigstore bundle: no subject matches the manifest digest sha256:{digest}"
-        ));
-    }
-
-    // 3. Certificate identity.
-    let ext = |oid: &str| -> Option<String> {
-        cert.extensions()
-            .iter()
-            .find(|e| e.oid.to_id_string() == oid)
-            .and_then(|e| der_utf8(e.value))
-    };
-    let need = |oid: &str, what: &str| {
-        ext(oid).ok_or_else(|| format!("sigstore certificate: missing {what}"))
-    };
-    let issuer = need(OID_ISSUER, "OIDC issuer")?;
+) -> Result<(String, String, String), String> {
+    let issuer = issuer.ok_or("sigstore certificate: missing OIDC issuer")?;
     if issuer != GITHUB_OIDC_ISSUER {
         return Err(format!(
             "sigstore certificate: issuer {issuer:?} is not GitHub Actions"
         ));
     }
-    let repo_uri = need(OID_SOURCE_REPO_URI, "source repository")?;
+    let repo_uri =
+        source_repository_uri.ok_or("sigstore certificate: missing source repository")?;
     let want_repo = format!("https://github.com/{}", policy.repo);
     if repo_uri != want_repo {
         return Err(format!(
             "sigstore certificate: repository {repo_uri} is not {want_repo}"
         ));
     }
-    let source_ref = need(OID_SOURCE_REF, "source ref")?;
+    let source_ref = source_repository_ref.ok_or("sigstore certificate: missing source ref")?;
     if source_ref
         .strip_prefix("refs/tags/v")
         .is_none_or(str::is_empty)
@@ -304,80 +155,103 @@ pub fn verify_bundle(
             "sigstore certificate: ref {source_ref} is not a refs/tags/v* release tag"
         ));
     }
-    let signer = need(OID_BUILD_SIGNER_URI, "build signer")?;
-    let want_signer = format!(
-        "https://github.com/{}/{}@{}",
-        policy.repo,
-        policy.workflow.trim_start_matches('/'),
-        source_ref
-    );
+    let want_signer = policy.expected_signer(source_ref);
+    let signer = build_signer_uri.ok_or("sigstore certificate: missing build signer")?;
     if signer != want_signer {
         return Err(format!(
             "sigstore certificate: signer workflow {signer} is not {want_signer}"
         ));
     }
-    let san_ok = cert
-        .subject_alternative_name()
-        .ok()
-        .flatten()
-        .is_some_and(|san| {
-            san.value.general_names.iter().any(
-                |n| matches!(n, x509_parser::extensions::GeneralName::URI(uri) if *uri == signer),
-            )
-        });
-    if !san_ok {
-        return Err("sigstore certificate: SAN does not name the signer workflow".into());
+    match identity_san {
+        Some(san) if san == want_signer => {}
+        Some(san) => {
+            return Err(format!(
+                "sigstore certificate: SAN {san} does not name the signer workflow {want_signer}"
+            ))
+        }
+        None => return Err("sigstore certificate: SAN does not name the signer workflow".into()),
     }
-    let runner = need(OID_RUNNER_ENV, "runner environment")?;
+    let runner = runner_environment.ok_or("sigstore certificate: missing runner environment")?;
     if runner != "github-hosted" {
         return Err(format!(
             "sigstore certificate: runner {runner:?} is not github-hosted"
         ));
     }
-    let commit = need(OID_SOURCE_DIGEST, "source commit")?;
+    let commit = source_repository_digest.ok_or("sigstore certificate: missing source commit")?;
+    if commit.is_empty() {
+        return Err("sigstore certificate: source commit is empty".into());
+    }
+    Ok((
+        source_ref.to_string(),
+        commit.to_string(),
+        signer.to_string(),
+    ))
+}
 
-    // 4. Rekor transparency log entry for this envelope.
-    let entry = material
+/// Verifies `bundle_json` for `manifest_bytes` against `policy`.
+pub fn verify_bundle(
+    manifest_bytes: &[u8],
+    bundle_json: &[u8],
+    policy: &Policy,
+) -> Result<Identity, String> {
+    let text = std::str::from_utf8(bundle_json)
+        .map_err(|_| "sigstore bundle: not valid UTF-8".to_string())?;
+    let bundle = Bundle::from_json(text).map_err(|err| format!("sigstore bundle: {err}"))?;
+
+    // Cryptographic verification against the embedded public-good trust root:
+    // Fulcio chain, SCT, Rekor inclusion proof / SET, certificate validity at
+    // integrated time, DSSE signature, and subject digest of the manifest.
+    let crypto_policy =
+        VerificationPolicy::any_identity().require_issuer(GITHUB_OIDC_ISSUER.to_string());
+    let result = verifier()?
+        .verify(manifest_bytes, &bundle, &crypto_policy)
+        .map_err(|err| format!("sigstore bundle: {err}"))?;
+    if !result.certificate_verified() || !result.tlog_verified() {
+        return Err(
+            "sigstore bundle: certificate chain or Rekor transparency log was not verified".into(),
+        );
+    }
+
+    let cert = result
+        .certificate()
+        .ok_or("sigstore bundle: no signing certificate (keyless signing required)")?;
+    let claims = &cert.ci_claims;
+    let san = result.identity().map(|s| s.as_str());
+    let (source_ref, commit, signer) = check_identity_claims(
+        san,
+        result.issuer().or(cert.issuer.as_deref()),
+        claims.source_repository_uri.as_deref(),
+        claims.source_repository_ref.as_deref(),
+        claims.source_repository_digest.as_deref(),
+        claims.build_signer_uri.as_deref(),
+        claims.runner_environment.as_deref(),
+        policy,
+    )?;
+
+    // Require SLSA provenance v1 (actions/attest-build-provenance).
+    let statement = match &bundle.content {
+        sigstore_types::SignatureContent::DsseEnvelope(env) => {
+            serde_json::from_slice::<serde_json::Value>(env.payload.as_bytes())
+                .map_err(|err| format!("sigstore bundle: statement json: {err}"))?
+        }
+        _ => return Err("sigstore bundle: no DSSE envelope (an attestation is required)".into()),
+    };
+    if statement["predicateType"].as_str() != Some(SLSA_V1) {
+        return Err("sigstore bundle: predicate is not SLSA provenance v1".into());
+    }
+
+    let entry = bundle
+        .verification_material
         .tlog_entries
         .first()
         .ok_or("sigstore bundle: no Rekor transparency log entry")?;
-    if entry.log_index.trim().is_empty()
-        || (entry.inclusion_proof.is_none() && entry.inclusion_promise.is_none())
-    {
-        return Err("sigstore bundle: Rekor entry has no inclusion proof or promise".into());
-    }
-    let integrated: i64 = entry
-        .integrated_time
-        .trim()
-        .parse()
-        .map_err(|_| "sigstore bundle: Rekor entry has no integrated time".to_string())?;
-    let validity = cert.validity();
-    if integrated < validity.not_before.timestamp() || integrated > validity.not_after.timestamp() {
-        return Err(
-            "sigstore bundle: Rekor entry was not integrated while the certificate was valid"
-                .into(),
-        );
-    }
-    let body: serde_json::Value =
-        serde_json::from_slice(&b64("Rekor entry body", &entry.canonicalized_body)?)
-            .map_err(|_| "sigstore bundle: Rekor entry body is not json".to_string())?;
-    let payload_hash = hex::encode(Sha256::digest(&payload));
-    let recorded_sig = body["spec"]["signatures"][0]["signature"]
-        .as_str()
-        .and_then(|s| B64.decode(s).ok());
-    if body["kind"] != "dsse"
-        || body["spec"]["payloadHash"]["value"].as_str() != Some(payload_hash.as_str())
-        || recorded_sig.as_deref() != Some(sig_bytes.as_slice())
-    {
-        return Err("sigstore bundle: Rekor entry does not record this attestation".into());
-    }
 
     Ok(Identity {
         repo: policy.repo.clone(),
         source_ref,
         commit,
         signer_workflow: signer,
-        rekor_log_index: entry.log_index.clone(),
+        rekor_log_index: entry.log_index.to_string(),
     })
 }
 
@@ -386,4 +260,66 @@ pub fn default_bundle_path(manifest: &std::path::Path) -> std::path::PathBuf {
     let mut name = manifest.as_os_str().to_owned();
     name.push(".sigstore.json");
     name.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_claims_require_the_pinned_release_workflow() {
+        let policy = Policy::default();
+        let source_ref = "refs/tags/v1.8.0";
+        let signer = policy.expected_signer(source_ref);
+        assert_eq!(
+            signer,
+            "https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v1.8.0"
+        );
+        let (got_ref, commit, got_signer) = check_identity_claims(
+            Some(&signer),
+            Some(GITHUB_OIDC_ISSUER),
+            Some("https://github.com/vibe-backend/sdk"),
+            Some(source_ref),
+            Some("abc123"),
+            Some(&signer),
+            Some("github-hosted"),
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(got_ref, source_ref);
+        assert_eq!(commit, "abc123");
+        assert_eq!(got_signer, signer);
+    }
+
+    #[test]
+    fn identity_claims_refuse_the_wrong_repo_or_workflow() {
+        let policy = Policy::default();
+        let err = check_identity_claims(
+            Some("https://github.com/attacker/sdk/.github/workflows/release.yml@refs/tags/v1.0.0"),
+            Some(GITHUB_OIDC_ISSUER),
+            Some("https://github.com/attacker/sdk"),
+            Some("refs/tags/v1.0.0"),
+            Some("abc"),
+            Some("https://github.com/attacker/sdk/.github/workflows/release.yml@refs/tags/v1.0.0"),
+            Some("github-hosted"),
+            &policy,
+        )
+        .unwrap_err();
+        assert!(err.contains("repository"), "{err}");
+
+        let signer =
+            "https://github.com/vibe-backend/sdk/.github/workflows/ci.yml@refs/tags/v1.0.0";
+        let err = check_identity_claims(
+            Some(signer),
+            Some(GITHUB_OIDC_ISSUER),
+            Some("https://github.com/vibe-backend/sdk"),
+            Some("refs/tags/v1.0.0"),
+            Some("abc"),
+            Some(signer),
+            Some("github-hosted"),
+            &policy,
+        )
+        .unwrap_err();
+        assert!(err.contains("signer workflow"), "{err}");
+    }
 }

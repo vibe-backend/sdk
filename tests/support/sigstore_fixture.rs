@@ -29,7 +29,7 @@ impl Default for Fixture {
     fn default() -> Self {
         Self {
             repo: "vibe-backend/sdk".into(),
-            workflow: ".github/workflows/vibe-release.yml".into(),
+            workflow: ".github/workflows/release.yml".into(),
             source_ref: "refs/tags/v1.0.0".into(),
             commit: "abc123".into(),
             issuer: "https://token.actions.githubusercontent.com".into(),

@@ -1,4 +1,4 @@
-# Reference workflow for a vibe release (copy to .github/workflows/vibe-release.yml).
+# Reference workflow for a vibe release (copy to .github/workflows/release.yml).
 #
 # - pull_request: informational build preview + policy report in the job
 #   summary. Never a deploy source. Uses the low-quota preview LLM key.
@@ -29,11 +29,11 @@ permissions:
   contents: read
 
 env:
-  VIBE_SDK_REV: 937e5d29d9eb71940cc59dc4f39ce25ae47031e3 # pin: full sdk commit SHA
+  VIBE_SDK_REV: 6fc2c6972140059b28d0376d1454bc5f903a9c5f # pin: full sdk commit SHA
   # The identity a release must carry. Keep in sync with the runtime's
   # VIBE_RELEASE_REPO / VIBE_RELEASE_WORKFLOW (defaults shown).
   VIBE_RELEASE_REPO: vibe-backend/sdk
-  VIBE_RELEASE_WORKFLOW: .github/workflows/vibe-release.yml
+  VIBE_RELEASE_WORKFLOW: .github/workflows/release.yml
 
 jobs:
   install:

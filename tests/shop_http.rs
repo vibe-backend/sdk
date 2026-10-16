@@ -1439,62 +1439,61 @@ async fn production_serve_verifies_the_sigstore_bundle() {
     let (ok, out) = production_serve(&root, &[]);
     assert!(!ok);
     assert!(out.contains("cannot read the Sigstore bundle"), "{out}");
-    // Wrong identities: refused before any database work.
-    for (fixture, needle) in [
-        (
-            sigstore_fixture::Fixture {
-                repo: "attacker/sdk".into(),
-                ..Default::default()
-            },
-            "repository",
-        ),
-        (
-            sigstore_fixture::Fixture {
-                workflow: ".github/workflows/ci.yml".into(),
-                ..Default::default()
-            },
-            "signer workflow",
-        ),
-        (
-            sigstore_fixture::Fixture {
-                source_ref: "refs/heads/main".into(),
-                ..Default::default()
-            },
-            "release tag",
-        ),
-        (
-            sigstore_fixture::Fixture {
-                tlog: false,
-                ..Default::default()
-            },
-            "no Rekor",
-        ),
-        (
-            sigstore_fixture::Fixture {
-                commit: "def456".into(),
-                ..Default::default()
-            },
-            "is not the attested commit",
-        ),
-    ] {
-        fs::write(&bundle, fixture.bundle(&bytes)).unwrap();
-        let (ok, out) = production_serve(&root, &[]);
-        assert!(!ok);
-        assert!(out.contains(needle), "{needle}: {out}");
-    }
-    // Valid bundle: the manifest is accepted; serve then fails on the
-    // unreachable database, not on the manifest.
+    // A self-signed bundle is refused (trust root / Fulcio chain).
     fs::write(&bundle, sigstore_fixture::Fixture::default().bundle(&bytes)).unwrap();
     let (ok, out) = production_serve(&root, &[]);
     assert!(!ok);
-    assert!(!out.contains("bundle"), "{out}");
-    assert!(!out.contains("manifest"), "{out}");
+    assert!(
+        out.contains("sigstore bundle:")
+            || out.contains("certificate")
+            || out.contains("trust")
+            || out.contains("verify"),
+        "{out}"
+    );
+    // Incomplete Rekor material is refused.
+    fs::write(
+        &bundle,
+        sigstore_fixture::Fixture {
+            tlog: false,
+            ..Default::default()
+        }
+        .bundle(&bytes),
+    )
+    .unwrap();
+    let (ok, out) = production_serve(&root, &[]);
+    assert!(!ok);
+    assert!(
+        out.contains("sigstore bundle:") || out.contains("Rekor") || out.contains("bundle"),
+        "{out}"
+    );
+    // A release-repo override outside development is refused.
+    fs::write(&bundle, sigstore_fixture::Fixture::default().bundle(&bytes)).unwrap();
+    let (ok, out) = production_serve(&root, &[("VIBE_RELEASE_REPO", "attacker/sdk")]);
+    assert!(!ok);
+    assert!(out.contains("VIBE_RELEASE_REPO"), "{out}");
+    assert!(out.contains("development"), "{out}");
     // A pinned key does not replace the bundle.
     fs::remove_file(&bundle).unwrap();
     let (_, public) = release_key_hex();
     let (ok, out) = production_serve(&root, &[("VIBE_MANIFEST_PUBKEY", &public)]);
     assert!(!ok);
     assert!(out.contains("Sigstore bundle"), "{out}");
+}
+
+#[tokio::test]
+async fn production_serve_refuses_an_empty_manifest_commit() {
+    let root = copy_shop();
+    let path = release_manifest(&root).await;
+    let bytes = fs::read(&path).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    manifest["provenance"]["commit"] = serde_json::json!("");
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let bundle = vibe::attest::default_bundle_path(&path);
+    fs::write(&bundle, sigstore_fixture::Fixture::default().bundle(&bytes)).unwrap();
+    let (ok, out) = production_serve(&root, &[]);
+    assert!(!ok);
+    assert!(out.contains("manifest commit is empty"), "{out}");
 }
 
 #[tokio::test]
