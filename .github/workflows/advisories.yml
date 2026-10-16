@@ -1,0 +1,35 @@
+name: RustSec advisories
+
+# Fails on any RustSec advisory affecting Cargo.lock that is not explicitly
+# ignored. Runs on pull requests that touch dependencies, on main, and daily so
+# that new advisories against already-locked crates (including crates Dependabot
+# is told to hold back) are noticed without a code change.
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/advisories.yml"
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: advisories-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  advisories:
+    name: cargo deny check advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
