@@ -30,6 +30,8 @@ Do not use guessed release tags or `releases/download` URLs; they are not a supp
 
 ## Run a project
 
+Another sample is [vibe-backend/sample-envelope](https://github.com/vibe-backend/sample-envelope), a Chinese envelope generator that is frontend-only for now.
+
 The shop demo is moving to [vibe-backend/sample-shop](https://github.com/vibe-backend/sample-shop). That repository currently contains only the frontend; the vibe backend project will be added there later. Until then, the small shop project used by this repo's tests, [tests/fixtures/shop](tests/fixtures/shop), is the runnable example. From a checkout of this repo with Rust 1.89 (`rust-version` in `Cargo.toml`; `rust-toolchain.toml` pins the same channel), replace `tests/fixtures/shop` with your own project path as needed:
 
 ```bash
