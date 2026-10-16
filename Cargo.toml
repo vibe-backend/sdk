@@ -40,7 +40,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-sqlparser = { version = "0.52", features = ["visitor"] }
+sqlparser = { version = "0.63", features = ["visitor"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
