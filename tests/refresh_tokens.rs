@@ -676,6 +676,68 @@ async fn slow_rotation_still_returns_new_tokens() {
     .await
     .unwrap();
     check_issuance_without_store_connection(&exec, &tenant).await;
+    struct ExpiringIssuer<'a> {
+        exec: &'a PgExec,
+        admin: &'a tokio_postgres::Client,
+        tenant: &'a str,
+        schema: &'a str,
+    }
+    #[async_trait::async_trait]
+    impl vibe::runtime::RefreshIssuer for ExpiringIssuer<'_> {
+        async fn issue(&self, _: &str) -> Result<Value, vibe::runtime::ExecError> {
+            self.admin.batch_execute(&format!("UPDATE {}._platform_refresh_tokens SET pending_until = clock_timestamp() - interval '1 second' WHERE token_hash = 'expiry-parent'", self.schema)).await.unwrap();
+            let policy = RefreshPolicy::default();
+            self.exec
+                .refresh_issue(self.tenant, "other", "expiry-other", policy)
+                .await?;
+            assert!(matches!(
+                self.exec
+                    .refresh_rotate(self.tenant, "expiry-other", "expiry-other-child", policy)
+                    .await?,
+                vibe::runtime::refresh::Rotated::Ok { .. }
+            ));
+            Ok(json!({}))
+        }
+    }
+    exec.refresh_issue(
+        &tenant,
+        "expiry-user",
+        "expiry-parent",
+        RefreshPolicy::default(),
+    )
+    .await
+    .unwrap();
+    let expired = exec
+        .refresh_rotate_authorized(
+            &tenant,
+            "expiry-parent",
+            "expiry-child",
+            RefreshPolicy::default(),
+            Some(&ExpiringIssuer {
+                exec: &exec,
+                admin: &admin,
+                tenant: &tenant,
+                schema: &schema,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(expired.0, vibe::runtime::refresh::Rotated::Invalid);
+    assert!(matches!(
+        exec.refresh_rotate(
+            &tenant,
+            "expiry-parent",
+            "expiry-retry",
+            RefreshPolicy::default()
+        )
+        .await
+        .unwrap(),
+        vibe::runtime::refresh::Rotated::Reuse { .. }
+    ));
+    assert_eq!(
+        exec.refresh_family(&tenant, "expiry-child").await.unwrap(),
+        None
+    );
     let lease_policy = RefreshPolicy::default();
     exec.refresh_issue(&tenant, "lease-user", "lease-parent", lease_policy)
         .await
@@ -685,7 +747,7 @@ async fn slow_rotation_still_returns_new_tokens() {
         exec.refresh_rotate(&tenant, "lease-parent", "lease-child", lease_policy)
             .await
             .unwrap(),
-        vibe::runtime::refresh::Rotated::Ok { .. }
+        vibe::runtime::refresh::Rotated::Reuse { .. }
     ));
     let policy = RefreshPolicy {
         family_ttl: 3600,
@@ -771,6 +833,72 @@ async fn slow_rotation_still_returns_new_tokens() {
         ))
         .await
         .unwrap();
+    struct PoolIssuer {
+        exec: Arc<PgExec>,
+        tenant: String,
+    }
+    #[async_trait::async_trait]
+    impl vibe::runtime::RefreshIssuer for PoolIssuer {
+        async fn issue(&self, _: &str) -> Result<Value, vibe::runtime::ExecError> {
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            self.exec.user_roles(&self.tenant, "u1").await?;
+            Ok(json!({}))
+        }
+    }
+    let small = Arc::new(
+        PgExec::connect_with(
+            &admin_url,
+            vibe::runtime::PgOptions {
+                pool_size: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let mut refreshes = tokio::task::JoinSet::new();
+    for n in 0..20 {
+        let hash = format!("pool-parent-{n}");
+        small
+            .refresh_issue(&tenant, "u1", &hash, policy)
+            .await
+            .unwrap();
+        let exec = small.clone();
+        let tenant = tenant.clone();
+        refreshes.spawn(async move {
+            let issuer = PoolIssuer {
+                exec: exec.clone(),
+                tenant: tenant.clone(),
+            };
+            exec.refresh_rotate_authorized(
+                &tenant,
+                &hash,
+                &format!("pool-child-{n}"),
+                policy,
+                Some(&issuer),
+            )
+            .await
+        });
+    }
+    for _ in 0..5 {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            small.user_roles(&tenant, "u1"),
+        )
+        .await
+        .expect("non-refresh requests must complete with a small pool")
+        .unwrap();
+    }
+    while let Some(result) = refreshes.join_next().await {
+        assert!(matches!(
+            result.unwrap().unwrap().0,
+            vibe::runtime::refresh::Rotated::Ok { .. }
+        ));
+    }
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE; DROP ROLE {role}"))
+        .await
+        .unwrap();
 }
 
 /// The PostgreSQL store (row lock, grace, family revoke) against a real
@@ -808,6 +936,50 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
     url.set_username(&role).unwrap();
     url.set_password(Some("pw")).unwrap();
     let exec = PgExec::connect(url.as_str()).await.unwrap();
+    exec.refresh_issue(
+        &tenant,
+        "finalize-user",
+        "finalize-parent",
+        RefreshPolicy::default(),
+    )
+    .await
+    .unwrap();
+    admin.batch_execute(&format!("CREATE FUNCTION {schema}.fail_finalize() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.token_hash = 'finalize-child' THEN RAISE EXCEPTION 'finalize unavailable'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_finalize BEFORE INSERT ON {schema}._platform_refresh_tokens FOR EACH ROW EXECUTE FUNCTION {schema}.fail_finalize()" )).await.unwrap();
+    assert!(exec
+        .refresh_rotate(
+            &tenant,
+            "finalize-parent",
+            "finalize-child",
+            RefreshPolicy::default()
+        )
+        .await
+        .is_err());
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match exec
+                .refresh_rotate(
+                    &tenant,
+                    "finalize-parent",
+                    "finalize-retry",
+                    RefreshPolicy::default(),
+                )
+                .await
+            {
+                Err(vibe::runtime::ExecError::Conflict) => tokio::task::yield_now().await,
+                Ok(Rotated::Reuse { .. }) => break,
+                other => panic!("finalize failure rotated: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        exec.refresh_family(&tenant, "finalize-child")
+            .await
+            .unwrap(),
+        None
+    );
+
     let policy = RefreshPolicy {
         family_ttl: 3600,
         idle_ttl: 600,
@@ -1080,6 +1252,12 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
             .unwrap();
         assert!(!row.get::<_, bool>(0), "{app_role}");
     }
+    admin
+        .batch_execute(&format!(
+            "DROP SCHEMA {schema} CASCADE; DROP SCHEMA {schema2} CASCADE; DROP ROLE {role}"
+        ))
+        .await
+        .unwrap();
 }
 
 #[test]
@@ -1216,7 +1394,7 @@ impl vibe::runtime::QueryExec for FamilyLookupFails {
     ) -> Result<Option<String>, vibe::runtime::ExecError> {
         tokio::time::sleep(std::time::Duration::from_millis(self.lookup_delay_ms)).await;
         if self.down.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(vibe::runtime::ExecError::Message("pool timed out".into()));
+            return Err(vibe::runtime::ExecError::Timeout);
         }
         self.inner.refresh_family(tenant_id, token_hash).await
     }
@@ -1238,12 +1416,12 @@ async fn family_lookup_error_fails_closed_and_keeps_the_token() {
     });
     let r0 = tok(&a.login().await, "refresh_token");
     let (s, body, _) = a.refresh(&r0).await;
-    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(s, StatusCode::GATEWAY_TIMEOUT, "{body}");
     assert!(body.to_string().contains("TX_TIMEOUT"), "{body}");
     assert!(body.get("access_token").is_none());
     // Unknown tokens get the same retryable answer while the store is down.
     let (s, _, _) = a.refresh("not-a-token").await;
-    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(s, StatusCode::GATEWAY_TIMEOUT);
     // The token was not consumed: it rotates once the store answers again.
     down.store(false, std::sync::atomic::Ordering::SeqCst);
     let (s, body, _) = a.refresh(&r0).await;
@@ -1345,6 +1523,10 @@ async fn postgres_cleanup_removes_finished_families_in_batches() {
         .map(|r| r.get(0))
         .collect();
     assert_eq!(left, vec!["live".to_string(), "recent".to_string()]);
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE; DROP ROLE {owner}"))
+        .await
+        .unwrap();
 }
 
 #[test]
@@ -1500,6 +1682,10 @@ async fn postgres_refresh_table_grants_and_guard() {
     }
     // A tenant without the table also fails.
     assert!(check_store(&rt, &[format!("tz{s}")]).await.is_err());
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE; DROP ROLE {role}"))
+        .await
+        .unwrap();
 }
 
 fn app_with_issuance_control(
@@ -1703,8 +1889,8 @@ async fn postgres_rotation_lock_wait_is_bounded() {
         .await;
         assert!(result.is_ok(), "rotation exceeded the timeout bound");
         assert!(
-            result.unwrap().is_err(),
-            "rotation must fail while the lock is held"
+            matches!(result.unwrap(), Err(vibe::runtime::ExecError::Timeout)),
+            "lock timeout must be classified by SQLSTATE"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         let revoke = tokio::time::timeout(
@@ -1816,6 +2002,53 @@ async fn check_issuance_without_store_connection(
             .unwrap(),
         Rotated::Ok { .. }
     ));
+    // Dropping a request after reservation must never produce a later session.
+    exec.refresh_issue(tenant, "cancel-user", "cancel-parent", policy)
+        .await
+        .unwrap();
+    let cancelled = Issuer {
+        exec,
+        tenant,
+        entered: Default::default(),
+        resume: Default::default(),
+    };
+    {
+        let rotation = exec.refresh_rotate_authorized(
+            tenant,
+            "cancel-parent",
+            "cancel-child",
+            policy,
+            Some(&cancelled),
+        );
+        tokio::pin!(rotation);
+        tokio::select! {
+            _ = cancelled.entered.notified() => {},
+            result = &mut rotation => panic!("rotation completed before cancellation: {result:?}"),
+        }
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match exec
+                .refresh_rotate(tenant, "cancel-parent", "cancel-retry", policy)
+                .await
+            {
+                Err(ExecError::Conflict) => tokio::task::yield_now().await,
+                Ok(Rotated::Reuse { .. }) => break,
+                other => panic!("cancelled reservation rotated: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        exec.refresh_family(tenant, "cancel-child").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        exec.refresh_family(tenant, "cancel-retry").await.unwrap(),
+        None
+    );
+
     exec.refresh_issue(tenant, "pending-user", "pending-parent", policy)
         .await
         .unwrap();
@@ -1834,12 +2067,11 @@ async fn check_issuance_without_store_connection(
     );
     let concurrent = async {
         issuer.entered.notified().await;
-        assert_eq!(
+        assert!(matches!(
             exec.refresh_rotate(tenant, "pending-parent", "other-child", policy)
-                .await
-                .unwrap(),
-            Rotated::Invalid
-        );
+                .await,
+            Err(ExecError::Conflict)
+        ));
         exec.refresh_issue(tenant, "other-user", "other-family", policy)
             .await
             .unwrap();
@@ -1859,6 +2091,73 @@ async fn check_issuance_without_store_connection(
             .unwrap(),
         Rotated::Ok { .. }
     ));
+    for scenario in ["revoke", "child-rotation", "concurrent-grace", "past-grace"] {
+        let parent = format!("{scenario}-parent");
+        let child = format!("{scenario}-child");
+        exec.refresh_issue(tenant, scenario, &parent, policy)
+            .await
+            .unwrap();
+        if scenario != "revoke" {
+            exec.refresh_rotate(tenant, &parent, &child, policy)
+                .await
+                .unwrap();
+        }
+        let issuer = Issuer {
+            exec,
+            tenant,
+            entered: Default::default(),
+            resume: Default::default(),
+        };
+        let new_child = format!("{scenario}-new");
+        let rotation =
+            exec.refresh_rotate_authorized(tenant, &parent, &new_child, policy, Some(&issuer));
+        let concurrent = async {
+            issuer.entered.notified().await;
+            match scenario {
+                "revoke" => {
+                    exec.refresh_revoke(
+                        tenant,
+                        vibe::runtime::refresh::RevokeTarget::User(scenario),
+                    )
+                    .await
+                    .unwrap();
+                }
+                "child-rotation" => {
+                    assert!(matches!(
+                        exec.refresh_rotate(tenant, &child, "child-descendant", policy)
+                            .await
+                            .unwrap(),
+                        Rotated::Ok { .. }
+                    ));
+                }
+                "concurrent-grace" => {
+                    assert!(matches!(
+                        exec.refresh_rotate(tenant, &parent, "grace-concurrent", policy)
+                            .await,
+                        Err(ExecError::Conflict)
+                    ));
+                }
+                "past-grace" => {
+                    let no_grace = RefreshPolicy { grace: 0, ..policy };
+                    assert!(matches!(
+                        exec.refresh_rotate(tenant, &parent, "past-grace-new", no_grace)
+                            .await
+                            .unwrap(),
+                        Rotated::Reuse { .. }
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            issuer.resume.notify_one();
+        };
+        let (result, ()) = tokio::join!(rotation, concurrent);
+        if scenario == "concurrent-grace" {
+            assert!(matches!(result.unwrap().0, Rotated::Ok { .. }));
+        } else {
+            assert_eq!(result.unwrap().0, Rotated::Invalid);
+            assert_eq!(exec.refresh_family(tenant, &new_child).await.unwrap(), None);
+        }
+    }
 }
 
 #[tokio::test]
@@ -1953,4 +2252,68 @@ async fn memory_revocation_during_issuance_prevents_finalization() {
     .unwrap();
     assert_eq!(result, (Rotated::Invalid, None));
     assert_eq!(exec.refresh_family(TENANT, "child").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn pending_refresh_returns_retryable_response_without_clearing_cookie() {
+    let a = app_wrapped(manifest(10), |inner| {
+        Arc::new(FamilyLookupFails {
+            inner,
+            down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lookup_delay_ms: 0,
+            rotate_delay_ms: 0,
+            signer_delay_ms: 600,
+            signer_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    });
+    let token = tok(&a.login().await, "refresh_token");
+    let first = a.refresh(&token);
+    let second = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let response = a
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/v1/acme/token/refresh")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"refresh_token": token}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(!response.headers().contains_key("set-cookie"));
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "TX_CONFLICT");
+    };
+    let (first, ()) = tokio::join!(first, second);
+    assert_eq!(first.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn refresh_and_logout_method_errors_are_not_cacheable() {
+    let a = app(10);
+    for path in ["/auth/v1/acme/token/refresh", "/v1/logout"] {
+        let response = a
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["pragma"], "no-cache");
+    }
 }

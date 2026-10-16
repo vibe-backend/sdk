@@ -400,7 +400,11 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             "METHOD_NOT_ALLOWED",
             "Method not allowed",
             &request_id,
-            &[("allow", allowed.as_str())],
+            &[
+                ("allow", allowed.as_str()),
+                ("cache-control", "no-store"),
+                ("pragma", "no-cache"),
+            ],
         );
     };
     if state.disabled.contains(&found.route.feature_id) {
@@ -1696,16 +1700,23 @@ fn invalid_refresh(request_id: &str, reason: &'static str) -> HttpResponse {
 
 fn refresh_unavailable(request_id: &str, err: &ExecError) -> HttpResponse {
     error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        if matches!(err, ExecError::Message(message) if message.contains("57014") || message.contains("55P03") || message.to_lowercase().contains("timeout") || message.to_lowercase().contains("timed out"))
-        {
+        if matches!(err, ExecError::Timeout) {
+            StatusCode::GATEWAY_TIMEOUT
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        if matches!(err, ExecError::Timeout) {
             "TX_TIMEOUT"
         } else {
             "TX_CONFLICT"
         },
         "Token refresh is temporarily unavailable; try again later",
         request_id,
-        &[("retry-after", "1")],
+        &[
+            ("retry-after", "1"),
+            ("cache-control", "no-store"),
+            ("pragma", "no-cache"),
+        ],
     )
 }
 
@@ -3162,18 +3173,23 @@ mod refresh_response_tests {
                 "TX_CONFLICT",
             ),
             (
-                ExecError::Message("57014 statement canceled".into()),
-                "TX_TIMEOUT",
+                ExecError::Message("57014 timeout text".into()),
+                "TX_CONFLICT",
             ),
-            (
-                ExecError::Message("55P03 lock unavailable".into()),
-                "TX_TIMEOUT",
-            ),
-            (ExecError::Message("pool timed out".into()), "TX_TIMEOUT"),
+            (ExecError::Timeout, "TX_TIMEOUT"),
         ] {
             let response = refresh_unavailable("request", &error);
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response.status(),
+                if code == "TX_TIMEOUT" {
+                    StatusCode::GATEWAY_TIMEOUT
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            );
             assert_eq!(response.headers()["retry-after"], "1");
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert!(!response.headers().contains_key("set-cookie"));
             let bytes = axum::body::to_bytes(response.into_body(), 4096)
                 .await
                 .unwrap();

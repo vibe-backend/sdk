@@ -14,6 +14,7 @@ pub enum ExecError {
     NotFound,
     Conflict,
     Precondition,
+    Timeout,
     Message(String),
 }
 
@@ -166,6 +167,16 @@ impl tokio_postgres::types::ToSql for TextParam {
     tokio_postgres::types::to_sql_checked!();
 }
 
+/// Resolves a committed reservation if its request is dropped or finalization fails.
+struct ReservationGuard<F: FnOnce()>(Option<F>);
+impl<F: FnOnce()> Drop for ReservationGuard<F> {
+    fn drop(&mut self) {
+        if let Some(resolve) = self.0.take() {
+            resolve();
+        }
+    }
+}
+
 const REFRESH_TABLE: &str = "_platform_refresh_tokens";
 
 #[derive(Default)]
@@ -308,16 +319,22 @@ impl QueryExec for MemoryExec {
                 .lock()
                 .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
             let stored = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
-            if stored.iter().any(|row| {
-                row["token_hash"] == token_hash
-                    && row["revoked_at"].is_null()
-                    && row
-                        .get("pending_until")
-                        .and_then(Value::as_i64)
-                        .is_some_and(|until| until > validated_at)
-            }) {
-                // Concurrent presentations are in flight, not reuse.
-                return Ok((Rotated::Invalid, None));
+            if let Some(row) = stored
+                .iter_mut()
+                .find(|row| row["token_hash"] == token_hash)
+            {
+                if row
+                    .get("pending_until")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|until| until <= validated_at)
+                {
+                    if row["used_at"].is_null() {
+                        row.insert("used_at".into(), validated_at.into());
+                    }
+                    row.insert("replaced_by".into(), Value::Null);
+                    row.remove("pending_rotation");
+                    row.remove("pending_until");
+                }
             }
             let mut rows = stored.clone();
             let rotated = super::refresh::memory_rotate(
@@ -332,6 +349,12 @@ impl QueryExec for MemoryExec {
                 *stored = rows;
                 return Ok((rotated, None));
             }
+            if stored
+                .iter()
+                .any(|row| row["token_hash"] == token_hash && row.get("pending_rotation").is_some())
+            {
+                return Err(ExecError::Conflict);
+            }
             let parent = stored
                 .iter()
                 .find(|row| row["token_hash"] == token_hash)
@@ -342,13 +365,45 @@ impl QueryExec for MemoryExec {
                 .find(|row| row["token_hash"] == token_hash)
             {
                 row.insert("pending_rotation".into(), reservation.clone().into());
-                row.insert("pending_until".into(), (validated_at + 300).into());
+                row.insert(
+                    "pending_until".into(),
+                    (validated_at
+                        + PgOptions::default().reservation_timeout_ms().div_ceil(1000) as i64)
+                        .into(),
+                );
             }
             (rotated, parent)
         };
         drop(gate);
+        let mut guard = ReservationGuard(Some(|| {
+            if let Ok(mut tables) = self.tables.lock() {
+                if let Some(row) = tables
+                    .entry(key(tenant_id, REFRESH_TABLE))
+                    .or_default()
+                    .iter_mut()
+                    .find(|row| {
+                        row["token_hash"] == token_hash
+                            && row.get("pending_rotation").and_then(Value::as_str)
+                                == Some(&reservation)
+                    })
+                {
+                    if row["used_at"].is_null() {
+                        row.insert("used_at".into(), chrono::Utc::now().timestamp().into());
+                    }
+                    row.insert("replaced_by".into(), Value::Null);
+                    row.remove("pending_rotation");
+                    row.remove("pending_until");
+                }
+            }
+        }));
         let issued = if let (Some(issuer), Rotated::Ok { user_id, .. }) = (issuer, &rotated) {
-            issuer.issue(user_id).await.map(Some)
+            tokio::time::timeout(
+                std::time::Duration::from_millis(PgOptions::default().issuance_timeout_ms()),
+                issuer.issue(user_id),
+            )
+            .await
+            .map_err(|_| ExecError::Timeout)?
+            .map(Some)
         } else {
             Ok(None)
         };
@@ -365,10 +420,17 @@ impl QueryExec for MemoryExec {
                     .get("pending_until")
                     .and_then(Value::as_i64)
                     .is_some_and(|until| until > chrono::Utc::now().timestamp());
+                if !reserved {
+                    if row["used_at"].is_null() {
+                        row.insert("used_at".into(), chrono::Utc::now().timestamp().into());
+                    }
+                    row.insert("replaced_by".into(), Value::Null);
+                }
                 row.remove("pending_rotation");
                 row.remove("pending_until");
             }
         }
+        guard.0.take();
         let value = issued?;
         if !reserved {
             return Ok((Rotated::Invalid, None));
@@ -735,6 +797,16 @@ impl Default for PgOptions {
 }
 
 impl PgOptions {
+    fn issuance_timeout_ms(&self) -> u64 {
+        self.statement_timeout_ms
+            .saturating_add(self.pool_timeout_ms)
+    }
+
+    fn reservation_timeout_ms(&self) -> u64 {
+        self.issuance_timeout_ms()
+            .saturating_add(self.statement_timeout_ms)
+    }
+
     pub fn from_env() -> Result<Self, String> {
         let mut out = Self::default();
         let num = |name: &str| -> Result<Option<u64>, String> {
@@ -1249,7 +1321,10 @@ impl QueryExec for PgExec {
         if !super::slugs::valid_tenant(tenant_id) {
             return Err(ExecError::Message("invalid tenant id".into()));
         }
-        let mut client = self.client().await.map_err(ExecError::Message)?;
+        let mut client = self.pool.get().await.map_err(|err| match err {
+            deadpool_postgres::PoolError::Timeout(_) => ExecError::Timeout,
+            other => ExecError::Message(pool_error(other)),
+        })?;
         let tx = client.transaction().await.map_err(map_pg)?;
         let schema = format!("\"t_{tenant_id}\"");
         tx.query(
@@ -1291,6 +1366,7 @@ impl QueryExec for PgExec {
         )
         .await
         .map_err(map_pg)?;
+        tx.execute("UPDATE _platform_refresh_tokens SET used_at = COALESCE(used_at, clock_timestamp()), replaced_by = NULL, pending_rotation = NULL, pending_until = NULL WHERE token_hash = $1 AND pending_rotation IS NOT NULL AND pending_until <= clock_timestamp()", &[&token_hash]).await.map_err(map_pg)?;
         let row = tx
             .query_opt(
                 "SELECT id::text, family_id::text, user_id, revoke_reason, revoked_at IS NOT NULL, \
@@ -1331,17 +1407,6 @@ impl QueryExec for PgExec {
             }
             return Ok((Rotated::Invalid, None));
         }
-        let pending: Option<String> = tx
-            .query_one(
-                "SELECT CASE WHEN pending_until > clock_timestamp() THEN pending_rotation END FROM _platform_refresh_tokens WHERE id = $1::text::uuid",
-                &[&id],
-            )
-            .await
-            .map_err(map_pg)?
-            .get(0);
-        if pending.is_some() {
-            return Ok((Rotated::Invalid, None));
-        }
         // Spent before expired: a late replay still revokes the family. A
         // grace reissue is allowed only while the earlier child is unused.
         if used && !in_grace {
@@ -1351,26 +1416,62 @@ impl QueryExec for PgExec {
             tx.commit().await.map_err(map_pg)?;
             return Ok((Rotated::Reuse { family_id: family }, None));
         }
+        let pending: Option<String> = tx
+            .query_one(
+                "SELECT CASE WHEN pending_until > clock_timestamp() THEN pending_rotation END FROM _platform_refresh_tokens WHERE id = $1::text::uuid",
+                &[&id],
+            )
+            .await
+            .map_err(map_pg)?
+            .get(0);
+        if pending.is_some() {
+            return Err(ExecError::Conflict);
+        }
         if expired {
             return Ok((Rotated::Invalid, None));
         }
-        // A pending presentation gets 401 without revocation. No pool connection
-        // or family lock is held during issuer queries. The reservation expires
-        // after five minutes so cancellation or a process exit cannot strand it.
+        // Issuance holds neither a pool connection nor a family lock.
         let reservation = uuid::Uuid::new_v4().to_string();
         tx.execute(
-            "UPDATE _platform_refresh_tokens SET pending_rotation = $1, pending_until = clock_timestamp() + interval '5 minutes' WHERE id = $2::text::uuid",
-            &[&reservation, &id],
+            "UPDATE _platform_refresh_tokens SET pending_rotation = $1, pending_until = clock_timestamp() + make_interval(secs => $3::double precision) WHERE id = $2::text::uuid",
+            &[&reservation, &id, &(self.options.reservation_timeout_ms() as f64 / 1000.0)],
         )
         .await
         .map_err(map_pg)?;
+        let pool = self.pool.clone();
+        let cleanup_tenant = tenant_id.to_owned();
+        let cleanup_schema = schema.clone();
+        let cleanup_id = id.clone();
+        let cleanup_reservation = reservation.clone();
+        let cleanup_timeout = self.options.statement_timeout_ms.to_string();
+        let mut guard = ReservationGuard(Some(move || {
+            tokio::spawn(async move {
+                if let Ok(mut client) = pool.get().await {
+                    if let Ok(tx) = client.transaction().await {
+                        if tx.query("SELECT set_config('search_path', $1, true), set_config('app.tenant_id', $2, true), set_config('statement_timeout', $3, true), set_config('lock_timeout', $3, true)", &[&cleanup_schema, &cleanup_tenant, &cleanup_timeout]).await.is_ok() {
+                            let _ = tx.execute("UPDATE _platform_refresh_tokens SET used_at = COALESCE(used_at, clock_timestamp()), replaced_by = NULL, pending_until = clock_timestamp() WHERE id = $1::text::uuid AND pending_rotation = $2 AND revoked_at IS NULL", &[&cleanup_id, &cleanup_reservation]).await;
+                            let _ = tx.commit().await;
+                        }
+                    }
+                }
+            });
+        }));
         tx.commit().await.map_err(map_pg)?;
         drop(client);
         let issued = match issuer {
-            Some(issuer) => issuer.issue(&user).await.map(Some),
+            Some(issuer) => tokio::time::timeout(
+                std::time::Duration::from_millis(self.options.issuance_timeout_ms()),
+                issuer.issue(&user),
+            )
+            .await
+            .map_err(|_| ExecError::Timeout)?
+            .map(Some),
             None => Ok(None),
         };
-        let mut client = self.client().await.map_err(ExecError::Message)?;
+        let mut client = self.pool.get().await.map_err(|err| match err {
+            deadpool_postgres::PoolError::Timeout(_) => ExecError::Timeout,
+            other => ExecError::Message(pool_error(other)),
+        })?;
         let tx = client.transaction().await.map_err(map_pg)?;
         tx.query(
             "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), set_config('statement_timeout', $3, true), set_config('lock_timeout', $3, true)",
@@ -1390,6 +1491,9 @@ impl QueryExec for PgExec {
             Ok(value) if current == 1 => value,
             result => {
                 tx.commit().await.map_err(map_pg)?;
+                if current == 1 {
+                    guard.0.take();
+                }
                 return result.map(|_| (Rotated::Invalid, None));
             }
         };
@@ -1427,6 +1531,7 @@ impl QueryExec for PgExec {
             .map_err(map_pg)?;
         }
         tx.commit().await.map_err(map_pg)?;
+        guard.0.take();
         Ok((
             Rotated::Ok {
                 user_id: user,
@@ -1445,7 +1550,10 @@ impl QueryExec for PgExec {
         if !super::slugs::valid_tenant(tenant_id) {
             return Err(ExecError::Message("invalid tenant id".into()));
         }
-        let mut client = self.client().await.map_err(ExecError::Message)?;
+        let mut client = self.pool.get().await.map_err(|err| match err {
+            deadpool_postgres::PoolError::Timeout(_) => ExecError::Timeout,
+            other => ExecError::Message(pool_error(other)),
+        })?;
         let tx = client.transaction().await.map_err(map_pg)?;
         let schema = format!("\"t_{tenant_id}\"");
         tx.query(
@@ -1556,7 +1664,10 @@ impl PgExec {
         if !super::slugs::valid_tenant(tenant_id) {
             return Err(ExecError::Message("invalid tenant id".into()));
         }
-        let mut client = self.client().await.map_err(ExecError::Message)?;
+        let mut client = self.pool.get().await.map_err(|err| match err {
+            deadpool_postgres::PoolError::Timeout(_) => ExecError::Timeout,
+            other => ExecError::Message(pool_error(other)),
+        })?;
         let tx = client
             .transaction()
             .await
@@ -1653,7 +1764,9 @@ fn parse_cell(text: Option<String>, ty: &str) -> Value {
 
 fn map_pg(err: tokio_postgres::Error) -> ExecError {
     let code = err.code().map(|code| code.code());
-    if code == Some("23505") {
+    if matches!(code, Some("57014" | "55P03")) {
+        ExecError::Timeout
+    } else if matches!(code, Some("23505" | "40001" | "40P01")) {
         ExecError::Conflict
     } else {
         ExecError::Message(pg_error(err))
@@ -1792,5 +1905,69 @@ mod tls_tests {
         assert_eq!(o.pool_size, 16);
         assert_eq!(o.statement_timeout_ms, 5_000);
         assert_eq!(o.pool_timeout_ms, 5_000);
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+
+    struct Issuer {
+        entered: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl RefreshIssuer for Issuer {
+        async fn issue(&self, _: &str) -> Result<Value, ExecError> {
+            self.entered.notify_one();
+            self.resume.notified().await;
+            Ok(Value::Null)
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_expired_reservation_prevents_original_finalization() {
+        let exec = MemoryExec::new();
+        let tenant = "tenant0001";
+        let policy = RefreshPolicy::default();
+        exec.refresh_issue(tenant, "user", "parent", policy)
+            .await
+            .unwrap();
+        let issuer = Issuer {
+            entered: Default::default(),
+            resume: Default::default(),
+        };
+        let original = exec.refresh_rotate_authorized(
+            tenant,
+            "parent",
+            "original-child",
+            policy,
+            Some(&issuer),
+        );
+        let concurrent = async {
+            issuer.entered.notified().await;
+            {
+                let mut tables = exec.tables.lock().unwrap();
+                let rows = tables.get_mut(&key(tenant, REFRESH_TABLE)).unwrap();
+                rows[0].insert("pending_until".into(), 0.into());
+            }
+            assert!(matches!(
+                exec.refresh_rotate(tenant, "parent", "other-child", policy)
+                    .await
+                    .unwrap(),
+                Rotated::Reuse { .. }
+            ));
+            issuer.resume.notify_one();
+        };
+        let (result, ()) = tokio::join!(original, concurrent);
+        assert_eq!(result.unwrap().0, Rotated::Invalid);
+        assert_eq!(
+            exec.refresh_family(tenant, "original-child").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            exec.refresh_family(tenant, "other-child").await.unwrap(),
+            None
+        );
     }
 }

@@ -5,6 +5,8 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Refresh rotation upgrade:** Run `vibe migrate` before `vibe serve` after upgrading. Reservation columns are added per tenant by migration. Pending requests return 503 `TX_CONFLICT` without clearing cookies; database/pool timeouts return 504 `TX_TIMEOUT`. Cancelled, failed-finalization and expired reservations consume the presented token; later presentation revokes its family.
+
 ### Upcoming (advance notice)
 
 - **Refresh 家族限流（決定 147，文件更新）：** 超過上限會要求重新登入。

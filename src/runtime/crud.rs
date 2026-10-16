@@ -865,6 +865,7 @@ fn int_field(input: &Value, key: &str) -> Option<i64> {
 
 fn db(err: ExecError) -> MethodFail {
     match err {
+        ExecError::Timeout => MethodFail::code("TX_TIMEOUT", "transaction timed out"),
         ExecError::NotFound => MethodFail::code("NOT_FOUND", "not found"),
         ExecError::Conflict => MethodFail::code("CONFLICT", "conflict"),
         ExecError::Precondition => MethodFail::code("PRECONDITION_FAILED", "precondition failed"),
