@@ -32,6 +32,16 @@ jobs:
       - name: Shellcheck install script
         run: shellcheck scripts/vibe-install.sh
 
+  cargo-deny:
+    name: cargo deny (licenses, advisories, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
   rust:
     name: Rust fmt / clippy / test
     runs-on: ubuntu-latest
