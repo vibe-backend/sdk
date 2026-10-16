@@ -68,6 +68,7 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
     check_targets(&docs, &mut report);
     check_migrations(&docs, &mut report);
     check_feature_method_writes(&docs, &mut report);
+    check_method_inherited_writes(&docs, &mut report);
     let env_roles_claim = std::env::var("VIBE_JWT_ROLES_CLAIM").ok();
     check_claims_vs_roles_claims(&docs, env_roles_claim.as_deref(), &mut report);
     check_security_items_enriched(&docs, &source_by_id, opts, &mut report);
@@ -392,7 +393,9 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                         .at_step(&block.heading)
                         .at_section("Steps"),
                 ),
-                Ok(Some(true)) if !sql_writes => report.push(
+                // `op: method` steps may inherit writes from the callee; that
+                // is checked once all locks are loaded (check_method_inherited_writes).
+                Ok(Some(true)) if !sql_writes && block_val(block, "op") != "method" => report.push(
                     Diag::error(
                         file,
                         "step is marked `writes: true` but its SQL does not write",
@@ -445,6 +448,7 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
         return;
     };
     let mut saw_write = false;
+    let calls_method = steps.blocks.iter().any(|b| block_val(b, "op") == "method");
     for block in &steps.blocks {
         let op = block_val(block, "op");
         if !matches!(
@@ -469,7 +473,11 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
         // #77 ops (query, verify-password, hash-password, random-token,
         // hash-token, sign-jwt) keep their own checks below.
         if matches!(op.as_str(), "method" | "validate" | "respond") {
-            for problem in api_step_problems(block, &op) {
+            // Inside a method, `op: method` may mark an inherited write.
+            for problem in api_step_problems(block, &op)
+                .into_iter()
+                .filter(|p| !(op == "method" && p.starts_with("unknown key `writes`")))
+            {
                 report.push(
                     Diag::error(file, problem)
                         .at_step(&block.heading)
@@ -591,9 +599,86 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
         report
             .push(Diag::error(file, "writes: false but a step writes SQL").at_section("Signature"));
     }
-    if writes && !saw_write {
+    // With `op: method` steps the write may be inherited from a callee;
+    // check_method_inherited_writes decides once all locks are loaded.
+    if writes && !saw_write && !calls_method {
         report
             .push(Diag::error(file, "writes: true but no step writes SQL").at_section("Signature"));
+    }
+}
+
+/// Writes propagate up through `op: method`: a method that calls a writing
+/// method writes too, so its Signature must say `writes: true`.
+fn check_method_inherited_writes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    let mut ids: Vec<&String> = docs.keys().collect();
+    ids.sort();
+    for id in ids {
+        let doc = &docs[id];
+        if doc.meta.kind != Kind::Method {
+            continue;
+        }
+        let Some(steps) = find_section(&doc.sections, "Steps") else {
+            continue;
+        };
+        if !steps.blocks.iter().any(|b| block_val(b, "op") == "method") {
+            continue;
+        }
+        let file = lock_rel(&doc.meta.source);
+        let Ok(declared) = find_section(&doc.sections, "Signature")
+            .map(|sig| crate::manifest::parse_writes(&sig.bullets))
+            .unwrap_or(Ok(None))
+        else {
+            continue; // reported by check_method
+        };
+        let declared = declared.unwrap_or(false);
+        let mut any_write = false;
+        let mut sql_write = false;
+        for block in &steps.blocks {
+            let sql = block_val(block, "sql");
+            if crate::security::sql_writes(sql.trim_matches('`')) {
+                any_write = true;
+                sql_write = true;
+            }
+            if block_val(block, "op") != "method" {
+                continue;
+            }
+            let callee = block_val(block, "target");
+            let inherited = !callee.is_empty() && security::known_method_writes(docs, &callee);
+            any_write |= inherited;
+            match crate::manifest::parse_writes(&block.bullets) {
+                Ok(Some(true)) if !inherited => report.push(
+                    Diag::error(
+                        &file,
+                        format!(
+                            "step is marked `writes: true` but method `{callee}` does not write"
+                        ),
+                    )
+                    .at_step(&block.heading)
+                    .at_section("Steps"),
+                ),
+                Ok(Some(false)) if inherited => report.push(
+                    Diag::error(
+                        &file,
+                        format!("step calls write method `{callee}` but is marked `writes: false`"),
+                    )
+                    .at_step(&block.heading)
+                    .at_section("Steps"),
+                ),
+                _ => {}
+            }
+        }
+        // SQL-only mismatches are already reported by check_method.
+        if !declared && any_write && !sql_write {
+            report.push(
+                Diag::error(&file, "writes: false but a called method writes")
+                    .at_section("Signature"),
+            );
+        }
+        if declared && !any_write {
+            report.push(
+                Diag::error(&file, "writes: true but no step writes SQL").at_section("Signature"),
+            );
+        }
     }
 }
 
@@ -1690,6 +1775,136 @@ mod tests {
         assert!(msgs.iter().any(|m| m.contains("nope.get")), "{msgs:?}");
         assert!(msgs.iter().any(|m| m.contains("product.ghost")), "{msgs:?}");
         assert!(!msgs.iter().any(|m| m.contains("example.com")), "{msgs:?}");
+    }
+
+    const WRITER: &str = "## Signature\n- writes: true\n## Steps\n### s1 query\n- op: query\n- sql: `INSERT INTO product (name) VALUES ($1)`\n- params: [input.name]\n- writes: true\n";
+    const READER: &str = "## Signature\n- writes: false\n## Steps\n### s1 query\n- op: query\n- sql: `SELECT id FROM product WHERE id = $1`\n- params: [input.id]\n";
+
+    fn wrapper(sig: &str, target: &str, step_writes: Option<&str>) -> String {
+        let marker = step_writes
+            .map(|w| format!("- writes: {w}\n"))
+            .unwrap_or_default();
+        format!("## Signature\n- writes: {sig}\n## Steps\n### s1 method\n- op: method\n- target: {target}\n- out: r\n{marker}")
+    }
+
+    fn inherited_errors(methods: &[(&str, String)]) -> Vec<String> {
+        let mut docs = HashMap::new();
+        let mut report = Report::new();
+        for (name, body) in methods {
+            let id = format!("models/product/methods/{name}");
+            let d = doc(Kind::Method, None, &id, body);
+            check_method(&d, "x.lock.md", &mut report);
+            docs.insert(format!("product/methods/{name}"), d);
+        }
+        check_method_inherited_writes(&docs, &mut report);
+        report.errors().map(|d| d.message.clone()).collect()
+    }
+
+    #[test]
+    fn wrapper_inherits_writes_from_called_method() {
+        let ok = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("wrap", wrapper("true", "product.save", Some("true"))),
+        ]);
+        assert!(ok.is_empty(), "{ok:?}");
+        let unmarked_step = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("wrap", wrapper("true", "product.save", None)),
+        ]);
+        assert!(unmarked_step.is_empty(), "{unmarked_step:?}");
+    }
+
+    #[test]
+    fn wrapper_marked_writes_false_fails() {
+        let msgs = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("wrap", wrapper("false", "product.save", None)),
+        ]);
+        assert!(
+            msgs.iter()
+                .any(|m| m == "writes: false but a called method writes"),
+            "{msgs:?}"
+        );
+        let msgs = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("wrap", wrapper("true", "product.save", Some("false"))),
+        ]);
+        assert!(
+            msgs.iter().any(|m| m.contains("marked `writes: false`")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn wrapper_of_read_method_cannot_claim_writes() {
+        let msgs = inherited_errors(&[
+            ("get", READER.into()),
+            ("wrap", wrapper("true", "product.get", Some("true"))),
+        ]);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("`product.get` does not write")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m == "writes: true but no step writes SQL"),
+            "{msgs:?}"
+        );
+        let ok = inherited_errors(&[
+            ("get", READER.into()),
+            ("wrap", wrapper("false", "product.get", None)),
+        ]);
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn writes_inherit_through_multiple_levels() {
+        let ok = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("mid", wrapper("true", "product.save", None)),
+            ("top", wrapper("true", "product.mid", None)),
+        ]);
+        assert!(ok.is_empty(), "{ok:?}");
+        let msgs = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("mid", wrapper("true", "product.save", None)),
+            ("top", wrapper("false", "product.mid", None)),
+        ]);
+        assert_eq!(
+            msgs,
+            vec!["writes: false but a called method writes"],
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_writes_terminate_on_cycles() {
+        let msgs = inherited_errors(&[
+            ("a", wrapper("false", "product.b", None)),
+            ("b", wrapper("false", "product.a", None)),
+        ]);
+        assert!(!msgs.iter().any(|m| m.contains("writes")), "{msgs:?}");
+        let mut docs = HashMap::new();
+        for (name, body) in [
+            ("a", wrapper("false", "product.b", None)),
+            (
+                "b",
+                format!(
+                    "{}### s2 method\n- op: method\n- target: product.save\n- out: q\n",
+                    wrapper("false", "product.a", None)
+                ),
+            ),
+            ("save", WRITER.to_string()),
+        ] {
+            let id = format!("models/product/methods/{name}");
+            docs.insert(
+                format!("product/methods/{name}"),
+                doc(Kind::Method, None, &id, &body),
+            );
+        }
+        assert!(crate::security::method_doc_writes(&docs, "product.a"));
+        assert!(crate::security::known_method_writes(&docs, "product.b"));
     }
 
     fn method_errors(body: &str) -> Vec<String> {
