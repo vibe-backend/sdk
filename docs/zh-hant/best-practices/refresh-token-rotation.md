@@ -116,7 +116,7 @@ Return 204.
 - **寬限期**（Decision 61，`reuse-grace` ≤ 10s）：寬限期內平台**不會**回傳先前的明文（它只有 hash）。它撤銷上一次發出的子 token（`revoke_reason: grace-reissue`），在同一家族發新的子 token，並設定 `grace_reissued_at`；以條件更新 `update ... where grace_reissued_at is null` 確保兩個並發請求只有一個成功。每個舊 token 最多重發一次；第二次使用、超過寬限期使用、或子 token 已再被輪換後使用，都當作重用並撤銷家族。`used_at` 不變，所以寬限期不會延長。
 - **Cookie 傳送**（`transport: cookie`）：一律 `HttpOnly; Secure; SameSite=Strict; Path=/{definition}/{version}/{slug}/refresh`（Decision 60）。
 - **分類**（Decision 72）：`public: true`（沒有 access token），但**不屬**公開寫入：用戶 lock 沒有寫入 step，只有平台寫自己的表，因此不計每日公開寫入配額，亦不需要 captcha；固定限流為每 IP 每分鐘 30 次、每家族每分鐘 10 次；最低回應耗時 300ms。
-- **登出**（`token-revoke`，Decision 65）：必須經 `auth`；`scope: family` 撤銷當前家族（登出），`scope: all` 撤銷該用戶所有家族（全部裝置登出）；只可撤銷呼叫者自己（`sub`）的家族；即使 token 不存在或已撤銷也回 204；cookie 傳送時會清除 cookie（`Max-Age=0`）。
+- **登出**（`token-revoke`，Decision 65）：必須經 `auth`；`scope: family` 撤銷當前家族（登出），`scope: all` 撤銷該用戶所有家族（全部裝置登出）；只可撤銷呼叫者自己（`sub`）的家族。例外（規格 v1.8 Decision 145）：`token-source: cookie` 加 `scope: family` 時登出不需要 access token，但必須通過 refresh 路由的 `Origin` 白名單及 `X-Vibe-CSRF: 1`（否則 403 `CSRF_REJECTED`）；之後只從 `__Host-` cookie 讀 token，一律回 204，只撤銷該 cookie 的家族。登出永不回 401 `INVALID_REFRESH_TOKEN`；即使 token 不存在或已撤銷也回 204；cookie 傳送時會清除 cookie（`Max-Age=0`）。
 - **其他撤銷**：電郵驗證成功會撤銷所有家族（`email-verified`，Decision 67）；私隱刪除會撤銷所有家族（`erasure`，§12.10）。
 - **用戶端儲存**（一般建議，規格以外）：瀏覽器優先用 `transport: cookie`；原生 app 應把 token 存在作業系統的 keychain／keystore。絕不要把 refresh token 存在 `localStorage`／`sessionStorage`。
 - Token 永不寫入 log（§9）。簽發只經 `sign-token` capability（§12.6），見 [sign-token.md](sign-token.md)。
