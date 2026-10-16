@@ -5,6 +5,7 @@ mod http;
 pub mod jwks;
 mod limiter;
 mod migrate;
+pub mod replay;
 mod slugs;
 mod sql;
 

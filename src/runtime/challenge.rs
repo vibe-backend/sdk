@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use super::http::RunEnv;
+pub use super::replay::{token_key, Outcome, PgReplayStore, ReplayStore};
 
 /// Cloudflare's siteverify endpoint.
 pub const TURNSTILE_SITEVERIFY_URL: &str =
@@ -166,32 +166,20 @@ impl Reservation<'_> {
     /// The provider accepted the token: keep it for the full TTL.
     pub fn verified(mut self) {
         self.settled = true;
-        let mut st = self.cache.lock();
-        let ttl = self.cache.ttl;
-        if let Some(mut entry) = st.entries.remove(&self.key) {
-            st.uncount(&mut entry);
-            entry.expires = Instant::now() + ttl;
-            st.entries.insert(self.key, entry);
-        }
+        self.cache.settle_key(&self.key, Outcome::Verified);
     }
 
     /// The provider rejected the token: keep it only briefly.
     pub fn rejected(mut self) {
         self.settled = true;
-        let hold = self.cache.rejected_hold;
-        let mut st = self.cache.lock();
-        if hold.is_zero() {
-            st.remove(&self.key);
-        } else if let Some(entry) = st.entries.get_mut(&self.key) {
-            entry.expires = Instant::now() + hold;
-        }
+        self.cache.settle_key(&self.key, Outcome::Rejected);
     }
 }
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         if !self.settled {
-            self.cache.lock().remove(&self.key);
+            self.cache.settle_key(&self.key, Outcome::Released);
         }
     }
 }
@@ -246,7 +234,22 @@ impl ReplayCache {
         ip: Option<&str>,
         tenant: Option<&str>,
     ) -> Result<Reservation<'_>, ChallengeError> {
-        let key: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let key = token_key(token);
+        self.reserve_key(&key, ip, tenant)?;
+        Ok(Reservation {
+            cache: self,
+            key,
+            settled: false,
+        })
+    }
+
+    fn reserve_key(
+        &self,
+        key: &[u8; 32],
+        ip: Option<&str>,
+        tenant: Option<&str>,
+    ) -> Result<(), ChallengeError> {
+        let key = *key;
         let now = Instant::now();
         let mut st = self.lock();
         match st.entries.get(&key) {
@@ -301,11 +304,47 @@ impl ReplayCache {
                 tenant,
             },
         );
-        Ok(Reservation {
-            cache: self,
-            key,
-            settled: false,
-        })
+        Ok(())
+    }
+
+    fn settle_key(&self, key: &[u8; 32], outcome: Outcome) {
+        let mut st = self.lock();
+        match outcome {
+            Outcome::Verified => {
+                if let Some(mut entry) = st.entries.remove(key) {
+                    st.uncount(&mut entry);
+                    entry.expires = Instant::now() + self.ttl;
+                    st.entries.insert(*key, entry);
+                }
+            }
+            Outcome::Rejected if !self.rejected_hold.is_zero() => {
+                if let Some(entry) = st.entries.get_mut(key) {
+                    entry.expires = Instant::now() + self.rejected_hold;
+                }
+            }
+            Outcome::Rejected | Outcome::Released => st.remove(key),
+        }
+    }
+}
+
+#[async_trait]
+impl super::replay::ReplayStore for ReplayCache {
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+
+    async fn reserve(
+        &self,
+        key: &[u8; 32],
+        ip: Option<&str>,
+        tenant: Option<&str>,
+    ) -> Result<(), ChallengeError> {
+        self.reserve_key(key, ip, tenant)
+    }
+
+    async fn settle(&self, key: &[u8; 32], outcome: Outcome) -> Result<(), ChallengeError> {
+        self.settle_key(key, outcome);
+        Ok(())
     }
 }
 
@@ -330,7 +369,7 @@ pub struct TurnstileConfig {
 pub struct TurnstileVerifier {
     config: TurnstileConfig,
     client: reqwest::Client,
-    replay: ReplayCache,
+    replay: Arc<dyn ReplayStore>,
 }
 
 #[derive(Deserialize)]
@@ -353,13 +392,23 @@ impl TurnstileVerifier {
         Self {
             config,
             client,
-            replay: ReplayCache::default(),
+            replay: Arc::new(ReplayCache::default()),
         }
     }
 
-    pub fn with_replay_cache(mut self, replay: ReplayCache) -> Self {
-        self.replay = replay;
+    pub fn with_replay_cache(self, replay: ReplayCache) -> Self {
+        self.with_replay_store(Arc::new(replay))
+    }
+
+    /// Uses `store` for single-use bookkeeping (e.g. [`PgReplayStore`] when
+    /// several instances serve the same routes).
+    pub fn with_replay_store(mut self, store: Arc<dyn ReplayStore>) -> Self {
+        self.replay = store;
         self
+    }
+
+    pub fn replay_store(&self) -> &'static str {
+        self.replay.name()
     }
 
     /// The production client: 5 s timeout, no redirects, outbound guard
@@ -388,20 +437,29 @@ impl ChallengeVerifier for TurnstileVerifier {
         }
         // Single use: reserve before asking the provider, so concurrent reuse
         // is refused. Only a verified token keeps the slot for the full TTL.
-        let reservation =
-            self.replay
-                .reserve(token, ctx.remote_ip.as_deref(), ctx.tenant.as_deref())?;
+        let key = token_key(token);
+        self.replay
+            .reserve(&key, ctx.remote_ip.as_deref(), ctx.tenant.as_deref())
+            .await?;
+        let mut guard = super::replay::PendingGuard::new(self.replay.clone(), key);
         match self.ask(token, ctx).await {
             Ok(()) => {
-                reservation.verified();
+                guard.disarm();
+                // Fail closed: a token that cannot be recorded is not accepted.
+                self.replay.settle(&key, Outcome::Verified).await?;
                 Ok(())
             }
             Err(err @ ChallengeError::Rejected(_)) => {
-                reservation.rejected();
+                guard.disarm();
+                // Best effort: the pending entry expires on its own.
+                let _ = self.replay.settle(&key, Outcome::Rejected).await;
                 Err(err)
             }
-            // No answer: the reservation is released on drop.
-            Err(err) => Err(err),
+            Err(err) => {
+                guard.disarm();
+                let _ = self.replay.settle(&key, Outcome::Released).await;
+                Err(err)
+            }
         }
     }
 }
@@ -483,8 +541,22 @@ pub fn verifier_from_env() -> Result<Option<Arc<dyn ChallengeVerifier>>, String>
     verifier_from_vars(|name| std::env::var(name).ok())
 }
 
+/// [`verifier_from_env`] with a replay store (the in-memory cache when `None`).
+pub fn verifier_from_env_with_store(
+    store: Option<Arc<dyn ReplayStore>>,
+) -> Result<Option<Arc<dyn ChallengeVerifier>>, String> {
+    verifier_from_vars_with_store(|name| std::env::var(name).ok(), store)
+}
+
 pub fn verifier_from_vars(
     get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Arc<dyn ChallengeVerifier>>, String> {
+    verifier_from_vars_with_store(get, None)
+}
+
+pub fn verifier_from_vars_with_store(
+    get: impl Fn(&str) -> Option<String>,
+    store: Option<Arc<dyn ReplayStore>>,
 ) -> Result<Option<Arc<dyn ChallengeVerifier>>, String> {
     let provider = get("VIBE_CHALLENGE_PROVIDER")
         .map(|v| v.trim().to_ascii_lowercase())
@@ -494,7 +566,11 @@ pub fn verifier_from_vars(
         Some(config) => config,
         None => return Ok(None),
     };
-    Ok(Some(Arc::new(TurnstileVerifier::guarded(config)?)))
+    let mut verifier = TurnstileVerifier::guarded(config)?;
+    if let Some(store) = store {
+        verifier = verifier.with_replay_store(store);
+    }
+    Ok(Some(Arc::new(verifier)))
 }
 
 fn turnstile_config(

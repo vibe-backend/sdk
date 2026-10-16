@@ -5,6 +5,8 @@
 use serde_json::{json, Value};
 use tokio_postgres::{Client, NoTls};
 use vibe::manifest::Manifest;
+use vibe::runtime::challenge::ChallengeError;
+use vibe::runtime::replay::{token_key, Outcome, PgReplayStore, ReplayStore};
 use vibe::runtime::{migrate_tenant, Col, PgExec, QueryExec, Stmt};
 
 fn admin_url() -> Option<String> {
@@ -1081,4 +1083,125 @@ async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
         .await
         .unwrap();
     assert_eq!(got, vec!["none|0".to_string()]);
+}
+
+// #157: shared challenge replay store.
+
+async fn replay_stores(s: &Setup, table: &str) -> (PgReplayStore, PgReplayStore) {
+    // Tests run with a different owner role each; in a deployment one owner
+    // role creates the schema on the first `vibe migrate`.
+    {
+        let _guard = SETUP.lock().await;
+        s.admin
+            .batch_execute(&format!(
+                "CREATE SCHEMA IF NOT EXISTS vibe_platform; GRANT ALL ON SCHEMA vibe_platform TO {owner} WITH GRANT OPTION",
+                owner = s.owner
+            ))
+            .await
+            .unwrap();
+    }
+    let owner = connect(&url_as(&s.admin_url, &s.owner)).await;
+    for sql in PgReplayStore::migration_sql(table, &s.app).unwrap() {
+        owner.batch_execute(&sql).await.unwrap();
+    }
+    // Two "instances": separate pools as the runtime role, one table.
+    let a = PgExec::connect(&url_as(&s.admin_url, &s.app))
+        .await
+        .unwrap();
+    let b = PgExec::connect(&url_as(&s.admin_url, &s.app))
+        .await
+        .unwrap();
+    (
+        PgReplayStore::new(a.pool(), table).unwrap(),
+        PgReplayStore::new(b.pool(), table).unwrap(),
+    )
+}
+
+fn is_rejected(r: Result<(), ChallengeError>) -> bool {
+    matches!(r, Err(ChallengeError::Rejected(_)))
+}
+
+#[tokio::test]
+async fn shared_replay_store_is_single_use_across_instances() {
+    let s = require_pg!(setup().await);
+    let table = format!("replay_{}", suffix());
+    let (a, b) = replay_stores(&s, &table).await;
+    a.check().await.unwrap();
+    let k = token_key("tok-1");
+    a.reserve(&k, Some("203.0.113.1"), Some(&s.tenant))
+        .await
+        .unwrap();
+    // Pending on A: B refuses concurrent use.
+    assert!(is_rejected(b.reserve(&k, Some("203.0.113.2"), None).await));
+    a.settle(&k, Outcome::Verified).await.unwrap();
+    assert!(is_rejected(b.reserve(&k, None, None).await));
+    // Released and rejected (with no hold) slots are free again.
+    let k2 = token_key("tok-2");
+    a.reserve(&k2, None, None).await.unwrap();
+    a.settle(&k2, Outcome::Released).await.unwrap();
+    b.reserve(&k2, None, None).await.unwrap();
+    let b0 = PgReplayStore::new(
+        PgExec::connect(&url_as(&s.admin_url, &s.app))
+            .await
+            .unwrap()
+            .pool(),
+        &table,
+    )
+    .unwrap()
+    .with_rejected_hold(std::time::Duration::ZERO);
+    b0.settle(&k2, Outcome::Rejected).await.unwrap();
+    a.reserve(&k2, None, None).await.unwrap();
+    // A verified token is not taken over by settling it again as released.
+    a.settle(&k2, Outcome::Verified).await.unwrap();
+    b.settle(&k2, Outcome::Released).await.unwrap();
+    assert!(is_rejected(b.reserve(&k2, None, None).await));
+}
+
+#[tokio::test]
+async fn shared_replay_store_quotas_and_capacity_hold_across_instances() {
+    let s = require_pg!(setup().await);
+    let table = format!("replay_{}", suffix());
+    let (a, b) = replay_stores(&s, &table).await;
+    let a = a.with_quotas(2, 3);
+    let b = b.with_quotas(2, 3);
+    let ip = Some("198.51.100.9");
+    a.reserve(&token_key("q1"), ip, Some("ta")).await.unwrap();
+    b.reserve(&token_key("q2"), ip, Some("ta")).await.unwrap();
+    // Third unverified token from the same IP, on either instance.
+    assert!(is_rejected(a.reserve(&token_key("q3"), ip, None).await));
+    // Tenant quota counts across IPs and instances.
+    b.reserve(&token_key("q4"), Some("198.51.100.10"), Some("ta"))
+        .await
+        .unwrap();
+    assert!(is_rejected(
+        a.reserve(&token_key("q5"), Some("198.51.100.11"), Some("ta"))
+            .await
+    ));
+    // Verified tokens leave the quota.
+    a.settle(&token_key("q1"), Outcome::Verified).await.unwrap();
+    assert!(b.reserve(&token_key("q6"), ip, None).await.is_ok());
+    // Capacity: four live rows (q1, q2, q4, q6).
+    let small = b.with_capacity(4);
+    assert!(matches!(
+        small.reserve(&token_key("q7"), None, None).await,
+        Err(ChallengeError::Unavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn shared_replay_store_fails_closed_when_unusable() {
+    let s = require_pg!(setup().await);
+    let exec = PgExec::connect(&url_as(&s.admin_url, &s.app))
+        .await
+        .unwrap();
+    let missing = PgReplayStore::new(exec.pool(), "replay_missing_table").unwrap();
+    assert!(missing.check().await.is_err());
+    assert!(matches!(
+        missing.reserve(&token_key("x"), None, None).await,
+        Err(ChallengeError::Unavailable(_))
+    ));
+    assert!(matches!(
+        missing.settle(&token_key("x"), Outcome::Verified).await,
+        Err(ChallengeError::Unavailable(_))
+    ));
 }

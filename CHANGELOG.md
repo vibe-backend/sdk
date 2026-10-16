@@ -5,6 +5,10 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+### Added
+
+- **Shared challenge replay store (#157):** `VIBE_CHALLENGE_REPLAY_STORE=postgres` keeps challenge single-use state, quotas and capacity in PostgreSQL (`vibe_platform.challenge_replay`, created by `vibe migrate`) so they hold across instances. Store errors fail closed (503). With a verifier configured, `VIBE_INSTANCES` > 1 requires the shared store.
+
 ### Breaking
 
 - **Challenge verification (#118):** `x-challenge-proof` is no longer accepted just because it is non-empty. Routes with `challenge: { type: captcha, when: always }` verify the token with Cloudflare Turnstile siteverify (hostname and action checked, each token single-use) and fail closed (403 `CHALLENGE_FAILED`, 503 `CHALLENGE_UNAVAILABLE` when no verifier is configured, the provider is unreachable, or the route uses `pow`). In production, `vibe serve` and `vibe validate --deploy` refuse such routes until `VIBE_TURNSTILE_SECRET` and `VIBE_CHALLENGE_HOSTNAMES` are set.

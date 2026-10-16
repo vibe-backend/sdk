@@ -38,8 +38,37 @@ For each request the server:
    `data-action`), and a `challenge_ts` that is present, at most 300 s old and not more
    than 60 s in the future (clock skew).
 
-The replay cache is per process. With several instances, Turnstile's own
-single-use check (`timeout-or-duplicate`) still applies.
+## Replay store
+
+The single-use state (step 2) lives behind the `ReplayStore` trait
+(`src/runtime/replay.rs`):
+
+| Variable | Meaning |
+| --- | --- |
+| `VIBE_CHALLENGE_REPLAY_STORE` | `memory` (default, per process) or `postgres` (shared by all instances). |
+| `VIBE_INSTANCES` | Number of instances serving the routes (default 1). |
+
+- `memory` suits a single instance.
+- `postgres` keeps the state in `vibe_platform.challenge_replay` in the
+  `VIBE_DATABASE_URL` database, so a token, the per-IP and per-tenant quotas
+  and the capacity limit hold across instances. Reservations use
+  `INSERT ... ON CONFLICT` (an expired row is taken over atomically), quota
+  checks are serialized per IP and per tenant with transaction-level advisory
+  locks, and expired rows are removed in small batches on each reservation.
+  Client IPs are stored as SHA-256 hashes; tokens as SHA-256 of the token.
+  `vibe migrate` creates the schema and table (owner role) and grants the
+  runtime role `SELECT, INSERT, UPDATE, DELETE` when
+  `VIBE_CHALLENGE_REPLAY_STORE=postgres` is set; `vibe serve` checks the table
+  at startup and refuses to start if it is not usable.
+- Any store error (database unreachable, timeout, missing table) answers
+  503 `CHALLENGE_UNAVAILABLE`. If a verified token cannot be recorded, it is
+  not accepted.
+- With a verifier configured, `VIBE_INSTANCES` greater than 1 requires
+  `VIBE_CHALLENGE_REPLAY_STORE=postgres`: `vibe serve` and `vibe validate`
+  refuse otherwise, in every environment. `postgres` is refused with
+  `--memory`.
+
+Turnstile's own single-use check (`timeout-or-duplicate`) applies in addition.
 
 ## Failing closed
 
@@ -47,7 +76,7 @@ single-use check (`timeout-or-duplicate`) still applies.
 | --- | --- |
 | No proof | 400 `CHALLENGE_REQUIRED` |
 | Proof rejected (forged, replayed, expired, missing or future `challenge_ts`, wrong hostname or action, per-IP or per-tenant quota reached) | 403 `CHALLENGE_FAILED` |
-| No verifier configured, replay cache full, provider unreachable, timeout, bad response, `type: pow` | 503 `CHALLENGE_UNAVAILABLE` |
+| No verifier configured, replay cache full, replay store unavailable, provider unreachable, timeout, bad response, `type: pow` | 503 `CHALLENGE_UNAVAILABLE` |
 
 In production (`VIBE_ENV`), `vibe serve` refuses to start and `vibe validate --deploy`
 fails if any route uses `challenge ... when: always` and no verifier is configured.
