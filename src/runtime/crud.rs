@@ -115,7 +115,7 @@ async fn run_steps(
                 let value = match step.op.as_str() {
                     "query" => super::ops::query(exec, method, step, &vars, ctx).await?,
                     "verify-password" => super::ops::verify_password(step, &vars).await?,
-                    "hash-password" => super::ops::hash_password_op(step, &vars).await?,
+                    "hash-password" => super::ops::hash_password_op(step, &vars, ctx).await?,
                     "random-token" => super::ops::random_token(step, ctx)?,
                     "hash-token" => super::ops::hash_token(step, &vars, ctx)?,
                     _ => super::ops::sign_jwt(manifest, exec, method, step, &vars, ctx).await?,
@@ -210,10 +210,14 @@ async fn create(
             ));
         }
         let mut value = provided.unwrap_or(Value::Null);
-        if field.ty == "password" && value.is_string() {
-            value = Value::String(hash_password(value.as_str().unwrap_or(""))?);
-        }
+        // Field rules apply to what the caller sent (as on update), then the
+        // password is hashed for storage.
         check_field(field, &value)?;
+        if field.ty == "password" && value.is_string() {
+            value = Value::String(
+                super::ops::hash_new_password(ctx.auth, value.as_str().unwrap_or("")).await?,
+            );
+        }
         if field.unique && !value.is_null() {
             let existing = exec
                 .execute(
@@ -462,7 +466,16 @@ async fn update(
             ));
         }
         check_field(field, value)?;
-        sets.push((col(field), value.clone()));
+        // A password is never stored as given: same floor, breached check
+        // and hashing as on create.
+        let value = if field.ty == "password" && value.is_string() {
+            Value::String(
+                super::ops::hash_new_password(ctx.auth, value.as_str().unwrap_or("")).await?,
+            )
+        } else {
+            value.clone()
+        };
+        sets.push((col(field), value));
     }
     if sets.is_empty() {
         return Err(MethodFail::code(
@@ -876,9 +889,7 @@ pub const ARGON2_P_COST: u32 = 1;
 
 pub fn hash_password(plain: &str) -> Result<String, MethodFail> {
     let len = plain.chars().count();
-    if !(12..=256).contains(&len)
-        || matches!(plain, "password1234" | "123456789012" | "qwertyuiopas")
-    {
+    if !(12..=256).contains(&len) {
         return Err(MethodFail::code(
             "WEAK_PASSWORD",
             "password does not meet the platform baseline",

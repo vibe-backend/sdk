@@ -85,6 +85,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         jwks: None,
         roles_claim: "roles".into(),
         signing_keys: Default::default(),
+        breached: std::sync::Arc::new(vibe::runtime::breached::BreachedConfig::builtin()),
         route_jwks: Default::default(),
     };
     let loaded = vibe::runtime::load_project_slugs(&root, true).unwrap();

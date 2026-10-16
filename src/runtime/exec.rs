@@ -109,6 +109,15 @@ impl MemoryExec {
         Self::default()
     }
 
+    /// Rows of a tenant table as stored (tests).
+    pub fn dump(&self, tenant_id: &str, table: &str) -> Vec<Row> {
+        self.tables
+            .lock()
+            .ok()
+            .and_then(|t| t.get(&key(tenant_id, table)).cloned())
+            .unwrap_or_default()
+    }
+
     /// Adds a row to a tenant table directly (dev data and tests).
     pub fn seed(&self, tenant_id: &str, table: &str, row: Row) {
         if let Ok(mut tables) = self.tables.lock() {

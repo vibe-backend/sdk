@@ -60,6 +60,8 @@ pub struct AuthConfig {
     pub roles_claim: String,
     /// Private keys for `sign-jwt` steps, by `key-ref` (loaded at startup).
     pub signing_keys: HashMap<String, SigningKey>,
+    /// Breached-password source for `hash-password` (spec §4A.2).
+    pub breached: Arc<super::breached::BreachedConfig>,
     /// JWKS caches for routes with their own `jwks-uri` (or an `iss` whose
     /// default `{iss}/.well-known/jwks.json` differs), keyed by URI. Built at
     /// startup; a route whose URI is missing here fails closed.
@@ -123,6 +125,7 @@ impl AuthConfig {
             jwks: None,
             roles_claim: "roles".into(),
             signing_keys: HashMap::new(),
+            breached: Arc::new(super::breached::BreachedConfig::builtin()),
             route_jwks: HashMap::new(),
         }
     }
@@ -1684,6 +1687,16 @@ fn fail_response(route: &RouteSpec, fail: MethodFail, request_id: &str) -> HttpR
             request_id,
             &[("www-authenticate", "Bearer realm=\"vibe\"")],
         )
+    } else if status == StatusCode::SERVICE_UNAVAILABLE {
+        // Retryable: a dependency (such as the breached-password check) could
+        // not answer; same short hint as other retryable 503s.
+        error_response(
+            status,
+            &fail.code,
+            &public_message(&fail),
+            request_id,
+            &[("retry-after", "1")],
+        )
     } else {
         error_response(status, &fail.code, &public_message(&fail), request_id, &[])
     }
@@ -1699,7 +1712,9 @@ fn public_message(fail: &MethodFail) -> String {
 
 fn platform_status(code: &str) -> StatusCode {
     match code {
-        "VALIDATION_FAILED" | "WEAK_PASSWORD" => StatusCode::UNPROCESSABLE_ENTITY,
+        "VALIDATION_FAILED" | "WEAK_PASSWORD" | "BREACHED_PASSWORD" => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
         "PRECONDITION_REQUIRED" => StatusCode::PRECONDITION_REQUIRED,
         "PRECONDITION_FAILED" => StatusCode::PRECONDITION_FAILED,
         "NOT_FOUND" => StatusCode::NOT_FOUND,
@@ -1990,6 +2005,55 @@ mod rate_tests {
             status(check_challenge(Some(&ok), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
             Some(StatusCode::SERVICE_UNAVAILABLE)
         );
+    }
+
+    #[tokio::test]
+    async fn non_production_range_outage_carries_retry_after() {
+        use crate::runtime::breached::{BreachedConfig, BreachedSource, RangeApi, MIN_TIMEOUT};
+
+        // Loopback HTTP is non-production only. A refused connection or
+        // lookup deadline must fail closed without an external dependency.
+        let api = RangeApi::new("http://127.0.0.1:9/range/", false)
+            .unwrap()
+            .with_timeout(MIN_TIMEOUT);
+        let mut auth = AuthConfig::anonymous();
+        auth.breached = Arc::new(BreachedConfig {
+            source: BreachedSource::Range(Box::new(api)),
+        });
+        let err = crate::runtime::ops::hash_new_password(&auth, "a-unique-clean-password")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "SERVICE_UNAVAILABLE");
+        let res = fail_response(&test_route(), err, "req-outage");
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(res.headers().get("retry-after").unwrap(), "1");
+    }
+
+    #[test]
+    fn unavailable_method_failures_carry_retry_after() {
+        let route = test_route();
+        let res = fail_response(
+            &route,
+            MethodFail::code(
+                "SERVICE_UNAVAILABLE",
+                "Password check is unavailable; try again later",
+            ),
+            "req-1",
+        );
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            res.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let res = fail_response(
+            &route,
+            MethodFail::code("BREACHED_PASSWORD", "choose another"),
+            "req-2",
+        );
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(res.headers().get("retry-after").is_none());
     }
 
     fn test_route() -> RouteSpec {

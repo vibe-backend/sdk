@@ -17,6 +17,8 @@ fn serve(envs: &[(&str, &str)], memory: bool) -> (bool, String) {
         cmd.arg("--memory");
     }
     for key in [
+        "VIBE_BREACHED_PASSWORDS_FALLBACK_FILE",
+        "VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE",
         "VIBE_ENV",
         "VIBE_API_KEY_PEPPER",
         "VIBE_DATABASE_URL",
@@ -42,6 +44,29 @@ fn serve(envs: &[(&str, &str)], memory: bool) -> (bool, String) {
         out.status.success(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     )
+}
+
+#[test]
+fn removed_breached_password_variables_refuse_startup() {
+    for environment in ["dev", "ci", "production"] {
+        for name in [
+            "VIBE_BREACHED_PASSWORDS_FALLBACK_FILE",
+            "VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE",
+        ] {
+            for value in ["", "false", "/missing/list"] {
+                let (ok, err) = serve(
+                    &[
+                        ("VIBE_ENV", environment),
+                        ("VIBE_API_KEY_PEPPER", "0123456789abcdef0123456789abcdef"),
+                        (name, value),
+                    ],
+                    environment == "dev",
+                );
+                assert!(!ok);
+                assert!(err.contains(name) && err.contains("was removed"), "{err}");
+            }
+        }
+    }
 }
 
 #[test]

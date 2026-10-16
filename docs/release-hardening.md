@@ -40,6 +40,16 @@ WARN vibe::rate_limit_saturation: rate-limit shard saturated; refusing new keys 
 
 `reason` is `owner_cap`, `network_cap`, `reserve` or `pinned`. Before release, add a log-based alert on that target (for example, any `reason="reserve"` or `reason="pinned"` line, or `refused` above a few dozen per minute), since those mean new clients are being turned away rather than one heavy network being capped.
 
+### Breached-password lookup alert
+
+Every failed range lookup (outage, timeout, non-200 status, unexpected response) increments a process-wide counter (`vibe::runtime::breached_lookup_failures()`) and logs at `WARN` with target `vibe::breached_password_unavailable`:
+
+```text
+WARN vibe::breached_password_unavailable: breached-password range lookup failed reason="timeout" status=0 fallback=false failures=3 failures_total=3
+```
+
+`reason` is `timeout`, `network`, `status`, `content_type`, `too_large`, `malformed` or `closed`; `status` is the HTTP status for `reason="status"` and 0 otherwise. Upstream response content is never logged. With `fallback=false` the request got 503 `SERVICE_UNAVAILABLE` (`Retry-After: 1`), so registration and password changes are refused. Before release, add a log-based alert on that target (for example, a few lines per minute), alongside the rate-limit saturation alert.
+
 ## Residual risks
 
 - `release` environment admin bypass is enabled (`can_admins_bypass: true`). An admin can deploy without Jack's environment approval. Jack accepted this risk.
