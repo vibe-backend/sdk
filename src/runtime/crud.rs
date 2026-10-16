@@ -1336,11 +1336,13 @@ mod unique_tests {
 
     async fn add(exec: &MemoryExec, tenant: &str, input: Value) -> Result<CallResult, MethodFail> {
         let roles: Vec<String> = vec![];
+        let auth = crate::runtime::http::AuthConfig::anonymous();
         create(
             exec,
             &model(),
             &input,
             CallCtx {
+                auth: &auth,
                 tenant_id: tenant,
                 role: "app_rw",
                 caller: Caller {
