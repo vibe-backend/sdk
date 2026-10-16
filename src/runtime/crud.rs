@@ -879,10 +879,8 @@ pub fn hash_password(plain: &str) -> Result<String, MethodFail> {
     let params = argon2::Params::new(65_536, 3, 1, Some(32))
         .map_err(|err| MethodFail::code("INTERNAL", err.to_string()))?;
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
-    let hash =
-        argon2::password_hash::PasswordHasher::hash_password(&argon, plain.as_bytes(), &salt)
-            .map_err(|err| MethodFail::code("INTERNAL", err.to_string()))?;
+    let hash = argon2::password_hash::PasswordHasher::hash_password(&argon, plain.as_bytes())
+        .map_err(|err| MethodFail::code("INTERNAL", err.to_string()))?;
     Ok(hash.to_string())
 }
 
@@ -1190,5 +1188,39 @@ mod db_error_tests {
         ));
         assert_eq!(fail.code, "FORBIDDEN");
         assert_eq!(fail.message, "permission denied");
+    }
+}
+
+#[cfg(test)]
+mod password_hash_tests {
+    use super::hash_password;
+    use argon2::password_hash::{phc::PasswordHash, PasswordVerifier};
+    use argon2::Argon2;
+
+    fn verify(plain: &str, phc: &str) -> bool {
+        let Ok(parsed) = PasswordHash::new(phc) else {
+            return false;
+        };
+        Argon2::default()
+            .verify_password(plain.as_bytes(), &parsed)
+            .is_ok()
+    }
+
+    /// PHC string produced by argon2 0.5 with the same params (m=65536,t=3,p=1)
+    /// and fixed salt `AAAAAAAAAAAAAAAAAAAAAA` for password `correcthorse1`.
+    const ARGON2_0_5_PHC: &str = "$argon2id$v=19$m=65536,t=3,p=1$AAAAAAAAAAAAAAAAAAAAAA$ItWDGBLmXI4K3WBpKL15+erEWf0pZ4NTFTyawNObDt8";
+
+    #[test]
+    fn argon2_0_5_phc_still_verifies() {
+        assert!(verify("correcthorse1", ARGON2_0_5_PHC));
+        assert!(!verify("wrong-password1", ARGON2_0_5_PHC));
+    }
+
+    #[test]
+    fn fresh_hash_round_trips() {
+        let hash = hash_password("correcthorse1").expect("hash");
+        assert!(hash.starts_with("$argon2id$"));
+        assert!(verify("correcthorse1", &hash));
+        assert!(!verify("correcthorse2", &hash));
     }
 }

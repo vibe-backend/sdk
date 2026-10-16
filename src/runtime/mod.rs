@@ -1,3 +1,4 @@
+pub mod challenge;
 mod crud;
 mod exec;
 pub mod grants;
@@ -10,6 +11,7 @@ mod pools;
 mod slugs;
 mod sql;
 
+pub use challenge::{ChallengeContext, ChallengeError, ChallengeVerifier, TurnstileVerifier};
 pub use crud::{check_expr, check_when, parse_ownership, run_method, Ownership};
 pub use exec::{etag, role_allows, ExecError, PgExec, PgOptions, PgSession, QueryExec, RoleStatus};
 pub use http::{

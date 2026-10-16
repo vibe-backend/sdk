@@ -852,12 +852,26 @@ async fn migration_without_tenant_id_or_with_a_view_fails() {
              AS 'BEGIN PERFORM set_config(''app.tenant_id'', ''other'', true); RETURN NEW; END'",
             "SECURITY DEFINER",
         ),
+        (
+            "CREATE PROCEDURE steal_proc() LANGUAGE sql SECURITY DEFINER              AS 'SELECT count(*) FROM notes'",
+            "SECURITY DEFINER",
+        ),
     ] {
         let mut m = manifest();
         m.migrations[0].statements = vec![stmt.to_string()];
         let tenant = format!("tv{}", suffix());
         let err = migrate_as(&s, &m, &tenant).await.unwrap_err();
         assert!(err.contains(expect), "{stmt}: {err}");
+        if stmt.contains("CREATE PROCEDURE") {
+            assert!(
+                err.contains("procedure "),
+                "procedure listing should say 'procedure ': {err}"
+            );
+            assert!(
+                err.contains("functions, procedures and triggers"),
+                "outer message should name procedures: {err}"
+            );
+        }
     }
 }
 
