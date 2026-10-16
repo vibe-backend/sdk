@@ -11,7 +11,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Added
 
-- **Spec: challenge request digest (#156, decision 140):** Spec v1.8 section 7.2b defines binding each Turnstile token to a request digest carried in `cdata` (SHA-256 over method, normalized path, normalized query, `Content-Type`, `If-Match` and the raw body hash; server recomputes and compares, failing closed with 403 `CHALLENGE_FAILED`). Confirmed by the PM on 2026-10-16 (full-length digest, login routes included, client IP not covered; per-request `X-Vibe-Request-Nonce` from a CSPRNG so the provider only sees an unreversible digest; raw `+` in the query is invalid); not yet implemented. Adds `scripts/request-digest-vectors.mjs` with test vectors.
+- **Spec: challenge request digest (#156, decision 140):** Spec v1.8 section 7.2b defines binding each Turnstile token to a request digest carried in `cdata` (SHA-256 over method, normalized path, normalized query, `Content-Type`, `If-Match` and the raw body hash; server recomputes and compares, failing closed with 403 `CHALLENGE_FAILED`). Confirmed by the PM on 2026-10-16 (full-length digest, login routes included, client IP not covered; per-request `X-Vibe-Request-Nonce` from a CSPRNG so the provider only sees an unreversible digest; raw `+` in the query is invalid; nonces are unique per tenant, one record per request, counted toward the D134 and D137 caps); not yet implemented. Adds `scripts/request-digest-vectors.mjs` with test vectors.
 
 - **Dependency / advisory CI (#192):** `cargo deny check` (advisories, licenses, bans, sources) runs on pull requests, pushes to main, a daily schedule, and `workflow_dispatch` via `.github/workflows/cargo-deny.yml` (Refs #196).
 

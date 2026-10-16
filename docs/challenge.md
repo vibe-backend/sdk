@@ -131,9 +131,12 @@ Every bound request must carry a fresh nonce in the `X-Vibe-Request-Nonce` heade
 - Encoded as base64url with no padding: exactly 22 characters.
 - Single use: never reuse a nonce, including on a retry. A retry needs a new
   nonce and a new challenge.
-- The nonce goes only to the vibe server. It is never sent to the challenge
-  provider, which only sees the digest. The nonce stops the provider from
-  recovering low-entropy bodies (such as login forms) from the digest.
+- Send the nonce only in the `X-Vibe-Request-Nonce` header to the vibe server.
+  The protocol puts only the digest in `cdata`, never the nonce, so `cdata` alone
+  can't be used to recover low-entropy bodies (such as login forms).
+- Nonces are unique per tenant (key `(tenant_id, nonce)`). Each request uses one
+  nonce record, which counts toward the replay store caps (decisions 134 and
+  137). Exceeding a cap is rejected with 403 `CHALLENGE_FAILED`.
 
 A missing, malformed or reused nonce is rejected with 403 `CHALLENGE_FAILED`.
 

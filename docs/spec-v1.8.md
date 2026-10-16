@@ -31,7 +31,7 @@
 - 補 v1.7 reviewer 提出嘅缺口：11.4 create-user lock 補返 `user.invite` step；新增 `user.register`、`user.invite` 編譯 lock 範例；11.3／11.4 rate-limit 補 `key`；admin `EMAIL_TAKEN` 處理；create-user 改為可以重試（idempotent）並新增 re-invite endpoint（決定 84–88）。
 
 - Challenge provider（issue #160，已確認（產品經理 2026-10-16））：決定 131–138，v1 用 Cloudflare Turnstile（server 端 siteverify、production 共用 Postgres replay store（#177）、`type: pow` build error、fail closed、錯誤碼、secret 處理、同限流組合、固定數值、已認證 endpoint opt-in、provider 抽象），見 0.12、7.2a。
-- Challenge 綁定 request digest（決定 140，issue #156）：已確認（產品經理 2026-10-16），token 經 Turnstile `cdata` 綁定 request digest（完整長度，涵蓋 method、path、query、body、`Content-Type`、`If-Match`；包括 login route），session 綁定留到 vNext；`bind: none` v1 出 warning，下一個 minor 起新 public INSERT route 禁用（#245）；未實作（見 0.12、7.2b）。；演算法修正（per-request nonce、query raw `+` 無效）已確認（產品經理 2026-10-16）
+- Challenge 綁定 request digest（決定 140，issue #156）：已確認（產品經理 2026-10-16），token 經 Turnstile `cdata` 綁定 request digest（完整長度，涵蓋 method、path、query、body、`Content-Type`、`If-Match`；包括 login route），session 綁定留到 vNext；`bind: none` v1 出 warning，下一個 minor 起新 public INSERT route 禁用（#245）；未實作（見 0.12、7.2b）；演算法修正（per-request nonce、query raw `+` 無效）已確認（產品經理 2026-10-16）。
 
 ### v1.7（定稿）
 
@@ -250,7 +250,7 @@
 | 136 | Secret 處理：`VIBE_TURNSTILE_SECRET` 只可以由環境變數或者 secret manager（例如 CI environment secret）注入；唔准寫入 source、lock、manifest、`.env` commit 或者 log；錯誤訊息同 debug 輸出只顯示「已設定／未設定」。驗證器見到 lock 或者 source 有疑似 secret 值即報 error。設定：`VIBE_CHALLENGE_PROVIDER`（預設 `turnstile`）、`VIBE_TURNSTILE_SECRET`、`VIBE_CHALLENGE_HOSTNAMES`（有 secret 就一定要有）、`VIBE_CHALLENGE_REPLAY_STORE`（production 一定 `postgres`，#177）；預設同 production 規則見 7.2a。 | 已確認（產品經理 2026-10-16） | 7.2a、2A.8.5 |
 | 137 | 同限流組合：route 限流（決定 25、39）同 public 寫入每日配額喺 challenge 之前檢查，超過回 **429**（同 challenge 嘅 503 分開），被限流嘅 request 唔會去到 replay store 或者 provider；challenge 唔取代限流同配額。v1 用固定平台數值：token 壽命 300s、每 client IP 最多 16、每租戶最多 1,000 個未驗證預留（超過回 403 `CHALLENGE_FAILED`，唔 call provider）；**冇租戶 override**。將來如果加 override，只可以調低，唔可以調高。 | 已確認（產品經理 2026-10-16） | 7.2a、4.3 |
 | 138 | Provider 抽象：runtime 經 `ChallengeVerifier` trait 驗證（輸入 token、client IP、預期 action；輸出 通過／失敗／不可用 三種，provider 細節唔外露；「失敗」對應 403，「不可用」對應 503）。之後加 hCaptcha 等 provider 只係新 implementation 同 `VIBE_CHALLENGE_PROVIDER` 新值，lock 語法、replay store 同錯誤碼唔變；未實作嘅值（例如 `hcaptcha`）啟動時拒絕。 | 已確認（產品經理 2026-10-16） | 7.2a |
-| 140 | Challenge token 綁定 request digest（issue #156）：所有 `type: captcha` route（包括 login 類 `when: after-failures`）嘅 token 經 Turnstile `cdata` 綁定 request digest：`rd1.` 加完整 43 字元 base64url（冇 padding）SHA-256，唔截短。Client 每個 request 用 CSPRNG 產生 128 bit nonce，只經 `X-Vibe-Request-Nonce`（剛好 22 字元 base64url）送畀 server，冇或者重用即 fail closed，nonce 紀錄計入決定 134 上限；provider 只見到 digest（私隱）。Digest 一律涵蓋 nonce、method、正規化 path（包括 tenant slug）、正規化 query 同 raw body 嘅 SHA-256；header 只涵蓋 `Content-Type` 同 `If-Match`；唔包括 client IP。Query raw `+` 無效（空格 `%20`、`+` 送 `%2B`，client helper 自動做）；冇 Unicode 正規化；任何無效 canonical 輸入回現有 403 `CHALLENGE_FAILED`，reason 只入內部 log；log 永遠唔記錄 nonce 或者 body。Server 喺 JSON 解析之前重新計算，同 siteverify `cdata` constant-time 比較，唔一致或者冇即 403 `CHALLENGE_FAILED`（唔講邊部分唔一致），fail closed。Proxy rewrite path 會 fail closed（部署要求）。v1 准 `bind: none` 但出 warning；下一個 minor release 起新 public INSERT route 唔准用 `none`（#245）。前端喺表格完成、送出之前先做 challenge。Session 綁定留到 vNext。實作狀態：未實作，見 7.2b。 | 已確認（產品經理 2026-10-16；演算法修正 2026-10-16 11:58 HKT） | 7.2b |
+| 140 | Challenge token 綁定 request digest（issue #156）：所有 `type: captcha` route（包括 login 類 `when: after-failures`）嘅 token 經 Turnstile `cdata` 綁定 request digest：`rd1.` 加完整 43 字元 base64url（冇 padding）SHA-256，唔截短。Client 每個 request 用 CSPRNG 產生 128 bit nonce，只經 `X-Vibe-Request-Nonce`（剛好 22 字元 base64url）送畀 server，冇或者重用即 fail closed，nonce key `(tenant_id, nonce)`、每個 request 一個紀錄，計入決定 134 同 137 上限，超過即 403 `CHALLENGE_FAILED`；`cdata` 只放 digest（私隱）。Digest 一律涵蓋 nonce、method、正規化 path（包括 tenant slug）、正規化 query 同 raw body 嘅 SHA-256；header 只涵蓋 `Content-Type` 同 `If-Match`；唔包括 client IP。Query raw `+` 無效（空格 `%20`、`+` 送 `%2B`，client helper 自動做）；冇 Unicode 正規化；任何無效 canonical 輸入回現有 403 `CHALLENGE_FAILED`，reason 只入內部 log；log 永遠唔記錄 nonce 或者 body。Server 喺 JSON 解析之前重新計算，同 siteverify `cdata` constant-time 比較，唔一致或者冇即 403 `CHALLENGE_FAILED`（唔講邊部分唔一致），fail closed。Proxy rewrite path 會 fail closed（部署要求）。v1 准 `bind: none` 但出 warning；下一個 minor release 起新 public INSERT route 唔准用 `none`（#245）。前端喺表格完成、送出之前先做 challenge。Session 綁定留到 vNext。實作狀態：未實作，見 7.2b。 | 已確認（產品經理 2026-10-16；演算法修正 2026-10-16 11:58 HKT） | 7.2b |
 
 ## 1. 目錄同命名
 
@@ -1441,15 +1441,17 @@ Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動�
 
 #### Request nonce
 
-- Client 每個 request 用 CSPRNG（例如 `crypto.getRandomValues`）產生新嘅 128 bit（16 byte）隨機 nonce，**只**經 header `X-Vibe-Request-Nonce` 送畀我哋嘅 server；nonce 唔會傳畀 challenge provider。
+- Client 每個 request 用 CSPRNG（例如 `crypto.getRandomValues`）產生新嘅 128 bit（16 byte）隨機 nonce，經 header `X-Vibe-Request-Nonce` 送畀我哋嘅 server；協定唔會將 nonce 放入任何送畀 challenge provider 嘅欄位（`cdata` 只放 digest）。
 - 格式嚴格：base64url（RFC 4648 §5）、冇 padding、**剛好 22 個字元** `[A-Za-z0-9_-]`，而且一定要係 canonical 編碼（decode 做 16 byte 再 encode 返要等於原值）。其他任何值（長度唔啱、有 padding、有其他字元、header 重複）即無效。
 - 冇 nonce 或者 nonce 重用一律 fail closed（403 `CHALLENGE_FAILED`）。
 - 單次使用：nonce 同 token 一齊喺現有 replay store（決定 132、#177）記錄（只存 SHA-256），有效期同 token 紀錄一樣（replay TTL 360s）；同一個 nonce 喺有效期內再出現即無效。
-- Nonce 紀錄計入決定 134 嘅每租戶容量同每個網段（IPv4 /24、IPv6 /48）上限，同 token 紀錄共用同一個限額，冇另外、冇上限嘅空間；超過照決定 134 回 429 `CHALLENGE_RATE_LIMITED`。
+- **唯一性範圍**：每租戶。Replay store 嘅 nonce key 係 `(tenant_id, nonce)`（喺租戶自己嘅 schema，同決定 132 replay store 一樣），只喺同一個租戶入面檢查重用。128 bit 隨機值喺唔同租戶之間撞中嘅機會可以忽略；用每租戶範圍可以保持租戶之間嘅隔離，唔使跨租戶查詢。
+- **計數**：每個 request 剛好佔**一個** nonce 紀錄（key `(tenant_id, nonce)`），另加決定 132 原有嘅 token 紀錄。Nonce 紀錄計入決定 134 嘅每租戶容量同每個網段（IPv4 /24、IPv6 /48）上限；因為佢喺驗證之前預留，亦計入決定 137 嘅未驗證預留上限（每 client IP 16、每租戶 1,000）。冇另外、冇上限嘅空間。
+- **超過上限**：因 nonce 紀錄而超過決定 134 或者決定 137 任何一個上限，request 一律 fail closed，回 403 `CHALLENGE_FAILED`。
 
 #### 私隱考慮
 
-`cdata` 會送畀 challenge provider。如果 digest 冇 salt，provider 可以對低熵 body（例如 login 嘅 email 同常見密碼）逐個試出內容。所以 canonical string 包括 client 產生、只送畀我哋 server 嘅 nonce：provider 只會見到 digest（`rd1.` 加 43 字元），**永遠見唔到** nonce、body、body hash 或者 canonical string，冇 nonce 就冇辦法由 digest 還原內容。
+`cdata` 會送畀 challenge provider。如果 digest 冇 salt，provider 可以對低熵 body（例如 login 嘅 email 同常見密碼）逐個試出內容。所以 canonical string 包括 client 產生、只送畀我哋 server 嘅 nonce：協定送畀 provider 嘅 `cdata` 只有 digest（`rd1.` 加 43 字元），唔包括 nonce、body、body hash 或者 canonical string。Nonce 防嘅係單憑 `cdata` 做離線估算：冇 nonce 就冇辦法由 digest 推返 body。佢唔係對所有可以睇到 request 或者頁面嘅一方嘅保護；邊啲地方睇得到 nonce，見下面「剩餘風險」。
 
 #### 涵蓋範圍
 
@@ -1495,7 +1497,7 @@ Digest 一律涵蓋 nonce、method、path、正規化 query 同 body；涵蓋嘅
 2. Request 大小上限（見下面）→ body 超過即 413（同未綁定 route 一樣）。
 3. 冇 `x-challenge-proof` → 400 `CHALLENGE_REQUIRED`。
 4. 檢查 `X-Vibe-Request-Nonce`（存在、唔重複、剛好 22 字元 canonical base64url），再由收到嘅 request 計 digest（JSON 解析之前、未 call provider 之前）。Nonce 無效或者任何 canonicalization 無效（raw `+`、method 唔係大寫 token、壞 percent-encoding、dot segment、重複 header、非 ASCII header 值、有 `Content-Encoding`、超過上限等）→ 403 `CHALLENGE_FAILED`，唔 call provider。
-5. Token 格式、replay store 預留同上限（7.2a 步驟 3，錯誤碼不變）；同一個預留入面一齊預留 nonce（只存 SHA-256），nonce 已經用過即 403 `CHALLENGE_FAILED`；nonce 計入決定 134 每租戶同每網段上限。
+5. Token 格式、replay store 預留同上限（7.2a 步驟 3，錯誤碼不變）；同一個預留入面一齊預留一個 nonce 紀錄（key `(tenant_id, nonce)`，只存 SHA-256）；nonce 已經用過，或者因 nonce 紀錄超過決定 134（每租戶、每網段）或者決定 137（未驗證預留）上限，即 403 `CHALLENGE_FAILED`。
 6. Siteverify（決定 132，所有現有檢查不變）。
 7. 比較 siteverify `cdata` 同第 4 步嘅 digest：用 constant-time 比較；`cdata` 冇、空、長度唔啱或者唔相等 → 403 `CHALLENGE_FAILED`。Token 同 nonce 照樣記為已用（單次使用，唔會因為 digest 唔啱而釋放）。
 8. 全部通過先做 JSON 解析同執行 lock steps；之後嘅處理只用第 4 步 hash 過嗰份 body bytes，唔會再讀第二次。
@@ -1532,7 +1534,7 @@ Server 以 streaming 方式計 body hash，同時套用 body 上限；未讀完 
 
 #### 測試向量
 
-用 [`scripts/request-digest-vectors.mjs`](../scripts/request-digest-vectors.mjs)（Node 20，`node:crypto`）計；V2 用 Python `hashlib` 獨立核對。Nonce 係固定測試值，實際一定要用 CSPRNG。Canonical string 入面嘅換行係 LF。
+用 [`scripts/request-digest-vectors.mjs`](../scripts/request-digest-vectors.mjs)（Node 20，`node:crypto`）計；全部有效同無效向量都用另一個獨立 Python 實作（只照 spec 文字寫，`hashlib`）核對，結果一致。Nonce 係固定測試值，實際一定要用 CSPRNG。Canonical string 入面嘅換行係 LF。
 
 ##### V1
 
@@ -1687,6 +1689,11 @@ b6366f0d634afe549d3039313154f8e78529a9fd92396fc35a8e52cb6e9bcf09
 
 - Digest：`rd1.24fttLUzKMXvEVrospLdcxoo_TcOtxHLiqEECmSruWg`
 
+##### V10
+
+- Request：`GET /v1/t/acme-7f3k/products?` 加 64 項 `k00=…`、`k01=v` … `k63=v`（`k00` 個 value 係 3714 個 `v`），query 剛好 4,096 bytes、64 項（上限邊界，有效）；nonce 同 V1。Canonical string 太長唔列出，由 script 產生
+- Digest：`rd1.JdKv8b3ZVxHQLNosmVB-PnlhaLnS6cZMXbntHv-S31o`
+
 ##### 一定要當無效嘅輸入（全部 403 `CHALLENGE_FAILED`，唔 call provider）
 
 | # | 輸入（其餘同 V1） |
@@ -1704,6 +1711,10 @@ b6366f0d634afe549d3039313154f8e78529a9fd92396fc35a8e52cb6e9bcf09
 | I11 | 截斷 percent-encoding `%4` |
 | I12 | 有 `Content-Encoding: gzip` |
 | I13 | `If-Match` 有 CR |
+| I14 | 非 canonical nonce `AAECAwQFBgcICQoLDA0ODx`（22 字元，但最後一個字元嘅 padding bit 唔係 0） |
+| I15 | `X-Vibe-Request-Nonce` 出現兩次 |
+| I16 | query 4,097 bytes（超過上限） |
+| I17 | query 65 項（超過上限） |
 
 必要測試（實作時）：上面有效向量逐個相等；無效向量全部 403 `CHALLENGE_FAILED` 而且唔 call provider；nonce、body、query、path、method、`Content-Type`、`If-Match` 任何一樣改咗即 403；`cdata` 冇或者空即 403；同一個 nonce 第二次用即 403；所有 403 回應 byte 一致；digest 唔一致之後 token 同 nonce 都唔可以再用；nonce 紀錄計入決定 134 上限；log 搵唔到 nonce 同 body。
 
@@ -1716,7 +1727,8 @@ b6366f0d634afe549d3039313154f8e78529a9fd92396fc35a8e52cb6e9bcf09
 - **Client 端計算**：digest 證明 token 係為呢個 request 內容攞嘅，唔證明內容係真人輸入；challenge 本身嘅保證唔變。
 - **部署相容性**：會改 body、path 或者 query encoding 嘅 proxy／CDN（壓縮、prefix rewrite、`%20` 改 `+`）會令所有綁定 request 被拒（fail closed），要喺部署文件講明。
 - **Provider 依賴**：`cdata` 由 Turnstile 原樣回傳；如果 provider 改變 `cdata` 行為，比對會失敗（fail closed），唔會放行。
-- **Replay store 容量**：nonce 紀錄同 token 共用決定 134 上限，高流量時會早啲觸發 429。
+- **Replay store 容量**：每個 request 多一個 nonce 紀錄，同 token 共用決定 134 同 137 上限，高流量時會早啲到上限（fail closed）。
+- **Nonce 喺邊度睇得到**：Operator 自己嘅 reverse proxy 或者 CDN 如果負責 TLS termination，睇得到 nonce 同 body；challenge script 喺我哋自己嘅頁面執行，原則上讀得到頁面內容（包括表格同 nonce）。Nonce 係單次使用、唔含任何 secret，睇到 nonce 唔可以用嚟偽造 request；呢度嘅保護範圍只係令 `cdata` 本身唔可以還原內容。
 - **用戶體驗**（已接受，產品經理 2026-10-16）：用戶做完 challenge 之後再改表格，要重新做 challenge。前端文件教開發者喺表格填好之後、送出之前先做 challenge（[`challenge.md`](challenge.md)）。
 
 ### 7.3 schema 升級去 database（離線遷移，CLI `tenant migrate`）

@@ -130,6 +130,9 @@ export const valid = [
     headers: [["Content-Type", "application/json"], ["X-Vibe-Request-Nonce", N1]], body: json('{"n":"\u00e9"}') },
   { name: "V9 NFD body (e + U+0301), differs from V8", method: "POST", target: "/v1/t/acme-7f3k/register",
     headers: [["Content-Type", "application/json"], ["X-Vibe-Request-Nonce", N1]], body: json('{"n":"e\u0301"}') },
+  { name: "V10 query at limits: 4096 bytes, 64 items", method: "GET",
+    target: "/v1/t/acme-7f3k/products?" + Array.from({ length: 64 }, (_, i) => `k${String(i).padStart(2, "0")}=` + "v".repeat(i === 0 ? 4096 - 64 * 5 - 63 + 1 : 1)).join("&"),
+    headers: [["X-Vibe-Request-Nonce", N1]] },
 ];
 
 export const invalid = [
@@ -146,6 +149,11 @@ export const invalid = [
   { name: "I11 truncated percent-encoding", ...reg, target: "/v1/t/acme-7f3k/register?q=%4" },
   { name: "I12 Content-Encoding present", ...reg, headers: [...reg.headers, ["Content-Encoding", "gzip"]] },
   { name: "I13 CR in If-Match", ...reg, headers: [...reg.headers, ["If-Match", '"v1"\r']] },
+  // 22 chars, but the last char has non-zero padding bits (decodes to the same 16 bytes as N1).
+  { name: "I14 non-canonical nonce", ...reg, headers: [["Content-Type", "application/json"], ["X-Vibe-Request-Nonce", "AAECAwQFBgcICQoLDA0ODx"]] },
+  { name: "I15 duplicate nonce header", ...reg, headers: [...reg.headers, ["x-vibe-request-nonce", N1]] },
+  { name: "I16 query 4097 bytes", ...reg, target: "/v1/t/acme-7f3k/register?q=" + "a".repeat(4095) },
+  { name: "I17 query 65 items", ...reg, target: "/v1/t/acme-7f3k/register?" + Array.from({ length: 65 }, (_, i) => `k${i}=v`).join("&") },
 ];
 
 if (import.meta.url === `file://${process.argv[1]}`) {
