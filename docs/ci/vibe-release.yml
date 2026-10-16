@@ -1,0 +1,157 @@
+# Reference workflow for a vibe project (copy to .github/workflows/vibe-release.yml).
+#
+# - pull_request: informational build preview + policy report in the job
+#   summary. Never a deploy source. Uses the low-quota preview LLM key.
+# - push to main: install a PINNED vibe in a job without secrets, then build
+#   ONCE with `vibe build` in the protected `release` environment, attest the
+#   manifest (actions/attest-build-provenance), upload it.
+# - deploy: verify the attestation (fail closed), then promote the same
+#   digest to staging and production without rebuilding.
+#
+# Pin VIBE_SDK_REV to a full commit SHA of vibe-backend/sdk (or replace the
+# install job with a checksummed release binary). Never install a moving ref
+# in a job that holds release secrets.
+name: vibe release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  VIBE_SDK_REV: c4ba25f31a21c9b7bbaee205c07cfe71fc3d9e0a # pin: full sdk commit SHA
+
+jobs:
+  install:
+    # No secrets, no id-token: builds the pinned vibe binary once.
+    runs-on: ubuntu-latest
+    outputs:
+      sha256: ${{ steps.sum.outputs.sha256 }}
+    steps:
+      - name: Install pinned vibe
+        run: cargo install --locked --git https://github.com/vibe-backend/sdk --rev "$VIBE_SDK_REV" vibe --root "$RUNNER_TEMP/vibe"
+      - id: sum
+        run: echo "sha256=$(sha256sum "$RUNNER_TEMP/vibe/bin/vibe" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vibe-bin
+          path: ${{ runner.temp }}/vibe/bin/vibe
+
+  preview:
+    if: github.event_name == 'pull_request'
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: vibe-bin
+          path: bin
+      - name: Same vibe binary as the install job
+        run: echo "${{ needs.install.outputs.sha256 }}  bin/vibe" | sha256sum -c - && chmod +x bin/vibe
+      - name: Build preview and policy report (informational)
+        env:
+          LLM_API_KEY: ${{ secrets.VIBE_LLM_API_KEY_PREVIEW }}
+        run: |
+          set -o pipefail
+          {
+            echo '## vibe build preview (not a deploy artifact)'
+            echo '```'
+            bin/vibe compile --check --project . 2>&1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  release-policy:
+    # LLM compile + policy only: holds the LLM key, never the signing secret.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: install
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: vibe-bin
+          path: bin
+      - run: echo "${{ needs.install.outputs.sha256 }}  bin/vibe" | sha256sum -c - && chmod +x bin/vibe
+      - name: Compile in memory and run the deploy policy (no signing key)
+        env:
+          VIBE_LLM_API_KEY: ${{ secrets.VIBE_LLM_API_KEY }}
+        run: LLM_API_KEY="$VIBE_LLM_API_KEY" bin/vibe compile --check --project . 2> >(tee -a "$GITHUB_STEP_SUMMARY" >&2)
+
+  release-build:
+    # `vibe build` recompiles from source in memory (lock files are never an
+    # input), validates, and signs. Until signing moves to Sigstore keyless
+    # (a separate step with the workflow's OIDC identity and no long-lived
+    # secret), this one step still holds both keys; the policy job above
+    # runs the LLM compile without the signing secret first.
+    # High-risk items fail closed until release-environment approval
+    # verification (#80) lands. There is no approval variable or string.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [install, release-policy]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: vibe-bin
+          path: bin
+      - run: echo "${{ needs.install.outputs.sha256 }}  bin/vibe" | sha256sum -c - && chmod +x bin/vibe
+      - name: Release build (compile in memory, policy, sign)
+        env:
+          VIBE_LLM_API_KEY: ${{ secrets.VIBE_LLM_API_KEY }}
+          VIBE_RELEASE_SIGNING_KEY: ${{ secrets.VIBE_RELEASE_SIGNING_KEY }}
+        run: |
+          bin/vibe build --project . --commit "$GITHUB_SHA" \
+            --locks-dir "$RUNNER_TEMP/locks" \
+            -o manifest.json 2> >(tee -a "$GITHUB_STEP_SUMMARY" >&2)
+      - id: digest
+        run: echo "sha256=$(sha256sum manifest.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: manifest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manifest
+          path: |
+            manifest.json
+            ${{ runner.temp }}/locks
+
+  deploy:
+    needs: release-build
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        target: [staging, production]
+    environment: ${{ matrix.target }}
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: manifest
+      - name: Same digest as the release build
+        run: echo "${{ needs.release-build.outputs.digest }}  manifest.json" | sha256sum -c -
+      - name: Verify attestation (fail closed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify manifest.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/vibe-release.yml" \
+            --source-ref refs/heads/main \
+            --deny-self-hosted-runners
+      - name: Deploy
+        run: echo "deploy manifest.json to ${{ matrix.target }} (runtime pins the release key)"

@@ -10,11 +10,10 @@ use crate::discover::{self, SourceFile};
 use crate::hashutil::source_hash;
 use crate::lock::{
     compiler_hash, find_section, parse_lock, section_order, Kind, LockDoc, Scope, Section,
-    SourceType, Status, LOCK_VERSION,
+    SourceType, LOCK_VERSION,
 };
 use crate::scan;
 use crate::security::{self, pipeline_name};
-use crate::sign;
 
 static FORBIDDEN_SQL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(delete|truncate|grant|revoke)\b").expect("regex"));
@@ -26,16 +25,49 @@ static PARAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$([1-9][0-9]*)").
 pub struct ValidateOptions<'a> {
     pub root: &'a Path,
     pub deploy: bool,
-    pub verify_key: Option<&'a ed25519_dalek::VerifyingKey>,
+}
+
+/// Sources plus the exact lock text read for each (None when missing).
+pub struct LoadedProject {
+    pub sources: Vec<SourceFile>,
+    pub lock_texts: Vec<Option<String>>,
+    /// `.vibe/build-record.json` as read with the locks (None when missing).
+    pub build_record: Option<String>,
+}
+
+/// Discovers sources and reads every lock once.
+pub fn load_project(root: &Path) -> Result<LoadedProject, Report> {
+    let sources = discover::discover(root)?;
+    let lock_texts = sources
+        .iter()
+        .map(|source| fs::read_to_string(root.join(lock_rel(&source.rel))).ok())
+        .collect();
+    let build_record = fs::read_to_string(root.join(crate::buildrecord::PATH)).ok();
+    Ok(LoadedProject {
+        sources,
+        lock_texts,
+        build_record,
+    })
 }
 
 pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
-    let sources = discover::discover(opts.root)?;
+    let loaded = load_project(opts.root)?;
+    validate_loaded(opts, &loaded).0
+}
+
+/// Validates already loaded lock texts (nothing is re-read from disk except
+/// to look for orphan locks) and returns the parsed docs by source id, so a
+/// caller (manifest) acts on exactly what was validated.
+pub fn validate_loaded(
+    opts: &ValidateOptions<'_>,
+    loaded: &LoadedProject,
+) -> (Result<Report, Report>, HashMap<String, LockDoc>) {
+    let sources = &loaded.sources;
     let mut report = Report::new();
     let mut docs: HashMap<String, LockDoc> = HashMap::new();
     let mut source_by_id: HashMap<String, SourceFile> = HashMap::new();
 
-    for source in &sources {
+    for (source, text) in sources.iter().zip(&loaded.lock_texts) {
         source_by_id.insert(source.id.clone(), source.clone());
         for hit in scan::scan_text(&source.combined_text()) {
             if hit.fatal {
@@ -44,15 +76,11 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
                 report.push(Diag::warning(&source.rel, hit.message));
             }
         }
-        let lock_path = opts.root.join(lock_rel(&source.rel));
-        let text = match fs::read_to_string(&lock_path) {
-            Ok(text) => text,
-            Err(_) => {
-                report.push(Diag::error(&source.rel, "source has no lock file"));
-                continue;
-            }
+        let Some(text) = text else {
+            report.push(Diag::error(&source.rel, "source has no lock file"));
+            continue;
         };
-        let doc = match parse_lock(&text) {
+        let doc = match parse_lock(text) {
             Ok(doc) => doc,
             Err(err) => {
                 report.push(Diag::error(lock_rel(&source.rel), err));
@@ -62,7 +90,12 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
         check_lock(&doc, source, opts, &mut report);
         docs.insert(source.id.clone(), doc);
     }
-    check_orphans(opts.root, &sources, &mut report);
+    check_dependencies(&docs, sources, &mut report);
+    check_inherited_auth(&docs, sources, &mut report);
+    if opts.deploy {
+        crate::buildrecord::check(loaded, &mut report);
+    }
+    check_orphans(opts.root, sources, &mut report);
     check_routes(&docs, &mut report);
     check_calls(&docs, &mut report);
     check_targets(&docs, &mut report);
@@ -71,10 +104,53 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
     let env_roles_claim = std::env::var("VIBE_JWT_ROLES_CLAIM").ok();
     check_claims_vs_roles_claims(&docs, env_roles_claim.as_deref(), &mut report);
     check_security_items_enriched(&docs, &source_by_id, opts, &mut report);
-    if opts.deploy {
-        check_approval_set(&docs, &source_by_id, opts, &mut report);
+    if opts.deploy && !report.has_errors() {
+        check_recompile(opts.root, sources, &docs, &mut report);
     }
-    report.into_result()
+    (report.into_result(), docs)
+}
+
+/// Spec 10.1 "hand edit" / "recompile mismatch": structured sources compile
+/// deterministically, so recompile them in memory and require the lock body
+/// to match. Natural-language locks are left to `vibe compile --check` in CI,
+/// which has the LLM.
+fn check_recompile(
+    root: &Path,
+    sources: &[SourceFile],
+    docs: &HashMap<String, LockDoc>,
+    report: &mut Report,
+) {
+    let natural: HashMap<String, LockDoc> = sources
+        .iter()
+        .filter(|source| !crate::lock::is_structured_source(&source.combined_text()))
+        .filter_map(|source| Some((source.id.clone(), docs.get(&source.id)?.clone())))
+        .collect();
+    let fresh = match crate::compile::recompile_offline(root, sources, &natural) {
+        Ok(fresh) => fresh,
+        Err(err) => {
+            for diag in err.errors() {
+                report.push(diag.clone());
+            }
+            report.push(Diag::error("", "deploy recompile check failed"));
+            return;
+        }
+    };
+    for source in sources {
+        if natural.contains_key(&source.id) {
+            continue;
+        }
+        let (Some(lock), Some(fresh)) = (docs.get(&source.id), fresh.get(&source.id)) else {
+            continue;
+        };
+        if crate::lock::content_hash(lock) != crate::lock::content_hash(fresh)
+            || !crate::security::same_items(&lock.meta.security_items, &fresh.meta.security_items)
+        {
+            report.push(Diag::error(
+                lock_rel(&source.rel),
+                "lock does not match a recompile of its source (hand-edited?); run `vibe compile`",
+            ));
+        }
+    }
 }
 
 fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, report: &mut Report) {
@@ -152,7 +228,6 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
                 item: "prompt-injection".into(),
                 risk: crate::lock::Risk::Medium,
                 reason: String::new(),
-                approved_by: Vec::new(),
             });
         }
         if !security::same_items(&expected, &doc.meta.security_items) {
@@ -163,15 +238,190 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
         }
     }
     check_sections(doc, &file, report);
-    if doc.meta.status == Status::Approved {
-        if doc.meta.signature == "(none)" {
-            if opts.deploy {
-                report.push(Diag::error(&file, "approved lock is missing a signature"));
+    if !doc.meta.legacy_fields.is_empty() {
+        let fields: Vec<String> = doc
+            .meta
+            .legacy_fields
+            .iter()
+            .map(|field| format!("`{field}`"))
+            .collect();
+        report.push(Diag::warning(
+            &file,
+            format!(
+                "legacy approval fields are ignored: {}; recompile to drop them",
+                fields.join(", ")
+            ),
+        ));
+    }
+    if let Some(status) = &doc.meta.legacy_status {
+        if opts.deploy && status != "approved" {
+            report.push(Diag::error(
+                &file,
+                format!("lock has legacy `status: {status}`; it cannot be deployed until it is recompiled from a reviewed source"),
+            ));
+        }
+    }
+}
+
+/// Deterministic auth policy: a feature lock inherits the merged auth of all
+/// its definition/version locks. Its roles must stay within the inherited
+/// roles (a wider list fails, and so does an empty one unless the mode
+/// changed), whatever its mode. A mode
+/// change (a missing mode is `jwt`) must be recorded as a high-risk
+/// `auth-mode-change` item, and dropping the auth pipeline without `-auth`
+/// (itself a high-risk `auth-removed` item) fails closed.
+fn check_inherited_auth(
+    docs: &HashMap<String, LockDoc>,
+    sources: &[SourceFile],
+    report: &mut Report,
+) {
+    fn auth_blocks(doc: &LockDoc) -> Vec<&crate::lock::Block> {
+        find_section(&doc.sections, "Pipelines")
+            .map(|s| {
+                s.blocks
+                    .iter()
+                    .filter(|b| {
+                        let name = b.heading.split_whitespace().last().unwrap_or("");
+                        name == "auth" || name == "-auth"
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let roles_of = |block: &crate::lock::Block| -> Option<Vec<String>> {
+        let raw = block_val(block, "roles");
+        if raw.trim().is_empty() {
+            return Some(Vec::new());
+        }
+        crate::lock::parse_string_list(&raw).ok()
+    };
+    for source in sources {
+        let Some(doc) = docs.get(&source.id) else {
+            continue;
+        };
+        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+            continue;
+        }
+        let file = lock_rel(&source.rel);
+        // Merge every parent auth block (definition and version): the union
+        // of their roles is the inherited set.
+        let mut inherited: Option<(Vec<String>, Vec<String>)> = None;
+        for dep in &doc.meta.dependencies {
+            let Some(parent) = docs.get(&dep.id) else {
+                continue;
+            };
+            if parent.meta.kind != Kind::Api {
+                continue;
             }
-        } else if let Some(key) = opts.verify_key {
-            let text = fs::read_to_string(opts.root.join(&file)).unwrap_or_default();
-            if !sign::verify_lock(&text, key) {
-                report.push(Diag::error(&file, "signature verification failed"));
+            for block in auth_blocks(parent) {
+                if block.heading.ends_with("-auth") {
+                    continue;
+                }
+                let Some(roles) = roles_of(block) else {
+                    continue;
+                };
+                let entry = inherited.get_or_insert_with(|| (Vec::new(), Vec::new()));
+                let mode = crate::security::auth_mode(&block_val(block, "mode"));
+                if !entry.0.contains(&mode) {
+                    entry.0.push(mode);
+                }
+                for role in roles {
+                    if !entry.1.contains(&role) {
+                        entry.1.push(role);
+                    }
+                }
+            }
+        }
+        let Some((modes, roles)) = inherited else {
+            continue;
+        };
+        let own = auth_blocks(doc);
+        if own.iter().any(|b| b.heading.ends_with("-auth")) {
+            continue; // explicit removal, reported as a high-risk item
+        }
+        let Some(block) = own.first() else {
+            report.push(Diag::error(
+                &file,
+                "inherited auth pipeline is missing (use `-auth` to remove it explicitly)",
+            ));
+            continue;
+        };
+        // A mode change (for example jwt to api-key) is never a quiet
+        // override: it must be recorded as a high-risk item, and the
+        // inherited roles still apply to the feature.
+        let own_mode = crate::security::auth_mode(&block_val(block, "mode"));
+        let mode_changed = modes.iter().any(|mode| *mode != own_mode);
+        if mode_changed
+            && !doc
+                .meta
+                .security_items
+                .iter()
+                .any(|item| item.item == "auth-mode-change" && item.risk == crate::lock::Risk::High)
+        {
+            report.push(Diag::error(
+                &file,
+                format!(
+                    "auth mode {own_mode} differs from the inherited mode [{}] and is not recorded as a high-risk item",
+                    modes.join(", ")
+                ),
+            ));
+        }
+        match roles_of(block) {
+            None => report.push(Diag::error(&file, "auth roles cannot be parsed")),
+            // Under a recorded mode change (e.g. api-key with scopes) a
+            // feature may omit roles; any roles it lists must still stay
+            // within the inherited ones.
+            Some(own_roles) if !roles.is_empty() && own_roles.is_empty() && !mode_changed => report
+                .push(Diag::error(
+                    &file,
+                    format!(
+                        "auth roles are missing; inherited roles are [{}]",
+                        roles.join(", ")
+                    ),
+                )),
+            Some(own_roles) if !roles.is_empty() => {
+                if let Some(extra) = own_roles.iter().find(|r| !roles.contains(r)) {
+                    report.push(Diag::error(
+                        &file,
+                        format!(
+                            "auth role {extra} widens the inherited roles [{}]",
+                            roles.join(", ")
+                        ),
+                    ));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// Every `dependencies` hash must equal the dependency's current content
+/// hash (spec 10.1 "stale").
+fn check_dependencies(
+    docs: &HashMap<String, LockDoc>,
+    sources: &[SourceFile],
+    report: &mut Report,
+) {
+    for source in sources {
+        let Some(doc) = docs.get(&source.id) else {
+            continue;
+        };
+        for dep in &doc.meta.dependencies {
+            match docs.get(&dep.id) {
+                None => report.push(Diag::error(
+                    lock_rel(&source.rel),
+                    format!("dependency {} has no lock", dep.id),
+                )),
+                Some(target) if crate::lock::content_hash(target) != dep.hash => {
+                    report.push(Diag::error(
+                        lock_rel(&source.rel),
+                        format!(
+                            "dependency {} hash does not match its lock (stale or edited); run `vibe compile`",
+                            dep.id
+                        ),
+                    ))
+                }
+                Some(_) => {}
             }
         }
     }
@@ -1148,63 +1398,6 @@ fn check_migrations(docs: &HashMap<String, LockDoc>, report: &mut Report) {
     }
 }
 
-fn check_approval_set(
-    docs: &HashMap<String, LockDoc>,
-    sources: &HashMap<String, SourceFile>,
-    opts: &ValidateOptions<'_>,
-    report: &mut Report,
-) {
-    for doc in docs.values() {
-        let file = lock_rel(&doc.meta.source);
-        if doc.meta.status != Status::Approved {
-            report.push(Diag::error(&file, "lock is not approved"));
-            continue;
-        }
-        if doc.meta.approved_by.is_empty()
-            || doc.meta.approved_at == "(none)"
-            || doc.meta.approved_commit == "(none)"
-        {
-            report.push(Diag::error(&file, "approval metadata is incomplete"));
-        }
-        let auto_ok =
-            doc.meta.source_type == SourceType::Structured && doc.meta.security_items.is_empty();
-        if doc.meta.approval_mode == crate::lock::ApprovalMode::Auto && !auto_ok {
-            report.push(Diag::error(
-                &file,
-                "automatic approval is only for structured locks with no security items",
-            ));
-        }
-        for item in &doc.meta.security_items {
-            if item.reason.trim().is_empty() {
-                report.push(Diag::error(
-                    &file,
-                    format!("security item {} needs a reason", item.item),
-                ));
-            }
-            let needed = if item.risk == crate::lock::Risk::High {
-                2
-            } else {
-                1
-            };
-            if item.approved_by.len() < needed {
-                report.push(Diag::error(
-                    &file,
-                    format!("security item {} needs {needed} approvers", item.item),
-                ));
-            }
-        }
-        if let Some(source) = sources.get(&doc.meta.id) {
-            let _ = source;
-        }
-        if opts.verify_key.is_none() {
-            report.push(Diag::error(
-                &file,
-                "deploy validation needs the manifest public key",
-            ));
-        }
-    }
-}
-
 fn check_orphans(root: &Path, sources: &[SourceFile], report: &mut Report) {
     let expected: HashSet<String> = sources.iter().map(|source| lock_rel(&source.rel)).collect();
     for dir in ["providers", "pipelines", "migrations", "models", "api"] {
@@ -1257,6 +1450,8 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
     if FORBIDDEN_SQL.is_match(&cleaned) {
         problems.push("DELETE, TRUNCATE, GRANT, and REVOKE are forbidden".into());
     }
+    static WHERE_WORD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)\bwhere\b").expect("regex"));
     static SELECT_INTO: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)\bselect\b[^;]*\binto\b").expect("regex"));
     if !migration && (DDL_SQL.is_match(&cleaned) || SELECT_INTO.is_match(&cleaned)) {
@@ -1264,9 +1459,16 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
     }
     if crate::security::sql_writes(trimmed)
         && lower.contains("update")
-        && !lower.contains(" where ")
+        && !WHERE_WORD.is_match(&lower)
     {
         problems.push("UPDATE needs a WHERE clause".into());
+    }
+    if !migration {
+        for problem in crate::sqlpolicy::problems(trimmed) {
+            if !problems.contains(&problem) {
+                problems.push(problem);
+            }
+        }
     }
     // Param hygiene for reads and writes, including WITH … forms.
     if !migration
@@ -1534,6 +1736,13 @@ fn check_security_items_enriched(
         let file = lock_rel(&source.rel);
         let mut expected = security::extract_items(doc);
         security::enrich_feature_writes(doc, docs, &mut expected);
+        if security::auth_mode_changed(doc, docs) {
+            expected.push(crate::lock::SecurityItem {
+                item: "auth-mode-change".into(),
+                risk: crate::lock::Risk::High,
+                reason: String::new(),
+            });
+        }
         if scan::scan_text(&source.combined_text())
             .iter()
             .any(|hit| !hit.fatal)
@@ -1542,7 +1751,6 @@ fn check_security_items_enriched(
                 item: "prompt-injection".into(),
                 risk: crate::lock::Risk::Medium,
                 reason: String::new(),
-                approved_by: Vec::new(),
             });
         }
         expected.sort_by(|a, b| a.item.cmp(&b.item));
@@ -1743,5 +1951,57 @@ mod tests {
         assert!(!crate::security::sql_writes(
             "SELECT note = 'update me' FROM t"
         ));
+    }
+
+    fn method_with_sql(sql: &str) -> LockDoc {
+        use crate::lock::{Block, Bullet, Meta};
+        let bullet = |key: &str, value: &str| Bullet {
+            key: key.into(),
+            value: value.into(),
+        };
+        LockDoc {
+            meta: Meta::pending(
+                Kind::Method,
+                None,
+                "product/zero-price",
+                "models/product/methods/zero-price/zero-price.md",
+            ),
+            sections: vec![Section {
+                name: "Steps".into(),
+                bullets: vec![],
+                table: None,
+                blocks: vec![Block {
+                    heading: "s1".into(),
+                    bullets: vec![
+                        bullet("op", "query"),
+                        bullet("sql", sql),
+                        bullet("params", "[input.id]"),
+                        bullet("scope", "pk"),
+                    ],
+                }],
+                none: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn hand_edited_tautological_update_fails_the_method_check() {
+        let mut report = Report::new();
+        check_method(
+            &method_with_sql("UPDATE products SET price_cents = 0 WHERE true OR id = $1"),
+            "zero-price.lock.md",
+            &mut report,
+        );
+        let text = report.to_string();
+        assert!(text.contains("WHERE is always true"), "{text}");
+        assert!(report.has_errors());
+
+        let mut report = Report::new();
+        check_method(
+            &method_with_sql("UPDATE products SET price_cents = 0 WHERE id = $1"),
+            "zero-price.lock.md",
+            &mut report,
+        );
+        assert!(!report.to_string().contains("always true"), "{report}");
     }
 }

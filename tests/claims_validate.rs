@@ -49,7 +49,6 @@ async fn problems(claims: &str, custom: &str) -> String {
     match validate_project(&ValidateOptions {
         root: &root,
         deploy: false,
-        verify_key: None,
     }) {
         Ok(_) => String::new(),
         Err(report) => report.to_string(),

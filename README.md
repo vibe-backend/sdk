@@ -33,10 +33,8 @@ Do not use guessed release tags or `releases/download` URLs; they are not a supp
 The shop demo is moving to [vibe-backend/sample-shop](https://github.com/vibe-backend/sample-shop). That repository currently contains only the frontend; the vibe backend project will be added there later. Until then, the small shop project used by this repo's tests, [tests/fixtures/shop](tests/fixtures/shop), is the runnable example. From a checkout of this repo with Rust 1.89 (`rust-version` in `Cargo.toml`; `rust-toolchain.toml` pins the same channel), replace `tests/fixtures/shop` with your own project path as needed:
 
 ```bash
+vibe keygen --project tests/fixtures/shop
 vibe compile --project tests/fixtures/shop
-vibe approve --project tests/fixtures/shop \
-  --reviewer ada@example.com --reviewer grace@example.com \
-  --reason "sample shop locks"
 vibe validate --project tests/fixtures/shop --deploy
 vibe manifest --project tests/fixtures/shop -o manifest.json
 vibe serve --manifest manifest.json --project tests/fixtures/shop --memory
@@ -46,7 +44,7 @@ vibe serve --manifest manifest.json --project tests/fixtures/shop --memory
 
 Runtime configuration (PostgreSQL roles and TLS, connection pool, LLM variables, `VIBE_ENV`, JWT/JWKS and API keys, rate limits and trusted proxies) is in [docs/runtime-config.md](docs/runtime-config.md).
 
-`vibe approve` needs `--reason` and one `--reviewer` per reviewer (repeat the flag, e.g. `--reviewer a@x --reviewer b@x`). High-risk locks (public endpoints, providers, and migrations) need two reviewers. A failed approve writes nothing.
+Locks are build output: they are not committed (`*.lock.md` is gitignored) and carry no approval or signature (spec v1.8). Deployments use only the manifest built and attested in the protected `release` environment (`vibe build`, which also writes the compiled locks to a local build directory, `--locks-dir`, default `<project>/.vibe/build/locks`, never to the repo; add `.vibe/` to your `.gitignore`). High-risk release builds fail closed until release-environment approval verification (#80) is implemented; see [docs/ci/README.md](docs/ci/README.md). Review happens in pull requests; see [docs/pr-review-guide.md](docs/pr-review-guide.md). `security-items` in a lock are informational. The manifest is still signed.
 
 ```bash
 cargo fmt --all -- --check

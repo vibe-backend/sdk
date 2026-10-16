@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::diag::{Diag, Report};
-use crate::discover;
-use crate::lock::{find_section, parse_lock, Kind, LockDoc, Scope};
+use crate::lock::{find_section, Kind, LockDoc, Scope};
 use crate::security::pipeline_name;
 use crate::sign;
 use crate::validate::{self, ValidateOptions};
@@ -23,7 +22,59 @@ pub struct Manifest {
     pub models: Vec<ModelSpec>,
     pub methods: Vec<MethodSpec>,
     pub migrations: Vec<MigrationSpec>,
+    /// Signed record of what the manifest was built from (spec 10.1, 10.10).
+    #[serde(default)]
+    pub provenance: Provenance,
     pub signature: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Provenance {
+    /// `release` or `dev`.
+    pub build_mode: String,
+    /// Source commit (`GITHUB_SHA`, `--commit`, or `git rev-parse HEAD`).
+    pub commit: String,
+    /// One entry per lock, sorted by id.
+    pub locks: Vec<LockProvenance>,
+    /// Every security item of every lock, sorted.
+    pub security_items: Vec<ItemProvenance>,
+    /// Release approval reference given for high-risk items (decision 90).
+    pub release_approval: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LockProvenance {
+    pub id: String,
+    pub lock_sha256: String,
+    pub content_hash: String,
+    pub source_hash: String,
+    pub compiler_hash: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ItemProvenance {
+    pub lock: String,
+    pub item: String,
+    pub risk: String,
+}
+
+impl Provenance {
+    pub fn high_risk(&self) -> Vec<&ItemProvenance> {
+        self.security_items
+            .iter()
+            .filter(|item| item.risk == "high")
+            .collect()
+    }
+}
+
+/// How a manifest is built.
+#[derive(Clone, Debug, Default)]
+pub struct BuildInfo {
+    /// Release build. High-risk items fail closed until release-environment
+    /// approval verification (#80) lands (decision 90/118).
+    pub release: bool,
+    pub release_approval: Option<String>,
+    pub commit: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -254,14 +305,84 @@ pub struct MigrationSpec {
 }
 
 pub fn manifest_from_project(root: &Path, signing_key: &SigningKey) -> Result<Manifest, Report> {
-    let verify = signing_key.verifying_key();
-    validate::validate_project(&ValidateOptions {
-        root,
-        deploy: true,
-        verify_key: Some(&verify),
-    })?;
-    let docs = load_docs(root)?;
+    // Read every lock once; validate and build from the same in-memory text.
+    let loaded = validate::load_project(root)?;
+    manifest_from_loaded(root, &loaded, signing_key)
+}
+
+/// Validates (deploy rules, including the recompile check) and builds the
+/// manifest from exactly the loaded lock texts; nothing is re-read.
+pub fn manifest_from_loaded(
+    root: &Path,
+    loaded: &validate::LoadedProject,
+    signing_key: &SigningKey,
+) -> Result<Manifest, Report> {
+    build_signed(root, loaded, signing_key, &BuildInfo::default())
+}
+
+/// Validates (deploy rules) and builds the manifest from exactly the loaded
+/// lock texts; nothing is re-read. Records provenance and, for a release
+/// build, fails closed on high-risk items without a release approval.
+pub fn build_signed(
+    root: &Path,
+    loaded: &validate::LoadedProject,
+    signing_key: &SigningKey,
+    info: &BuildInfo,
+) -> Result<Manifest, Report> {
+    let (result, docs) = validate::validate_loaded(&ValidateOptions { root, deploy: true }, loaded);
+    result?;
     let mut manifest = build_manifest(&docs)?;
+    let mut locks = Vec::new();
+    let mut items = Vec::new();
+    for (source, text) in loaded.sources.iter().zip(&loaded.lock_texts) {
+        let (Some(text), Some(doc)) = (text, docs.get(&source.id)) else {
+            continue;
+        };
+        locks.push(LockProvenance {
+            id: doc.meta.id.clone(),
+            lock_sha256: crate::buildrecord::lock_hash(text),
+            content_hash: crate::lock::content_hash(doc),
+            source_hash: doc.meta.source_hash.clone(),
+            compiler_hash: doc.meta.compiler_hash.clone(),
+        });
+        for item in &doc.meta.security_items {
+            items.push(ItemProvenance {
+                lock: doc.meta.id.clone(),
+                item: item.item.clone(),
+                risk: item.risk.as_str().to_string(),
+            });
+        }
+    }
+    locks.sort_by(|a, b| a.id.cmp(&b.id));
+    items.sort_by(|a, b| (&a.lock, &a.item).cmp(&(&b.lock, &b.item)));
+    manifest.provenance = Provenance {
+        build_mode: if info.release { "release" } else { "dev" }.into(),
+        commit: info.commit.clone(),
+        locks,
+        security_items: items,
+        release_approval: info
+            .release_approval
+            .clone()
+            .filter(|r| !r.trim().is_empty()),
+    };
+    // Decision 90/118: the approval is the `release` environment approval,
+    // verified against the platform (#80). Until that verification exists,
+    // a release build with high-risk items fails closed; no
+    // `--release-approval` value counts as approval.
+    if info.release {
+        let high: Vec<String> = manifest
+            .provenance
+            .high_risk()
+            .iter()
+            .map(|item| format!("{} ({})", item.lock, item.item))
+            .collect();
+        if !high.is_empty() {
+            return Err(single(format!(
+                "release build has high-risk items: {}; release-environment approval verification (#80) is not implemented yet, so high-risk release builds fail closed (--release-approval is not accepted as approval)",
+                high.join(", ")
+            )));
+        }
+    }
     manifest.signature = String::new();
     let bytes =
         serde_json::to_vec(&manifest).map_err(|err| single(format!("manifest json: {err}")))?;
@@ -269,12 +390,34 @@ pub fn manifest_from_project(root: &Path, signing_key: &SigningKey) -> Result<Ma
     Ok(manifest)
 }
 
+/// Outside development only release manifests run (decisions 79, 90, 91):
+/// built with `vibe manifest --release` (compiled in memory in the release
+/// environment) and, if they have high-risk items, carrying a release
+/// approval.
+pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), String> {
+    if development {
+        return Ok(());
+    }
+    let provenance = &manifest.provenance;
+    if provenance.build_mode != "release" {
+        return Err(
+            "only release manifests (`vibe manifest --release`) can run outside development".into(),
+        );
+    }
+    if provenance.locks.is_empty() {
+        return Err("manifest has no lock provenance".into());
+    }
+    // Fail closed until release-environment approval verification (#80):
+    // a recorded approval string is not proof of approval.
+    if !provenance.high_risk().is_empty() {
+        return Err("manifest has high-risk items without a verified release approval".into());
+    }
+    Ok(())
+}
+
 pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), Report> {
     let json = serde_json::to_vec_pretty(manifest).map_err(|err| single(err.to_string()))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| single(err.to_string()))?;
-    }
-    fs::write(path, json).map_err(|err| single(err.to_string()))
+    crate::fsutil::write_atomic(path, &json).map_err(|err| single(err.to_string()))
 }
 
 pub fn read_manifest(path: &Path, key: &VerifyingKey) -> Result<Manifest, Report> {
@@ -340,6 +483,7 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
         return Err(report);
     }
     Ok(Manifest {
+        provenance: Provenance::default(),
         manifest_version: MANIFEST_VERSION,
         routes,
         models,
@@ -347,27 +491,6 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
         migrations,
         signature: String::new(),
     })
-}
-
-fn load_docs(root: &Path) -> Result<HashMap<String, LockDoc>, Report> {
-    let sources = discover::discover(root)?;
-    let mut docs = HashMap::new();
-    let mut report = Report::new();
-    for source in sources {
-        let path = root.join(source.rel.trim_end_matches(".md").to_string() + ".lock.md");
-        let text = fs::read_to_string(&path).map_err(|err| single(err.to_string()))?;
-        match parse_lock(&text) {
-            Ok(doc) => {
-                docs.insert(doc.meta.id.clone(), doc);
-            }
-            Err(err) => report.push(Diag::error(source.rel, err)),
-        }
-    }
-    if report.has_errors() {
-        Err(report)
-    } else {
-        Ok(docs)
-    }
 }
 
 fn model_from(doc: &LockDoc) -> ModelSpec {
