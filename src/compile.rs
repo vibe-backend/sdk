@@ -575,7 +575,7 @@ fn normalize_model(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Dia
             },
             Bullet {
                 key: "policy".into(),
-                value: "tenant_id = current_setting('app.tenant_id', false)".into(),
+                value: crate::runtime::POLICY_TEMPLATE.into(),
             },
             Bullet {
                 key: "grants".into(),

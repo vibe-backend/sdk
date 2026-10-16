@@ -15,3 +15,7 @@ site/dist/
 
 # vibe build output (spec v1.8 decision 117): locks are generated at build time and never committed
 *.lock.md
+
+# Tenant DB password files are for development/tests only (D129); never commit them.
+.vibe/tenant-db-secrets.json
+*tenant-db-secrets*.json

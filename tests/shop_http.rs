@@ -113,6 +113,24 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
             public_write: false,
         },
     );
+    // The compiler writes exactly the per-tenant policy vibe migrate installs.
+    assert!(!manifest.models.is_empty());
+    for model in &manifest.models {
+        assert_eq!(model.policy, vibe::runtime::POLICY_TEMPLATE, "{}", model.id);
+    }
+    let exhausted_state = Arc::new(AppState {
+        exec: Arc::new(Exhausted),
+        manifest: manifest.clone(),
+        auth: auth.clone(),
+        slugs: slugs.clone(),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
+        disabled: std::collections::HashSet::new(),
+        min_override_ms: Some(0),
+        honor_test_ip: true,
+        trusted_proxies: Vec::new(),
+        dev_hints: true,
+    });
     let state = Arc::new(AppState {
         exec: Arc::new(MemoryExec::from_manifest(&manifest).unwrap()),
         manifest,
@@ -133,6 +151,29 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     assert_eq!(health.json["status"], "ok");
 
     let staff_token = token("staff-user", &["staff"], "tenant0001");
+
+    // Process-wide DB connection cap reached: 503 DB_POOL_EXHAUSTED with
+    // Retry-After, at once.
+    let exhausted = router(exhausted_state);
+    let res = send(
+        &exhausted,
+        "POST",
+        "/catalog/v1/products",
+        Some(bearer(&staff_token)),
+        Some(product("sku-503", "Pear", 100)),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{:?}",
+        res.json
+    );
+    assert_eq!(res.json["error"]["code"], "DB_POOL_EXHAUSTED");
+    assert_eq!(
+        res.headers.get("retry-after").map(String::as_str),
+        Some("1")
+    );
     let customer_token = token("customer-1", &["customer"], "tenant0001");
     let other_token = token("other-user", &["staff"], "tenant0002");
     let admin_token = token("admin-user", &["admin"], "tenant0001");
@@ -641,6 +682,21 @@ fn token(sub: &str, roles: &[&str], tenant: &str) -> String {
     header.kid = Some("local".into());
     let key = EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap();
     encode(&header, &claims, &key).unwrap()
+}
+
+/// Executor that is always at the process-wide connection cap.
+struct Exhausted;
+
+#[async_trait::async_trait]
+impl vibe::runtime::QueryExec for Exhausted {
+    async fn execute(
+        &self,
+        _tenant_id: &str,
+        _role: &str,
+        _stmt: vibe::runtime::Stmt,
+    ) -> Result<Vec<serde_json::Map<String, Value>>, vibe::runtime::ExecError> {
+        Err(vibe::runtime::ExecError::PoolExhausted)
+    }
 }
 
 struct HttpResult {

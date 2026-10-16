@@ -363,10 +363,18 @@ fn check_model(doc: &LockDoc, file: &str, report: &mut Report) {
     }
     if let Some(policies) = find_section(&doc.sections, "Policies") {
         let policy = policies.get("policy").unwrap_or("");
-        if !policy.contains("current_setting('app.tenant_id', false)") {
+        // Must be exactly what `vibe migrate` installs (decision 97): the
+        // constant per-tenant policy, never `current_setting('app.tenant_id')`.
+        if policy != crate::runtime::POLICY_TEMPLATE {
             report.push(
-                Diag::error(file, "RLS policy must use current_setting(..., false)")
-                    .at_section("Policies"),
+                Diag::error(
+                    file,
+                    format!(
+                        "RLS policy must be `{}` (the per-tenant policy vibe migrate installs); recompile the lock",
+                        crate::runtime::POLICY_TEMPLATE
+                    ),
+                )
+                .at_section("Policies"),
             );
         }
         // Parsed structurally: only SELECT/INSERT/UPDATE exist, so DELETE,

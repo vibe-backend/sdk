@@ -22,22 +22,40 @@ use crate::manifest::ModelSpec;
 /// (decision 97).
 pub const RUNTIME_ROLES: &[&str] = &["app_rw", "public_reader", "public_writer"];
 
+/// PostgreSQL's identifier limit in bytes (NAMEDATALEN - 1).
+pub const MAX_IDENTIFIER_BYTES: usize = 63;
+
 /// The PostgreSQL role for one (tenant, role class) pair (decision 97):
-/// `tenant_<id>_rw`, `tenant_<id>_public_reader`, `tenant_<id>_public_writer`.
-/// Each is `LOGIN NOINHERIT`, has privileges only on `t_<id>`, and is not a
-/// member of (nor has as member) any other role. The longest name is 57
-/// bytes, under PostgreSQL's 63-byte identifier limit.
+/// `tenant_<id>_rw`, `tenant_<id>_public_reader`, `tenant_<id>_public_writer`,
+/// and the tenant's migration role `tenant_<id>_owner` (class `owner`).
+/// Runtime roles are `LOGIN NOINHERIT`, have privileges only on `t_<id>`,
+/// own nothing, and are not members of (nor have as member) any other role.
+/// A name over 63 bytes is an error: PostgreSQL would silently truncate it,
+/// which could make two tenants share a role.
 pub fn tenant_role(tenant: &str, class: &str) -> Result<String, String> {
     if !super::slugs::valid_tenant(tenant) {
-        return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
+        return Err(super::slugs::TENANT_ID_RULE.into());
     }
     let suffix = match class {
         "app_rw" => "rw",
         "public_reader" => "public_reader",
         "public_writer" => "public_writer",
+        "owner" => "owner",
         other => return Err(format!("unknown executor role {other}")),
     };
-    Ok(format!("tenant_{tenant}_{suffix}"))
+    let name = format!("tenant_{tenant}_{suffix}");
+    if name.len() > MAX_IDENTIFIER_BYTES {
+        return Err(format!(
+            "role name {name} is {} bytes, over PostgreSQL's {MAX_IDENTIFIER_BYTES}-byte limit; refusing (names are never truncated)",
+            name.len()
+        ));
+    }
+    Ok(name)
+}
+
+/// The tenant's migration role, `tenant_<id>_owner`: owns `t_<id>`.
+pub fn tenant_owner_role(tenant: &str) -> Result<String, String> {
+    tenant_role(tenant, "owner")
 }
 
 /// The three [`tenant_role`]s of one tenant, in [`RUNTIME_ROLES`] order.
@@ -313,6 +331,33 @@ pub fn pg_grant_statements(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_role_names_are_checked_not_truncated() {
+        assert_eq!(
+            tenant_role("acme0001", "app_rw").unwrap(),
+            "tenant_acme0001_rw"
+        );
+        assert_eq!(
+            tenant_owner_role("acme_0001").unwrap(),
+            "tenant_acme_0001_owner"
+        );
+        // 42-byte id: tenant_ + 42 + _public_writer = 63 bytes, accepted.
+        let id = "a".repeat(42);
+        assert_eq!(tenant_role(&id, "public_writer").unwrap().len(), 63);
+        // One byte more is refused for that class, never truncated.
+        let id = "a".repeat(43);
+        let err = tenant_role(&id, "public_writer").unwrap_err();
+        assert!(
+            err.contains("63-byte") && err.contains("never truncated"),
+            "{err}"
+        );
+        assert!(tenant_role(&id, "app_rw").is_ok());
+        assert!(tenant_role(&"a".repeat(61), "app_rw").is_err());
+        assert!(tenant_role("Acme0001", "app_rw").is_err());
+        assert!(tenant_role("acme-0001", "app_rw").is_err());
+        assert!(tenant_role("acme0001", "bogus").is_err());
+    }
 
     #[test]
     fn parses_table_and_column_grants() {

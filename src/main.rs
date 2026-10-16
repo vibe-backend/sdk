@@ -377,9 +377,14 @@ async fn cmd_serve(
     } else {
         // One pool per (tenant, role class), logged in as the tenant role
         // itself (decision 97); every configured role is checked now.
-        let pools = vibe::runtime::TenantPools::from_env()?;
-        let checked = pools.check_all().await?;
-        println!("checked {checked} tenant database role(s)");
+        let production = run_env == vibe::runtime::RunEnv::Production;
+        let pools = vibe::runtime::TenantPools::from_env(production, project)?;
+        let checked = pools.check_all(&manifest.models).await?;
+        println!(
+            "checked {checked} tenant database role(s) and their policies (credentials: {}; connection cap {})",
+            pools.describe_secrets(),
+            pools.max_connections()
+        );
         Arc::new(pools)
     };
     let loaded = vibe::runtime::load_project_slugs(project, memory)?;
@@ -424,12 +429,8 @@ async fn cmd_serve(
 }
 
 async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Result<(), String> {
-    if !tenant
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        || !(8..=32).contains(&tenant.len())
-    {
-        return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
+    if !vibe::runtime::valid_tenant(tenant) {
+        return Err(vibe::runtime::TENANT_ID_RULE.into());
     }
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;

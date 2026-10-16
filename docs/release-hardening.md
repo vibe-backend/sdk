@@ -44,3 +44,8 @@ WARN vibe::rate_limit_saturation: rate-limit shard saturated; refusing new keys 
 
 - `release` environment admin bypass is enabled (`can_admins_bypass: true`). An admin can deploy without Jack's environment approval. Jack accepted this risk.
 - An admin can bypass the `main` ruleset (OrganizationAdmin bypass). The only release gate is the `release` environment approval, and the same account (`j113203`) can approve its own release. Admin bypass stays on; Jack accepted this risk.
+
+
+## Database connection cap (D129, #98)
+
+`VIBE_DB_MAX_CONNECTIONS` (default 200) caps database connections in use across all tenant pools. Above it, requests get 503 `DB_POOL_EXHAUSTED` with `Retry-After: 1` immediately (no queueing). The counter `pool_exhausted_total` (`vibe::runtime::pool_exhausted_total()`, also logged at warn on each refusal) counts these refusals; alert on any sustained increase. Tenant DB password files are dev/test only; production must use `VIBE_TENANT_DB_SECRET_REF`.

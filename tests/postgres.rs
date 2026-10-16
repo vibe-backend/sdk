@@ -44,7 +44,7 @@ fn trole(tenant: &str, class: &str) -> String {
 
 /// The per-tenant migration role used by these tests.
 fn owner_of(tenant: &str) -> String {
-    format!("own_{tenant}")
+    vibe::runtime::grants::tenant_owner_role(tenant).unwrap()
 }
 
 /// Logs in as `tenant`'s role for `class` and runs the serve-time check.
@@ -129,7 +129,7 @@ fn manifest() -> Manifest {
             "crud": [], "sensitive_output": [], "ownership": "",
             "grants": GRANTS,
             "rls": "enable, force",
-            "policy": "tenant_id = current_setting('app.tenant_id', false)",
+            "policy": vibe::runtime::POLICY_TEMPLATE,
             "list": {"page_size": 20, "max_page_size": 100, "sort": [], "filter": []},
             "fields": [
                 field("id", "uuid"), field("tenant_id", "string"), field("body", "string"),
@@ -381,7 +381,7 @@ async fn cross_tenant_access_fails_even_through_set_role() {
         .unwrap_err();
     assert!(format!("{err:?}").contains("not tenant role"), "{err:?}");
     let pools = pools_for(&s.admin_url, &[&s.tenant, &b]);
-    assert_eq!(pools.check_all().await.unwrap(), 6);
+    assert_eq!(pools.check_all(&manifest().models).await.unwrap(), 6);
     let seen = pools
         .execute(&b, "app_rw", p_select(&["body"], None, None))
         .await
@@ -464,6 +464,26 @@ async fn migrate_requires_a_per_tenant_owner_and_safe_tenant_roles() {
         .await
         .unwrap_err();
     assert!(
+        err.contains(&format!("must log in as {}", owner_of(&other))),
+        "{err}"
+    );
+    // A login with the right name but reach into another tenant is refused
+    // too (here: the other tenant's owner made a member of this one).
+    s.admin
+        .batch_execute(&format!("GRANT {} TO {}", s.owner, owner_of(&other)))
+        .await
+        .unwrap();
+    let as_other = PgExec::connect(&url_as(&s.admin_url, &owner_of(&other)))
+        .await
+        .unwrap();
+    let err = migrate_tenant(&as_other, &manifest(), &other)
+        .await
+        .unwrap_err();
+    s.admin
+        .batch_execute(&format!("REVOKE {} FROM {}", s.owner, owner_of(&other)))
+        .await
+        .unwrap();
+    assert!(
         err.contains("can own schema") && err.contains(&s.tenant),
         "{err}"
     );
@@ -495,6 +515,14 @@ async fn migrate_requires_a_per_tenant_owner_and_safe_tenant_roles() {
             format!("REVOKE pg_read_all_data FROM {reader}"),
             "member",
         ),
+        (
+            format!(
+                "CREATE TABLE public.owned_{fresh} (x int); \
+                 ALTER TABLE public.owned_{fresh} OWNER TO {reader}"
+            ),
+            format!("DROP TABLE public.owned_{fresh}"),
+            "must not be owners",
+        ),
     ] {
         s.admin.batch_execute(&break_it).await.unwrap();
         let got = migrate_tenant(&owner, &manifest(), &fresh).await;
@@ -505,7 +533,136 @@ async fn migrate_requires_a_per_tenant_owner_and_safe_tenant_roles() {
             "{break_it}: {err}"
         );
     }
-    migrate_tenant(&owner, &manifest(), &fresh).await.unwrap();
+    let log = migrate_tenant(&owner, &manifest(), &fresh).await.unwrap();
+    assert!(log.iter().any(|l| l.starts_with("verified")), "{log:?}");
+    // The schema belongs to tenant_<id>_owner, runtime roles own nothing,
+    // and every table has ENABLE + FORCE row level security.
+    let row = s
+        .admin
+        .query_one(
+            "SELECT n.nspowner::regrole::text, \
+             (SELECT count(*) FROM pg_class c WHERE c.relnamespace = n.oid AND c.relkind = 'r' \
+               AND NOT (c.relrowsecurity AND c.relforcerowsecurity)), \
+             (SELECT count(*) FROM pg_class c WHERE c.relnamespace = n.oid AND c.relkind = 'r'), \
+             (SELECT count(*) FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
+               WHERE r.rolname = ANY($2)) \
+             FROM pg_namespace n WHERE n.nspname = $1",
+            &[
+                &format!("t_{fresh}"),
+                &RUNTIME_ROLES
+                    .iter()
+                    .map(|c| trole(&fresh, c))
+                    .collect::<Vec<_>>(),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), owner_of(&fresh));
+    assert_eq!(
+        row.get::<_, i64>(1),
+        0,
+        "every table is FORCE ROW LEVEL SECURITY"
+    );
+    assert!(row.get::<_, i64>(2) >= 2);
+    assert_eq!(row.get::<_, i64>(3), 0, "runtime roles own nothing");
+}
+
+/// D129: the policy text the compiler writes into the lock is exactly what
+/// is installed (`pg_policies`), and `vibe serve` refuses to start when they
+/// differ.
+#[tokio::test]
+async fn installed_policies_match_the_compiled_lock_or_serve_refuses() {
+    let s = require_pg!(setup_exclusive().await);
+    let m = manifest();
+    let lock_line = &m.models[0].policy;
+    assert_eq!(lock_line, vibe::runtime::POLICY_TEMPLATE);
+    assert!(!lock_line.contains("current_setting"));
+    // Lock line rendered for this tenant == the installed policy.
+    let want =
+        vibe::runtime::policy_parts(&vibe::runtime::render_policy(&s.tenant).unwrap()).unwrap();
+    let row = s
+        .admin
+        .query_one(
+            "SELECT policyname::text, permissive, cmd, roles::text[], qual, with_check FROM pg_policies \
+             WHERE schemaname = $1 AND tablename = 'notes'",
+            &[&format!("t_{}", s.tenant)],
+        )
+        .await
+        .unwrap();
+    let mut roles: Vec<String> = row.get(3);
+    roles.sort();
+    assert_eq!(row.get::<_, String>(0), want.name);
+    assert_eq!(row.get::<_, String>(1), "PERMISSIVE");
+    assert_eq!(row.get::<_, String>(2), "ALL");
+    assert_eq!(roles, want.roles);
+    assert_eq!(row.get::<_, String>(4), format!("({}::text)", want.using));
+    assert_eq!(
+        row.get::<_, String>(5),
+        format!("({}::text)", want.with_check)
+    );
+    // Startup check passes.
+    pools_for(&s.admin_url, &[&s.tenant])
+        .check_all(&m.models)
+        .await
+        .unwrap();
+    // A lock whose policy differs from what is installed: refused.
+    let mut stale = m.clone();
+    stale.models[0].policy = "tenant_id = current_setting('app.tenant_id', false)".into();
+    let err = pools_for(&s.admin_url, &[&s.tenant])
+        .check_all(&stale.models)
+        .await
+        .unwrap_err();
+    assert!(err.contains("differ") && err.contains("recompile"), "{err}");
+    // An installed policy that differs from the lock: refused. Only the
+    // public reader is dropped from the roles, so the generic catalog check
+    // is the only other thing that could notice.
+    let schema = format!("t_{}", s.tenant);
+    let rw = trole(&s.tenant, "app_rw");
+    for altered in [
+        format!(
+            "TO {rw}, {w} USING (tenant_id = '{t}') WITH CHECK (tenant_id = '{t}')",
+            w = trole(&s.tenant, "public_writer"),
+            t = s.tenant
+        ),
+        format!(
+            "AS PERMISSIVE FOR SELECT TO {rw}, {r}, {w} USING (tenant_id = '{t}')",
+            r = trole(&s.tenant, "public_reader"),
+            w = trole(&s.tenant, "public_writer"),
+            t = s.tenant
+        ),
+    ] {
+        s.admin
+            .batch_execute(&format!(
+                "DROP POLICY tenant_isolation ON {schema}.notes; \
+                 CREATE POLICY tenant_isolation ON {schema}.notes {altered}"
+            ))
+            .await
+            .unwrap();
+        let err = s_check(&s, &m).await.unwrap_err();
+        assert!(err.contains("refusing to serve"), "{altered}: {err}");
+    }
+    // Missing policy: refused.
+    s.admin
+        .batch_execute(&format!("DROP POLICY tenant_isolation ON {schema}.notes"))
+        .await
+        .unwrap();
+    let err = pools_for(&s.admin_url, &[&s.tenant])
+        .pool(&s.tenant, "app_rw")
+        .await
+        .unwrap()
+        .check_policies(&s.tenant, &m.models)
+        .await
+        .unwrap_err();
+    assert!(err.contains("not installed"), "{err}");
+    // Re-running migrate restores it.
+    migrate_as(&s, &m, &s.tenant).await.unwrap();
+    s_check(&s, &m).await.unwrap();
+}
+
+async fn s_check(s: &Setup, m: &Manifest) -> Result<usize, String> {
+    pools_for(&s.admin_url, &[&s.tenant])
+        .check_all(&m.models)
+        .await
 }
 
 #[tokio::test]
@@ -1327,6 +1484,7 @@ fn outcome(
         Err(ExecError::Precondition) => "precondition".into(),
         Err(ExecError::Conflict) => "conflict".into(),
         Err(ExecError::Message(_)) => "error".into(),
+        Err(ExecError::PoolExhausted) => "exhausted".into(),
     }
 }
 
@@ -1401,7 +1559,7 @@ async fn memory_and_postgres_agree() {
     let other = format!("to{}", suffix());
     migrate_as(&s, &manifest(), &other).await.unwrap();
     let pg = pools_for(&s.admin_url, &[&s.tenant, &other]);
-    assert_eq!(pg.check_all().await.unwrap(), 6);
+    assert_eq!(pg.check_all(&manifest().models).await.unwrap(), 6);
     let mem = vibe::runtime::MemoryExec::from_manifest(&manifest()).unwrap();
     let t = s.tenant.clone();
     let row1 = uuid::Uuid::new_v4().to_string();

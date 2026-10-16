@@ -21,7 +21,12 @@ SELECT format('%s: %s', w.name, p) FROM want w LEFT JOIN pg_roles r ON r.rolname
    (CASE WHEN r.rolcreaterole OR r.rolcreatedb OR r.rolreplication \
      THEN 'has CREATEROLE, CREATEDB or REPLICATION' END), \
    (CASE WHEN EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid OR m.roleid = r.oid) \
-     THEN 'is a member of another role or has members' END)) v(p) \
+     THEN 'is a member of another role or has members' END), \
+   (CASE WHEN EXISTS (SELECT 1 FROM pg_class WHERE relowner = r.oid) \
+     OR EXISTS (SELECT 1 FROM pg_namespace WHERE nspowner = r.oid) \
+     OR EXISTS (SELECT 1 FROM pg_proc WHERE proowner = r.oid) \
+     OR EXISTS (SELECT 1 FROM pg_type WHERE typowner = r.oid) \
+     THEN 'owns database objects (runtime roles must not be owners)' END)) v(p) \
 WHERE p IS NOT NULL ORDER BY 1";
 
 /// Problems with the migration login for tenant `$1` (decision 97): it must
@@ -44,11 +49,12 @@ SELECT x FROM ( \
    AND has_schema_privilege(current_user, n.oid, 'USAGE') \
  UNION ALL \
  SELECT format('is or can become tenant role %I', r.rolname) FROM pg_roles r \
-   WHERE r.rolname LIKE 'tenant\\_%' AND pg_has_role(current_user, r.oid, 'MEMBER') \
+   WHERE r.rolname LIKE 'tenant\\_%' AND r.rolname <> current_user \
+   AND pg_has_role(current_user, r.oid, 'MEMBER') \
 ) y ORDER BY 1";
 
 /// Bootstraps one tenant schema and applies migrations, connected as the
-/// owner role. Grants only that tenant's own roles (`tenant_<id>_rw`,
+/// tenant's owner role `tenant_<id>_owner` (required by name). Grants only that tenant's own roles (`tenant_<id>_rw`,
 /// `tenant_<id>_public_reader`, `tenant_<id>_public_writer`, see
 /// [`super::grants::tenant_role`]) SELECT/INSERT/UPDATE per the model
 /// grants. The roles are created by an operator beforehand; migrate refuses
@@ -63,7 +69,46 @@ pub async fn migrate_tenant(
     tenant: &str,
 ) -> Result<Vec<String>, String> {
     if !valid_tenant(tenant) {
-        return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
+        return Err(super::slugs::TENANT_ID_RULE.into());
+    }
+    // The migration login must be this tenant's owner role by name.
+    let owner = super::grants::tenant_owner_role(tenant)?;
+    super::grants::tenant_roles(tenant)?;
+    let me = exec
+        .query_texts("SELECT session_user::text WHERE $1::text IS NOT NULL", "")
+        .await?;
+    if me.first() != Some(&owner) {
+        return Err(format!(
+            "refusing to migrate t_{tenant}: VIBE_MIGRATE_DATABASE_URL must log in as {owner} (logged in as {})",
+            me.first().map(String::as_str).unwrap_or("?")
+        ));
+    }
+    let schema_owner = exec
+        .query_texts(
+            "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname = 't_' || $1::text",
+            tenant,
+        )
+        .await?;
+    if let Some(other) = schema_owner.first().filter(|o| **o != owner) {
+        return Err(format!(
+            "refusing to migrate t_{tenant}: the schema is owned by {other}, not {owner}"
+        ));
+    }
+    // The lock's policy must be the one vibe installs.
+    for model in &manifest.models {
+        if model
+            .policy
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            != super::sql::POLICY_TEMPLATE
+        {
+            return Err(format!(
+                "model {}: lock policy is not the per-tenant policy vibe installs (`{}`); recompile the lock",
+                model.id,
+                super::sql::POLICY_TEMPLATE
+            ));
+        }
     }
     let problems = exec.query_texts(MIGRATE_ROLE_SQL, tenant).await?;
     if !problems.is_empty() {
@@ -109,7 +154,8 @@ pub async fn migrate_tenant(
         session
             .batch(&[format!("SET LOCAL vibe.migrate_tx = '{marker}'")])
             .await?;
-        let log = migrate_in_tx(&session, manifest, tenant).await?;
+        let mut log = migrate_in_tx(&session, manifest, tenant).await?;
+        log.extend(verify_tenant(&session, tenant).await?);
         still_in_transaction(&session, &marker).await?;
         Ok::<_, String>(log)
     }
@@ -126,6 +172,42 @@ pub async fn migrate_tenant(
             }
             Err(err)
         }
+    }
+}
+
+/// After migrating (same transaction): the schema is owned by
+/// `tenant_<id>_owner`, the runtime roles own nothing, and every table in the
+/// schema has ENABLE + FORCE row level security. Any failure rolls back.
+async fn verify_tenant(exec: &PgSession, tenant: &str) -> Result<Vec<String>, String> {
+    let owner = super::grants::tenant_owner_role(tenant)?;
+    let mut problems = exec
+        .query_texts(
+            "SELECT format('schema %I is owned by %s', n.nspname, n.nspowner::regrole::text) \
+             FROM pg_namespace n WHERE n.nspname = 't_' || $1::text \
+             AND n.nspowner::regrole::text <> 'tenant_' || $1::text || '_owner' \
+             UNION ALL \
+             SELECT format('table %I.%I lacks ENABLE + FORCE ROW LEVEL SECURITY', n.nspname, c.relname) \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 't_' || $1::text AND c.relkind IN ('r','p') \
+             AND NOT (c.relrowsecurity AND c.relforcerowsecurity) ORDER BY 1",
+            tenant,
+        )
+        .await?;
+    problems.extend(
+        exec.query_texts(TENANT_ROLE_SETUP_SQL, tenant)
+            .await?
+            .into_iter()
+            .filter(|p| p.contains("owns database objects")),
+    );
+    if problems.is_empty() {
+        Ok(vec![format!(
+            "verified t_{tenant}: owned by {owner}, runtime roles own nothing, every table has FORCE ROW LEVEL SECURITY"
+        )])
+    } else {
+        Err(format!(
+            "post-migration check failed for t_{tenant}: {}",
+            problems.join("; ")
+        ))
     }
 }
 

@@ -858,6 +858,10 @@ fn db(err: ExecError) -> MethodFail {
             tracing::warn!(%message, "database refused the statement for the role");
             MethodFail::code("FORBIDDEN", "permission denied")
         }
+        ExecError::PoolExhausted => MethodFail::code(
+            "DB_POOL_EXHAUSTED",
+            "database connections exhausted; retry shortly",
+        ),
         ExecError::Message(message) => MethodFail::code("INTERNAL", message),
     }
 }

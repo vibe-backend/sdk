@@ -323,26 +323,62 @@ pub fn rls_statements(tenant: &str, table: &str) -> Result<Vec<String>, String> 
     )
 }
 
+/// The `## Policies` `policy:` line the compiler writes into every model
+/// lock, and the only policy `vibe migrate` installs (decision 97). `<id>`
+/// stands for the tenant id; [`render_policy`] substitutes it, and the
+/// `CREATE POLICY` statement is built from exactly that text, so the lock
+/// and the database say the same thing.
+pub const POLICY_TEMPLATE: &str = "tenant_isolation TO tenant_<id>_rw, tenant_<id>_public_reader, tenant_<id>_public_writer USING (tenant_id = '<id>') WITH CHECK (tenant_id = '<id>')";
+
+/// [`POLICY_TEMPLATE`] for one tenant. `tenant` is `^[a-z0-9_]{8,61}$`, so
+/// the literal needs no escaping, and every role name must fit 63 bytes.
+pub fn render_policy(tenant: &str) -> Result<String, String> {
+    if !super::slugs::valid_tenant(tenant) {
+        return Err(super::slugs::TENANT_ID_RULE.into());
+    }
+    super::grants::tenant_roles(tenant)?;
+    Ok(POLICY_TEMPLATE.replace("<id>", tenant))
+}
+
+/// What a rendered policy line says, for comparison with `pg_policies`.
+#[derive(Debug, PartialEq)]
+pub struct PolicyParts {
+    pub name: String,
+    pub roles: Vec<String>,
+    pub using: String,
+    pub with_check: String,
+}
+
+/// Splits a rendered `<name> TO <roles> USING (<expr>) WITH CHECK (<expr>)`.
+pub fn policy_parts(rendered: &str) -> Result<PolicyParts, String> {
+    let bad = || format!("unexpected policy line `{rendered}`");
+    let (name, rest) = rendered.split_once(" TO ").ok_or_else(bad)?;
+    let (roles, rest) = rest.split_once(" USING (").ok_or_else(bad)?;
+    let (using, rest) = rest.split_once(") WITH CHECK (").ok_or_else(bad)?;
+    let with_check = rest.strip_suffix(')').ok_or_else(bad)?;
+    let mut roles: Vec<String> = roles.split(", ").map(str::to_string).collect();
+    roles.sort();
+    Ok(PolicyParts {
+        name: name.to_string(),
+        roles,
+        using: using.to_string(),
+        with_check: with_check.to_string(),
+    })
+}
+
 /// The policy applies only to the tenant's own roles and compares with the
 /// tenant id as a constant (decision 97): `app.tenant_id` never takes part in
-/// an access decision. `tenant` is `^[a-z0-9]{8,32}$`, so the literal needs
-/// no escaping.
+/// an access decision. Built from [`render_policy`].
 fn rls_statements_for(tenant: &str, qualified: &str) -> Result<Vec<String>, String> {
-    if !super::slugs::valid_tenant(tenant) {
-        return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
-    }
-    let roles = super::grants::tenant_roles(tenant)?
-        .iter()
-        .map(|r| quote(r))
-        .collect::<Result<Vec<_>, _>>()?
-        .join(", ");
+    let rendered = render_policy(tenant)?;
+    let (name, rest) = rendered
+        .split_once(' ')
+        .ok_or("unexpected policy template")?;
     Ok(vec![
         format!("ALTER TABLE {qualified} ENABLE ROW LEVEL SECURITY"),
         format!("ALTER TABLE {qualified} FORCE ROW LEVEL SECURITY"),
-        format!("DROP POLICY IF EXISTS tenant_isolation ON {qualified}"),
-        format!(
-            "CREATE POLICY tenant_isolation ON {qualified} TO {roles} USING (\"tenant_id\" = '{tenant}') WITH CHECK (\"tenant_id\" = '{tenant}')"
-        ),
+        format!("DROP POLICY IF EXISTS {name} ON {qualified}"),
+        format!("CREATE POLICY {name} ON {qualified} {rest}"),
     ])
 }
 
@@ -418,10 +454,18 @@ mod tests {
     #[test]
     fn policy_names_the_tenant_roles_and_a_constant() {
         let sql = rls_statements("acme0001", "notes").unwrap().join("\n");
-        assert!(sql.contains("TO \"tenant_acme0001_rw\", \"tenant_acme0001_public_reader\", \"tenant_acme0001_public_writer\""));
         assert!(sql.contains(
-            "USING (\"tenant_id\" = 'acme0001') WITH CHECK (\"tenant_id\" = 'acme0001')"
+            "TO tenant_acme0001_rw, tenant_acme0001_public_reader, tenant_acme0001_public_writer"
         ));
+        assert!(sql.contains("USING (tenant_id = 'acme0001') WITH CHECK (tenant_id = 'acme0001')"));
+        let parts = policy_parts(&render_policy("acme0001").unwrap()).unwrap();
+        assert_eq!(parts.name, "tenant_isolation");
+        assert_eq!(parts.roles.len(), 3);
+        assert_eq!(parts.using, "tenant_id = 'acme0001'");
+        assert!(
+            render_policy(&"a".repeat(43)).is_err(),
+            "role names over 63 bytes are refused"
+        );
         assert!(!sql.contains("current_setting"));
         assert!(rls_statements("x'; --", "notes").is_err());
     }
@@ -502,7 +546,7 @@ mod tests {
         .to_ascii_lowercase();
         assert!(sql.contains("enable row level security"));
         assert!(sql.contains("force row level security"));
-        assert!(sql.contains("\"tenant_id\" = 'tenant0001'"));
+        assert!(sql.contains("tenant_id = 'tenant0001'"));
         assert!(!sql.contains("current_setting"));
         assert!(!sql.contains("grant delete"));
     }

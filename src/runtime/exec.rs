@@ -14,6 +14,9 @@ pub enum ExecError {
     /// column privilege, or a row-level security violation (SQLSTATE 42501).
     /// The message is for logs only.
     Denied(String),
+    /// The process-wide connection cap is reached; refused at once
+    /// (HTTP 503 `DB_POOL_EXHAUSTED` with `Retry-After`).
+    PoolExhausted,
     Message(String),
 }
 
@@ -428,6 +431,81 @@ impl PgExec {
             Err(format!(
                 "refusing to serve tenant {tenant}: database role `{expected}` {}",
                 problems.join(", ")
+            ))
+        }
+    }
+
+    /// Deploy-time check (D129): every model's compiled lock policy must be
+    /// the per-tenant policy, and the policy actually installed on
+    /// `t_<tenant>.<table>` (`pg_policies`) must say exactly what that lock
+    /// line says for this tenant: same name, PERMISSIVE, FOR ALL, the same
+    /// roles and the same USING / WITH CHECK. Any mismatch fails closed.
+    pub async fn check_policies(
+        &self,
+        tenant: &str,
+        models: &[crate::manifest::ModelSpec],
+    ) -> Result<(), String> {
+        let client = self.client().await?;
+        let schema = format!("t_{tenant}");
+        let mut problems = Vec::new();
+        for model in models {
+            let lock = model
+                .policy
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if lock != sql::POLICY_TEMPLATE {
+                problems.push(format!(
+                    "model {}: lock policy `{lock}` is not the per-tenant policy; recompile",
+                    model.id
+                ));
+                continue;
+            }
+            let want = sql::policy_parts(&lock.replace("<id>", tenant))?;
+            let rows = client
+                .query(
+                    "SELECT permissive, cmd, roles::text[], qual, with_check FROM pg_policies \
+                     WHERE schemaname = $1 AND tablename = $2 AND policyname = $3",
+                    &[&schema, &model.table, &want.name],
+                )
+                .await
+                .map_err(pg_error)?;
+            let Some(row) = rows.first() else {
+                problems.push(format!(
+                    "{schema}.{}: policy {} from the lock is not installed",
+                    model.table, want.name
+                ));
+                continue;
+            };
+            let mut roles: Vec<String> = row.get(2);
+            roles.sort();
+            let got = (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                roles,
+                row.get::<_, Option<String>>(3),
+                row.get::<_, Option<String>>(4),
+            );
+            let expected = (
+                "PERMISSIVE".to_string(),
+                "ALL".to_string(),
+                want.roles.clone(),
+                Some(format!("({}::text)", want.using)),
+                Some(format!("({}::text)", want.with_check)),
+            );
+            if got != expected {
+                problems.push(format!(
+                    "{schema}.{}: installed policy {} does not match the lock (installed {:?}, lock {:?})",
+                    model.table, want.name, got, expected
+                ));
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "refusing to serve tenant {tenant}: compiled policy and installed policies differ: {}; re-run `vibe migrate`",
+                problems.join("; ")
             ))
         }
     }

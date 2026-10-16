@@ -19,9 +19,13 @@ pub use http::{
 pub use limiter::{saturation_refusals, ProxyNet, QuotaBuckets, RateBuckets};
 pub use memory::{MemoryExec, MEMORY_UNSUPPORTED_SQL};
 pub use migrate::migrate_tenant;
-pub use pools::{parse_tenant_role, TenantPools, MAX_TENANT_POOL_SIZE};
-pub use slugs::{add_slug, load_project_slugs, SlugLoad};
+pub use pools::{
+    parse_tenant_role, pool_exhausted_total, secret_source, secret_source_from_env, EnvSecrets,
+    FileSecrets, TenantPools, TenantSecretSource, DEFAULT_MAX_CONNECTIONS, DEV_SECRETS_FILE,
+    MAX_TENANT_POOL_SIZE,
+};
+pub use slugs::{add_slug, load_project_slugs, valid_tenant, SlugLoad, TENANT_ID_RULE};
 pub use sql::{
-    bootstrap_statements, quote as sql_quote, rls_statements, tenant_schema_statements, Col, Sort,
-    Stmt,
+    bootstrap_statements, policy_parts, quote as sql_quote, render_policy, rls_statements,
+    tenant_schema_statements, Col, PolicyParts, Sort, Stmt, POLICY_TEMPLATE,
 };

@@ -25,7 +25,13 @@ Pending — add each entry only when its PR merges:
 - #98 (release note, Breaking): per-tenant database roles (decision 97). Before upgrading, an operator
   must pre-create for every tenant <id>: `tenant_<id>_rw`, `tenant_<id>_public_reader` and
   `tenant_<id>_public_writer` (each `LOGIN NOINHERIT PASSWORD ...`, no other attributes, no role
-  memberships either way) and a migration role that owns only `t_<id>` (needs CREATE on the database).
+  memberships either way, never owners) and the migration role `tenant_<id>_owner`, which owns `t_<id>`
+  (needs CREATE on the database; migrate requires this name). Tenant ids are `^[a-z0-9_]{8,61}$`;
+  role names over 63 bytes are refused. Production credentials come from `VIBE_TENANT_DB_SECRET_REF`
+  (`env:<PREFIX>`); the 0600 JSON file `VIBE_TENANT_DB_SECRETS` is dev/test only and refused in
+  production. `VIBE_DB_MAX_CONNECTIONS` (default 200) returns 503 `DB_POOL_EXHAUSTED`. Locks must be
+  recompiled: the `policy:` line is now the per-tenant policy that migrate installs, and serve refuses
+  to start if the installed policies differ.
   `vibe migrate` refuses to run without them and refuses a migration login that can own or use another
   tenant's schema; re-run it for every tenant to replace the old `current_setting('app.tenant_id')`
   policy with the per-tenant one. `vibe serve` needs `VIBE_TENANT_DB_SECRETS` (JSON role -> password)

@@ -117,6 +117,7 @@ impl AuthConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct Slug {
     pub tenant_id: String,
     pub public_access: bool,
@@ -1639,8 +1640,21 @@ impl AuthError {
     }
 }
 
+/// `Retry-After` (seconds) sent with 503 `DB_POOL_EXHAUSTED`.
+pub const DB_POOL_RETRY_AFTER_SECS: &str = "1";
+
 fn fail_response(route: &RouteSpec, fail: MethodFail, request_id: &str) -> HttpResponse {
     let mut status = platform_status(&fail.code);
+    if fail.code == "DB_POOL_EXHAUSTED" {
+        // Platform condition: always 503 with Retry-After, never remapped.
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &fail.code,
+            &fail.message,
+            request_id,
+            &[("retry-after", DB_POOL_RETRY_AFTER_SECS)],
+        );
+    }
     if let Some(mapped) = route.errors.iter().find(|err| err.code == fail.code) {
         status = StatusCode::from_u16(mapped.status).unwrap_or(status);
     }
@@ -1675,6 +1689,7 @@ fn platform_status(code: &str) -> StatusCode {
         "FORBIDDEN" => StatusCode::FORBIDDEN,
         "UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
         "BAD_REQUEST" => StatusCode::BAD_REQUEST,
+        "DB_POOL_EXHAUSTED" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -2247,7 +2262,7 @@ RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
             "tenant0001; drop",
             "x, t_victim",
             "",
-            &"a".repeat(33),
+            &"a".repeat(62),
         ] {
             write(rec(bad));
             assert!(load_api_keys(&path).is_err(), "{bad:?}");

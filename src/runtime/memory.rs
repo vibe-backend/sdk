@@ -15,7 +15,7 @@ pub const MEMORY_UNSUPPORTED_SQL: &str = "MEMORY_UNSUPPORTED_SQL";
 /// The only row-level security setup the memory executor models: the one
 /// the compiler generates for every model.
 const STANDARD_RLS: &str = "enable, force";
-const STANDARD_POLICY: &str = "tenant_id = current_setting('app.tenant_id', false)";
+const STANDARD_POLICY: &str = super::sql::POLICY_TEMPLATE;
 
 /// In-memory executor for `vibe dev` / `serve --memory` and tests.
 ///

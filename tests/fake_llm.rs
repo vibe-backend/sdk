@@ -27,7 +27,7 @@ const SECTIONS: &str = r#"## Table
 ## Policies
 
 - rls: enable, force
-- policy: tenant_id = current_setting('app.tenant_id', false)
+- policy: tenant_isolation TO tenant_<id>_rw, tenant_<id>_public_reader, tenant_<id>_public_writer USING (tenant_id = '<id>') WITH CHECK (tenant_id = '<id>')
 - grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT(sku)], public_writer [UPDATE(sku, deleted_at)]
 "#;
 
