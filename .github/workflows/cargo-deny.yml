@@ -1,0 +1,35 @@
+name: cargo-deny
+
+# Full deny.toml policy (advisories, licenses, bans, sources). Runs on every PR
+# and push to main, plus a daily schedule and manual dispatch so new advisories
+# against already-locked crates (including Dependabot hold-backs) fail visibly
+# without a code change. Absorbs the schedule/dispatch request from #196.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-deny-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    name: cargo deny (licenses, advisories, bans, sources)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # cargo-deny version comes from the pinned action commit: its Dockerfile
+      # fixes deny_version=0.20.2 on a digest-pinned base image.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
