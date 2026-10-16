@@ -134,6 +134,7 @@ jobs:
         run: |
           # A release build refuses VIBE_RELEASE_SIGNING_KEY; do not pass it.
           LLM_API_KEY="$VIBE_LLM_API_KEY" bin/vibe build --project . \
+            --version "${GITHUB_REF_NAME#v}" \
             --commit "$GITHUB_SHA" \
             --locks-dir "$RUNNER_TEMP/locks" \
             -o manifest.json 2> >(tee -a "$GITHUB_STEP_SUMMARY" >&2)
@@ -187,4 +188,6 @@ jobs:
             --deny-self-hosted-runners
           case "$GITHUB_REF" in refs/tags/v?*) ;; *) echo "::error::not a v* tag"; exit 1;; esac
       - name: Deploy
-        run: echo "deploy manifest.json + manifest.json.sigstore.json to ${{ matrix.target }} (vibe serve re-checks the bundle)"
+        run: |
+          echo "deploy manifest.json + manifest.json.sigstore.json to ${{ matrix.target }}"
+          echo "vibe serve re-checks the bundle with --expect-version ${GITHUB_REF_NAME#v} --expect-commit $GITHUB_SHA"

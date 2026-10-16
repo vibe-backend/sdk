@@ -102,6 +102,8 @@ const BUILD: &[&str] = &[
     "build",
     "--release-approval",
     "pr:1",
+    "--version",
+    "1.8.0",
     "--commit",
     "abc123",
     "-o",
@@ -119,6 +121,7 @@ fn release_build_writes_a_keyless_manifest_when_there_are_no_high_risk_items() {
         serde_json::from_slice(&fs::read(root.join("out/manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest.signature, vibe::attest::SIGSTORE_SIGNATURE);
     assert_eq!(manifest.provenance.build_mode, "release");
+    assert_eq!(manifest.provenance.version, "1.8.0");
     assert_eq!(manifest.provenance.commit, "abc123");
     assert!(
         manifest.provenance.high_risk().is_empty(),
@@ -209,6 +212,7 @@ async fn build_signs_the_validated_content_not_a_later_edit() {
         &vibe::manifest::BuildInfo {
             release: false,
             release_approval: None,
+            version: String::new(),
             commit: String::new(),
         },
     )
@@ -233,7 +237,11 @@ fn release_build_refuses_the_env_signing_key_and_writes_nothing() {
 fn build_with_high_risk_items_and_no_approval_writes_nothing() {
     let root = copy_shop();
     let before = tree(&root);
-    let (ok, out) = vibe(&root, &["build", "-o", "out/manifest.json"], &[]);
+    let (ok, out) = vibe(
+        &root,
+        &["build", "--version", "1.8.0", "-o", "out/manifest.json"],
+        &[],
+    );
     assert!(!ok, "{out}");
     assert!(out.contains(FAIL_CLOSED), "{out}");
     assert_eq!(tree(&root), before);

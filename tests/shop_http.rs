@@ -1264,6 +1264,7 @@ async fn release_build_is_immune_to_lock_edits_during_the_build() {
         &vibe::manifest::BuildInfo {
             release: false,
             release_approval: None,
+            version: String::new(),
             commit: "abc".into(),
         },
     )
@@ -1294,6 +1295,7 @@ async fn release_build_with_high_risk_items_needs_an_approval() {
         &vibe::manifest::BuildInfo {
             release: true,
             release_approval: None,
+            version: "1.8.0".into(),
             commit: String::new(),
         },
     )
@@ -1312,6 +1314,7 @@ async fn release_build_with_high_risk_items_needs_an_approval() {
         &vibe::manifest::BuildInfo {
             release: true,
             release_approval: Some("pr:1".into()),
+            version: "1.8.0".into(),
             commit: String::new(),
         },
     )
@@ -1355,6 +1358,8 @@ async fn production_serve_ignores_the_project_public_key() {
                 "0123456789abcdef0123456789abcdef0123",
             ),
             ("VIBE_DATABASE_URL", "postgres://invalid.invalid/x"),
+            ("VIBE_EXPECT_VERSION", "1.8.0"),
+            ("VIBE_EXPECT_COMMIT", "abc123"),
         ],
     );
     assert!(!ok);
@@ -1371,6 +1376,8 @@ async fn production_serve_ignores_the_project_public_key() {
                 "0123456789abcdef0123456789abcdef0123",
             ),
             ("VIBE_DATABASE_URL", "postgres://invalid.invalid/x"),
+            ("VIBE_EXPECT_VERSION", "1.8.0"),
+            ("VIBE_EXPECT_COMMIT", "abc123"),
             ("VIBE_MANIFEST_PUBKEY", public.trim()),
         ],
     );
@@ -1397,11 +1404,13 @@ async fn release_manifest(root: &Path) -> PathBuf {
         &vibe::manifest::BuildInfo {
             release: false,
             release_approval: None,
+            version: "1.8.0".into(),
             commit: "abc123".into(),
         },
     )
     .unwrap_or_else(|err| panic!("{err}"));
     manifest.provenance.build_mode = "release".into();
+    manifest.provenance.version = "1.8.0".into();
     manifest
         .provenance
         .security_items
@@ -1420,6 +1429,8 @@ fn production_serve(root: &Path, extra: &[(&str, &str)]) -> (bool, String) {
             "0123456789abcdef0123456789abcdef0123",
         ),
         ("VIBE_DATABASE_URL", "postgres://invalid.invalid/x"),
+        ("VIBE_EXPECT_VERSION", "1.8.0"),
+        ("VIBE_EXPECT_COMMIT", "abc123"),
     ];
     envs.extend_from_slice(extra);
     vibe_cli(

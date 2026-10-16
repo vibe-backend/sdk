@@ -13,12 +13,14 @@ in the `release` environment, verified with `gh attestation verify`.
 | Field | Required value |
 | --- | --- |
 | OIDC issuer | `https://token.actions.githubusercontent.com` |
-| Source repository | `https://github.com/vibe-backend/sdk` (compiled in; override only when `VIBE_ENV=development`) |
-| Signer workflow | `vibe-backend/sdk/.github/workflows/release.yml` (compiled in; override only when `VIBE_ENV=development`) at the same ref |
-| Ref | `refs/tags/v*` (non-empty after `v`) |
+| Source repository | `https://github.com/vibe-backend/sdk` (compiled in; override only in relaxed mode) |
+| Signer workflow | `vibe-backend/sdk/.github/workflows/release.yml` (compiled in; override only in relaxed mode) at `refs/tags/v<version>` |
+| Ref | `refs/tags/v<version>` exactly (deployer `--expect-version` / `VIBE_EXPECT_VERSION`, matching `provenance.version`) |
+| Commit | certificate source commit == deployer `--expect-commit` / `VIBE_EXPECT_COMMIT` == `provenance.commit` |
+| Bundle media type | v0.2 or v0.3 (v0.1 is refused) |
+| Rekor | inclusion proof **and** a SET or checkpoint for that entry |
 | Runner | GitHub-hosted |
 | Subject | SHA-256 of the exact `manifest.json` bytes |
-| Rekor | an entry with an inclusion proof or promise, integrated while the certificate was valid, recording this envelope |
 
 Anything else fails closed: a missing bundle, a missing or wrong field, no
 Rekor entry, a bad DSSE signature, a different manifest, a key-based
@@ -32,13 +34,16 @@ commit.
   `--source-digest`, `--cert-oidc-issuer`, `--predicate-type` and
   `--deny-self-hosted-runners`. This is the full cryptographic check: Fulcio
   chain to the Sigstore trust root, Rekor inclusion and SET, identity.
-- **`vibe serve` / `vibe migrate`** (`src/attest.rs`), outside development:
+- **`vibe serve` / `vibe migrate`** (`src/attest.rs`), outside relaxed mode:
   the bundle must exist and pass every row of the table above. Verification
   uses the `sigstore-verify` verifier with the embedded Sigstore public-good
   trust root (`trusted_root.json`): Fulcio certificate chain, SCT, Rekor
-  inclusion proof or SET, certificate validity at the integrated time, DSSE
-  signature, and subject digest. Identity, issuer, runner and commit checks
-  then follow decision 119.
+  inclusion proof and SET (or checkpoint), certificate validity at the
+  integrated time, DSSE signature, and subject digest. Identity, issuer,
+  runner, version/ref and commit checks then follow decision 119: the
+  deployer supplies the expected version and commit (`--expect-version` /
+  `--expect-commit` or `VIBE_EXPECT_*`); they must equal `provenance.version`
+  / `provenance.commit` and the certificate.
 
 ## `VIBE_RELEASE_SIGNING_KEY`
 
@@ -56,7 +61,9 @@ check:
    limited to `v*` tags.
 2. The `v*` tag ruleset (no update, deletion or non-fast-forward).
 3. Copy `docs/ci/vibe-release.yml` to `.github/workflows/release.yml`
-   (the path the identity check expects). Repo/workflow overrides are only
-   for `VIBE_ENV=development`.
+   (the path the identity check expects). Repo/workflow overrides and other
+   relaxed config need `VIBE_ENV=development` **and** either a debug build or
+   `--insecure-dev` / `VIBE_INSECURE_DEV` (release binaries stay strict when
+   only `VIBE_ENV` is set).
 4. Ship `manifest.json.sigstore.json` next to `manifest.json` (or set
    `VIBE_MANIFEST_BUNDLE`).

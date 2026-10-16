@@ -59,6 +59,9 @@ enum Command {
         /// Source commit to record (default: GITHUB_SHA or `git rev-parse HEAD`).
         #[arg(long)]
         commit: Option<String>,
+        /// Release version without a leading `v` (required for `--release`).
+        #[arg(long)]
+        version: Option<String>,
     },
     /// Build a manifest: compile in memory, validate, then sign from the
     /// validated content. Writes nothing unless every step succeeds.
@@ -86,6 +89,9 @@ enum Command {
         /// Source commit to record (default: GITHUB_SHA or `git rev-parse HEAD`).
         #[arg(long)]
         commit: Option<String>,
+        /// Release version without a leading `v` (required for release builds).
+        #[arg(long)]
+        version: Option<String>,
     },
     /// Create a development manifest signing key (.vibe/signing.key, mode 0600).
     Keygen {
@@ -109,6 +115,17 @@ enum Command {
         /// Dev-only executor that does not use PostgreSQL.
         #[arg(long)]
         memory: bool,
+        /// Expected release version (no leading `v`). Required outside relaxed mode.
+        #[arg(long)]
+        expect_version: Option<String>,
+        /// Expected release commit SHA. Required outside relaxed mode.
+        #[arg(long)]
+        expect_commit: Option<String>,
+        /// Allow relaxed identity config with `VIBE_ENV=development` on a
+        /// release binary (debug builds already allow it when `VIBE_ENV` is
+        /// development).
+        #[arg(long)]
+        insecure_dev: bool,
     },
     /// Create tenant tables from model locks. Development bootstrap, not a production migration.
     Migrate {
@@ -118,6 +135,16 @@ enum Command {
         project: PathBuf,
         #[arg(long)]
         tenant: String,
+        /// Expected release version (no leading `v`). Required outside relaxed mode.
+        #[arg(long)]
+        expect_version: Option<String>,
+        /// Expected release commit SHA. Required outside relaxed mode.
+        #[arg(long)]
+        expect_commit: Option<String>,
+        /// Allow relaxed identity config with `VIBE_ENV=development` on a
+        /// release binary.
+        #[arg(long)]
+        insecure_dev: bool,
     },
     /// Register a public slug for a tenant.
     Slug {
@@ -194,7 +221,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             release,
             release_approval,
             commit,
-        } => cmd_manifest(&project, &output, release, release_approval, commit).await,
+            version,
+        } => cmd_manifest(&project, &output, release, release_approval, commit, version).await,
         Command::Build {
             project,
             dev,
@@ -202,6 +230,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             locks_dir,
             release_approval,
             commit,
+            version,
         } => {
             let locks_dir = locks_dir.unwrap_or_else(|| default_locks_dir(&project));
             cmd_build(
@@ -211,6 +240,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 &locks_dir,
                 release_approval,
                 commit,
+                version,
             )
             .await
         }
@@ -225,12 +255,39 @@ async fn run(cli: Cli) -> Result<(), String> {
             project,
             addr,
             memory,
-        } => cmd_serve(&manifest, &project, &addr, memory).await,
+            expect_version,
+            expect_commit,
+            insecure_dev,
+        } => {
+            cmd_serve(
+                &manifest,
+                &project,
+                &addr,
+                memory,
+                expect_version,
+                expect_commit,
+                insecure_dev,
+            )
+            .await
+        }
         Command::Migrate {
             manifest,
             project,
             tenant,
-        } => cmd_migrate(&manifest, &project, &tenant).await,
+            expect_version,
+            expect_commit,
+            insecure_dev,
+        } => {
+            cmd_migrate(
+                &manifest,
+                &project,
+                &tenant,
+                expect_version,
+                expect_commit,
+                insecure_dev,
+            )
+            .await
+        }
         Command::Slug { action } => match action {
             SlugAction::Add {
                 slug,
@@ -344,6 +401,7 @@ async fn cmd_manifest(
     release: bool,
     release_approval: Option<String>,
     commit: Option<String>,
+    version: Option<String>,
 ) -> Result<(), String> {
     let key = if release {
         sign::refuse_env_key_for_release()?;
@@ -352,6 +410,7 @@ async fn cmd_manifest(
         Some(sign::load_dev_key(project)?)
     };
     let commit = resolve_commit(project, commit);
+    let version = resolve_version(version, release)?;
     let loaded = if release {
         compile_build(project, false).await?
     } else {
@@ -360,6 +419,7 @@ async fn cmd_manifest(
     let info = manifest::BuildInfo {
         release,
         release_approval,
+        version,
         commit,
     };
     let manifest = match &key {
@@ -436,6 +496,7 @@ async fn cmd_build(
     locks_dir: &Path,
     release_approval: Option<String>,
     commit: Option<String>,
+    version: Option<String>,
 ) -> Result<(), String> {
     if dev && release_approval.is_some() {
         return Err("--release-approval applies only to release builds; drop --dev".into());
@@ -446,6 +507,7 @@ async fn cmd_build(
         sign::refuse_env_key_for_release()?;
     }
     let commit = resolve_commit(project, commit);
+    let version = resolve_version(version, !dev)?;
     let loaded = compile_build(project, dev).await?;
     // Validate first: errors stop the build before any key is used.
     let (result, _) = vibe::validate::validate_loaded(
@@ -473,6 +535,7 @@ async fn cmd_build(
     let info = manifest::BuildInfo {
         release: !dev,
         release_approval,
+        version,
         commit,
     };
     let manifest = match &key {
@@ -558,32 +621,50 @@ fn print_high_risk(manifest: &manifest::Manifest) {
     }
 }
 
-/// Loads and verifies the manifest. Outside development only a keyless
+/// Loads and verifies the manifest. Outside relaxed mode only a keyless
 /// release manifest with a valid Sigstore bundle (`VIBE_MANIFEST_BUNDLE`, or
 /// `<manifest>.sigstore.json`) is accepted, bound to the compiled-in release
-/// repo and workflow (overrides only when `VIBE_ENV=development`) and a
-/// `refs/tags/v*` ref. No key is trusted there. In development a manifest
-/// without a bundle is verified with a pinned key or `.vibe/signing.pub`.
+/// repo and workflow, the deployer-expected version/commit, and
+/// `refs/tags/v<version>`. No key is trusted there. Relaxed mode
+/// (`VIBE_ENV=development` plus a debug build or `--insecure-dev`) may verify
+/// a development-key manifest without a bundle, and may override the release
+/// identity.
 fn load_manifest(
     manifest_path: &Path,
     project: &Path,
     run_env: vibe::runtime::RunEnv,
+    expect_version: Option<String>,
+    expect_commit: Option<String>,
+    insecure_dev: bool,
 ) -> Result<manifest::Manifest, String> {
+    if insecure_dev {
+        std::env::set_var("VIBE_INSECURE_DEV", "1");
+    }
     let bundle = std::env::var_os("VIBE_MANIFEST_BUNDLE")
         .map(PathBuf::from)
         .unwrap_or_else(|| vibe::attest::default_bundle_path(manifest_path));
+    let relaxed = vibe::attest::relaxed_config_allowed(insecure_dev);
     if !run_env.is_dev() || bundle.exists() {
         let policy = vibe::attest::Policy::from_env()?;
-        let (manifest, identity) = manifest::read_release_manifest(manifest_path, &bundle, &policy)
-            .map_err(|err| err.to_string())?;
+        let expected = deployer_expectation(expect_version, expect_commit)?;
+        let (manifest, identity) =
+            manifest::read_release_manifest(manifest_path, &bundle, &policy, &expected)
+                .map_err(|err| err.to_string())?;
         tracing::info!(
             repo = %identity.repo,
             source_ref = %identity.source_ref,
+            version = %identity.version,
             commit = %identity.commit,
             rekor_log_index = %identity.rekor_log_index,
             "release manifest attestation verified"
         );
         return Ok(manifest);
+    }
+    if !relaxed && !run_env.is_dev() {
+        return Err(
+            "release manifests require a Sigstore bundle; development-key manifests need VIBE_ENV=development and a debug build or --insecure-dev"
+                .into(),
+        );
     }
     let key = match sign::pinned_public_key()? {
         Some(key) => key,
@@ -595,6 +676,57 @@ fn load_manifest(
         }
     };
     read_manifest(manifest_path, &key).map_err(|err| err.to_string())
+}
+
+fn deployer_expectation(
+    expect_version: Option<String>,
+    expect_commit: Option<String>,
+) -> Result<vibe::attest::Expectation, String> {
+    let version = expect_version
+        .or_else(|| std::env::var("VIBE_EXPECT_VERSION").ok())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(
+            "set --expect-version or VIBE_EXPECT_VERSION to the release version this deploy must run",
+        )?;
+    let commit = expect_commit
+        .or_else(|| std::env::var("VIBE_EXPECT_COMMIT").ok())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(
+            "set --expect-commit or VIBE_EXPECT_COMMIT to the release commit this deploy must run",
+        )?;
+    vibe::attest::Expectation::new(&version, &commit)
+}
+
+fn resolve_version(version: Option<String>, release: bool) -> Result<String, String> {
+    let raw = version
+        .or_else(|| std::env::var("VIBE_RELEASE_VERSION").ok())
+        .or_else(|| {
+            std::env::var("GITHUB_REF_NAME").ok().and_then(|name| {
+                name.strip_prefix('v')
+                    .filter(|v| !v.is_empty() && !v.contains('/'))
+                    .map(|v| v.to_string())
+                    .or_else(|| {
+                        if name.starts_with('v') {
+                            None
+                        } else if std::env::var("GITHUB_REF")
+                            .ok()
+                            .is_some_and(|r| r.starts_with("refs/tags/v"))
+                        {
+                            Some(name)
+                        } else {
+                            None
+                        }
+                    })
+            })
+        })
+        .unwrap_or_default();
+    let trimmed = raw.trim().trim_start_matches('v').trim().to_string();
+    if release && trimmed.is_empty() {
+        return Err(
+            "release builds need --version (or VIBE_RELEASE_VERSION / a v* tag ref)".into(),
+        );
+    }
+    Ok(trimmed)
 }
 
 fn check_deployable(
@@ -617,6 +749,9 @@ async fn cmd_serve(
     project: &Path,
     addr: &str,
     memory: bool,
+    expect_version: Option<String>,
+    expect_commit: Option<String>,
+    insecure_dev: bool,
 ) -> Result<(), String> {
     if let Some(name) = llm::runtime_llm_env_present() {
         return Err(format!("runtime environment must not contain {name}"));
@@ -630,7 +765,14 @@ async fn cmd_serve(
         ));
     }
     let auth = auth_from_env(run_env)?;
-    let manifest = load_manifest(manifest_path, project, run_env)?;
+    let manifest = load_manifest(
+        manifest_path,
+        project,
+        run_env,
+        expect_version,
+        expect_commit,
+        insecure_dev,
+    )?;
     check_deployable(&manifest, run_env)?;
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::new())
@@ -685,7 +827,14 @@ async fn cmd_serve(
     .map_err(|err| err.to_string())
 }
 
-async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Result<(), String> {
+async fn cmd_migrate(
+    manifest_path: &Path,
+    project: &Path,
+    tenant: &str,
+    expect_version: Option<String>,
+    expect_commit: Option<String>,
+    insecure_dev: bool,
+) -> Result<(), String> {
     if !tenant
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
@@ -694,7 +843,14 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
         return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
     }
     let run_env = vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), false);
-    let manifest = load_manifest(manifest_path, project, run_env)?;
+    let manifest = load_manifest(
+        manifest_path,
+        project,
+        run_env,
+        expect_version,
+        expect_commit,
+        insecure_dev,
+    )?;
     check_deployable(&manifest, run_env)?;
     // Migrations need the table-owner role; serving must not use it.
     let url = std::env::var("VIBE_MIGRATE_DATABASE_URL").map_err(|_| {

@@ -31,6 +31,11 @@ pub struct Manifest {
 pub struct Provenance {
     /// `release` or `dev`.
     pub build_mode: String,
+    /// Release version without a leading `v` (e.g. `1.8.0`). Empty for
+    /// development builds. Required for release manifests and must match the
+    /// deployer expectation and the attested tag.
+    #[serde(default)]
+    pub version: String,
     /// Source commit (`GITHUB_SHA`, `--commit`, or `git rev-parse HEAD`).
     pub commit: String,
     /// One entry per lock, sorted by id.
@@ -73,6 +78,8 @@ pub struct BuildInfo {
     /// approval verification (#80) lands (decision 90/118).
     pub release: bool,
     pub release_approval: Option<String>,
+    /// Release version without a leading `v`. Required for release builds.
+    pub version: String,
     pub commit: String,
 }
 
@@ -370,8 +377,20 @@ fn build_unsigned(
     }
     locks.sort_by(|a, b| a.id.cmp(&b.id));
     items.sort_by(|a, b| (&a.lock, &a.item).cmp(&(&b.lock, &b.item)));
+    let version = info
+        .version
+        .trim()
+        .trim_start_matches('v')
+        .trim()
+        .to_string();
+    if info.release && version.is_empty() {
+        return Err(single(
+            "release build needs a version (`--version` or the tag name without v)".into(),
+        ));
+    }
     manifest.provenance = Provenance {
         build_mode: if info.release { "release" } else { "dev" }.into(),
+        version,
         commit: info.commit.clone(),
         locks,
         security_items: items,
@@ -453,6 +472,7 @@ pub fn read_release_manifest(
     path: &Path,
     bundle: &Path,
     policy: &crate::attest::Policy,
+    expected: &crate::attest::Expectation,
 ) -> Result<(Manifest, crate::attest::Identity), Report> {
     let bytes = fs::read(path).map_err(|err| single(format!("cannot read manifest: {err}")))?;
     let bundle_bytes = fs::read(bundle).map_err(|err| {
@@ -470,16 +490,46 @@ pub fn read_release_manifest(
             "attested manifest is not a keyless release manifest".into(),
         ));
     }
+    if manifest.provenance.version.is_empty() {
+        return Err(single(
+            "manifest version is empty; a release manifest must record its version".into(),
+        ));
+    }
     if manifest.provenance.commit.is_empty() {
         return Err(single(
             "manifest commit is empty; a release manifest must record its commit".into(),
         ));
     }
-    let identity = crate::attest::verify_bundle(&bytes, &bundle_bytes, policy).map_err(single)?;
+    let manifest_version = manifest
+        .provenance
+        .version
+        .trim()
+        .trim_start_matches('v')
+        .trim();
+    if manifest_version != expected.version {
+        return Err(single(format!(
+            "manifest version {} is not the expected {}",
+            manifest.provenance.version, expected.version
+        )));
+    }
+    if manifest.provenance.commit != expected.commit {
+        return Err(single(format!(
+            "manifest commit {} is not the expected {}",
+            manifest.provenance.commit, expected.commit
+        )));
+    }
+    let identity =
+        crate::attest::verify_bundle(&bytes, &bundle_bytes, policy, expected).map_err(single)?;
     if manifest.provenance.commit != identity.commit {
         return Err(single(format!(
             "manifest commit {} is not the attested commit {}",
             manifest.provenance.commit, identity.commit
+        )));
+    }
+    if identity.version != expected.version {
+        return Err(single(format!(
+            "attested version {} is not the expected {}",
+            identity.version, expected.version
         )));
     }
     Ok((manifest, identity))
