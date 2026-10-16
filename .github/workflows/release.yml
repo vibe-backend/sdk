@@ -36,10 +36,9 @@ jobs:
     name: ${{ matrix.target }}
     needs: verify-tag
     runs-on: ${{ matrix.os }}
+    # Builds run project and dependency code: no id-token, no attestations.
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -95,19 +94,13 @@ jobs:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
           if-no-files-found: error
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: ${{ matrix.asset }}
 
   checksums:
-    name: SHA256SUMS + provenance
+    name: SHA256SUMS
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -118,20 +111,41 @@ jobs:
           cd dist
           sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
           mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
-      - name: Attest SHA256SUMS
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: dist/SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
           if-no-files-found: error
 
+  # The only job with id-token/attestations: runs in the `release`
+  # environment, checks out nothing and runs no project or dependency code.
+  # It downloads the built artifacts, checks them against SHA256SUMS, and
+  # attests every asset and SHA256SUMS.
+  attest:
+    name: Attest build provenance
+    needs: checksums
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check assets against SHA256SUMS
+        run: cd dist && sha256sum -c SHA256SUMS
+      - name: Attest assets and SHA256SUMS
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
   # The publishing job holds only contents: write (no id-token/attestations).
   release:
     name: GitHub Release
-    needs: checksums
+    needs: attest
     runs-on: ubuntu-24.04
     environment: release
     permissions:

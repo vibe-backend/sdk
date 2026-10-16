@@ -27,6 +27,10 @@ jobs:
           fail: true
       - name: Check zh-hant code blocks match English
         run: python3 scripts/check-zh-code-blocks.py
+      - name: OIDC and attestation permissions only in the release environment
+        run: |
+          python3 -c "import yaml" 2>/dev/null || python3 -m pip install --user pyyaml
+          python3 scripts/check-oidc-permissions.py
       - name: Install script tests
         run: python3 tests/install_manager.py
       - name: Shellcheck install script
