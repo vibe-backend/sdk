@@ -63,10 +63,47 @@ fn table_problem(name: &ObjectName) -> Option<String> {
     if !(plain_name(&value) && (ident.quote_style.is_none() || plain_name(&ident.value))) {
         return Some(format!("table {name} must be a plain lowercase name"));
     }
-    if value.starts_with("_platform") || value.starts_with("pg_") || value == "information_schema" {
+    if reserved_name(&value) || value == "only" {
         return Some(format!("table {name} is not allowed"));
     }
     None
+}
+
+/// Names reserved for platform and catalog objects (`pg_*`, `_platform*`,
+/// `vibe_*`, `information_schema`). Lock SQL and migrations both refuse
+/// them.
+pub fn reserved_name(value: &str) -> bool {
+    value.starts_with("pg_")
+        || value.starts_with("_platform")
+        || value.starts_with("vibe_")
+        || value == "information_schema"
+}
+
+/// SQL special-value keywords and session/introspection functions. Some
+/// parse as plain identifiers rather than function calls; both forms are
+/// refused like a function outside [`ALLOWED_FUNCTIONS`].
+pub const SESSION_KEYWORDS: &[&str] = &[
+    "current_role",
+    "current_user",
+    "session_user",
+    "user",
+    "system_user",
+    "current_schema",
+    "current_schemas",
+    "current_catalog",
+    "current_database",
+    "current_query",
+    "inet_client_addr",
+    "inet_client_port",
+    "inet_server_addr",
+    "inet_server_port",
+    "pg_backend_pid",
+    "version",
+];
+
+fn session_keyword(ident: &Ident) -> bool {
+    ident.quote_style.is_none()
+        && SESSION_KEYWORDS.contains(&ident.value.to_ascii_lowercase().as_str())
 }
 
 /// Problems in the set-expression tree that the visitor does not reach as
@@ -187,6 +224,9 @@ impl Visitor for Guard {
                 op: BinaryOperator::PGCustomBinaryOperator(_),
                 ..
             } => return self.fail("OPERATOR(...) is not allowed in lock SQL".into()),
+            Expr::Identifier(ident) if session_keyword(ident) => {
+                return self.fail(format!("function {ident} is not allowed in lock SQL"));
+            }
             _ => {}
         }
         if let Expr::Function(func) = expr {
@@ -525,6 +565,17 @@ mod tests {
             "select * into tmp_copy from users",
             "select name from users where name = 'a' collate other_schema.\"C\"",
             "select 1 operator(other_schema.+) 1",
+            "select * from vibe_challenge_replay",
+            "select count(*) from \"vibe_challenge_replay\"",
+            "insert into vibe_challenge_replay (tenant_id) values ('x')",
+            "update vibe_challenge_replay set state = 'released' where true",
+            "delete from vibe_challenge_replay where true",
+            "select id from users where id in (select key from vibe_challenge_replay)",
+            "with r as (select * from vibe_challenge_replay) select * from r",
+            "select * from vibe_migrate_audit",
+            "select * from pg_class",
+            "select * from information_schema",
+            "update only users set name = 'x' where id = $1",
         ] {
             assert!(query_problem(sql).is_some(), "accepted: {sql}");
         }
@@ -657,6 +708,35 @@ mod tests {
         ] {
             assert_eq!(query_problem(sql), None, "{sql}");
         }
+    }
+
+    #[test]
+    fn session_keywords_are_refused_like_functions() {
+        for sql in [
+            "select current_role",
+            "select CURRENT_USER",
+            "select session_user",
+            "select user",
+            "select current_schema",
+            "select current_catalog",
+            "select current_schema()",
+            "select current_database()",
+            "select system_user",
+            "select id from users where name = current_user",
+            "update users set name = current_role where id = $1",
+            "insert into users (name) values (session_user)",
+        ] {
+            let problem = query_problem(sql);
+            assert!(
+                problem
+                    .as_deref()
+                    .is_some_and(|p| p.contains("not allowed")),
+                "accepted: {sql}: {problem:?}"
+            );
+        }
+        // Quoted or qualified column names are ordinary columns.
+        assert_eq!(query_problem("select u.\"user\" from users u"), None);
+        assert_eq!(query_problem("select \"current_user\" from users"), None);
     }
 
     #[test]

@@ -537,15 +537,24 @@ impl TenantPools {
     /// with [`PgExec::check_tenant_role`]) on first use.
     pub async fn pool(&self, tenant: &str, class: &str) -> Result<Arc<PgExec>, String> {
         let role = tenant_role(tenant, class)?;
-        let mut pools = self.pools.lock().await;
-        if let Some(open) = pools.get_mut(&role) {
-            open.last_used = std::time::Instant::now();
-            return Ok(open.exec.clone());
+        {
+            let mut pools = self.pools.lock().await;
+            if let Some(open) = pools.get_mut(&role) {
+                open.last_used = std::time::Instant::now();
+                return Ok(open.exec.clone());
+            }
         }
+        // The pools lock is not held while connecting or checking the role.
         // Connection errors from PgExec never include the URL (password).
         let pool = PgExec::connect_with(&self.url_for(&role)?, self.options.clone()).await?;
         pool.check_tenant_role(tenant, class).await?;
         let pool = Arc::new(pool);
+        let mut pools = self.pools.lock().await;
+        if let Some(open) = pools.get_mut(&role) {
+            // Another request opened it meanwhile; keep that one.
+            open.last_used = std::time::Instant::now();
+            return Ok(open.exec.clone());
+        }
         pools.insert(
             role,
             OpenPool {
