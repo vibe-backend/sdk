@@ -59,7 +59,14 @@ source-type: natural
 dependencies: []
 compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
-security-items: [{ item: rate-limit-new, risk: medium, reason: "Login brute-force protection" }]
+status: approved
+approval-mode: manual
+approved-by: [jack@example]
+approved-at: 2026-10-14T08:05:00+08:00
+approval-ref: pr#121
+approved-commit: a1b2c121
+security-items: [{ item: rate-limit-new, risk: medium, reason: "Login brute-force protection", approved-by: [jack@example] }]
+signature: MEYCIQ...
 ---
 ## Parameters
 | name | type | default | min | max |

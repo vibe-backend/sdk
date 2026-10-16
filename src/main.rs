@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use vibe::approve::{approve_project, ApproveOptions};
 use vibe::compile::{compile_project, CompileOptions};
 use vibe::discover;
 use vibe::llm::{self, HttpAdapter, LlmAdapter};
@@ -27,7 +28,7 @@ enum Command {
     Compile {
         #[arg(long, default_value = ".")]
         project: PathBuf,
-        /// Build in memory and run the deploy policy. Ignores and does not write lock files.
+        /// Recompile and fail if the locks differ. Does not write.
         #[arg(long)]
         check: bool,
     },
@@ -35,40 +36,31 @@ enum Command {
     Validate {
         #[arg(long, default_value = ".")]
         project: PathBuf,
-        /// Also apply deploy-only checks (e.g. no locks compiled against a private LLM endpoint).
+        /// Also require approval and a valid signature.
         #[arg(long)]
         deploy: bool,
     },
-    /// Build a signed manifest from validated locks.
+    /// Record local approval and sign locks.
+    ///
+    /// Production approval is a platform review. This command is the local stand-in.
+    Approve {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Repeatable. High-risk locks (public endpoints, providers, and migrations) need two reviewers: `--reviewer a --reviewer b`.
+        #[arg(long = "reviewer")]
+        reviewers: Vec<String>,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value = "local")]
+        approval_ref: String,
+    },
+    /// Build a signed manifest from approved locks.
     Manifest {
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// Output path, relative to the current directory (like `serve --manifest`).
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
-        /// Release build: signs with VIBE_RELEASE_SIGNING_KEY only, never reads
-        /// .env, requires an allowlisted LLM host, and fails closed on
-        /// high-risk items until release-environment approval verification (#80).
-        #[arg(long)]
-        release: bool,
-        /// Recorded for audit only. It is not accepted as approval: the approval
-        /// is the `release` environment approval (decision 90/118, #80).
-        #[arg(long)]
-        release_approval: Option<String>,
-        /// Source commit to record (default: GITHUB_SHA or `git rev-parse HEAD`).
-        #[arg(long)]
-        commit: Option<String>,
-    },
-    /// Create a development manifest signing key (.vibe/signing.key, mode 0600).
-    Keygen {
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
-    /// Removed in v1.8.
-    #[command(hide = true)]
-    Approve {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        _args: Vec<String>,
     },
     /// Serve HTTP from a signed manifest.
     Serve {
@@ -160,19 +152,13 @@ async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Compile { project, check } => cmd_compile(&project, check).await,
         Command::Validate { project, deploy } => cmd_validate(&project, deploy),
-        Command::Manifest {
+        Command::Approve {
             project,
-            output,
-            release,
-            release_approval,
-            commit,
-        } => cmd_manifest(&project, &output, release, release_approval, commit).await,
-        Command::Keygen { project } => {
-            sign::create_dev_key(&project)?;
-            println!("wrote {}", project.join(".vibe/signing.key").display());
-            Ok(())
-        }
-        Command::Approve { .. } => Err("`vibe approve` was removed in v1.8: locks carry no approval. Review the source in a pull request; release builds (`vibe manifest --release`) require --release-approval for high-risk items.".into()),
+            reviewers,
+            reason,
+            approval_ref,
+        } => cmd_approve(&project, &reviewers, &reason, &approval_ref),
+        Command::Manifest { project, output } => cmd_manifest(&project, &output),
         Command::Serve {
             manifest,
             project,
@@ -281,133 +267,98 @@ async fn cmd_compile(project: &Path, check: bool) -> Result<(), String> {
 }
 
 fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
-    let report = validate_project(&ValidateOptions {
+    // A missing key is one more finding, not a reason to stop before
+    // reporting everything else.
+    let mut key_problem = None;
+    let key = if deploy {
+        match sign::load_public(project) {
+            Ok(key) => Some(key),
+            Err(err) => {
+                key_problem = Some(vibe::Diag::error(
+                    ".vibe/signing.pub",
+                    format!("cannot load the signing key: {err}"),
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let result = validate_project(&ValidateOptions {
         root: project,
         deploy,
-    })
-    .map_err(|err| err.to_string())?;
+        verify_key: key.as_ref(),
+    });
+    let report = match (result, key_problem) {
+        (Ok(report), None) => report,
+        (Ok(mut report) | Err(mut report), Some(problem)) => {
+            report.diags.insert(0, problem);
+            return Err(report.to_string());
+        }
+        (Err(report), None) => return Err(report.to_string()),
+    };
+    // #118: `vibe validate --deploy` (and any validate with a production
+    // VIBE_ENV) refuses `challenge_when: always` until a verifier is configured.
+    let run_env =
+        vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), !deploy);
+    let always = vibe::runtime::challenge::always_challenge_locks(project);
+    let configured = vibe::runtime::challenge::configured_in_env()?;
+    vibe::runtime::challenge::production_gate(run_env, configured, &always)?;
+    // #157: the replay store choice (the table itself is checked by `vibe serve`).
+    let replay_kind =
+        vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?;
+    vibe::runtime::replay::resolve_replay_store(run_env, configured, replay_kind, true)?;
     print_report(&report);
-    println!("validation ok");
+    if deploy {
+        println!("validation ok");
+    } else {
+        println!("validation ok; approval and signatures are checked only with --deploy");
+    }
     Ok(())
 }
 
-async fn cmd_manifest(
+fn cmd_approve(
     project: &Path,
-    output: &Path,
-    release: bool,
-    release_approval: Option<String>,
-    commit: Option<String>,
+    reviewers: &[String],
+    reason: &str,
+    approval_ref: &str,
 ) -> Result<(), String> {
-    let key = if release {
-        sign::load_release_key()?
-    } else {
-        sign::load_dev_key(project)?
-    };
-    let commit = commit
-        .or_else(|| std::env::var("GITHUB_SHA").ok())
-        .or_else(|| {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(project)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .ok()
-                .filter(|out| out.status.success())
-                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        })
-        .unwrap_or_default();
-    // A release build compiles from source in memory and never reads lock
-    // files from disk; a dev manifest uses the locks `vibe compile` wrote
-    // (checked against the build record).
-    let loaded = if release {
-        // A release build never reads the project .env: every input comes
-        // from the release environment.
-        let mut env = llm::env_map_from_process();
-        if let Some(key) = env.get("VIBE_LLM_API_KEY").cloned() {
-            env.entry("LLM_API_KEY".into()).or_insert(key);
-        }
-        // No LLM key (VIBE_LLM_API_KEY or LLM_API_KEY) is ever sent to a
-        // host outside the release allowlist.
-        if let Ok(config) = llm::load_llm_config(&env, true) {
-            llm::check_release_endpoint(&config)?;
-        }
-        let config = llm::load_llm_config(&env, true).ok();
-        let adapter = match &config {
-            Some(config) => Some(HttpAdapter::new(config.clone()).map_err(|err| err.to_string())?),
-            None => None,
-        };
-        let (loaded, report) = vibe::compile::compile_in_memory(
-            project,
-            adapter.as_ref().map(|a| a as &dyn LlmAdapter),
-            config.as_ref(),
-        )
-        .await
-        .map_err(|err| err.to_string())?;
-        print_report(&report);
-        loaded
-    } else {
-        vibe::validate::load_project(project).map_err(|err| err.to_string())?
-    };
-    let info = manifest::BuildInfo {
-        release,
-        release_approval,
-        commit,
-    };
-    let manifest =
-        manifest::build_signed(project, &loaded, &key, &info).map_err(|err| err.to_string())?;
-    print_high_risk(&manifest);
+    let key = sign::load_or_create(project).map_err(|err| err.to_string())?;
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "local".into());
+    let now = chrono::Utc::now().to_rfc3339();
+    let report = approve_project(&ApproveOptions {
+        root: project,
+        reviewers,
+        reason,
+        approval_ref,
+        commit: &commit,
+        now: &now,
+        signing_key: &key,
+    })
+    .map_err(|err| err.to_string())?;
+    print_report(&report);
+    println!(
+        "approved locks with {}",
+        hex::encode(key.verifying_key().to_bytes())
+    );
+    Ok(())
+}
+
+fn cmd_manifest(project: &Path, output: &Path) -> Result<(), String> {
+    let key = sign::load_or_create(project).map_err(|err| err.to_string())?;
+    let manifest = manifest::manifest_from_project(project, &key).map_err(|err| err.to_string())?;
     // Relative to the current directory, like `vibe serve --manifest` (#31).
     let path = output.to_path_buf();
     manifest::write_manifest(&path, &manifest).map_err(|err| err.to_string())?;
     println!("wrote {}", path.display());
     Ok(())
-}
-
-fn print_high_risk(manifest: &manifest::Manifest) {
-    let high = manifest.provenance.high_risk();
-    if high.is_empty() {
-        return;
-    }
-    eprintln!("high-risk items ({}):", high.len());
-    for item in high {
-        eprintln!("  {} {}", item.lock, item.item);
-    }
-    if let Some(reference) = &manifest.provenance.release_approval {
-        eprintln!("release approval: {reference}");
-    }
-}
-
-/// Manifest verifying key. Production trusts only the pinned release key
-/// (one compiled in with VIBE_RELEASE_PUBKEY, which VIBE_MANIFEST_PUBKEY
-/// cannot override, else VIBE_MANIFEST_PUBKEY); the project's
-/// `.vibe/signing.pub` is accepted in development only.
-fn manifest_key(
-    project: &Path,
-    run_env: vibe::runtime::RunEnv,
-) -> Result<ed25519_dalek::VerifyingKey, String> {
-    if let Some(key) = sign::pinned_public_key()? {
-        return Ok(key);
-    }
-    if !run_env.is_dev() {
-        return Err("no pinned manifest key: set VIBE_MANIFEST_PUBKEY to the release public key (the project's .vibe/signing.pub is not trusted outside development)".into());
-    }
-    eprintln!("warning: verifying the manifest with the development key in .vibe/signing.pub");
-    sign::load_dev_public(project)
-}
-
-fn check_deployable(
-    manifest: &manifest::Manifest,
-    run_env: vibe::runtime::RunEnv,
-) -> Result<(), String> {
-    let provenance = &manifest.provenance;
-    tracing::info!(
-        build_mode = %provenance.build_mode,
-        commit = %provenance.commit,
-        locks = provenance.locks.len(),
-        high_risk = provenance.high_risk().len(),
-        "manifest provenance"
-    );
-    manifest::check_deployable(manifest, run_env.is_dev())
 }
 
 async fn cmd_serve(
@@ -427,12 +378,38 @@ async fn cmd_serve(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
+    // #157: production always uses the PostgreSQL replay store and
+    // refuses the memory switch; dev/CI must choose explicitly. Decided
+    // before loading anything.
+    let replay_choice = vibe::runtime::replay::resolve_replay_store(
+        run_env,
+        vibe::runtime::challenge::configured_in_env()?,
+        vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?,
+        !memory,
+    )?;
     let mut auth = auth_from_env(run_env)?;
-    let key = manifest_key(project, run_env)?;
+    let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
-    check_deployable(&manifest, run_env)?;
+    // `sign-jwt` key-refs name environment variables holding private PEMs.
+    auth.signing_keys =
+        vibe::runtime::load_signing_keys(&manifest, &|name| std::env::var(name).ok(), &auth.kid)?;
+    if memory {
+        let with_query: Vec<&str> = manifest
+            .methods
+            .iter()
+            .filter(|m| m.steps.iter().any(|s| s.op == "query"))
+            .map(|m| m.target.as_str())
+            .collect();
+        if !with_query.is_empty() {
+            eprintln!(
+                "warning: --memory does not run `query` steps; these methods will fail until you use PostgreSQL: {}",
+                with_query.join(", ")
+            );
+        }
+    }
     // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
     auth.add_route_jwks(&manifest.routes)?;
+    let mut pg_pool = None;
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::new())
     } else {
@@ -443,6 +420,7 @@ async fn cmd_serve(
             })?;
         let pg = PgExec::connect_with(&url, vibe::runtime::PgOptions::from_env()?).await?;
         pg.check_runtime_role().await?;
+        pg_pool = Some(pg.pool());
         Arc::new(pg)
     };
     let loaded = vibe::runtime::load_project_slugs(project, memory)?;
@@ -459,6 +437,36 @@ async fn cmd_serve(
             "warning: public routes use {{slug}} but no tenants are configured; copy slugs.example.json to .vibe/slugs.json or run `vibe slug add <slug> --tenant <id>`"
         );
     }
+    // #118: refuse `challenge_when: always` in production until a verifier
+    // is configured.
+    // #157: build the per-tenant store chosen at startup; a missing or unusable
+    // table refuses to start.
+    let replay_store: Option<Arc<dyn vibe::runtime::replay::ReplayStore>> =
+        match (replay_choice, pg_pool) {
+            (Some(vibe::runtime::replay::StoreKind::Postgres), Some(pool)) => {
+                // Per-tenant tables; the IP digest is keyed per tenant from
+                // the API-key pepper.
+                let store = vibe::runtime::replay::PgReplayStore::new(pool, &auth.pepper);
+                let mut tenants: Vec<String> =
+                    loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
+                tenants.sort();
+                tenants.dedup();
+                store.check(&tenants).await?;
+                Some(Arc::new(store))
+            }
+            (Some(vibe::runtime::replay::StoreKind::Postgres), None) => {
+                return Err("the challenge replay store needs PostgreSQL".into())
+            }
+            _ => None,
+        };
+    let challenge = vibe::runtime::challenge::verifier_from_env_with_store(replay_store)?;
+    let always: Vec<String> = manifest
+        .routes
+        .iter()
+        .filter(|r| r.public && r.challenge_type != "none" && r.challenge_when == "always")
+        .map(|r| r.feature_id.clone())
+        .collect();
+    vibe::runtime::challenge::production_gate(run_env, challenge.is_some(), &always)?;
     let addr: SocketAddr = addr.parse().map_err(|err| format!("bad address: {err}"))?;
     let state = Arc::new(AppState {
         manifest,
@@ -472,6 +480,7 @@ async fn cmd_serve(
         honor_test_ip: false,
         trusted_proxies: trusted_proxies_from_env()?,
         dev_hints: memory,
+        challenge,
     });
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr)
@@ -494,10 +503,8 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
     {
         return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
     }
-    let run_env = vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), false);
-    let key = manifest_key(project, run_env)?;
+    let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
-    check_deployable(&manifest, run_env)?;
     // Migrations need the table-owner role; serving must not use it.
     let url = std::env::var("VIBE_MIGRATE_DATABASE_URL").map_err(|_| {
         "VIBE_MIGRATE_DATABASE_URL is required (the owner role used for DDL; `vibe serve` uses a separate non-owner VIBE_DATABASE_URL)".to_string()

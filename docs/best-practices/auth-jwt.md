@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Require a valid JWT on every endpoint of an API definition. `auth` is a built-in pipeline (§4) whose lock is provided by the platform; you enable it and pass parameters (`mode`, `roles`, optionally `iss`, `aud`, `jwks-uri`) (§4.1, Decision 44). Declare it once in `_definition.md` so it is inherited by every version and feature (§3), and restrict roles per feature where needed.
+Require a valid JWT on every endpoint of an API definition. `auth` is a built-in pipeline (§4) whose lock is provided and signed by the platform; you enable it and pass parameters (`mode`, `roles`, optionally `iss`, `aud`, `jwks-uri`) (§4.1, Decision 44). Declare it once in `_definition.md` so it is inherited by every version and feature (§3), and restrict roles per feature where needed.
 
 The example feature is the admin **create-user** endpoint from §11.4. Under v1.7 it no longer sets a password: it creates an unverified user without a password and sends an **invite** (Decision 69).
 
@@ -64,7 +64,14 @@ dependencies:
   - { id: users/v2/_version, kind: api, hash: sha256:0d9e...51 }
 compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
-security-items: [{ item: roles, risk: high, reason: "Only admin may create users" }]
+status: approved
+approval-mode: manual
+approved-by: [jack@example, mei@example]
+approved-at: 2026-10-14T08:10:00+08:00
+approval-ref: pr#122
+approved-commit: a1b2c122
+security-items: [{ item: roles, risk: high, reason: "Only admin may create users", approved-by: [jack@example, mei@example] }]
+signature: MEUCIG...
 ---
 ## Route
 - method: POST

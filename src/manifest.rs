@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -7,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::diag::{Diag, Report};
-use crate::lock::{find_section, Kind, LockDoc, Scope};
+use crate::discover;
+use crate::lock::{find_section, parse_lock, Kind, LockDoc, Scope};
 use crate::security::pipeline_name;
 use crate::sign;
 use crate::validate::{self, ValidateOptions};
@@ -21,59 +23,7 @@ pub struct Manifest {
     pub models: Vec<ModelSpec>,
     pub methods: Vec<MethodSpec>,
     pub migrations: Vec<MigrationSpec>,
-    /// Signed record of what the manifest was built from (spec 10.1, 10.10).
-    #[serde(default)]
-    pub provenance: Provenance,
     pub signature: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct Provenance {
-    /// `release` or `dev`.
-    pub build_mode: String,
-    /// Source commit (`GITHUB_SHA`, `--commit`, or `git rev-parse HEAD`).
-    pub commit: String,
-    /// One entry per lock, sorted by id.
-    pub locks: Vec<LockProvenance>,
-    /// Every security item of every lock, sorted.
-    pub security_items: Vec<ItemProvenance>,
-    /// Release approval reference given for high-risk items (decision 90).
-    pub release_approval: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct LockProvenance {
-    pub id: String,
-    pub lock_sha256: String,
-    pub content_hash: String,
-    pub source_hash: String,
-    pub compiler_hash: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct ItemProvenance {
-    pub lock: String,
-    pub item: String,
-    pub risk: String,
-}
-
-impl Provenance {
-    pub fn high_risk(&self) -> Vec<&ItemProvenance> {
-        self.security_items
-            .iter()
-            .filter(|item| item.risk == "high")
-            .collect()
-    }
-}
-
-/// How a manifest is built.
-#[derive(Clone, Debug, Default)]
-pub struct BuildInfo {
-    /// Release build. High-risk items fail closed until release-environment
-    /// approval verification (#80) lands (decision 90/118).
-    pub release: bool,
-    pub release_approval: Option<String>,
-    pub commit: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -226,6 +176,10 @@ pub struct StepSpec {
     pub when_expr: String,
     pub writes: bool,
     pub table: String,
+    /// Every bullet of the step, raw (op-specific settings such as `hash`,
+    /// `plain`, `bytes`, `claims`, `ttl`, `key-ref`).
+    #[serde(default)]
+    pub opts: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -300,84 +254,14 @@ pub struct MigrationSpec {
 }
 
 pub fn manifest_from_project(root: &Path, signing_key: &SigningKey) -> Result<Manifest, Report> {
-    // Read every lock once; validate and build from the same in-memory text.
-    let loaded = validate::load_project(root)?;
-    manifest_from_loaded(root, &loaded, signing_key)
-}
-
-/// Validates (deploy rules, including the recompile check) and builds the
-/// manifest from exactly the loaded lock texts; nothing is re-read.
-pub fn manifest_from_loaded(
-    root: &Path,
-    loaded: &validate::LoadedProject,
-    signing_key: &SigningKey,
-) -> Result<Manifest, Report> {
-    build_signed(root, loaded, signing_key, &BuildInfo::default())
-}
-
-/// Validates (deploy rules) and builds the manifest from exactly the loaded
-/// lock texts; nothing is re-read. Records provenance and, for a release
-/// build, fails closed on high-risk items without a release approval.
-pub fn build_signed(
-    root: &Path,
-    loaded: &validate::LoadedProject,
-    signing_key: &SigningKey,
-    info: &BuildInfo,
-) -> Result<Manifest, Report> {
-    let (result, docs) = validate::validate_loaded(&ValidateOptions { root, deploy: true }, loaded);
-    result?;
+    let verify = signing_key.verifying_key();
+    validate::validate_project(&ValidateOptions {
+        root,
+        deploy: true,
+        verify_key: Some(&verify),
+    })?;
+    let docs = load_docs(root)?;
     let mut manifest = build_manifest(&docs)?;
-    let mut locks = Vec::new();
-    let mut items = Vec::new();
-    for (source, text) in loaded.sources.iter().zip(&loaded.lock_texts) {
-        let (Some(text), Some(doc)) = (text, docs.get(&source.id)) else {
-            continue;
-        };
-        locks.push(LockProvenance {
-            id: doc.meta.id.clone(),
-            lock_sha256: crate::buildrecord::lock_hash(text),
-            content_hash: crate::lock::content_hash(doc),
-            source_hash: doc.meta.source_hash.clone(),
-            compiler_hash: doc.meta.compiler_hash.clone(),
-        });
-        for item in &doc.meta.security_items {
-            items.push(ItemProvenance {
-                lock: doc.meta.id.clone(),
-                item: item.item.clone(),
-                risk: item.risk.as_str().to_string(),
-            });
-        }
-    }
-    locks.sort_by(|a, b| a.id.cmp(&b.id));
-    items.sort_by(|a, b| (&a.lock, &a.item).cmp(&(&b.lock, &b.item)));
-    manifest.provenance = Provenance {
-        build_mode: if info.release { "release" } else { "dev" }.into(),
-        commit: info.commit.clone(),
-        locks,
-        security_items: items,
-        release_approval: info
-            .release_approval
-            .clone()
-            .filter(|r| !r.trim().is_empty()),
-    };
-    // Decision 90/118: the approval is the `release` environment approval,
-    // verified against the platform (#80). Until that verification exists,
-    // a release build with high-risk items fails closed; no
-    // `--release-approval` value counts as approval.
-    if info.release {
-        let high: Vec<String> = manifest
-            .provenance
-            .high_risk()
-            .iter()
-            .map(|item| format!("{} ({})", item.lock, item.item))
-            .collect();
-        if !high.is_empty() {
-            return Err(single(format!(
-                "release build has high-risk items: {}; release-environment approval verification (#80) is not implemented yet, so high-risk release builds fail closed (--release-approval is not accepted as approval)",
-                high.join(", ")
-            )));
-        }
-    }
     manifest.signature = String::new();
     let bytes =
         serde_json::to_vec(&manifest).map_err(|err| single(format!("manifest json: {err}")))?;
@@ -385,34 +269,12 @@ pub fn build_signed(
     Ok(manifest)
 }
 
-/// Outside development only release manifests run (decisions 79, 90, 91):
-/// built with `vibe manifest --release` (compiled in memory in the release
-/// environment) and, if they have high-risk items, carrying a release
-/// approval.
-pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), String> {
-    if development {
-        return Ok(());
-    }
-    let provenance = &manifest.provenance;
-    if provenance.build_mode != "release" {
-        return Err(
-            "only release manifests (`vibe manifest --release`) can run outside development".into(),
-        );
-    }
-    if provenance.locks.is_empty() {
-        return Err("manifest has no lock provenance".into());
-    }
-    // Fail closed until release-environment approval verification (#80):
-    // a recorded approval string is not proof of approval.
-    if !provenance.high_risk().is_empty() {
-        return Err("manifest has high-risk items without a verified release approval".into());
-    }
-    Ok(())
-}
-
 pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), Report> {
     let json = serde_json::to_vec_pretty(manifest).map_err(|err| single(err.to_string()))?;
-    crate::fsutil::write_atomic(path, &json).map_err(|err| single(err.to_string()))
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| single(err.to_string()))?;
+    }
+    fs::write(path, json).map_err(|err| single(err.to_string()))
 }
 
 pub fn read_manifest(path: &Path, key: &VerifyingKey) -> Result<Manifest, Report> {
@@ -440,7 +302,10 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
     for doc in ids {
         match doc.meta.kind {
             Kind::Model => models.push(model_from(doc)),
-            Kind::Method => methods.push(method_from(doc)),
+            Kind::Method => match method_from(doc) {
+                Ok(method) => methods.push(method),
+                Err(diag) => report.push(diag),
+            },
             Kind::Migration => migrations.push(migration_from(doc)),
             Kind::Api if doc.meta.scope == Some(Scope::Feature) => match route_from(doc, docs) {
                 Ok(route) => routes.push(route),
@@ -475,7 +340,6 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
         return Err(report);
     }
     Ok(Manifest {
-        provenance: Provenance::default(),
         manifest_version: MANIFEST_VERSION,
         routes,
         models,
@@ -483,6 +347,27 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
         migrations,
         signature: String::new(),
     })
+}
+
+fn load_docs(root: &Path) -> Result<HashMap<String, LockDoc>, Report> {
+    let sources = discover::discover(root)?;
+    let mut docs = HashMap::new();
+    let mut report = Report::new();
+    for source in sources {
+        let path = root.join(source.rel.trim_end_matches(".md").to_string() + ".lock.md");
+        let text = fs::read_to_string(&path).map_err(|err| single(err.to_string()))?;
+        match parse_lock(&text) {
+            Ok(doc) => {
+                docs.insert(doc.meta.id.clone(), doc);
+            }
+            Err(err) => report.push(Diag::error(source.rel, err)),
+        }
+    }
+    if report.has_errors() {
+        Err(report)
+    } else {
+        Ok(docs)
+    }
 }
 
 fn model_from(doc: &LockDoc) -> ModelSpec {
@@ -585,33 +470,38 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
     }
 }
 
-fn method_from(doc: &LockDoc) -> MethodSpec {
+fn method_from(doc: &LockDoc) -> Result<MethodSpec, Diag> {
     let target = doc
         .meta
         .id
         .split_once("/methods/")
         .map(|(object, method)| format!("{object}.{method}"))
         .unwrap_or_else(|| doc.meta.id.clone());
-    let writes =
-        find_section(&doc.sections, "Signature").and_then(|s| s.get("writes")) == Some("true");
-    let errors = find_section(&doc.sections, "Signature")
-        .and_then(|s| s.get("errors"))
-        .and_then(|raw| crate::lock::parse_string_list(raw).ok())
-        .unwrap_or_default();
-    let capabilities = find_section(&doc.sections, "Signature")
-        .and_then(|s| s.get("capabilities"))
-        .and_then(|raw| crate::lock::parse_string_list(raw).ok())
-        .unwrap_or_default();
-    MethodSpec {
+    let signature = find_section(&doc.sections, "Signature");
+    let writes = signature.and_then(|s| s.get("writes")) == Some("true");
+    let mut errors = Vec::new();
+    if let Some(raw) = signature.and_then(|s| s.get("errors")) {
+        errors = crate::lock::parse_string_list(raw).map_err(|err| {
+            Diag::error(&doc.meta.id, format!("invalid errors: {err}")).at_section("Signature")
+        })?;
+    }
+    let mut capabilities = Vec::new();
+    if let Some(raw) = signature.and_then(|s| s.get("capabilities")) {
+        capabilities = crate::lock::parse_string_list(raw).map_err(|err| {
+            Diag::error(&doc.meta.id, format!("invalid capabilities: {err}"))
+                .at_section("Signature")
+        })?;
+    }
+    Ok(MethodSpec {
         target,
         writes,
         input: Vec::new(),
         errors,
         capabilities,
-        steps: steps_from(find_section(&doc.sections, "Steps")),
+        steps: steps_from(find_section(&doc.sections, "Steps"), &doc.meta.id)?,
         crud_model: String::new(),
         crud_action: String::new(),
-    }
+    })
 }
 
 fn migration_from(doc: &LockDoc) -> MigrationSpec {
@@ -779,7 +669,7 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
             .and_then(|s| s.get("out"))
             .unwrap_or("result")
             .to_string(),
-        steps: steps_from(find_section(&doc.sections, "Steps")),
+        steps: steps_from(find_section(&doc.sections, "Steps"), &doc.meta.id)?,
         errors: error_rows(find_section(&doc.sections, "Errors")),
         min_response_ms,
         public_writes: access.and_then(|s| s.get("public-writes")) == Some("true"),
@@ -853,51 +743,60 @@ fn error_rows(section: Option<&crate::lock::Section>) -> Vec<ErrMap> {
         .collect()
 }
 
-fn steps_from(section: Option<&crate::lock::Section>) -> Vec<StepSpec> {
+fn steps_from(section: Option<&crate::lock::Section>, file: &str) -> Result<Vec<StepSpec>, Diag> {
     let Some(section) = section else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    section
-        .blocks
-        .iter()
-        .map(|block| {
-            let get = |key: &str| {
-                block
-                    .bullets
-                    .iter()
-                    .find(|b| b.key == key)
-                    .map(|b| b.value.clone())
-                    .unwrap_or_default()
-            };
-            let op = get("op");
-            let id = block
-                .heading
-                .split_whitespace()
-                .next()
-                .unwrap_or("s")
-                .to_string();
-            StepSpec {
-                id,
-                op: op.clone(),
-                target: get("target"),
-                args: get("args"),
-                value: get("value"),
-                status: get("status")
-                    .parse()
-                    .unwrap_or(if op == "respond" { 200 } else { 0 }),
-                sql: get("sql").trim_matches('`').trim().to_string(),
-                params: crate::lock::parse_string_list(&get("params")).unwrap_or_default(),
-                out: get("out"),
-                fail: get("fail"),
-                when_expr: get("when"),
-                writes: get("writes") == "true",
-                table: get("table"),
-            }
-        })
-        .collect()
+    let mut steps = Vec::new();
+    for block in &section.blocks {
+        let get = |key: &str| {
+            block
+                .bullets
+                .iter()
+                .find(|b| b.key == key)
+                .map(|b| b.value.clone())
+                .unwrap_or_default()
+        };
+        let op = get("op");
+        let id = block
+            .heading
+            .split_whitespace()
+            .next()
+            .unwrap_or("s")
+            .to_string();
+        let mut params = Vec::new();
+        if let Some(raw) = block.bullets.iter().find(|b| b.key == "params") {
+            params = crate::lock::parse_string_list(&raw.value).map_err(|err| {
+                Diag::error(file, format!("invalid params: {err}")).at_section("Steps")
+            })?;
+        }
+        steps.push(StepSpec {
+            id,
+            op: op.clone(),
+            target: get("target"),
+            args: get("args"),
+            value: get("value"),
+            status: get("status")
+                .parse()
+                .unwrap_or(if op == "respond" { 200 } else { 0 }),
+            sql: get("sql").trim_matches('`').trim().to_string(),
+            params,
+            out: get("out"),
+            fail: get("fail"),
+            when_expr: get("when"),
+            writes: get("writes") == "true",
+            table: get("table"),
+            opts: block
+                .bullets
+                .iter()
+                .map(|b| (b.key.clone(), b.value.clone()))
+                .collect(),
+        });
+    }
+    Ok(steps)
 }
 
-fn parse_challenge(raw: &str) -> (String, String) {
+pub(crate) fn parse_challenge(raw: &str) -> (String, String) {
     let map = crate::lock::parse_inline_map(raw).unwrap_or_default();
     let ty = map
         .iter()
@@ -1202,6 +1101,65 @@ mod roles_list_tests {
             crate::lock::parse_string_list("[staff]").unwrap(),
             vec!["staff"]
         );
+    }
+}
+
+#[cfg(test)]
+mod malformed_list_tests {
+    use super::{method_from, steps_from};
+    use crate::diag::Level;
+    use crate::lock::{parse_sections, Kind, LockDoc, Meta};
+
+    fn method_doc(body: &str) -> LockDoc {
+        LockDoc {
+            meta: Meta::pending(
+                Kind::Method,
+                None,
+                "shop/methods/bad",
+                "shop/methods/bad.md",
+            ),
+            sections: parse_sections(body).expect("sections"),
+        }
+    }
+
+    #[test]
+    fn malformed_signature_errors_is_a_build_error() {
+        let doc = method_doc("## Signature\n\n- errors: NOT_FOUND\n- capabilities: []\n");
+        let err = method_from(&doc).unwrap_err();
+        assert_eq!(err.level, Level::Error);
+        assert!(err.message.contains("invalid errors"), "{err:?}");
+    }
+
+    #[test]
+    fn malformed_signature_capabilities_is_a_build_error() {
+        let doc = method_doc("## Signature\n\n- errors: []\n- capabilities: sign-jwt\n");
+        let err = method_from(&doc).unwrap_err();
+        assert!(err.message.contains("invalid capabilities"), "{err:?}");
+    }
+
+    #[test]
+    fn malformed_step_params_is_a_build_error() {
+        let doc = method_doc(
+            "## Signature\n\n- errors: []\n\n## Steps\n\n### s1\n\n- op: respond\n- params: a, b\n- status: 200\n",
+        );
+        let err = method_from(&doc).unwrap_err();
+        assert!(err.message.contains("invalid params"), "{err:?}");
+    }
+
+    #[test]
+    fn absent_lists_stay_empty() {
+        let doc = LockDoc {
+            meta: Meta::pending(Kind::Method, None, "shop/methods/ok", "shop/methods/ok.md"),
+            sections: parse_sections(
+                "## Signature\n\n- writes: false\n\n## Steps\n\n### s1\n\n- op: respond\n- status: 200\n",
+            )
+            .unwrap(),
+        };
+        let method = method_from(&doc).unwrap();
+        assert!(method.errors.is_empty());
+        assert!(method.capabilities.is_empty());
+        assert!(method.steps[0].params.is_empty());
+        assert!(steps_from(None, "x").unwrap().is_empty());
     }
 }
 

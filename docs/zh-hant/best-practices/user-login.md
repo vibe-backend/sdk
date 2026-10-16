@@ -57,8 +57,15 @@ dependencies:
   - { id: user/methods/sign-token, kind: method, hash: sha256:3b90...d4 }
 compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
+status: approved
+approval-mode: manual
+approved-by: [jack@example, mei@example]
+approved-at: 2026-10-14T08:25:00+08:00
+approval-ref: pr#125
+approved-commit: a1b2c125
 security-items:
-  - { item: write-sql, risk: medium, reason: "Records last login time" }
+  - { item: write-sql, risk: medium, reason: "Records last login time", approved-by: [jack@example] }
+signature: MEUCIQ...
 ---
 ## Signature
 - input: { email: { type: string, format: email, required: true }, password: { type: string, min: 1, max: 256, required: true } }
@@ -210,7 +217,7 @@ model lock 把 `last_login_at` 標記為 `public-writable`，並在 `public_writ
 - 排除已軟刪除的用戶（`deleted_at is null`）。
 - **密碼雜湊**（Decision 46）：argon2id m=64 MiB、t=3、p=1；登入成功時若已存的 PHC 參數不同，平台以 `credential_rehash` role 自動重新雜湊（§4A.2）。lock 不需宣告這項寫入。
 - **Refresh token**：與 access token 一併回傳；只以 HMAC 雜湊存在 `_platform_refresh_tokens`（Decision 45）。見 [refresh-token-rotation.md](refresh-token-rotation.md)。
-- 審核重點：`public: true`、`-auth`、`public-writes: true`（每項都屬高風險），以及寫入 SQL（中風險）（§12.8）。
+- 審核重點：`public: true`、`-auth`、`public-writes: true`（每項都屬高風險，需兩位確認），以及寫入 SQL（中風險）（§12.8）。
 
 ## 規格缺口
 

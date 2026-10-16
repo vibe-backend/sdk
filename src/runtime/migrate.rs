@@ -214,6 +214,17 @@ async fn migrate_in_tx(
         exec.batch(&["RESET search_path".to_string()]).await?;
         log.push(format!("applied {}", migration.id));
     }
+    // #157: this tenant's challenge replay table (SELECT/INSERT for the
+    // runtime role; expired rows are removed here, as the owner).
+    exec.batch(&super::replay::PgReplayStore::migration_sql(
+        tenant,
+        runtime_role,
+    )?)
+    .await?;
+    log.push(format!(
+        "challenge replay table {schema}.{}",
+        super::replay::REPLAY_TABLE
+    ));
     log.extend(protect_schema(exec, &schema).await?);
     // Fail closed: any RLS problem in any tenant schema fails the migration,
     // whether this run introduced it or it was already there (for example
@@ -273,7 +284,7 @@ async fn protect_schema(exec: &PgSession, schema: &str) -> Result<Vec<String>, S
     // `app.tenant_id` mid-transaction and read or copy other tenants' rows.
     let definer = exec
         .query_texts(
-            "SELECT format('function %I(%s)', p.proname, pg_get_function_identity_arguments(p.oid)) \
+            "SELECT format('%s %I(%s)', CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END, p.proname, pg_get_function_identity_arguments(p.oid)) \
              FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
              WHERE n.nspname = $1 AND p.prosecdef \
              UNION ALL \
@@ -286,7 +297,7 @@ async fn protect_schema(exec: &PgSession, schema: &str) -> Result<Vec<String>, S
         .await?;
     if !definer.is_empty() {
         return Err(format!(
-            "{schema}: SECURITY DEFINER functions and triggers are not allowed; they run as their owner and can switch app.tenant_id ({})",
+            "{schema}: SECURITY DEFINER functions, procedures and triggers are not allowed; they run as their owner and can switch app.tenant_id ({})",
             definer.join(", ")
         ));
     }

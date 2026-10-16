@@ -16,8 +16,8 @@ Each page has the same structure:
 
 ## Conventions used in examples
 
-- Names (`jack@example`, `mei@example`) and PR numbers (`pr#121` …) in the examples are **fictional**, copied in style from the spec examples. Since v1.8, locks carry no approval fields or signature (§2A.1).
-- Hashes are shortened placeholders (`sha256:9a1c...e2`), exactly as in the spec examples.
+- Approver names (`jack@example`, `mei@example`), PR numbers (`pr#121` …) and commit ids in lock frontmatter are **fictional**, copied in style from the spec examples.
+- Hashes, signatures and commit ids are shortened placeholders (`sha256:9a1c...e2`, `MEUCIQ...`), exactly as in the spec examples.
 - When a lock is shown as an excerpt ("sections only"), the frontmatter follows §2A.1 exactly; api locks additionally carry `scope:` (§2A.3).
 - Sections not used by a lock are written as `(none)` (§2A.2).
 
@@ -41,10 +41,10 @@ Each page has the same structure:
 
 ## Cross-cutting rules (apply to every page)
 
-- Runtime never interprets natural language; only locks that pass deploy validation, delivered through the signed manifest, are executed (§2.1, §9).
+- Runtime never interprets natural language; only approved, signed locks (via the signed manifest) are executed (§2.1, §9).
 - Every endpoint goes through `auth` by default; removing it (`-auth`) requires `public: true` (§3, §4).
 - No `DELETE` or `TRUNCATE` SQL in any lock, and no DDL outside `kind: migration` locks; every `UPDATE` needs a `WHERE` plus `scope: pk | rls` (§2A.4, §2B, Decisions 27, 51).
 - SQL is parameterized (`$1`, `$2` + `params`), single-statement (§2A.2, §2A.4).
-- Locks record no approval (v1.8, Decisions 77–80). `security-items` are informational highlights; human review happens in pull requests via the Git platform (rulesets, CODEOWNERS; see [pr-review-guide.md](../pr-review-guide.md)) (§2A.5, §9C).
+- Natural-language locks and any lock touching a security item need manual approval; high-risk items need two non-author owners/maintainers; max 5 security items per PR across all its locks (§2A.5, Decisions 19, 33, 34).
 - Row-level ownership inside a tenant uses `owner-key` (Decision 70, §12.6a); RLS alone only isolates tenants.
 - Secrets (DB connections, JWT keys, LLM keys) appear only as references, never in source, lock, manifest or logs (§2A.8.5, §9B). Audit never records plaintext email (Decision 68).

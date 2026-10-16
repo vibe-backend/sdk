@@ -33,8 +33,15 @@ dependencies:
   - { id: user, kind: model, hash: sha256:aa41...0f }
 compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
+status: approved
+approval-mode: manual
+approved-by: [jack@example, mei@example]
+approved-at: 2026-10-14T08:22:00+08:00
+approval-ref: pr#125
+approved-commit: a1b2c125
 security-items:
-  - { item: sign-token, risk: high, reason: "Sole token issuance entry point" }
+  - { item: sign-token, risk: high, reason: "Sole token issuance entry point", approved-by: [jack@example, mei@example] }
+signature: MEQCIA...
 ---
 ## Signature
 - input: { sub: { type: uuid, required: true } }
@@ -47,11 +54,19 @@ security-items:
 (none)
 
 ## Steps
-### s1 sign-jwt
+### s1 query
+- op: query
+- table: users
+- sql: select id::text as id from users where id = $1::uuid and deleted_at is null
+- params: [input.sub]
+- out: u
+- source-lines: 1-2
+
+### s2 sign-jwt
 - op: sign-jwt
 - alg: ES256
 - key-ref: JWT_SIGNING_KEY
-- claims: { sub: input.sub }
+- claims: { sub: u.id }
 - platform-claims: [iss, aud, exp, nbf, iat, jti, roles, tenant_id]
 - platform-claims-source: { roles: users.roles where id = sub, tenant_id: ctx.tenant_id }
 - ttl: 1h
@@ -60,7 +75,7 @@ security-items:
 - out: token
 - source-lines: 1-5
 
-### s2 respond
+### s3 respond
 - op: respond
 - value: { token: token.access, refresh_token: token.refresh }
 - source-lines: 4-4
@@ -86,7 +101,7 @@ Callers use it like this (from `user.login`):
 - **Claim whitelist**: the method may pass only `sub` and platform-allowed custom claims (e.g. `sid`). `roles` is read by the platform from the DB (looking up `sub` in the current tenant). `tenant_id` has exactly one source: `ctx.tenant_id`, resolved by the platform from the slug (public) or the verified token (auth); never from the client, the method or the `users` table (Decision 62). `iss`, `aud`, `exp`, `nbf`, `iat`, `jti` are added by the platform. Passing any of these is an error (§12.6, §10.8).
 - **TTL**: access tokens are capped at 1h (§4A.1, §10.8).
 - **Algorithm/key**: JWT only, RS256 or ES256; the private key is a platform secret referenced via `key-ref`, never inline (§12.6, §9B).
-- `capabilities: [sign-token]`, the claim whitelist and token ttl are all **high-risk** security items (highlighted for PR review) (§2A.5).
+- `capabilities: [sign-token]`, the claim whitelist and token ttl are all **high-risk** security items (two non-author approvers) (§2A.5).
 - Tokens are never logged (§9).
 - ⚠️ **Any caller can sign an arbitrary `sub`**: `user.sign-token` takes `sub` as plain input and does not verify that the caller authenticated that user. Any method or pipeline that can call it can mint a token for any user in the tenant. Keep callers to a minimum (`user.login`, `token-refresh`), review every new `## Calls` edge pointing at it, and watch the "signs token" column of the effective-permission summary (§10.10). The spec has no caller allowlist for capability methods.
 

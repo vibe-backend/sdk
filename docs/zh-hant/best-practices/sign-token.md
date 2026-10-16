@@ -33,8 +33,15 @@ dependencies:
   - { id: user, kind: model, hash: sha256:aa41...0f }
 compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
 compiler-hash: sha256:c0de...77
+status: approved
+approval-mode: manual
+approved-by: [jack@example, mei@example]
+approved-at: 2026-10-14T08:22:00+08:00
+approval-ref: pr#125
+approved-commit: a1b2c125
 security-items:
-  - { item: sign-token, risk: high, reason: "Sole token issuance entry point" }
+  - { item: sign-token, risk: high, reason: "Sole token issuance entry point", approved-by: [jack@example, mei@example] }
+signature: MEQCIA...
 ---
 ## Signature
 - input: { sub: { type: uuid, required: true } }
@@ -47,11 +54,19 @@ security-items:
 (none)
 
 ## Steps
-### s1 sign-jwt
+### s1 query
+- op: query
+- table: users
+- sql: select id::text as id from users where id = $1::uuid and deleted_at is null
+- params: [input.sub]
+- out: u
+- source-lines: 1-2
+
+### s2 sign-jwt
 - op: sign-jwt
 - alg: ES256
 - key-ref: JWT_SIGNING_KEY
-- claims: { sub: input.sub }
+- claims: { sub: u.id }
 - platform-claims: [iss, aud, exp, nbf, iat, jti, roles, tenant_id]
 - platform-claims-source: { roles: users.roles where id = sub, tenant_id: ctx.tenant_id }
 - ttl: 1h
@@ -60,7 +75,7 @@ security-items:
 - out: token
 - source-lines: 1-5
 
-### s2 respond
+### s3 respond
 - op: respond
 - value: { token: token.access, refresh_token: token.refresh }
 - source-lines: 4-4
@@ -86,7 +101,7 @@ security-items:
 - **Claim 白名單**：method 只可以傳入 `sub` 及平台允許的自訂 claim（例如 `sid`）。`roles` 由平台從資料庫讀取（在當前租戶中查找 `sub`）。`tenant_id` 只有一個來源：`ctx.tenant_id`，由平台從 slug（公開）或已驗證的 token（auth）解析；絕不取自用戶端、method 或 `users` 表（Decision 62）。`iss`、`aud`、`exp`、`nbf`、`iat`、`jti` 由平台加上。傳入其中任何一項都屬錯誤（§12.6、§10.8）。
 - **TTL**：access token 上限為 1 小時（§4A.1、§10.8）。
 - **演算法／金鑰**：只限 JWT，使用 RS256 或 ES256；私鑰屬平台機密，以 `key-ref` 引用，絕不直接寫入（§12.6、§9B）。
-- `capabilities: [sign-token]`、claim 白名單及 token ttl 都屬於**高風險**安全項目（會在 PR 審核中標示）（§2A.5）。
+- `capabilities: [sign-token]`、claim 白名單及 token ttl 都屬於**高風險**安全項目（需兩位非作者確認）（§2A.5）。
 - token 永遠不會寫入日誌（§9）。
 - ⚠️ **任何呼叫方都可以為任意 `sub` 簽發 token**：`user.sign-token` 把 `sub` 當作一般輸入，並不會驗證呼叫方是否已認證該用戶。任何能呼叫它的 method 或 pipeline，都可以為租戶內任何用戶簽發 token。請把呼叫方減至最少（`user.login`、`token-refresh`），審核每一條新指向它的 `## Calls` 關係，並留意有效權限摘要中的「簽發 token」一欄（§10.10）。規格沒有為 capability method 提供呼叫方白名單。
 
