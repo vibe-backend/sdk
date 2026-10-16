@@ -122,6 +122,24 @@ fn normalize_version(raw: &str) -> Result<String, String> {
     Ok(v)
 }
 
+/// Release version named by the certificate itself: the tag of
+/// `source_ref` (`refs/tags/v<version>`), which the SAN must end with. The
+/// result comes only from the certificate; callers compare it with the
+/// deployer's expected version, which comes from deployer config or the CLI.
+pub fn attested_version(san: &str, source_ref: &str) -> Result<String, String> {
+    let tag = source_ref
+        .strip_prefix("refs/tags/v")
+        .ok_or_else(|| format!("sigstore certificate: ref {source_ref} is not a v<version> tag"))?;
+    let version = normalize_version(tag)
+        .map_err(|err| format!("sigstore certificate: ref {source_ref}: {err}"))?;
+    if version != tag || !san.ends_with(&format!("@{source_ref}")) {
+        return Err(format!(
+            "sigstore certificate: SAN {san} does not name the tag {source_ref}"
+        ));
+    }
+    Ok(version)
+}
+
 fn expectation_source_ref(version: &str) -> String {
     format!("refs/tags/v{}", version.trim().trim_start_matches('v'))
 }
@@ -248,6 +266,14 @@ pub fn check_identity_claims(
         }
         None => return Err("sigstore certificate: SAN does not name the signer workflow".into()),
     }
+    let san = identity_san.unwrap_or_default();
+    let attested = attested_version(san, source_ref)?;
+    if attested != expected.version {
+        return Err(format!(
+            "sigstore certificate: release version {attested} is not the expected {}",
+            expected.version
+        ));
+    }
     let runner = runner_environment.ok_or("sigstore certificate: missing runner environment")?;
     if runner != "github-hosted" {
         return Err(format!(
@@ -335,11 +361,12 @@ fn finish_identity(
         policy,
         expected,
     )?;
+    let version = attested_version(&signer, &source_ref)?;
     Ok(Identity {
         repo: policy.repo.clone(),
         source_ref,
         commit,
-        version: expected.version.clone(),
+        version,
         signer_workflow: signer,
         rekor_log_index,
     })

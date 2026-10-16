@@ -539,10 +539,12 @@ pub fn read_release_manifest(
             manifest.provenance.commit, identity.commit
         )));
     }
-    if identity.version != expected.version {
+    // `identity.version` is read from the certificate tag; `expected` comes
+    // from the deployer (CLI or environment), never from the bundle.
+    if identity.version != expected.version || manifest_version != identity.version {
         return Err(single(format!(
-            "attested version {} is not the expected {}",
-            identity.version, expected.version
+            "attested version {} does not match the expected {} and the manifest version {}",
+            identity.version, expected.version, manifest.provenance.version
         )));
     }
     Ok((manifest, identity))

@@ -426,3 +426,89 @@ fn tempfile_dir() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+fn release_claims(
+    tag_version: &str,
+    expected: &Expectation,
+) -> Result<(String, String, String), String> {
+    let policy = Policy::default();
+    let signer = policy.expected_signer(tag_version);
+    let source_ref = format!("refs/tags/v{tag_version}");
+    check_identity_claims(
+        Some(&signer),
+        Some(GITHUB_OIDC_ISSUER),
+        Some("https://github.com/vibe-backend/sdk"),
+        Some(&source_ref),
+        Some("abc123"),
+        Some(&signer),
+        Some("github-hosted"),
+        &policy,
+        expected,
+    )
+}
+
+#[test]
+fn identity_tag_for_another_version_is_refused() {
+    let expected = expect("1.8.0", "abc123");
+    for other in ["1.9.0", "1.8.1", "1.8.0-rc.1", "18.0"] {
+        let err = release_claims(other, &expected).unwrap_err();
+        assert!(err.contains("sigstore certificate:"), "{other}: {err}");
+    }
+    let err = vibe::attest::attested_version(
+        "https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v1.9.0",
+        "refs/tags/v1.8.0",
+    )
+    .unwrap_err();
+    assert!(err.contains("does not name the tag"), "{err}");
+}
+
+#[test]
+fn identity_tag_for_the_expected_version_passes() {
+    let expected = expect("v1.8.0", "abc123");
+    let (source_ref, commit, _) = release_claims("1.8.0", &expected).unwrap();
+    assert_eq!(source_ref, "refs/tags/v1.8.0");
+    assert_eq!(commit, "abc123");
+    let signer = Policy::default().expected_signer("1.8.0");
+    assert_eq!(
+        vibe::attest::attested_version(&signer, &source_ref).unwrap(),
+        "1.8.0"
+    );
+}
+
+#[test]
+fn manifest_version_other_than_the_expected_is_refused() {
+    let dir = tempfile_dir();
+    let manifest_path = dir.join("manifest.json");
+    let manifest = serde_json::json!({
+        "manifest_version": 1,
+        "routes": [],
+        "models": [],
+        "methods": [],
+        "migrations": [],
+        "signature": "sigstore-keyless",
+        "provenance": {
+            "build_mode": "release",
+            "version": "1.9.0",
+            "commit": "abc123",
+            "locks": [],
+            "security_items": [],
+            "release_approval": null
+        }
+    });
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    std::fs::write(&manifest_path, &bytes).unwrap();
+    let bundle_path = vibe::attest::default_bundle_path(&manifest_path);
+    std::fs::write(&bundle_path, Fixture::default().bundle(&bytes)).unwrap();
+    let err = vibe::manifest::read_release_manifest(
+        &manifest_path,
+        &bundle_path,
+        &Policy::default(),
+        &expect("1.8.0", "abc123"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("manifest version 1.9.0 is not the expected 1.8.0"),
+        "{err}"
+    );
+}
