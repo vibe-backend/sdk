@@ -80,10 +80,7 @@ fn ctx(auth: &AuthConfig) -> CallCtx<'_> {
 }
 
 fn cfg(source: BreachedSource) -> BreachedConfig {
-    BreachedConfig {
-        source,
-        min_count: 1,
-    }
+    BreachedConfig { source }
 }
 
 async fn hash_with(config: BreachedConfig, pw: &str) -> Result<(), String> {
@@ -232,13 +229,13 @@ struct Mock {
     redirect_to: String,
 }
 
-/// 150 padding lines plus the breached suffixes (counts 3 and 0).
+/// 150 padding lines plus the breached suffixes (counts 1 and 0).
 fn padded_body(prefix: &str) -> String {
     let mut body = String::new();
     for i in 0..150 {
         body.push_str(&format!("{:035X}:0\r\n", i));
     }
-    for (pw, count) in [("hunter2hunter2", 3), ("padding-only-password", 0)] {
+    for (pw, count) in [("hunter2hunter2", 1), ("padding-only-password", 0)] {
         let h = sha1_hex(pw);
         if h.starts_with(prefix) {
             body.push_str(&format!("{}:{count}\r\n", h[5..].to_lowercase()));
@@ -330,7 +327,7 @@ async fn range_api_sends_only_a_prefix_and_caches_it() {
     let api = Arc::new(BreachedSource::range(&url, false).unwrap());
     let check = |pw: &'static str| {
         let api = api.clone();
-        async move { api.is_breached(pw, 1).await }
+        async move { api.is_breached(pw).await }
     };
     assert_eq!(check("hunter2hunter2").await, Ok(true));
     assert_eq!(check("hunter2hunter2").await, Ok(true));
@@ -352,25 +349,6 @@ async fn range_api_sends_only_a_prefix_and_caches_it() {
         assert_eq!(prefix.len(), 5, "only the prefix leaves the platform");
         assert_eq!(padding.as_deref(), Some("true"));
     }
-}
-
-#[tokio::test]
-async fn min_count_is_configurable() {
-    let (url, _) = server("ok", "").await;
-    let strict = BreachedConfig {
-        source: BreachedSource::range(&url, false).unwrap(),
-        min_count: 5,
-    };
-    assert_eq!(
-        strict.is_breached("hunter2hunter2").await,
-        Ok(false),
-        "seen 3 times < 5"
-    );
-    let default = BreachedConfig {
-        source: BreachedSource::range(&url, false).unwrap(),
-        min_count: 1,
-    };
-    assert_eq!(default.is_breached("hunter2hunter2").await, Ok(true));
 }
 
 #[tokio::test]
@@ -415,8 +393,8 @@ async fn redirects_are_not_followed() {
 async fn outage_fails_closed_and_counts_failures() {
     let (url, _) = server("500", "").await;
     let source = BreachedSource::range(&url, false).unwrap();
-    assert!(source.is_breached("hunter2hunter2", 1).await.is_err());
-    assert!(source.is_breached(CLEAN, 1).await.is_err());
+    assert!(source.is_breached("hunter2hunter2").await.is_err());
+    assert!(source.is_breached(CLEAN).await.is_err());
     let BreachedSource::Range(api) = &source else {
         unreachable!()
     };
@@ -436,7 +414,6 @@ fn configuration_rules() {
     };
     let ok = BreachedConfig::from_env(&env(&[]), true).unwrap();
     assert!(ok.source.describe().contains("api.pwnedpasswords.com"));
-    assert_eq!(ok.min_count, 1);
     assert!(BreachedConfig::from_env(
         &env(&[
             ("VIBE_BREACHED_PASSWORDS_FILE", "/x"),
@@ -448,12 +425,6 @@ fn configuration_rules() {
     assert!(
         BreachedConfig::from_env(&env(&[("VIBE_BREACHED_PASSWORDS_MIN_COUNT", "0")]), false)
             .is_err()
-    );
-    assert_eq!(
-        BreachedConfig::from_env(&env(&[("VIBE_BREACHED_PASSWORDS_MIN_COUNT", "10")]), false)
-            .unwrap()
-            .min_count,
-        10
     );
     // Hosts.
     assert!(
@@ -492,13 +463,13 @@ async fn timeout_is_configurable() {
         .unwrap()
         .with_timeout(std::time::Duration::from_millis(200));
     assert!(BreachedSource::Range(Box::new(fast))
-        .is_breached(CLEAN, 1)
+        .is_breached(CLEAN)
         .await
         .is_err());
     let patient = RangeApi::new(&url, false).unwrap();
     assert_eq!(
         BreachedSource::Range(Box::new(patient))
-            .is_breached(CLEAN, 1)
+            .is_breached(CLEAN)
             .await,
         Ok(false)
     );
@@ -631,17 +602,12 @@ fn removed_variables_stop_startup_in_every_environment() {
 }
 
 #[test]
-fn min_count_has_an_upper_bound() {
-    let min = |value: &'static str| {
-        let get = move |name: &str| {
-            (name == "VIBE_BREACHED_PASSWORDS_MIN_COUNT").then(|| value.to_string())
-        };
-        BreachedConfig::from_env(&get, false).map(|c| c.min_count)
-    };
-    assert_eq!(min("1").unwrap(), 1);
-    assert_eq!(min("10").unwrap(), vibe::runtime::breached::MAX_MIN_COUNT);
-    for bad in ["0", "11", "1000", "18446744073709551615"] {
-        assert!(min(bad).is_err(), "accepted {bad}");
+fn removed_min_count_is_rejected() {
+    for value in ["", "1", "10", "invalid"] {
+        let get =
+            |name: &str| (name == "VIBE_BREACHED_PASSWORDS_MIN_COUNT").then(|| value.to_string());
+        let err = BreachedConfig::from_env(&get, false).err().unwrap();
+        assert!(err.contains("removed"));
     }
 }
 
@@ -715,7 +681,7 @@ async fn lookup_errors_name_only_a_category() {
         let (url, _) = server(mode, "").await;
         let err = BreachedSource::range(&url, false)
             .unwrap()
-            .is_breached(CLEAN, 1)
+            .is_breached(CLEAN)
             .await
             .unwrap_err();
         assert!(!err.contains("UPSTREAM-MARKER-TEXT"), "{mode}: {err}");
@@ -744,7 +710,7 @@ async fn timeout_is_one_total_deadline_and_fails_closed() {
         let source = source.clone();
         tasks.push(tokio::spawn(async move {
             source
-                .is_breached(&format!("timeout-check-{i}-password"), 1)
+                .is_breached(&format!("timeout-check-{i}-password"))
                 .await
         }));
     }
@@ -768,7 +734,72 @@ async fn failures_feed_the_process_wide_counter() {
     let before = vibe::runtime::breached_lookup_failures();
     let (url, _) = server("500", "").await;
     let source = BreachedSource::range(&url, false).unwrap();
-    assert!(source.is_breached(CLEAN, 1).await.is_err());
-    assert!(source.is_breached(CLEAN, 1).await.is_err());
+    assert!(source.is_breached(CLEAN).await.is_err());
+    assert!(source.is_breached(CLEAN).await.is_err());
     assert!(vibe::runtime::breached_lookup_failures() >= before + 2);
+}
+
+#[test]
+fn range_parser_rejects_duplicates_and_malformed_lines() {
+    use vibe::runtime::breached::LookupError;
+    let body = padded_body("00000");
+    assert!(
+        parse_range(body.as_bytes()).is_ok(),
+        "zero-count padding is valid"
+    );
+    assert!(parse_range(format!("{body}\r\n\n").as_bytes()).is_ok());
+    for suffix in [format!("{:035X}:0", 10), format!("{:035x}:1", 10)] {
+        assert_eq!(
+            parse_range(format!("{body}{suffix}\n").as_bytes()).unwrap_err(),
+            LookupError::DuplicateSuffix(151)
+        );
+    }
+    for bad in [
+        "",
+        " ",
+        "ABC:1",
+        "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG:1",
+        "00000000000000000000000000000000000:+1",
+        "00000000000000000000000000000000000:1 ",
+        "00000000000000000000000000000000000:18446744073709551616",
+    ] {
+        let input = format!("{bad}\n{body}");
+        assert_eq!(
+            parse_range(input.as_bytes()).unwrap_err(),
+            LookupError::MalformedLine(1)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_targets_and_link_containers_are_checked() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let path = list_file("symlinks", 0o644);
+    let root = std::path::Path::new(&path).parent().unwrap();
+    let target_dir = root.join("target");
+    let link_dir = root.join("links");
+    for dir in [&target_dir, &link_dir] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let target = target_dir.join("list");
+    std::fs::copy(&path, &target).unwrap();
+    let link = link_dir.join("list");
+    symlink(&target, &link).unwrap();
+    let directory_link = link_dir.join("directory");
+    symlink(&target_dir, &directory_link).unwrap();
+    let via_directory = directory_link.join("list");
+    let via_directory = via_directory.to_str().unwrap();
+    let link = link.to_str().unwrap();
+    assert!(OfflineList::load(link, true).is_ok());
+    for dir in [&target_dir, &link_dir] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let err = OfflineList::load(link, true).err().unwrap();
+        assert!(err.contains(dir.to_str().unwrap()), "{err}");
+        assert!(OfflineList::load(link, false).is_ok());
+        assert!(OfflineList::load(via_directory, true).is_err());
+        assert!(OfflineList::load(via_directory, false).is_ok());
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }

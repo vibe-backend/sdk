@@ -36,11 +36,6 @@ const MIN_LINES: usize = 100;
 const CACHE_TTL: Duration = Duration::from_secs(3600);
 const CACHE_ENTRIES: usize = 4096;
 const MAX_LOOKUPS: usize = 8;
-/// Largest accepted `VIBE_BREACHED_PASSWORDS_MIN_COUNT`. The recommended
-/// value is 1 (any breach counts); a small margin is allowed for operators
-/// who want to ignore one-off entries, anything above it is a startup error.
-pub const MAX_MIN_COUNT: u64 = 10;
-
 /// A few well-known breached passwords that pass the length floor; the
 /// default for tests and `AuthConfig::anonymous`.
 const BUILTIN: &[&str] = &[
@@ -83,6 +78,8 @@ pub enum LookupError {
     Encoding,
     /// A line that is not `SUFFIX:COUNT` (1-based line number).
     MalformedLine(usize),
+    /// Repeated suffix (case insensitive), with its 1-based line number.
+    DuplicateSuffix(usize),
     /// Fewer entries than a padded response has.
     TooFewEntries,
     /// Lookup slots closed (shutdown).
@@ -98,7 +95,10 @@ impl LookupError {
             Self::Status(_) => "status",
             Self::ContentType => "content_type",
             Self::TooLarge => "too_large",
-            Self::Encoding | Self::MalformedLine(_) | Self::TooFewEntries => "malformed",
+            Self::Encoding
+            | Self::MalformedLine(_)
+            | Self::DuplicateSuffix(_)
+            | Self::TooFewEntries => "malformed",
             Self::Closed => "closed",
         }
     }
@@ -116,6 +116,10 @@ impl std::fmt::Display for LookupError {
             Self::TooLarge => f.write_str("breached-password lookup: response too large"),
             Self::Encoding => f.write_str("breached-password response is not UTF-8"),
             Self::MalformedLine(n) => write!(f, "breached-password response: malformed line {n}"),
+            Self::DuplicateSuffix(n) => write!(
+                f,
+                "breached-password response: duplicate suffix at line {n}"
+            ),
             Self::TooFewEntries => {
                 f.write_str("breached-password response has too few entries for a padded response")
             }
@@ -151,10 +155,6 @@ pub enum BreachedSource {
 /// Breached-password settings.
 pub struct BreachedConfig {
     pub source: BreachedSource,
-    /// A password counts as breached when seen at least this many times
-    /// (`VIBE_BREACHED_PASSWORDS_MIN_COUNT`, default 1: any breach counts,
-    /// as NIST SP 800-63B recommends).
-    pub min_count: u64,
 }
 
 fn sha1(plain: &str) -> [u8; 20] {
@@ -262,8 +262,43 @@ pub fn unsafe_permissions(path: &str, meta: &std::fs::Metadata) -> Result<Option
     if meta.permissions().mode() & 0o022 != 0 {
         return Ok(Some("file is writable by group or other".into()));
     }
+    // Walk link targets as well as the requested path, retaining every
+    // directory that contains a link (including links within link targets).
+    let absolute = std::path::absolute(path).map_err(|err| err.to_string())?;
+    let mut pending: std::collections::VecDeque<_> = absolute
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    let mut current = std::path::PathBuf::new();
+    let mut link_parents = Vec::new();
+    let mut links = 0;
+    while let Some(component) = pending.pop_front() {
+        current.push(component);
+        let metadata = std::fs::symlink_metadata(&current).map_err(|err| err.to_string())?;
+        if metadata.file_type().is_symlink() {
+            links += 1;
+            if links > 40 {
+                return Err("breached-password list: too many symbolic links".into());
+            }
+            let parent = current.parent().unwrap().to_path_buf();
+            link_parents.push(std::fs::canonicalize(&parent).map_err(|err| err.to_string())?);
+            let target = std::fs::read_link(&current).map_err(|err| err.to_string())?;
+            current = if target.is_absolute() {
+                std::path::PathBuf::new()
+            } else {
+                parent
+            };
+            for part in target.components().rev() {
+                pending.push_front(part.as_os_str().to_os_string());
+            }
+        }
+    }
     let full = std::fs::canonicalize(path).map_err(|err| format!("{path}: {err}"))?;
-    for dir in full.ancestors().skip(1) {
+    for dir in full
+        .ancestors()
+        .skip(1)
+        .chain(link_parents.iter().flat_map(|p| p.ancestors()))
+    {
         let mode = std::fs::metadata(dir)
             .map_err(|err| format!("{}: {err}", dir.display()))?
             .permissions()
@@ -500,11 +535,16 @@ impl RangeApi {
 pub fn parse_range(body: &[u8]) -> Result<Suffixes, LookupError> {
     let text = std::str::from_utf8(body).map_err(|_| LookupError::Encoding)?;
     let mut out = Suffixes::new();
-    for (n, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+    let mut text = text;
+    while let Some(rest) = text.strip_suffix('\n') {
+        text = rest.strip_suffix('\r').unwrap_or(rest);
+    }
+    for (n, line) in text.split_inclusive('\n').enumerate() {
+        let line = if let Some(rest) = line.strip_suffix('\n') {
+            rest.strip_suffix('\r').unwrap_or(rest)
+        } else {
+            line
+        };
         let bad = || LookupError::MalformedLine(n + 1);
         let (suffix, count) = line.split_once(':').ok_or_else(bad)?;
         if suffix.len() != 35 || count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
@@ -514,7 +554,9 @@ pub fn parse_range(body: &[u8]) -> Result<Suffixes, LookupError> {
         let mut key = [0u8; 18];
         hex::decode_to_slice(format!("0{suffix}"), &mut key).map_err(|_| bad())?;
         let count: u64 = count.parse().map_err(|_| bad())?;
-        out.insert(key, count);
+        if out.insert(key, count).is_some() {
+            return Err(LookupError::DuplicateSuffix(n + 1));
+        }
     }
     if out.len() < MIN_LINES {
         return Err(LookupError::TooFewEntries);
@@ -558,9 +600,9 @@ impl BreachedSource {
         }
     }
 
-    /// Whether `plain` was seen in breaches at least `min_count` times.
+    /// Whether `plain` was seen in breaches at least once.
     /// `Err` when no source can answer (the caller fails closed).
-    pub async fn is_breached(&self, plain: &str, min_count: u64) -> Result<bool, String> {
+    pub async fn is_breached(&self, plain: &str) -> Result<bool, String> {
         let digest = sha1(plain);
         match self {
             Self::Offline(list) => Ok(list.contains(&digest)),
@@ -569,7 +611,7 @@ impl BreachedSource {
                 match api.suffixes(prefix).await {
                     Ok(suffixes) => Ok(suffixes
                         .get(&suffix_key(&digest))
-                        .is_some_and(|count| *count >= min_count.max(1))),
+                        .is_some_and(|count| *count >= 1)),
                     Err(err) => {
                         let failures = api.failures.fetch_add(1, Ordering::Relaxed) + 1;
                         LOOKUP_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -600,7 +642,6 @@ impl BreachedConfig {
     pub fn builtin() -> Self {
         Self {
             source: BreachedSource::builtin(),
-            min_count: 1,
         }
     }
 
@@ -609,14 +650,15 @@ impl BreachedConfig {
     /// - `VIBE_BREACHED_PASSWORDS_URL` (default Pwned Passwords). Errors,
     ///   timeouts and invalid responses fail closed (503 with Retry-After: 1)
     ///   in every environment;
-    /// - `VIBE_BREACHED_PASSWORDS_MIN_COUNT` (default 1, at most
-    ///   [`MAX_MIN_COUNT`]),
-    ///   `VIBE_BREACHED_PASSWORDS_TIMEOUT_MS` (default 2000, 100..=10000:
+    /// - `VIBE_BREACHED_PASSWORDS_TIMEOUT_MS` (default 2000, 100..=10000:
     ///   one total deadline per lookup).
     pub fn from_env(
         get: &dyn Fn(&str) -> Option<String>,
         production: bool,
     ) -> Result<Self, String> {
+        if get("VIBE_BREACHED_PASSWORDS_MIN_COUNT").is_some() {
+            return Err("VIBE_BREACHED_PASSWORDS_MIN_COUNT was removed; unset it. Any breach occurrence rejects the password".into());
+        }
         for name in [
             "VIBE_BREACHED_PASSWORDS_FALLBACK_FILE",
             "VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE",
@@ -634,18 +676,6 @@ impl BreachedConfig {
         };
         let file = var("VIBE_BREACHED_PASSWORDS_FILE");
         let url = var("VIBE_BREACHED_PASSWORDS_URL");
-        let min_count = match var("VIBE_BREACHED_PASSWORDS_MIN_COUNT") {
-            None => 1,
-            Some(raw) => raw
-                .parse::<u64>()
-                .ok()
-                .filter(|n| (1..=MAX_MIN_COUNT).contains(n))
-                .ok_or_else(|| {
-                    format!(
-                        "VIBE_BREACHED_PASSWORDS_MIN_COUNT must be a whole number from 1 to {MAX_MIN_COUNT}"
-                    )
-                })?,
-        };
         let timeout = match var("VIBE_BREACHED_PASSWORDS_TIMEOUT_MS") {
             None => DEFAULT_TIMEOUT,
             Some(raw) => raw
@@ -675,10 +705,10 @@ impl BreachedConfig {
                 BreachedSource::Range(Box::new(api))
             }
         };
-        Ok(Self { source, min_count })
+        Ok(Self { source })
     }
 
     pub async fn is_breached(&self, plain: &str) -> Result<bool, String> {
-        self.source.is_breached(plain, self.min_count).await
+        self.source.is_breached(plain).await
     }
 }

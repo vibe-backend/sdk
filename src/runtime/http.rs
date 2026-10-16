@@ -2019,7 +2019,6 @@ mod rate_tests {
         let mut auth = AuthConfig::anonymous();
         auth.breached = Arc::new(BreachedConfig {
             source: BreachedSource::Range(Box::new(api)),
-            min_count: 1,
         });
         let err = crate::runtime::ops::hash_new_password(&auth, "a-unique-clean-password")
             .await
