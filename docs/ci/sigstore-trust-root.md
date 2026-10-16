@@ -13,12 +13,23 @@ check.
 
 | Name | Level | When | Where |
 | --- | --- | --- | --- |
-| `manifest_trust_root_rejected` | `ERROR` log, process counter | A release manifest is refused because the trust root cannot vouch for its bundle: Fulcio chain does not lead to a trusted CA, no CA was valid at signing time, the Rekor log is unknown, or the embedded root itself is unusable. | `src/attest.rs` (`record_trust_root_rejection`); counter via `vibe::attest::trust_root_rejected_total()` |
+| `manifest_trust_root_rejected` | `ERROR` log (with bounded `kind`) | A release manifest is refused because the trust root cannot vouch for its bundle. `kind` is one of: `sct` (signed certificate timestamp from a CT log the root does not know, e.g. CT log rotation), `ca_chain` (Fulcio chain does not lead to a trusted CA), `no_valid_authority` (no CA valid at signing time), `unknown_log` (Rekor log unknown), `timestamp_authority` (timestamp outside the authority's validity), `not_verified` (certificate chain or Rekor log not verified), `trust_root` (embedded root unusable). | `src/attest.rs` (`record_trust_root_rejection`) |
 | `manifest_trust_root_rotation_pending` | `WARN` log | At manifest verification, the embedded root lists a CA or log key whose validity ends in the future (being retired) or starts in the future (announced). | `src/attest.rs` (`warn_on_pending_rotation`) |
 
-Both log lines carry an `alert` field with the name above, so a log-based
-alert rule is `alert = "manifest_trust_root_rejected"` (page) and
-`alert = "manifest_trust_root_rotation_pending"` (ticket). Other refusals
+Both log lines carry an `alert` field with the name above. The alert is
+log-based: the SDK ships no metrics exporter and no alert rule file. The
+in-process counters (`vibe::attest::trust_root_rejected_total()`,
+`trust_root_rejected_by_kind(kind)`) are not exported; they exist for tests
+and for an embedding service that exports them itself.
+
+**Where the alert fires:** the deployment's log pipeline must have these
+rules (they are not in this repository):
+
+- page: any line with `alert = "manifest_trust_root_rejected"` (any `kind`);
+- ticket: any line with `alert = "manifest_trust_root_rotation_pending"`.
+
+Group or label alerts by `kind` only. `reason` is the full verifier error
+(unbounded); keep it in the log and never use it as a metric label. Other refusals
 (bad signature, digest mismatch, wrong identity, version or commit) are not
 counted as trust-root rejections.
 
@@ -33,13 +44,13 @@ as the same early warning.
 Never turn verification off, never fall back to the development key, and
 never deploy the manifest by another path to get past this alert.
 
-1. **Collect the refusal.** The log line has a `reason` (the verifier
-   error). Note the release version and commit being deployed, and the
+1. **Collect the refusal.** The log line has a `kind` (bounded, see
+   Signals) and a `reason` (the full verifier error). Note the release version and commit being deployed, and the
    running binary version (`vibe --version`).
 2. **Tell rotation apart from a bad signature.**
    - Likely an expired or rotated trust root when: the reason is a
      certificate chain error, "no trusted certificate authority is valid",
-     or "unknown transparency log"; the same bundle verifies with a current
+     "unknown transparency log", or `kind = "sct"` (CT log rotation); the same bundle verifies with a current
      tool (`gh attestation verify <manifest> --bundle <bundle> --repo
      vibe-backend/sdk --signer-workflow
      vibe-backend/sdk/.github/workflows/release.yml --source-ref
@@ -55,8 +66,9 @@ never deploy the manifest by another path to get past this alert.
 3. **Rotated root: ship a release with a refreshed trust root** (next
    section), approved through the `release` environment like any release.
 4. **Redeploy** the new runtime, then the manifest. Confirm the
-   `release manifest attestation verified` log line and that the
-   `manifest_trust_root_rejected` counter stays at zero.
+   `release manifest attestation verified` log line, and that the log query
+   `alert = "manifest_trust_root_rejected"` returns no new lines for the new
+   deployment.
 
 ## Runbook: `manifest_trust_root_rotation_pending` fired
 

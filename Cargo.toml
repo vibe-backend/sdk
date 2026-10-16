@@ -47,6 +47,7 @@ zeroize = "1"
 sqlparser = { version = "0.52", features = ["visitor"] }
 
 [dev-dependencies]
+jiff = "0.2"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 rcgen = "0.13"
 tower = { version = "0.5", features = ["util"] }
