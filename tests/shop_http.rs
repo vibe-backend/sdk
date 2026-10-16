@@ -84,6 +84,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         env_name: "test".into(),
         jwks: None,
         roles_claim: "roles".into(),
+        signing_keys: Default::default(),
         route_jwks: Default::default(),
     };
     let loaded = vibe::runtime::load_project_slugs(&root, true).unwrap();
@@ -697,6 +698,14 @@ impl vibe::runtime::QueryExec for Exhausted {
         _role: &str,
         _stmt: vibe::runtime::Stmt,
     ) -> Result<Vec<serde_json::Map<String, Value>>, vibe::runtime::ExecError> {
+        Err(vibe::runtime::ExecError::PoolExhausted)
+    }
+
+    async fn user_roles(
+        &self,
+        _tenant_id: &str,
+        _user_id: &str,
+    ) -> Result<Option<Vec<String>>, vibe::runtime::ExecError> {
         Err(vibe::runtime::ExecError::PoolExhausted)
     }
 }

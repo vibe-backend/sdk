@@ -497,6 +497,22 @@ impl TenantPools {
 
 #[async_trait]
 impl QueryExec for TenantPools {
+    async fn user_roles(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, ExecError> {
+        let _permits = self.acquire(tenant_id, "app_rw").map_err(|scope| {
+            scope.counter().fetch_add(1, Ordering::Relaxed);
+            ExecError::PoolExhausted
+        })?;
+        let pool = self
+            .pool(tenant_id, "app_rw")
+            .await
+            .map_err(|err| ExecError::Message(format!("database unavailable: {err}")))?;
+        pool.user_roles(tenant_id, user_id).await
+    }
+
     async fn execute(
         &self,
         tenant_id: &str,

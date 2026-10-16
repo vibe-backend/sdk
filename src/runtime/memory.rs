@@ -40,6 +40,9 @@ const STANDARD_POLICY: &str = super::sql::POLICY_TEMPLATE;
 pub struct MemoryExec {
     tables: Mutex<BTreeMap<String, Vec<Row>>>,
     models: BTreeMap<String, MemTable>,
+    /// Set by [`MemoryExec::new`]: an unchecked store for platform
+    /// operation tests (no model grants).
+    plain: Option<super::exec::PlainMemoryExec>,
 }
 
 struct MemTable {
@@ -58,11 +61,29 @@ fn squash(text: &str) -> String {
 impl MemoryExec {
     /// Executor without models; every statement is refused. Only for tests.
     #[cfg(test)]
+    pub fn empty() -> Self {
+        Self {
+            tables: Mutex::default(),
+            models: BTreeMap::new(),
+            plain: None,
+        }
+    }
+
+    /// Unchecked store (any table, no model grants) for tests of platform
+    /// operations; [`MemoryExec::from_manifest`] is the dev executor.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             tables: Mutex::default(),
             models: BTreeMap::new(),
+            plain: Some(super::exec::PlainMemoryExec::new()),
+        }
+    }
+
+    /// Adds a row to a tenant table directly (only for [`MemoryExec::new`]).
+    pub fn seed(&self, tenant_id: &str, table: &str, row: Row) {
+        if let Some(plain) = &self.plain {
+            plain.seed(tenant_id, table, row);
         }
     }
 
@@ -106,6 +127,7 @@ impl MemoryExec {
         Ok(Self {
             tables: Mutex::default(),
             models,
+            plain: None,
         })
     }
 }
@@ -117,12 +139,36 @@ fn denied(table: &str) -> ExecError {
 
 #[async_trait]
 impl QueryExec for MemoryExec {
+    async fn user_roles(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, ExecError> {
+        if let Some(plain) = &self.plain {
+            return plain.user_roles(tenant_id, user_id).await;
+        }
+        let tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        let Some(row) = tables.get(&key(tenant_id, "users")).and_then(|rows| {
+            rows.iter()
+                .find(|r| r.get("id").and_then(Value::as_str) == Some(user_id))
+        }) else {
+            return Ok(None);
+        };
+        super::exec::roles_from(row.get("roles")).map(Some)
+    }
+
     async fn execute(
         &self,
         tenant_id: &str,
         role: &str,
         stmt: Stmt,
     ) -> Result<Vec<Row>, ExecError> {
+        if let Some(plain) = &self.plain {
+            return plain.execute(tenant_id, role, stmt).await;
+        }
         // Both executors refuse an invalid tenant before running anything.
         // (In PostgreSQL itself a pooled connection without the setting reads
         // `''` and sees no rows; the executor never gets that far.)
@@ -691,7 +737,7 @@ mod memory_tests {
             exec.execute(T, "app_rw", other).await,
             Err(ExecError::Message(m)) if m.contains("does not exist")
         ));
-        assert!(MemoryExec::new()
+        assert!(MemoryExec::empty()
             .execute(T, "app_rw", select(&["id"]))
             .await
             .is_err());

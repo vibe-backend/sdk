@@ -35,7 +35,13 @@ Pending — add each entry only when its PR merges:
   (needs CREATE on the database; migrate requires this name). Tenant ids are `^[a-z0-9_]{8,61}$`;
   role names over 63 bytes are refused. Production credentials come from `VIBE_TENANT_DB_SECRET_REF`
   (`env:<PREFIX>`); the 0600 JSON file `VIBE_TENANT_DB_SECRETS` is dev/test only and refused in
-  production. `VIBE_DB_MAX_CONNECTIONS` (default 200) returns 503 `DB_POOL_EXHAUSTED`. Locks must be
+  production. Connection caps of 5 per (tenant, role), 15 per tenant and `VIBE_DB_POOL_MAX_TOTAL`
+  (default 200) return 503 `DB_POOL_EXHAUSTED` with `Retry-After: 1`
+  (`vibe_db_pool_exhausted_total{scope}`). The owner role is NOLOGIN outside migrate: migrate uses
+  `VIBE_MIGRATE_ADMIN_DATABASE_URL` to open a one-time owner login window and always closes it;
+  `vibe check-owners` alerts on owners that can log in. Migration statements use an allowlist;
+  UNIQUE indexes are built in the main transaction, other indexes concurrently after commit, and
+  INVALID indexes are rebuilt on the next migrate. Locks must be
   recompiled: the `policy:` line is now the per-tenant policy that migrate installs, and serve refuses
   to start if the installed policies differ.
   `vibe migrate` refuses to run without them and refuses a migration login that can own or use another
