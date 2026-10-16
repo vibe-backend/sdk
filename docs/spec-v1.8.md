@@ -1620,6 +1620,7 @@ Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動�
 - sql 唔係參數化（字串拼接、`$n` 冇對應 param、param 冇用到）；sql 有多個 statement。
 - sql 用咗物件以外嘅表或者 provider（寫入其他物件一定要經佢自己嘅 method）。
 - `writes: false` 但有 INSERT／UPDATE sql。
+- Inherited writes (#166): a method that calls, via `op: method`, a method that writes (directly or through further `op: method` calls) is itself a writing method and must declare `writes: true` in `## Signature`; `writes: false` is an error. An `op: method` step may be marked `writes: true` only when its target writes, and must not be marked `writes: false` when it does. Call cycles are reported separately and add no writes. For security risk grading (`write-sql`), writes follow the same call graph; a target that is malformed or does not resolve to a method lock or a CRUD action on an existing model is graded as a write (it is also a validation error), so an unresolved target never lowers the risk. CRUD `create`, `update` and `delete` count as writes; `get` and `list` do not.
 - migration 以外嘅 lock 出現 DDL；任何 lock（包括 migration）出現 `DELETE`、`TRUNCATE`、`GRANT`、`REVOKE`。
 - Migration：用咗 2B.3 唔准嘅 DDL；`seq` 跳號或者重複；`CREATE INDEX` 冇 `CONCURRENTLY`；`backfill` 冇 WHERE 或者冇 `batch`；`destructive: true` 但冇 `deprecated-since` 或者未夠 30 日；DROP 嘅欄位仲有 lock 引用；冇 `## Verify`。
 - CRUD update 或者自訂 update method 用樂觀鎖但 input 唔係 `if_match`，或者 `if_match` 唔係由 `req.header.if-match` 映射。

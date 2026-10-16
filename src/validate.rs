@@ -1907,6 +1907,43 @@ mod tests {
         assert!(crate::security::known_method_writes(&docs, "product.b"));
     }
 
+    #[test]
+    fn unknown_method_targets_fail_validation_and_count_as_writes() {
+        let mut docs = HashMap::new();
+        docs.insert(
+            "product/methods/wrap".to_string(),
+            doc(
+                Kind::Method,
+                None,
+                "models/product/methods/wrap",
+                &wrapper("false", "product.missing", None),
+            ),
+        );
+        docs.insert(
+            "product".to_string(),
+            doc(Kind::Model, None, "models/product", "## Fields\n"),
+        );
+        // Validation rejects the unknown target...
+        assert!(check_method_target("product.missing", &docs).is_err());
+        assert!(check_method_target("nothing.here", &docs).is_err());
+        // ...and risk grading never treats it as read-only.
+        for target in ["product.missing", "nothing.here", "no-dot", "product.wrap"] {
+            assert!(
+                crate::security::method_doc_writes(&docs, target),
+                "{target} must count as a write for risk"
+            );
+        }
+        // Read-only CRUD on an existing model is not a write; write CRUD is.
+        assert!(!crate::security::method_doc_writes(&docs, "product.get"));
+        assert!(!crate::security::method_doc_writes(&docs, "product.list"));
+        assert!(crate::security::method_doc_writes(&docs, "product.create"));
+        // Validation-side inheritance ignores unresolved targets (reported above).
+        assert!(!crate::security::known_method_writes(
+            &docs,
+            "product.missing"
+        ));
+    }
+
     fn method_errors(body: &str) -> Vec<String> {
         let d = doc(Kind::Method, None, "models/product/methods/x", body);
         let mut report = Report::new();
