@@ -7,6 +7,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Added
 
+- **Dependency / advisory CI (#192):** `cargo deny check` (advisories, licenses, bans, sources) runs on pull requests, pushes to main, a daily schedule, and `workflow_dispatch` via `.github/workflows/cargo-deny.yml` (Refs #196).
 - **Compile format repair (#92):** When LLM output for a natural-language source fails the lock format check, `vibe compile` re-prompts the model with the validator errors (by line number and fixed message) up to `LLM_FORMAT_RETRIES` times (0–5, default 2) instead of failing the source on the first malformed answer.
 - **Raw LLM output dump (#92):** Set `VIBE_DUMP_LLM=1` to save the raw response of every attempt that fails the format check to `.vibe/llm-dump/<source>.attempt-<n>.txt`. Only the response is stored (no prompt); the API key is redacted.
 - **LLM budget (#92, from #93):** `LLM_MAX_CALLS_PER_SOURCE` (default 8) and `LLM_MAX_CALLS_PER_RUN` (default 200) bound LLM calls for every adapter, including repair attempts. Config may lower the limits; raising is capped at 2x the default. Invalid values fail.
