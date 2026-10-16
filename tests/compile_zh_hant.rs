@@ -327,3 +327,40 @@ async fn missing_declaration_is_named() {
         "{text}"
     );
 }
+
+fn responder_keeps_chinese(request: &LlmRequest) -> Result<String, String> {
+    if request.system == vibe::compile::TRANSLATE_PROMPT {
+        // A translator that keeps Chinese names and terms in its output.
+        return Ok(format!(
+            "{} 「商品」「購物車」",
+            translation(&request.input)
+        ));
+    }
+    responder(request)
+}
+
+/// #92: Chinese text left in the translation must not fail the source
+/// (models, methods and `_definition.md` stay in Chinese by design).
+#[tokio::test]
+async fn chinese_left_in_translation_is_not_an_error() {
+    let root = fixture();
+    let adapter = FakeAdapter {
+        responder: responder_keeps_chinese,
+    };
+    let config = config();
+    let out = compile_project(&CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&config),
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(out.files.len(), 7, "{:?}", out.files);
+    validate_project(&ValidateOptions {
+        root: &root,
+        deploy: false,
+        verify_key: None,
+    })
+    .unwrap_or_else(|err| panic!("{err}"));
+}
