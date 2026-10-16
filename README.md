@@ -59,7 +59,7 @@ vibe serve --manifest manifest.json --project tests/fixtures/shop --memory
 
 **Breaking (#31):** `vibe manifest` without `-o` writes `./manifest.json` relative to the current working directory (same as `-o` / `serve --manifest`), not `<project>/manifest.json`.
 
-`--memory` is a dev executor. PostgreSQL needs two roles. `vibe migrate` connects with the owner role (`VIBE_MIGRATE_DATABASE_URL`) and grants SELECT, INSERT and UPDATE to the runtime role named in `VIBE_RUNTIME_DB_ROLE`. `vibe serve` connects as that runtime role (`VIBE_DATABASE_URL`, or `DATABASE_URL`) and refuses to start if the role is, or can `SET ROLE` to, a superuser or BYPASSRLS role, or can own any tenant schema, relation, function or type, because row-level security would not apply. `VIBE_RUNTIME_DB_ROLE` is required:
+`--memory` is a dev executor. PostgreSQL needs two roles. `vibe migrate` connects with the owner role (`VIBE_MIGRATE_DATABASE_URL`) and grants SELECT, INSERT and UPDATE to the runtime role named in `VIBE_RUNTIME_DB_ROLE`. `vibe serve` connects as that runtime role (`VIBE_DATABASE_URL`, or `DATABASE_URL`) and refuses to start if the role is, or can `SET ROLE` to, a superuser or BYPASSRLS role, or can own any tenant schema, relation, function or type, because row-level security would not apply. The owner role needs `CREATE` on the database to create tenant schemas, but should have no `CREATE` privilege in any other schema (for example, revoke `CREATE` on schema `public`); it only creates objects inside its own tenant schemas. `VIBE_RUNTIME_DB_ROLE` is required:
 
 ```bash
 VIBE_MIGRATE_DATABASE_URL=postgres://owner@db/app VIBE_RUNTIME_DB_ROLE=vibe_app \
