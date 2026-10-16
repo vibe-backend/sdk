@@ -334,7 +334,7 @@ Exclude by default:
 
 ### 9.2 Example
 
-```md
+````md
 # Vibe API
 
 ## generate
@@ -350,7 +350,7 @@ const result = await vibe.generate({prompt})
 ```
 
 Errors: `INVALID_INPUT`, `UNAUTHORIZED`, `LIMITED`, `FAILED`
-```
+````
 
 ### 9.3 Size policy
 
