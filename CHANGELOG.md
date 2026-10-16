@@ -7,9 +7,15 @@ added only when the corresponding PR is merged to `main`.
 
 ### Added
 
+- **Dependency / advisory CI (#192):** `cargo deny check` (advisories, licenses, bans, sources) runs on pull requests, pushes to main, a daily schedule, and `workflow_dispatch` via `.github/workflows/cargo-deny.yml` (Refs #196).
+
 - **Challenge replay store (#157):** Challenge single-use state, quotas and capacity live in PostgreSQL in each tenant's own schema (`t_<tenant>.vibe_challenge_replay`, created by that tenant's `vibe migrate`, FORCE RLS) so they hold across instances. The runtime role has SELECT and INSERT only; expired rows are ignored and removed by `vibe migrate`. Capacity is per tenant and client IPs are stored as a per-tenant HMAC. In production with a verifier configured the PostgreSQL store is always used; `vibe serve` refuses to start if a tenant's table is missing or has wrong grants, or if `VIBE_CHALLENGE_REPLAY_STORE=memory` is set. Outside production the store must be chosen explicitly (`memory` or `postgres`). Store errors fail closed (503).
 
 - **Challenge replay cleanup (#193):** `vibe replay-cleanup --tenant <id>` deletes a tenant's expired challenge replay rows with the owner connection (`VIBE_MIGRATE_DATABASE_URL`), one transaction per tenant, and records each run in the owner-only table `t_<tenant>.vibe_challenge_replay_cleanup`. It refuses to run as `VIBE_RUNTIME_DB_ROLE` (or a member of it) and when that role does not exist. Verified rows are now kept for `TOKEN_LIFETIME + MAX_CLOCK_SKEW + RETENTION_MARGIN` (480s, previously 360s) to allow for clock drift between application and database.
+
+### Fixed
+
+- **Postgres TLS (#174):** `TlsMode::Require` (`sslmode=require`) previously did not enable TLS for database connections. It now requires TLS and fails to connect if the server does not offer it. `sslrootcert` is honored, and an unreadable or empty `sslrootcert` file is reported as an error.
 
 ### Breaking
 
