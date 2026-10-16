@@ -550,7 +550,9 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
             &runtime_role,
         )?)
         .await?;
-        println!("bootstrapped {schema}._platform_refresh_tokens");
+        exec.batch(&vibe::runtime::refresh::cleanup_statements(&schema)?)
+            .await?;
+        println!("bootstrapped {schema}._platform_refresh_tokens (finished families cleaned up)");
     }
     Ok(())
 }

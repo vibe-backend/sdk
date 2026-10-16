@@ -47,8 +47,28 @@ pub enum RevokeTarget<'a> {
     User(&'a str),
 }
 
-/// Columns of `_platform_refresh_tokens`.
+/// Rows are kept this long after their family's lifetime ends, then removed
+/// by [`cleanup_statements`]. Whole families go together: every row of a
+/// family shares `family_expires_at`, so reuse detection inside a live
+/// family is never weakened by cleanup.
+pub const CLEANUP_RETENTION_SECS: i64 = 86_400;
+/// Rows deleted per batch.
+pub const CLEANUP_BATCH: i64 = 1000;
+/// Batches per cleanup run (bounds the work done by one `vibe migrate`).
+pub const CLEANUP_MAX_BATCHES: i64 = 100;
+
+fn tenant_of(schema: &str) -> Result<&str, String> {
+    schema
+        .strip_prefix("t_")
+        .filter(|t| super::slugs::valid_tenant(t))
+        .ok_or_else(|| format!("refresh store schema {schema} is not t_<tenant>"))
+}
+
+/// Columns of `_platform_refresh_tokens`. The tenant policy compares
+/// `tenant_id` with the schema's own tenant id as a constant, so access never
+/// depends on the `app.tenant_id` session setting.
 pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
+    let tenant = tenant_of(schema)?;
     let qualified = format!("{}._platform_refresh_tokens", super::sql::quote(schema)?);
     Ok(vec![
         format!("CREATE SCHEMA IF NOT EXISTS {}", super::sql::quote(schema)?),
@@ -62,11 +82,13 @@ pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
         ),
         format!("CREATE INDEX IF NOT EXISTS _platform_refresh_family ON {qualified} (family_id)"),
         format!("CREATE INDEX IF NOT EXISTS _platform_refresh_user ON {qualified} (user_id)"),
+        format!("CREATE INDEX IF NOT EXISTS _platform_refresh_family_expiry ON {qualified} (family_expires_at)"),
         format!("ALTER TABLE {qualified} ENABLE ROW LEVEL SECURITY"),
         format!("ALTER TABLE {qualified} FORCE ROW LEVEL SECURITY"),
         format!("DROP POLICY IF EXISTS tenant_isolation ON {qualified}"),
         format!(
-            "CREATE POLICY tenant_isolation ON {qualified} USING (\"tenant_id\" = current_setting('app.tenant_id', false)) WITH CHECK (\"tenant_id\" = current_setting('app.tenant_id', false))"
+            "CREATE POLICY tenant_isolation ON {qualified} USING (tenant_id = {t}::text) WITH CHECK (tenant_id = {t}::text)",
+            t = sql_literal(tenant)
         ),
         // Until the dedicated refresh-store role lands (#51), app `query`
         // steps run as public_reader / public_writer: take away their access
@@ -101,6 +123,40 @@ pub fn runtime_grant_statements(schema: &str, runtime_role: &str) -> Result<Vec<
         ),
         format!("GRANT SELECT, INSERT, UPDATE ON {qualified} TO {role}"),
     ])
+}
+
+/// Removes refresh rows whose family lifetime ended more than
+/// [`CLEANUP_RETENTION_SECS`] ago, in batches of [`CLEANUP_BATCH`] and at
+/// most [`CLEANUP_MAX_BATCHES`] batches per run. Run by `vibe migrate` as the
+/// table owner (the runtime role has no DELETE), like the challenge replay
+/// table cleanup.
+pub fn cleanup_statements(schema: &str) -> Result<Vec<String>, String> {
+    tenant_of(schema)?;
+    let qualified = format!("{}._platform_refresh_tokens", super::sql::quote(schema)?);
+    Ok(vec![format!(
+        "DO $$ DECLARE n bigint; i int := 0; BEGIN LOOP \
+         DELETE FROM {qualified} WHERE id IN (SELECT id FROM {qualified} \
+         WHERE family_expires_at <= now() - make_interval(secs => {CLEANUP_RETENTION_SECS}) \
+         LIMIT {CLEANUP_BATCH}); \
+         GET DIAGNOSTICS n = ROW_COUNT; i := i + 1; \
+         EXIT WHEN n < {CLEANUP_BATCH} OR i >= {CLEANUP_MAX_BATCHES}; END LOOP; END $$"
+    )])
+}
+
+/// Memory counterpart of [`cleanup_statements`]: drops at most `max` rows
+/// whose family lifetime ended more than [`CLEANUP_RETENTION_SECS`] before
+/// `now`. Returns how many were removed.
+pub fn memory_cleanup(rows: &mut Vec<Map<String, Value>>, now: i64, max: usize) -> usize {
+    let mut removed = 0;
+    rows.retain(|r| {
+        let done = removed < max
+            && int(r, "family_expires_at").is_some_and(|e| e + CLEANUP_RETENTION_SECS <= now);
+        if done {
+            removed += 1;
+        }
+        !done
+    });
+    removed
 }
 
 fn sql_literal(value: &str) -> String {
@@ -510,5 +566,51 @@ mod tests {
             memory_rotate(&mut rows, T, "c0", "c1", policy(), 4),
             Rotated::Ok { .. }
         ));
+    }
+
+    #[test]
+    fn cleanup_removes_only_finished_families_and_is_bounded() {
+        let mut rows = Vec::new();
+        // Family A ends at 1000 (policy family_ttl), B at 5000.
+        memory_issue(&mut rows, T, "u1", "a0", policy(), 0);
+        let _ = memory_rotate(&mut rows, T, "a0", "a1", policy(), 50);
+        memory_issue(&mut rows, T, "u1", "b0", policy(), 4000);
+        assert_eq!(rows.len(), 3);
+        // Within the retention window nothing goes.
+        assert_eq!(
+            memory_cleanup(&mut rows, 1000 + CLEANUP_RETENTION_SECS - 1, 10),
+            0
+        );
+        // Bounded: one row per call when max is 1.
+        assert_eq!(
+            memory_cleanup(&mut rows, 1000 + CLEANUP_RETENTION_SECS, 1),
+            1
+        );
+        assert_eq!(
+            memory_cleanup(&mut rows, 1000 + CLEANUP_RETENTION_SECS, 10),
+            1
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(text(&rows[0], "token_hash"), "b0");
+    }
+
+    #[test]
+    fn cleanup_sql_is_batched_and_bounded() {
+        let sql = cleanup_statements("t_tenant0001").unwrap().join("\n");
+        assert!(sql.contains(&format!("LIMIT {CLEANUP_BATCH}")));
+        assert!(sql.contains(&format!("i >= {CLEANUP_MAX_BATCHES}")));
+        assert!(sql.contains("family_expires_at <= now()"));
+        assert!(cleanup_statements("public").is_err());
+    }
+
+    #[test]
+    fn tenant_policy_uses_a_constant_tenant_id() {
+        let sql = table_statements("t_tenant0001").unwrap().join("\n");
+        assert!(
+            sql.contains("USING (tenant_id = 'tenant0001'::text)"),
+            "{sql}"
+        );
+        assert!(!sql.contains("current_setting"));
+        assert!(table_statements("x_tenant0001").is_err());
     }
 }

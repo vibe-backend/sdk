@@ -233,13 +233,11 @@ impl QueryExec for MemoryExec {
             .lock()
             .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
         let rows = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+        let now = chrono::Utc::now().timestamp();
+        // Bounded cleanup of finished families (PostgreSQL: `vibe migrate`).
+        super::refresh::memory_cleanup(rows, now, super::refresh::CLEANUP_BATCH as usize);
         Ok(super::refresh::memory_issue(
-            rows,
-            tenant_id,
-            user_id,
-            token_hash,
-            policy,
-            chrono::Utc::now().timestamp(),
+            rows, tenant_id, user_id, token_hash, policy, now,
         ))
     }
 
