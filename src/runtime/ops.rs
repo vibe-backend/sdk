@@ -356,7 +356,8 @@ pub async fn sign_jwt(
         .get(key_ref)
         .ok_or_else(|| internal(format!("signing key {key_ref} is not loaded")))?;
     let alg = match opt(step, "alg") {
-        "ES256" => jsonwebtoken::Algorithm::ES256,
+        // Decision 139: ES256 when `alg` is omitted.
+        "ES256" | "" => jsonwebtoken::Algorithm::ES256,
         "RS256" => jsonwebtoken::Algorithm::RS256,
         other => return Err(internal(format!("unsupported alg {other}"))),
     };
@@ -459,14 +460,19 @@ pub fn load_signing_keys(
                     )
                 })?;
             let (alg, key) = match opt(step, "alg") {
-                "ES256" => (
+                // Decision 139: ES256 when `alg` is omitted.
+                "ES256" | "" => (
                     jsonwebtoken::Algorithm::ES256,
                     jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()),
                 ),
-                "RS256" => (
-                    jsonwebtoken::Algorithm::RS256,
-                    jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()),
-                ),
+                "RS256" => {
+                    // Decision 139: RS256 signing keys need >= 2048 bits.
+                    super::rsakey::check_rsa_pem(&key_ref, &pem)?;
+                    (
+                        jsonwebtoken::Algorithm::RS256,
+                        jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()),
+                    )
+                }
                 other => return Err(format!("{}: unsupported alg {other}", method.target)),
             };
             let key = key.map_err(|err| format!("{key_ref}: {err}"))?;

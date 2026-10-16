@@ -457,7 +457,8 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                 );
             }
             let alg = block_val(block, "alg");
-            if !matches!(alg.as_str(), "ES256" | "RS256") {
+            // Omitted alg defaults to ES256 (decision 139).
+            if !matches!(alg.as_str(), "" | "ES256" | "RS256") {
                 report.push(
                     Diag::error(file, "sign-jwt alg must be ES256 or RS256")
                         .at_step(&block.heading),

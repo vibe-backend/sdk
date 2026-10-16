@@ -981,3 +981,59 @@ async fn writing_query_needs_a_method_marked_writes() {
     let err = run(&m, &users(), json!({"n": "x"})).await.unwrap_err();
     assert!(err.1.contains("method is not marked writes"), "{err:?}");
 }
+
+fn fixture_with_alg(alg: Option<&str>) -> Manifest {
+    let mut m = fixture();
+    for method in &mut m.methods {
+        for step in method.steps.iter_mut().filter(|s| s.op == "sign-jwt") {
+            match alg {
+                Some(alg) => {
+                    step.opts.insert("alg".into(), alg.into());
+                }
+                None => {
+                    step.opts.remove("alg");
+                }
+            }
+        }
+    }
+    m
+}
+
+#[test]
+fn rs256_signing_key_under_2048_bits_refuses_to_start() {
+    // Decision 139 (#222).
+    let short = include_str!("../src/runtime/testdata/rsa-k1024.pem");
+    let ok = include_str!("../src/runtime/testdata/rsa-k2048.pem");
+    let m = fixture_with_alg(Some("RS256"));
+    let err = vibe::runtime::load_signing_keys(
+        &m,
+        &|name| (name == "JWT_SIGNING_KEY").then(|| short.to_string()),
+        "local",
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("at least 2048 bits"), "{err}");
+    assert!(
+        !err.contains("MII"),
+        "key material must not be printed: {err}"
+    );
+    let keys = vibe::runtime::load_signing_keys(
+        &m,
+        &|name| (name == "JWT_SIGNING_KEY").then(|| ok.to_string()),
+        "local",
+    )
+    .unwrap();
+    assert_eq!(keys["JWT_SIGNING_KEY"].alg, jsonwebtoken::Algorithm::RS256);
+}
+
+#[test]
+fn sign_jwt_without_alg_defaults_to_es256() {
+    // Decision 139 (#226).
+    let keys = vibe::runtime::load_signing_keys(
+        &fixture_with_alg(None),
+        &|name| (name == "JWT_SIGNING_KEY").then(|| PRIVATE_PEM.to_string()),
+        "local",
+    )
+    .unwrap();
+    assert_eq!(keys["JWT_SIGNING_KEY"].alg, jsonwebtoken::Algorithm::ES256);
+}

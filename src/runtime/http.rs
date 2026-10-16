@@ -1214,12 +1214,20 @@ async fn authenticate(
             .key(&kid)
             .await
             .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+        if found.alg != auth.alg {
+            // Decision 139: only the configured alg; other keys are unused.
+            return Err(AuthError::unauthorized("Bearer"));
+        }
         (found.alg, found.key)
     } else if let Some(jwks) = &auth.jwks {
         let found = jwks
             .key(&kid)
             .await
             .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+        if found.alg != auth.alg {
+            // Decision 139: only the configured alg; other keys are unused.
+            return Err(AuthError::unauthorized("Bearer"));
+        }
         (found.alg, found.key)
     } else {
         if auth.public_pem.is_empty() || kid != auth.kid {
@@ -1399,6 +1407,31 @@ pub fn detect_jwt_alg(pem: &str) -> Result<Algorithm, String> {
         return Ok(Algorithm::ES256);
     }
     Err("VIBE_JWT_PUBLIC_KEY_PEM is not a usable RSA or EC public key".into())
+}
+
+/// Startup check of `VIBE_JWT_PUBLIC_KEY_PEM` against the configured alg
+/// (decision 139): the key type must match, and RSA keys need >= 2048 bits.
+pub fn check_static_jwt_key(pem: &str, alg: Algorithm) -> Result<(), String> {
+    const WHAT: &str = "VIBE_JWT_PUBLIC_KEY_PEM";
+    match alg {
+        Algorithm::RS256 => {
+            if DecodingKey::from_rsa_pem(pem.as_bytes()).is_err() {
+                return Err(format!(
+                    "{WHAT}: VIBE_JWT_ALG is RS256 but the key is not an RSA public key"
+                ));
+            }
+            super::rsakey::check_rsa_pem(WHAT, pem)
+        }
+        Algorithm::ES256 => {
+            if DecodingKey::from_ec_pem(pem.as_bytes()).is_err() {
+                return Err(format!(
+                    "{WHAT}: VIBE_JWT_ALG is ES256 but the key is not an EC public key"
+                ));
+            }
+            Ok(())
+        }
+        other => Err(format!("{WHAT}: unsupported alg {other:?}")),
+    }
 }
 
 pub fn hash_api_secret(pepper: &[u8], secret: &str) -> String {
@@ -2121,6 +2154,59 @@ RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
             json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "k1", "x": X, "y": Y}]}),
         )))));
         auth
+    }
+
+    /// 2048-bit RSA modulus (src/runtime/testdata/rsa-p2048.pem).
+    const RSA_N: &str = "tupUT5sUR0iufz_2dX_ZWfdJ9oluerIsYtUELeYxbe_Bu71_oJUILJiNUyceUtmDJRNHj6NWalJ36zkykGm3ZU65cAI91A9d7mSN0ryaDn6-b45VINQIEtMSutWrGh2I7FgxLNGmDFMLQQ1sDVCS1lwtAD_EtYzzWrqjxdqRal1eaGF58dtMjqCk_rrGcQ7oEm_tTBZVge24sf7bQUliuwZQo6t7SI2tvocawcgDuZvFMU_I99dyGJNQxyY1pKkPqIdMxtrTrBoHcBXNvlSu8IoFslK49w3XY8kpkb7KGoJvDmT6NYQxXtjNY0_-ZZIdM_egJboeibuVVzi549nPjQ";
+
+    #[tokio::test]
+    async fn jwks_accepts_only_the_configured_alg() {
+        // Decision 139 (#225): a JWKS holding EC and RSA keys only serves the
+        // configured alg; keys of the other type are unused.
+        let doc = json!({"keys": [
+            {"kty": "EC", "crv": "P-256", "kid": "k1", "x": X, "y": Y},
+            {"kty": "RSA", "kid": "r1", "n": RSA_N, "e": "AQAB"},
+        ]});
+        let mut auth = AuthConfig::anonymous();
+        auth.jwks = Some(Arc::new(super::super::jwks::JwksCache::new(Arc::new(Doc(
+            doc.clone(),
+        )))));
+        let r = route(json!({}));
+        let t = token("k1", json!({"roles": ["staff"]}));
+        assert_eq!(auth.alg, Algorithm::ES256);
+        assert!(authenticate(&auth, &r, &bearer(&t)).await.is_ok());
+        auth.alg = Algorithm::RS256;
+        assert!(
+            authenticate(&auth, &r, &bearer(&t)).await.is_err(),
+            "ES256 key must not be used when RS256 is configured"
+        );
+        // Same rule for a route-level issuer JWKS.
+        let mut auth = AuthConfig::anonymous();
+        auth.alg = Algorithm::RS256;
+        const URI: &str = "https://idp.example.com/jwks.json";
+        auth.route_jwks.insert(
+            URI.into(),
+            Arc::new(super::super::jwks::JwksCache::new(Arc::new(Doc(doc)))),
+        );
+        let r = route(json!({"jwks_uri": URI}));
+        assert!(authenticate(&auth, &r, &bearer(&t)).await.is_err());
+    }
+
+    #[test]
+    fn static_jwt_key_must_match_alg_and_size() {
+        // Decision 139 (#224).
+        let pub2048 = include_str!("testdata/rsa-p2048.pem");
+        let pub1024 = include_str!("testdata/rsa-p1024.pem");
+        let ec = "-----BEGIN PUBLIC KEY-----\n\
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0mqNqll14aIJEhYqCiRLWJX63Ty6\n\
+Q0UxBzbmJ2wI9FMVJLw4XEhuIJFqIdA/P6b6ozSNGyOUZK7OjIfGKtpNYw==\n\
+-----END PUBLIC KEY-----\n";
+        assert!(check_static_jwt_key(pub2048, Algorithm::RS256).is_ok());
+        assert!(check_static_jwt_key(ec, Algorithm::ES256).is_ok());
+        let err = check_static_jwt_key(pub1024, Algorithm::RS256).unwrap_err();
+        assert!(err.contains("at least 2048 bits"), "{err}");
+        assert!(check_static_jwt_key(ec, Algorithm::RS256).is_err());
+        assert!(check_static_jwt_key(pub2048, Algorithm::ES256).is_err());
     }
 
     #[tokio::test]

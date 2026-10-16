@@ -536,6 +536,9 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
             }
         };
     }
+    if !auth.public_pem.is_empty() {
+        vibe::runtime::check_static_jwt_key(&auth.public_pem, auth.alg)?;
+    }
     if let Ok(iss) = std::env::var("VIBE_JWT_ISS") {
         auth.iss = iss;
     }
