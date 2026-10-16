@@ -8,7 +8,7 @@ use vibe::compile::{compile_project, CompileOptions};
 use vibe::discover;
 use vibe::llm::{self, HttpAdapter, LlmAdapter};
 use vibe::lock::is_structured_source;
-use vibe::manifest::{self, read_manifest};
+use vibe::manifest;
 use vibe::runtime::{router, AppState, AuthConfig, PgExec, QueryExec};
 use vibe::secret::secret_scan;
 use vibe::sign;
@@ -48,14 +48,9 @@ enum Command {
         output: PathBuf,
         /// Release build: no key (the release job signs the output keyless
         /// with Sigstore); never reads .env, requires an allowlisted LLM host,
-        /// and fails closed on high-risk items until release-environment
-        /// approval verification (#80).
+        /// and records the release version and the full commit SHA.
         #[arg(long)]
         release: bool,
-        /// Recorded for audit only. It is not accepted as approval: the approval
-        /// is the `release` environment approval (decision 90/118, #80).
-        #[arg(long)]
-        release_approval: Option<String>,
         /// Source commit to record (default: GITHUB_SHA or `git rev-parse HEAD`).
         #[arg(long)]
         commit: Option<String>,
@@ -82,10 +77,6 @@ enum Command {
         /// only when the build succeeds.
         #[arg(long)]
         locks_dir: Option<PathBuf>,
-        /// Recorded for audit only. It is not accepted as approval: the approval
-        /// is the `release` environment approval (decision 90/118, #80).
-        #[arg(long)]
-        release_approval: Option<String>,
         /// Source commit to record (default: GITHUB_SHA or `git rev-parse HEAD`).
         #[arg(long)]
         commit: Option<String>,
@@ -220,16 +211,14 @@ async fn run(cli: Cli) -> Result<(), String> {
             project,
             output,
             release,
-            release_approval,
             commit,
             version,
-        } => cmd_manifest(&project, &output, release, release_approval, commit, version).await,
+        } => cmd_manifest(&project, &output, release, commit, version).await,
         Command::Build {
             project,
             dev,
             output,
             locks_dir,
-            release_approval,
             commit,
             version,
         } => {
@@ -239,7 +228,6 @@ async fn run(cli: Cli) -> Result<(), String> {
                 dev,
                 &output,
                 &locks_dir,
-                release_approval,
                 commit,
                 version,
             )
@@ -250,7 +238,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!("wrote {}", project.join(".vibe/signing.key").display());
             Ok(())
         }
-        Command::Approve { .. } => Err("`vibe approve` was removed in v1.8: locks carry no approval. Review the source in a pull request; release builds use `vibe build`, which requires --release-approval for high-risk items.".into()),
+        Command::Approve { .. } => Err("`vibe approve` was removed in v1.8: locks carry no approval. Review the source in a pull request; the release approval is the `release` environment approval.".into()),
         Command::Serve {
             manifest,
             project,
@@ -360,7 +348,11 @@ async fn run(cli: Cli) -> Result<(), String> {
 }
 
 async fn cmd_compile(project: &Path, check: bool) -> Result<(), String> {
-    load_dotenv(project);
+    // The project .env is a development convenience only; CI and production
+    // take every input from the environment.
+    if !ci_or_prod() {
+        load_dotenv(project);
+    }
     let sources = discover::discover(project).map_err(|err| err.to_string())?;
     let natural = sources
         .iter()
@@ -413,12 +405,10 @@ async fn cmd_manifest(
     project: &Path,
     output: &Path,
     release: bool,
-    release_approval: Option<String>,
     commit: Option<String>,
     version: Option<String>,
 ) -> Result<(), String> {
     let key = if release {
-        sign::refuse_env_key_for_release()?;
         None
     } else {
         Some(sign::load_dev_key(project)?)
@@ -432,7 +422,6 @@ async fn cmd_manifest(
     };
     let info = manifest::BuildInfo {
         release,
-        release_approval,
         version,
         commit,
     };
@@ -508,18 +497,9 @@ async fn cmd_build(
     dev: bool,
     output: &Path,
     locks_dir: &Path,
-    release_approval: Option<String>,
     commit: Option<String>,
     version: Option<String>,
 ) -> Result<(), String> {
-    if dev && release_approval.is_some() {
-        return Err("--release-approval applies only to release builds; drop --dev".into());
-    }
-    // Refuse a release env signing key before any compile or validate work
-    // (decisions 113, 118, 119). Dev builds ignore that variable.
-    if !dev {
-        sign::refuse_env_key_for_release()?;
-    }
     let commit = resolve_commit(project, commit);
     let version = resolve_version(version, !dev)?;
     let loaded = compile_build(project, dev).await?;
@@ -548,7 +528,6 @@ async fn cmd_build(
     };
     let info = manifest::BuildInfo {
         release: !dev,
-        release_approval,
         version,
         commit,
     };
@@ -630,9 +609,6 @@ fn print_high_risk(manifest: &manifest::Manifest) {
     for item in high {
         eprintln!("  {} {}", item.lock, item.item);
     }
-    if let Some(reference) = &manifest.provenance.release_approval {
-        eprintln!("release approval: {reference}");
-    }
 }
 
 /// Loads and verifies the manifest. Outside relaxed mode only a keyless
@@ -676,16 +652,17 @@ fn load_manifest(
         );
         return Ok(manifest);
     }
-    let key = match sign::pinned_public_key()? {
-        Some(key) => key,
-        None => {
-            eprintln!(
-                "warning: verifying the manifest with the development key in .vibe/signing.pub"
-            );
-            sign::load_dev_public(project)?
-        }
-    };
-    read_manifest(manifest_path, &key).map_err(|err| err.to_string())
+    #[cfg(debug_assertions)]
+    {
+        eprintln!("warning: verifying the manifest with the development key in .vibe/signing.pub");
+        let key = sign::load_dev_public(project)?;
+        manifest::read_manifest(manifest_path, &key).map_err(|err| err.to_string())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = project;
+        Err("release builds verify manifests only with their Sigstore bundle".into())
+    }
 }
 
 fn deployer_expectation(

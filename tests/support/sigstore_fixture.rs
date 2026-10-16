@@ -31,7 +31,7 @@ impl Default for Fixture {
             repo: "vibe-backend/sdk".into(),
             workflow: ".github/workflows/release.yml".into(),
             source_ref: "refs/tags/v1.0.0".into(),
-            commit: "abc123".into(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
             issuer: "https://token.actions.githubusercontent.com".into(),
             runner: "github-hosted".into(),
             tlog: true,

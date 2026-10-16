@@ -96,18 +96,59 @@ pub struct Expectation {
 }
 
 impl Expectation {
-    /// Normalizes `version` (strips a leading `v`) and rejects empty fields.
+    /// Normalizes `version` (strips a leading `v`), then requires a release
+    /// version (`1.8.0`, `1.8.0-rc.1`) and a full 40-character commit SHA.
     pub fn new(version: &str, commit: &str) -> Result<Self, String> {
         let version = normalize_version(version)?;
+        check_release_version(&version)?;
         let commit = commit.trim().to_string();
         if commit.is_empty() {
             return Err("release commit is empty".into());
         }
+        check_release_commit(&commit)?;
         Ok(Self { version, commit })
     }
 
     pub fn source_ref(&self) -> String {
         expectation_source_ref(&self.version)
+    }
+}
+
+/// A release version (`1.8.0`, `1.8.0-rc.1`): three numeric parts and an
+/// optional alphanumeric/dot pre-release suffix, without a leading `v`.
+pub fn check_release_version(version: &str) -> Result<(), String> {
+    let (core, pre) = match version.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (version, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    let core_ok = parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    let pre_ok = pre
+        .is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.'));
+    if core_ok && pre_ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid release version `{version}` (expected e.g. 1.8.0, without `v`)"
+        ))
+    }
+}
+
+/// A full 40-character lowercase hex commit SHA.
+pub fn check_release_commit(commit: &str) -> Result<(), String> {
+    if commit.len() == 40
+        && commit
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "release commit `{commit}` must be a full 40-character lowercase hex SHA"
+        ))
     }
 }
 
@@ -131,6 +172,7 @@ pub fn attested_version(san: &str, source_ref: &str) -> Result<String, String> {
         .strip_prefix("refs/tags/v")
         .ok_or_else(|| format!("sigstore certificate: ref {source_ref} is not a v<version> tag"))?;
     let version = normalize_version(tag)
+        .and_then(|v| check_release_version(&v).map(|()| v))
         .map_err(|err| format!("sigstore certificate: ref {source_ref}: {err}"))?;
     if version != tag || !san.ends_with(&format!("@{source_ref}")) {
         return Err(format!(
@@ -458,7 +500,8 @@ mod tests {
     #[test]
     fn identity_claims_require_the_deployer_version_and_commit() {
         let policy = Policy::default();
-        let expected = Expectation::new("1.8.0", "abc123").unwrap();
+        let expected =
+            Expectation::new("1.8.0", "0123456789abcdef0123456789abcdef01234567").unwrap();
         let signer = policy.expected_signer(&expected.version);
         assert_eq!(
             signer,
@@ -469,7 +512,7 @@ mod tests {
             Some(GITHUB_OIDC_ISSUER),
             Some("https://github.com/vibe-backend/sdk"),
             Some(&expected.source_ref()),
-            Some("abc123"),
+            Some("0123456789abcdef0123456789abcdef01234567"),
             Some(&signer),
             Some("github-hosted"),
             &policy,
@@ -477,21 +520,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got_ref, "refs/tags/v1.8.0");
-        assert_eq!(commit, "abc123");
+        assert_eq!(commit, "0123456789abcdef0123456789abcdef01234567");
         assert_eq!(got_signer, signer);
     }
 
     #[test]
     fn identity_claims_refuse_a_ref_or_commit_that_is_not_the_expected() {
         let policy = Policy::default();
-        let expected = Expectation::new("1.8.0", "abc123").unwrap();
+        let expected =
+            Expectation::new("1.8.0", "0123456789abcdef0123456789abcdef01234567").unwrap();
         let signer = policy.expected_signer("1.8.0");
         let err = check_identity_claims(
             Some(&signer),
             Some(GITHUB_OIDC_ISSUER),
             Some("https://github.com/vibe-backend/sdk"),
             Some("refs/tags/v9.9.9"),
-            Some("abc123"),
+            Some("0123456789abcdef0123456789abcdef01234567"),
             Some(&signer),
             Some("github-hosted"),
             &policy,
