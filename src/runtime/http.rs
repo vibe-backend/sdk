@@ -9,7 +9,7 @@ use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 
 type HttpResponse = Response<Body>;
 use axum::Router;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -2626,5 +2626,20 @@ mod request_validation_tests {
             assert!(check_type(&f, &good).is_ok(), "{ty} good");
             assert!(check_type(&f, &bad).is_err(), "{ty} bad");
         }
+    }
+}
+
+#[cfg(test)]
+mod crypto_kats {
+    use super::hmac_hex;
+
+    #[test]
+    fn hmac_sha256_known_answer() {
+        // RFC 4231 test case 1
+        let mac = hmac_hex(&[0x0b; 20], "Hi There");
+        assert_eq!(
+            mac,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
     }
 }
