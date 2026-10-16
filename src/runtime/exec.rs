@@ -374,18 +374,14 @@ impl QueryExec for MemoryExec {
         drop(gate);
         let mut guard = ReservationGuard(Some(|| {
             if let Ok(mut tables) = self.tables.lock() {
-                if let Some(row) = tables
-                    .entry(key(tenant_id, REFRESH_TABLE))
-                    .or_default()
-                    .iter_mut()
-                    .find(|row| {
-                        row["token_hash"] == token_hash
-                            && row.get("pending_rotation").and_then(Value::as_str)
-                                == Some(&reservation)
-                    })
-                {
-                    row.remove("pending_rotation");
-                    row.remove("pending_until");
+                let rows = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+                if let Some(index) = rows.iter().position(|row| {
+                    row["token_hash"] == token_hash
+                        && row.get("pending_rotation").and_then(Value::as_str) == Some(&reservation)
+                }) {
+                    memory_revoke_changed_child(rows, &parent);
+                    rows[index].remove("pending_rotation");
+                    rows[index].remove("pending_until");
                 }
             }
         }));
@@ -418,33 +414,7 @@ impl QueryExec for MemoryExec {
             }
         }
         guard.0.take();
-        let value = issued?;
-        if !reserved {
-            return Ok((Rotated::Invalid, None));
-        }
-        let current = rows.iter().find(|row| row["token_hash"] == token_hash);
-        if !current.is_some_and(|row| {
-            row["revoked_at"].is_null() && row["replaced_by"] == parent["replaced_by"]
-        }) {
-            return Ok((Rotated::Invalid, None));
-        }
-        if !parent["used_at"].is_null()
-            && !rows.iter().any(|row| {
-                row["id"] == parent["replaced_by"]
-                    && row["used_at"].is_null()
-                    && row["revoked_at"].is_null()
-                    && row["replaced_by"].is_null()
-            })
-        {
-            for row in rows
-                .iter_mut()
-                .filter(|row| row["family_id"] == parent["family_id"])
-            {
-                if row["revoked_at"].is_null() {
-                    row.insert("revoked_at".into(), chrono::Utc::now().timestamp().into());
-                    row.insert("revoke_reason".into(), "reuse-detected".into());
-                }
-            }
+        if memory_revoke_changed_child(rows, &parent) {
             return Ok((
                 Rotated::Reuse {
                     family_id: parent["family_id"].as_str().unwrap().to_owned(),
@@ -452,6 +422,16 @@ impl QueryExec for MemoryExec {
                 None,
             ));
         }
+        let current = rows.iter().find(|row| row["token_hash"] == token_hash);
+        if !current.is_some_and(|row| {
+            row["revoked_at"].is_null() && row["replaced_by"] == parent["replaced_by"]
+        }) {
+            return Ok((Rotated::Invalid, None));
+        }
+        if !reserved {
+            return Err(ExecError::Timeout);
+        }
+        let value = issued?;
         let rotated = super::refresh::memory_rotate(
             rows,
             tenant_id,
@@ -776,6 +756,32 @@ pub fn role_allows(role: &str, stmt: &Stmt) -> Result<(), String> {
     } else {
         Err(format!("role {role} may not run this statement"))
     }
+}
+
+fn memory_revoke_changed_child(rows: &mut [Row], parent: &Row) -> bool {
+    let changed = rows.iter().any(|row| {
+        row["id"] == parent["id"]
+            && row["revoked_at"].is_null()
+            && row["replaced_by"] == parent["replaced_by"]
+    }) && !parent["used_at"].is_null()
+        && !rows.iter().any(|row| {
+            row["id"] == parent["replaced_by"]
+                && row["used_at"].is_null()
+                && row["revoked_at"].is_null()
+                && row["replaced_by"].is_null()
+        });
+    if changed {
+        for row in rows
+            .iter_mut()
+            .filter(|row| row["family_id"] == parent["family_id"])
+        {
+            if row["revoked_at"].is_null() {
+                row.insert("revoked_at".into(), chrono::Utc::now().timestamp().into());
+                row.insert("revoke_reason".into(), "reuse-detected".into());
+            }
+        }
+    }
+    changed
 }
 
 /// Connection settings for [`PgExec`].
@@ -1449,12 +1455,15 @@ impl QueryExec for PgExec {
         let cleanup_id = id.clone();
         let cleanup_reservation = reservation.clone();
         let cleanup_timeout = self.options.statement_timeout_ms.to_string();
+        let cleanup_family = family.clone();
         let mut guard = ReservationGuard(Some(move || {
             tokio::spawn(async move {
                 if let Ok(mut client) = pool.get().await {
                     if let Ok(tx) = client.transaction().await {
                         if tx.query("SELECT set_config('search_path', $1, true), set_config('app.tenant_id', $2, true), set_config('statement_timeout', $3, true), set_config('lock_timeout', $3, true)", &[&cleanup_schema, &cleanup_tenant, &cleanup_timeout]).await.is_ok() {
-                            let _ = tx.execute("UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE id = $1::text::uuid AND pending_rotation = $2 AND revoked_at IS NULL", &[&cleanup_id, &cleanup_reservation]).await;
+                            if tx.execute("SELECT pg_advisory_xact_lock(hashtext('vibe-refresh:' || $1))", &[&cleanup_family]).await.is_err() { return; }
+                            if tx.execute("UPDATE _platform_refresh_tokens SET revoked_at = clock_timestamp(), revoke_reason = 'reuse-detected' WHERE family_id = $1::text::uuid AND revoked_at IS NULL AND EXISTS (SELECT 1 FROM _platform_refresh_tokens p WHERE p.id = $2::text::uuid AND p.pending_rotation = $3 AND p.used_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = p.replaced_by AND c.used_at IS NULL AND c.revoked_at IS NULL AND c.replaced_by IS NULL))", &[&cleanup_family, &cleanup_id, &cleanup_reservation]).await.is_err() { return; }
+                            let _ = tx.execute("UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE id = $1::text::uuid AND pending_rotation = $2", &[&cleanup_id, &cleanup_reservation]).await;
                             let _ = tx.commit().await;
                         }
                     }
@@ -1488,9 +1497,9 @@ impl QueryExec for PgExec {
         )
         .await
         .map_err(map_pg)?;
-        if used && issued.is_ok() {
+        if used {
             let child_changed: bool = tx.query_one(
-                "SELECT EXISTS (SELECT 1 FROM _platform_refresh_tokens p WHERE p.id = $1::text::uuid AND p.pending_rotation = $2 AND p.pending_until > clock_timestamp() AND p.revoked_at IS NULL AND NOT EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = $3::text::uuid AND c.used_at IS NULL AND c.revoked_at IS NULL AND c.replaced_by IS NULL))",
+                "SELECT EXISTS (SELECT 1 FROM _platform_refresh_tokens p WHERE p.id = $1::text::uuid AND p.pending_rotation = $2 AND p.revoked_at IS NULL AND NOT EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = $3::text::uuid AND c.used_at IS NULL AND c.revoked_at IS NULL AND c.replaced_by IS NULL))",
                 &[&id, &reservation, &old_child],
             ).await.map_err(map_pg)?.get(0);
             if child_changed {
@@ -1510,9 +1519,15 @@ impl QueryExec for PgExec {
         let value = match issued {
             Ok(value) if current == 1 => value,
             result => {
+                let still_current: bool = tx.query_one(
+                    "SELECT EXISTS (SELECT 1 FROM _platform_refresh_tokens WHERE id = $1::text::uuid AND revoked_at IS NULL AND replaced_by IS NOT DISTINCT FROM $2::text::uuid)",
+                    &[&id, &old_child],
+                ).await.map_err(map_pg)?.get(0);
+                tx.execute("UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE id = $1::text::uuid AND pending_rotation = $2", &[&id, &reservation]).await.map_err(map_pg)?;
                 tx.commit().await.map_err(map_pg)?;
-                if current == 1 {
-                    guard.0.take();
+                guard.0.take();
+                if current == 0 && still_current {
+                    return Err(ExecError::Timeout);
                 }
                 return result.map(|_| (Rotated::Invalid, None));
             }
@@ -1983,7 +1998,7 @@ mod reservation_tests {
             issuer.resume.notify_one();
         };
         let (result, ()) = tokio::join!(original, concurrent);
-        assert_eq!(result.unwrap().0, Rotated::Invalid);
+        assert!(matches!(result, Err(ExecError::Timeout)));
         assert!(matches!(
             exec.refresh_rotate(tenant, "parent", "other-child", policy)
                 .await
@@ -2027,7 +2042,7 @@ mod reservation_tests {
             // Memory finalization has no database operation to fail. Expire its
             // reservation to exercise a failed finalization validation instead.
             issuer.resume.notify_one();
-            assert_eq!(rotation.await.unwrap().0, Rotated::Invalid);
+            assert!(matches!(rotation.await, Err(ExecError::Timeout)));
         }
         assert!(matches!(
             exec.refresh_rotate(tenant, "parent", "retry", policy)

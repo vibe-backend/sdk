@@ -765,9 +765,8 @@ async fn check_postgres_reservation(mode: &str) {
                     schema: &schema,
                 }),
             )
-            .await
-            .unwrap();
-        assert_eq!(expired.0, vibe::runtime::refresh::Rotated::Invalid);
+            .await;
+        assert!(matches!(expired, Err(vibe::runtime::ExecError::Timeout)));
         assert!(matches!(
             exec.refresh_rotate(
                 &tenant,
@@ -802,7 +801,7 @@ async fn check_postgres_reservation(mode: &str) {
         idle_ttl: 600,
         grace: 10,
     };
-    if mode == "slow" || mode == "http-pool-timeout" {
+    if ["slow", "http-pool-timeout", "http-reservation-expiry"].contains(&mode) {
         // A child insert waits inside the rotation transaction beyond the response floor.
         admin
             .batch_execute(&format!(
@@ -885,6 +884,19 @@ async fn check_postgres_reservation(mode: &str) {
             assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
             assert_eq!(body["error"]["code"], "TX_TIMEOUT");
             drop(held);
+        }
+        if mode == "http-reservation-expiry" {
+            admin.batch_execute(&format!("CREATE FUNCTION {schema}.issuance_delay() RETURNS text LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.3); RETURN 'u1'; END $$; ALTER TABLE {schema}.users RENAME TO users_data; CREATE VIEW {schema}.users AS SELECT {schema}.issuance_delay() AS id, roles FROM {schema}.users_data; GRANT SELECT ON {schema}.users TO public_reader")).await.unwrap();
+            let expire = async {
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    loop {
+                        let count = admin.execute(&format!("UPDATE {schema}._platform_refresh_tokens SET pending_until = clock_timestamp() - interval '1 second' WHERE token_hash = $1 AND pending_rotation IS NOT NULL"), &[&hash]).await.unwrap();
+                        if count == 1 { break; }
+                        tokio::task::yield_now().await;
+                    }
+                }).await.unwrap();
+            };
+            tokio::join!(assert_http_refresh_timeout(&a, &token), expire);
         }
         let (status, body, elapsed) = a.refresh(&token).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1341,6 +1353,7 @@ struct FamilyLookupFails {
     rotate_delay_ms: u64,
     signer_delay_ms: u64,
     signer_timeout: bool,
+    reservation_overrun: bool,
     signer_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1363,6 +1376,14 @@ impl vibe::runtime::QueryExec for FamilyLookupFails {
         sql: &str,
         params: Vec<Option<String>>,
     ) -> Result<Vec<vibe::runtime::Row>, vibe::runtime::ExecError> {
+        if self.reservation_overrun
+            && self
+                .signer_down
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Synchronous issuance can finish after the reservation lifetime.
+            std::thread::sleep(std::time::Duration::from_secs(16));
+        }
         tokio::time::sleep(std::time::Duration::from_millis(self.signer_delay_ms)).await;
         if self.signer_down.load(std::sync::atomic::Ordering::SeqCst) {
             if self.signer_timeout {
@@ -1470,6 +1491,7 @@ async fn refresh_timeout_returns_504_tx_timeout_and_preserves_token() {
             rotate_delay_ms: 0,
             signer_delay_ms: 0,
             signer_timeout: false,
+            reservation_overrun: false,
             signer_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     });
@@ -1500,6 +1522,7 @@ async fn refresh_waits_complete_and_new_tokens_remain_usable() {
                 rotate_delay_ms,
                 signer_delay_ms,
                 signer_timeout: false,
+                reservation_overrun: false,
                 signer_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             })
         });
@@ -1775,6 +1798,7 @@ fn app_with_issuance_control(
             rotate_delay_ms: 0,
             signer_delay_ms: 0,
             signer_timeout: false,
+            reservation_overrun: false,
             signer_down: flag,
         })
     });
@@ -2158,6 +2182,84 @@ async fn check_issuance_without_store_connection(
             Rotated::Ok { .. }
         ));
     }
+    if ["child-rotation-failure", "child-rotation-cancel"].contains(&scenario) {
+        exec.refresh_issue(tenant, "user", "failure-parent", policy)
+            .await
+            .unwrap();
+        exec.refresh_rotate(tenant, "failure-parent", "failure-child", policy)
+            .await
+            .unwrap();
+        struct ChildIssuer<'a> {
+            exec: &'a dyn vibe::runtime::QueryExec,
+            tenant: &'a str,
+            cancel: bool,
+            entered: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl RefreshIssuer for ChildIssuer<'_> {
+            async fn issue(&self, _: &str) -> Result<Value, ExecError> {
+                self.exec
+                    .refresh_rotate(
+                        self.tenant,
+                        "failure-child",
+                        "failure-descendant",
+                        RefreshPolicy::default(),
+                    )
+                    .await?;
+                self.entered.notify_one();
+                if self.cancel {
+                    std::future::pending::<()>().await;
+                }
+                Err(ExecError::IssuanceFailed)
+            }
+        }
+        let issuer = ChildIssuer {
+            exec,
+            tenant,
+            cancel: scenario == "child-rotation-cancel",
+            entered: Default::default(),
+        };
+        let mut rotation = Box::pin(exec.refresh_rotate_authorized(
+            tenant,
+            "failure-parent",
+            "failure-new",
+            policy,
+            Some(&issuer),
+        ));
+        if issuer.cancel {
+            tokio::select! { _ = issuer.entered.notified() => {}, result = &mut rotation => panic!("unexpected completion: {result:?}") }
+            drop(rotation);
+        } else {
+            assert!(matches!(rotation.await.unwrap().0, Rotated::Reuse { .. }));
+        }
+        // PostgreSQL cancellation cleanup runs in a separate transaction.
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    exec.refresh_rotate_authorized(
+                        tenant,
+                        "failure-descendant",
+                        "failure-probe",
+                        policy,
+                        Some(&FailingIssuer)
+                    )
+                    .await,
+                    Ok((Rotated::Invalid, None))
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            exec.refresh_rotate(tenant, "failure-descendant", "failure-retry", policy)
+                .await
+                .unwrap(),
+            Rotated::Invalid
+        );
+    }
     if scenario == "retry" {
         for late in [false, true] {
             let parent = format!("retry-parent-{late}");
@@ -2407,6 +2509,7 @@ async fn pending_refresh_returns_retryable_response_without_clearing_cookie() {
             rotate_delay_ms: 0,
             signer_delay_ms: 600,
             signer_timeout: false,
+            reservation_overrun: false,
             signer_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     });
@@ -2569,6 +2672,7 @@ async fn issuance_timeout_returns_504_and_allows_retry() {
             rotate_delay_ms: 0,
             signer_delay_ms: 0,
             signer_timeout: true,
+            reservation_overrun: false,
             signer_down: flag,
         })
     });
@@ -2585,4 +2689,69 @@ async fn issuance_timeout_returns_504_and_allows_retry() {
         a.refresh(&tok(&body, "refresh_token")).await.0,
         StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn memory_child_rotation_after_failed_or_cancelled_issuance() {
+    for scenario in ["child-rotation-failure", "child-rotation-cancel"] {
+        check_issuance_without_store_connection(&MemoryExec::new(), TENANT, scenario).await;
+    }
+}
+#[tokio::test]
+async fn postgres_child_rotation_after_failed_or_cancelled_issuance() {
+    for scenario in ["child-rotation-failure", "child-rotation-cancel"] {
+        check_postgres_reservation(scenario).await;
+    }
+}
+
+#[tokio::test]
+async fn memory_http_reservation_lifetime_allows_same_token_retry() {
+    let overrun = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = overrun.clone();
+    let a = app_wrapped(manifest(10), move |inner| {
+        Arc::new(FamilyLookupFails {
+            inner,
+            down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lookup_delay_ms: 0,
+            rotate_delay_ms: 0,
+            signer_delay_ms: 0,
+            signer_timeout: false,
+            reservation_overrun: true,
+            signer_down: flag,
+        })
+    });
+    let token = tok(&a.login().await, "refresh_token");
+    overrun.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_http_refresh_timeout(&a, &token).await;
+    assert_eq!(a.refresh(&token).await.0, StatusCode::OK);
+}
+
+async fn assert_http_refresh_timeout(a: &App, token: &str) {
+    let response = a
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/v1/acme/token/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"refresh_token": token}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(!response.headers().contains_key("set-cookie"));
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "TX_TIMEOUT");
+    assert_eq!(body["error"]["retryable"], true);
+}
+
+#[tokio::test]
+async fn postgres_http_expired_reservation_allows_same_token_retry() {
+    check_postgres_reservation("http-reservation-expiry").await;
 }
