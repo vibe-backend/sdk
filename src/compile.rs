@@ -693,11 +693,10 @@ async fn translate_source(
     if text.trim().is_empty() {
         return Err(fail("the LLM returned an empty translation".into()));
     }
-    if needs_translation(&text) {
-        return Err(fail(
-            "the translation still contains non-English text".into(),
-        ));
-    }
+    // Chinese (or other non-ASCII) text may remain in the translation, e.g.
+    // quoted names or terms. That is not an error: the keyword check reads
+    // the translation together with the original source, and its rules fail
+    // closed when a required English keyword is missing.
     if let Some(dir) = path.parent() {
         if fs::create_dir_all(dir).is_ok() {
             let _ = fs::write(&path, &text);
@@ -1528,11 +1527,12 @@ fn semantic_check(
     report.extend(frontmatter_security_check(doc, source));
     // #37 point 1-4: the keyword check is English-only and reads the English
     // normalization of the source (the source itself when already English).
-    let text = english
-        .get(&source.id)
-        .cloned()
-        .unwrap_or_else(|| strip_source_frontmatter(&source.combined_text()).to_string())
-        .to_lowercase();
+    let original = strip_source_frontmatter(&source.combined_text()).to_string();
+    let text = match english.get(&source.id) {
+        Some(translated) => format!("{translated}\n\n{original}"),
+        None => original,
+    }
+    .to_lowercase();
     if source_type_natural(source) {
         report.extend(declaration_check(doc, source, &text));
     }
