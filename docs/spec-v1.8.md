@@ -172,7 +172,7 @@
 | 58 | Adapter 按 model capability 送決定性參數：model 唔支援嘅參數（例如 `temperature`、`top_p`、`seed`）就唔送，唔可以強送；決定性只靠 CI 重編比對保證。Model pin 用 provider 回報嘅 model id／snapshot id，唔再要求 id 帶日期後綴。 | 已確認 | 2A.6、2A.8.2、2A.8.3、2A.8.6 |
 | 59 | 三個 provider 嘅 request path 同 header 固定寫入 adapter：OpenAI `POST {base}/chat/completions`＋`Authorization: Bearer`；Anthropic `POST {base}/v1/messages`＋`x-api-key`＋`anthropic-version: 2023-06-01`；Gemini `POST {base}/models/{model}:generateContent`＋`x-goog-api-key`。 | 已確認 | 2A.8.2 |
 | 60 | Refresh cookie 嘅 `Path` 一定包含 `{slug}`：`/{definition}/{version}/{slug}/refresh`（同 10.7 一致）。 | 已確認 | 4A.1 |
-| 61 | Refresh 寬限期精確定義：DB 只存 hash；寬限期內用返舊 token，平台用 `used_at` 判斷，撤銷上一次發出嘅子 token，再喺同一家族發一組新 token；唔儲存、唔重發明文。每個舊 token 最多重發一次（`used_at` 加 `grace_reissued_at`）；寬限期內第二次再用即當重用，撤銷成個家族。 | 已確認 | 4A.1 |
+| 61 | Refresh 寬限期精確定義：DB 只存 hash；寬限期內用返舊 token，平台用 `used_at` 判斷，撤銷上一次發出嘅子 token，再喺同一家族發一組新 token；唔儲存、唔重發明文。並行請求喺第一個請求處理中出示同一 token，會收到可重試嘅 503 TX_CONFLICT（retryable: true，唔清 cookie）。第一個請求完成之後，喺寬限期（10 秒）內再出示，按寬限期規則處理；超過寬限期先當重用，撤銷整個 family。每個舊 token 最多重發一次（`used_at` 加 `grace_reissued_at`）；寬限期內第二次再用即當重用，撤銷成個家族。 | 已確認（產品經理 2026-10-17） | 4A.1 |
 | 62 | `sign-token` 嘅 `tenant_id` 只有一個來源：平台由 slug（public）或者已驗證 token（auth）解析出嚟嘅 `ctx.tenant_id`；永遠唔由 client 或者 method 傳入，亦唔由 `users` 表讀。 | 已確認 | 12.6、12.8 |
 | 63 | `mail_worker` 加入 7.1 平台專用 role 表。 | 已確認 | 7.1 |
 | 64 | `compiler-hash` 只有一個標準定義（2A.1），包括 seed 同實際送出嘅決定性參數。 | 已確認 | 2A.1、2A.6、10.1 |
@@ -1123,17 +1123,19 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 
 ### 4A.1 Access token 同 refresh token（決定 6）
 
+- For the per-refresh-family limit, when the limit is exceeded the response is 401, consistent with an invalid token. IP limits remain 429 `RATE_LIMITED` with `Retry-After`.
 - Access token：JWT，ttl 上限 1 小時。
 - Refresh token：不透明隨機值（最少 256 bit），DB 只存 hash；ttl 上限 30 日（由家族第一次簽發計，絕對壽命），閒置 7 日冇用就失效。
 - 每次用 refresh token 都輪換：發新 refresh token 同新 access token，舊 refresh token 即時失效。
 - 同一次登入產生嘅 refresh token 屬同一個家族（`family_id`）；偵測到重用已失效嘅 refresh token，即時撤銷成個家族，並寫審計記錄、通知用戶。
 - 寬限期（決定 61）：為咗容忍網絡重試，輪換後 `reuse-grace`（預設同上限 10 秒）內再用同一個舊 token，唔當重用。DB 只存 hash，平台冇可能回返上一次嘅明文，所以做法係：
   1. 用 `HMAC-SHA-256(pepper, token)` 搵到嗰列；佢 `used_at` 唔係 null、`now() - used_at <= reuse-grace`、`grace_reissued_at` 係 null、家族未撤銷。
-  2. 喺同一個 transaction 撤銷佢嘅 `replaced_by` 子 token（`revoke_reason: grace-reissue`），再由同一個舊 token 發一個新子 token（同一個 `family_id`，`parent_id` 指舊 token），更新舊 token 嘅 `replaced_by`，設 `grace_reissued_at = now()`；`used_at` 唔改（寬限期唔會延長）。用 `update ... where grace_reissued_at is null` 做條件更新，兩個並發請求只有一個成功，另一個當重用。
+  2. 喺同一個 transaction 撤銷佢嘅 `replaced_by` 子 token（`revoke_reason: grace-reissue`），再由同一個舊 token 發一個新子 token（同一個 `family_id`，`parent_id` 指舊 token），更新舊 token 嘅 `replaced_by`，設 `grace_reissued_at = now()`；`used_at` 唔改（寬限期唔會延長）。用 `update ... where grace_reissued_at is null` 做條件更新，並行請求喺第一個請求處理中出示同一 token，會收到可重試嘅 503 TX_CONFLICT（retryable: true，唔清 cookie）。第一個請求完成之後，喺寬限期（10 秒）內再出示，按寬限期規則處理；超過寬限期先當重用，撤銷整個 family。
   3. 回新 access token 同新 refresh token。家族唔變，絕對壽命唔變。
   4. 每個舊 token 最多重發一次。超過寬限期、或者 `grace_reissued_at` 已經有值（寬限期內第二次再用）、或者家族已撤銷、或者子 token 已經再被輪換過，一律當重用：撤銷成個家族。
   5. 可選：平台可以額外比對 client 指紋（例如 User-Agent hash）先准重發；v1 唔要求。
 - 登出：revoke 當前家族；「全部裝置登出」revoke 該用戶所有家族。
+- 清理（#95）：revoke 一律用 UPDATE；成個家族絕對壽命完咗超過 1 日之後，`vibe migrate`（table owner）會分批 DELETE 嗰個家族嘅所有列（每批 1000 列，每次最多 100 批）。生效中嘅家族永遠唔會被清理，所以重用偵測唔受影響。
 - refresh 流程由平台內置 `token-refresh` pipeline 實現，用 `method` op 呼叫標咗 `capabilities: [sign-token]` 嘅 model method 簽新 access token。
 - 簽發：`sign-jwt` op 嘅 `issue-refresh` 參數決定係咪同時發 refresh token：`new-family`（登入）、`rotate`（refresh，由 `token-refresh` pipeline 注入）、`none`；由平台按呼叫來源決定，method 唔可以自己揀 `rotate`。
 
