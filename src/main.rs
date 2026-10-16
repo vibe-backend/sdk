@@ -468,15 +468,14 @@ async fn cmd_serve(
         .collect();
     vibe::runtime::challenge::production_gate(run_env, challenge.is_some(), &always)?;
     let addr: SocketAddr = addr.parse().map_err(|err| format!("bad address: {err}"))?;
+    let rates = vibe::runtime::RateBuckets::with_limits(net_limits_from_env()?);
     let state = Arc::new(AppState {
         manifest,
         exec,
         auth,
         slugs: loaded.slugs,
-        rates: std::sync::Mutex::new(vibe::runtime::RateBuckets::with_limits(
-            net_limits_from_env()?,
-        )),
-        quotas: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(vibe::runtime::QuotaBuckets::with_memory(rates.memory())),
+        rates: std::sync::Mutex::new(rates),
         disabled: load_disabled(project),
         min_override_ms: None,
         honor_test_ip: false,
@@ -600,6 +599,8 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
 /// multiple of the tenant cap (default 5, 1..=100).
 /// `VIBE_RATE_EXPECTED_TENANTS` sizes the global tenant slot budget
 /// (default 256, 1..=4096; budget = tenants x 4,096 slots).
+/// `VIBE_RATE_TABLE_MEMORY_MAX_BYTES` caps the estimated memory of all
+/// limiter tables combined (default 268435456 = 256 MiB, at least 1 MiB).
 fn net_limits_from_env() -> Result<vibe::runtime::NetLimits, String> {
     let mut limits = vibe::runtime::NetLimits::default();
     if let Ok(raw) = std::env::var("VIBE_RATE_PLATFORM_FACTOR") {
@@ -628,6 +629,16 @@ fn net_limits_from_env() -> Result<vibe::runtime::NetLimits, String> {
                 )
             })?;
         limits = limits.sized_for(tenants);
+    }
+    if let Ok(raw) = std::env::var("VIBE_RATE_TABLE_MEMORY_MAX_BYTES") {
+        limits.table_memory_max_bytes = raw
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|b| *b >= 1024 * 1024)
+            .ok_or_else(|| {
+                format!("VIBE_RATE_TABLE_MEMORY_MAX_BYTES must be an integer of at least 1048576, got {raw}")
+            })?;
     }
     Ok(limits)
 }

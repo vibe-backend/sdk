@@ -83,7 +83,6 @@ impl<V> BoundedMap<V> {
         }
     }
 
-    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -180,6 +179,49 @@ impl<V> BoundedMap<V> {
 pub struct RateBuckets {
     shards: HashMap<String, RateShard>,
     net: NetLayers,
+    memory: std::sync::Arc<LimiterMemory>,
+}
+
+/// Default hard cap on the estimated memory of all limiter tables combined
+/// (`VIBE_RATE_TABLE_MEMORY_MAX_BYTES`, 256 MiB).
+pub const TABLE_MEMORY_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Estimated heap bytes per D130 counter slot: about 480 measured
+/// (tests/limiter_memory.rs) with one record per window queue, doubled to
+/// cover queues at their worst-case length (4 records per slot) and hash
+/// table growth. See docs/release-hardening.md.
+pub const COUNTER_SLOT_BYTES: usize = 1_024;
+/// Estimated bytes per rate bucket, excluding its hit timestamps, including
+/// per-owner bookkeeping (about 990 measured with 5 hits; rounded up).
+pub const BUCKET_BYTES: usize = 1_024;
+/// Bytes per allowed hit of a bucket (`Instant`), doubled for `Vec` growth.
+pub const HIT_BYTES: usize = 2 * std::mem::size_of::<Instant>();
+/// Estimated bytes per daily-quota entry (about 200 measured; rounded up).
+pub const QUOTA_ENTRY_BYTES: usize = 256;
+
+/// Shared hard memory budget for every limiter table (rate shards, D130
+/// tables, daily quotas). Estimates are conservative upper bounds per entry.
+#[derive(Debug)]
+pub struct LimiterMemory {
+    max: usize,
+    quota: std::sync::atomic::AtomicUsize,
+}
+
+impl LimiterMemory {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            quota: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        self.max
+    }
+
+    fn quota_bytes(&self) -> usize {
+        self.quota.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl Default for RateBuckets {
@@ -199,6 +241,8 @@ struct RateShard {
     saturated_logged: Option<Instant>,
     /// Refusals since the last saturation log line.
     refused_since_log: u64,
+    /// Largest per-minute limit of any bucket created (memory estimate).
+    max_limit: u32,
 }
 
 impl RateShard {
@@ -209,7 +253,16 @@ impl RateShard {
             owner_keys: HashMap::new(),
             saturated_logged: None,
             refused_since_log: 0,
+            max_limit: 0,
         }
+    }
+
+    fn bucket_bytes(limit: u32) -> usize {
+        BUCKET_BYTES + HIT_BYTES * limit as usize
+    }
+
+    fn bytes(&self) -> usize {
+        self.map.len() * Self::bucket_bytes(self.max_limit)
     }
 
     fn release(owned: &mut HashMap<String, usize>, owners: &[String; 2]) {
@@ -372,10 +425,35 @@ pub enum RateDecision {
 
 impl RateBuckets {
     pub fn with_limits(limits: NetLimits) -> Self {
+        let memory = std::sync::Arc::new(LimiterMemory::new(limits.table_memory_max_bytes));
         Self {
             shards: HashMap::new(),
             net: NetLayers::new(limits),
+            memory,
         }
+    }
+
+    /// The memory budget shared with [`QuotaBuckets::with_memory`].
+    pub fn memory(&self) -> std::sync::Arc<LimiterMemory> {
+        self.memory.clone()
+    }
+
+    /// Estimated bytes of every limiter table sharing this budget.
+    pub fn estimated_bytes(&self) -> usize {
+        self.shard_bytes() + self.net.bytes() + self.memory.quota_bytes()
+    }
+
+    fn shard_bytes(&self) -> usize {
+        self.shards.values().map(RateShard::bytes).sum()
+    }
+
+    /// Live D130 counter slots `(tenant, platform)` (measurement hook).
+    #[doc(hidden)]
+    pub fn counter_slots(&self) -> (usize, usize) {
+        (
+            self.net.tenants.entries.len(),
+            self.net.platform.entries.len(),
+        )
     }
 
     /// Shard logic only (D130 layers off), for the #73 tests.
@@ -458,14 +536,23 @@ impl RateBuckets {
             .map(|(shard, key, _)| (shard.as_str(), key.as_str()))
             .collect::<std::collections::HashSet<_>>()
             .len() as u32;
+        let new_bucket_bytes: usize = checks
+            .iter()
+            .filter(|(shard, key, _)| self.shards[shard].map.get(key).is_none())
+            .map(|(shard, _, limit)| {
+                RateShard::bucket_bytes((*limit).max(self.shards[shard].max_limit))
+            })
+            .sum();
+        self.net.base_bytes = self.shard_bytes() + self.memory.quota_bytes() + new_bucket_bytes;
+        self.net.max_bytes = self.memory.max;
         match self.net.charge(tenant, owner, new, now) {
             Ok(()) => {}
             Err(NetRefusal::Cap(layer, wait)) => {
                 record_slot_refused(layer, "network_cap");
                 return RateDecision::Limited(wait);
             }
-            Err(NetRefusal::SlotsFull(layer, wait)) => {
-                self.net.log_full(layer, now);
+            Err(NetRefusal::SlotsFull(layer, reason, wait)) => {
+                self.net.log_full(layer, reason, now);
                 return RateDecision::Limited(wait);
             }
         }
@@ -474,6 +561,7 @@ impl RateBuckets {
             if rs.map.get(key).is_some() {
                 continue;
             }
+            rs.max_limit = rs.max_limit.max(*limit);
             if !rs.insert(key, &owners, *limit, now) {
                 rs.log_saturation(shard, "pinned", now);
                 return RateDecision::Limited(WINDOW.as_secs());
@@ -532,8 +620,9 @@ impl RateBuckets {
 /// Requests refused because D130 counter slots were full of live counters.
 static COUNTER_SLOT_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Total requests refused (fail closed) because D130 counter slots were full.
-/// Alias of the sum of `vibe_rate_limit_slot_refused_total{reason="table_full"}`.
+/// Total requests refused (fail closed) because D130 counter slots or the
+/// limiter memory budget were exhausted: the sum of
+/// `vibe_rate_limit_slot_refused_total` over every reason but `network_cap`.
 pub fn counter_slot_refusals() -> u64 {
     COUNTER_SLOT_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -541,15 +630,20 @@ pub fn counter_slot_refusals() -> u64 {
 /// Name of the D130 refusal metric.
 pub const SLOT_REFUSED_METRIC: &str = "vibe_rate_limit_slot_refused_total";
 const SLOT_LAYERS: [&str; 2] = ["tenant", "platform"];
-const SLOT_REASONS: [&str; 2] = ["network_cap", "table_full"];
+const SLOT_REASONS: [&str; 4] = [
+    "network_cap",
+    "table_full",
+    "tenant_budget_exhausted",
+    "prefix_cap_exceeded",
+];
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static SLOT_REFUSED: [std::sync::atomic::AtomicU64; 4] = [ZERO; 4];
+static SLOT_REFUSED: [std::sync::atomic::AtomicU64; 8] = [ZERO; 8];
 
 fn slot_index(layer: &str, reason: &str) -> Option<usize> {
     let l = SLOT_LAYERS.iter().position(|x| *x == layer)?;
     let r = SLOT_REASONS.iter().position(|x| *x == reason)?;
-    Some(l * 2 + r)
+    Some(l * SLOT_REASONS.len() + r)
 }
 
 fn record_slot_refused(layer: &str, reason: &str) {
@@ -559,7 +653,11 @@ fn record_slot_refused(layer: &str, reason: &str) {
 }
 
 /// `vibe_rate_limit_slot_refused_total{layer, reason}`: `layer` is `tenant`
-/// or `platform`, `reason` is `network_cap` or `table_full`. Internal only;
+/// or `platform`; `reason` is `network_cap` (a network over its new-slot
+/// cap), `table_full` (a tenant's own partition, the platform total or the
+/// memory budget is full), `tenant_budget_exhausted` (the global tenant
+/// budget is used up) or `prefix_cap_exceeded` (a platform IPv4 /24 or IPv6
+/// /32 partition is full). Internal only;
 /// responses never name the layer.
 pub fn slot_refused_total(layer: &str, reason: &str) -> u64 {
     slot_index(layer, reason).map_or(0, |i| {
@@ -621,6 +719,8 @@ pub struct NetLimits {
     pub platform_slots_per_aggregate: usize,
     /// Platform counter slots across all aggregates.
     pub platform_slots: usize,
+    /// Hard cap on the estimated bytes of all limiter tables combined.
+    pub table_memory_max_bytes: usize,
 }
 
 impl Default for NetLimits {
@@ -634,6 +734,7 @@ impl Default for NetLimits {
             tenant_slot_floor: TENANT_SLOT_FLOOR,
             platform_slots_per_aggregate: PLATFORM_SLOTS_PER_AGGREGATE,
             platform_slots: PLATFORM_SLOTS_TOTAL,
+            table_memory_max_bytes: TABLE_MEMORY_MAX_BYTES,
         }
     }
 }
@@ -757,7 +858,7 @@ impl CounterTable {
     /// Slots that must be free to add the absent `keys`, versus free slots
     /// (after [`sweep`](Self::sweep)). `Err` carries seconds until the oldest
     /// live counter in the way expires.
-    fn room(&self, group: &str, keys: &[&str], now: Instant) -> Result<(), u64> {
+    fn room(&self, group: &str, keys: &[&str], now: Instant) -> Result<(), (Bound, u64)> {
         let missing = keys
             .iter()
             .filter(|k| {
@@ -772,7 +873,12 @@ impl CounterTable {
         if used + missing <= self.per_group && within_total {
             return Ok(());
         }
-        let oldest = if used + missing > self.per_group {
+        let bound = if used + missing > self.per_group {
+            Bound::Partition
+        } else {
+            Bound::Total
+        };
+        let oldest = if bound == Bound::Partition {
             self.group_queue
                 .get(group)
                 .and_then(|q| q.iter().find(|(k, s)| self.is_current(group, k, *s)))
@@ -783,7 +889,21 @@ impl CounterTable {
                 .find(|(g, k, s)| self.is_current(g, k, *s))
                 .map(|(_, _, s)| *s)
         };
-        Err(oldest.map_or(WINDOW.as_secs(), |s| retry_after(s, now)))
+        Err((
+            bound,
+            oldest.map_or(WINDOW.as_secs(), |s| retry_after(s, now)),
+        ))
+    }
+
+    /// Absent `keys` (slots a successful add would create).
+    fn missing(&self, group: &str, keys: &[&str]) -> usize {
+        keys.iter()
+            .filter(|k| {
+                !self
+                    .entries
+                    .contains_key(&(group.to_string(), k.to_string()))
+            })
+            .count()
     }
 
     /// Adds `n` to `key`, restarting its window if expired. Call only after
@@ -834,19 +954,33 @@ impl CounterTable {
     }
 }
 
+/// Which slot bound refused: a group's partition or the table total.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Bound {
+    Partition,
+    Total,
+}
+
 /// The D130 layers.
 struct NetLayers {
     limits: NetLimits,
     tenants: CounterTable,
     platform: CounterTable,
-    full_logged: Option<Instant>,
+    /// Last warn log per `(layer, reason)`.
+    full_logged: HashMap<(&'static str, &'static str), Instant>,
+    /// Estimated bytes of the other tables plus the buckets this request
+    /// would create (set by `check_tenant`).
+    base_bytes: usize,
+    max_bytes: usize,
 }
 
 /// Which table a refusal came from (logs only, never the response).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum NetRefusal {
     Cap(&'static str, u64),
-    SlotsFull(&'static str, u64),
+    /// `(layer, reason, wait)`; reason is `table_full`,
+    /// `tenant_budget_exhausted` or `prefix_cap_exceeded`.
+    SlotsFull(&'static str, &'static str, u64),
 }
 
 impl NetLayers {
@@ -862,8 +996,10 @@ impl NetLayers {
                 limits.platform_slots,
                 0,
             ),
+            max_bytes: limits.table_memory_max_bytes,
             limits,
-            full_logged: None,
+            full_logged: HashMap::new(),
+            base_bytes: 0,
         }
     }
 
@@ -945,16 +1081,29 @@ impl NetLayers {
         }
         let tk: Vec<&str> = tkeys.iter().map(|(k, _)| k.as_str()).collect();
         let pk: Vec<&str> = pkeys.iter().map(String::as_str).collect();
-        let full = if let Err(w) = self.tenants.room(tenant, &tk, now) {
-            Some(("tenant", w))
-        } else if let Err(w) = self.platform.room(&group, &pk, now) {
-            Some(("platform", w))
-        } else {
-            None
+        let new_t = self.tenants.missing(tenant, &tk);
+        let new_p = self.platform.missing(&group, &pk);
+        let projected = self
+            .base_bytes
+            .saturating_add(self.bytes())
+            .saturating_add((new_t + new_p) * COUNTER_SLOT_BYTES);
+        let full = match (
+            self.tenants.room(tenant, &tk, now),
+            self.platform.room(&group, &pk, now),
+        ) {
+            (Err((Bound::Partition, w)), _) => Some(("tenant", "table_full", w)),
+            (Err((Bound::Total, w)), _) => Some(("tenant", "tenant_budget_exhausted", w)),
+            (_, Err((Bound::Partition, w))) => Some(("platform", "prefix_cap_exceeded", w)),
+            (_, Err((Bound::Total, w))) => Some(("platform", "table_full", w)),
+            _ if projected > self.max_bytes => {
+                let layer = if new_t > 0 { "tenant" } else { "platform" };
+                Some((layer, "table_full", WINDOW.as_secs()))
+            }
+            _ => None,
         };
-        if let Some((layer, w)) = full {
+        if let Some((layer, reason, w)) = full {
             let w = w.max(self.wait_all(tenant, &tkeys, &group, &pkeys, now));
-            return Err(NetRefusal::SlotsFull(layer, w));
+            return Err(NetRefusal::SlotsFull(layer, reason, w));
         }
         for k in tk {
             self.tenants.add(tenant, k, n, now);
@@ -965,21 +1114,31 @@ impl NetLayers {
         Ok(())
     }
 
-    fn log_full(&mut self, layer: &'static str, now: Instant) {
+    /// Estimated bytes of both D130 tables.
+    fn bytes(&self) -> usize {
+        (self.tenants.entries.len() + self.platform.entries.len()) * COUNTER_SLOT_BYTES
+    }
+
+    /// Counts a fail-closed refusal and logs at most once per minute per
+    /// `(layer, reason)` (alert hook: target `vibe::rate_limit_counter_slots`).
+    fn log_full(&mut self, layer: &'static str, reason: &'static str, now: Instant) {
         COUNTER_SLOT_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        record_slot_refused(layer, "table_full");
+        record_slot_refused(layer, reason);
         if self
             .full_logged
-            .is_some_and(|at| now.duration_since(at) < WINDOW)
+            .get(&(layer, reason))
+            .is_some_and(|at| now.duration_since(*at) < WINDOW)
         {
             return;
         }
-        self.full_logged = Some(now);
+        self.full_logged.insert((layer, reason), now);
         tracing::warn!(
             target: "vibe::rate_limit_counter_slots",
             layer,
+            reason,
+            refused = slot_refused_total(layer, reason),
             refused_total = counter_slot_refusals(),
-            "rate-limit counter slots full of live counters; failing closed"
+            "rate-limit counter slots exhausted; failing closed"
         );
     }
 }
@@ -1024,12 +1183,29 @@ pub fn owner_levels(owner: &str) -> [String; 2] {
 }
 
 /// Daily public-write counters, one bounded shard per key type.
-#[derive(Default)]
 pub struct QuotaBuckets {
     shards: HashMap<&'static str, BoundedMap<(String, u32)>>,
+    memory: std::sync::Arc<LimiterMemory>,
+}
+
+impl Default for QuotaBuckets {
+    fn default() -> Self {
+        Self::with_memory(std::sync::Arc::new(LimiterMemory::new(
+            TABLE_MEMORY_MAX_BYTES,
+        )))
+    }
 }
 
 impl QuotaBuckets {
+    /// Quotas sharing the rate limiter's memory budget
+    /// ([`RateBuckets::memory`]).
+    pub fn with_memory(memory: std::sync::Arc<LimiterMemory>) -> Self {
+        Self {
+            shards: HashMap::new(),
+            memory,
+        }
+    }
+
     /// `checks` = `(key type, key, daily limit)`. Counts only when all admit.
     pub fn check(&mut self, day: &str, checks: &[(&'static str, String, u32)]) -> bool {
         for (kind, key, limit) in checks {
@@ -1038,6 +1214,17 @@ impl QuotaBuckets {
                     return false;
                 }
             }
+        }
+        let new = checks
+            .iter()
+            .filter(|(kind, key, _)| self.shards.get(kind).is_none_or(|m| m.get(key).is_none()))
+            .count();
+        let used = self.memory.quota_bytes();
+        if new > 0 && used + new * QUOTA_ENTRY_BYTES > self.memory.max {
+            // Rate buckets and D130 tables are counted by the rate limiter;
+            // here only quota growth is refused (fail closed).
+            COUNTER_SLOT_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
         }
         for (kind, key, _) in checks {
             let entry = self
@@ -1050,6 +1237,11 @@ impl QuotaBuckets {
             }
             entry.1 += 1;
         }
+        let entries: usize = self.shards.values().map(|m| m.len()).sum();
+        self.memory.quota.store(
+            entries * QUOTA_ENTRY_BYTES,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         true
     }
 }
@@ -2121,7 +2313,7 @@ mod tests {
         }
         assert!(matches!(
             rates.net.charge("ta", &v4(9), 1, now),
-            Err(NetRefusal::SlotsFull("tenant", _))
+            Err(NetRefusal::SlotsFull("tenant", "table_full", _))
         ));
         for i in 0..4 {
             assert!(rates.net.charge("tb", &v4(100 + i), 1, now).is_ok());
@@ -2181,7 +2373,7 @@ mod tests {
         }
         assert!(matches!(
             rates.net.charge("fresh", &v6(0, 99), 1, now),
-            Err(NetRefusal::SlotsFull("platform", _))
+            Err(NetRefusal::SlotsFull("platform", "prefix_cap_exceeded", _))
         ));
         assert!(rates.net.charge("fresh", &v6(1, 0), 1, now).is_ok());
         assert!(rates.net.charge("fresh", &v4(7), 1, now).is_ok());
@@ -2262,5 +2454,150 @@ mod tests {
         assert_eq!(d130_fill(&mut rates, "ta", &mapped, 10, now), 4);
         assert_eq!(owner_of("::ffff:198.51.100.7"), "198.51.100.7");
         assert_eq!(rates.net.tenants.count("ta", "198.51.100.0/24", now), 10);
+    }
+
+    fn refusal(rates: &mut RateBuckets, tenant: &str, owner: &str, now: Instant) -> NetRefusal {
+        rates
+            .net
+            .charge(tenant, owner, 1, now)
+            .expect_err("refused")
+    }
+
+    #[test]
+    fn each_refusal_path_has_its_reason() {
+        let now = Instant::now();
+        // network_cap (tenant and platform layer).
+        let mut rates = RateBuckets::default();
+        d130_fill(&mut rates, "ta", "198.51.100.1", 10, now);
+        assert!(matches!(
+            refusal(&mut rates, "ta", "198.51.100.2", now),
+            NetRefusal::Cap("tenant", _)
+        ));
+        for t in 0..5 {
+            d130_fill(&mut rates, &format!("p{t}"), "203.0.113.1", 10, now);
+        }
+        assert!(matches!(
+            refusal(&mut rates, "fresh", "203.0.113.1", now),
+            NetRefusal::Cap("platform", _)
+        ));
+        // table_full: a tenant's own partition.
+        let mut rates = RateBuckets::with_limits(NetLimits {
+            slots_per_tenant: 2,
+            ..NetLimits::default()
+        });
+        for i in 0..2 {
+            assert!(rates.net.charge("ta", &v4(i), 1, now).is_ok());
+        }
+        assert!(matches!(
+            refusal(&mut rates, "ta", &v4(5), now),
+            NetRefusal::SlotsFull("tenant", "table_full", _)
+        ));
+        // tenant_budget_exhausted: the global tenant budget.
+        let mut rates = RateBuckets::with_limits(NetLimits {
+            slots_per_tenant: 4,
+            tenant_slots_total: 4,
+            tenant_slot_floor: 1,
+            ..NetLimits::default()
+        });
+        for i in 0..4 {
+            assert!(rates.net.charge("ta", &v4(i), 1, now).is_ok());
+        }
+        assert!(rates.net.charge("tb", &v4(10), 1, now).is_ok());
+        assert!(matches!(
+            refusal(&mut rates, "tb", &v4(11), now),
+            NetRefusal::SlotsFull("tenant", "tenant_budget_exhausted", _)
+        ));
+        // prefix_cap_exceeded: a platform IPv4 /24 partition is full.
+        let mut rates = RateBuckets::with_limits(NetLimits {
+            platform_slots_per_aggregate: 1,
+            ..NetLimits::default()
+        });
+        assert!(rates.net.charge("ta", "2001:db8:1::/48", 1, now).is_ok());
+        assert!(matches!(
+            refusal(&mut rates, "tb", "2001:db8:2::/48", now),
+            NetRefusal::SlotsFull("platform", "prefix_cap_exceeded", _)
+        ));
+        // table_full: the platform total.
+        let mut rates = RateBuckets::with_limits(NetLimits {
+            platform_slots: 1,
+            ..NetLimits::default()
+        });
+        assert!(rates.net.charge("ta", &v4(0), 1, now).is_ok());
+        assert!(matches!(
+            refusal(&mut rates, "tb", &v4(1), now),
+            NetRefusal::SlotsFull("platform", "table_full", _)
+        ));
+    }
+
+    #[test]
+    fn budget_and_prefix_refusals_are_counted_and_logged() {
+        let now = Instant::now();
+        let budget = slot_refused_total("tenant", "tenant_budget_exhausted");
+        let prefix = slot_refused_total("platform", "prefix_cap_exceeded");
+        let mut rates = RateBuckets::with_limits(NetLimits {
+            slots_per_tenant: 4,
+            tenant_slots_total: 4,
+            tenant_slot_floor: 2,
+            platform_slots_per_aggregate: 1,
+            ..NetLimits::default()
+        });
+        let ((), events) = capture(|| {
+            for i in 0..4 {
+                d130(&mut rates, "ta", &v4(i), &format!("a{i}"), now);
+            }
+            assert!(d130(&mut rates, "tb", &v4(10), "b0", now).is_none());
+            assert!(d130(&mut rates, "tb", &v4(11), "b1", now).is_none());
+            assert!(d130(&mut rates, "tb", &v4(12), "b2", now).is_some());
+            assert!(d130(&mut rates, "tb", &v4(13), "b3", now).is_some());
+            assert!(d130(&mut rates, "tc", "2001:db8:1::/48", "c0", now).is_none());
+            assert!(d130(&mut rates, "td", "2001:db8:2::/48", "c1", now).is_some());
+        });
+        assert!(slot_refused_total("tenant", "tenant_budget_exhausted") >= budget + 2);
+        assert!(slot_refused_total("platform", "prefix_cap_exceeded") > prefix);
+        let ours = events
+            .iter()
+            .filter(|e| e.0 == "vibe::rate_limit_counter_slots")
+            .count();
+        assert_eq!(ours, 2, "one line per reason per minute: {events:?}");
+    }
+
+    #[test]
+    fn memory_cap_fails_closed_with_table_full() {
+        let now = Instant::now();
+        let max = 20 * COUNTER_SLOT_BYTES + 5 * RateShard::bucket_bytes(5);
+        let mut rates = RateBuckets::with_limits(NetLimits {
+            table_memory_max_bytes: max,
+            ..NetLimits::default()
+        });
+        let full = slot_refused_total("tenant", "table_full");
+        let admitted = (0..20)
+            .filter(|i| {
+                d130(&mut rates, &format!("t{i}"), &v4(*i), &format!("k{i}"), now).is_none()
+            })
+            .count();
+        assert!(admitted > 0 && admitted < 20, "admitted {admitted}");
+        assert!(rates.estimated_bytes() <= max);
+        // Same response shape as any other refusal.
+        assert_eq!(d130(&mut rates, "fresh", &v4(99), "k", now), Some(60));
+        assert!(slot_refused_total("tenant", "table_full") > full);
+        // Existing buckets keep working; expiry frees memory.
+        assert_eq!(d130(&mut rates, "t0", &v4(0), "k0", now), None);
+        assert_eq!(d130(&mut rates, "fresh", &v4(99), "k2", now + WINDOW), None);
+    }
+
+    #[test]
+    fn quota_growth_shares_the_memory_cap() {
+        let rates = RateBuckets::with_limits(NetLimits {
+            table_memory_max_bytes: 3 * QUOTA_ENTRY_BYTES,
+            ..NetLimits::default()
+        });
+        let mut quotas = QuotaBuckets::with_memory(rates.memory());
+        let day = "2026-10-16";
+        assert!(quotas.check(day, &[("ip", "a".into(), 50)]));
+        assert!(quotas.check(day, &[("ip", "b".into(), 50)]));
+        assert!(quotas.check(day, &[("ip", "c".into(), 50)]));
+        assert!(!quotas.check(day, &[("ip", "d".into(), 50)]));
+        assert!(quotas.check(day, &[("ip", "a".into(), 50)]));
+        assert_eq!(rates.estimated_bytes(), 3 * QUOTA_ENTRY_BYTES);
     }
 }

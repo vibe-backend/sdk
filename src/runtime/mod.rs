@@ -25,7 +25,9 @@ pub use http::{
 };
 pub use limiter::{
     counter_slot_refusals, saturation_refusals, slot_refused_metrics, slot_refused_total,
-    NetLimits, ProxyNet, QuotaBuckets, RateBuckets, MAX_EXPECTED_TENANTS, MAX_PLATFORM_FACTOR,
+    LimiterMemory, NetLimits, ProxyNet, QuotaBuckets, RateBuckets, BUCKET_BYTES,
+    COUNTER_SLOT_BYTES, HIT_BYTES, MAX_EXPECTED_TENANTS, MAX_PLATFORM_FACTOR, QUOTA_ENTRY_BYTES,
+    TABLE_MEMORY_MAX_BYTES,
 };
 pub use ops::{custom_claim_problem, load_signing_keys, sub_source_problem};
 pub use sql::Stmt;
