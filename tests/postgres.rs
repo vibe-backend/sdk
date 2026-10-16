@@ -158,56 +158,53 @@ fn field(name: &str, ty: &str) -> Value {
 }
 
 struct Setup {
+    _owner_guard: Option<tokio::sync::RwLockReadGuard<'static, ()>>,
     admin_url: String,
     admin: Client,
     owner: String,
     app: String,
     tenant: String,
-    _guard: Guard,
 }
 
-/// All tests share one cluster. Tests that deliberately break RLS take this
-/// lock exclusively and repair before returning.
-///
-/// Shared holders still interfered with each other (catalog-wide checks seeing
-/// another test's half-built tenant, and lock-order deadlocks between
-/// concurrent migrations; #110), so every test now takes it exclusively and
-/// the Postgres tests run one at a time.
-static CORRUPTION: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
-
-#[allow(dead_code)]
-enum Guard {
-    Shared(tokio::sync::RwLockReadGuard<'static, ()>),
-    Exclusive(tokio::sync::RwLockWriteGuard<'static, ()>),
-}
+// Normal fixtures may use owner logins concurrently. The cluster-wide sweep
+// needs exclusive access because it disables every unlocked owner, in all DBs.
+static OWNER_LOGINS: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 /// Catalog-wide DDL (GRANT ON DATABASE, CREATE ROLE) races between parallel
-/// tests ("tuple concurrently updated"), so setup runs one at a time.
+/// tests ("tuple concurrently updated"), so role setup runs one at a time.
 static SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Each fixture gets a fresh database, so intentionally broken tenant schemas
+/// cannot affect another test's database-wide startup checks. Databases and
+/// uniquely named roles are left in the disposable test cluster for inspection.
 async fn setup() -> Option<Setup> {
-    setup_exclusive().await
+    setup_with_owner_guard(Some(OWNER_LOGINS.read().await)).await
 }
 
-/// For tests that leave RLS broken for a while.
-async fn setup_exclusive() -> Option<Setup> {
-    let admin_url = admin_url()?;
-    setup_with(admin_url, Guard::Exclusive(CORRUPTION.write().await)).await
-}
-
-async fn setup_with(admin_url: String, guard: Guard) -> Option<Setup> {
+async fn setup_with_owner_guard(
+    owner_guard: Option<tokio::sync::RwLockReadGuard<'static, ()>>,
+) -> Option<Setup> {
+    let root_url = admin_url()?;
+    let root = connect(&root_url).await;
+    let database = format!("vibe_pg_{}", uuid::Uuid::new_v4().simple());
+    root.batch_execute(&format!("CREATE DATABASE {database} TEMPLATE template0"))
+        .await
+        .unwrap();
+    let mut url = url::Url::parse(&root_url).unwrap();
+    url.set_path(&format!("/{database}"));
+    let admin_url = url.to_string();
     let admin = connect(&admin_url).await;
     let tenant = format!("tn{}", suffix());
     migrate_fresh(&admin_url, &manifest(), &tenant)
         .await
         .unwrap();
     Some(Setup {
+        _owner_guard: owner_guard,
         owner: owner_of(&tenant),
         app: trole(&tenant, "app_rw"),
         admin_url,
         admin,
         tenant,
-        _guard: guard,
     })
 }
 
@@ -626,7 +623,7 @@ async fn concurrent_first_use_opens_one_pool() {
 /// Issue #250: `tenant_<id>_rw` holds exactly SELECT and INSERT on the
 /// challenge replay table; any other privilege fails the startup check.
 #[tokio::test]
-async fn replay_table_privileges_are_exactly_select_insert() {
+async fn replay_table_privileges_are_exactly_select_insert_delete() {
     let s = require_pg!(setup().await);
     let rw = trole(&s.tenant, "app_rw");
     let reader = trole(&s.tenant, "public_reader");
@@ -642,11 +639,6 @@ async fn replay_table_privileges_are_exactly_select_insert() {
             "app_rw",
             format!("GRANT UPDATE ON {t} TO {rw}"),
             format!("REVOKE UPDATE ON {t} FROM {rw}"),
-        ),
-        (
-            "app_rw",
-            format!("GRANT DELETE ON {t} TO {rw}"),
-            format!("REVOKE DELETE ON {t} FROM {rw}"),
         ),
         (
             "app_rw",
@@ -831,7 +823,7 @@ async fn migrate_requires_a_per_tenant_owner_and_safe_tenant_roles() {
 /// differ.
 #[tokio::test]
 async fn installed_policies_match_the_compiled_lock_or_serve_refuses() {
-    let s = require_pg!(setup_exclusive().await);
+    let s = require_pg!(setup().await);
     let m = manifest();
     let lock_line = &m.models[0].policy;
     assert_eq!(lock_line, vibe::runtime::POLICY_TEMPLATE);
@@ -905,8 +897,7 @@ async fn installed_policies_match_the_compiled_lock_or_serve_refuses() {
         .batch_execute(&format!("DROP POLICY tenant_isolation ON {schema}.notes"))
         .await
         .unwrap();
-    let err = pools_for(&s.admin_url, &[&s.tenant])
-        .pool(&s.tenant, "app_rw")
+    let err = PgExec::connect(&url_as(&s.admin_url, &s.app))
         .await
         .unwrap()
         .check_policies(&s.tenant, &m.models)
@@ -1134,7 +1125,7 @@ async fn migration_without_tenant_id_or_with_a_view_fails() {
 
 #[tokio::test]
 async fn serve_refuses_tables_without_forced_rls() {
-    let s = require_pg!(setup_exclusive().await);
+    let s = require_pg!(setup().await);
     let schema = format!("t_{}", s.tenant);
     // A table added behind migrate's back gets no grants by default; one
     // that a tenant role was granted (even a single column) is refused.
@@ -1170,12 +1161,21 @@ async fn serve_refuses_tables_without_forced_rls() {
         ))
         .await
         .unwrap();
-    check_tenant(&s.admin_url, &s.tenant, "public_reader")
+    // FORCE alone is still insufficient: every tenant table needs a policy.
+    let err = check_tenant(&s.admin_url, &s.tenant, "public_reader")
         .await
-        .unwrap();
-    // Leave no RLS problem behind for other tests (it has no policy).
+        .unwrap_err();
+    assert!(
+        err.contains(&format!(
+            "{schema}.later: tenant_isolation policy is missing"
+        )),
+        "{err}"
+    );
     s.admin
         .batch_execute(&format!("DROP TABLE {schema}.later"))
+        .await
+        .unwrap();
+    check_tenant(&s.admin_url, &s.tenant, "public_reader")
         .await
         .unwrap();
 }
@@ -1294,7 +1294,7 @@ async fn migration_policies_are_refused_and_nothing_is_committed() {
 
 #[tokio::test]
 async fn serve_refuses_extra_or_altered_policies() {
-    let s = require_pg!(setup_exclusive().await);
+    let s = require_pg!(setup().await);
     let schema = format!("t_{}", s.tenant);
     check_tenant(&s.admin_url, &s.tenant, "app_rw")
         .await
@@ -1323,7 +1323,10 @@ async fn serve_refuses_extra_or_altered_policies() {
     let err = check_tenant(&s.admin_url, &s.tenant, "app_rw")
         .await
         .unwrap_err();
-    assert!(err.contains(&format!("{schema}.audit_notes:open")), "{err}");
+    assert!(
+        err.contains(&format!("{schema}.audit_notes: unexpected policy open")),
+        "{err}"
+    );
     s.admin
         .batch_execute(&format!(
             "DROP POLICY open ON {schema}.audit_notes; DELETE FROM {schema}.audit_notes; \
@@ -1345,7 +1348,12 @@ async fn serve_refuses_extra_or_altered_policies() {
     let err = check_tenant(&s.admin_url, &s.tenant, "app_rw")
         .await
         .unwrap_err();
-    assert!(err.contains("notes:tenant_isolation"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "{schema}.notes: tenant_isolation policy was altered"
+        )),
+        "{err}"
+    );
     // The old GUC-based policy, or one for PUBLIC / another tenant: refused.
     for policy in [
         "USING (\"tenant_id\" = current_setting('app.tenant_id', false)) \
@@ -1626,7 +1634,7 @@ async fn migration_cannot_touch_another_tenants_types_or_default_privileges() {
 
 #[tokio::test]
 async fn migration_repairs_only_its_tenant() {
-    let s = require_pg!(setup_exclusive().await);
+    let s = require_pg!(setup().await);
     let victim = format!("t_{}", s.tenant);
     // Left behind outside vibe (e.g. by an older, unprotected migration).
     s.admin
@@ -1641,9 +1649,13 @@ async fn migration_repairs_only_its_tenant() {
             .is_err(),
         "serve refuses"
     );
-    migrate_as(&s, &manifest(), &format!("tg{}", suffix()))
+    let other = format!("tg{}", suffix());
+    migrate_as(&s, &manifest(), &other).await.unwrap();
+    // A healthy tenant cannot start while any other schema is broken.
+    let err = check_tenant(&s.admin_url, &other, "app_rw")
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(err.contains(&format!("{victim}.audit_notes")), "{err}");
     // Migrating the affected tenant repairs it.
     migrate_as(&s, &manifest(), &s.tenant).await.unwrap();
     check_tenant(&s.admin_url, &s.tenant, "app_rw")
@@ -2309,7 +2321,8 @@ async fn migrate_refuses_an_owner_that_can_already_log_in() {
 
 #[tokio::test]
 async fn periodic_check_disables_and_reports_owners_that_can_log_in() {
-    let s = require_pg!(setup().await);
+    let _exclusive = OWNER_LOGINS.write().await;
+    let s = require_pg!(setup_with_owner_guard(None).await);
     let tenant = format!("tc{}", suffix());
     let owner = owner_of(&tenant);
     ensure_tenant_roles(&s.admin_url, &tenant).await;
@@ -2337,17 +2350,8 @@ async fn periodic_check_disables_and_reports_owners_that_can_log_in() {
     assert!(found.contains(&owner), "{found:?}");
     assert!(vibe::runtime::owner_login_alerts_total() > before);
     assert_eq!(login_state(&s.admin, &owner).await, (false, false));
-    assert!(vibe::runtime::check_owner_logins(&admin)
-        .await
-        .unwrap()
-        .is_empty());
-    // Restore the other tests' owners (the helpers keep them LOGIN).
-    for other in found.iter().filter(|o| **o != owner) {
-        s.admin
-            .batch_execute(&format!("ALTER ROLE {other} LOGIN PASSWORD 'pw'"))
-            .await
-            .unwrap();
-    }
+    let again = vibe::runtime::check_owner_logins(&admin).await.unwrap();
+    assert!(!again.contains(&owner), "{again:?}");
 }
 
 #[tokio::test]
@@ -2681,7 +2685,7 @@ async fn replay_store_concurrent_reservations_admit_one() {
 }
 
 #[tokio::test]
-async fn replay_store_runtime_role_has_no_delete_or_update() {
+async fn replay_store_runtime_role_cannot_delete_live_rows_or_update() {
     let s = require_pg!(setup().await);
     let table = format!("t_{}.vibe_challenge_replay", s.tenant);
     let rows = s
@@ -2697,7 +2701,7 @@ async fn replay_store_runtime_role_has_no_delete_or_update() {
         .await
         .unwrap();
     let got: Vec<bool> = (0..5).map(|i| rows[0].get(i)).collect();
-    assert_eq!(got, vec![true, true, false, false, false]);
+    assert_eq!(got, vec![true, true, true, false, false]);
     // A verified row cannot be removed or shortened by the runtime role.
     let (a, b) = replay_stores(&s).await;
     let t = Some(s.tenant.as_str());
@@ -2707,10 +2711,12 @@ async fn replay_store_runtime_role_has_no_delete_or_update() {
     let app = connect(&url_as(&s.admin_url, &s.app)).await;
     let set = format!("SET app.tenant_id = '{}'", s.tenant);
     app.batch_execute(&set).await.unwrap();
-    assert!(app
-        .batch_execute(&format!("DELETE FROM {table}"))
-        .await
-        .is_err());
+    assert_eq!(
+        app.execute(&format!("DELETE FROM {table}"), &[])
+            .await
+            .unwrap(),
+        0
+    );
     assert!(app
         .batch_execute(&format!("UPDATE {table} SET expires_at = now()"))
         .await
@@ -2967,6 +2973,20 @@ async fn legacy_tenants_upgrade_in_sequence() {
             .await
             .unwrap();
         migrate_tenant(&owner, &manifest(), tenant).await.unwrap();
+        if tenant == &s.tenant {
+            // Startup checks the entire DB, including the tenant still on legacy policy.
+            let err = check_tenant(&s.admin_url, tenant, "app_rw")
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains(&format!(
+                    "t_{other}.audit_notes: tenant_isolation policy was altered"
+                )),
+                "{err}"
+            );
+        }
+    }
+    for tenant in [&s.tenant, &other] {
         check_tenant(&s.admin_url, tenant, "app_rw").await.unwrap();
     }
 }
@@ -3002,12 +3022,49 @@ async fn retention_removes_expired_rows_under_forced_rls() {
     ))
     .await
     .unwrap();
+    rw.batch_execute(&format!("INSERT INTO {table} (tenant_id, key, nonce, state, expires_at) SELECT '{}', decode(lpad(to_hex(i), 8, '0'), 'hex'), decode('03', 'hex'), 'verified', now() - interval '1 hour' FROM generate_series(10, 2510) i", s.tenant)).await.unwrap();
     let owner = PgExec::connect(&url_as(&s.admin_url, &s.owner))
         .await
         .unwrap();
-    migrate_tenant(&owner, &manifest(), &s.tenant)
+    // Hold a cleanup batch open while an independent runtime connection reads/inserts.
+    owner_client.batch_execute(&format!("BEGIN; SET LOCAL ROLE {}; DELETE FROM {table} WHERE ctid IN (SELECT ctid FROM {table} WHERE expires_at < now() LIMIT 1000)", s.app)).await.unwrap();
+    rw.batch_execute("SET lock_timeout = '100ms'")
         .await
         .unwrap();
+    let pool = replay_pool(&s).await;
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute("SET lock_timeout = '100ms'")
+        .await
+        .unwrap();
+    let store = PgReplayStore::new(pool, IP_SECRET);
+    let slot = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        store.reserve(&token_key("during-cleanup"), None, Some(&s.tenant)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    store.settle(&slot, Outcome::Verified).await.unwrap();
+    rw.query_one(&format!("SELECT count(*) FROM {table}"), &[])
+        .await
+        .unwrap();
+    owner_client.batch_execute("ROLLBACK").await.unwrap();
+    let other = second_tenant(&s).await;
+    let other_table = format!("t_{other}.vibe_challenge_replay");
+    s.admin.batch_execute(&format!("INSERT INTO {other_table} (tenant_id, key, nonce, state, expires_at) VALUES ('{other}', decode('01', 'hex'), decode('01', 'hex'), 'verified', now() - interval '1 hour')")).await.unwrap();
+    let mut session = owner.session().await.unwrap();
+    vibe::runtime::migrate::cleanup_replay(&mut session, &s.tenant)
+        .await
+        .unwrap();
+    let remaining: i64 = s
+        .admin
+        .query_one(&format!("SELECT count(*) FROM {other_table}"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining, 1);
     let row = s
         .admin
         .query_one(
@@ -3016,11 +3073,13 @@ async fn retention_removes_expired_rows_under_forced_rls() {
         )
         .await
         .unwrap();
-    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (0, 1));
-    assert!(rw
-        .execute(&format!("DELETE FROM {table}"), &[])
-        .await
-        .is_err());
+    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (0, 4));
+    assert_eq!(
+        rw.execute(&format!("DELETE FROM {table}"), &[])
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -3044,4 +3103,92 @@ async fn pool_limits_apply_uniformly() {
         .reserve(&token_key("available"), None, Some(&s.tenant))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn replay_policy_drift_fails_closed() {
+    let s = require_pg!(setup().await);
+    let table = format!("t_{}.vibe_challenge_replay", s.tenant);
+    for ddl in [
+        format!("DROP POLICY replay_expired_delete ON {table}"),
+        format!("CREATE POLICY replay_expired_delete ON {table} AS RESTRICTIVE FOR DELETE TO {} USING (tenant_id = '{}')", s.app, s.tenant),
+    ] {
+        s.admin.batch_execute(&ddl).await.unwrap();
+        let err = check_tenant(&s.admin_url, &s.tenant, "app_rw").await.unwrap_err();
+        assert!(err.contains(&format!("{table}: replay DELETE policy is missing or altered")), "{err}");
+    }
+    migrate_as(&s, &manifest(), &s.tenant).await.unwrap();
+    check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn startup_checks_unconfigured_tables_for_canonical_policy() {
+    let s = require_pg!(setup().await);
+    let other = format!("tb{}", suffix());
+    s.admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA t_{other}; CREATE TABLE t_{other}.entries (tenant_id text); \
+         ALTER TABLE t_{other}.entries ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE t_{other}.entries FORCE ROW LEVEL SECURITY"
+        ))
+        .await
+        .unwrap();
+    assert!(check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .is_err());
+    s.admin
+        .batch_execute(&format!("DROP SCHEMA t_{other} CASCADE"))
+        .await
+        .unwrap();
+    s.admin
+        .batch_execute(&format!(
+            "DROP POLICY tenant_isolation ON t_{}.vibe_challenge_replay",
+            s.tenant
+        ))
+        .await
+        .unwrap();
+    assert!(check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn replay_policy_is_limited_to_the_replay_table() {
+    let s = require_pg!(setup().await);
+    let pools = std::sync::Arc::new(pools_for(&s.admin_url, &[&s.tenant]));
+    let store = PgReplayStore::for_tenant_pools(pools, IP_SECRET);
+    // The installed policy passes migration, tenant-pool startup and replay startup.
+    migrate_as(&s, &manifest(), &s.tenant).await.unwrap();
+    check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .unwrap();
+    store.check(std::slice::from_ref(&s.tenant)).await.unwrap();
+
+    // Even an otherwise canonical policy is forbidden on an ordinary table.
+    // Include expires_at so rejection is about the policy, rather than DDL.
+    s.admin
+        .batch_execute(&format!(
+            "ALTER TABLE t_{}.notes ADD COLUMN expires_at timestamptz; \
+         CREATE POLICY replay_expired_delete ON t_{}.notes AS RESTRICTIVE \
+         FOR DELETE TO {} USING (tenant_id = '{}' AND expires_at < now())",
+            s.tenant, s.tenant, s.app, s.tenant
+        ))
+        .await
+        .unwrap();
+    let err = check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .unwrap_err();
+    assert!(err.contains("replay_expired_delete"), "{err}");
+    let fresh_store = PgReplayStore::for_tenant_pools(
+        std::sync::Arc::new(pools_for(&s.admin_url, &[&s.tenant])),
+        IP_SECRET,
+    );
+    assert!(fresh_store
+        .check(std::slice::from_ref(&s.tenant))
+        .await
+        .is_err());
+    let err = migrate_as(&s, &manifest(), &s.tenant).await.unwrap_err();
+    assert!(err.contains("replay_expired_delete"), "{err}");
 }

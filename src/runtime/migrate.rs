@@ -254,6 +254,7 @@ pub async fn migrate_tenant_recorded(
         Ok((mut log, deferred)) => {
             session.batch(&["COMMIT".to_string()]).await?;
             session.in_transaction(false);
+            cleanup_replay(&mut session, tenant).await?;
             log.extend(build_indexes_after_commit(&session, tenant, &deferred, built).await?);
             Ok(log)
         }
@@ -615,7 +616,8 @@ async fn build_indexes_after_commit(
 /// After migrations: every table in the tenant schema gets ENABLE + FORCE RLS
 /// and the tenant policy. A table without `tenant_id`, or any view,
 /// materialized view or foreign table (which RLS cannot protect), fails.
-/// Any policy other than `tenant_isolation` fails too: permissive policies
+/// Except for the canonical replay expiry policy on the replay table, any
+/// policy other than `tenant_isolation` fails too: permissive policies
 /// are OR-combined, so `CREATE POLICY open ON t USING (true)` in a migration
 /// would expose every tenant's rows.
 async fn protect_schema(exec: &PgSession, tenant: &str) -> Result<Vec<String>, String> {
@@ -671,9 +673,12 @@ async fn protect_schema(exec: &PgSession, tenant: &str) -> Result<Vec<String>, S
     }
     let extra = exec
         .query_texts(
-            "SELECT format('%I.%I', c.relname, p.polname) FROM pg_policy p \
+            &format!(
+                "SELECT format('%I.%I', c.relname, p.polname) FROM pg_policy p \
              JOIN pg_class c ON c.oid = p.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = $1 AND p.polname <> 'tenant_isolation' ORDER BY 1",
+             WHERE n.nspname = $1 AND p.polname <> 'tenant_isolation' AND NOT ({}) ORDER BY 1",
+                replay_delete_policy_sql("p", "c.relname", "substr($1::text, 3)")
+            ),
             schema,
         )
         .await?;
@@ -698,18 +703,60 @@ async fn protect_schema(exec: &PgSession, tenant: &str) -> Result<Vec<String>, S
     Ok(log)
 }
 
+/// Remove expired replay rows after DDL commits, without changing table locks or policies.
+pub async fn cleanup_replay(exec: &mut PgSession, tenant: &str) -> Result<(), String> {
+    let role = super::grants::tenant_role(tenant, "app_rw")?;
+    let owner = format!("tenant_{tenant}_owner");
+    let table = format!("{}.vibe_challenge_replay", quote(&format!("t_{tenant}"))?);
+    loop {
+        exec.in_transaction(true);
+        let result = async {
+            exec.batch(&["BEGIN".into(), format!("SET LOCAL ROLE {}", quote(&role)?)]).await?;
+            let identities = exec.query_texts("SELECT current_user::text || ':' || session_user::text WHERE $1::text IS NOT NULL", tenant).await?;
+            if identities != [format!("{role}:{owner}")] {
+                return Err("replay cleanup role identity mismatch".to_string());
+            }
+            let count = exec.query_texts(&format!("WITH removed AS (DELETE FROM {table} WHERE ctid IN (SELECT ctid FROM {table} WHERE expires_at < now() LIMIT 1000) RETURNING 1) SELECT count(*)::text FROM removed WHERE $1::text IS NOT NULL"), tenant).await?;
+            let after = exec.query_texts("SELECT current_user::text || ':' || session_user::text WHERE $1::text IS NOT NULL", tenant).await?;
+            if after != identities { return Err("replay cleanup role identity changed".into()); }
+            Ok::<_, String>(count == ["0"])
+        }.await;
+        match result {
+            Ok(done) => {
+                exec.batch(&["COMMIT".into()]).await?;
+                exec.in_transaction(false);
+                if done {
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                if exec.batch(&["ROLLBACK".into()]).await.is_ok() {
+                    exec.in_transaction(false);
+                }
+                return Err(err);
+            }
+        }
+    }
+}
+
+/// Exact restrictive expiry policy, allowed only on the replay table.
+/// A missing role or expression fails closed rather than yielding SQL NULL.
+pub fn replay_delete_policy_sql(p: &str, table: &str, tenant: &str) -> String {
+    format!("COALESCE(({table} = 'vibe_challenge_replay' AND {p}.polname = 'replay_expired_delete' AND NOT {p}.polpermissive AND {p}.polcmd = 'd' AND cardinality({p}.polroles) = 1 AND {p}.polroles[1] = to_regrole('tenant_' || {tenant} || '_rw') AND {p}.polwithcheck IS NULL AND pg_get_expr({p}.polqual, {p}.polrelid) = format('((tenant_id = %L::text) AND (expires_at < now()))', {tenant})), false)")
+}
+
 /// RLS problems in the tenant being migrated, as `schema.table: problem`.
 /// Other schemas may still have legacy policies; their fingerprint is checked
 /// separately to ensure this migration does not change them.
-async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>, String> {
+pub async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>, String> {
     exec.query_texts(
         &format!(
             r#"WITH rels AS (
-                 SELECT c.oid, format('%I.%I', n.nspname, c.relname) AS name, c.relkind,
+                 SELECT c.oid, c.relname, format('%I.%I', n.nspname, c.relname) AS name, c.relkind,
                         c.relrowsecurity, c.relforcerowsecurity, substr(n.nspname, 3) AS tenant
                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                  WHERE n.nspname LIKE 't\_%' AND c.relkind IN ('r','p','v','m','f')
-                 AND n.nspname = $1::text)
+                 AND ($1::text = '' OR n.nspname = $1::text))
              SELECT name || ': ' || problem FROM (
                SELECT name, 'view, materialized view or foreign table' AS problem
                  FROM rels WHERE relkind IN ('v','m','f')
@@ -720,7 +767,7 @@ async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>,
                UNION ALL
                SELECT r.name, 'unexpected policy ' || quote_ident(p.polname)
                  FROM rels r JOIN pg_policy p ON p.polrelid = r.oid
-                 WHERE p.polname <> 'tenant_isolation'
+                 WHERE p.polname <> 'tenant_isolation' AND NOT ({replay})
                UNION ALL
                SELECT r.name, 'tenant_isolation policy was altered'
                  FROM rels r JOIN pg_policy p ON p.polrelid = r.oid
@@ -730,8 +777,19 @@ async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>,
                  FROM rels r WHERE r.relkind IN ('r','p') AND NOT EXISTS (
                    SELECT 1 FROM pg_policy p WHERE p.polrelid = r.oid
                    AND p.polname = 'tenant_isolation')
+               UNION ALL
+               SELECT r.name, 'replay DELETE policy is missing or altered'
+                 FROM rels r WHERE r.relname = 'vibe_challenge_replay' AND NOT EXISTS (
+                   SELECT 1 FROM pg_policy p WHERE p.polrelid = r.oid AND {replay})
+               UNION ALL
+               SELECT n.nspname::text, 'replay table is missing'
+                 FROM pg_namespace n WHERE n.nspname LIKE 't\_%'
+                 AND ($1::text = '' OR n.nspname = $1::text)
+                 AND NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.relnamespace = n.oid
+                   AND c.relname = 'vibe_challenge_replay' AND c.relkind IN ('r','p'))
              ) x ORDER BY 1"#,
-            canonical = canonical_policy_sql("p", "r.tenant")
+            canonical = canonical_policy_sql("p", "r.tenant"),
+            replay = replay_delete_policy_sql("p", "r.relname", "r.tenant")
         ),
         own_schema,
     )

@@ -465,16 +465,16 @@ pub fn tenant_role_status_sql() -> String {
    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname = 't_' || $1::text AND c.relkind IN ('r','p','v','m','f')
    AND (NOT (c.relkind IN ('r','p') AND c.relrowsecurity AND c.relforcerowsecurity)
-     OR has_table_privilege(r.oid, c.oid, 'DELETE,TRUNCATE,REFERENCES,TRIGGER'))), '{{}}'),
+     OR has_table_privilege(r.oid, c.oid, 'TRUNCATE,REFERENCES,TRIGGER') OR (c.relname <> 'vibe_challenge_replay' AND has_table_privilege(r.oid, c.oid, 'DELETE')))), '{{}}'),
  COALESCE((SELECT array_agg(format('%I.%I:%I', n.nspname, c.relname, p.polname) ORDER BY 1)
    FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
    JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname = 't_' || $1::text
-   AND NOT (p.polname = 'tenant_isolation' AND {canonical})), '{{}}'),
+   AND NOT (p.polname = 'tenant_isolation' AND {canonical} OR {replay})), '{{}}'),
  COALESCE((SELECT array_agg(x ORDER BY x) FROM (
    SELECT format('%I.%I lacks %s', n.nspname, c.relname, need) AS x
      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
-     LATERAL (VALUES ('SELECT'), ('INSERT')) v(need)
+     LATERAL (VALUES ('SELECT'), ('INSERT'), ('DELETE')) v(need)
      WHERE n.nspname = 't_' || $1::text AND c.relname = 'vibe_challenge_replay'
      AND $2::text = 'tenant_' || $1::text || '_rw'
      AND NOT has_table_privilege(r.oid, c.oid, need)
@@ -486,7 +486,7 @@ pub fn tenant_role_status_sql() -> String {
      WHERE n.nspname = 't_' || $1::text AND c.relname = 'vibe_challenge_replay'
      AND a.grantee <> c.relowner
      AND NOT (a.grantee = to_regrole('tenant_' || $1::text || '_rw')
-       AND a.privilege_type IN ('SELECT', 'INSERT') AND NOT a.is_grantable)
+       AND a.privilege_type IN ('SELECT', 'INSERT', 'DELETE') AND NOT a.is_grantable)
    UNION ALL
    SELECT format('%I.%I column %I grants %s to %s', n.nspname, c.relname, t.attname, a.privilege_type,
        CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(a.grantee::regrole::text) END)
@@ -496,6 +496,7 @@ pub fn tenant_role_status_sql() -> String {
      WHERE n.nspname = 't_' || $1::text AND c.relname = 'vibe_challenge_replay'
      AND a.grantee <> c.relowner) y), '{{}}')
 FROM pg_roles r WHERE r.rolname = current_user"#,
+        replay = super::migrate::replay_delete_policy_sql("p", "c.relname", "$1::text"),
         canonical = super::migrate::canonical_policy_sql("p", "$1::text"),
         members = super::migrate::membership_problems_sql("$1::text", "r.oid")
     )
@@ -791,6 +792,12 @@ impl PgExec {
     /// nothing, no privileges outside `t_<tenant>`, and only RLS-forced
     /// tables with the canonical policy inside it.
     pub async fn check_tenant_role(&self, tenant: &str, class: &str) -> Result<(), String> {
+        let session = self.session().await?;
+        let problems = super::migrate::rls_problems(&session, "").await?;
+        if !problems.is_empty() {
+            return Err(format!("refusing to serve: {}", problems.join("; ")));
+        }
+        drop(session);
         let expected = super::grants::tenant_role(tenant, class)?;
         let client = self.client().await?;
         let rows = client
