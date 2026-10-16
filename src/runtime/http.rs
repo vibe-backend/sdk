@@ -103,8 +103,10 @@ impl AuthConfig {
                 // Route URIs come from locks: public hosts only, no dev exception.
                 let source = super::jwks::HttpsJwks::new(&uri)
                     .map_err(|err| format!("{} {}: {err}", route.method, route.path))?;
-                self.route_jwks
-                    .insert(uri, Arc::new(super::jwks::JwksCache::new(Arc::new(source))));
+                self.route_jwks.insert(
+                    uri,
+                    Arc::new(super::jwks::JwksCache::with_alg(Arc::new(source), self.alg)),
+                );
             }
         }
         Ok(())
@@ -626,16 +628,30 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     // Refresh routes answer every bad or missing token with the same 401,
     // so they run before request-table validation (which would give 422).
     if let Some(spec) = &found.route.refresh {
-        let response = refresh_response(
-            &state,
-            found.route,
-            spec,
-            &principal.tenant_id,
-            &ip,
-            &body,
-            &request_id,
+        let mut response = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(started + Duration::from_millis(REFRESH_WORK_MS)),
+            refresh_response(
+                &state,
+                found.route,
+                spec,
+                &principal.tenant_id,
+                &ip,
+                &body,
+                &request_id,
+            ),
         )
-        .await;
+        .await
+        .unwrap_or_else(|_| refresh_unavailable(&request_id));
+        if response.status() == StatusCode::UNAUTHORIZED {
+            if let Some(slug) = found.params.get("slug") {
+                let cookie = format!(
+                    "__Host-vibe_rt_{slug}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict"
+                );
+                if let Ok(value) = cookie.parse() {
+                    response.headers_mut().insert(header::SET_COOKIE, value);
+                }
+            }
+        }
         return finish(found.route, &state, started, response).await;
     }
     // Validate only after authentication and authorization, so unauthenticated
@@ -918,9 +934,9 @@ async fn finish(
     } else {
         0
     });
-    // Refresh rotation always pads to 300 ms (decision 72).
+    // All refresh paths share a request-start deadline and response floor.
     let min_ms = if route.refresh.is_some() {
-        min_ms.max(300)
+        min_ms.max(REFRESH_WORK_MS)
     } else {
         min_ms
     };
@@ -1247,12 +1263,20 @@ async fn authenticate(
             .key(&kid)
             .await
             .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+        if found.alg != auth.alg {
+            // Decision 139: only the configured alg; other keys are unused.
+            return Err(AuthError::unauthorized("Bearer"));
+        }
         (found.alg, found.key)
     } else if let Some(jwks) = &auth.jwks {
         let found = jwks
             .key(&kid)
             .await
             .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+        if found.alg != auth.alg {
+            // Decision 139: only the configured alg; other keys are unused.
+            return Err(AuthError::unauthorized("Bearer"));
+        }
         (found.alg, found.key)
     } else {
         if auth.public_pem.is_empty() || kid != auth.kid {
@@ -1435,6 +1459,77 @@ pub fn detect_jwt_alg(pem: &str) -> Result<Algorithm, String> {
     Err("VIBE_JWT_PUBLIC_KEY_PEM is not a usable RSA or EC public key".into())
 }
 
+/// Startup error text for an ES256 key that is not a usable P-256 key.
+/// Never includes key material.
+pub(crate) fn ec_problem_message(what: &str, problem: super::eckey::EcProblem) -> String {
+    use super::eckey::EcProblem;
+    match problem {
+        EcProblem::Sec1 => {
+            "SEC1 EC PRIVATE KEY is not supported; use PKCS#8 PRIVATE KEY".to_string()
+        }
+        EcProblem::InvalidPem => "invalid PEM encoding".to_string(),
+        EcProblem::NotEc => format!("{what}: ES256 key is not a readable EC key"),
+        EcProblem::OtherCurve => format!("{what}: ES256 key must use the P-256 curve"),
+        EcProblem::BadPoint => format!("{what}: ES256 key has an invalid P-256 public point"),
+        EcProblem::BadScalar => format!("{what}: ES256 private scalar is out of range"),
+        EcProblem::TrailingData => format!("{what}: ES256 key has unexpected data in its encoding"),
+    }
+}
+
+/// Resolves the deployment JWT alg from `VIBE_JWT_PUBLIC_KEY_PEM` and
+/// `VIBE_JWT_ALG` and checks the static key against it (what `vibe serve`
+/// does at startup). `pem` must already have escaped newlines expanded.
+pub fn static_jwt_alg(pem: Option<&str>, alg_env: Option<&str>) -> Result<Algorithm, String> {
+    let mut alg = Algorithm::ES256;
+    if let Some(pem) = pem {
+        alg = detect_jwt_alg(pem)?;
+    }
+    if let Some(value) = alg_env {
+        alg = match value.trim().to_ascii_uppercase().as_str() {
+            "ES256" => Algorithm::ES256,
+            "RS256" => Algorithm::RS256,
+            other => {
+                return Err(format!(
+                    "VIBE_JWT_ALG `{other}`: only ES256 and RS256 are supported"
+                ));
+            }
+        };
+    }
+    if let Some(pem) = pem.filter(|p| !p.is_empty()) {
+        check_static_jwt_key(pem, alg)?;
+    }
+    Ok(alg)
+}
+
+/// Startup check of `VIBE_JWT_PUBLIC_KEY_PEM` against the configured alg
+/// (decision 139): the key type must match, RSA keys need >= 2048 bits and
+/// ES256 keys must be valid P-256 keys.
+pub fn check_static_jwt_key(pem: &str, alg: Algorithm) -> Result<(), String> {
+    const WHAT: &str = "VIBE_JWT_PUBLIC_KEY_PEM";
+    match alg {
+        Algorithm::RS256 => {
+            if DecodingKey::from_rsa_pem(pem.as_bytes()).is_err() {
+                return Err(format!(
+                    "{WHAT}: VIBE_JWT_ALG is RS256 but the key is not an RSA public key"
+                ));
+            }
+            super::rsakey::check_rsa_pem(WHAT, pem)
+        }
+        Algorithm::ES256 => {
+            if DecodingKey::from_ec_pem(pem.as_bytes()).is_err() {
+                return Err(format!(
+                    "{WHAT}: VIBE_JWT_ALG is ES256 but the key is not an EC public key"
+                ));
+            }
+            // Defense-in-depth only: report P-256 curve/point errors at startup.
+            // jsonwebtoken (aws_lc_rs) performs authoritative parsing and
+            // verification; JWKS keys bypass these hand-written checks.
+            super::eckey::p256_public(pem).map_err(|problem| ec_problem_message(WHAT, problem))
+        }
+        other => Err(format!("{WHAT}: unsupported alg {other:?}")),
+    }
+}
+
 pub fn hash_api_secret(pepper: &[u8], secret: &str) -> String {
     hmac_hex(pepper, secret)
 }
@@ -1561,11 +1656,30 @@ fn limit_check(state: &AppState, checks: &[(String, String, u32)], owner: &str) 
 }
 
 /// Platform ceilings for refresh routes (decision 72).
+// Bound database lookup, rotation and signing together; pad early results to
+// the same deadline in finish, including rate-limit and unknown-token paths.
+const REFRESH_WORK_MS: u64 = 300;
 const REFRESH_IP_PER_MINUTE: u32 = 30;
 const REFRESH_FAMILY_PER_MINUTE: u32 = 10;
 
 static REFRESH_REJECTIONS: std::sync::LazyLock<Mutex<HashMap<&'static str, u64>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Snapshot for internal metrics collectors, alongside saturation_refusals.
+pub fn refresh_rejections() -> HashMap<&'static str, u64> {
+    REFRESH_REJECTIONS
+        .lock()
+        .map(|counts| counts.clone())
+        .unwrap_or_default()
+}
+
+fn log_id_hash(value: &str) -> String {
+    let digest = <Sha256 as sha2::Digest>::digest(value.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 fn invalid_refresh(_request_id: &str, reason: &'static str) -> HttpResponse {
     if let Ok(mut counts) = REFRESH_REJECTIONS.lock() {
@@ -1647,10 +1761,14 @@ async fn refresh_response(
             .min()
             .unwrap_or(REFRESH_FAMILY_PER_MINUTE)
             .min(REFRESH_FAMILY_PER_MINUTE);
-        let family_check = [(format!("{}:family", route.feature_id), family, per_minute)];
-        // Only live tokens count (see refresh_family).
+        let family_check = [(
+            format!("{}:family", route.feature_id),
+            family.clone(),
+            per_minute,
+        )];
+        // Known tokens, including revoked children, reach rotation when allowed.
         if limit_check(state, &family_check, &owner).is_some() {
-            tracing::warn!(%request_id, %tenant, "refresh family rate limit reached");
+            tracing::warn!(tenant_hash = %log_id_hash(tenant), family_hash = %log_id_hash(&family), "refresh family rate limit reached");
             return invalid_refresh(request_id, "family_limit");
         }
     } else {
@@ -1705,7 +1823,7 @@ async fn refresh_response(
             }
         }
         Ok(Rotated::Reuse { family_id }) => {
-            tracing::warn!(%request_id, %tenant, family = %family_id, "refresh token replayed; family revoked");
+            tracing::warn!(tenant_hash = %log_id_hash(tenant), family_hash = %log_id_hash(&family_id), "refresh token reuse detected; family revoked");
             invalid_refresh(request_id, "invalid")
         }
         Ok(Rotated::Invalid) => invalid_refresh(request_id, "invalid"),
@@ -2369,6 +2487,113 @@ RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
             json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "k1", "x": X, "y": Y}]}),
         )))));
         auth
+    }
+
+    /// 2048-bit RSA modulus (src/runtime/testdata/rsa-p2048.pem).
+    const RSA_N: &str = "tupUT5sUR0iufz_2dX_ZWfdJ9oluerIsYtUELeYxbe_Bu71_oJUILJiNUyceUtmDJRNHj6NWalJ36zkykGm3ZU65cAI91A9d7mSN0ryaDn6-b45VINQIEtMSutWrGh2I7FgxLNGmDFMLQQ1sDVCS1lwtAD_EtYzzWrqjxdqRal1eaGF58dtMjqCk_rrGcQ7oEm_tTBZVge24sf7bQUliuwZQo6t7SI2tvocawcgDuZvFMU_I99dyGJNQxyY1pKkPqIdMxtrTrBoHcBXNvlSu8IoFslK49w3XY8kpkb7KGoJvDmT6NYQxXtjNY0_-ZZIdM_egJboeibuVVzi549nPjQ";
+
+    #[tokio::test]
+    async fn jwks_accepts_only_the_configured_alg() {
+        // Decision 139 (#225): a JWKS holding EC and RSA keys only serves the
+        // configured alg; keys of the other type are unused.
+        let doc = json!({"keys": [
+            {"kty": "EC", "crv": "P-256", "kid": "k1", "x": X, "y": Y},
+            {"kty": "RSA", "kid": "r1", "n": RSA_N, "e": "AQAB"},
+        ]});
+        let mut auth = AuthConfig::anonymous();
+        auth.jwks = Some(Arc::new(super::super::jwks::JwksCache::new(Arc::new(Doc(
+            doc.clone(),
+        )))));
+        let r = route(json!({}));
+        let t = token("k1", json!({"roles": ["staff"]}));
+        assert_eq!(auth.alg, Algorithm::ES256);
+        assert!(authenticate(&auth, &r, &bearer(&t)).await.is_ok());
+        auth.alg = Algorithm::RS256;
+        assert!(
+            authenticate(&auth, &r, &bearer(&t)).await.is_err(),
+            "ES256 key must not be used when RS256 is configured"
+        );
+        // Same rule for a route-level issuer JWKS.
+        let mut auth = AuthConfig::anonymous();
+        auth.alg = Algorithm::RS256;
+        const URI: &str = "https://idp.example.com/jwks.json";
+        auth.route_jwks.insert(
+            URI.into(),
+            Arc::new(super::super::jwks::JwksCache::new(Arc::new(Doc(doc)))),
+        );
+        let r = route(json!({"jwks_uri": URI}));
+        assert!(authenticate(&auth, &r, &bearer(&t)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rsa_key_sharing_a_kid_does_not_affect_es256_tokens() {
+        // An RSA key and an EC key with the same kid: the kid is ambiguous
+        // and unused whatever the order; other kids keep working.
+        let r = route(json!({}));
+        for keys in [
+            json!([
+                {"kty": "EC", "crv": "P-256", "kid": "k1", "x": X, "y": Y},
+                {"kty": "RSA", "kid": "k1", "n": RSA_N, "e": "AQAB"},
+                {"kty": "EC", "crv": "P-256", "kid": "k2", "x": X, "y": Y},
+            ]),
+            json!([
+                {"kty": "RSA", "kid": "k1", "n": RSA_N, "e": "AQAB"},
+                {"kty": "EC", "crv": "P-256", "kid": "k1", "x": X, "y": Y},
+                {"kty": "EC", "crv": "P-256", "kid": "k2", "x": X, "y": Y},
+            ]),
+        ] {
+            let mut auth = AuthConfig::anonymous();
+            auth.jwks = Some(Arc::new(super::super::jwks::JwksCache::with_alg(
+                Arc::new(Doc(json!({ "keys": keys }))),
+                Algorithm::ES256,
+            )));
+            let t1 = token("k1", json!({"roles": ["staff"]}));
+            let t2 = token("k2", json!({"roles": ["staff"]}));
+            assert!(authenticate(&auth, &r, &bearer(&t1)).await.is_err());
+            assert!(authenticate(&auth, &r, &bearer(&t2)).await.is_ok());
+        }
+    }
+
+    #[test]
+    fn static_jwt_key_must_match_alg_and_size() {
+        // Decision 139 (#224).
+        let pub2048 = include_str!("testdata/rsa-p2048.pem");
+        let pub1024 = include_str!("testdata/rsa-p1024.pem");
+        let ec = "-----BEGIN PUBLIC KEY-----\n\
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0mqNqll14aIJEhYqCiRLWJX63Ty6\n\
+Q0UxBzbmJ2wI9FMVJLw4XEhuIJFqIdA/P6b6ozSNGyOUZK7OjIfGKtpNYw==\n\
+-----END PUBLIC KEY-----\n";
+        assert!(check_static_jwt_key(pub2048, Algorithm::RS256).is_ok());
+        assert!(check_static_jwt_key(ec, Algorithm::ES256).is_ok());
+        let err = check_static_jwt_key(pub1024, Algorithm::RS256).unwrap_err();
+        assert!(err.contains("at least 2048 bits"), "{err}");
+        assert!(check_static_jwt_key(ec, Algorithm::RS256).is_err());
+        assert!(check_static_jwt_key(pub2048, Algorithm::ES256).is_err());
+        let p384 = include_str!("testdata/ec-p384-p.pem");
+        let err = check_static_jwt_key(p384, Algorithm::ES256).unwrap_err();
+        assert!(err.contains("P-256"), "{err}");
+        assert!(!err.contains("MH"), "{err}");
+    }
+
+    #[test]
+    fn static_jwt_alg_resolves_env_and_checks_the_key() {
+        let ec = include_str!("testdata/ec-p256-p.pem");
+        let rsa = include_str!("testdata/rsa-p2048.pem");
+        let p384 = include_str!("testdata/ec-p384-p.pem");
+        assert_eq!(static_jwt_alg(None, None).unwrap(), Algorithm::ES256);
+        assert_eq!(static_jwt_alg(Some(ec), None).unwrap(), Algorithm::ES256);
+        assert_eq!(static_jwt_alg(Some(rsa), None).unwrap(), Algorithm::RS256);
+        assert_eq!(
+            static_jwt_alg(Some(rsa), Some("rs256")).unwrap(),
+            Algorithm::RS256
+        );
+        let err = static_jwt_alg(Some(ec), Some("RS256")).unwrap_err();
+        assert!(err.contains("not an RSA public key"), "{err}");
+        let err = static_jwt_alg(Some(rsa), Some("ES256")).unwrap_err();
+        assert!(err.contains("not an EC public key"), "{err}");
+        assert!(static_jwt_alg(Some(p384), None).is_err());
+        assert!(static_jwt_alg(Some(p384), Some("ES256")).is_err());
+        assert!(static_jwt_alg(None, Some("HS256")).is_err());
     }
 
     #[tokio::test]

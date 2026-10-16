@@ -386,6 +386,12 @@ async fn refresh_limit_responses() {
         assert_eq!(response.0, StatusCode::UNAUTHORIZED);
         assert_eq!(response.1, limited.1);
         assert_eq!(response.2, limited.2);
+        let cookies: Vec<_> = response.1.get_all("set-cookie").iter().collect();
+        assert!(!cookies.is_empty());
+        assert_eq!(
+            cookies,
+            limited.1.get_all("set-cookie").iter().collect::<Vec<_>>()
+        );
         assert!(!response.1.contains_key("retry-after"));
         assert!(response.3 >= 300);
     }
@@ -403,7 +409,39 @@ async fn refresh_limit_responses() {
 }
 
 #[tokio::test]
-async fn revoked_tokens_do_not_count_toward_the_family_limit() {
+async fn revoked_child_reuse_revokes_family_over_http() {
+    let a = app(10);
+    let parent = tok(&a.login().await, "refresh_token");
+    let (status, first, _) = a.refresh(&parent).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, reissued, _) = a.refresh(&parent).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        a.refresh(&tok(&first, "refresh_token")).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        a.refresh(&tok(&reissued, "refresh_token")).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn refresh_rejections_are_available_to_internal_metrics() {
+    let a = app(10);
+    let before = vibe::runtime::refresh_rejections()
+        .get("invalid")
+        .copied()
+        .unwrap_or_default();
+    assert_eq!(
+        a.raw_refresh("", "192.0.2.10").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(vibe::runtime::refresh_rejections()["invalid"] > before);
+}
+
+#[tokio::test]
+async fn revoked_tokens_leave_other_families_available() {
     let a = app(0);
     let r0 = tok(&a.login().await, "refresh_token");
     let (_, body, _) = a.refresh(&r0).await;
@@ -769,7 +807,9 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
         exec.refresh_rotate(&tenant, "g0", "gx", policy)
             .await
             .unwrap(),
-        Rotated::Reuse { family_id: fam2 }
+        Rotated::Reuse {
+            family_id: fam2.clone()
+        }
     );
     assert_eq!(
         exec.refresh_rotate(&tenant, "g2", "gy", policy)
@@ -777,8 +817,11 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
             .unwrap(),
         Rotated::Invalid
     );
-    // Revoked tokens are not counted by the family limiter.
-    assert_eq!(exec.refresh_family(&tenant, "g2").await.unwrap(), None);
+    // Revoked tokens remain discoverable for reuse detection.
+    assert_eq!(
+        exec.refresh_family(&tenant, "g2").await.unwrap(),
+        Some(fam2)
+    );
 
     // Concurrent reuse and rotation on two connections: afterwards no live
     // token may remain in the family.
@@ -909,6 +952,8 @@ fn app_sql_cannot_reach_the_refresh_table() {
 struct FamilyLookupFails {
     inner: Arc<MemoryExec>,
     down: Arc<std::sync::atomic::AtomicBool>,
+    lookup_delay_ms: u64,
+    rotate_delay_ms: u64,
 }
 
 #[async_trait::async_trait]
@@ -960,6 +1005,7 @@ impl vibe::runtime::QueryExec for FamilyLookupFails {
         new_hash: &str,
         policy: vibe::runtime::refresh::RefreshPolicy,
     ) -> Result<vibe::runtime::refresh::Rotated, vibe::runtime::ExecError> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.rotate_delay_ms)).await;
         self.inner
             .refresh_rotate(tenant_id, token_hash, new_hash, policy)
             .await
@@ -978,6 +1024,7 @@ impl vibe::runtime::QueryExec for FamilyLookupFails {
         tenant_id: &str,
         token_hash: &str,
     ) -> Result<Option<String>, vibe::runtime::ExecError> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.lookup_delay_ms)).await;
         if self.down.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(vibe::runtime::ExecError::Message("pool timed out".into()));
         }
@@ -990,7 +1037,12 @@ async fn family_lookup_error_fails_closed_and_keeps_the_token() {
     let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let flag = down.clone();
     let a = app_wrapped(manifest(0), move |inner| {
-        Arc::new(FamilyLookupFails { inner, down: flag })
+        Arc::new(FamilyLookupFails {
+            inner,
+            down: flag,
+            lookup_delay_ms: 0,
+            rotate_delay_ms: 0,
+        })
     });
     let r0 = tok(&a.login().await, "refresh_token");
     let (s, body, _) = a.refresh(&r0).await;
@@ -1004,6 +1056,40 @@ async fn family_lookup_error_fails_closed_and_keeps_the_token() {
     down.store(false, std::sync::atomic::Ordering::SeqCst);
     let (s, body, _) = a.refresh(&r0).await;
     assert_eq!(s, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn refresh_database_waits_share_the_response_deadline() {
+    for (lookup_delay_ms, rotate_delay_ms) in [(100, 100), (1000, 0), (0, 1000)] {
+        let a = app_wrapped(manifest(10), move |inner| {
+            Arc::new(FamilyLookupFails {
+                inner,
+                down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                lookup_delay_ms,
+                rotate_delay_ms,
+            })
+        });
+        let token = tok(&a.login().await, "refresh_token");
+        let valid = a.raw_refresh(&token, "192.0.2.20").await;
+        let unknown = a.raw_refresh("unknown", "192.0.2.21").await;
+        let missing = a.raw_refresh("", "192.0.2.22").await;
+        for response in [&valid, &unknown, &missing] {
+            assert!(response.3 >= 300);
+            assert!(
+                response.3 < 650,
+                "request exceeded response floor: {}ms",
+                response.3
+            );
+        }
+        assert_eq!(
+            valid.0,
+            if lookup_delay_ms + rotate_delay_ms < 300 {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        );
+    }
 }
 
 /// Cleanup of finished families against a real database, run as a

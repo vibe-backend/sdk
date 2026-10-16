@@ -212,10 +212,7 @@ impl QueryExec for MemoryExec {
             .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
         Ok(tables.get(&key(tenant_id, REFRESH_TABLE)).and_then(|rows| {
             rows.iter()
-                .find(|r| {
-                    r.get("token_hash").and_then(Value::as_str) == Some(token_hash)
-                        && r.get("revoked_at").is_none_or(Value::is_null)
-                })
+                .find(|r| r.get("token_hash").and_then(Value::as_str) == Some(token_hash))
                 .and_then(|r| r.get("family_id").and_then(Value::as_str))
                 .map(str::to_string)
         }))
@@ -1027,7 +1024,7 @@ impl QueryExec for PgExec {
                 tenant_id,
                 None,
                 false,
-                "SELECT family_id::text AS family_id FROM _platform_refresh_tokens WHERE token_hash = $1 AND revoked_at IS NULL",
+                "SELECT family_id::text AS family_id FROM _platform_refresh_tokens WHERE token_hash = $1",
                 vec![Some(token_hash.to_string())],
             )
             .await?;
@@ -1121,15 +1118,21 @@ impl QueryExec for PgExec {
         .await
         .map_err(map_pg)?;
         // Row lock: concurrent presentations of one token serialise here.
+        tx.query_opt(
+            "SELECT id FROM _platform_refresh_tokens WHERE token_hash = $1 FOR UPDATE",
+            &[&token_hash],
+        )
+        .await
+        .map_err(map_pg)?;
         let row = tx
             .query_opt(
                 "SELECT id::text, family_id::text, user_id, revoke_reason, revoked_at IS NOT NULL, \
-                 (now() >= family_expires_at OR now() >= idle_expires_at), \
+                 (clock_timestamp() >= family_expires_at OR clock_timestamp() >= idle_expires_at), \
                  used_at IS NOT NULL, \
-                 (used_at IS NOT NULL AND now() - used_at <= make_interval(secs => $2::double precision) AND grace_reissued_at IS NULL \
+                 (used_at IS NOT NULL AND clock_timestamp() - used_at <= make_interval(secs => $2::double precision) AND grace_reissued_at IS NULL \
                   AND EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = t.replaced_by AND c.used_at IS NULL AND c.revoked_at IS NULL)), \
                  replaced_by::text, \
-                 floor(extract(epoch FROM family_expires_at - now()))::bigint \
+                 floor(extract(epoch FROM family_expires_at - clock_timestamp()))::bigint \
                  FROM _platform_refresh_tokens t WHERE token_hash = $1 FOR UPDATE",
                 &[&token_hash, &(policy.grace as f64)],
             )
@@ -1149,7 +1152,7 @@ impl QueryExec for PgExec {
         let old_child: Option<String> = row.get(8);
         let family_left: i64 = row.get(9);
         let revoke_family =
-            "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'reuse' \
+            "UPDATE _platform_refresh_tokens SET revoked_at = clock_timestamp(), revoke_reason = 'reuse' \
                              WHERE family_id = $1::text::uuid AND revoked_at IS NULL";
         if revoked {
             if reason.as_deref() == Some("grace-reissue") {
@@ -1176,7 +1179,7 @@ impl QueryExec for PgExec {
         let child = uuid::Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO _platform_refresh_tokens (id, tenant_id, family_id, user_id, token_hash, parent_id, created_at, family_expires_at, idle_expires_at) \
-             SELECT $1::text::uuid, tenant_id, family_id, user_id, $2, id, now(), family_expires_at, now() + make_interval(secs => $3::double precision) \
+             SELECT $1::text::uuid, tenant_id, family_id, user_id, $2, id, clock_timestamp(), family_expires_at, clock_timestamp() + make_interval(secs => $3::double precision) \
              FROM _platform_refresh_tokens WHERE id = $4::text::uuid",
             &[&child, &new_hash, &(policy.idle_ttl as f64), &id],
         )
@@ -1185,7 +1188,7 @@ impl QueryExec for PgExec {
         if used {
             if let Some(old) = old_child {
                 tx.execute(
-                    "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'grace-reissue' \
+                    "UPDATE _platform_refresh_tokens SET revoked_at = clock_timestamp(), revoke_reason = 'grace-reissue' \
                      WHERE id = $1::text::uuid AND revoked_at IS NULL",
                     &[&old],
                 )
@@ -1193,14 +1196,14 @@ impl QueryExec for PgExec {
                 .map_err(map_pg)?;
             }
             tx.execute(
-                "UPDATE _platform_refresh_tokens SET replaced_by = $1::text::uuid, grace_reissued_at = now() WHERE id = $2::text::uuid",
+                "UPDATE _platform_refresh_tokens SET replaced_by = $1::text::uuid, grace_reissued_at = clock_timestamp() WHERE id = $2::text::uuid",
                 &[&child, &id],
             )
             .await
             .map_err(map_pg)?;
         } else {
             tx.execute(
-                "UPDATE _platform_refresh_tokens SET replaced_by = $1::text::uuid, used_at = now() WHERE id = $2::text::uuid",
+                "UPDATE _platform_refresh_tokens SET replaced_by = $1::text::uuid, used_at = clock_timestamp() WHERE id = $2::text::uuid",
                 &[&child, &id],
             )
             .await

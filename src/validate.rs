@@ -494,7 +494,8 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                 );
             }
             let alg = block_val(block, "alg");
-            if !matches!(alg.as_str(), "ES256" | "RS256") {
+            // Omitted alg defaults to ES256 (decision 139).
+            if !matches!(alg.as_str(), "" | "ES256" | "RS256") {
                 report.push(
                     Diag::error(file, "sign-jwt alg must be ES256 or RS256")
                         .at_step(&block.heading),
@@ -1850,6 +1851,33 @@ mod tests {
             "{:?}",
             report.diags
         );
+    }
+
+    #[test]
+    fn sign_jwt_alg_may_be_omitted_but_not_unknown() {
+        // Decision 139 (#226): an omitted alg means ES256.
+        let body = |alg: &str| {
+            format!(
+                "## Signature\n- input: {{email: string}}\n- output: {{t: string}}\n- writes: false\n- capabilities: [sign-token]\n\n## Steps\n\n### s1\n\n- op: sign-jwt\n{alg}- key-ref: VIBE_JWT_PRIVATE_KEY\n- out: t\n"
+            )
+        };
+        let alg_errors = |text: String| {
+            let lock = LockDoc {
+                meta: Meta::pending(Kind::Method, None, "user/methods/issue", "issue.md"),
+                sections: crate::lock::parse_sections(&text).unwrap(),
+            };
+            let mut report = Report::new();
+            check_method(&lock, "issue.md", &mut report);
+            report
+                .errors()
+                .filter(|d| d.message.contains("alg must be"))
+                .count()
+        };
+        assert_eq!(alg_errors(body("")), 0);
+        assert_eq!(alg_errors(body("- alg: ES256\n")), 0);
+        assert_eq!(alg_errors(body("- alg: RS256\n")), 0);
+        assert_eq!(alg_errors(body("- alg: HS256\n")), 1);
+        assert_eq!(alg_errors(body("- alg: none\n")), 1);
     }
 
     #[test]
