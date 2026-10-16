@@ -25,19 +25,36 @@ use sha2::{Digest, Sha256};
 
 use super::challenge::{
     ChallengeError, DEFAULT_PENDING_PER_IP, DEFAULT_PENDING_PER_TENANT, DEFAULT_REJECTED_HOLD,
-    TOKEN_LIFETIME,
+    MAX_CLOCK_SKEW, TOKEN_LIFETIME,
 };
 
 /// Table in each tenant schema (created by `vibe migrate`).
 pub const REPLAY_TABLE: &str = "vibe_challenge_replay";
 /// Owner-only audit log of expired-row deletions (one row per run).
 pub const REPLAY_CLEANUP_AUDIT_TABLE: &str = "vibe_challenge_replay_cleanup";
+/// Extra time a verified row is kept beyond [`TOKEN_LIFETIME`] +
+/// [`MAX_CLOCK_SKEW`]. It absorbs clock drift between the application hosts
+/// (which run the token age check) and the database (whose `now()` sets and
+/// checks `expires_at`): at least 60s and at least twice the allowed skew.
+pub const RETENTION_MARGIN: Duration = {
+    let twice_skew = MAX_CLOCK_SKEW.as_secs() * 2;
+    Duration::from_secs(if twice_skew > 60 { twice_skew } else { 60 })
+};
 /// How long a verified row is kept. It must outlive the token: once a
-/// verified row is deleted, a replay of that token is only refused by the
-/// token age check (`challenge_ts` older than [`TOKEN_LIFETIME`]), so
-/// deletion must never happen while the token itself is still acceptable.
-pub const VERIFIED_RETENTION: Duration = Duration::from_secs(TOKEN_LIFETIME.as_secs() + 60);
-const _: () = assert!(VERIFIED_RETENTION.as_secs() > TOKEN_LIFETIME.as_secs());
+/// verified row is deleted, reuse of that token is only refused by the
+/// token age check, so deletion must never happen while the token itself is
+/// still acceptable. A token is accepted for up to [`TOKEN_LIFETIME`] +
+/// [`MAX_CLOCK_SKEW`] after verification (its `challenge_ts` may be up to
+/// [`MAX_CLOCK_SKEW`] in the future), plus [`RETENTION_MARGIN`] for clock
+/// drift between the application and the database.
+pub const VERIFIED_RETENTION: Duration = Duration::from_secs(
+    TOKEN_LIFETIME.as_secs() + MAX_CLOCK_SKEW.as_secs() + RETENTION_MARGIN.as_secs(),
+);
+const _: () =
+    assert!(VERIFIED_RETENTION.as_secs() > TOKEN_LIFETIME.as_secs() + MAX_CLOCK_SKEW.as_secs());
+const _: () = assert!(
+    VERIFIED_RETENTION.as_secs() - TOKEN_LIFETIME.as_secs() - MAX_CLOCK_SKEW.as_secs() >= 60
+);
 /// Live rows allowed per tenant.
 const DEFAULT_CAPACITY: i64 = 10_000;
 const PENDING_HOLD: Duration = Duration::from_secs(30);
@@ -263,13 +280,17 @@ pub async fn cleanup_expired(
     let who = session
         .query_texts(
             "SELECT current_user::text || '|' || pg_has_role(current_user, $1::text, 'MEMBER')::text \
-             FROM pg_roles WHERE rolname = $1::text \
-             UNION ALL SELECT current_user::text || '|false' \
-             WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1::text)",
+             FROM pg_roles WHERE rolname = $1::text",
             runtime_role,
         )
         .await?;
-    let who = who.first().cloned().unwrap_or_default();
+    // A runtime role that does not exist is a configuration error, not a
+    // pass: the membership check would have nothing to compare against.
+    let Some(who) = who.first() else {
+        return Err(format!(
+            "VIBE_RUNTIME_DB_ROLE {runtime_role:?} does not exist in this database"
+        ));
+    };
     let (user, member) = who.split_once('|').unwrap_or((who.as_str(), "true"));
     if user == runtime_role || member != "false" {
         return Err(format!(
@@ -697,8 +718,67 @@ mod tests {
     fn verified_rows_outlive_the_token() {
         // Cleanup may delete a verified row only once the token it records
         // is already refused by the age check.
-        assert!(VERIFIED_RETENTION > TOKEN_LIFETIME);
-        assert_eq!(VERIFIED_RETENTION, TOKEN_LIFETIME + Duration::from_secs(60));
+        assert!(VERIFIED_RETENTION > TOKEN_LIFETIME + MAX_CLOCK_SKEW);
+        assert!(RETENTION_MARGIN >= Duration::from_secs(60));
+        assert!(RETENTION_MARGIN >= MAX_CLOCK_SKEW * 2);
+        assert_eq!(
+            VERIFIED_RETENTION,
+            TOKEN_LIFETIME + MAX_CLOCK_SKEW + RETENTION_MARGIN
+        );
+    }
+
+    /// Steps app time second by second from verification until well past
+    /// the last moment the token is accepted, with the database clock
+    /// `db_ahead` ahead of the app, and checks the verified row (whose
+    /// `expires_at` is the database's `now() + VERIFIED_RETENTION` at
+    /// verification) is live whenever the age check accepts the token.
+    fn assert_row_live_while_token_accepted(
+        db_ahead: chrono::Duration,
+        ts_offset: chrono::Duration,
+    ) {
+        use super::super::challenge::check_token_age;
+        let app_verify = chrono::DateTime::parse_from_rfc3339("2026-10-16T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let issued = (app_verify + ts_offset).fixed_offset();
+        assert!(check_token_age(app_verify, issued).is_ok());
+        let expires_at =
+            app_verify + db_ahead + chrono::Duration::from_std(VERIFIED_RETENTION).unwrap();
+        let horizon = (TOKEN_LIFETIME + MAX_CLOCK_SKEW + VERIFIED_RETENTION).as_secs() as i64;
+        let mut last_accepted = None;
+        for s in 0..=horizon {
+            let app_now = app_verify + chrono::Duration::seconds(s);
+            if check_token_age(app_now, issued).is_ok() {
+                let db_now = app_now + db_ahead;
+                assert!(
+                    expires_at > db_now,
+                    "row expired at app +{s}s while the token is still accepted"
+                );
+                last_accepted = Some(s);
+            }
+        }
+        // The token is accepted until challenge_ts + TOKEN_LIFETIME.
+        let expected =
+            (ts_offset + chrono::Duration::from_std(TOKEN_LIFETIME).unwrap()).num_seconds();
+        assert_eq!(last_accepted, Some(expected));
+    }
+
+    #[test]
+    fn verified_row_covers_future_skew_with_db_clock_ahead() {
+        let skew = chrono::Duration::from_std(MAX_CLOCK_SKEW).unwrap();
+        let margin = chrono::Duration::from_std(RETENTION_MARGIN).unwrap();
+        // challenge_ts at the future skew limit, database clock ahead of the
+        // app by up to the full margin (just under it, since the comparison
+        // with expires_at is strict).
+        for db_ahead in [
+            chrono::Duration::zero(),
+            skew,
+            margin - chrono::Duration::seconds(1),
+        ] {
+            assert_row_live_while_token_accepted(db_ahead, skew);
+            assert_row_live_while_token_accepted(db_ahead, chrono::Duration::zero());
+            assert_row_live_while_token_accepted(db_ahead, -skew);
+        }
     }
 
     #[test]

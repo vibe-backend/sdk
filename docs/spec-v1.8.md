@@ -1301,7 +1301,7 @@ migration 放喺 ./migrations/main/。
     - 建立資料（有 INSERT）嘅 public endpoint：一定要 `type: captcha` 或者 `pow`，`when: always`（v1 只支援 `captcha`，`pow` 係 build error，見 7.2a 決定 131）。
     - login 類 endpoint：一定要 `{ type: captcha, when: after-failures, after-failures: 3 }`（跟 4A.3）。
     - 其他冇 INSERT 嘅 public 寫入：可以 `type: none`。
-    - Challenge token 單次使用狀態（#157，產品決定）：production 有設定 verifier 時一律用 PostgreSQL replay store；表喺每個租戶自己 schema（`t_<tenant>.vibe_challenge_replay`，有 `tenant_id`、ENABLE + FORCE RLS，owner role 擁有，由該租戶嘅 `vibe migrate` 建立），冇跨租戶共用表（決定 97）。runtime role 只有 SELECT、INSERT，冇 DELETE／UPDATE（決定 27）：預留同結果都係追加記錄，讀取忽略過期記錄，過期記錄只由 owner role 喺 `vibe migrate` 刪除。Fail closed 唔依賴清理：清理冇做或者延遲，只會令 store 較早滿，滿咗按決定 134 回 429，永遠唔會放行未記錄 replay 嘅 request（見 #193）。容量上限同 quota 按租戶計；client IP 用每租戶 key 嘅 HMAC 儲存。表唔存在、用唔到或者 runtime role 權限多過 SELECT／INSERT 就拒絕啟動；production 設 `VIBE_CHALLENGE_REPLAY_STORE=memory` 亦拒絕啟動。dev／CI 一定要明確揀 `memory` 或者 `postgres`，冇預設值。v1 captcha provider 係 Cloudflare Turnstile。
+    - Challenge token 單次使用狀態（#157，產品決定）：production 有設定 verifier 時一律用 PostgreSQL replay store；表喺每個租戶自己 schema（`t_<tenant>.vibe_challenge_replay`，有 `tenant_id`、ENABLE + FORCE RLS，owner role 擁有，由該租戶嘅 `vibe migrate` 建立），冇跨租戶共用表（決定 97）。runtime role 只有 SELECT、INSERT，冇 DELETE／UPDATE（決定 27）：預留同結果都係追加記錄，讀取忽略過期記錄，過期記錄只由 owner role 喺 `vibe migrate` 同定期 `vibe replay-cleanup`（#193，見 7.2a）刪除。Fail closed 唔依賴清理：清理冇做或者延遲，只會令 store 較早滿，滿咗按決定 134 回 429，永遠唔會放行未記錄 replay 嘅 request（見 #193）。容量上限同 quota 按租戶計；client IP 用每租戶 key 嘅 HMAC 儲存。表唔存在、用唔到或者 runtime role 權限多過 SELECT／INSERT 就拒絕啟動；production 設 `VIBE_CHALLENGE_REPLAY_STORE=memory` 亦拒絕啟動。dev／CI 一定要明確揀 `memory` 或者 `postgres`，冇預設值。v1 captcha provider 係 Cloudflare Turnstile。
   - **註冊（password 寫入）**（決定 47）：public 路徑寫 password 類型欄位只准一種方式：
     - method 標 `capabilities: [set-password]`（高風險安全項目），而且寫入 password 欄位嘅值一定係同一 method 內 `hash-password` op 嘅輸出；直接用 request 值寫 password 欄位一律 error。
     - api lock `## Access` 寫 `password-write: allow`，`writable-columns` 明確列出 password 欄位。
@@ -1393,7 +1393,7 @@ Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動�
 
 | 項目 | 值 |
 | --- | --- |
-| 已驗證 token 保留時間（replay TTL） | 360s（token 壽命 300s + 60s clock skew 邊際） |
+| 已驗證 token 保留時間（`VERIFIED_RETENTION`） | 480s = token 壽命 300s + 最大 clock skew 60s + 時鐘差邊際 120s（`RETENTION_MARGIN`，取 60s 同 2 × clock skew 較大者）；由常數推導，compile-time assertion 保證大過 token 壽命 + clock skew |
 | 被拒 token 保留時間（rejected hold） | 10s |
 | 未有答覆嘅預留（provider 唔可用，正常 settle） | 即時釋放 |
 | Request 中斷、未 settle 嘅 pending 預留（pending hold） | 30s |
@@ -1403,6 +1403,13 @@ Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動�
 | 告警 | 使用率超過 80%：`challenge_replay_store_high_usage`；store 滿：`challenge_replay_store_full`（metric reason `replay_store_full`） |
 | Metric | `vibe_challenge_rejected_total{reason}`（例如 `reason="replay_store_full"`、`"replay_prefix_cap"`）；reason 只入 metric 同內部 log，永遠唔出現喺 HTTP 回應 |
 | 容量上限 | Postgres store：每租戶 10,000；memory store（只限 dev／CI）：每 process 100,000；滿咗回 429（決定 134） |
+
+#### 過期記錄清理（#193）
+
+- `vibe replay-cleanup --tenant <id> [--tenant <id> ...]`：用 owner 連線（同 `vibe migrate` 一樣，`VIBE_MIGRATE_DATABASE_URL`）刪除該租戶 `expires_at` 已過嘅記錄，每個租戶一個 transaction；同一個 transaction 寫一行 audit 入 owner 專用表 `t_<tenant>.vibe_challenge_replay_cleanup`（`ran_at`、`run_by`、`trigger` = `scheduled`／`migrate`、`deleted`），runtime role 冇權限讀寫。
+- 以 `VIBE_RUNTIME_DB_ROLE` 或者佢嘅 member 身份執行即拒絕；`VIBE_RUNTIME_DB_ROLE` 指嘅 role 唔存在亦拒絕。Runtime role 冇 DELETE（決定 27）。
+- SDK 唔會改 owner role 嘅 `LOGIN`／`NOLOGIN`；如果部署平時將 owner role 設做 `NOLOGIN`，清理要喺同 `vibe migrate` 一樣嘅開放登入流程入面執行。
+- 驗證唔依賴清理：讀取忽略過期記錄；已驗證記錄保留 `VERIFIED_RETENTION`（見上表），一定長過 token 可以被接受嘅時間。
 
 #### 實作狀態（對比 `main` 4b85de5）
 

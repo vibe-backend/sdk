@@ -1380,6 +1380,15 @@ async fn replay_cleanup_removes_only_expired_rows_as_owner_and_audits() {
         .unwrap_err();
     assert!(err.contains("owner"), "{err}");
     assert_eq!(count(format!("SELECT count(*) FROM {table}")).await, before);
+    // A runtime role name that does not exist is refused, not waved through.
+    let owner_check = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    let err = vibe::runtime::replay::cleanup_expired(&owner_check, &s.tenant, "no_such_role_x")
+        .await
+        .unwrap_err();
+    assert!(err.contains("does not exist"), "{err}");
+    assert_eq!(count(format!("SELECT count(*) FROM {table}")).await, before);
 
     let owner = PgExec::connect(&url_as(&s.admin_url, &s.owner))
         .await
