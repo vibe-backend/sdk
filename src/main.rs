@@ -544,10 +544,10 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
     Ok(auth)
 }
 
-/// `VIBE_TRUSTED_PROXIES`: comma-separated proxy IPs or CIDR blocks whose
-/// `X-Forwarded-For` is honoured. Unset = trust no proxy (use the peer).
-/// D130 limits; `VIBE_RATE_PLATFORM_FACTOR` sets the platform cap as a
-/// multiple of the tenant cap (default 5).
+/// D130 limits. `VIBE_RATE_PLATFORM_FACTOR` sets the platform cap as a
+/// multiple of the tenant cap (default 5, 1..=100).
+/// `VIBE_RATE_EXPECTED_TENANTS` sizes the global tenant slot budget
+/// (default 256, 1..=4096; budget = tenants x 4,096 slots).
 fn net_limits_from_env() -> Result<vibe::runtime::NetLimits, String> {
     let mut limits = vibe::runtime::NetLimits::default();
     if let Ok(raw) = std::env::var("VIBE_RATE_PLATFORM_FACTOR") {
@@ -555,14 +555,33 @@ fn net_limits_from_env() -> Result<vibe::runtime::NetLimits, String> {
             .trim()
             .parse::<u32>()
             .ok()
-            .filter(|f| *f >= 1)
+            .filter(|f| (1..=vibe::runtime::MAX_PLATFORM_FACTOR).contains(f))
             .ok_or_else(|| {
-                format!("VIBE_RATE_PLATFORM_FACTOR must be a positive integer, got {raw}")
+                format!(
+                    "VIBE_RATE_PLATFORM_FACTOR must be an integer from 1 to {}, got {raw}",
+                    vibe::runtime::MAX_PLATFORM_FACTOR
+                )
             })?;
+    }
+    if let Ok(raw) = std::env::var("VIBE_RATE_EXPECTED_TENANTS") {
+        let tenants = raw
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|t| (1..=vibe::runtime::MAX_EXPECTED_TENANTS).contains(t))
+            .ok_or_else(|| {
+                format!(
+                    "VIBE_RATE_EXPECTED_TENANTS must be an integer from 1 to {}, got {raw}",
+                    vibe::runtime::MAX_EXPECTED_TENANTS
+                )
+            })?;
+        limits = limits.sized_for(tenants);
     }
     Ok(limits)
 }
 
+/// `VIBE_TRUSTED_PROXIES`: comma-separated proxy IPs or CIDR blocks whose
+/// `X-Forwarded-For` is honoured. Unset = trust no proxy (use the peer).
 fn trusted_proxies_from_env() -> Result<Vec<vibe::runtime::ProxyNet>, String> {
     let Ok(raw) = std::env::var("VIBE_TRUSTED_PROXIES") else {
         return Ok(Vec::new());

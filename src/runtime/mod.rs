@@ -18,7 +18,8 @@ pub use http::{
     AuthConfig, RunEnv, Slug, StoredKey, REQUEST_TYPES,
 };
 pub use limiter::{
-    counter_slot_refusals, saturation_refusals, NetLimits, ProxyNet, QuotaBuckets, RateBuckets,
+    counter_slot_refusals, saturation_refusals, slot_refused_metrics, slot_refused_total,
+    NetLimits, ProxyNet, QuotaBuckets, RateBuckets, MAX_EXPECTED_TENANTS, MAX_PLATFORM_FACTOR,
 };
 pub use migrate::migrate_tenant;
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
