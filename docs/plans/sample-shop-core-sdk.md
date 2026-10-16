@@ -1,7 +1,7 @@
 # Sample Shop 核心 SDK 實作計畫與契約對照（草案）
 
-- 狀態：Draft，待產品範圍與相關 PR 分流確認
-- SDK 基線：`vibe-backend/sdk@413ccd6`（`main`，2026-10-15）
+- 狀態：Draft；產品範圍已確認為 PR #62 核心契約，相關 PR 分流待確認
+- SDK 基線：`vibe-backend/sdk@534207b`（`main`，2026-10-16）
 - 消費端基線：`vibe-backend/sample-shop` PR #62（`backend/markdown-v1`，Open Draft）
 - 規格基線：`docs/spec-v1.8.md`
 
@@ -12,7 +12,7 @@
 ### 本階段範圍
 
 1. 中文自然語言 source 可重現地產生合法 lock，並可逐檔診斷與重試，但 build／lock 輸出維持 all-or-nothing；任何檔案失敗都不留下部分輸出。
-2. 核心驗證與 HTTP 能力：auth、CORS、跨 model transaction、冪等、cursor 分頁、關聯欄位／expand、錯誤細節、ETag／`If-Match`。
+2. 核心驗證與 HTTP 能力：auth、CORS、跨 model transaction、冪等、cursor 分頁、錯誤細節、ETag／`If-Match`。
 3. sample-shop PR #62 endpoint matrix 的全部 26 條核心 API：
    - 註冊、登入、目前使用者。
    - 公開／店員商品與 SKU。
@@ -24,7 +24,8 @@
 ### 非目標
 
 - 不把商品、訂單、庫存或付款等商店業務規則硬編碼至 SDK。
-- 不在本階段承諾前端 `ShopFeatures` 的收藏、優惠券、錢包、評論、問答、售後、通知與其他未列於 PR #62 的功能。
+- 前端 `ShopFeatures` 的 [Favorites #237](https://github.com/vibe-backend/sdk/issues/237)、[Coupons #238](https://github.com/vibe-backend/sdk/issues/238)、[Wallet #239](https://github.com/vibe-backend/sdk/issues/239)、[Reviews #240](https://github.com/vibe-backend/sdk/issues/240)、[Q&A #241](https://github.com/vibe-backend/sdk/issues/241)、[After-sales #242](https://github.com/vibe-backend/sdk/issues/242) 均為 vNext 後續工作；通知與其他未列於 PR #62 的功能亦不在本階段範圍。
+- ref／expand（#75）延至 v1.1，不在本階段範圍。
 - 不處理 UI 實作。
 - 不合併 sample-shop PR #62。
 - 不在 PR 尚未審查、合併及 release scope 未確認前發布版本。
@@ -37,11 +38,13 @@
 
 SDK 目前有多個未合併且部分相互堆疊的 PR。直接在 `main` 重做會造成衝突，實作前須先決定合併／重建順序：
 
-- #75：reference field／expand（Draft；2026-10-16 已合併 `main` 解衝突；產品決定延至 v1.1，見下方風險）
+- #75：reference field／expand（Draft；2026-10-16 已合併 `main` 解衝突；產品決定延至 v1.1，不納入本階段）
 - #77、#95、#106：auth 三階段（#95 已合併其 base 解衝突；#77 與 `main` 仍有衝突）
+- #121：auth fixes for #77（Open）
+- #231：D139 JWT key checks（Open；規格 §4.1、§4.1a、§12.6，決定 139）
 - #88：method step validator（已合併入 `main`，`bcf1207`）
 - #92、#93、#96：自然語言編譯與中文 source（#92 已合併 `main` 解衝突；#93 仍需處理）
-- #99：MemoryExec RLS／grant（Draft；已合併 `main` 解衝突；其 PostgreSQL 共用 runtime login 模型與 spec v1.8 決定 97 的租戶 login role 模型不一致，需重新對齊）
+- #147：per-tenant DB roles（取代已關閉的舊 RLS／grant PR；依 spec v1.8 §7.1、§7.1a、§9C，決定 97、129，以每個租戶／role 的獨立連線池直接登入租戶 role）
 - #116：release signing（與核心 runtime 無直接依賴）
 
 以上狀態於 2026-10-16 更新；實作前須以當時 PR 狀態重新確認。
@@ -51,7 +54,7 @@ SDK 目前有多個未合併且部分相互堆疊的 PR。直接在 `main` 重�
 1. **規格與契約漂移**：PR #62 文件仍提及 v1.7 與舊 SDK commit，但 `main` 已合併 spec v1.8。
 2. **堆疊 PR 衝突**：不可把「已有 open PR」視為 SDK 已具備能力；每項能力都須在整合基線重新測試。
 3. **安全**：auth、refresh cookie、CORS credentials、tenant isolation、RLS、冪等資料與錯誤內容均涉及跨租戶或敏感資料風險。
-4. **範圍衝突**：#75（ref／expand）已由產品決定延至 v1.1，但本計畫將 ref／expand 列入本階段；須先確認 sample-shop 購物車商品摘要改用其他方式，或由產品重新納入範圍。
+4. **關聯摘要整合**：#75（ref／expand）已由產品決定延至 v1.1，不納入本階段；sample-shop 購物車商品摘要須改用不依賴該能力的方式並以契約測試驗證。
 5. **發布**：crate 仍為 `0.1.0`，目前沒有 GitHub Release；版本與 release scope 尚未核准。
 6. **測試環境**：本機盤點時沒有 `cargo`，尚未取得本機基線結果；CI 使用 Rust 1.89 與 PostgreSQL 17。開始程式修改前須補齊工具鏈並跑完整基線。
 
@@ -61,7 +64,7 @@ SDK 目前有多個未合併且部分相互堆疊的 PR。直接在 `main` 重�
 | --- | --- | --- | --- |
 | 中文自然語言 source 穩定編譯 | 支援 LLM compile，但 sample-shop 9 次整批失敗 | #37、#83；PR #92/#93/#96 | 整合／重建後以固定 fixture 驗證；保留逐檔輸出、修復重試與可診斷輸出 |
 | login／register／refresh | spec 已定義，runtime 尚未完整落地 | #26；PR #77/#95/#106 | 先完成與審查堆疊 PR；以 uniform auth errors、rotation/reuse tests 驗收 |
-| cart item 關聯 product 摘要 | 缺通用 ref／expand | #21；PR #75 | 將通用 reference 與受限 expand 留在 SDK；業務投影留在 sample-shop source |
+| cart item 關聯 product 摘要 | 通用 ref／expand 延至 v1.1 | #21；PR #75（延至 v1.1） | 本階段摘要採不依賴 ref／expand 的方式；業務投影留在 sample-shop source |
 | 跨 model checkout transaction | spec v1.8 已定義語意；runtime 能力需補齊與驗證 | #34、PR #94 等相關工作 | 實作單 DB transaction、timeout/conflict mapping、rollback 與庫存競態測試 |
 | `Idempotency-Key` | 規格已文件化；平台執行能力需補齊 | #85 | 實作 `(tenant, subject, route, key)` scope、request hash、response replay、TTL 與併發唯一性 |
 | CORS／preflight | 規格已文件化；runtime 需補齊 | #84 | 僅允許明確 origin；驗證 `*` + credentials 禁用；支援 required/exposed headers |
@@ -69,13 +72,13 @@ SDK 目前有多個未合併且部分相互堆疊的 PR。直接在 `main` 重�
 | PATCH partial update | sample-shop 核心目前採 PUT；spec 已定義 PATCH | #86 | 不阻塞 PR #62；保留相容性測試，避免 PUT 行為破壞 |
 | ETag／`If-Match` | spec v1.8 已定義 | 相關 v1.8 工作 | 實作／驗證 428、412、成功後新 ETag |
 | error `details`／`retryable` | 基本 error envelope 已有，擴充欄位不足 | 尚待去重確認 | 以向後相容的 optional fields 擴充，禁止洩漏 SQL、token 或跨租戶識別資訊 |
-| tenant isolation／RLS | 有 PostgreSQL runtime 與 migration 防護 | PR #99 等 | PostgreSQL 與 memory executor 都測跨 tenant deny；memory mode 不得給錯誤安全保證 |
+| tenant isolation／RLS | 有 PostgreSQL runtime 與 migration 防護 | PR #147（§7.1、§7.1a、§9C；決定 97、129） | PostgreSQL 與 memory executor 都測跨 tenant deny；memory mode 不得給錯誤安全保證 |
 | SKU／庫存／狀態機 | 屬 sample-shop 業務 source | sample-shop #62 | SDK 僅提供原子操作、驗證與錯誤映射，不內建商店規則 |
 
 ### 行為真相與契約修正 gate
 
 - SDK 通用 HTTP 行為以 `docs/spec-v1.8.md` 為唯一真相；sample-shop contract 可增加業務限制，但不得覆寫平台狀態碼或安全語意。
-- 在 runtime 實作前，sample-shop PR #62 必須修正三項已確認漂移：同 key 不同 body 由 409 改為 422 `IDEMPOTENCY_KEY_REUSED`；invalid／mismatched cursor 明定為 400 `INVALID_CURSOR`；註冊密碼長度由 8–72 對齊 v1.8 `hash-password` 的 12–256，過短回 422 `WEAK_PASSWORD`。
+- 在 runtime 實作前，sample-shop PR #62 必須修正三項已確認漂移：同 key 不同 body 由 409 改為 422 `IDEMPOTENCY_KEY_REUSED`；invalid／mismatched cursor 明定為 400 `INVALID_CURSOR`；註冊密碼長度由 8–72 對齊 v1.8 `hash-password` 的 12–256，長度不符回 422 `WEAK_PASSWORD`，洩漏密碼回 422 `BREACHED_PASSWORD`（§4A.2、§8；決定 7）。
 - PR #62 的 endpoint matrix（目前 26 條，含地址簿 #21–#26）全部納入並須凍結成 contract test 清單；checkout 測試必須由同一登入使用者先建立並選取地址。refresh／logout 若納入本階段，需補入 matrix，否則明確列為依賴 auth phase、不可宣稱核心 auth 全部完成。
 
 ## 4. SDK 介面草案
@@ -96,9 +99,9 @@ vibe compile [SOURCE ...] [--keep-going] [--dump-llm DIR]
 ### HTTP runtime
 
 - CORS：從 API definition allowlist 產生 preflight 與實際回應標頭。
-- Idempotency：以 tenant、subject、route、key 與 canonical request hash 辨識；同 key 不同 request 回 422 `IDEMPOTENCY_KEY_REUSED`；409 僅用於有效租約仍在處理中的 `IDEMPOTENCY_IN_PROGRESS`；相同 request 重播首次狀態碼、必要標頭與 body。
+- Idempotency：public endpoint 不得啟用（§2.3b；決定 104）；以 tenant、subject、route、key 與 canonical request hash 辨識；同 key 不同 request 回 422 `IDEMPOTENCY_KEY_REUSED`；409 僅用於有效租約仍在處理中的 `IDEMPOTENCY_IN_PROGRESS`；相同 request 重播首次狀態碼、必要標頭與 body。
 - Transaction：跨 model method steps 在同一資料庫 transaction 執行；serialization/deadlock 映射為可重試 `TX_CONFLICT`，逾時映射 `TX_TIMEOUT`。
-- Pagination：cursor 封裝排序鍵、id、filter identity 與版本；簽章、版本或 sort／filter 驗證失敗回 400 `INVALID_CURSOR`，不接受任意 SQL sort。
+- Pagination：cursor 使用 `base64url(payload) + "." + HMAC-SHA-256(租戶 cursor key, payload)`，payload 包含版本、最後一列的 sort 值與 `id`、sort／filter hash（§12.9；決定 106）；簽章、版本或 sort／filter 驗證失敗回 400 `INVALID_CURSOR`，不接受任意 SQL sort。
 - Concurrency：需要版本保護的更新缺 `If-Match` 回 428、不符回 412。
 - Error envelope：
 
@@ -140,7 +143,7 @@ vibe compile [SOURCE ...] [--keep-going] [--dump-llm DIR]
 
 - 全部 source 可 compile、validate、build manifest；任一檔失敗時無部分 lock／build 輸出。
 - public catalog 與 staff-only route 權限。
-- register/login 的相同 401 行為、密碼 12–256 規則與 422 `WEAK_PASSWORD`，以及 refresh rotation/reuse。
+- register/login 的相同 401 行為，以及 refresh rotation/reuse；註冊時驗證密碼 12–256 規則、長度不符的 422 `WEAK_PASSWORD` 與洩漏密碼的 422 `BREACHED_PASSWORD`（§4A.2、§8；決定 7）；登入不做洩漏密碼檢查（§4A.2）。
 - unknown request fields、型別與 boundary validation 回 422。
 - CORS allow／deny 與 preflight。
 - cursor 首頁、末頁、非法／竄改或 sort／filter 不符時回 400 `INVALID_CURSOR`，以及資料插入後穩定性。
@@ -162,7 +165,7 @@ vibe compile [SOURCE ...] [--keep-going] [--dump-llm DIR]
 - 所有 tenant-owned query 與 idempotency record 都必須綁 tenant；subject-scoped record 不得跨使用者重播。
 - refresh token 只存雜湊；cookie 使用 `__Host-vibe_rt_{slug}`、HttpOnly、Secure、Path=/ 且無 Domain。same-site 使用 SameSite=Strict；cross-site 使用 SameSite=None，且強制精確 Origin allowlist、`X-Vibe-CSRF: 1`、preflight 與 `Vary: Origin`。credentials 只允許 refresh／logout。
 - auth failure 維持一致時間與回應，避免帳號枚舉。
-- cursor 必須簽章或 MAC，並綁 filter／sort；不可直接接受 client SQL 片段。
+- cursor 必須以租戶 cursor key 做 HMAC-SHA-256，並綁租戶、filter／sort（§12.9；決定 106）；不可直接接受 client SQL 片段。
 - `details` 只允許 schema 驗證後的公開欄位，不回傳 SQL、stack trace、內部 table 名或憑證。
 - lock／manifest schema 新欄位採可選或版本化；舊產物的接受／拒絕策略須有明確錯誤與 migration 說明。
 - release artifact 必須由正式 workflow 建立；不得用長期私鑰或本機未追蹤 artifact 發布。
@@ -177,7 +180,7 @@ vibe compile [SOURCE ...] [--keep-going] [--dump-llm DIR]
 
 - 安裝／確認 Rust 1.89 與 PostgreSQL 17 測試環境。
 - 跑 `main` 完整基線。
-- 審查並決定 #75、#77/#95/#106、#88、#92/#93/#96、#99 的合併、重建或關閉順序。
+- 審查並決定 #77/#95/#106、#121、#231、#88、#92/#93/#96、#147 的合併、重建或關閉順序；#75（ref／expand）延至 v1.1。
 - 將 PR #62 契約更新至 spec v1.8，凍結核心 endpoint 清單。
 
 ### Phase 1：編譯與驗證閉環
@@ -188,14 +191,14 @@ vibe compile [SOURCE ...] [--keep-going] [--dump-llm DIR]
 
 ### Phase 2：核心 runtime primitives
 
-- 依序交付 auth、CORS、transaction／error mapping、idempotency、cursor、ref／expand、ETag。
+- 依序交付 auth、CORS、transaction／error mapping、idempotency、cursor、ETag。
 - 每個 primitive 使用獨立 PR 或可審查 commit，避免單一巨型 PR。
 
 ### Phase 3：sample-shop 整合
 
 - 重新編譯 PR #62 source，人工審查 lock。
 - 跑 PostgreSQL contract tests 與 frontend real adapter 核心流程。
-- 將非核心 ShopFeatures 去重後分別建立具體 issue。
+- 追蹤非核心 ShopFeatures 的 vNext 後續 issue：[Favorites #237](https://github.com/vibe-backend/sdk/issues/237)、[Coupons #238](https://github.com/vibe-backend/sdk/issues/238)、[Wallet #239](https://github.com/vibe-backend/sdk/issues/239)、[Reviews #240](https://github.com/vibe-backend/sdk/issues/240)、[Q&A #241](https://github.com/vibe-backend/sdk/issues/241)、[After-sales #242](https://github.com/vibe-backend/sdk/issues/242)。
 
 ### Phase 4：穩定化與發布候選
 
@@ -212,8 +215,10 @@ vibe compile [SOURCE ...] [--keep-going] [--dump-llm DIR]
 
 ## 9. 待確認事項
 
-1. 產品範圍是否採「PR #62 核心契約」而非 frontend 全部 `ShopFeatures`。
-2. #75、#77、#92、#99 等 DIRTY／Draft PR 是由原作者合併 base 更新（不 rebase），還是由本工作以新整合 PR 重建。
+1. 產品範圍已確認：採 PR #62 核心契約；frontend 其他 `ShopFeatures` 依上述 vNext issue 跟進。
+2. #77、#92、#147 等待整合 PR 是由原作者合併 base 更新（不 rebase），還是由本工作以新整合 PR 重建。
 3. refresh cookie 的實際部署 topology、SameSite 與 credentials 策略。
 4. `details` 的公開 schema，以及 `PRODUCT_UNAVAILABLE` 可揭露欄位。
 5. 第一個可發布版本是維持 `0.1.0`、升 `0.1.1`，或在 scope 完成後定義其他版本；未確認前不發布。
+
+文件維護註：本 PR 僅更新計畫文件，無行為變更，不需 CHANGELOG entry；計畫沿用規格的語言，目前不需英文版，可在有要求時補充。
