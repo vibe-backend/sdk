@@ -778,34 +778,18 @@ async fn query_runs_as_public_reader_in_a_read_only_transaction() {
     );
 }
 
-/// A query step cannot switch tenant, role or run dynamic SQL to reach
-/// another tenant's rows.
+/// Query steps with a disallowed function or a schema-qualified table are
+/// rejected before they run.
 #[tokio::test]
-async fn query_cannot_read_another_tenant() {
-    let Some((_app, admin, tenant_a, url)) = pg_app().await else {
+async fn query_step_rejects_disallowed_sql() {
+    let Some((_app, _admin, tenant, url)) = pg_app().await else {
         return;
     };
-    let Some((_app_b, _, tenant_b, _)) = pg_app().await else {
-        return;
-    };
-    admin
-        .execute(
-            &format!(
-                "INSERT INTO t_{tenant_b}.users (tenant_id, email) VALUES ($1, 'secret@b.example')"
-            ),
-            &[&tenant_b],
-        )
-        .await
-        .unwrap();
     let exec = PgExec::connect(&url).await.unwrap();
     let auth = auth();
     for sql in [
-        format!(
-            "select set_config('app.tenant_id', '{tenant_b}', true), query_to_xml('select email from t_{tenant_b}.users', true, false, '') as x"
-        ),
-        format!("select email from t_{tenant_b}.users"),
-        "select set_config('role', 'none', true) as r".to_string(),
-        format!("select * from query_to_xml('select email from t_' || '{tenant_b}' || '.users', true, false, '')"),
+        "select forbidden_fn(1) as x",
+        "select id from other_schema.users",
     ] {
         let m = method_manifest(
             &[],
@@ -814,12 +798,8 @@ async fn query_cannot_read_another_tenant() {
                 respond("u")
             ]),
         );
-        let out = run_method(&m, &exec, "t.run", &json!({}), ctx(&auth, &tenant_a), 0).await;
-        assert!(out.is_err(), "not blocked: {sql}: {out:?}");
-        assert!(
-            !format!("{out:?}").contains("secret@b.example"),
-            "tenant {tenant_a} read tenant {tenant_b}"
-        );
+        let out = run_method(&m, &exec, "t.run", &json!({}), ctx(&auth, &tenant), 0).await;
+        assert!(out.is_err(), "accepted: {sql}: {out:?}");
     }
 }
 

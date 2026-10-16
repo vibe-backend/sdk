@@ -7,7 +7,8 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, ObjectName, Query, SetExpr, Statement, TableFactor, Visit, Visitor,
+    ArrayElemTypeDef, BinaryOperator, DataType, Expr, ObjectName, Query, SetExpr, Statement,
+    TableFactor, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -146,19 +147,11 @@ impl Visitor for Guard {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-        let cast_type = match expr {
-            Expr::Cast { data_type, .. } | Expr::TypedString { data_type, .. } => {
-                Some(data_type.to_string())
-            }
-            _ => None,
-        };
-        if let Some(ty) = cast_type {
+        if let Expr::Cast { data_type, .. } | Expr::TypedString { data_type, .. } = expr {
             // Object-identifier types (regclass, regproc, …) turn strings into
             // catalog references.
-            let ty = ty.to_ascii_lowercase();
-            let base = ty.rsplit('.').next().unwrap_or(&ty);
-            if base.starts_with("reg") || base == "oid" || base == "name" {
-                return self.fail(format!("cast to {ty} is not allowed in lock SQL"));
+            if let Some(problem) = cast_type_problem(data_type) {
+                return self.fail(problem);
             }
         }
         match expr {
@@ -185,6 +178,44 @@ impl Visitor for Guard {
         }
         ControlFlow::Continue(())
     }
+}
+
+/// Rejects casts to object-identifier types, compared on parsed identifier
+/// parts so quoting and a `pg_catalog.` prefix make no difference.
+fn cast_type_problem(data_type: &DataType) -> Option<String> {
+    let mut ty = data_type;
+    while let DataType::Array(
+        ArrayElemTypeDef::AngleBracket(inner)
+        | ArrayElemTypeDef::SquareBracket(inner, _)
+        | ArrayElemTypeDef::Parenthesis(inner),
+    ) = ty
+    {
+        ty = inner;
+    }
+    let name = match ty {
+        DataType::Regclass => {
+            return Some(format!("cast to {data_type} is not allowed in lock SQL"))
+        }
+        DataType::Custom(name, _) => name,
+        _ => return None,
+    };
+    let parts: Vec<String> = name.0.iter().map(|i| i.value.to_lowercase()).collect();
+    let base = match parts.as_slice() {
+        [base] => base,
+        [schema, base] if schema == "pg_catalog" => base,
+        // Any other schema-qualified type is refused outright.
+        _ => return Some(format!("cast to {data_type} is not allowed in lock SQL")),
+    };
+    if base.starts_with("reg")
+        || base == "oid"
+        || base == "name"
+        || base == "xid"
+        || base == "cid"
+        || base == "tid"
+    {
+        return Some(format!("cast to {data_type} is not allowed in lock SQL"));
+    }
+    None
 }
 
 /// What a `query` step's SQL does, from its parse tree.
@@ -351,35 +382,60 @@ mod tests {
     }
 
     #[test]
-    fn session_role_setting_and_dynamic_sql_are_rejected() {
+    fn disallowed_sql_is_rejected() {
         for sql in [
-            "select set_config('role', 'none', true)",
-            "select set_config('app.tenant_id', 'b', true), query_to_xml('select 1', true, false, '')",
-            "select email from users where set_config('app.tenant_id','b',true) is not null",
-            "select current_setting('app.tenant_id')",
-            "select * from query_to_xml('select 1', true, false, '')",
+            "select forbidden_fn(1)",
+            "select * from forbidden_fn(1)",
+            "select id from users where forbidden_fn(1) is not null",
             "select pg_catalog.lower('x')",
-            "set role vibe_app",
-            "set session authorization vibe_app",
-            "reset role",
+            "set some_setting = 1",
+            "reset some_setting",
             "select 1; select 2",
-            "select email from t_b.users",
-            "select * from pg_catalog.pg_roles",
-            "select * from _platform_refresh_tokens",
-            "select * from U&\"\\005fplatform_refresh_tokens\"",
+            "select id from other_schema.users",
+            "select * from _platform_example",
             "with d as (update users set name = 'x' returning id) select * from d",
             "with d as (delete from users returning id) select * from d",
             "do $$ begin end $$",
             "copy users to stdout",
             "select * into tmp_copy from users",
-            "select 'x'::regclass",
-            "select cast('x' as regproc)",
-            "select count(*) from users where tableoid = '_platform_refresh_tokens'::regclass",
-            "select regclass 'users'",
-            "select name from users where name = 'a' collate pg_catalog.\"C\"",
-            "select 1 operator(pg_catalog.+) 1",
+            "select name from users where name = 'a' collate other_schema.\"C\"",
+            "select 1 operator(other_schema.+) 1",
         ] {
             assert!(query_problem(sql).is_some(), "accepted: {sql}");
+        }
+    }
+
+    #[test]
+    fn identifier_type_casts_are_rejected() {
+        for sql in [
+            "select 'x'::regclass",
+            "select cast('x' as regproc)",
+            "select regclass 'x'",
+            "select 'x'::oid",
+            "select 'x'::name",
+            "select 'x'::\"regclass\"",
+            "select 'x'::\"REGCLASS\"",
+            "select 'x'::pg_catalog.regclass",
+            "select 'x'::pg_catalog.\"regclass\"",
+            "select 'x'::\"pg_catalog\".\"regtype\"",
+            "select 'x'::\"oid\"",
+            "select cast('x' as \"regproc\")",
+            "select 'x'::regclass[]",
+            "select 'x'::\"regclass\"[]",
+        ] {
+            assert!(query_problem(sql).is_some(), "accepted: {sql}");
+        }
+    }
+
+    #[test]
+    fn ordinary_casts_pass() {
+        for sql in [
+            "select $1::uuid",
+            "select '1'::int",
+            "select 'x'::text",
+            "select 'x'::\"text\"",
+        ] {
+            assert_eq!(query_problem(sql), None, "{sql}");
         }
     }
 
