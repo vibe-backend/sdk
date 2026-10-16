@@ -991,10 +991,29 @@ mod tests {
     }
 
     /// Saturation events: `(target, reason, refused)` per log line.
-    #[derive(Clone, Default)]
-    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<(String, String, u64)>>>);
+    type Events = Vec<(String, String, u64)>;
+
+    thread_local! {
+        /// Per-test capture buffer; `Some` only inside [`capture`].
+        static CAPTURED: std::cell::RefCell<Option<Events>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Records events into the current thread's [`CAPTURED`] buffer.
+    ///
+    /// Installed once as the global default. A per-test scoped subscriber
+    /// (`with_default`) is racy: tracing caches callsite interest globally,
+    /// so another test thread hitting the same callsite with no subscriber
+    /// can cache `Interest::never` and the scoped capture sees no events.
+    struct Captured;
 
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
         fn on_event(
             &self,
             event: &tracing::Event<'_>,
@@ -1014,21 +1033,28 @@ mod tests {
                 }
                 fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
             }
-            let mut v = V(String::new(), 0);
-            event.record(&mut v);
-            self.0
-                .lock()
-                .unwrap()
-                .push((event.metadata().target().to_string(), v.0, v.1));
+            CAPTURED.with(|c| {
+                if let Some(buf) = c.borrow_mut().as_mut() {
+                    let mut v = V(String::new(), 0);
+                    event.record(&mut v);
+                    buf.push((event.metadata().target().to_string(), v.0, v.1));
+                }
+            });
         }
     }
 
-    fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<(String, String, u64)>) {
+    fn capture<T>(f: impl FnOnce() -> T) -> (T, Events) {
         use tracing_subscriber::layer::SubscriberExt;
-        let cap = Captured::default();
-        let subscriber = tracing_subscriber::registry().with(cap.clone());
-        let out = tracing::subscriber::with_default(subscriber, f);
-        let events = cap.0.lock().unwrap().clone();
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::registry().with(Captured);
+            // Fails only if a global default is already set elsewhere.
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("test capture subscriber must be the global default");
+        });
+        CAPTURED.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        let out = f();
+        let events = CAPTURED.with(|c| c.borrow_mut().take()).unwrap_or_default();
         (out, events)
     }
 

@@ -15,33 +15,18 @@ curl http://localhost:8080/catalog/v1/acme/items
 
 `vibe dev` will use an in-memory database for development and testing only; all data is lost when the server stops.
 
+**Method ops (#26, part 1).** Method steps `query`, `verify-password`, `hash-password`, `random-token`, `hash-token` and `sign-jwt` now run. `query` runs the lock's parameterised SQL in the tenant schema under row level security, as `public_reader` (or `public_writer` for a step marked `writes: true`, via `SET LOCAL ROLE`; both database roles must exist and be granted to the runtime role), in a READ ONLY transaction unless the step writes. Lock SQL is checked with a PostgreSQL parser by `vibe validate` and again at runtime: exactly one SELECT, INSERT, UPDATE or DELETE; unqualified plain table names (no `pg_*`, `information_schema` or platform tables); no table functions; no `SELECT … INTO`; no casts to object-identifier types (`regclass`, `regproc`, …); only allowlisted functions (`src/sqlguard.rs`), so no `SET`, settings or dynamic SQL. A data-modifying `WITH` is rejected, and a unique violation (SQLSTATE 23505) returns 409 `CONFLICT`. `query` is PostgreSQL only: with `--memory`, `vibe serve` warns at startup and the step fails with "query steps need PostgreSQL; the --memory executor does not run them" (500). `verify-password` uses argon2id and only accepts hashes made with the platform's own parameters (m=65536, t=3, p=1) and passwords of at most 256 characters (at most four hashes at a time per instance; a request that waits more than 5 s gets 503). When the user does not exist (`missing-user: dummy-hash`) it compares against a dummy hash, built at startup, so timing and the result look the same as a wrong password. Endpoints that reach a `verify-password` step are padded to at least 500 ms. `validate` conditions are `X is empty`, `X is not empty`, `X == true|false|null` or `X != true|false|null` (code-span backticks are allowed); anything else is a validate error and, at runtime, fails closed (the step's `fail` fires), never a silent pass. Step expressions can read `ctx.user.sub`, `ctx.user.roles` and `ctx.user.tenant`. `random-token` returns `{value, hash}` for 32 random bytes; `hash` (and `hash-token`) is HMAC-SHA-256 under a key derived from `VIBE_API_KEY_PEPPER`, as a `bytea` literal (`\x…`) for a `bytea` column (`normalize: email` trims and lowercases first). `sign-jwt` runs only in methods with `capabilities: [sign-token]`. It reads the private PEM from the environment variable named by `key-ref` (`<key-ref>_KID` sets the kid, default `VIBE_JWT_KID`), and `vibe serve` refuses to start if that variable is missing. The runtime sets `iss`, `aud`, `iat`/`nbf`/`exp` (ttl at most 1 h), `jti`, `tenant_id` (always the request's tenant) and the roles claim, which it reads from `users.roles` for the token's `sub`; a lock cannot supply roles. `sub` must be a field of a row read by an earlier `query` step (for example `u.id`), checked by `vibe validate` and at runtime. Other claims must be listed in `custom-claims` and can never be a reserved claim or any configured roles claim. The step returns `{access_token, token_type, expires_in, expires_at}`. `issue-refresh` is refused until refresh tokens land.
+
 ## Install
 
-Download `vibe` from [GitHub Releases](https://github.com/vibe-backend/sdk/releases). The CLI is not published to crates.io and it is not published as a container image.
-
-| Platform | Archive |
-| --- | --- |
-| Linux x86_64 | `vibe-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux aarch64 | `vibe-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS x86_64 | `vibe-x86_64-apple-darwin.tar.gz` |
-| macOS aarch64 | `vibe-aarch64-apple-darwin.tar.gz` |
-| Windows x86_64 | `vibe-x86_64-pc-windows-msvc.zip` |
-
-Each release also has `SHA256SUMS`. On Linux or macOS:
+There are currently no published tags, GitHub Releases, or downloadable release assets for this repository. The `vibe` CLI is not published to crates.io or as a container image. For now, build it from a source checkout with Rust 1.89:
 
 ```bash
-tag=v0.1.0
-asset=vibe-x86_64-unknown-linux-gnu.tar.gz
-curl -fsSL -O "https://github.com/vibe-backend/sdk/releases/download/${tag}/${asset}"
-curl -fsSL -O "https://github.com/vibe-backend/sdk/releases/download/${tag}/SHA256SUMS"
-sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf "$asset"
-install -m 755 vibe "$HOME/.local/bin/vibe"
+cargo build --release --locked
+./target/release/vibe --help
 ```
 
-On Windows, download `vibe-x86_64-pc-windows-msvc.zip`, check it against `SHA256SUMS`, and unpack `vibe.exe`.
-
-A checkout with Rust 1.89 can also build the binary with `cargo build --release --locked`.
+Do not use guessed release tags or `releases/download` URLs; they are not a supported installation path until an actual release has been published and verified.
 
 ## Run a project
 
@@ -86,7 +71,7 @@ cargo test --all-features
 
 ## Status
 
-Implemented in 0.1.0: discovery and source hashing, OpenAI-compatible / Anthropic / Gemini adapters, a fake adapter for tests, deterministic compile of structured markdown, lock rendering, the validator, local ed25519 approval, a signed manifest, JWT and API-key auth, built-in CRUD, offset pagination (platform `max-page-size` 500), soft delete, per-row `owner-key` scoping, and a single-connection Postgres executor with schema-per-tenant RLS settings.
+Implemented in the current source tree (not yet published as a release): discovery and source hashing, OpenAI-compatible / Anthropic / Gemini adapters, a fake adapter for tests, deterministic compile of structured markdown, lock rendering, the validator, local ed25519 approval, a signed manifest, JWT and API-key auth, built-in CRUD, offset pagination (platform `max-page-size` 500), soft delete, per-row `owner-key` scoping, and a single-connection Postgres executor with schema-per-tenant RLS settings.
 
 Deferred: platform KMS and GitHub review binding, refresh tokens, account lockout, pow challenges and hCaptcha, persisted quotas, cross-instance rate limits, crypto-shredding, the email outbox, webhooks, queues, schedules, Postgres TLS, and a connection pool per tenant. Custom method steps other than `method`, `respond`, and `validate` are not executed. Challenge proofs (`challenge: { type: captcha, when: always }`) are verified server-side with Cloudflare Turnstile; see [docs/challenge.md](docs/challenge.md).
 
@@ -101,5 +86,9 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 Required CI checks are **Markdown lint & link check** and **Rust fmt / clippy / test**. There is no Docker image job.
 
 - **CI** (`.github/workflows/ci.yml`, on PRs and pushes to `main`): Markdown lint + local link check; Rust 1.89 `cargo check --locked`, `fmt`, `clippy`, and `test` once a `Cargo.toml` exists.
-- **Release** (`.github/workflows/release.yml`, on tags `v*`): builds `vibe` for Linux x86_64 and aarch64, macOS x86_64 and aarch64, and Windows x86_64. Archives are `tar.gz` (Unix) or `zip` (Windows), plus `SHA256SUMS`, on a GitHub Release. Nothing is pushed to GHCR or crates.io.
+- **Release workflow** (`.github/workflows/release.yml`, on tags `v*`): is configured to build platform archives and `SHA256SUMS`, but no tag or GitHub Release has been published. Nothing is pushed to GHCR or crates.io.
 - **CD** (`.github/workflows/cd.yml`): GHCR image publishing is disabled.
+
+## Binary installation
+
+The install/upgrade/remove manager in [docs/install.md](docs/install.md) is an unreleased review candidate only. It is not a public installation method, because there are no published tags, Releases, or assets to install. Continue using a source checkout until the release and provenance flow has passed review and end-to-end verification.

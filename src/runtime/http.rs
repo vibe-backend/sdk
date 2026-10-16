@@ -9,7 +9,7 @@ use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 
 type HttpResponse = Response<Body>;
 use axum::Router;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -58,10 +58,20 @@ pub struct AuthConfig {
     /// Default claim holding the caller's roles (`VIBE_JWT_ROLES_CLAIM`,
     /// default `roles`); a route's `roles-claim` overrides it.
     pub roles_claim: String,
+    /// Private keys for `sign-jwt` steps, by `key-ref` (loaded at startup).
+    pub signing_keys: HashMap<String, SigningKey>,
     /// JWKS caches for routes with their own `jwks-uri` (or an `iss` whose
     /// default `{iss}/.well-known/jwks.json` differs), keyed by URI. Built at
     /// startup; a route whose URI is missing here fails closed.
     pub route_jwks: HashMap<String, Arc<super::jwks::JwksCache>>,
+}
+
+/// A JWT signing key named by a lock `key-ref`.
+#[derive(Clone)]
+pub struct SigningKey {
+    pub alg: Algorithm,
+    pub kid: String,
+    pub key: jsonwebtoken::EncodingKey,
 }
 
 /// The JWKS URI a route authenticates against when it overrides the issuer:
@@ -112,6 +122,7 @@ impl AuthConfig {
             env_name: "test".into(),
             jwks: None,
             roles_claim: "roles".into(),
+            signing_keys: HashMap::new(),
             route_jwks: HashMap::new(),
         }
     }
@@ -142,6 +153,7 @@ pub struct AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    super::ops::warm_up();
     Router::new().fallback(handle).with_state(state)
 }
 
@@ -674,6 +686,18 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     let req_value = crud::req_var(body, query_values, found.params.clone(), header_values);
     let mut vars = Map::new();
     vars.insert("req".into(), req_value);
+    vars.insert(
+        "ctx".into(),
+        crud::ctx_var(&crud::CallCtx {
+            auth: &state.auth,
+            tenant_id: &principal.tenant_id,
+            role: "",
+            caller: crud::Caller {
+                subject: &principal.subject,
+                roles: &principal.roles,
+            },
+        }),
+    );
     let input = match crud::eval_expr(&found.route.transform_in, &vars) {
         Ok(value) => value,
         Err(err) => {
@@ -732,6 +756,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     &step.target,
                     &args,
                     crud::CallCtx {
+                        auth: &state.auth,
                         tenant_id: &principal.tenant_id,
                         role,
                         caller: crud::Caller {
@@ -856,7 +881,13 @@ async fn finish(
     response: HttpResponse,
 ) -> HttpResponse {
     let min_ms = state.min_override_ms.unwrap_or(if route.public {
-        route.min_response_ms
+        // Login-class endpoints (a verify-password step) pad to 500 ms so
+        // timing does not reveal whether the account exists.
+        if crud::route_verifies_password(&state.manifest, route) {
+            route.min_response_ms.max(500)
+        } else {
+            route.min_response_ms
+        }
     } else {
         0
     });
@@ -1466,10 +1497,12 @@ fn rate_limited(
     let checks: Vec<(String, String, u32)> = route
         .rates
         .iter()
-        .map(|rate| {
+        .enumerate()
+        .map(|(index, rate)| {
             let (shard, key) =
                 rate_bucket(&rate.key, route, ip, principal, body, &state.auth.pepper);
-            (shard, key, rate.per_minute)
+            // Each block is its own limit, even when two share a key.
+            (format!("{shard}#{index}"), key, rate.per_minute)
         })
         .collect();
     let Ok(mut rates) = state.rates.lock() else {
@@ -1673,6 +1706,7 @@ fn platform_status(code: &str) -> StatusCode {
         "FORBIDDEN" => StatusCode::FORBIDDEN,
         "UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
         "BAD_REQUEST" => StatusCode::BAD_REQUEST,
+        "SERVICE_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -2592,5 +2626,20 @@ mod request_validation_tests {
             assert!(check_type(&f, &good).is_ok(), "{ty} good");
             assert!(check_type(&f, &bad).is_err(), "{ty} bad");
         }
+    }
+}
+
+#[cfg(test)]
+mod crypto_kats {
+    use super::hmac_hex;
+
+    #[test]
+    fn hmac_sha256_known_answer() {
+        // RFC 4231 test case 1
+        let mac = hmac_hex(&[0x0b; 20], "Hi There");
+        assert_eq!(
+            mac,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
     }
 }

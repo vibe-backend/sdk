@@ -5,6 +5,10 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+### Added
+
+- **Challenge replay store (#157):** Challenge single-use state, quotas and capacity live in PostgreSQL in each tenant's own schema (`t_<tenant>.vibe_challenge_replay`, created by that tenant's `vibe migrate`, FORCE RLS) so they hold across instances. The runtime role has SELECT and INSERT only; expired rows are ignored and removed by `vibe migrate`. Capacity is per tenant and client IPs are stored as a per-tenant HMAC. In production with a verifier configured the PostgreSQL store is always used; `vibe serve` refuses to start if a tenant's table is missing or has wrong grants, or if `VIBE_CHALLENGE_REPLAY_STORE=memory` is set. Outside production the store must be chosen explicitly (`memory` or `postgres`). Store errors fail closed (503).
+
 ### Breaking
 
 - **Strict `writes` and `status` (#166):** In method and API locks, `writes` must be exactly `true` or `false` and `status` a plain HTTP status (100-599); unknown, empty, malformed or repeated values are build and validation errors instead of silent defaults. A step marked `writes: true` must have SQL that writes, a writing step must be marked, and the Signature `writes` must match the steps.
@@ -21,6 +25,11 @@ added only when the corresponding PR is merged to `main`.
 - **LLM errors (#62):** Failed LLM calls report the real HTTP status (only 401/403 blame the API key; 400, 404, 429 and 5xx are worded by status). HTML responses and 404s add a hint to check `LLM_BASE_URL` (OpenAI-compatible endpoints usually end in `/v1`). The message includes the request URL and the first 200 characters of the response; the API key and `key=`/`api_key=` query values are masked as `***` before truncation.
 - **Rate limits (#54):** `VIBE_TRUSTED_PROXIES` accepts proxy IPs, CIDR blocks (v4/v6), hops with ports and IPv4-mapped IPv6; `X-Forwarded-For` is used only when the peer is trusted, taking the rightmost untrusted hop. IPv6 clients are bucketed per /64. `Retry-After` is the real time until the oldest hit leaves the window (quota: seconds until UTC midnight). Buckets are held in bounded, per-route/key-type LRU shards (10k each); at-limit buckets are never evicted, and a flood of one key type cannot block other clients.
 - **Request handling (#57):** Authentication, role/scope checks and rate limiting now run before request validation, so unauthenticated callers get 401/403 instead of 422 details. Expression failures return a generic `422 Invalid request` (details go to the server log). Required headers are enforced case-insensitively; body, query and path values are type-checked. Early 400, 413 (payload too large) and 415 (unsupported media type) responses respect the route's `min_response_ms`.
+
+### Security
+
+- **JWT signing algorithm policy (#198, spec decision 139):** The spec now fixes the `sign-jwt` and JWT verification policy: only ES256 (default) and RS256; RS256 keys must be at least 2048 bits and a shorter key makes startup/deploy fail closed; verification accepts only the one configured alg and rejects any other `alg` header, including `none`, HS* and the other of ES256/RS256; EdDSA is deferred to vNext. Spec only; parts are not yet implemented (see spec 4.1a).
+- **Lock and manifest signatures (#167):** Lock and manifest signature verification now uses `verify_strict`; weak keys and non-canonical signatures are rejected (#151).
 
 <!--
 Pending — add each entry only when its PR merges:
