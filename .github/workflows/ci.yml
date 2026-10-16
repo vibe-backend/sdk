@@ -17,20 +17,26 @@ jobs:
     name: Markdown lint & link check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: DavidAnson/markdownlint-cli2-action@v24
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24
         with:
           globs: "**/*.md"
-      - uses: lycheeverse/lychee-action@v2
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
         with:
           args: --offline --no-progress --include-fragments './**/*.md'
           fail: true
       - name: Check zh-hant code blocks match English
         run: python3 scripts/check-zh-code-blocks.py
-      - name: OIDC and attestation permissions only in the release environment
+      - name: Install pinned policy-checker dependencies
         run: |
-          python3 -c "import yaml" 2>/dev/null || python3 -m pip install --user pyyaml
-          python3 scripts/check-oidc-permissions.py
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --require-hashes --no-deps -r scripts/requirements-ci.txt
+      - name: Policy checks for jobs that can mint OIDC tokens / write attestations
+        run: "$RUNNER_TEMP/venv/bin/python" scripts/check-oidc-permissions.py
+      - name: Policy checker tests
+        run: "$RUNNER_TEMP/venv/bin/python" tests/oidc_policy.py -v
       - name: Install script tests
         run: python3 tests/install_manager.py
       - name: Shellcheck install script
@@ -52,17 +58,17 @@ jobs:
       # Postgres tests fail (not skip) in CI when this is missing.
       VIBE_TEST_PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Detect Cargo.toml
         id: detect
         run: echo "present=${{ hashFiles('Cargo.toml') != '' }}" >> "$GITHUB_OUTPUT"
       - if: steps.detect.outputs.present == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.89"
           components: rustfmt, clippy
       - if: steps.detect.outputs.present == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - if: steps.detect.outputs.present == 'true'

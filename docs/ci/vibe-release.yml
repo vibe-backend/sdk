@@ -14,8 +14,9 @@
 #   production without rebuilding. `vibe serve` / `vibe migrate` check the
 #   bundle again at startup.
 #
-# Every action is pinned to a full commit SHA. Only `release-build` gets
-# `id-token: write`. Pin VIBE_SDK_REV to a full commit SHA of
+# Every action is pinned to a full commit SHA. Only `sign` gets
+# `id-token: write` / `attestations: write`; it checks out nothing and runs
+# no project code. Pin VIBE_SDK_REV to a full commit SHA of
 # vibe-backend/sdk (or replace the install job with a checksummed release
 # binary).
 name: vibe release
@@ -29,6 +30,10 @@ permissions:
   contents: read
 
 env:
+  # WARNING: this pin is a vibe-backend/sdk feature-branch commit (PR #116),
+  # not yet on main, so the "Require VIBE_SDK_REV ... on sdk main" step below
+  # fails until it is re-pinned. Re-pin to the #116 merge commit on main
+  # right after merge; do not copy this template before then.
   VIBE_SDK_REV: 2d9d2cfcaf592c7ac94ec2f54a5ea4f96f3b64b8 # pin: full sdk commit SHA
   # The identity a release must carry. Keep in sync with the runtime's
   # VIBE_RELEASE_REPO / VIBE_RELEASE_WORKFLOW (defaults shown).
@@ -116,10 +121,10 @@ jobs:
     needs: [install, release-policy]
     runs-on: ubuntu-24.04
     environment: release
+    # Runs project code, so it gets no id-token / attestations permission;
+    # the `sign` job below signs the manifest it uploads.
     permissions:
       contents: read
-      id-token: write # Sigstore keyless signing (Fulcio certificate from the GitHub OIDC token)
-      attestations: write
     outputs:
       digest: ${{ steps.digest.outputs.sha256 }}
     steps:
@@ -149,24 +154,48 @@ jobs:
             -o manifest.json 2> >(tee -a "$GITHUB_STEP_SUMMARY" >&2)
       - id: digest
         run: echo "sha256=$(sha256sum manifest.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-      - name: Sign keyless (Sigstore via GitHub attestation)
-        id: attest
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
-        with:
-          subject-path: manifest.json
-      - name: Keep the Sigstore bundle next to the manifest
-        run: cp "${{ steps.attest.outputs.bundle-path }}" manifest.json.sigstore.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: manifest
           path: |
             manifest.json
-            manifest.json.sigstore.json
             ${{ runner.temp }}/locks
           if-no-files-found: error
 
-  deploy:
+  sign:
+    # The only job with id-token / attestations: write. It checks out
+    # nothing and runs no project code: it downloads the manifest from this
+    # run by exact name, checks its digest and signs it keyless with
+    # Sigstore (Fulcio certificate from the GitHub OIDC token, Rekor entry).
+    # scripts/check-oidc-permissions.py enforces this shape.
     needs: release-build
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: manifest
+      - name: Same digest as the release build
+        run: echo "${{ needs.release-build.outputs.digest }}  manifest.json" | sha256sum -c -
+      - name: Sign keyless (Sigstore via GitHub attestation)
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: manifest.json
+      - name: Keep the Sigstore bundle next to the manifest
+        run: cp "${{ steps.attest.outputs.bundle-path }}" manifest.json.sigstore.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: manifest-sigstore-bundle
+          path: manifest.json.sigstore.json
+          if-no-files-found: error
+
+  deploy:
+    needs: [release-build, sign]
     runs-on: ubuntu-24.04
     strategy:
       max-parallel: 1
@@ -180,6 +209,9 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: manifest
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: manifest-sigstore-bundle
       - name: Same digest as the release build
         run: echo "${{ needs.release-build.outputs.digest }}  manifest.json" | sha256sum -c -
       - name: Verify Sigstore bundle (signature, Fulcio identity, Rekor entry; fail closed)

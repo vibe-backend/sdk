@@ -25,11 +25,14 @@ Locks are build output. They are not committed (`*.lock.md` is in
    allowlisted host (`api.openai.com`, the default when `LLM_BASE_URL` is
    unset; `api.anthropic.com`; `generativelanguage.googleapis.com`). The
    build takes **no signing key** and refuses `VIBE_RELEASE_SIGNING_KEY`.
-3. **Sign keyless.** The same job attests `manifest.json` with
-   `actions/attest-build-provenance`: Sigstore keyless signing with the
-   job's GitHub OIDC token, a short-lived Fulcio certificate and a Rekor
-   transparency log entry. The bundle is shipped as
-   `manifest.json.sigstore.json`. This is the only job with `id-token: write`.
+3. **Sign keyless.** A separate `sign` job in the `release` environment
+   downloads `manifest` from the same run by exact name, checks its digest
+   and attests `manifest.json` with `actions/attest-build-provenance`:
+   Sigstore keyless signing with the job's GitHub OIDC token, a short-lived
+   Fulcio certificate and a Rekor transparency log entry. The bundle is
+   shipped as `manifest.json.sigstore.json`. This is the only job with
+   `id-token: write` / `attestations: write`; it checks out nothing and runs
+   no project code. `release-build` has `contents: read` only.
 4. **Promote only.** `deploy` checks the digest and runs
    `gh attestation verify --bundle --repo --signer-workflow --source-ref
    --source-digest --deny-self-hosted-runners` (fail closed), then deploys the
