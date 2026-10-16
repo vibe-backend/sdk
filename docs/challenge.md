@@ -93,6 +93,7 @@ Turnstile's own single-use check (`timeout-or-duplicate`) applies in addition.
 | No proof | 400 `CHALLENGE_REQUIRED` |
 | Proof rejected (forged, replayed, expired, missing or future `challenge_ts`, wrong hostname or action, per-IP or per-tenant quota reached) | 403 `CHALLENGE_FAILED` |
 | Provider or network failure only: provider unreachable, timeout, bad response, replay store unreachable (spec decision 134) | 503 `CHALLENGE_UNAVAILABLE`, `Retry-After: 5` (decision 135) |
+| Per-network-prefix cap reached (IPv4 /24 or IPv6 /48, default 16 per tenant replay store; decision 134) | 429 `CHALLENGE_RATE_LIMITED` with `Retry-After`; identical to the full-store response apart from `Retry-After` |
 | Replay store full (capacity limit from traffic, not a provider failure; decision 134, PM-confirmed 2026-10-16) | 429 `CHALLENGE_RATE_LIMITED`, `Retry-After` = remaining validity of the oldest record, capped at 360 s, or a fixed 60 if it cannot be computed |
 
 A full replay store still fails closed: a request is never admitted without recording its replay entry. Each occurrence emits the metric `vibe_challenge_rejected_total{reason="replay_store_full"}` and raises the alert `challenge_replay_store_full`. Names confirmed by the PM on 2026-10-16.
@@ -104,7 +105,7 @@ Implementation status: not yet aligned with spec decisions 131, 134 and 135 (fol
 - The 503 has no `Retry-After` header yet.
 - The current code also returns 503 when no verifier is configured and for a `type: pow` route; under the spec these are rejected at build or startup (decisions 131, 134).
 - A full replay cache or store returns 503 today; the spec requires 429 with the computed `Retry-After`, the `replay_store_full` metric and the alert (decision 134). Not yet implemented, follow-up issue #204.
-- Per-network-prefix cap (decision 134): in each tenant's replay store, each IPv4 /24 or IPv6 /48 may hold at most 16 entries by default (matching decision 130); over the cap the request gets 429 `CHALLENGE_RATE_LIMITED` (internal reason `replay_prefix_cap`). The alert `challenge_replay_store_high_usage` fires when replay store utilization exceeds 80%; the alert `challenge_replay_store_full` fires when the store is full (the 429 `replay_store_full` case). Not yet implemented, follow-up issue #204.
+- Per-network-prefix cap (decision 134): in each tenant's replay store, each IPv4 /24 or IPv6 /48 may hold at most 16 entries by default (matching decision 137: 16 unverified reservations per IP); over the cap the request gets 429 `CHALLENGE_RATE_LIMITED` (internal reason `replay_prefix_cap`). The alert `challenge_replay_store_high_usage` fires when replay store utilization exceeds 80%; the alert `challenge_replay_store_full` fires when the store is full (metric reason `replay_store_full`). Not yet implemented, follow-up issue #204.
 
 In production (`VIBE_ENV`), `vibe serve` refuses to start and `vibe validate --deploy`
 fails if any route uses `challenge ... when: always` and no verifier is configured.
