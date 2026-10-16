@@ -1,8 +1,9 @@
 # vibe-backend Binary API vNext — Architecture Discussion Draft
 
 - **Status:** Discussion draft; not approved for implementation
-- **Draft date:** 2026-10-15 (UTC)
-- **Baseline:** Latest `main` containing PR #119 merge commit `39179a873c290af7fdce8dc5674107c4540815c6`
+- **Draft date:** 2026-10-15 (UTC); revised 2026-10-16 (PM directions, review round 2)
+- **Baseline:** `main` at `37198cabe8562edfff2a0ef6f1a3b91355c8bc2e` (merged into this branch), spec `docs/spec-v1.8.md`
+- **Scope:** vNext only, **not in v1 scope**.
 - **Implementation state:** Documentation proposal only; no runtime implementation, milestone, or delivery ETA is approved
 - **Protocol choices:** Every protocol choice in this document (media types, envelopes, encoding, headers, URLs, error mapping, limits) is a **proposal pending a spec PR**. Nothing here amends `spec-v1.8.md` until a spec PR is merged.
 
@@ -11,8 +12,19 @@
 The following direction is confirmed and is the frame for the rest of this draft:
 
 1. **v2 stays REST.** Resources are addressed by path and HTTP verb (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`), the same model as the spec v1.8 routes. There is no generic `/v2/operations` RPC envelope.
-2. **Bodies are binary.** Request and response bodies use a binary encoding: MessagePack or CBOR. The comparison is in §5.0; the final choice is pending (§15).
+2. **Bodies are binary.** Request and response bodies use a binary encoding: MessagePack or CBOR. The comparison is in §5.0; the PM chose CBOR (§0.1).
 3. **Generated Markdown API description.** SDK generation also emits a small, automatically generated Markdown description of the REST resources for frontend AI agents (§9).
+
+### 0.1 PM-confirmed directions (2026-10-16)
+
+PM-confirmed directions on 2026-10-16. They remain part of this **proposal**, are **not in v1 scope**, and become normative only through a spec PR.
+
+1. **Encoding:** CBOR (RFC 8949) using **core deterministic encoding** (RFC 8949 §4.2.1), with the decoder profile in §5.0a.
+2. **Version marker:** the v2 marker is carried **only** in the media type, `application/vnd.vibe.v2+cbor`. The path `{version}` remains the definition version from spec v1.8; there is no `/v2/` path segment and no in-body version field.
+3. **JSON also accepted:** v2 resources also accept and return JSON (`application/vnd.vibe.v2+json`) selected through `Content-Type`/`Accept`, with identical semantics. CBOR is opt-in. Both are decoded into the same canonical data model (§5.0a).
+4. **Retention defaults:** event replay 24h, job expiry 24h, result retention 7d. Tenants may only **lower** these values, never raise them.
+5. **AI Markdown budget:** the generated Markdown is capped at **64 KB per endpoint**. Exceeding it is a generation error; output is never silently truncated.
+6. **No batching** in the first release.
 
 ## 1. Intent
 
@@ -30,7 +42,7 @@ Non-goal: binary encoding is not encryption, authentication, authorization, or a
 
 ### Required for the first vNext release
 
-- Binary (MessagePack or CBOR, §5.0) request and response bodies on REST resources.
+- CBOR (core deterministic encoding, opt-in) and JSON request and response bodies on REST resources (§0.1, §5.0a).
 - A canonical, versioned schema from which backend and SDK codecs are generated.
 - Stable numeric field IDs with explicit compatibility rules.
 - SDK-generated semantic APIs that hide transport details.
@@ -46,14 +58,15 @@ Non-goal: binary encoding is not encryption, authentication, authorization, or a
 ### Conditional
 
 - Zstandard compression, enabled only above a benchmark-derived threshold.
-- Batch requests, if measurements show meaningful header/round-trip savings.
 
 ### Deferred
+
+- Batch requests (PM 2026-10-16: not in the first release).
 
 - Bidirectional streaming.
 - Large binary results carried inside SSE.
 - Base64-encoded binary events.
-- Custom MessagePack extension types or CBOR tags unless a concrete schema need is proven.
+- CBOR tags beyond the §5.0a allowlist unless a concrete schema need is proven.
 - Automatic retry of non-idempotent writes.
 - Large default documentation or tutorials.
 
@@ -78,7 +91,7 @@ AI / application
       v
 Generated SDK
   - input validation
-  - binary codec (MessagePack or CBOR)
+  - CBOR / JSON codec (one canonical model)
   - protocol/schema checks
   - operation lifecycle
   - fetch-based SSE client
@@ -117,21 +130,52 @@ Both are compact, schemaless binary encodings with a JSON-like data model. Compa
 | Browser support | Library required | Library required |
 | Security review | Simpler grammar | More features (tags, indefinite length) to restrict |
 
-Draft assessment, not a decision: MessagePack has a simpler grammar and slightly smaller output; CBOR has a standard, deterministic encoding and a tag registry, which help if bodies are hashed (for example the request hash in spec decision 104 idempotency). Whichever is chosen, the decoder profile must forbid indefinite-length items, unknown tags/extension types, and duplicate keys, and enforce §11 limits. The choice is a product/architecture decision listed in §15.
+Outcome (PM 2026-10-16, §0.1): **CBOR with core deterministic encoding**, chosen mainly because it has a standard canonical form for the decision 104 request hash. MessagePack is not used.
+
+### 5.0a Decoder profile and canonical form
+
+This profile is a prerequisite for the decision 104 request hash and applies to both CBOR and JSON input. Default limits are platform values (proposal); tenants may only lower them.
+
+| Limit | Default |
+| --- | --- |
+| Raw body size | 1 MiB (spec v1.8 413 rule applies) |
+| Decompressed body size | 1 MiB; compression ratio above 20:1 rejected |
+| Nesting depth (maps + arrays) | 32 |
+| Map entries per map | 1,024 |
+| Array elements per array | 10,000 |
+| Text string length | 256 KiB UTF-8 bytes |
+| Byte string length | 1 MiB (bounded by body size) |
+| Total items in one body | 100,000 |
+| Decode time | 50 ms CPU |
+
+Rules:
+
+- **Well-formed and valid only.** Length claims are checked against remaining bytes before allocation.
+- **No indefinite-length items** (major types 2–5 with additional info 31) and no `break` outside them: reject.
+- **Duplicate map keys are rejected** (after canonicalization of the key), in CBOR and JSON alike.
+- **Map keys:** text strings or unsigned integers only (field IDs). Other key types are rejected.
+- **Tag allowlist:** none by default. Only tags explicitly listed in the canonical schema are allowed; timestamps are integer epoch seconds, not tagged. Any other tag is rejected. Simple values other than `false`, `true`, `null` are rejected; `undefined` is rejected.
+- **UTF-8:** text strings must be valid UTF-8 (no overlong forms, no surrogates); invalid input is rejected, never replaced. No Unicode normalization is applied (values are compared as bytes).
+- **Integers:** integers within ±(2^53 − 1) are canonical integers; fields typed `int64` may use the full 64-bit range (in JSON carried as a decimal string); bignum tags are rejected. Integers are never encoded as floats.
+- **Floats:** allowed only for schema fields typed `float`. Canonical form uses the shortest of half/single/double that preserves the value exactly (RFC 8949 §4.2.2). `NaN` and ±Infinity are rejected. `-0.0` is normalized to `0.0`. A float with an integral value in an integer field is rejected (no silent conversion).
+- **Canonical form for hashing:** after decoding and schema validation, the request record is re-encoded with RFC 8949 core deterministic encoding: preferred (shortest) argument encoding, definite lengths, map keys sorted by the bytewise lexicographic order of their deterministic encodings. The decision 104 request hash is `SHA-256` over this canonical CBOR, so the same input sent as JSON or CBOR, in any key order, produces the same hash.
+- **JSON input** is parsed with the same limits, duplicate-key rejection, UTF-8 and number rules (JSON numbers map to integers or floats per schema field type), converted to the same canonical model, and hashed the same way.
+- Violations return 400 `MALFORMED_PAYLOAD` (proposed) or 413; error bodies never echo input.
 
 ### 5.1 Media types and headers
 
-Initial proposal:
+Proposal (PM direction 2026-10-16: the v2 marker is only in the media type):
 
 ```http
-Content-Type: application/vnd.vibe.v2+msgpack   # or application/vnd.vibe.v2+cbor, per §5.0
-Accept: application/vnd.vibe.v2+msgpack
-Vibe-Protocol-Version: 2
+Content-Type: application/vnd.vibe.v2+cbor      # opt-in; or application/vnd.vibe.v2+json
+Accept: application/vnd.vibe.v2+cbor
 Vibe-Schema-Fingerprint: <compact fingerprint>
 Content-Encoding: zstd  # optional; never assumed
 ```
 
-Open question: whether protocol version belongs only in headers, in a compact envelope, or both. A small in-body version marker is more robust when bodies are stored or relayed independently of headers, but adds bytes.
+- The path `{version}` stays the definition version; there is no `Vibe-Protocol-Version` header and no in-body version.
+- An unknown media type returns 415; an unsatisfiable `Accept` returns 406 (proposed).
+- JSON and CBOR responses carry identical semantics (§5.0a).
 
 ### 5.2 Logical envelopes
 
@@ -141,7 +185,7 @@ Illustrative only; final numeric field assignments belong in the canonical schem
 Request  = <resource input record>   # path + verb select the operation; no operation_id envelope
 Success  = [request_id, result]
 Failure  = [request_id, error_code, error_fields]
-Accepted = [request_id, operation_id, event_url, result_url, cancel_url]   # all URLs same-origin, see §8.3
+Accepted = [request_id, job_id, events_url, result_url, cancel_url]   # = Location .../jobs/{job_id} and its /events, /result; cancel = DELETE on Location; all same-origin, §8.3
 ```
 
 Envelope arrays minimize key overhead. Domain records may use numeric-key maps when optional/evolving fields make positional arrays unsafe.
@@ -156,11 +200,11 @@ Envelope arrays minimize key overhead. Domain records may use numeric-key maps w
 - A required field cannot be added within a compatible schema revision.
 - Type changes require a new field ID or breaking protocol version.
 - Enum values are append-only within a compatible revision; unknown values surface as a typed compatibility error if they cannot be preserved.
-- SDKs must preserve enough context to return `SCHEMA_MISMATCH` or `UNSUPPORTED_PROTOCOL`, rather than a misleading domain error.
+- SDKs must preserve enough context to return `SCHEMA_MISMATCH` or 415/406 for an unsupported media type, rather than a misleading domain error.
 
 ### 5.4 Compression
 
-MessagePack is not automatically smaller after compression than compressed JSON. The implementation must benchmark representative payload distributions.
+A binary encoding is not automatically smaller than compressed JSON after compression. The implementation must benchmark representative payload distributions for both media types.
 
 Rules proposed:
 
@@ -232,7 +276,7 @@ No large final result or Base64 binary payload is sent through SSE.
 - Ordered delivery within one operation.
 - Heartbeats sized to survive intended proxy/load-balancer idle timeouts.
 - Explicit terminal event followed by stream closure.
-- Bounded event replay window.
+- Bounded event replay window: 24h default (tenants may only lower it, §0.1).
 - When resume is no longer possible, SDK fetches operation status and reconciles the terminal state.
 - Client backoff includes jitter and respects server retry hints within bounded limits.
 - Maximum stream duration and reconnect attempts are configurable.
@@ -280,7 +324,13 @@ for await (const event of vibe.generateStream({ prompt })) {
 - Authenticate SSE without reusable URL tokens.
 - Reconnect, resume, deduplicate, and reconcile state.
 - Fetch and decode the final result.
-- Follow `event_url`, `result_url`, `cancel_url`, and `Location` **only** when their origin (scheme, host, port) exactly equals the configured API origin; otherwise stop and return `UNTRUSTED_URL` without sending any credentials. Relative URLs are resolved against the configured origin. Redirects to another origin are not followed with credentials.
+- **Same-origin rule for `events_url`, `result_url`, `cancel_url`, and `Location`:** relative URLs are resolved against the configured API origin (WHATWG URL parsing). The SDK then compares the origin tuple (scheme, host, port) by exact equality after normalization:
+  - **Scheme:** lowercased; must be `https` (`http` allowed only when the configured origin itself is `http://localhost` in dev). An `https`→`http` downgrade is always rejected.
+  - **Host:** lowercased ASCII; IDN hosts are converted to punycode (UTS #46 / IDNA, as the WHATWG URL parser does) before comparison; a trailing dot is not stripped (so `api.example.com.` differs). IP literals compare in their canonical serialized form.
+  - **Port:** default ports are normalized (`https` 443, `http` 80), so `https://api.example.com` equals `https://api.example.com:443`; any other port must match exactly.
+  - **Userinfo:** any URL with `user:pass@` is rejected.
+  - Any mismatch: stop and return `UNTRUSTED_URL` (SDK-side), sending no request and no credentials.
+- **Redirects:** cross-origin redirects are **never followed** (`redirect: "manual"`), returning `UNTRUSTED_URL`. Same-origin redirects are re-checked with the rule above at every hop, with a limit of 3 hops.
 - Expose cancellation and timeouts.
 - Convert transport/protocol errors into stable semantic SDK errors.
 - Provide an opt-in redacted diagnostic formatter.
@@ -328,12 +378,12 @@ Progress: may be reported before completion.
 const result = await vibe.generate({prompt})
 ```
 
-Errors: `UNAUTHORIZED`, `FORBIDDEN`, `RATE_LIMITED`, `INTERNAL`
+Errors: `UNAUTHORIZED`, `FORBIDDEN`, `RATE_LIMITED`, `INTERNAL`  <!-- `UNAUTHORIZED`/`FORBIDDEN` are proposed names, see §10 -->
 ````
 
 ### 9.3 Size policy
 
-Open decision: enforce a token/byte budget for the whole index and per operation. If the API surface becomes large, generate:
+PM direction (2026-10-16): the generated Markdown is capped at **64 KB per endpoint**; exceeding it fails generation with an error and is never silently truncated. If the API surface becomes large, generate:
 
 1. A tiny operation index.
 2. One small operation detail file loaded only when needed.
@@ -344,25 +394,30 @@ The generator must fail CI when required semantic documentation is absent or exc
 
 Error codes align with `spec-v1.8.md` §8; v2 changes only the body encoding, not the codes or status mapping. The binary error body carries the same fields as the v1.8 JSON error (`code`, `message`, `request_id`); `message` stays safe and short.
 
+Codes marked *(proposed)* are not literally named in v1.8 §8 (which defines statuses, plus some codes); they need the spec PR.
+
 | Status | Code | Source |
 | --- | --- | --- |
-| 400 | `MALFORMED_PAYLOAD` (proposed), `INVALID_CURSOR` (decision 106), `IDEMPOTENCY_KEY_REQUIRED` (decision 104) | v1.8 §8, 2.3b |
-| 401 | `UNAUTHORIZED` (with `WWW-Authenticate`) | v1.8 §8 |
-| 403 | `FORBIDDEN` | v1.8 §8 |
-| 404 | `NOT_FOUND` | v1.8 §8 / 7.2 |
-| 409 | `UNIQUE_VIOLATION` (decision 107), `IDEMPOTENCY_IN_PROGRESS` (decision 104), declared business conflicts | v1.8 §8 |
-| 412 / 428 | `If-Match` mismatch / required | v1.8 §8, decision 48 |
-| 413 | `PAYLOAD_TOO_LARGE` | v1.8 §8 |
-| 415 | `UNSUPPORTED_MEDIA_TYPE` (unknown binary media type) | v1.8 §8 |
-| 422 | validation codes, `IDEMPOTENCY_KEY_REUSED` (decision 104), `EMPTY_PATCH` | v1.8 §8 |
-| 429 | `RATE_LIMITED` (with `Retry-After`) | v1.8 §8 / 4.3 |
-| 500 | `INTERNAL` | v1.8 §8 |
-| 503 | `TX_CONFLICT` (decision 100), temporarily unavailable | v1.8 §8 |
-| 504 | `TX_TIMEOUT` (decision 100) | v1.8 §8 |
+| 400 | `MALFORMED_PAYLOAD` *(proposed)*; `INVALID_CURSOR` (decision 106, §12.9); `IDEMPOTENCY_KEY_REQUIRED` (decision 104, §2.3b) | v1.8 §8 400 |
+| 401 | `UNAUTHORIZED` *(proposed)*, with `WWW-Authenticate` | v1.8 §8 401 |
+| 403 | `FORBIDDEN` *(proposed)* | v1.8 §8 403 |
+| 404 | `NOT_FOUND` *(proposed)* | v1.8 §8 404 / 7.2 |
+| 405 | `METHOD_NOT_ALLOWED` *(proposed)*, with `Allow` | v1.8 §8 405 |
+| 406 | `NOT_ACCEPTABLE` *(proposed)* | new (media type negotiation, §5.1) |
+| 409 | `UNIQUE_VIOLATION` (decision 107), `IDEMPOTENCY_IN_PROGRESS` (decision 104), declared business conflicts | v1.8 §8 409 |
+| 412 | `PRECONDITION_FAILED` *(proposed)* | v1.8 §8 412, decision 48 |
+| 413 | `PAYLOAD_TOO_LARGE` *(proposed)* | v1.8 §8 413 |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` *(proposed)* | v1.8 §8 415 |
+| 422 | declared validation codes, `IDEMPOTENCY_KEY_REUSED` (decision 104), `EMPTY_PATCH` | v1.8 §8 422 |
+| 428 | `PRECONDITION_REQUIRED` *(proposed)* | v1.8 §8 428 |
+| 429 | `RATE_LIMITED` (spec §4.3 default), with `Retry-After` | v1.8 §8 429 |
+| 500 | `INTERNAL` | v1.8 §8 500 |
+| 503 | `TX_CONFLICT` (decision 100); other unavailability `UNAVAILABLE` *(proposed)* | v1.8 §8 503 |
+| 504 | `TX_TIMEOUT` (decision 100) | v1.8 §8 504 |
 
-New v2-only codes (proposed, pending spec PR): `UNSUPPORTED_PROTOCOL`, `SCHEMA_MISMATCH`, `MALFORMED_PAYLOAD`, `JOB_EXPIRED`, `CANCELLED`, and SDK-side `UNTRUSTED_URL` (§8.3, never sent on the wire). The earlier generic codes `INVALID_INPUT`, `LIMITED`, `CONFLICT`, `FAILED`, and `TEMPORARILY_UNAVAILABLE` are dropped in favour of the v1.8 codes above.
+New v2-only codes (proposed, pending spec PR): `SCHEMA_MISMATCH`, `MALFORMED_PAYLOAD`, `JOB_EXPIRED`, `CANCELLED`, and SDK-side `UNTRUSTED_URL` (§8.3, never sent on the wire). The earlier generic codes `INVALID_INPUT`, `LIMITED`, `CONFLICT`, `FAILED`, and `TEMPORARILY_UNAVAILABLE` are dropped. `JOB_EXPIRED` is returned (404 or 410, proposed) after the 24h job expiry or 7d result retention.
 
-Idempotency (decision 104) applies unchanged to v2 `POST`/`PATCH`: same `Idempotency-Key` header, same `(tenant, subject, route, key)` scope. The request hash is computed over the decoded canonical record, not the raw bytes, so equivalent encodings of the same input hash equally (this favours a deterministic encoding, §5.0).
+Idempotency (decision 104) applies unchanged to v2 `POST`/`PATCH`: same `Idempotency-Key` header, same `(tenant, subject, route, key)` scope. The request hash is `SHA-256` over the RFC 8949 core deterministic re-encoding of the decoded record (§5.0a), not the raw bytes, so the same input in JSON or CBOR and in any key order hashes equally.
 
 ## 11. Security and abuse controls
 
@@ -370,12 +425,13 @@ Binary formats and persistent streams expand the attack surface. Required gates:
 
 - **Tenant isolation (spec decisions 23, 62, 97):** the tenant comes only from the URL slug (public endpoints) or from a verified token (authenticated endpoints), resolved by the platform into `ctx.tenant_id`. A tenant in the binary body, a header, or a query parameter is never trusted; a body field named `tenant_id` is rejected as in decision 23. Each request runs on the per-tenant role connection of decision 97.
 - Jobs, SSE events, and results are scoped to `(tenant, subject)`: storage keys include both; every events, result, status, and cancel request re-checks that the caller's tenant and subject match the job's owner, and a mismatch returns `NOT_FOUND` (no existence leak). A job ID from one tenant is never valid in another.
-
+- **Slug/token tenant mismatch:** on an authenticated request, if the tenant resolved from the path slug differs from the tenant in the verified token, the request is **rejected**, never resolved by letting one source win. Response is 404 `NOT_FOUND` (same as an unknown slug), so it does not reveal whether the slug's tenant exists; the detail goes to the audit log only.
+- Decoder limits and canonical form: §5.0a.
 - Authentication and authorization on request, event stream, status, result, and cancellation endpoints.
 - Ownership checks must not rely only on possession of an operation ID.
 - Cryptographically unguessable operation IDs, without treating them as credentials.
-- Maximum raw body size, decompressed body size, nesting depth, collection length, string/binary length, and decode time.
-- Reject duplicate or invalid keys according to a canonical policy.
+- Maximum raw body size, decompressed body size, nesting depth, collection length, string/binary length, and decode time (defaults in §5.0a).
+- Reject duplicate keys, indefinite-length items, non-allowlisted tags, and invalid UTF-8 (§5.0a).
 - No unbounded allocation based on encoded length claims.
 - Per-principal limits for running operations, queued work, SSE connections, reconnect rate, and stored results/events.
 - Redacted logging; raw bodies off by default.
@@ -402,7 +458,7 @@ Collect without logging raw sensitive payloads:
 
 ## 13. Benchmark and acceptance plan
 
-Representative datasets must include tiny CRUD payloads, common requests, nested structures, large text/binary fields, error responses, and batched candidates.
+Representative datasets must include tiny CRUD payloads, common requests, nested structures, large text/binary fields, and error responses, in both CBOR and JSON.
 
 Provisional acceptance targets, subject to measurement and product confirmation:
 
@@ -414,10 +470,23 @@ Provisional acceptance targets, subject to measurement and product confirmation:
 - Older SDKs tolerate new optional fields.
 - Incompatible schemas fail explicitly before returning a misleading result.
 - Malformed payloads fail safely and consistently across backend implementations.
-- Generated default Markdown passes an agreed operation-level and total token/byte budget.
-- Cross-tenant tests: a job, event stream, or result of tenant A is never readable or cancellable from tenant B.
-- SDK refuses `event_url`/`result_url`/`cancel_url` on a different origin.
+- Generated Markdown stays within 64 KB per endpoint; an oversized endpoint fails generation (test).
 - No credentials, reusable stream tokens, or raw sensitive inputs appear in standard logs.
+
+### 13.1 Required test cases for the spike
+
+These are required test cases, not just acceptance targets. The spike is not complete until each passes:
+
+1. **Cross-tenant read:** tenant B's token cannot `GET` tenant A's job status, `/events`, or `/result`; each returns 404 `NOT_FOUND`, identical to an unknown job ID.
+2. **Cross-tenant cancel:** tenant B cannot `DELETE` tenant A's job; 404, and A's job continues.
+3. **Same tenant, other subject:** subject Y cannot read or cancel subject X's job in the same tenant; 404.
+4. **Slug/token mismatch:** a token for tenant A on a path slug for tenant B is rejected with 404, for an existing and a non-existent B alike (identical responses).
+5. **Tenant in body/header/query** is ignored or rejected (`tenant_id` body field → 422, decision 23).
+6. **Origin rule:** SDK returns `UNTRUSTED_URL` for a different host, different port, `https`→`http`, userinfo, IDN homograph vs punycode mismatch; accepts `:443` vs no port.
+7. **Redirects:** cross-origin redirect not followed; same-origin chain of 4 hops rejected; 3 accepted.
+8. **Decoder profile:** each §5.0a limit at limit (accepted) and limit+1 (rejected); duplicate keys, indefinite-length, unknown tag, invalid UTF-8, NaN, Infinity rejected; `-0.0` normalized.
+9. **Hash equivalence:** the same record as JSON, CBOR, and CBOR with different key order yields the same decision 104 request hash; a changed value yields a different one.
+10. **Retention:** events replay up to 24h, job expiry 24h, result 7d; a tenant setting above the default is rejected, below is honoured.
 
 ## 14. Rollout proposal
 
@@ -434,24 +503,23 @@ v2 is a new REST API version served alongside v1; rollout is measured:
 
 ## 15. Decisions required before implementation
 
-1. MessagePack or CBOR (§5.0)?
-2. Which canonical schema language/tool owns numeric IDs and code generation?
-3. Are envelopes positional arrays, integer-key maps, or a hybrid?
-4. Is the v2 marker in the media type only (`application/vnd.vibe.v2+…`), in the path, or both, given that `{version}` in the v1.8 path is the definition version?
-5. What exact compatibility guarantees apply across SDK and server versions?
-6. Which resources qualify for asynchronous jobs and SSE?
-7. What are event replay, job expiration, and result retention durations?
-8. Which SSE authentication strategy is valid for each supported runtime?
-9. What payload distributions and current production baselines define success?
-10. What byte/token budgets apply to the generated AI Markdown?
-11. Is batching part of the first release or a measured follow-up?
-12. Does a v2 resource also accept JSON (content negotiation) when the binary codec is unavailable, or is v2 binary-only?
+Decided by the PM on 2026-10-16 (§0.1): encoding (CBOR), version marker (media type only), JSON acceptance (yes), retention defaults, AI Markdown budget (64 KB/endpoint), batching (not in first release).
+
+Still open:
+
+1. Which canonical schema language/tool owns numeric IDs and code generation?
+2. Are envelopes positional arrays, integer-key maps, or a hybrid?
+3. What exact compatibility guarantees apply across SDK and server versions?
+4. Which resources qualify for asynchronous jobs and SSE?
+5. Which SSE authentication strategy is valid for each supported runtime?
+6. What payload distributions and current production baselines define success?
+7. Confirm the §5.0a default limits and whether `JOB_EXPIRED` is 404 or 410.
 
 ## 16. Suggested first design spike
 
 Use two representative operations:
 
-- **Fast:** small request and response, to measure binary-encoding overhead and compatibility behavior.
+- **Fast:** small request and response, to measure CBOR vs JSON overhead and compatibility behavior.
 - **Long-running:** accepted operation with real progress, reconnect, cancellation, and binary final result.
 
 Deliverables of the spike:
