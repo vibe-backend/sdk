@@ -1842,7 +1842,7 @@ mod tests {
             let body = format!("## Calls\n- methods: {list}\n");
             docs.insert(
                 "product/methods/x".into(),
-                doc(Kind::Method, None, "product/methods/x", &body),
+                parsed_doc(Kind::Method, None, "product/methods/x", &body),
             );
             let mut report = Report::new();
             check_targets(&docs, &mut report);
@@ -1862,7 +1862,7 @@ mod tests {
         let body = "## Signature\n- writes: false\n## Calls\n- methods: [product.ghost]\n## Steps\n### s1 method\n- op: method\n- target: nope.get\n- out: r\n### s2 call\n- op: call\n- target: https://example.com/hook\n";
         docs.insert(
             "product/methods/caller".into(),
-            doc(Kind::Method, None, "models/product/methods/caller", body),
+            parsed_doc(Kind::Method, None, "models/product/methods/caller", body),
         );
         let mut report = Report::new();
         check_targets(&docs, &mut report);
@@ -1875,7 +1875,7 @@ mod tests {
     #[test]
     fn method_lock_steps_get_step_grammar_checks() {
         let body = "## Signature\n- writes: false\n## Calls\n- methods: []\n## Steps\n### s1 method\n- op: method\n- method: product.get\n- out: r\n### s2 validate\n- op: validate\n- when: `r == null`\n### s3 respond\n- op: respond\n- value: r\n- status: 999\n";
-        let d = doc(Kind::Method, None, "models/product/methods/x", body);
+        let d = parsed_doc(Kind::Method, None, "models/product/methods/x", body);
         let mut report = Report::new();
         check_method(&d, "x.lock.md", &mut report);
         let msgs: Vec<&str> = report.errors().map(|d| d.message.as_str()).collect();

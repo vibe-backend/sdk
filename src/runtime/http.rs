@@ -20,14 +20,10 @@ use crate::manifest::{Manifest, RouteSpec};
 
 use super::crud::{self, MethodFail};
 use super::exec::QueryExec;
-<<<<<<< HEAD
-use super::limiter::{ip_bucket, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision};
-use super::refresh::{RevokeTarget, Rotated};
-=======
 use super::limiter::{
     ip_bucket, owner_of, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision,
 };
->>>>>>> origin/main
+use super::refresh::{RevokeTarget, Rotated};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1555,11 +1551,11 @@ fn rate_limited(
     }
 }
 
-fn limit_check(state: &AppState, checks: &[(String, String, u32)]) -> Option<String> {
+fn limit_check(state: &AppState, checks: &[(String, String, u32)], owner: &str) -> Option<String> {
     let Ok(mut rates) = state.rates.lock() else {
         return Some("1".into());
     };
-    match rates.check(checks, Instant::now()) {
+    match rates.check(checks, owner, Instant::now()) {
         RateDecision::Allow => None,
         RateDecision::Limited(wait) => Some(wait.to_string()),
     }
@@ -1605,7 +1601,8 @@ async fn refresh_response(
         ip.to_string(),
         REFRESH_IP_PER_MINUTE,
     )];
-    if let Some(retry) = limit_check(state, &ip_check) {
+    let owner = owner_of(ip);
+    if let Some(retry) = limit_check(state, &ip_check, &owner) {
         return rate_limited_response(request_id, &retry);
     }
     let Some(token) = body
@@ -1628,7 +1625,7 @@ async fn refresh_response(
         let family_check = [(format!("{}:family", route.feature_id), family, per_minute)];
         // Same 401 as every other failure: a 429 here would tell a caller
         // that the token exists. Only live tokens count (see refresh_family).
-        if limit_check(state, &family_check).is_some() {
+        if limit_check(state, &family_check, &owner).is_some() {
             tracing::warn!(%request_id, %tenant, "refresh family rate limit reached");
             return invalid_refresh(request_id);
         }

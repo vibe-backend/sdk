@@ -21,7 +21,6 @@ pub use http::{
     detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router, ApiKeyFile, AppState,
     AuthConfig, RunEnv, SigningKey, Slug, StoredKey, REQUEST_TYPES,
 };
-<<<<<<< HEAD
 pub use ops::{custom_claim_problem, load_signing_keys, sub_source_problem};
 pub use sql::Stmt;
 
@@ -29,10 +28,8 @@ pub use sql::Stmt;
 pub fn hash_password_for_tests(plain: &str) -> String {
     crud::hash_password(plain).expect("hash")
 }
-pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
-=======
 pub use limiter::{saturation_refusals, ProxyNet, QuotaBuckets, RateBuckets};
->>>>>>> origin/main
+
 pub use migrate::migrate_tenant;
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
 pub use sql::{
