@@ -121,9 +121,9 @@ enum Command {
         /// Expected release commit SHA. Required outside relaxed mode.
         #[arg(long)]
         expect_commit: Option<String>,
-        /// Allow relaxed identity config with `VIBE_ENV=development` on a
-        /// release binary (debug builds already allow it when `VIBE_ENV` is
-        /// development).
+        /// Debug builds only: allow a development-key manifest when `VIBE_ENV`
+        /// is unset. Release builds do not have this flag.
+        #[cfg(debug_assertions)]
         #[arg(long)]
         insecure_dev: bool,
     },
@@ -141,8 +141,9 @@ enum Command {
         /// Expected release commit SHA. Required outside relaxed mode.
         #[arg(long)]
         expect_commit: Option<String>,
-        /// Allow relaxed identity config with `VIBE_ENV=development` on a
-        /// release binary.
+        /// Debug builds only: allow a development-key manifest when `VIBE_ENV`
+        /// is unset. Release builds do not have this flag.
+        #[cfg(debug_assertions)]
         #[arg(long)]
         insecure_dev: bool,
     },
@@ -257,8 +258,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             memory,
             expect_version,
             expect_commit,
+            #[cfg(debug_assertions)]
             insecure_dev,
         } => {
+            #[cfg(not(debug_assertions))]
+            let insecure_dev = false;
             cmd_serve(
                 &manifest,
                 &project,
@@ -276,8 +280,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             tenant,
             expect_version,
             expect_commit,
+            #[cfg(debug_assertions)]
             insecure_dev,
         } => {
+            #[cfg(not(debug_assertions))]
+            let insecure_dev = false;
             cmd_migrate(
                 &manifest,
                 &project,
@@ -632,10 +639,10 @@ fn print_high_risk(manifest: &manifest::Manifest) {
 /// release manifest with a valid Sigstore bundle (`VIBE_MANIFEST_BUNDLE`, or
 /// `<manifest>.sigstore.json`) is accepted, bound to the compiled-in release
 /// repo and workflow, the deployer-expected version/commit, and
-/// `refs/tags/v<version>`. No key is trusted there. Relaxed mode
-/// (`VIBE_ENV=development` plus a debug build or `--insecure-dev`) may verify
-/// a development-key manifest without a bundle, and may override the release
-/// identity.
+/// `refs/tags/v<version>`. No key is trusted there. Relaxed mode exists only
+/// in debug builds (see [`vibe::attest::relaxed_config_allowed`]); release
+/// builds always take the Sigstore path, whatever `VIBE_ENV` or `--memory`
+/// say.
 fn load_manifest(
     manifest_path: &Path,
     project: &Path,
@@ -644,14 +651,16 @@ fn load_manifest(
     expect_commit: Option<String>,
     insecure_dev: bool,
 ) -> Result<manifest::Manifest, String> {
+    #[cfg(debug_assertions)]
     if insecure_dev {
         std::env::set_var("VIBE_INSECURE_DEV", "1");
     }
     let bundle = std::env::var_os("VIBE_MANIFEST_BUNDLE")
         .map(PathBuf::from)
         .unwrap_or_else(|| vibe::attest::default_bundle_path(manifest_path));
-    let relaxed = vibe::attest::relaxed_config_allowed(insecure_dev);
-    if !run_env.is_dev() || bundle.exists() {
+    // The relaxed gate is decided before any key material is looked at.
+    let relaxed = vibe::attest::relaxed_config_allowed(insecure_dev) && run_env.is_dev();
+    if !relaxed || bundle.exists() {
         let policy = vibe::attest::Policy::from_env()?;
         let expected = deployer_expectation(expect_version, expect_commit)?;
         let (manifest, identity) =
@@ -666,12 +675,6 @@ fn load_manifest(
             "release manifest attestation verified"
         );
         return Ok(manifest);
-    }
-    if !relaxed && !run_env.is_dev() {
-        return Err(
-            "release manifests require a Sigstore bundle; development-key manifests need VIBE_ENV=development and a debug build or --insecure-dev"
-                .into(),
-        );
     }
     let key = match sign::pinned_public_key()? {
         Some(key) => key,

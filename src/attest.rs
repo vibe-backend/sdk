@@ -25,9 +25,10 @@
 //!   GitHub-hosted runner.
 //!
 //! Relaxed identity configuration (repo/workflow overrides, and serving a
-//! development-key manifest without a bundle) requires `VIBE_ENV=development`
-//! and either a debug build or an explicit insecure-dev opt-in. Release
-//! binaries stay strict by default.
+//! development-key manifest without a bundle) exists only in debug builds and
+//! requires an explicit `VIBE_ENV=development` (or the debug-only
+//! `--insecure-dev` opt-in when `VIBE_ENV` is unset). Release builds always
+//! require Sigstore verification.
 
 use std::sync::OnceLock;
 
@@ -126,12 +127,21 @@ fn expectation_source_ref(version: &str) -> String {
 }
 
 /// Relaxed configuration (identity overrides, development-key serve without a
-/// bundle) is allowed only when `VIBE_ENV` is a development value and either
-/// this is a debug build or `insecure_dev` was explicitly opted in.
+/// bundle). Release builds never allow it. Debug builds allow it when
+/// `VIBE_ENV` is explicitly a development value, or when `VIBE_ENV` is unset
+/// and `insecure_dev` was opted in.
+#[cfg(debug_assertions)]
 pub fn relaxed_config_allowed(insecure_dev: bool) -> bool {
-    let run_env =
-        crate::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), false);
-    run_env.is_dev() && (cfg!(debug_assertions) || insecure_dev)
+    let raw = std::env::var("VIBE_ENV").ok();
+    let unset = raw.as_deref().is_none_or(|v| v.trim().is_empty());
+    let explicit_dev = crate::runtime::RunEnv::from_var(raw.as_deref(), false).is_dev();
+    explicit_dev || (unset && insecure_dev)
+}
+
+/// Relaxed configuration is compiled out of release builds.
+#[cfg(not(debug_assertions))]
+pub fn relaxed_config_allowed(_insecure_dev: bool) -> bool {
+    false
 }
 
 fn env_override(name: &str) -> Result<Option<String>, String> {
@@ -145,17 +155,23 @@ fn env_override(name: &str) -> Result<Option<String>, String> {
     }
     if !relaxed_config_allowed(insecure_dev_from_env()) {
         return Err(format!(
-            "{name} is only accepted in a development environment with a debug build or VIBE_INSECURE_DEV; unset it or use the compiled-in release identity"
+            "{name} is only accepted by a debug build with VIBE_ENV=development; unset it or use the compiled-in release identity"
         ));
     }
     Ok(Some(trimmed.to_string()))
 }
 
+#[cfg(debug_assertions)]
 fn insecure_dev_from_env() -> bool {
     matches!(
         std::env::var("VIBE_INSECURE_DEV").ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
     )
+}
+
+#[cfg(not(debug_assertions))]
+fn insecure_dev_from_env() -> bool {
+    false
 }
 
 /// The verified signer identity.
@@ -266,12 +282,23 @@ fn require_bundle_media_type(bundle: &Bundle) -> Result<(), String> {
     }
 }
 
+/// Exactly one Rekor entry is accepted: every entry a bundle carries must be
+/// the one that is checked, so extra entries are rejected rather than ignored.
+fn single_tlog_entry(
+    bundle: &Bundle,
+) -> Result<&sigstore_types::bundle::TransparencyLogEntry, String> {
+    match bundle.verification_material.tlog_entries.as_slice() {
+        [entry] => Ok(entry),
+        [] => Err("sigstore bundle: no Rekor transparency log entry".into()),
+        entries => Err(format!(
+            "sigstore bundle: expected exactly one Rekor transparency log entry, found {}",
+            entries.len()
+        )),
+    }
+}
+
 fn require_inclusion_and_set(bundle: &Bundle) -> Result<(), String> {
-    let entry = bundle
-        .verification_material
-        .tlog_entries
-        .first()
-        .ok_or("sigstore bundle: no Rekor transparency log entry")?;
+    let entry = single_tlog_entry(bundle)?;
     let proof = entry
         .inclusion_proof
         .as_ref()
@@ -355,11 +382,7 @@ fn verify_parsed_bundle<'a>(
         }
     }
 
-    let entry = bundle
-        .verification_material
-        .tlog_entries
-        .first()
-        .ok_or("sigstore bundle: no Rekor transparency log entry")?;
+    let entry = single_tlog_entry(bundle)?;
     finish_identity(&result, policy, expected, entry.log_index.to_string())
 }
 

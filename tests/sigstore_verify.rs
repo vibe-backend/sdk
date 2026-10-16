@@ -187,6 +187,26 @@ fn public_good_bundle_verifies_against_the_trust_root() {
 }
 
 #[test]
+fn bundle_with_more_than_one_rekor_entry_is_refused() {
+    let mut bundle: serde_json::Value = serde_json::from_str(GHA_BUNDLE).unwrap();
+    let entries = bundle["verificationMaterial"]["tlogEntries"]
+        .as_array_mut()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    let first = entries[0].clone();
+    entries.push(first);
+    let err = verify_bundle_digest(
+        GHA_DIGEST,
+        &serde_json::to_vec(&bundle).unwrap(),
+        &gha_policy(),
+        &expect("1.0.0", GHA_COMMIT),
+        false,
+    )
+    .unwrap_err();
+    assert!(err.contains("exactly one Rekor"), "{err}");
+}
+
+#[test]
 fn public_good_bundle_wrong_identity_is_refused() {
     let err = verify_bundle_digest(
         GHA_DIGEST,
@@ -307,9 +327,16 @@ fn policy_override_outside_development_is_refused() {
 
     std::env::set_var("VIBE_ENV", "development");
     std::env::set_var("VIBE_RELEASE_REPO", "acme/shop");
-    // Debug test builds allow overrides when VIBE_ENV=development.
-    let policy = Policy::from_env().unwrap();
-    assert_eq!(policy.repo, "acme/shop");
+    if cfg!(debug_assertions) {
+        // Debug builds allow overrides when VIBE_ENV=development.
+        let policy = Policy::from_env().unwrap();
+        assert_eq!(policy.repo, "acme/shop");
+    } else {
+        // Release builds never do, even with the opt-in variable set.
+        std::env::set_var("VIBE_INSECURE_DEV", "1");
+        let err = Policy::from_env().unwrap_err();
+        assert!(err.contains("VIBE_RELEASE_REPO"), "{err}");
+    }
 
     restore("VIBE_RELEASE_REPO", prev_repo);
     restore("VIBE_RELEASE_WORKFLOW", prev_wf);

@@ -64,5 +64,8 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - if: steps.detect.outputs.present == 'true'
         run: cargo test --locked --all-features
+      - if: steps.detect.outputs.present == 'true'
+        name: Release-profile tests
+        run: cargo test --locked --all-features --release --test release_profile --test sigstore_verify
       - if: steps.detect.outputs.present != 'true'
         run: echo "No Cargo.toml yet; skipping Rust checks."
