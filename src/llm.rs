@@ -758,15 +758,62 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
         [
             r#"(?i)[a-z][a-z0-9+.-]*://(?:\\.|[^\s/"'<>\\])*@(?:\\.|[^\s"'<>\\])*"#,
             r#"(?i)[a-z][a-z0-9+.-]*%3a%2f%2f[^\s"'<>]*"#,
-            r#"(?i)\b[a-z0-9_]*(?:password|passwd|pwd|database_url)[a-z0-9_]*[\s"']*[:=]\s*(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|(?:\\.|[^;\s,}\\])+)"#,
+            r#"(?i)\b[a-z0-9_]*(?:password|passwd|pwd|database_url)[a-z0-9_]*[\s"']*[:=]\s*(?:"(?:\\+.|[^"\\])*(?:"|$)|'(?:\\+.|[^'\\])*(?:'|$)|(?:\\.|[^;\s,}\\])+)"#,
             r"(?i)\b(?:password|passwd|pwd)\s*=\s*[^;\r\n]*",
             r"(?im)authorization\s*:[^\r\n]*",
             r"(?i)bearer\s+[a-z0-9._~+/=-]+",
             r"\b(?:sk-|xai-|ghp_)[A-Za-z0-9_-]+",
         ].into_iter().map(|pattern| regex::Regex::new(pattern).expect("redaction pattern")).collect()
     });
+    // Decode with byte offsets so matches remove the corresponding original span.
+    let mut decoded = text.as_bytes().to_vec();
+    let mut spans: Vec<_> = (0..decoded.len()).map(|i| (i, i + 1)).collect();
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        let mut next_spans = Vec::new();
+        let mut i = 0;
+        while i < decoded.len() {
+            if decoded[i] == b'%' && i + 2 < decoded.len() {
+                let hex = |b: u8| (b as char).to_digit(16);
+                if let (Some(a), Some(b)) = (hex(decoded[i + 1]), hex(decoded[i + 2])) {
+                    next.push((a * 16 + b) as u8);
+                    next_spans.push((spans[i].0, spans[i + 2].1));
+                    i += 3;
+                    continue;
+                }
+            }
+            next.push(decoded[i]);
+            next_spans.push(spans[i]);
+            i += 1;
+        }
+        if next == decoded {
+            break;
+        }
+        decoded = next;
+        spans = next_spans;
+    }
+    let mut ranges = Vec::new();
     for pattern in PATTERNS.iter() {
-        text = pattern.replace_all(&text, "[redacted]").into_owned();
+        ranges.extend(pattern.find_iter(&text).map(|m| (m.start(), m.end())));
+        if let Ok(decoded) = std::str::from_utf8(&decoded) {
+            ranges.extend(
+                pattern
+                    .find_iter(decoded)
+                    .map(|m| (spans[m.start()].0, spans[m.end() - 1].1)),
+            );
+        }
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    for (start, end) in merged.into_iter().rev() {
+        text.replace_range(start..end, "[redacted]");
     }
     text
 }
@@ -1328,6 +1375,35 @@ pub fn runtime_llm_env_present() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_multilevel_escaped_quoted_values_including_tail() {
+        for raw in [
+            r"password='a\\'b tail'",
+            r"password='a\\\\'b tail'",
+            r"database_url='a\\'b tail'",
+            r#"password="a\\"b tail""#,
+        ] {
+            assert_eq!(redact(raw, &[]), "[redacted]", "{raw}");
+        }
+    }
+
+    #[test]
+    fn redact_iteratively_percent_encoded_settings_in_original_text() {
+        for raw in [
+            "password%3Dsecret",
+            "pwd%3Dsecret%26x%3D1",
+            "password%253Dsecret",
+            "p%2561ssword%253Dsecret",
+            "password%25253Dsecret",
+        ] {
+            assert_eq!(
+                redact(&format!("before {raw}; after"), &[]),
+                "before [redacted]; after",
+                "{raw}"
+            );
+        }
+    }
 
     #[test]
     fn redact_password_with_escaped_single_quote() {

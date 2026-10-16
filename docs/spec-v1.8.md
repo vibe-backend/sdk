@@ -874,9 +874,7 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
 
 適用：`vibe dev`（預設）同 `vibe serve --memory`。
 
-- **用途限制**：譯文只用於語意一致性檢查。安全關鍵字只檢查中文及英文原文，不能由譯文補足。Lock、`source-hash`、編譯 prompt 及 cache key 用原文。以下規則取代 #37／決定 108 的 English-only 及不處理中文否定規則（產品經理 2026-10-16 確認）。
-- **否定**：唔、不、冇、無、毋、非及 not、no、never 只作用於短距離內最近的下一個安全關鍵字，不跨越 `, . ; : ! ? 、，。；：！？` 或換行，不以偶數／奇數抵銷。只有無歧義的直接否定可讀作否定；中間有其他字詞或雙重否定（not … not、不得不、唔可以唔、不能不、非…不可）一律保留較嚴格的要求並發出 warning，請作者以 `auth` 等 structured frontmatter 確認。`不得不公開` 表示公開。Prose 不會自動降低保護；有 `auth/public/secrets/writes` 宣告時以宣告為準，明確的 prose 衝突為 compile error。
-- **Code**：忽略行首最多三個空格後的至少三個反引號或波浪號 fence；結束 fence 必須同字元且長度不少於開始。行中 ``` 不開啟 fence。Inline code 的反引號 run 長度必須相同。未結束 fence 是 compile error，不能忽略其後內容；不確定時採取較嚴格的判讀。
+- **用途限制**：只限開發同測試。資料只存喺 process 記憶體，server 停止、重啟或者 crash 就全部消失；冇持久化、冇備份、冇跨 instance 共享。
 - **Dev 提示**：dev 用 in-memory 時，啟動同 health 都要清楚標示資料唔會保存：
   - 喺 stderr 印顯眼警告（多行、紅色），內容包括「IN-MEMORY DATABASE：所有資料喺 server 停止時消失，唔可以用喺 production」；
   - health endpoint（`/_health`）回 `"db": "memory"` 同 `"warning": "in-memory database, data is lost on stop"`；

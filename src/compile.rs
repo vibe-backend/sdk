@@ -1748,7 +1748,7 @@ fn semantic_check(
         ("ownership", &["shared", "共享", "ownership", "owner"][..]),
     ] {
         for word in words {
-            let (present, ambiguous, negative) = keyword_reading(&text, word);
+            let (_, ambiguous, negative, definite) = keyword_occurrences(&text, word);
             if ambiguous {
                 report.push(Diag::warning(&doc.meta.source, format!(
                     "ambiguous negation near `{word}`; requirement retained; confirm with the structured `{field}` frontmatter field"
@@ -1757,7 +1757,7 @@ fn semantic_check(
             if let Some((_, value)) = front.iter().find(|(key, _)| key == field) {
                 let enabled =
                     !matches!(value.as_str(), "false" | "none" | "removed" | "off" | "[]");
-                if !ambiguous && ((enabled && negative) || (!enabled && present)) {
+                if (enabled && negative) || (!enabled && definite) {
                     report.push(Diag::error(
                         &doc.meta.source,
                         format!(
@@ -2015,7 +2015,8 @@ fn declaration_check(doc: &LockDoc, source: &SourceFile, english: &str) -> Vec<D
     out
 }
 
-/// Remove Markdown code while retaining line boundaries. Unclosed fences fail closed.
+/// Replace Markdown code with scope boundaries while retaining line breaks.
+/// Unclosed fences fail closed.
 fn security_prose(text: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut fence: Option<(char, usize)> = None;
@@ -2028,10 +2029,10 @@ fn security_prose(text: &str) -> Result<String, String> {
             if indent <= 3 && marker == ch && count >= len && trimmed[count..].trim().is_empty() {
                 fence = None;
             }
-            out.push('\n');
+            out.push_str("\u{1e}\n");
         } else if indent <= 3 && matches!(marker, '`' | '~') && count >= 3 {
             fence = Some((marker, count));
-            out.push('\n');
+            out.push_str("\u{1e}\n");
         } else {
             out.push_str(line);
         }
@@ -2057,7 +2058,8 @@ fn security_prose(text: &str) -> Result<String, String> {
             offset = start + len;
         }
         if let Some(end) = closing {
-            result.push(' ');
+            result.push('\u{1e}');
+            result.extend(tail[..end].chars().filter(|c| matches!(c, '\n' | '\r')));
             rest = &tail[end..];
         } else {
             result.push_str(&rest[at..at + run]);
@@ -2097,6 +2099,12 @@ const SECURITY_TERMS: &[&str] = &[
 /// Returns (affirmed, ambiguous, directly negated). Negators belong only to
 /// the nearest following security term; ambiguous language retains the requirement.
 fn keyword_reading(text: &str, word: &str) -> (bool, bool, bool) {
+    let (affirmed, ambiguous, negative, _) = keyword_occurrences(text, word);
+    (affirmed, ambiguous, negative)
+}
+
+/// Returns requirement presence, ambiguity, direct negation, and unambiguous affirmation.
+fn keyword_occurrences(text: &str, word: &str) -> (bool, bool, bool, bool) {
     let text = security_prose(text).unwrap_or_else(|_| text.to_string());
     static NEGATOR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
@@ -2107,6 +2115,7 @@ fn keyword_reading(text: &str, word: &str) -> (bool, bool, bool) {
     let mut affirmed = false;
     let mut ambiguous = false;
     let mut negative = false;
+    let mut definite = false;
     for (at, _) in text.match_indices(word) {
         let end = at + word.len();
         let boundary = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
@@ -2131,16 +2140,27 @@ fn keyword_reading(text: &str, word: &str) -> (bool, bool, bool) {
         let head = text[..at]
             .rsplit([
                 ',', '.', ';', ':', '!', '?', '、', '，', '。', '；', '：', '！', '？', '\n', '\r',
+                '\u{1e}',
             ])
             .next()
             .unwrap_or("");
         let negations: Vec<_> = NEGATOR.find_iter(head).collect();
         let Some(last) = negations.last() else {
             affirmed = true;
+            definite = true;
             continue;
         };
         let gap = &head[last.end()..];
-        if head[last.start()..].starts_with('非') && tail.starts_with("不可") {
+        if head[last.start()..].starts_with('非')
+            && tail
+                .split([
+                    ',', '.', ';', ':', '!', '?', '、', '，', '。', '；', '：', '！', '？', '\n',
+                    '\r', '\u{1e}',
+                ])
+                .next()
+                .unwrap_or("")
+                .contains("不可")
+        {
             affirmed = true;
             ambiguous = true;
         } else if gap.chars().count() > 32
@@ -2151,6 +2171,7 @@ fn keyword_reading(text: &str, word: &str) -> (bool, bool, bool) {
                 .any(|term| gap.contains(term))
         {
             affirmed = true;
+            definite = true;
         } else if negations.len() > 1 || !gap.trim_matches([' ', '\t', '-']).is_empty() {
             affirmed = true;
             ambiguous = true;
@@ -2158,7 +2179,7 @@ fn keyword_reading(text: &str, word: &str) -> (bool, bool, bool) {
             negative = true;
         }
     }
-    (affirmed, ambiguous, negative)
+    (affirmed, ambiguous, negative, definite)
 }
 
 pub(crate) fn affirms(text: &str, word: &str) -> bool {
@@ -2708,6 +2729,59 @@ mod security_tests {
 
     const PUBLIC: &str = "## Access\n- public: true\n## Pipelines\n### -auth\n- removed: true\n";
     const PRIVATE: &str = "## Access\n- public: false\n## Pipelines\n### auth\n- mode: jwt\n";
+
+    #[test]
+    fn separated_chinese_necessity_retains_requirement_and_warns() {
+        assert_ambiguous_requirement("非公開這份資料不可", "公開", PUBLIC);
+    }
+
+    #[test]
+    fn removed_code_blocks_negation_and_preserves_newlines() {
+        for text in [
+            "not `example` public",
+            "not `example\nmore` public",
+            "not\n```\nexample\n```\npublic",
+        ] {
+            assert!(affirms(text, "public"), "{text}");
+        }
+        assert!(security_prose("not `example\nmore` public")
+            .unwrap()
+            .contains('\n'));
+    }
+
+    #[test]
+    fn ambiguous_occurrence_keeps_other_affirmative_conflicts() {
+        for auth in ["removed", "none"] {
+            let text = format!("---\nauth: {auth}\n---\nRequire login. not necessarily login.");
+            assert!(errors(&text, PUBLIC)
+                .iter()
+                .any(|e| e.contains("conflicts with source wording near `login`")));
+        }
+    }
+
+    #[test]
+    fn in_memory_documentation_keeps_usage_limit_and_scoped_keyword_rules() {
+        let spec = include_str!("../docs/spec-v1.8.md");
+        let section = spec
+            .split("### 2C.4")
+            .nth(1)
+            .unwrap()
+            .split("## 2B.")
+            .next()
+            .unwrap();
+        assert!(section.contains("- **用途限制**：只限開發同測試。資料只存喺 process 記憶體，server 停止、重啟或者 crash 就全部消失；冇持久化、冇備份、冇跨 instance 共享。"));
+        assert!(!section.contains("- **否定**"));
+        assert!(!section.contains("- **Code**"));
+        assert_eq!(spec.matches("- **否定**").count(), 1);
+        assert_eq!(spec.matches("- **Code**").count(), 1);
+    }
+
+    #[test]
+    fn changelog_keeps_current_keyword_rules() {
+        let changelog = include_str!("../CHANGELOG.md");
+        assert!(!changelog.contains("Source security keyword checks exclude negated Chinese and English terms and fenced or inline code."));
+        assert!(changelog.contains("retain ambiguous requirements with confirmation warnings"));
+    }
 
     #[test]
     fn chinese_double_negation_affirms_public() {

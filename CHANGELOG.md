@@ -27,7 +27,6 @@ added only when the corresponding PR is merged to `main`.
 - Security checks use original Chinese and English prose, retain ambiguous requirements with confirmation warnings, validate Markdown fences, and report structured declaration conflicts (PM decision 2026-10-16, supersedes #37 English-only rules).
 - LLM dumps redact complete escaped quoted values, escaped spaces, DSN credentials and URL-encoded connection strings.
 
-- Source security keyword checks exclude negated Chinese and English terms and fenced or inline code.
 - LLM dumps redact password settings and credential-bearing URLs and connection strings, preserve existing directory permissions, and refuse symlink components inside the project.
 - Calls without an explicit LLM budget share an environment-configured counter across calls.
 - The direct `libc` dependency is restricted to Unix targets.
