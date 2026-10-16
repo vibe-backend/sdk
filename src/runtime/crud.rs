@@ -7,6 +7,7 @@ use crate::manifest::{FieldSpec, Manifest, MethodSpec, ModelSpec};
 use super::exec::{etag, ExecError, QueryExec, Row};
 use super::sql::{Col, Sort, Stmt};
 
+#[derive(Debug)]
 pub struct CallResult {
     pub value: Value,
     pub etag: Option<String>,
@@ -23,6 +24,8 @@ pub struct Caller<'a> {
 
 #[derive(Clone, Copy)]
 pub struct CallCtx<'a> {
+    /// Pepper, issuer/audience and signing keys for platform ops.
+    pub auth: &'a super::http::AuthConfig,
     pub tenant_id: &'a str,
     pub role: &'a str,
     pub caller: Caller<'a>,
@@ -69,6 +72,7 @@ async fn run_steps(
 ) -> Result<CallResult, MethodFail> {
     let mut vars = Map::new();
     vars.insert("input".into(), input.clone());
+    vars.insert("ctx".into(), ctx_var(&ctx));
     let mut last = Value::Null;
     for step in &method.steps {
         match step.op.as_str() {
@@ -105,6 +109,21 @@ async fn run_steps(
                 if when_matches(&step.when_expr, &vars) {
                     return Err(MethodFail::code(step.fail.clone(), step.fail.clone()));
                 }
+            }
+            "query" | "verify-password" | "hash-password" | "random-token" | "hash-token"
+            | "sign-jwt" => {
+                let value = match step.op.as_str() {
+                    "query" => super::ops::query(exec, method, step, &vars, ctx).await?,
+                    "verify-password" => super::ops::verify_password(step, &vars).await?,
+                    "hash-password" => super::ops::hash_password_op(step, &vars).await?,
+                    "random-token" => super::ops::random_token(step, ctx)?,
+                    "hash-token" => super::ops::hash_token(step, &vars, ctx)?,
+                    _ => super::ops::sign_jwt(manifest, exec, method, step, &vars, ctx).await?,
+                };
+                if !step.out.is_empty() && step.out != "(none)" {
+                    vars.insert(step.out.clone(), value.clone());
+                }
+                last = value;
             }
             _ => {
                 return Err(MethodFail::code(
@@ -510,6 +529,26 @@ async fn delete(
     })
 }
 
+/// True when a route's steps reach a method with a `verify-password` step
+/// (a login-class endpoint, padded to 500 ms).
+pub fn route_verifies_password(manifest: &Manifest, route: &crate::manifest::RouteSpec) -> bool {
+    fn method_verifies(manifest: &Manifest, target: &str, depth: u32) -> bool {
+        let Some(method) = crate::manifest::method(manifest, target) else {
+            return false;
+        };
+        method.steps.iter().any(|s| {
+            s.op == "verify-password"
+                || (s.op == "method"
+                    && depth < 3
+                    && method_verifies(manifest, &s.target, depth + 1))
+        })
+    }
+    route
+        .steps
+        .iter()
+        .any(|s| s.op == "method" && method_verifies(manifest, &s.target, 0))
+}
+
 fn finish_row(model: &ModelSpec, row: Row, include_sensitive: bool) -> CallResult {
     let (out, tag) = row_output(model, &row, include_sensitive);
     CallResult {
@@ -830,6 +869,11 @@ fn db(err: ExecError) -> MethodFail {
     }
 }
 
+/// Platform argon2id parameters; verify accepts only hashes made with them.
+pub const ARGON2_M_COST: u32 = 65_536;
+pub const ARGON2_T_COST: u32 = 3;
+pub const ARGON2_P_COST: u32 = 1;
+
 pub fn hash_password(plain: &str) -> Result<String, MethodFail> {
     let len = plain.chars().count();
     if !(12..=256).contains(&len)
@@ -840,7 +884,7 @@ pub fn hash_password(plain: &str) -> Result<String, MethodFail> {
             "password does not meet the platform baseline",
         ));
     }
-    let params = argon2::Params::new(65_536, 3, 1, Some(32))
+    let params = argon2::Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
         .map_err(|err| MethodFail::code("INTERNAL", err.to_string()))?;
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let hash = argon2::password_hash::PasswordHasher::hash_password(&argon, plain.as_bytes())
@@ -969,6 +1013,63 @@ fn lookup(path: &str, vars: &Map<String, Value>) -> Value {
     current
 }
 
+/// A parsed `when` condition. Forms: `X is empty`, `X is not empty`,
+/// `X == v`, `X != v` with `v` one of true, false, null. Surrounding
+/// backticks (lock code spans) are stripped.
+enum When {
+    Empty(String, bool),
+    Eq(String, Value, bool),
+}
+
+fn parse_when(expr: &str) -> Result<When, String> {
+    let expr = expr.trim().trim_matches('`').trim();
+    let path_ok = |p: &str| {
+        !p.is_empty()
+            && p.split('.').all(|seg| {
+                !seg.is_empty()
+                    && seg
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            })
+    };
+    if let Some(name) = expr.strip_suffix(" is not empty") {
+        let name = name.trim();
+        if path_ok(name) {
+            return Ok(When::Empty(name.to_string(), false));
+        }
+    } else if let Some(name) = expr.strip_suffix(" is empty") {
+        let name = name.trim();
+        if path_ok(name) {
+            return Ok(When::Empty(name.to_string(), true));
+        }
+    }
+    for (op, equal) in [("!=", false), ("==", true)] {
+        if let Some((left, right)) = expr.split_once(op) {
+            let left = left.trim();
+            let literal = match right.trim() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                "null" => Value::Null,
+                _ => break,
+            };
+            if path_ok(left) {
+                return Ok(When::Eq(left.to_string(), literal, equal));
+            }
+        }
+    }
+    Err(format!("unsupported when condition `{expr}`"))
+}
+
+/// Why a `when` condition cannot run, if it cannot (validate uses this).
+pub fn when_problem(expr: &str) -> Option<String> {
+    parse_when(expr).err()
+}
+
+/// Checks a `when` condition the way the runtime parses it.
+pub fn check_when(expr: &str) -> Result<(), String> {
+    parse_when(expr).map(|_| ())
+}
+
 /// Checks that an expression parses the way the runtime will parse it.
 pub fn check_expr(input: &str) -> Result<(), String> {
     let (_, rest) = parse_expr(input.trim())?;
@@ -978,37 +1079,40 @@ pub fn check_expr(input: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Checks a `when` condition: only `<path> is empty` and `<path> != true`
-/// are understood.
-pub fn check_when(expr: &str) -> Result<(), String> {
-    let expr = expr.trim();
-    let path = expr
-        .strip_suffix(" is empty")
-        .or_else(|| expr.strip_suffix(" != true"))
-        .ok_or_else(|| {
-            format!("unsupported condition `{expr}` (use `<path> is empty` or `<path> != true`)")
-        })?;
-    let (_, rest) = take_path(path.trim())?;
-    if !rest.trim().is_empty() {
-        return Err(format!("unsupported condition `{expr}`"));
+/// Evaluates a `when`. An unparseable condition is never "false": it fails
+/// closed (the step's `fail` fires), and `vibe validate` rejects it first.
+pub(crate) fn when_matches(expr: &str, vars: &Map<String, Value>) -> bool {
+    let parsed = match parse_when(expr) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::error!(error = %err, "invalid when condition; failing closed");
+            return true;
+        }
+    };
+    match parsed {
+        When::Empty(name, want) => {
+            let value = lookup(&name, vars);
+            let empty = value.is_null()
+                || value.as_array().is_some_and(Vec::is_empty)
+                || value.as_object().is_some_and(|m| m.is_empty())
+                || value.as_str().is_some_and(str::is_empty);
+            empty == want
+        }
+        When::Eq(name, literal, equal) => (lookup(&name, vars) == literal) == equal,
     }
-    Ok(())
 }
 
-/// Unknown conditions fail closed (the step's `fail` fires); `vibe validate`
-/// rejects them before deploy.
-pub(crate) fn when_matches(expr: &str, vars: &Map<String, Value>) -> bool {
-    let expr = expr.trim();
-    if let Some(name) = expr.strip_suffix(" is empty") {
-        let value = lookup(name.trim(), vars);
-        return value.is_null()
-            || value.as_array().is_some_and(Vec::is_empty)
-            || value.as_object().is_some_and(|m| m.is_empty());
-    }
-    if let Some(name) = expr.strip_suffix(" != true") {
-        return lookup(name.trim(), vars) != Value::Bool(true);
-    }
-    true
+/// `ctx.user` for step expressions: the caller's `sub`, `roles` and `tenant`
+/// (`sub` is null on unauthenticated routes).
+pub fn ctx_var(ctx: &CallCtx<'_>) -> Value {
+    let sub = if ctx.caller.subject.is_empty() {
+        Value::Null
+    } else {
+        Value::String(ctx.caller.subject.to_string())
+    };
+    serde_json::json!({
+        "user": {"sub": sub, "roles": ctx.caller.roles, "tenant": ctx.tenant_id}
+    })
 }
 
 pub fn req_var(

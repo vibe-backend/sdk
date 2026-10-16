@@ -54,11 +54,19 @@ signature: MEQCIA...
 (none)
 
 ## Steps
-### s1 sign-jwt
+### s1 query
+- op: query
+- table: users
+- sql: select id::text as id from users where id = $1::uuid and deleted_at is null
+- params: [input.sub]
+- out: u
+- source-lines: 1-2
+
+### s2 sign-jwt
 - op: sign-jwt
 - alg: ES256
 - key-ref: JWT_SIGNING_KEY
-- claims: { sub: input.sub }
+- claims: { sub: u.id }
 - platform-claims: [iss, aud, exp, nbf, iat, jti, roles, tenant_id]
 - platform-claims-source: { roles: users.roles where id = sub, tenant_id: ctx.tenant_id }
 - ttl: 1h
@@ -67,7 +75,7 @@ signature: MEQCIA...
 - out: token
 - source-lines: 1-5
 
-### s2 respond
+### s3 respond
 - op: respond
 - value: { token: token.access, refresh_token: token.refresh }
 - source-lines: 4-4

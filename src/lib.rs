@@ -22,6 +22,7 @@ pub mod scan;
 pub mod secret;
 pub mod security;
 pub mod sign;
+pub mod sqlguard;
 pub mod validate;
 
 pub use approve::{approve_project, ApproveOptions};
