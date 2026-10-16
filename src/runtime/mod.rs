@@ -1,3 +1,4 @@
+pub mod challenge;
 mod crud;
 mod exec;
 mod http;
@@ -8,6 +9,7 @@ mod ops;
 mod slugs;
 mod sql;
 
+pub use challenge::{ChallengeContext, ChallengeError, ChallengeVerifier, TurnstileVerifier};
 pub use crud::{
     check_expr, check_when, parse_ownership, run_method, when_problem, CallCtx, CallResult, Caller,
     MethodFail, Ownership,

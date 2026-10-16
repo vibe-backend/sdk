@@ -297,6 +297,13 @@ fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
         }
         (Err(report), None) => return Err(report.to_string()),
     };
+    // #118: `vibe validate --deploy` (and any validate with a production
+    // VIBE_ENV) refuses `challenge_when: always` until a verifier is configured.
+    let run_env =
+        vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), !deploy);
+    let always = vibe::runtime::challenge::always_challenge_locks(project);
+    let configured = vibe::runtime::challenge::configured_in_env()?;
+    vibe::runtime::challenge::production_gate(run_env, configured, &always)?;
     print_report(&report);
     if deploy {
         println!("validation ok");
@@ -415,6 +422,16 @@ async fn cmd_serve(
             "warning: public routes use {{slug}} but no tenants are configured; copy slugs.example.json to .vibe/slugs.json or run `vibe slug add <slug> --tenant <id>`"
         );
     }
+    // #118: refuse `challenge_when: always` in production until a verifier
+    // is configured.
+    let challenge = vibe::runtime::challenge::verifier_from_env()?;
+    let always: Vec<String> = manifest
+        .routes
+        .iter()
+        .filter(|r| r.public && r.challenge_type != "none" && r.challenge_when == "always")
+        .map(|r| r.feature_id.clone())
+        .collect();
+    vibe::runtime::challenge::production_gate(run_env, challenge.is_some(), &always)?;
     let addr: SocketAddr = addr.parse().map_err(|err| format!("bad address: {err}"))?;
     let state = Arc::new(AppState {
         manifest,
@@ -428,6 +445,7 @@ async fn cmd_serve(
         honor_test_ip: false,
         trusted_proxies: trusted_proxies_from_env()?,
         dev_hints: memory,
+        challenge,
     });
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr)

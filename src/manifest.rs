@@ -302,7 +302,10 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
     for doc in ids {
         match doc.meta.kind {
             Kind::Model => models.push(model_from(doc)),
-            Kind::Method => methods.push(method_from(doc)),
+            Kind::Method => match method_from(doc) {
+                Ok(method) => methods.push(method),
+                Err(diag) => report.push(diag),
+            },
             Kind::Migration => migrations.push(migration_from(doc)),
             Kind::Api if doc.meta.scope == Some(Scope::Feature) => match route_from(doc, docs) {
                 Ok(route) => routes.push(route),
@@ -467,33 +470,38 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
     }
 }
 
-fn method_from(doc: &LockDoc) -> MethodSpec {
+fn method_from(doc: &LockDoc) -> Result<MethodSpec, Diag> {
     let target = doc
         .meta
         .id
         .split_once("/methods/")
         .map(|(object, method)| format!("{object}.{method}"))
         .unwrap_or_else(|| doc.meta.id.clone());
-    let writes =
-        find_section(&doc.sections, "Signature").and_then(|s| s.get("writes")) == Some("true");
-    let errors = find_section(&doc.sections, "Signature")
-        .and_then(|s| s.get("errors"))
-        .and_then(|raw| crate::lock::parse_string_list(raw).ok())
-        .unwrap_or_default();
-    let capabilities = find_section(&doc.sections, "Signature")
-        .and_then(|s| s.get("capabilities"))
-        .and_then(|raw| crate::lock::parse_string_list(raw).ok())
-        .unwrap_or_default();
-    MethodSpec {
+    let signature = find_section(&doc.sections, "Signature");
+    let writes = signature.and_then(|s| s.get("writes")) == Some("true");
+    let mut errors = Vec::new();
+    if let Some(raw) = signature.and_then(|s| s.get("errors")) {
+        errors = crate::lock::parse_string_list(raw).map_err(|err| {
+            Diag::error(&doc.meta.id, format!("invalid errors: {err}")).at_section("Signature")
+        })?;
+    }
+    let mut capabilities = Vec::new();
+    if let Some(raw) = signature.and_then(|s| s.get("capabilities")) {
+        capabilities = crate::lock::parse_string_list(raw).map_err(|err| {
+            Diag::error(&doc.meta.id, format!("invalid capabilities: {err}"))
+                .at_section("Signature")
+        })?;
+    }
+    Ok(MethodSpec {
         target,
         writes,
         input: Vec::new(),
         errors,
         capabilities,
-        steps: steps_from(find_section(&doc.sections, "Steps")),
+        steps: steps_from(find_section(&doc.sections, "Steps"), &doc.meta.id)?,
         crud_model: String::new(),
         crud_action: String::new(),
-    }
+    })
 }
 
 fn migration_from(doc: &LockDoc) -> MigrationSpec {
@@ -661,7 +669,7 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
             .and_then(|s| s.get("out"))
             .unwrap_or("result")
             .to_string(),
-        steps: steps_from(find_section(&doc.sections, "Steps")),
+        steps: steps_from(find_section(&doc.sections, "Steps"), &doc.meta.id)?,
         errors: error_rows(find_section(&doc.sections, "Errors")),
         min_response_ms,
         public_writes: access.and_then(|s| s.get("public-writes")) == Some("true"),
@@ -735,56 +743,60 @@ fn error_rows(section: Option<&crate::lock::Section>) -> Vec<ErrMap> {
         .collect()
 }
 
-fn steps_from(section: Option<&crate::lock::Section>) -> Vec<StepSpec> {
+fn steps_from(section: Option<&crate::lock::Section>, file: &str) -> Result<Vec<StepSpec>, Diag> {
     let Some(section) = section else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    section
-        .blocks
-        .iter()
-        .map(|block| {
-            let get = |key: &str| {
-                block
-                    .bullets
-                    .iter()
-                    .find(|b| b.key == key)
-                    .map(|b| b.value.clone())
-                    .unwrap_or_default()
-            };
-            let op = get("op");
-            let id = block
-                .heading
-                .split_whitespace()
-                .next()
-                .unwrap_or("s")
-                .to_string();
-            StepSpec {
-                id,
-                op: op.clone(),
-                target: get("target"),
-                args: get("args"),
-                value: get("value"),
-                status: get("status")
-                    .parse()
-                    .unwrap_or(if op == "respond" { 200 } else { 0 }),
-                sql: get("sql").trim_matches('`').trim().to_string(),
-                params: crate::lock::parse_string_list(&get("params")).unwrap_or_default(),
-                out: get("out"),
-                fail: get("fail"),
-                when_expr: get("when"),
-                writes: get("writes") == "true",
-                table: get("table"),
-                opts: block
-                    .bullets
-                    .iter()
-                    .map(|b| (b.key.clone(), b.value.clone()))
-                    .collect(),
-            }
-        })
-        .collect()
+    let mut steps = Vec::new();
+    for block in &section.blocks {
+        let get = |key: &str| {
+            block
+                .bullets
+                .iter()
+                .find(|b| b.key == key)
+                .map(|b| b.value.clone())
+                .unwrap_or_default()
+        };
+        let op = get("op");
+        let id = block
+            .heading
+            .split_whitespace()
+            .next()
+            .unwrap_or("s")
+            .to_string();
+        let mut params = Vec::new();
+        if let Some(raw) = block.bullets.iter().find(|b| b.key == "params") {
+            params = crate::lock::parse_string_list(&raw.value).map_err(|err| {
+                Diag::error(file, format!("invalid params: {err}")).at_section("Steps")
+            })?;
+        }
+        steps.push(StepSpec {
+            id,
+            op: op.clone(),
+            target: get("target"),
+            args: get("args"),
+            value: get("value"),
+            status: get("status")
+                .parse()
+                .unwrap_or(if op == "respond" { 200 } else { 0 }),
+            sql: get("sql").trim_matches('`').trim().to_string(),
+            params,
+            out: get("out"),
+            fail: get("fail"),
+            when_expr: get("when"),
+            writes: get("writes") == "true",
+            table: get("table"),
+            opts: block
+                .bullets
+                .iter()
+                .map(|b| (b.key.clone(), b.value.clone()))
+                .collect(),
+        });
+    }
+    Ok(steps)
 }
 
-fn parse_challenge(raw: &str) -> (String, String) {
+pub(crate) fn parse_challenge(raw: &str) -> (String, String) {
     let map = crate::lock::parse_inline_map(raw).unwrap_or_default();
     let ty = map
         .iter()
@@ -1089,6 +1101,65 @@ mod roles_list_tests {
             crate::lock::parse_string_list("[staff]").unwrap(),
             vec!["staff"]
         );
+    }
+}
+
+#[cfg(test)]
+mod malformed_list_tests {
+    use super::{method_from, steps_from};
+    use crate::diag::Level;
+    use crate::lock::{parse_sections, Kind, LockDoc, Meta};
+
+    fn method_doc(body: &str) -> LockDoc {
+        LockDoc {
+            meta: Meta::pending(
+                Kind::Method,
+                None,
+                "shop/methods/bad",
+                "shop/methods/bad.md",
+            ),
+            sections: parse_sections(body).expect("sections"),
+        }
+    }
+
+    #[test]
+    fn malformed_signature_errors_is_a_build_error() {
+        let doc = method_doc("## Signature\n\n- errors: NOT_FOUND\n- capabilities: []\n");
+        let err = method_from(&doc).unwrap_err();
+        assert_eq!(err.level, Level::Error);
+        assert!(err.message.contains("invalid errors"), "{err:?}");
+    }
+
+    #[test]
+    fn malformed_signature_capabilities_is_a_build_error() {
+        let doc = method_doc("## Signature\n\n- errors: []\n- capabilities: sign-jwt\n");
+        let err = method_from(&doc).unwrap_err();
+        assert!(err.message.contains("invalid capabilities"), "{err:?}");
+    }
+
+    #[test]
+    fn malformed_step_params_is_a_build_error() {
+        let doc = method_doc(
+            "## Signature\n\n- errors: []\n\n## Steps\n\n### s1\n\n- op: respond\n- params: a, b\n- status: 200\n",
+        );
+        let err = method_from(&doc).unwrap_err();
+        assert!(err.message.contains("invalid params"), "{err:?}");
+    }
+
+    #[test]
+    fn absent_lists_stay_empty() {
+        let doc = LockDoc {
+            meta: Meta::pending(Kind::Method, None, "shop/methods/ok", "shop/methods/ok.md"),
+            sections: parse_sections(
+                "## Signature\n\n- writes: false\n\n## Steps\n\n### s1\n\n- op: respond\n- status: 200\n",
+            )
+            .unwrap(),
+        };
+        let method = method_from(&doc).unwrap();
+        assert!(method.errors.is_empty());
+        assert!(method.capabilities.is_empty());
+        assert!(method.steps[0].params.is_empty());
+        assert!(steps_from(None, "x").unwrap().is_empty());
     }
 }
 
