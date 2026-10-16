@@ -29,7 +29,7 @@ permissions:
   contents: read
 
 env:
-  VIBE_SDK_REV: cecaa6682ea09405a018b59737ea460bedbf3202 # pin: full sdk commit SHA
+  VIBE_SDK_REV: 2d9d2cfcaf592c7ac94ec2f54a5ea4f96f3b64b8 # pin: full sdk commit SHA
   # The identity a release must carry. Keep in sync with the runtime's
   # VIBE_RELEASE_REPO / VIBE_RELEASE_WORKFLOW (defaults shown).
   VIBE_RELEASE_REPO: vibe-backend/sdk
