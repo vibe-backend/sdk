@@ -69,7 +69,8 @@ impl Provenance {
 /// How a manifest is built.
 #[derive(Clone, Debug, Default)]
 pub struct BuildInfo {
-    /// Release build: high-risk items need `release_approval` (decision 90).
+    /// Release build. High-risk items fail closed until release-environment
+    /// approval verification (#80) lands (decision 90/118).
     pub release: bool,
     pub release_approval: Option<String>,
     pub commit: String,
@@ -89,6 +90,14 @@ pub struct RouteSpec {
     /// runtime default.
     #[serde(default)]
     pub roles_claim: String,
+    /// Per-route JWT overrides (spec §4.1 `### auth` bullets `iss`, `aud`,
+    /// `jwks-uri`); empty means the runtime default from env.
+    #[serde(default)]
+    pub jwt_iss: String,
+    #[serde(default)]
+    pub jwt_aud: String,
+    #[serde(default)]
+    pub jwks_uri: String,
     pub rates: Vec<RateSpec>,
     pub body_limit: u64,
     pub request: Vec<ReqField>,
@@ -351,7 +360,11 @@ pub fn build_signed(
             .clone()
             .filter(|r| !r.trim().is_empty()),
     };
-    if info.release && manifest.provenance.release_approval.is_none() {
+    // Decision 90/118: the approval is the `release` environment approval,
+    // verified against the platform (#80). Until that verification exists,
+    // a release build with high-risk items fails closed; no
+    // `--release-approval` value counts as approval.
+    if info.release {
         let high: Vec<String> = manifest
             .provenance
             .high_risk()
@@ -360,7 +373,7 @@ pub fn build_signed(
             .collect();
         if !high.is_empty() {
             return Err(single(format!(
-                "release build has high-risk items and no release approval: {}; pass --release-approval <ref>",
+                "release build has high-risk items: {}; release-environment approval verification (#80) is not implemented yet, so high-risk release builds fail closed (--release-approval is not accepted as approval)",
                 high.join(", ")
             )));
         }
@@ -389,8 +402,10 @@ pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), St
     if provenance.locks.is_empty() {
         return Err("manifest has no lock provenance".into());
     }
-    if !provenance.high_risk().is_empty() && provenance.release_approval.is_none() {
-        return Err("manifest has high-risk items without a release approval".into());
+    // Fail closed until release-environment approval verification (#80):
+    // a recorded approval string is not proof of approval.
+    if !provenance.high_risk().is_empty() {
+        return Err("manifest has high-risk items without a verified release approval".into());
     }
     Ok(())
 }
@@ -634,6 +649,9 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
     let mut roles = Vec::new();
     let mut scopes = Vec::new();
     let mut roles_claim = String::new();
+    let mut jwt_iss = String::new();
+    let mut jwt_aud = String::new();
+    let mut jwks_uri = String::new();
     let mut rates = Vec::new();
     if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
         for block in &pipes.blocks {
@@ -672,6 +690,15 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
                         return Err(Diag::error(&doc.meta.id, problem).at_section("Pipelines"));
                     }
                 }
+                for (bullet, slot) in [
+                    ("iss", &mut jwt_iss),
+                    ("aud", &mut jwt_aud),
+                    ("jwks-uri", &mut jwks_uri),
+                ] {
+                    if let Some(raw) = block.bullets.iter().find(|b| b.key == bullet) {
+                        *slot = raw.value.trim().to_string();
+                    }
+                }
             }
             if name == "rate-limit" {
                 check_rate_params(block.bullets.iter().map(|b| b.key.as_str()))
@@ -706,6 +733,11 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
             }
         }
     }
+    if let Some(problem) =
+        jwt_override_problem(&jwt_iss, &jwt_aud, &jwks_uri, auth_removed, &auth_mode)
+    {
+        return Err(Diag::error(&doc.meta.id, problem).at_section("Pipelines"));
+    }
     for rate in &rates {
         check_rate_key(&rate.key, auth_removed, &auth_mode)
             .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
@@ -733,6 +765,9 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         roles,
         scopes,
         roles_claim,
+        jwt_iss,
+        jwt_aud,
+        jwks_uri,
         rates,
         body_limit,
         request: request_fields(find_section(&doc.sections, "Request")),
@@ -1012,6 +1047,116 @@ pub fn roles_claim_problem(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Why a route's `iss` / `aud` / `jwks-uri` override cannot be used, if it
+/// cannot. Issuers and JWKS URIs must be https (an http issuer would let a
+/// network attacker serve keys); overrides only make sense on JWT routes.
+pub fn jwt_override_problem(
+    iss: &str,
+    aud: &str,
+    jwks_uri: &str,
+    auth_removed: bool,
+    auth_mode: &str,
+) -> Option<String> {
+    if iss.is_empty() && aud.is_empty() && jwks_uri.is_empty() {
+        return None;
+    }
+    if auth_removed || auth_mode != "jwt" {
+        return Some("iss / aud / jwks-uri apply only to JWT auth routes".into());
+    }
+    for (name, value) in [("iss", iss), ("jwks-uri", jwks_uri)] {
+        if value.is_empty() {
+            continue;
+        }
+        match url::Url::parse(value) {
+            Ok(url) if url.scheme() == "https" && url.host_str().is_some() => {
+                if !url.username().is_empty() || url.password().is_some() {
+                    return Some(format!("{name} must not carry credentials"));
+                }
+                if crate::runtime::jwks::non_public_host(url.host_str().unwrap_or("")) {
+                    // Locks ship to production: no private/loopback/link-local
+                    // issuers (the derived {iss}/.well-known/jwks.json too).
+                    return Some(format!(
+                        "{name} host must be public (not loopback, private or link-local)"
+                    ));
+                }
+                if name == "jwks-uri" && url.fragment().is_some() {
+                    return Some("jwks-uri must not have a fragment".into());
+                }
+            }
+            _ => return Some(format!("{name} `{value}` must be an absolute https URL")),
+        }
+    }
+    if !aud.is_empty()
+        && (aud.len() > 256
+            || aud
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == ',' || c == '['))
+    {
+        return Some(format!("aud `{aud}` must be a single audience value"));
+    }
+    if !jwks_uri.is_empty() && iss.is_empty() {
+        // Keys from another IdP checked against the default issuer would mix
+        // trust domains; pin the issuer that goes with the keys.
+        return Some("jwks-uri requires iss on the same route".into());
+    }
+    None
+}
+
+#[cfg(test)]
+mod jwt_override_tests {
+    use super::jwt_override_problem;
+
+    #[test]
+    fn overrides_are_validated() {
+        fn ok(i: &str, a: &str, j: &str) -> bool {
+            jwt_override_problem(i, a, j, false, "jwt").is_none()
+        }
+        assert!(ok("", "", ""));
+        assert!(ok("https://idp.example.com/t1", "shop", ""));
+        assert!(ok(
+            "https://idp.example.com/t1",
+            "",
+            "https://idp.example.com/t1/keys"
+        ));
+        assert!(ok("", "other-aud", ""));
+        assert!(!ok("http://idp.example.com", "", ""));
+        assert!(!ok(
+            "https://idp.example.com",
+            "",
+            "http://idp.example.com/k"
+        ));
+        assert!(
+            !ok("", "", "https://idp.example.com/k"),
+            "jwks-uri needs iss"
+        );
+        assert!(!ok("https://u:p@idp.example.com", "", ""));
+        assert!(!ok("idp.example.com", "", ""));
+        assert!(!ok("", "a b", ""));
+        assert!(!ok("", "a,b", ""));
+        assert!(!ok("", "[a,b]", ""));
+        assert!(!ok(
+            "https://idp.example.com",
+            "",
+            "https://u:p@idp.example.com/k"
+        ));
+        for host in [
+            "https://127.0.0.1",
+            "https://localhost",
+            "https://169.254.169.254",
+            "https://10.1.2.3",
+            "https://[::1]",
+        ] {
+            assert!(!ok(host, "", ""), "iss {host}");
+            assert!(
+                !ok("https://idp.example.com", "", &format!("{host}/k")),
+                "jwks {host}"
+            );
+        }
+        assert!(jwt_override_problem("https://i.example.com", "", "", true, "jwt").is_some());
+        assert!(jwt_override_problem("https://i.example.com", "", "", false, "api-key").is_some());
+    }
 }
 
 #[cfg(test)]

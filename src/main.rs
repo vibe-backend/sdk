@@ -46,11 +46,13 @@ enum Command {
         /// Output path, relative to the current directory (like `serve --manifest`).
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
-        /// Release build: signs with VIBE_RELEASE_SIGNING_KEY only and fails on
-        /// high-risk items without --release-approval.
+        /// Release build: signs with VIBE_RELEASE_SIGNING_KEY only, never reads
+        /// .env, requires an allowlisted LLM host, and fails closed on
+        /// high-risk items until release-environment approval verification (#80).
         #[arg(long)]
         release: bool,
-        /// Reference to the approval of this release's high-risk items.
+        /// Recorded for audit only. It is not accepted as approval: the approval
+        /// is the `release` environment approval (decision 90/118, #80).
         #[arg(long)]
         release_approval: Option<String>,
         /// Source commit to record (default: GITHUB_SHA or `git rev-parse HEAD`).
@@ -318,11 +320,16 @@ async fn cmd_manifest(
     // files from disk; a dev manifest uses the locks `vibe compile` wrote
     // (checked against the build record).
     let loaded = if release {
-        load_dotenv(project);
-        // The release environment provides the compiler key as VIBE_LLM_API_KEY.
+        // A release build never reads the project .env: every input comes
+        // from the release environment.
         let mut env = llm::env_map_from_process();
         if let Some(key) = env.get("VIBE_LLM_API_KEY").cloned() {
             env.entry("LLM_API_KEY".into()).or_insert(key);
+        }
+        // No LLM key (VIBE_LLM_API_KEY or LLM_API_KEY) is ever sent to a
+        // host outside the release allowlist.
+        if let Ok(config) = llm::load_llm_config(&env, true) {
+            llm::check_release_endpoint(&config)?;
         }
         let config = llm::load_llm_config(&env, true).ok();
         let adapter = match &config {
@@ -371,7 +378,8 @@ fn print_high_risk(manifest: &manifest::Manifest) {
 }
 
 /// Manifest verifying key. Production trusts only the pinned release key
-/// (VIBE_MANIFEST_PUBKEY or one compiled in); the project's
+/// (one compiled in with VIBE_RELEASE_PUBKEY, which VIBE_MANIFEST_PUBKEY
+/// cannot override, else VIBE_MANIFEST_PUBKEY); the project's
 /// `.vibe/signing.pub` is accepted in development only.
 fn manifest_key(
     project: &Path,
@@ -419,10 +427,12 @@ async fn cmd_serve(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
-    let auth = auth_from_env(run_env)?;
+    let mut auth = auth_from_env(run_env)?;
     let key = manifest_key(project, run_env)?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
     check_deployable(&manifest, run_env)?;
+    // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
+    auth.add_route_jwks(&manifest.routes)?;
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::new())
     } else {
@@ -431,7 +441,7 @@ async fn cmd_serve(
             .map_err(|_| {
                 "set VIBE_DATABASE_URL or pass --memory for the dev executor".to_string()
             })?;
-        let pg = PgExec::connect(&url).await?;
+        let pg = PgExec::connect_with(&url, vibe::runtime::PgOptions::from_env()?).await?;
         pg.check_runtime_role().await?;
         Arc::new(pg)
     };
@@ -560,7 +570,11 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
         return Err("set either VIBE_JWT_PUBLIC_KEY_PEM or VIBE_JWT_JWKS_URI, not both".into());
     }
     if let Some(uri) = jwks_uri {
-        let source = vibe::runtime::jwks::HttpsJwks::new(&uri)?;
+        let allow_private = std::env::var("VIBE_JWT_ALLOW_PRIVATE_HOST").as_deref() == Ok("true");
+        if allow_private && !run_env.is_dev() {
+            return Err("VIBE_JWT_ALLOW_PRIVATE_HOST is only allowed in development".into());
+        }
+        let source = vibe::runtime::jwks::HttpsJwks::with_policy(&uri, allow_private)?;
         auth.jwks = Some(std::sync::Arc::new(vibe::runtime::jwks::JwksCache::new(
             std::sync::Arc::new(source),
         )));

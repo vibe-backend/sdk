@@ -21,8 +21,10 @@ Locks are build output. They are not committed (`*.lock.md` is in
    `gh attestation verify --repo --signer-workflow --source-ref refs/heads/main`
    (fail closed), and deploys the same file to staging and then production.
 4. **Run.** Outside development, `vibe serve` / `vibe migrate` verify the
-   manifest with the pinned release public key only (`VIBE_MANIFEST_PUBKEY`,
-   or one compiled in with `VIBE_RELEASE_PUBKEY`) and run only
+   manifest with the pinned release public key only: a key compiled into the
+   binary with `VIBE_RELEASE_PUBKEY` (the runtime `VIBE_MANIFEST_PUBKEY`
+   cannot override it; a differing value is refused), otherwise
+   `VIBE_MANIFEST_PUBKEY`. They run only
    `build_mode: release` manifests. `.vibe/signing.pub` is ignored there.
 
 ## Setup (done by a repo admin, not by the SDK)

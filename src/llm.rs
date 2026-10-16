@@ -379,6 +379,27 @@ const FLOATING_ALIASES: &[&str] = &[
     "o4-mini",
 ];
 
+/// LLM hosts a release build may send a key to. The default endpoint
+/// (api.openai.com when LLM_BASE_URL is unset) is on the list.
+pub const RELEASE_LLM_HOSTS: &[&str] = &[
+    "api.openai.com",
+    "api.anthropic.com",
+    "generativelanguage.googleapis.com",
+];
+
+/// Release builds only talk to allowlisted hosts, over https.
+pub fn check_release_endpoint(config: &LlmConfig) -> Result<(), String> {
+    let host = config.endpoint_host.to_ascii_lowercase();
+    if config.endpoint_private || !RELEASE_LLM_HOSTS.contains(&host.as_str()) {
+        return Err(format!(
+            "release builds only send the LLM key to an allowlisted host ({}); LLM_BASE_URL points at {}",
+            RELEASE_LLM_HOSTS.join(", "),
+            if host.is_empty() { "(none)" } else { &host }
+        ));
+    }
+    Ok(())
+}
+
 fn default_base_url(provider: &str) -> &'static str {
     match provider {
         ANTHROPIC => "https://api.anthropic.com",
@@ -416,34 +437,11 @@ fn classify_endpoint(
 }
 
 fn is_loopback(host: &str) -> bool {
-    let host = host.trim_matches(['[', ']']);
-    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+    crate::netguard::is_loopback_host(host)
 }
 
-fn is_private_host(host: &str) -> bool {
-    let host = host.trim_matches(['[', ']']);
-    if host.eq_ignore_ascii_case("localhost")
-        || host.ends_with(".localhost")
-        || host.ends_with(".internal")
-        || host.ends_with(".local")
-    {
-        return true;
-    }
-    if !host.contains('.') && !host.contains(':') {
-        return true;
-    }
-    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-        return ip.is_private() || ip.is_loopback() || ip.is_link_local();
-    }
-    if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
-        return ip.is_loopback() || is_ula_or_link_local(ip);
-    }
-    false
-}
-
-fn is_ula_or_link_local(ip: std::net::Ipv6Addr) -> bool {
-    let octets = ip.octets();
-    octets[0] & 0xfe == 0xfc || octets[0] == 0xfe && octets[1] & 0xc0 == 0x80
+pub(crate) fn is_private_host(host: &str) -> bool {
+    crate::netguard::is_non_public_host(host)
 }
 
 fn parse_timeout(raw: &str, report: &mut Report) -> Duration {
@@ -598,8 +596,16 @@ pub fn describe_failure(
 
 impl HttpAdapter {
     pub fn new(config: LlmConfig) -> Result<Self, String> {
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .timeout(config.timeout)
+            // A redirect could lead to a host the endpoint check never saw.
+            .redirect(reqwest::redirect::Policy::none());
+        if !config.endpoint_private {
+            // A public endpoint must not resolve to a private address (DNS
+            // rebinding); every resolved address is checked before connecting.
+            builder = crate::netguard::guard_client(builder);
+        }
+        let client = builder
             .build()
             .map_err(|err| format!("http client: {err}"))?;
         Ok(Self { config, client })

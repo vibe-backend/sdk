@@ -261,10 +261,13 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
     }
 }
 
-/// Deterministic auth policy: a feature lock may narrow, never widen, the
-/// auth its definition/version locks declare. Removing roles, changing the
-/// mode, or dropping the auth pipeline without `-auth` (which is itself a
-/// high-risk `auth-removed` item) fails closed.
+/// Deterministic auth policy: a feature lock inherits the merged auth of all
+/// its definition/version locks. Its roles must stay within the inherited
+/// roles (a wider list fails, and so does an empty one unless the mode
+/// changed), whatever its mode. A mode
+/// change (a missing mode is `jwt`) must be recorded as a high-risk
+/// `auth-mode-change` item, and dropping the auth pipeline without `-auth`
+/// (itself a high-risk `auth-removed` item) fails closed.
 fn check_inherited_auth(
     docs: &HashMap<String, LockDoc>,
     sources: &[SourceFile],
@@ -298,7 +301,9 @@ fn check_inherited_auth(
             continue;
         }
         let file = lock_rel(&source.rel);
-        let mut inherited: Option<(String, Vec<String>)> = None;
+        // Merge every parent auth block (definition and version): the union
+        // of their roles is the inherited set.
+        let mut inherited: Option<(Vec<String>, Vec<String>)> = None;
         for dep in &doc.meta.dependencies {
             let Some(parent) = docs.get(&dep.id) else {
                 continue;
@@ -307,12 +312,25 @@ fn check_inherited_auth(
                 continue;
             }
             for block in auth_blocks(parent) {
-                if let Some(roles) = roles_of(block) {
-                    inherited = Some((block_val(block, "mode"), roles));
+                if block.heading.ends_with("-auth") {
+                    continue;
+                }
+                let Some(roles) = roles_of(block) else {
+                    continue;
+                };
+                let entry = inherited.get_or_insert_with(|| (Vec::new(), Vec::new()));
+                let mode = crate::security::auth_mode(&block_val(block, "mode"));
+                if !entry.0.contains(&mode) {
+                    entry.0.push(mode);
+                }
+                for role in roles {
+                    if !entry.1.contains(&role) {
+                        entry.1.push(role);
+                    }
                 }
             }
         }
-        let Some((mode, roles)) = inherited else {
+        let Some((modes, roles)) = inherited else {
             continue;
         };
         let own = auth_blocks(doc);
@@ -326,22 +344,39 @@ fn check_inherited_auth(
             ));
             continue;
         };
-        if block_val(block, "mode") != mode {
-            // A different mode (e.g. api-key with scopes) is a declared
-            // override; inherited roles do not apply to it.
-            continue;
+        // A mode change (for example jwt to api-key) is never a quiet
+        // override: it must be recorded as a high-risk item, and the
+        // inherited roles still apply to the feature.
+        let own_mode = crate::security::auth_mode(&block_val(block, "mode"));
+        let mode_changed = modes.iter().any(|mode| *mode != own_mode);
+        if mode_changed
+            && !doc
+                .meta
+                .security_items
+                .iter()
+                .any(|item| item.item == "auth-mode-change" && item.risk == crate::lock::Risk::High)
+        {
+            report.push(Diag::error(
+                &file,
+                format!(
+                    "auth mode {own_mode} differs from the inherited mode [{}] and is not recorded as a high-risk item",
+                    modes.join(", ")
+                ),
+            ));
         }
         match roles_of(block) {
             None => report.push(Diag::error(&file, "auth roles cannot be parsed")),
-            Some(own_roles) if !roles.is_empty() && own_roles.is_empty() => {
-                report.push(Diag::error(
+            // Under a recorded mode change (e.g. api-key with scopes) a
+            // feature may omit roles; any roles it lists must still stay
+            // within the inherited ones.
+            Some(own_roles) if !roles.is_empty() && own_roles.is_empty() && !mode_changed => report
+                .push(Diag::error(
                     &file,
                     format!(
                         "auth roles are missing; inherited roles are [{}]",
                         roles.join(", ")
                     ),
-                ))
-            }
+                )),
             Some(own_roles) if !roles.is_empty() => {
                 if let Some(extra) = own_roles.iter().find(|r| !roles.contains(r)) {
                     report.push(Diag::error(
@@ -836,6 +871,28 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
             }
         }
         for block in &pipes.blocks {
+            if pipeline_name(&block.heading) != "auth" {
+                continue;
+            }
+            let get = |k: &str| {
+                block
+                    .bullets
+                    .iter()
+                    .find(|b| b.key == k)
+                    .map(|b| b.value.trim().to_string())
+                    .unwrap_or_default()
+            };
+            if let Some(problem) = crate::manifest::jwt_override_problem(
+                &get("iss"),
+                &get("aud"),
+                &get("jwks-uri"),
+                auth_removed,
+                &auth_mode,
+            ) {
+                report.push(Diag::error(file, problem).at_section("Pipelines"));
+            }
+        }
+        for block in &pipes.blocks {
             let name = pipeline_name(&block.heading);
             if name == "auth" {
                 if let Some(roles) = block.bullets.iter().find(|b| b.key == "roles") {
@@ -1216,6 +1273,8 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
     if FORBIDDEN_SQL.is_match(&cleaned) {
         problems.push("DELETE, TRUNCATE, GRANT, and REVOKE are forbidden".into());
     }
+    static WHERE_WORD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)\bwhere\b").expect("regex"));
     static SELECT_INTO: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)\bselect\b[^;]*\binto\b").expect("regex"));
     if !migration && (DDL_SQL.is_match(&cleaned) || SELECT_INTO.is_match(&cleaned)) {
@@ -1223,7 +1282,7 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
     }
     if crate::security::sql_writes(trimmed)
         && lower.contains("update")
-        && !lower.contains(" where ")
+        && !WHERE_WORD.is_match(&lower)
     {
         problems.push("UPDATE needs a WHERE clause".into());
     }
@@ -1488,6 +1547,13 @@ fn check_security_items_enriched(
         let file = lock_rel(&source.rel);
         let mut expected = security::extract_items(doc);
         security::enrich_feature_writes(doc, docs, &mut expected);
+        if security::auth_mode_changed(doc, docs) {
+            expected.push(crate::lock::SecurityItem {
+                item: "auth-mode-change".into(),
+                risk: crate::lock::Risk::High,
+                reason: String::new(),
+            });
+        }
         if scan::scan_text(&source.combined_text())
             .iter()
             .any(|hit| !hit.fatal)
