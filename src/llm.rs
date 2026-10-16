@@ -1343,6 +1343,7 @@ mod tests {
                 model: model.into(),
                 seed: 0,
                 timeout: Duration::from_secs(5),
+                budget: None,
             };
             let (url, _, _) = gemini_call(&config, &request);
             let expected = format!(
@@ -1368,6 +1369,7 @@ mod tests {
             model: "gemini-2.5-pro-001".into(),
             seed: 0,
             timeout: Duration::from_secs(5),
+            budget: None,
         };
         let (url, _, _) = gemini_call(&config, &request);
         assert_eq!(

@@ -22,14 +22,14 @@ MODEL KEYS:
 - ## Fields table header is exactly `| name | type | rules | system |`. One row per user field; do NOT add id, tenant_id, created_at, updated_at, deleted_at, erased_at (the platform adds them). system is `no`.
 - type is one of: uuid, string, string[], integer, number, boolean, timestamp, password, json, bytes.
 - rules is a comma-separated list from: required, nullable, unique, primary, default: <value|gen|now>, format: email, min: <int>, max: <int>, enum: [a, b], sensitive, untrusted, personal: <standard|sensitive>, public-writable. For strings min/max are character lengths (\"at most 80 characters\" is `max: 80`; there is no max_length/min_length/maxLength key). For integers/numbers min/max are values.
-- `unique` is per column only. A uniqueness over several columns together cannot be expressed in Fields: do NOT mark each column unique; leave the columns without `unique` (it needs a migration with a composite unique index).
+- `unique` is per column only. A uniqueness over several columns together cannot be expressed in Fields: do NOT mark each column unique; leave the columns without `unique` (it needs a migration with a composite unique index). TODO(D107): spec decision 107 adds a `## Constraints` section (`- unique: [col_a, col_b]`); switch this rule to emit it once the lock grammar supports it.
 - ## CRUD table header is exactly `| method | options |`; rows only for actions the source asks for: create, get, list, update, delete. list options: page-size: N, max-page-size: N (<= 500), sort: [fields], filter: [fields]. update options: optimistic-lock: if-match. delete options: soft: true. No options: `-`.
 - ## Policies: write `(none)`; the platform generates RLS and grants.
 ";
 
 const METHOD_KEYS: &str = "\
 METHOD KEYS:
-- ## Signature bullets: input ({ name: { type: T, required: true } }), output, errors ([CODE, ...]), writes (true|false), capabilities ([] or [sign-token] / [set-password] only when the source says so).
+- ## Signature bullets: input ({ name: { type: T, required: true } }), output, errors ([CODE, ...]), writes (true|false), capabilities ([] or [sign-token] / [set-password] / [confirm-verification] only when the source says so).
 - ## Calls: `- methods: [object.action, ...]` (platform recomputes it from steps).
 - ## Steps keys per op (plus `op` first and `source-lines` last on every step):
   - query: sql (`one parameterized statement` in backticks), params ([input.x, ctx.user.id, prev.x]), writes (true|false), scope (pk|rls, required for UPDATE), out.

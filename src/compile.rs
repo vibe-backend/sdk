@@ -171,7 +171,17 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                         model_snapshot: stamp.model_snapshot.clone(),
                         hash: hash.clone(),
                     });
-                    record_translation_for_audit(opts.root, &source.id, &hash, &text);
+                    if let Err(e) =
+                        record_translation_for_audit(opts.root, &source.id, &hash, &text)
+                    {
+                        report.push(Diag::error(
+                            &source.rel,
+                            format!(
+                                "could not write the D109 translation audit record under {TRANSLATION_AUDIT_DIR}: {e}"
+                            ),
+                        ));
+                        continue;
+                    }
                     english.insert(source.id.clone(), text);
                 }
                 Err(diag) => {
@@ -506,16 +516,19 @@ pub const TRANSLATION_AUDIT_DIR: &str = ".vibe/audit/translations";
 /// #97). When the release job builds it, include every file under
 /// `TRANSLATION_AUDIT_DIR` so its digest is covered by the attestation, and
 /// check each file's sha256 against the lock's `translation.hash`.
-fn record_translation_for_audit(root: &std::path::Path, id: &str, hash: &str, text: &str) {
+fn record_translation_for_audit(
+    root: &std::path::Path,
+    id: &str,
+    hash: &str,
+    text: &str,
+) -> std::io::Result<()> {
     let dir = root.join(TRANSLATION_AUDIT_DIR);
-    if fs::create_dir_all(&dir).is_err() {
-        return;
-    }
+    fs::create_dir_all(&dir)?;
     let name = id.replace('/', "__");
-    let _ = fs::write(
+    fs::write(
         dir.join(format!("{name}.txt")),
         format!("lock-id: {id}\ntranslation-hash: {hash}\n\n{text}"),
-    );
+    )
 }
 
 /// Prose outside code spans contains non-ASCII text.
