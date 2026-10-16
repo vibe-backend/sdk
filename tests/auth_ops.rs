@@ -27,6 +27,46 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0mqNqll14aIJEhYqCiRLWJX63Ty6\n\
 Q0UxBzbmJ2wI9FMVJLw4XEhuIJFqIdA/P6b6ozSNGyOUZK7OjIfGKtpNYw==\n\
 -----END PUBLIC KEY-----\n";
 
+#[test]
+fn jsonwebtoken_rejects_off_curve_key_without_startup_checks() {
+    use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+    use serde_json::{json, Value};
+
+    let token = encode(
+        &Header::new(Algorithm::ES256),
+        &json!({"sub": "test", "exp": 4_102_444_800u64}),
+        &EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let validation = Validation::new(Algorithm::ES256);
+    let valid_key = DecodingKey::from_ec_pem(PUBLIC_PEM.as_bytes()).unwrap();
+    assert!(decode::<Value>(&token, &valid_key, &validation).is_ok());
+
+    // Keep the valid x coordinate and change y's low bit to leave P-256.
+    // Pass the PEM directly to jsonwebtoken, bypassing our startup checks.
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mut der = STANDARD
+        .decode(
+            PUBLIC_PEM
+                .lines()
+                .filter(|line| !line.starts_with("-----"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    let last = der.len() - 1;
+    der[last] ^= 1;
+    let pem = format!(
+        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+        STANDARD.encode(&der)
+    );
+    assert_eq!(
+        vibe::runtime::eckey::p256_public(&pem),
+        Err(vibe::runtime::eckey::EcProblem::BadPoint)
+    );
+    let key = DecodingKey::from_ec_pem(pem.as_bytes()).expect("off-curve PEM loads");
+    assert!(decode::<Value>(&token, &key, &validation).is_err());
+}
+
 fn fixture() -> Manifest {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -648,6 +688,49 @@ fn missing_signing_key_refuses_to_start() {
     assert!(err.contains("JWT_SIGNING_KEY"), "{err}");
 }
 
+/// PRIVATE_PEM with its private scalar replaced by `d`, or with two bytes
+/// appended after the key.
+fn altered_private_pem(d: Option<[u8; 32]>) -> String {
+    use base64::Engine;
+    let b64: String = PRIVATE_PEM
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect();
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut der = engine.decode(b64).unwrap();
+    match d {
+        Some(d) => {
+            let marker = [0x02, 0x01, 0x01, 0x04, 0x20];
+            let at = der.windows(5).position(|w| w == marker).unwrap() + 5;
+            der[at..at + 32].copy_from_slice(&d);
+        }
+        None => der.extend_from_slice(&[0x05, 0x00]),
+    }
+    format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        engine.encode(der)
+    )
+}
+
+#[test]
+fn unusable_es256_signing_key_refuses_to_start() {
+    let order: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
+        0x25, 0x51,
+    ];
+    for (name, pem) in [
+        ("d = 0", altered_private_pem(Some([0; 32]))),
+        ("d = n", altered_private_pem(Some(order))),
+        ("d = 2^256 - 1", altered_private_pem(Some([0xff; 32]))),
+        ("trailing bytes", altered_private_pem(None)),
+    ] {
+        let res = vibe::runtime::load_signing_keys(&fixture(), &|_| Some(pem.clone()), "local");
+        let err = res.err().unwrap_or_else(|| panic!("{name} accepted"));
+        assert!(err.contains("JWT_SIGNING_KEY"), "{name}: {err}");
+    }
+}
+
 #[tokio::test]
 async fn query_steps_need_postgres() {
     let m = method_manifest(
@@ -1096,4 +1179,102 @@ async fn writing_query_needs_a_method_marked_writes() {
     m.methods[0].writes = false;
     let err = run(&m, &users(), json!({"n": "x"})).await.unwrap_err();
     assert!(err.1.contains("method is not marked writes"), "{err:?}");
+}
+
+fn fixture_with_alg(alg: Option<&str>) -> Manifest {
+    let mut m = fixture();
+    for method in &mut m.methods {
+        for step in method.steps.iter_mut().filter(|s| s.op == "sign-jwt") {
+            match alg {
+                Some(alg) => {
+                    step.opts.insert("alg".into(), alg.into());
+                }
+                None => {
+                    step.opts.remove("alg");
+                }
+            }
+        }
+    }
+    m
+}
+
+#[test]
+fn rs256_signing_key_under_2048_bits_refuses_to_start() {
+    // Decision 139 (#222).
+    let short = include_str!("../src/runtime/testdata/rsa-k1024.pem");
+    let ok = include_str!("../src/runtime/testdata/rsa-k2048.pem");
+    let m = fixture_with_alg(Some("RS256"));
+    let err = vibe::runtime::load_signing_keys(
+        &m,
+        &|name| (name == "JWT_SIGNING_KEY").then(|| short.to_string()),
+        "local",
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("at least 2048 bits"), "{err}");
+    assert!(
+        !err.contains("MII"),
+        "key material must not be printed: {err}"
+    );
+    let keys = vibe::runtime::load_signing_keys(
+        &m,
+        &|name| (name == "JWT_SIGNING_KEY").then(|| ok.to_string()),
+        "local",
+    )
+    .unwrap();
+    assert_eq!(keys["JWT_SIGNING_KEY"].alg, jsonwebtoken::Algorithm::RS256);
+}
+
+#[test]
+fn sign_jwt_without_alg_defaults_to_es256() {
+    // Decision 139 (#226).
+    let keys = vibe::runtime::load_signing_keys(
+        &fixture_with_alg(None),
+        &|name| (name == "JWT_SIGNING_KEY").then(|| PRIVATE_PEM.to_string()),
+        "local",
+    )
+    .unwrap();
+    assert_eq!(keys["JWT_SIGNING_KEY"].alg, jsonwebtoken::Algorithm::ES256);
+}
+
+#[test]
+fn es256_signing_key_must_be_p256() {
+    // Decision 139: other curves refuse to start.
+    let pem = include_str!("../src/runtime/testdata/ec-p384-k.pem");
+    for alg in [Some("ES256"), None] {
+        let err = vibe::runtime::load_signing_keys(
+            &fixture_with_alg(alg),
+            &|name| (name == "JWT_SIGNING_KEY").then(|| pem.to_string()),
+            "local",
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("P-256"), "{err}");
+        assert!(
+            !err.contains("MI"),
+            "key material must not be printed: {err}"
+        );
+    }
+}
+
+#[test]
+fn sec1_signing_keys_are_rejected() {
+    for pem in [
+        include_str!("../src/runtime/testdata/ec-p256-sec1.pem"),
+        include_str!("../src/runtime/testdata/ec-p384-sec1.pem"),
+    ] {
+        for alg in [Some("ES256"), None] {
+            let err = vibe::runtime::load_signing_keys(
+                &fixture_with_alg(alg),
+                &|name| (name == "JWT_SIGNING_KEY").then(|| pem.to_string()),
+                "local",
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                err,
+                "JWT_SIGNING_KEY: SEC1 EC PRIVATE KEY is not supported; use PKCS#8 PRIVATE KEY"
+            );
+        }
+    }
 }
