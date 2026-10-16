@@ -644,9 +644,38 @@ pub fn production_gate(env: RunEnv, configured: bool, routes: &[String]) -> Resu
     ))
 }
 
+/// Whether a declared challenge is never verified at runtime: only public
+/// routes with `when: always` are checked, so `after-failures` routes and
+/// non-public (authenticated) routes that declare a challenge are not (#199).
+pub fn challenge_unverified(public: bool, ty: &str, when: &str) -> bool {
+    ty != "none" && !(public && when == "always")
+}
+
+/// Error when production would serve routes whose declared challenge is not
+/// verified at runtime (#199). `routes` are the offending lock or route ids.
+pub fn unverified_gate(env: RunEnv, routes: &[String]) -> Result<(), String> {
+    if env != RunEnv::Production || routes.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "challenge with `when: after-failures` or on an authenticated route is temporarily unsupported in production until verified challenges on these routes are implemented (#201); only public routes with `when: always` are verified (use `type: none` or make the route public with `when: always`); affected: {}",
+        routes.join(", ")
+    ))
+}
+
+/// Lock files (project-relative) whose `## Access` declares a challenge that
+/// is not verified at runtime (see [`challenge_unverified`]).
+pub fn unverified_challenge_locks(root: &Path) -> Vec<String> {
+    scan_locks(root, challenge_unverified)
+}
+
 /// Lock files (project-relative) whose `## Access` declares a challenge with
 /// `when: always`.
 pub fn always_challenge_locks(root: &Path) -> Vec<String> {
+    scan_locks(root, |_, ty, when| ty != "none" && when == "always")
+}
+
+fn scan_locks(root: &Path, matches: impl Fn(bool, &str, &str) -> bool) -> Vec<String> {
     let Ok(sources) = crate::discover::discover(root) else {
         return Vec::new();
     };
@@ -659,14 +688,11 @@ pub fn always_challenge_locks(root: &Path) -> Vec<String> {
         let Ok(doc) = crate::lock::parse_lock(&text) else {
             continue;
         };
-        let raw = doc
-            .sections
-            .iter()
-            .find(|s| s.name == "Access")
-            .and_then(|s| s.get("challenge"))
-            .unwrap_or("");
+        let access = doc.sections.iter().find(|s| s.name == "Access");
+        let raw = access.and_then(|s| s.get("challenge")).unwrap_or("");
+        let public = access.and_then(|s| s.get("public")) == Some("true");
         let (ty, when) = crate::manifest::parse_challenge(raw);
-        if ty != "none" && when == "always" {
+        if matches(public, &ty, &when) {
             out.push(rel);
         }
     }
@@ -798,5 +824,34 @@ mod tests {
         assert!(production_gate(RunEnv::Production, false, &[]).is_ok());
         assert!(production_gate(RunEnv::Dev, false, &routes).is_ok());
         assert!(production_gate(RunEnv::Ci, false, &routes).is_ok());
+    }
+
+    #[test]
+    fn only_public_always_challenges_count_as_verified() {
+        assert!(!challenge_unverified(true, "captcha", "always"));
+        assert!(!challenge_unverified(false, "none", "always"));
+        assert!(!challenge_unverified(true, "none", "after-failures"));
+        assert!(challenge_unverified(true, "captcha", "after-failures"));
+        assert!(challenge_unverified(false, "captcha", "after-failures"));
+        assert!(challenge_unverified(false, "captcha", "always"));
+        assert!(challenge_unverified(false, "pow", "always"));
+    }
+
+    #[test]
+    fn production_refuses_unverified_challenges() {
+        let login = vec!["api/login.lock.md".to_string()];
+        let authed = vec!["api/orders.lock.md".to_string()];
+        for routes in [&login, &authed] {
+            let err = unverified_gate(RunEnv::Production, routes).unwrap_err();
+            assert!(err.contains(&routes[0]), "{err}");
+            assert!(
+                err.contains("temporarily unsupported in production"),
+                "{err}"
+            );
+            assert!(err.contains("#201"), "{err}");
+            assert!(unverified_gate(RunEnv::Dev, routes).is_ok());
+            assert!(unverified_gate(RunEnv::Ci, routes).is_ok());
+        }
+        assert!(unverified_gate(RunEnv::Production, &[]).is_ok());
     }
 }
