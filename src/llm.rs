@@ -752,19 +752,21 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
             text = text.replace(&secret, "[redacted]");
         }
     }
-    for pattern in [
-        r#"(?i)[a-z][a-z0-9+.-]*://[^\s/"'<>]*@[^\s"'<>]*"#,
-        r#"(?i)\b[a-z0-9_]*(?:password|passwd|pwd)[a-z0-9_]*[\s"']*[:=]\s*(?:"[^"]*"|'[^']*'|[^;\s,}]+)"#,
-        r"(?i)\b(?:password|passwd|pwd)\s*=\s*[^;\r\n]*",
-        r#"(?i)\b[a-z0-9_]*database_url[\s"']*[:=]\s*(?:"[^"]*"|'[^']*'|[^;\s,}]+)"#,
-        r"(?im)authorization\s*:[^\r\n]*",
-        r"(?i)bearer\s+[a-z0-9._~+/=-]+",
-        r"\b(?:sk-|xai-|ghp_)[A-Za-z0-9_-]+",
-    ] {
-        text = regex::Regex::new(pattern)
-            .expect("redaction pattern")
-            .replace_all(&text, "[redacted]")
-            .into_owned();
+    // Compile once, outside replacement loops. Escaped delimiters belong to
+    // the value and must never leave a credential suffix in the dump.
+    static PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> = std::sync::LazyLock::new(|| {
+        [
+            r#"(?i)[a-z][a-z0-9+.-]*://(?:\\.|[^\s/"'<>\\])*@(?:\\.|[^\s"'<>\\])*"#,
+            r#"(?i)[a-z][a-z0-9+.-]*%3a%2f%2f[^\s"'<>]*"#,
+            r#"(?i)\b[a-z0-9_]*(?:password|passwd|pwd|database_url)[a-z0-9_]*[\s"']*[:=]\s*(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|(?:\\.|[^;\s,}\\])+)"#,
+            r"(?i)\b(?:password|passwd|pwd)\s*=\s*[^;\r\n]*",
+            r"(?im)authorization\s*:[^\r\n]*",
+            r"(?i)bearer\s+[a-z0-9._~+/=-]+",
+            r"\b(?:sk-|xai-|ghp_)[A-Za-z0-9_-]+",
+        ].into_iter().map(|pattern| regex::Regex::new(pattern).expect("redaction pattern")).collect()
+    });
+    for pattern in PATTERNS.iter() {
+        text = pattern.replace_all(&text, "[redacted]").into_owned();
     }
     text
 }
@@ -1326,6 +1328,42 @@ pub fn runtime_llm_env_present() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_password_with_escaped_single_quote() {
+        assert_eq!(redact(r"password='a\'b'", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_password_with_escaped_double_quote_and_space() {
+        assert_eq!(redact(r#"password="a\"b c""#, &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_password_with_escaped_space() {
+        assert_eq!(redact(r"password=a\ b", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_dsn_with_percent_encoded_password() {
+        assert_eq!(
+            redact("postgres://user:a%40b%3Ac@host/db", &[]),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_fully_url_encoded_connection_string() {
+        assert_eq!(
+            redact("postgres%3A%2F%2Fuser%3Apass%40host", &[]),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_dsn_with_escaped_space() {
+        assert_eq!(redact(r"postgres://user:a\ b@host/db", &[]), "[redacted]");
+    }
 
     #[test]
     fn redact_connection_strings_and_settings() {

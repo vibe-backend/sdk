@@ -415,7 +415,7 @@ async fn keyword_check_uses_source() {
 }
 
 #[tokio::test]
-async fn keyword_check_uses_source_with_translation() {
+async fn keyword_present_only_in_translation_fails() {
     check_source_keywords_text(true, "商品有名稱與價格。").await;
 }
 
@@ -456,9 +456,10 @@ async fn negated_and_code_keywords_do_not_support_ownership() {
         "not shared",
         "no shared",
         "never shared",
-        "does not require shared",
-        "```\n共享 shared\n```",
+        "\n```\n共享 shared\n```\n",
         "`共享` `shared`",
+        "\n~~~\n共享 shared\n~~~\n",
+        "``共享 ` shared``",
     ] {
         check_source_keywords_text(true, text).await;
     }

@@ -224,7 +224,7 @@
 | 105 | PATCH（issue #86）：route method 加 `PATCH`（修訂 0.1、2.3 嘅 GET／POST／PUT／DELETE）；語意係 JSON Merge Patch（RFC 7396），只限宣告欄位；`null` 只可以清 nullable 欄位；唔可以改嘅欄位回 422；內置 CRUD `update`（`partial: true`）用 PATCH、`partial: false` 用 PUT；CRUD update 照樣一定要 `If-Match`（決定 48），自訂 PATCH 可以選擇要唔要。 | 已確認（產品經理 2026-10-14） | 0.1、2.3、2.3c、12.9 |
 | 106 | Cursor 分頁同區間篩選（issue #87）：CRUD `list` 可以揀 `pagination: cursor`（offset 照樣係預設，決定 14）；cursor 係簽名嘅不透明值，綁定 sort、filter 同租戶；排序一定加主鍵做 tiebreaker；`page-size` 預設 20，`max-page-size` 同 offset 一樣跟決定 71（平台上限 500），冇另外嘅 100 上限；`range` 篩選只准宣告咗而且有 index 嘅欄位，運算子 `gte`／`gt`／`lte`／`lt`；編譯時驗證；cursor 同 sort／filter 唔對應回 400 `INVALID_CURSOR`。 | 已確認（產品經理 2026-10-14） | 12.9 |
 | 107 | 多欄唯一鍵：model lock 加 `## Constraints`（`- unique: [col_a, col_b]`，平台自動喺前面加 `tenant_id`）；一定要有對應 migration 建 unique index；衝突回 409 `UNIQUE_VIOLATION`，唔回顯欄位值。 | 已確認（產品經理 2026-10-14） | 12.2、8 |
-| 108 | 翻譯階段（issue #37）：source 去咗 frontmatter、code 同識別字之後仲有非 ASCII 字元，就喺語意一致性檢查之前，用現有 LLM adapter 以 prompt `translate-1` 譯做英文（直譯、保留識別字／數字／否定，source 放喺有分隔嘅 data-only `SOURCE` 區塊，冇工具）。譯文**只**用嚟做關鍵字同一致性檢查；lock 內容、`source-hash`、編譯 prompt 同 cache key 一律用原文。語意檢查唔再有中文關鍵字同否定詞。翻譯失敗即成次編譯失敗（#93 全部或者冇），冇 fallback、唔會略過。Cache 喺 `.vibe/cache/translate/`，key 係 `source-hash` + provider + model + prompt 版本 + 實際送出參數。 | 已確認（產品經理 2026-10-14） | 2.1a、2A.7 |
+| 108 | 翻譯階段（issue #37）：非 ASCII source 按 `translate-1` 翻譯，只供語意一致性檢查；安全關鍵字一律檢查中文及英文原文，譯文不能補足。原文保留作 lock、hash、編譯 prompt 及 cache key。否定及 code 規則見 2.1a。此規則取代 #37 的 English-only／不處理中文否定決定。翻譯失敗即編譯失敗，沒有 fallback。翻譯 cache key 包含 source-hash、provider、model、prompt 版本及實際參數。 | 已確認（產品經理 2026-10-16） | 2.1a、2A.7 |
 | 109 | Lock 記錄翻譯資料（審計用，唔計入 `source-hash`）：`translation: { prompt-version, llm-provider, model-snapshot, hash }`。 | 已確認（產品經理 2026-10-14） | 2A.1、2.1a |
 | 110 | 高風險 release build 唔可以用翻譯 cache，一定重新翻譯。 | 已確認（產品經理 2026-10-14） | 2.1a、2C.3 |
 | 111 | 翻譯 call 計入 #92 P5 每次編譯 LLM call 上限；超過即編譯失敗。 | 已確認（產品經理 2026-10-14） | 2.1a |
@@ -334,7 +334,9 @@ project/
 - **做法**：用現有 LLM adapter（2A.8，同一個 provider 設定同沙盒），prompt `translate-1`：
   - 直譯，唔解釋、唔補充、唔總結；保留識別字、數字同否定（例如「唔公開」一定譯做 not public）。
   - Source 放喺有分隔嘅 data-only `SOURCE` 區塊（同編譯 prompt 一樣嘅分隔方式），入面任何指示都唔會執行；冇工具、冇 function calling。
-- **用途限制**：譯文**只**用嚟做關鍵字同一致性檢查。Lock 內容、`source-hash`、編譯 prompt 同編譯 cache key 一律用原文；譯文唔會寫入 lock，亦唔會送去編譯器。安全關鍵字檢查以原文為準，譯文唔可以補足原文缺少嘅關鍵字。忽略 fenced code blocks（```）同 inline code；直接喺關鍵字之前嘅否定詞（唔、不、冇、無、毋、非；not、no、never）會令該次出現唔計，容許短語法間隔，例如 `does not require`。
+- **用途限制**：譯文只用於語意一致性檢查。安全關鍵字只檢查中文及英文原文，不能由譯文補足。Lock、`source-hash`、編譯 prompt 及 cache key 用原文。以下規則取代 #37／決定 108 的 English-only 及不處理中文否定規則（產品經理 2026-10-16 確認）。
+- **否定**：唔、不、冇、無、毋、非及 not、no、never 只作用於短距離內最近的下一個安全關鍵字，不跨越 `, . ; : ! ? 、，。；：！？` 或換行，不以偶數／奇數抵銷。只有無歧義的直接否定可讀作否定；中間有其他字詞或雙重否定（not … not、不得不、唔可以唔、不能不、非…不可）一律保留較嚴格的要求並發出 warning，請作者以 `auth` 等 structured frontmatter 確認。`不得不公開` 表示公開。Prose 不會自動降低保護；有 `auth/public/secrets/writes` 宣告時以宣告為準，明確的 prose 衝突為 compile error。
+- **Code**：忽略行首最多三個空格後的至少三個反引號或波浪號 fence；結束 fence 必須同字元且長度不少於開始。行中 ``` 不開啟 fence。Inline code 的反引號 run 長度必須相同。未結束 fence 是 compile error，不能忽略其後內容；不確定時採取較嚴格的判讀。
 - **失敗**：翻譯 call 失敗、回應格式唔啱、或者譯文缺咗原文嘅識別字／數字，成次編譯失敗（#93 全部或者冇，冇 lock 會寫入）；冇 fallback，唔會略過檢查。
 - **Cache**：`.vibe/cache/translate/<sha256>`，key 係 `source-hash` + provider + model snapshot + translate prompt 版本 + 實際送出參數。**高風險 release build 唔可以用翻譯 cache**（決定 110），一定重新翻譯。
 - **Call 上限**：翻譯 call 計入 #92 P5 嘅每次編譯 LLM call 上限；超過即編譯失敗（決定 111）。
@@ -580,7 +582,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - 編譯器只可以讀自己依賴範圍內嘅 lock（例如 method 只見到自己物件、provider 同被呼叫 method 嘅 `## Signature`）。
 - Prompt injection 偵測：驗證器用固定規則掃 source，例如「忽略之前／上面嘅指示」、「你而家係」、「system:」、「唔使檢查」、「當作已確認」、「print secret」、隱藏字元（零寬字元、bidi 控制字元）、大段 base64 等；命中就出 warning、喺 PR 高亮做中風險安全項目。零寬同 bidi 控制字元直接 error。
 - 誤報處理（決定 37）：項目可以喺 `.compiler/injection-allowlist` 加精確句子豁免（只可以精確匹配，唔准 pattern），檔案一定受 CODEOWNERS 保護（v1.8 照舊，決定 93），改動屬中風險安全項目。
-- 驗證器亦會做語意一致性檢查：source 冇提及寫入，lock 卻有寫入 sql；source 冇提及公開，lock 卻有 `public: true`；呢類「lock 多過 source」嘅情況出 error（決定 37）；誤報就改 source 寫清楚，冇豁免。非英文 source 用 2.1a 嘅英文譯文做比對（決定 108）；高風險欄位一定要同 frontmatter 宣告一致（決定 112）；api feature 唔做寫入 sql 關鍵字檢查，由 method lock 繼承。
+- 驗證器亦會做語意一致性檢查：source 冇提及寫入，lock 卻有寫入 sql；source 冇提及公開，lock 卻有 `public: true`；呢類「lock 多過 source」嘅情況出 error（決定 37）；誤報就改 source 寫清楚，冇豁免。安全關鍵字只用原文；非英文 source 的其他一致性檢查用 2.1a 譯文（決定 108，2026-10-16 修訂）；高風險欄位一定要同 frontmatter 宣告一致（決定 112）；api feature 唔做寫入 sql 關鍵字檢查，由 method lock 繼承。
 
 ### 2A.8 編譯器 LLM 設定（決定 57）
 
@@ -872,7 +874,9 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
 
 適用：`vibe dev`（預設）同 `vibe serve --memory`。
 
-- **用途限制**：只限開發同測試。資料只存喺 process 記憶體，server 停止、重啟或者 crash 就全部消失；冇持久化、冇備份、冇跨 instance 共享。
+- **用途限制**：譯文只用於語意一致性檢查。安全關鍵字只檢查中文及英文原文，不能由譯文補足。Lock、`source-hash`、編譯 prompt 及 cache key 用原文。以下規則取代 #37／決定 108 的 English-only 及不處理中文否定規則（產品經理 2026-10-16 確認）。
+- **否定**：唔、不、冇、無、毋、非及 not、no、never 只作用於短距離內最近的下一個安全關鍵字，不跨越 `, . ; : ! ? 、，。；：！？` 或換行，不以偶數／奇數抵銷。只有無歧義的直接否定可讀作否定；中間有其他字詞或雙重否定（not … not、不得不、唔可以唔、不能不、非…不可）一律保留較嚴格的要求並發出 warning，請作者以 `auth` 等 structured frontmatter 確認。`不得不公開` 表示公開。Prose 不會自動降低保護；有 `auth/public/secrets/writes` 宣告時以宣告為準，明確的 prose 衝突為 compile error。
+- **Code**：忽略行首最多三個空格後的至少三個反引號或波浪號 fence；結束 fence 必須同字元且長度不少於開始。行中 ``` 不開啟 fence。Inline code 的反引號 run 長度必須相同。未結束 fence 是 compile error，不能忽略其後內容；不確定時採取較嚴格的判讀。
 - **Dev 提示**：dev 用 in-memory 時，啟動同 health 都要清楚標示資料唔會保存：
   - 喺 stderr 印顯眼警告（多行、紅色），內容包括「IN-MEMORY DATABASE：所有資料喺 server 停止時消失，唔可以用喺 production」；
   - health endpoint（`/_health`）回 `"db": "memory"` 同 `"warning": "in-memory database, data is lost on stop"`；

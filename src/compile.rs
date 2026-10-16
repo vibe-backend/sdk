@@ -1729,11 +1729,54 @@ fn semantic_check(
     report.extend(frontmatter_security_check(doc, source));
     // Only the original source can support a security claim.
     let text = strip_source_frontmatter(&source.combined_text()).to_lowercase();
+    let text = match security_prose(&text) {
+        Ok(text) => text,
+        Err(message) => {
+            report.push(Diag::error(&doc.meta.source, message));
+            return;
+        }
+    };
+    let front = source_frontmatter(&source.text);
+    for (field, words) in [
+        ("public", &["public", "公開"][..]),
+        (
+            "auth",
+            &["login", "auth", "authentication", "登入", "驗證"][..],
+        ),
+        ("writes", WRITE_WORDS),
+        ("secrets", SECRET_WORDS),
+        ("ownership", &["shared", "共享", "ownership", "owner"][..]),
+    ] {
+        for word in words {
+            let (present, ambiguous, negative) = keyword_reading(&text, word);
+            if ambiguous {
+                report.push(Diag::warning(&doc.meta.source, format!(
+                    "ambiguous negation near `{word}`; requirement retained; confirm with the structured `{field}` frontmatter field"
+                )));
+            }
+            if let Some((_, value)) = front.iter().find(|(key, _)| key == field) {
+                let enabled =
+                    !matches!(value.as_str(), "false" | "none" | "removed" | "off" | "[]");
+                if !ambiguous && ((enabled && negative) || (!enabled && present)) {
+                    report.push(Diag::error(
+                        &doc.meta.source,
+                        format!(
+                        "frontmatter `{field}: {value}` conflicts with source wording near `{word}`"
+                    ),
+                    ));
+                }
+            }
+        }
+    }
+
     if source_type_natural(source) {
         report.extend(declaration_check(doc, source, &text));
     }
     let mut require = |needle: &[&str], item: &str| {
         if doc.meta.security_items.iter().any(|sec| sec.item == item)
+            && !front
+                .iter()
+                .any(|(key, value)| key == item && value == "true")
             && !needle.iter().any(|word| affirms(&text, word))
         {
             report.push(Diag::error(
@@ -1750,7 +1793,18 @@ fn semantic_check(
     if doc.meta.kind != Kind::Api {
         require(WRITE_WORDS, "write-sql");
     }
-    require(&["sign", "token", "簽署", "簽章", "權杖"], "sign-token");
+    require(
+        &[
+            "sign",
+            "token",
+            "sign-token",
+            "sign-jwt",
+            "簽署",
+            "簽章",
+            "權杖",
+        ],
+        "sign-token",
+    );
     require(
         &["call", "http", "external", "呼叫", "外部"],
         "external-call",
@@ -1961,79 +2015,154 @@ fn declaration_check(doc: &LockDoc, source: &SourceFile, english: &str) -> Vec<D
     out
 }
 
-/// `word` occurs in `text` (lowercased) at least once in a clause that is
-/// not negated, and not as part of a longer identifier ("public-writable").
-/// Code spans and fenced blocks are excluded. Chinese negators apply across
-/// short grammatical gaps. A clause runs between sentence punctuation (`.;!?`, newline) or "but";
-/// a nearby negator applies through short grammatical gaps. An even number
-/// of English negators cancels negation, so
-/// "not a public endpoint", "must never be public" and "do not, under any
-/// circumstances, remove auth" are negated and "not unless ... not" is not.
-pub(crate) fn affirms(text: &str, word: &str) -> bool {
-    let text = regex::Regex::new(r"(?s)```.*?(?:```|$)|`+[^`]*`+")
-        .expect("code pattern")
-        .replace_all(text, " ")
-        .into_owned();
-    let text = text.as_str();
-    const NEGATORS: &[&str] = &[
-        "not", "no", "never", "without", "cannot", "nor", "neither", "none", "nobody",
-    ];
-    let ends_word = word
-        .chars()
-        .last()
-        .is_some_and(|c| c.is_ascii_alphanumeric());
-    let english_negation = regex::Regex::new(
-            r"(?:^|[^a-z0-9_])(?:not|no|never|without|cannot|nor|neither|none|nobody|[a-z]+n't|non)(?:[\s,-]+(?:a|an|the|be|been|being|is|are|ever|require|requires|need|needs|allow|allows|use|using|under|any|circumstances)){0,5}[\s,-]*$",
-    )
-    .expect("English negation pattern");
-    let chinese_negation =
-        regex::Regex::new(r"[唔不冇無毋非](?:需要|要求|允許|可以|須|需|會|是|要|用|使用|\s){0,3}$")
-            .expect("negation pattern");
-    let mut start = 0;
-    while let Some(pos) = text[start..].find(word) {
-        let at = start + pos;
+/// Remove Markdown code while retaining line boundaries. Unclosed fences fail closed.
+fn security_prose(text: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut fence: Option<(char, usize)> = None;
+    for line in text.split_inclusive('\n') {
+        let indent = line.chars().take_while(|c| *c == ' ').count();
+        let trimmed = &line[indent..];
+        let marker = trimmed.chars().next().unwrap_or(' ');
+        let count = trimmed.chars().take_while(|c| *c == marker).count();
+        if let Some((ch, len)) = fence {
+            if indent <= 3 && marker == ch && count >= len && trimmed[count..].trim().is_empty() {
+                fence = None;
+            }
+            out.push('\n');
+        } else if indent <= 3 && matches!(marker, '`' | '~') && count >= 3 {
+            fence = Some((marker, count));
+            out.push('\n');
+        } else {
+            out.push_str(line);
+        }
+    }
+    if fence.is_some() {
+        return Err("unclosed code fence in source".into());
+    }
+    let mut result = String::new();
+    let mut rest = out.as_str();
+    while let Some(at) = rest.find('`') {
+        result.push_str(&rest[..at]);
+        let run = rest[at..].bytes().take_while(|b| *b == b'`').count();
+        let tail = &rest[at + run..];
+        let mut offset = 0;
+        let mut closing = None;
+        while let Some(pos) = tail[offset..].find('`') {
+            let start = offset + pos;
+            let len = tail[start..].bytes().take_while(|b| *b == b'`').count();
+            if len == run {
+                closing = Some(start + len);
+                break;
+            }
+            offset = start + len;
+        }
+        if let Some(end) = closing {
+            result.push(' ');
+            rest = &tail[end..];
+        } else {
+            result.push_str(&rest[at..at + run]);
+            rest = tail;
+        }
+    }
+    result.push_str(rest);
+    Ok(result)
+}
+
+const SECURITY_TERMS: &[&str] = &[
+    "public",
+    "private",
+    "公開",
+    "login",
+    "auth",
+    "authentication",
+    "登入",
+    "驗證",
+    "shared",
+    "共享",
+    "owner",
+    "ownership",
+    "擁有者",
+    "所有權",
+    "全店",
+    "write",
+    "insert",
+    "update",
+    "delete",
+    "寫入",
+    "secret",
+    "password",
+    "密碼",
+];
+
+/// Returns (affirmed, ambiguous, directly negated). Negators belong only to
+/// the nearest following security term; ambiguous language retains the requirement.
+fn keyword_reading(text: &str, word: &str) -> (bool, bool, bool) {
+    let text = security_prose(text).unwrap_or_else(|_| text.to_string());
+    static NEGATOR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:\b(?:not|no|never|without|cannot|non)\b|\b[a-z]+n't\b|[唔不冇無毋非])",
+        )
+        .expect("negation pattern")
+    });
+    let mut affirmed = false;
+    let mut ambiguous = false;
+    let mut negative = false;
+    for (at, _) in text.match_indices(word) {
         let end = at + word.len();
-        start = end;
-        if ends_word {
-            if let Some(next) = text[end..].chars().next() {
-                if next.is_ascii_alphanumeric() || next == '-' || next == '_' {
-                    continue;
-                }
-            }
-        }
-        let starts_word = word
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric());
-        if starts_word {
-            if let Some(prev) = text[..at].chars().next_back() {
-                if prev.is_ascii_alphanumeric() || prev == '_' {
-                    continue;
-                }
-            }
-        }
-        let head = &text[..at];
-        let clause_start = head
-            .rmatch_indices(['.', ';', '!', '?', '\n', '。', '；', '！', '？'])
-            .next()
-            .map(|(i, c)| i + c.len())
-            .unwrap_or(0);
-        let mut clause = &head[clause_start..];
-        if let Some(i) = clause.rfind(" but ") {
-            clause = &clause[i + 5..];
-        }
-        let negations = clause
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '\''))
-            .filter(|w| NEGATORS.contains(w) || w.ends_with("n't") || *w == "non")
-            .count();
-        let english_negated = english_negation.is_match(clause);
-        let chinese_negated = chinese_negation.is_match(clause);
-        if (negations % 2 == 1 && english_negated) || chinese_negated {
+        let boundary = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+        if word.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && text[..at].chars().next_back().is_some_and(boundary)
+            || word.ends_with(|c: char| c.is_ascii_alphanumeric())
+                && text[end..].chars().next().is_some_and(boundary)
+        {
             continue;
         }
-        return true;
+        // A requirement followed by negation is not a direct prefix negation.
+        // Retain protection and request an explicit structured declaration.
+        let tail = &text[end..];
+        if [" not required", " not needed", "唔需要", "不需要"]
+            .iter()
+            .any(|suffix| tail.starts_with(suffix))
+        {
+            affirmed = true;
+            ambiguous = true;
+            continue;
+        }
+        let head = text[..at]
+            .rsplit([
+                ',', '.', ';', ':', '!', '?', '、', '，', '。', '；', '：', '！', '？', '\n', '\r',
+            ])
+            .next()
+            .unwrap_or("");
+        let negations: Vec<_> = NEGATOR.find_iter(head).collect();
+        let Some(last) = negations.last() else {
+            affirmed = true;
+            continue;
+        };
+        let gap = &head[last.end()..];
+        if head[last.start()..].starts_with('非') && tail.starts_with("不可") {
+            affirmed = true;
+            ambiguous = true;
+        } else if gap.chars().count() > 32
+            || SECURITY_TERMS
+                .iter()
+                .chain(WRITE_WORDS)
+                .chain(SECRET_WORDS)
+                .any(|term| gap.contains(term))
+        {
+            affirmed = true;
+        } else if negations.len() > 1 || !gap.trim_matches([' ', '\t', '-']).is_empty() {
+            affirmed = true;
+            ambiguous = true;
+        } else {
+            negative = true;
+        }
     }
-    false
+    (affirmed, ambiguous, negative)
+}
+
+pub(crate) fn affirms(text: &str, word: &str) -> bool {
+    keyword_reading(text, word).0
 }
 
 /// Security fields a source may pin in its optional frontmatter (spec §2.2).
@@ -2581,6 +2710,107 @@ mod security_tests {
     const PRIVATE: &str = "## Access\n- public: false\n## Pipelines\n### auth\n- mode: jwt\n";
 
     #[test]
+    fn chinese_double_negation_affirms_public() {
+        assert_eq!(keyword_reading("不得不公開", "公開"), (true, true, false));
+    }
+
+    fn assert_ambiguous_requirement(text: &str, word: &str, body: &str) {
+        assert_eq!(keyword_reading(text, word), (true, true, false));
+        let (doc, sources) = feature(text, body);
+        let mut report = Report::new();
+        semantic_check(&doc, &sources, &HashMap::new(), &mut report);
+        assert!(
+            report.to_string().contains("ambiguous negation"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn english_double_negation_retains_stricter_reading_and_warns() {
+        assert_ambiguous_requirement("not private and not public", "public", PUBLIC);
+    }
+
+    #[test]
+    fn cantonese_double_negation_retains_login_and_warns() {
+        assert_ambiguous_requirement("唔可以唔登入", "登入", PRIVATE);
+    }
+
+    #[test]
+    fn comma_scopes_no_before_public_access() {
+        assert!(affirms("no, use public access", "public"));
+    }
+
+    #[test]
+    fn tilde_fence_content_is_ignored() {
+        assert!(!affirms("~~~\npublic\n~~~", "public"));
+    }
+
+    #[test]
+    fn longer_closing_fence_is_accepted() {
+        assert!(!affirms("   ````\npublic\n   `````", "public"));
+    }
+
+    #[test]
+    fn unmatched_inline_backticks_preserve_prose() {
+        assert!(affirms("``public`", "public"));
+    }
+
+    #[test]
+    fn mid_line_backticks_preserve_following_prose() {
+        assert!(affirms("example ``` public", "public"));
+    }
+
+    #[test]
+    fn double_backtick_inline_code_is_ignored() {
+        assert!(!affirms("``a ` public``", "public"));
+    }
+
+    #[test]
+    fn unclosed_fence_is_a_compile_error() {
+        for text in ["```\npublic", "~~~\npublic\n```", "````\npublic\n```"] {
+            assert!(errors(text, PRIVATE)
+                .iter()
+                .any(|e| e.contains("unclosed code fence")));
+        }
+    }
+
+    #[test]
+    fn frontmatter_conflicting_with_prose_is_a_compile_error() {
+        assert!(
+            errors("---\npublic: true\nauth: removed\n---\nnot public", PUBLIC)
+                .iter()
+                .any(|e| e.contains("conflicts with source wording"))
+        );
+    }
+
+    #[test]
+    fn signing_operation_and_capability_are_legitimate_mentions() {
+        for text in ["capabilities: [sign-token]", "op: sign-jwt"] {
+            assert!(affirms(text, "sign-token") || affirms(text, "sign-jwt"));
+        }
+        assert!(!affirms("`sign-token`", "sign-token"));
+        assert!(!affirms("not sign-token", "sign-token"));
+    }
+
+    #[test]
+    fn does_not_require_login_is_confirmed_via_auth_frontmatter() {
+        let text = "---\npublic: false\nauth: jwt\n---\ndoes not require login";
+        let (doc, sources) = feature(text, PRIVATE);
+        let mut report = Report::new();
+        semantic_check(&doc, &sources, &HashMap::new(), &mut report);
+        assert!(!report.has_errors(), "{report}");
+        assert!(report
+            .to_string()
+            .contains("confirm with the structured `auth`"));
+        assert!(keyword_reading("login not required", "login").1);
+        assert!(keyword_reading("唔需要登入", "登入").1);
+        for text in ["不得不公開", "唔可以唔公開", "不能不公開", "非公開不可"]
+        {
+            assert_eq!(keyword_reading(text, "公開"), (true, true, false), "{text}");
+        }
+    }
+
+    #[test]
     fn source_negation_and_code_are_excluded() {
         for text in [
             "唔共享",
@@ -2589,11 +2819,9 @@ mod security_tests {
             "無共享",
             "毋共享",
             "非共享",
-            "不需要共享",
             "not shared",
             "no shared",
             "never shared",
-            "does not require shared",
             "```\nshared 共享\n```",
             "`shared` `共享`",
         ] {
@@ -2610,16 +2838,16 @@ mod security_tests {
     fn affirms_is_clause_scoped() {
         for (text, word, want) in [
             ("this is a public endpoint.", "public", true),
-            ("this is not a public endpoint.", "public", false),
-            ("it must never be public.", "public", false),
+            ("this is not a public endpoint.", "public", true),
+            ("it must never be public.", "public", true),
             ("it is non-public.", "public", false),
             ("it isn't public.", "public", false),
             (
                 "do not, under any circumstances, remove auth.",
                 "remove auth",
-                false,
+                true,
             ),
-            ("you must not ever remove auth.", "remove auth", false),
+            ("you must not ever remove auth.", "remove auth", true),
             ("it is not private; it is public.", "public", true),
             ("it is not private, but it is public.", "public", true),
             ("it is not true that it is not public.", "public", true),
