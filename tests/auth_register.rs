@@ -11,8 +11,27 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 use vibe::manifest::Manifest;
+use vibe::runtime::challenge::{ChallengeContext, ChallengeError, ChallengeVerifier};
 use vibe::runtime::refresh::{RefreshPolicy, Rotated};
 use vibe::runtime::{router, AppState, AuthConfig, PgExec, QueryExec, Slug};
+
+/// Test verifier: accepts only the proof `ok` (the register route requires a
+/// captcha with `when: always`; without a verifier it fails closed).
+struct AcceptOk;
+
+#[async_trait::async_trait]
+impl ChallengeVerifier for AcceptOk {
+    fn provider(&self) -> &'static str {
+        "test"
+    }
+    async fn verify(&self, token: &str, _ctx: &ChallengeContext) -> Result<(), ChallengeError> {
+        if token == "ok" {
+            Ok(())
+        } else {
+            Err(ChallengeError::Rejected("test verifier".into()))
+        }
+    }
+}
 
 const PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
 MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgxoRRfBXmTDDBak37\n\
@@ -114,7 +133,7 @@ async fn pg() -> Option<Pg> {
         min_override_ms: None,
         honor_test_ip: true,
         dev_hints: false,
-        challenge: None,
+        challenge: Some(Arc::new(AcceptOk)),
     }));
     Some(Pg {
         app,
