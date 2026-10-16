@@ -169,8 +169,8 @@ fn non_public_v6(ip: Ipv6Addr) -> bool {
         return true;
     }
     // 64:ff9b::/96 NAT64
-        // 64:ff9b:1::/48 local NAT64
-        (s[0] == 0x64 && s[1] == 0xff9b && (s[2..6].iter().all(|&x| x == 0) || s[2] == 1))
+    // 64:ff9b:1::/48 local NAT64
+    (s[0] == 0x64 && s[1] == 0xff9b && (s[2..6].iter().all(|&x| x == 0) || s[2] == 1))
         || (s[0] == 0x100 && s[1..4].iter().all(|&x| x == 0)) // 100::/64 discard
         || (s[0] == 0x2001 && s[1] == 0) // 2001::/32 Teredo
         || (s[0] == 0x2001 && s[1] == 2 && s[2] == 0) // 2001:2::/48 benchmarking
