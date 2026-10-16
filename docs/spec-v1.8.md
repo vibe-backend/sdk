@@ -935,7 +935,7 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
   - Batch transaction：一定用明確嘅 `BEGIN` 開始；batch 入面禁止 savepoint；owner 連線永遠唔加入任何共用連線池。
   - 條件：(1) 只有 migrate runner 可以發 `SET ROLE`；用戶寫嘅 migration SQL 唔可以用 `SET ROLE`、`RESET ROLE`、`SET SESSION AUTHORIZATION` 或者改 GUC，決定 129 白名單 parser（2B.3、Owner role 條件第 1 點）一律拒絕。(2) 每個 batch UPDATE 之前同之後都核對 `current_user` 等於處理緊嗰個租戶嘅 `tenant_<id>_rw`、`session_user` 等於 `tenant_<id>_owner`，任何唔一致即中止（fail closed）；FORCE RLS 同部署時 policy 比對全程有效。(3) #193 replay 清理用同一個做法。(4) 必須測試：用租戶 A context 跑嘅 backfill 對租戶 B 改動零行。
   - 實作狀態：未實作，#233（#147 @8066b69 而家以 owner 跑一條冇參數化、冇分批嘅 `UPDATE … WHERE`，喺 FORCE RLS 下睇唔到任何行）。
-  - 剩餘風險（待產品經理確認）：owner role 可以 `SET ROLE` 去自己租戶嘅 rw role，所以 owner 憑證如果喺登入窗口外洩，亦會有該租戶平台表（outbox、idempotency）嘅 rw 權限。緩解：只有 migrate runner 可以發 `SET ROLE`，用戶 migration SQL 一律被白名單拒絕；owner 平時 `NOLOGIN`、一次性密碼、每次 `SET ROLE` 寫審計、定期偏差檢查。
+  - 剩餘風險（已接受（產品經理 2026-10-16））：owner role 可以 `SET ROLE` 去自己租戶嘅 rw role，所以 owner 憑證如果喺登入窗口外洩，亦會有該租戶平台表（outbox、idempotency）嘅 rw 權限。緩解：只有 migrate runner 可以發 `SET ROLE`，用戶 migration SQL 一律被白名單拒絕；owner 平時 `NOLOGIN`、一次性密碼、每次 `SET ROLE` 寫審計、定期偏差檢查。接受理由：owner 本身已經擁有該租戶嘅表，owner 憑證外洩對該租戶已經係最壞情況，可以 `SET ROLE` 做 rw 唔會擴大影響範圍；而且決定 129 下 owner 平時 `NOLOGIN`、用一次性密碼（見上面「Owner role 條件」第 2 點），暴露窗口只限 migrate 執行期間。接受條件：每次 `SET ROLE` 寫審計（見上面「Migration role 就係 owner」）同定期偏差檢查（見上面受控例外條件 (2)、決定 129 `vibe check-owners`）一定要持續生效。
   - 剩餘風險（已接受）：登入窗口期間外洩嘅 owner 憑證對表有完整權力；靠一次性密碼、parser 白名單、審計同定期檢查緩解。
 - 安全項目：migration lock 一律標 `migration-ddl`（高風險，資訊性，決定 78）；SDK 唔要求人手確認，建議 `migrations/` 受 CODEOWNERS 保護（見 [`pr-review-guide.md`](pr-review-guide.md)）。
 - 棄用流程（DROP 租戶資料）：**v1 未提供**，所以 `DROP TABLE`／`DROP COLUMN` 一律拒絕；以下係將來版本嘅設計：
