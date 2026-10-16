@@ -60,16 +60,33 @@ fn release_key() -> (String, String) {
     )
 }
 
-/// Builds a release manifest at `<root>/release.json`; returns the public key hex.
+/// Writes a release-mode manifest at `<root>/release.json`; returns the public
+/// key hex. The shop fixture has high-risk items, so `vibe build` (release)
+/// fails closed until release approval verification exists; build a dev
+/// manifest and re-sign it as a release build to exercise the runtime checks.
 fn release_manifest(root: &Path) -> String {
-    let (secret, public) = release_key();
+    let (secret, _) = release_key();
     let (ok, out) = vibe(
         root,
         &["build", "--release-approval", "pr:1", "-o", "release.json"],
         &[("VIBE_RELEASE_SIGNING_KEY", &secret)],
     );
+    assert!(!ok && out.contains("fail closed"), "{out}");
+    sign::create_dev_key(root).unwrap();
+    let (ok, out) = vibe(root, &["build", "--dev", "-o", "dev.json"], &[]);
     assert!(ok, "{out}");
-    public
+    let text = fs::read_to_string(root.join("dev.json")).unwrap();
+    let mut manifest: vibe::manifest::Manifest = serde_json::from_str(&text).unwrap();
+    manifest.provenance.build_mode = "release".into();
+    manifest.signature = String::new();
+    let key = sign::generate_key();
+    manifest.signature = sign::sign_bytes(&serde_json::to_vec(&manifest).unwrap(), &key);
+    fs::write(
+        root.join("release.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    hex::encode(key.verifying_key().to_bytes())
 }
 
 const SERVE_MEMORY: &[&str] = &[
