@@ -17,11 +17,11 @@ jobs:
     name: Markdown lint & link check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: DavidAnson/markdownlint-cli2-action@v24
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
         with:
           globs: "**/*.md"
-      - uses: lycheeverse/lychee-action@v2
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
           args: --offline --no-progress --include-fragments './**/*.md'
           fail: true
@@ -48,21 +48,31 @@ jobs:
       # Postgres tests fail (not skip) in CI when this is missing.
       VIBE_TEST_PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Detect Cargo.toml
         id: detect
         run: echo "present=${{ hashFiles('Cargo.toml') != '' }}" >> "$GITHUB_OUTPUT"
       - if: steps.detect.outputs.present == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.89"
           components: rustfmt, clippy
       - if: steps.detect.outputs.present == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - if: steps.detect.outputs.present == 'true'
         run: cargo check --locked --all-targets --all-features
+      - if: steps.detect.outputs.present == 'true'
+        name: Dependency check (no rsa crate, no jsonwebtoken rust_crypto)
+        run: |
+          if cargo tree --locked --target all -i rsa >/dev/null 2>&1; then
+            echo "::error::rsa crate is in the dependency tree"; cargo tree --locked --target all -i rsa; exit 1
+          fi
+          if cargo tree --locked --target all -e features -i jsonwebtoken | grep -q 'jsonwebtoken feature "rust_crypto"'; then
+            echo "::error::jsonwebtoken rust_crypto backend is enabled"; exit 1
+          fi
+          echo "OK: rsa absent; jsonwebtoken backend is aws_lc_rs only"
       - if: steps.detect.outputs.present == 'true'
         run: cargo fmt --all -- --check
       - if: steps.detect.outputs.present == 'true'
@@ -153,7 +163,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install nasm -y --no-progress
+          choco install nasm --version=3.2.0 -y --no-progress
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Install aarch64 Linux linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
