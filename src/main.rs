@@ -467,6 +467,14 @@ async fn cmd_serve(
         .map(|r| r.feature_id.clone())
         .collect();
     vibe::runtime::challenge::production_gate(run_env, challenge.is_some(), &always)?;
+    // #159: no two challenge routes may expect the same widget action.
+    vibe::runtime::challenge::action_collisions(
+        manifest
+            .routes
+            .iter()
+            .filter(|r| r.challenge_type != "none" && !r.challenge_type.is_empty())
+            .map(|r| r.feature_id.as_str()),
+    )?;
     let addr: SocketAddr = addr.parse().map_err(|err| format!("bad address: {err}"))?;
     let state = Arc::new(AppState {
         manifest,

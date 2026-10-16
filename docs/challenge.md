@@ -33,10 +33,17 @@ For each request the server:
    secret, the token and the client IP (5 s timeout, no redirects, public
    addresses only).
 4. Requires `success: true`, a `hostname` in `VIBE_CHALLENGE_HOSTNAMES`, an
-   `action` equal to the route's endpoint name (the last segment of the feature
-   id, at most 32 characters of `[A-Za-z0-9_-]`; set it as the widget's
+   `action` equal to the route's widget action (set it as the widget's
    `data-action`), and a `challenge_ts` that is present, at most 300 s old and not more
    than 60 s in the future (clock skew).
+
+   The widget action is derived from the whole feature id (#159), so
+   endpoints that share a last segment get different actions: `/` becomes
+   `_` (`shop/v1/register` → `shop_v1_register`). If the result is longer
+   than 32 characters or contains a character outside `[A-Za-z0-9_-]`
+   (replaced by `-`), the action is the first 23 sanitized characters, `-`,
+   and the first 8 hex digits of SHA-256 of the feature id. `vibe serve`
+   refuses to start if two challenge routes would still share an action.
 
 ## Replay store
 

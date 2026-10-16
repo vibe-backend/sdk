@@ -7,6 +7,7 @@
 //! unreachable provider, a bad answer, a wrong hostname or action, or a token
 //! seen before are all rejections.
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -66,20 +67,68 @@ pub trait ChallengeVerifier: Send + Sync {
     async fn verify(&self, token: &str, ctx: &ChallengeContext) -> Result<(), ChallengeError>;
 }
 
-/// Widget action expected for a route: the endpoint name (last segment of
-/// the feature id), limited to Turnstile's 32 characters of `[A-Za-z0-9_-]`.
+/// Turnstile allows at most 32 characters of `[A-Za-z0-9_-]` in an action.
+const MAX_ACTION_LEN: usize = 32;
+
+/// Widget action expected for a route, derived from the whole feature id so
+/// that endpoints sharing a last segment (`shop/v1/register`,
+/// `admin/v1/register`) get different actions (#159).
+///
+/// - If every character is in `[A-Za-z0-9_-]` once `/` is mapped to `_`, and
+///   the result fits in 32 characters, the action is that string
+///   (`shop/v1/register` → `shop_v1_register`).
+/// - Otherwise (too long, or a character had to be replaced) it is the first
+///   23 sanitized characters, `-`, and the first 8 hex digits of SHA-256 of
+///   the feature id, so names that only differ after 23 characters or in a
+///   replaced character still differ.
+///
+/// [`action_collisions`] refuses the rare remaining hash collision at startup.
 pub fn challenge_action(feature_id: &str) -> String {
-    let name = feature_id.rsplit('/').next().unwrap_or(feature_id);
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
+    let mut changed = false;
+    let sanitized: String = feature_id
+        .chars()
+        .map(|c| match c {
+            c if c.is_ascii_alphanumeric() || c == '_' || c == '-' => c,
+            '/' => '_',
+            _ => {
+                changed = true;
                 '-'
             }
         })
-        .take(32)
-        .collect()
+        .collect();
+    if !changed && sanitized.len() <= MAX_ACTION_LEN {
+        return sanitized;
+    }
+    let digest = Sha256::digest(feature_id.as_bytes());
+    let suffix: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    let prefix: String = sanitized.chars().take(MAX_ACTION_LEN - 9).collect();
+    format!("{prefix}-{suffix}")
+}
+
+/// Refuses a manifest where two challenge routes would expect the same
+/// widget action (a token solved for one would be accepted by the other).
+pub fn action_collisions<'a>(feature_ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    let mut seen: std::collections::BTreeMap<String, &str> = Default::default();
+    let mut clashes = Vec::new();
+    for id in feature_ids {
+        let action = challenge_action(id);
+        match seen.get(&action) {
+            Some(other) if *other != id => {
+                clashes.push(format!("{other} and {id} (action {action})"))
+            }
+            _ => {
+                seen.insert(action, id);
+            }
+        }
+    }
+    if clashes.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "challenge routes share a widget action; rename one of: {}",
+            clashes.join("; ")
+        ))
+    }
 }
 
 /// Single-use bookkeeping for challenge tokens (SHA-256 of the token).
@@ -681,9 +730,33 @@ mod tests {
 
     #[test]
     fn action_is_the_endpoint_name() {
-        assert_eq!(challenge_action("shop/v1/register"), "register");
-        assert_eq!(challenge_action("a/v1/x.y z"), "x-y-z");
-        assert_eq!(challenge_action(&"a".repeat(40)).len(), 32);
+        assert_eq!(challenge_action("shop/v1/register"), "shop_v1_register");
+        assert_ne!(
+            challenge_action("shop/v1/register"),
+            challenge_action("admin/v1/register")
+        );
+        let odd = challenge_action("a/v1/x.y z");
+        assert!(odd.starts_with("a_v1_x-y-z-"), "{odd}");
+        assert_ne!(odd, challenge_action("a/v1/x-y-z"));
+        // Long names sharing their first 32 characters stay distinct.
+        let base = "shop/v1/".to_string() + &"a".repeat(40);
+        let (x, y) = (
+            challenge_action(&(base.clone() + "x")),
+            challenge_action(&(base + "y")),
+        );
+        assert_ne!(x, y);
+        for action in [&x, &y, &odd] {
+            assert!(action.len() <= 32, "{action}");
+            assert!(action
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        }
+        assert!(action_collisions(["shop/v1/register", "admin/v1/register"]).is_ok());
+        // The same route listed twice is not a collision.
+        assert!(action_collisions(["shop/v1/register", "shop/v1/register"]).is_ok());
+        // `a/b` and `a_b` both map to `a_b`.
+        let err = action_collisions(["x/a/b", "x/a_b"]).unwrap_err();
+        assert!(err.contains("x/a/b and x/a_b"), "{err}");
     }
 
     #[test]
