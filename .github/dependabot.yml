@@ -20,11 +20,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    ignore:
-      # rand 0.10 changed its API and broke CI in Dependabot PR #180 (closed).
-      # Hold back until the migration tracked in #181 lands.
-      - dependency-name: "rand"
-        versions: [">=0.10"]
     groups:
       rustcrypto:
         patterns:
