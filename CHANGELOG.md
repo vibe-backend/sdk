@@ -7,11 +7,21 @@ added only when the corresponding PR is merged to `main`.
 
 ### Added
 
+- **Dependency / advisory CI (#192):** `cargo deny check` (advisories, licenses, bans, sources) runs on pull requests, pushes to main, a daily schedule, and `workflow_dispatch` via `.github/workflows/cargo-deny.yml` (Refs #196).
+- **Compile format repair (#92):** When LLM output for a natural-language source fails the lock format check, `vibe compile` re-prompts the model with the validator errors (by line number and fixed message) up to `LLM_FORMAT_RETRIES` times (0–5, default 2) instead of failing the source on the first malformed answer.
+- **Raw LLM output dump (#92):** Set `VIBE_DUMP_LLM=1` to save the raw response of every attempt that fails the format check to `.vibe/llm-dump/<source>.attempt-<n>.txt`. Only the response is stored (no prompt); the API key is redacted.
+- **LLM budget (#92, from #93):** `LLM_MAX_CALLS_PER_SOURCE` (default 8) and `LLM_MAX_CALLS_PER_RUN` (default 200) bound LLM calls for every adapter, including repair attempts. Config may lower the limits; raising is capped at 2x the default. Invalid values fail.
+- **Run lock (#92, from #93):** Only one `vibe compile` writes locks for a project at a time.
 - **Challenge replay store (#157):** Challenge single-use state, quotas and capacity live in PostgreSQL in each tenant's own schema (`t_<tenant>.vibe_challenge_replay`, created by that tenant's `vibe migrate`, FORCE RLS) so they hold across instances. The runtime role has SELECT and INSERT only; expired rows are ignored and removed by `vibe migrate`. Capacity is per tenant and client IPs are stored as a per-tenant HMAC. In production with a verifier configured the PostgreSQL store is always used; `vibe serve` refuses to start if a tenant's table is missing or has wrong grants, or if `VIBE_CHALLENGE_REPLAY_STORE=memory` is set. Outside production the store must be chosen explicitly (`memory` or `postgres`). Store errors fail closed (503).
+
+### Fixed
+
+- **Postgres TLS (#174):** `TlsMode::Require` (`sslmode=require`) previously did not enable TLS for database connections. It now requires TLS and fails to connect if the server does not offer it. `sslrootcert` is honored, and an unreadable or empty `sslrootcert` file is reported as an error.
 
 ### Breaking
 
 - **Unique constraint errors (#96):** Duplicate unique-key writes (single-column `unique` and composite `## Constraints`) now return 409 `UNIQUE_VIOLATION` instead of `CONFLICT` (SQLSTATE 23505 maps to the same code on every path, including method `query` steps). Messages name only the constraint columns, never field values. `unique_index_of` accepts only unqualified table names and either no `WHERE` clause or exactly `WHERE deleted_at IS NULL`; other predicates and schema-qualified tables are rejected.
+- **Frontmatter declaration (#92, D16):** Structured sources must declare their frontmatter explicitly; the declaration is now required. Malformed name lists are errors, not empty lists.
 - **Challenge verification (#118):** `x-challenge-proof` is no longer accepted just because it is non-empty. Routes with `challenge: { type: captcha, when: always }` verify the token with Cloudflare Turnstile siteverify (hostname and action checked, each token single-use) and fail closed (403 `CHALLENGE_FAILED`, 503 `CHALLENGE_UNAVAILABLE` when no verifier is configured, the provider is unreachable, or the route uses `pow`). In production, `vibe serve` and `vibe validate --deploy` refuse such routes until `VIBE_TURNSTILE_SECRET` and `VIBE_CHALLENGE_HOSTNAMES` are set.
 - **Ownership (#53):** The implicit admin ownership bypass is removed. Models that need admin-wide access must declare `ownership: role(admin)`. `owner-key: id` is only allowed on user-like models.
 - **Environment / slugs / pepper (#52):** Unknown `VIBE_ENV` values are treated as production. With PostgreSQL, unset `VIBE_ENV` is production. `--memory` is refused outside development. Outside development, `VIBE_API_KEY_PEPPER` is required (≥ 32 bytes). Missing, empty, or malformed `.vibe/slugs.json` fails closed (only `--memory` falls back to `slugs.example.json`).
@@ -22,12 +32,15 @@ added only when the corresponding PR is merged to `main`.
 
 ### Changed
 
+- **Lock commit (#92, from #93):** Lock files from one compile are committed all-or-nothing through a journal; journal writes are atomic and recovery after an interrupted commit is hardened.
+- **LLM_FORMAT_RETRIES (#92):** A value that is not an integer from 0 to 5 is an error instead of being silently clamped or ignored.
 - **LLM errors (#62):** Failed LLM calls report the real HTTP status (only 401/403 blame the API key; 400, 404, 429 and 5xx are worded by status). HTML responses and 404s add a hint to check `LLM_BASE_URL` (OpenAI-compatible endpoints usually end in `/v1`). The message includes the request URL and the first 200 characters of the response; the API key and `key=`/`api_key=` query values are masked as `***` before truncation.
 - **Rate limits (#54):** `VIBE_TRUSTED_PROXIES` accepts proxy IPs, CIDR blocks (v4/v6), hops with ports and IPv4-mapped IPv6; `X-Forwarded-For` is used only when the peer is trusted, taking the rightmost untrusted hop. IPv6 clients are bucketed per /64. `Retry-After` is the real time until the oldest hit leaves the window (quota: seconds until UTC midnight). Buckets are held in bounded, per-route/key-type LRU shards (10k each); at-limit buckets are never evicted, and a flood of one key type cannot block other clients.
 - **Request handling (#57):** Authentication, role/scope checks and rate limiting now run before request validation, so unauthenticated callers get 401/403 instead of 422 details. Expression failures return a generic `422 Invalid request` (details go to the server log). Required headers are enforced case-insensitively; body, query and path values are type-checked. Early 400, 413 (payload too large) and 415 (unsupported media type) responses respect the route's `min_response_ms`.
 
 ### Security
 
+- **JWT signing algorithm policy (#198, spec decision 139):** The spec now fixes the `sign-jwt` and JWT verification policy: only ES256 (default) and RS256; RS256 keys must be at least 2048 bits and a shorter key makes startup/deploy fail closed; verification accepts only the one configured alg and rejects any other `alg` header, including `none`, HS* and the other of ES256/RS256; EdDSA is deferred to vNext. Spec only; parts are not yet implemented (see spec 4.1a).
 - **Lock and manifest signatures (#167):** Lock and manifest signature verification now uses `verify_strict`; weak keys and non-canonical signatures are rejected (#151).
 
 <!--

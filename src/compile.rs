@@ -45,6 +45,13 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
             return Err(report);
         }
     };
+    let _run_lock = match crate::lockcommit::RunLock::acquire(opts.root) {
+        Ok(lock) => lock,
+        Err(err) => {
+            report.push(Diag::error("compile", err.to_string()));
+            return Err(report);
+        }
+    };
     if let Err(err) = crate::lockcommit::recover(opts.root) {
         report.push(Diag::error(
             "compile",
@@ -291,10 +298,12 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         return Err(report);
     }
     if let Err(err) = crate::lockcommit::commit_journaled(opts.root, &writes) {
-        report.push(Diag::error(
-            "compile",
-            format!("cannot write locks (none changed): {err}"),
-        ));
+        let message = if err.committed {
+            format!("locks were written, but cleanup failed: {err}; the next run finishes it")
+        } else {
+            format!("cannot write locks (none changed): {err}")
+        };
+        report.push(Diag::error("compile", message));
         return Err(report);
     }
     Ok(CompileOutput { files, report })
@@ -398,7 +407,9 @@ async fn llm_sections(
     }
     let system = system_prompt(source.kind, source.scope);
     let input = llm_input(source, docs);
-    let retries = crate::prompt_guide::format_retries();
+    let retries =
+        crate::prompt_guide::format_retries().map_err(|err| Diag::error(&source.rel, err))?;
+    let dump = dump_llm_enabled();
     let mut attempt_input = input.clone();
     let mut attempt = 0u32;
     loop {
@@ -410,12 +421,26 @@ async fn llm_sections(
             timeout: config.timeout,
             budget: Some(budget.clone()),
         };
-        let response = adapter
-            .compile(&request)
+        let response = crate::llm::call_budgeted(adapter, &request)
             .await
             .map_err(|err| Diag::error(&source.rel, err))?;
         let text = normalize_table_pipes(&strip_fence(&response.text));
-        match check_llm_output(&text, source.kind, source.scope) {
+        let checked = check_llm_output(&text, source.kind, source.scope);
+        if dump && checked.is_err() {
+            if let Err(err) = dump_llm_output(
+                opts.root,
+                &source.rel,
+                attempt + 1,
+                &response.text,
+                &[&config.api_key],
+            ) {
+                eprintln!(
+                    "warning: could not write raw LLM output for {}: {err}",
+                    source.rel
+                );
+            }
+        }
+        match checked {
             Ok(sections) => return Ok((sections, response.system_fingerprint)),
             Err(errors) if attempt < retries => {
                 attempt += 1;
@@ -432,6 +457,75 @@ async fn llm_sections(
                 ))
             }
         }
+    }
+}
+
+/// `VIBE_DUMP_LLM=1` (or `true`) saves the raw LLM response of every attempt
+/// that fails the lock format check under `.vibe/llm-dump/`.
+pub(crate) fn dump_llm_enabled() -> bool {
+    matches!(
+        std::env::var("VIBE_DUMP_LLM")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true")
+    )
+}
+
+/// Path of the dump file for one source and attempt. Only the response is
+/// stored (no prompt, no API key).
+pub(crate) fn dump_llm_path(root: &Path, rel: &str, attempt: u32) -> std::path::PathBuf {
+    let name: String = rel
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => c,
+            '/' | '\\' => '~',
+            _ => '_',
+        })
+        .collect();
+    root.join(".vibe")
+        .join("llm-dump")
+        .join(format!("{name}.attempt-{attempt}.txt"))
+}
+
+pub(crate) fn dump_llm_output(
+    root: &Path,
+    rel: &str,
+    attempt: u32,
+    raw: &str,
+    secrets: &[&str],
+) -> std::io::Result<std::path::PathBuf> {
+    let path = dump_llm_path(root, rel, attempt);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(&path, crate::llm::redact(raw, secrets))?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod dump_tests {
+    use super::*;
+
+    #[test]
+    fn dump_writes_redacted_response() {
+        let dir = std::env::temp_dir().join(format!("vibe-dump-{}", uuid::Uuid::new_v4()));
+        let path =
+            dump_llm_output(&dir, "api/a/b.md", 2, "## X\nkey sk-secret", &["sk-secret"]).unwrap();
+        assert!(path.starts_with(dir.join(".vibe/llm-dump")));
+        assert!(path.ends_with("api~a~b.md.attempt-2.txt"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("sk-secret") && text.contains("[redacted]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dump_names_do_not_collide() {
+        let root = Path::new("/r");
+        assert_ne!(
+            dump_llm_path(root, "a/b_c.md", 1),
+            dump_llm_path(root, "a_b/c.md", 1)
+        );
     }
 }
 
@@ -592,7 +686,9 @@ async fn translate_source(
         timeout: config.timeout,
         budget: Some(budget.clone()),
     };
-    let response = adapter.compile(&request).await.map_err(fail)?;
+    let response = crate::llm::call_budgeted(adapter, &request)
+        .await
+        .map_err(fail)?;
     let text = strip_fence(&response.text);
     if text.trim().is_empty() {
         return Err(fail("the LLM returned an empty translation".into()));
