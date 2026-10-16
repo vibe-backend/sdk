@@ -142,9 +142,19 @@ Every bound request must carry a fresh nonce in the `X-Vibe-Request-Nonce` heade
   can't be used to recover low-entropy bodies (such as login forms).
 - Nonces are unique per tenant (key `(tenant_id, nonce)`). Each request uses one
   nonce record, which counts toward the replay store caps (decisions 134 and
-  137). Exceeding a cap is rejected with 403 `CHALLENGE_FAILED`.
+  137).
 
-A missing, malformed or reused nonce is rejected with 403 `CHALLENGE_FAILED`.
+The server checks the nonce in a fixed order and stops at the first failure:
+
+1. Format and canonical form: 403 `CHALLENGE_FAILED`.
+2. Reuse of the same nonce: 403 `CHALLENGE_FAILED`.
+3. Decision 137 unverified-reservation cap: 403 `CHALLENGE_FAILED`.
+4. Decision 134 capacity caps (store full, per-prefix cap): 429
+   `CHALLENGE_RATE_LIMITED` with `Retry-After`. This response is identical to
+   every other decision 134 429, apart from the `Retry-After` value.
+
+Every verification failure, including a reused nonce, is 403, never 429. On 429,
+wait `Retry-After` seconds, then retry with a new nonce and a new challenge.
 
 ### Frontend: run the challenge just before submit
 

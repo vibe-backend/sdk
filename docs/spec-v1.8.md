@@ -32,6 +32,7 @@
 
 - Challenge provider（issue #160，已確認（產品經理 2026-10-16））：決定 131–138，v1 用 Cloudflare Turnstile（server 端 siteverify、production 共用 Postgres replay store（#177）、`type: pow` build error、fail closed、錯誤碼、secret 處理、同限流組合、固定數值、已認證 endpoint opt-in、provider 抽象），見 0.12、7.2a。
 - Challenge 綁定 request digest（決定 140，issue #156）：已確認（產品經理 2026-10-16），token 經 Turnstile `cdata` 綁定 request digest（完整長度，涵蓋 method、path、query、body、`Content-Type`、`If-Match`；包括 login route），session 綁定留到 vNext；`bind: none` v1 出 warning，下一個 minor 起新 public INSERT route 禁用（#245）；未實作（見 0.12、7.2b）；演算法修正（per-request nonce、query raw `+` 無效）已確認（產品經理 2026-10-16）。
+- Refresh cookie 補充（issue #78，已確認（產品經理 2026-10-16））：決定 141–148（cookie 模式 login、對外錯誤一致、`Max-Age`、CSRF 次序、cookie logout、access token 預設 TTL、錯誤碼、向後相容），喺決定 6、45、60、61、65、72、101 之上補充，見 0.11、4A.1b；實作狀態見 4A.1b。
 
 ### v1.7（定稿）
 
@@ -236,6 +237,21 @@
 | 120 | Email 正規化（issue #106）：v1 唔合併 plus addressing，`a+x@` 同 `a@` 係兩個唔同地址；local part 入面嘅點（`.`）照樣保留，`a.b@` 同 `ab@` 係兩個唔同地址。Local part：先做 Unicode NFC（唔係 NFKC），再 trim，再 lowercase。Domain：用 IDNA UTS #46 轉做 punycode，再 lowercase；IDNA 轉換失敗回 422 `VALIDATION_FAILED`。唯一 index、查找同發送全部用正規化後嘅值；login、註冊、邀請、驗證、重發同 rate-limit 全部先正規化再儲存同查找（12.11）。v1 只儲存正規化後嘅值，唔另外保留原本地址做顯示。現有資料遷移：migration 先偵測正規化後衝突（只差大小寫或者 Unicode 形式嘅重複地址）；有任何衝突就 fail closed 停止，唔自動合併；衝突報告只列 user id，任何公開 log 都唔出現完整 email；由人手按 12.11 嘅處理程序解決之後先重新跑。 | 已確認（產品經理 2026-10-16） | 4.3、9、12.11 |
 | 139 | `sign-jwt` 簽名算法政策（issue #198）：v1 只支援 ES256 同 RS256，預設 ES256；RS256 用嚟同第三方／JWKS 互通。RS256 key 最少 2048 bit，喺 `vibe validate --deploy`／部署同 `vibe serve` 啟動時檢查，唔夠就 fail closed（拒絕啟動，永遠唔會降級或者改用其他 alg）。驗證端只接受設定好嘅一個 alg；`alg` header 係其他值一律拒絕，包括 `none`、HS*，同埋 ES256／RS256 之中另一個（唔准混用）。EdDSA 留到 vNext。實作狀態：部分未實作，見 4.1a。 | 已確認（產品經理 2026-10-16） | 4.1、4.1a、12.6 |
 
+### 0.11 v1.8 refresh cookie 補充（決定 141 起，issue #78，已確認（產品經理 2026-10-16））
+
+決定 6、45、60、61、65、72 同 101 已經定咗 refresh 輪換、重用偵測、寬限期、pipeline 參數、限流、cookie 名同屬性、兩個模式同 CSRF／CORS 原則；以下只補返 issue #78 仲未寫清楚嘅部分。產品經理已確認（2026-10-16）。實作狀態見 4A.1b。
+
+| # | 決定 | 狀態 | 位置 |
+| --- | --- | --- | --- |
+| 141 | Cookie 模式下 login 都用 cookie：`transport: cookie` 時，login（`sign-jwt` `issue-refresh: new-family`）同 refresh（決定 101）一樣，新 refresh token **只**喺 `Set-Cookie` 出現，response body 唔包含 `refresh_token`；body 只有 `access_token` 同 `expires_in`（login 而家已經用 `access_token` 欄位名）。`transport: body` 照舊（決定 6、45）。 | 已確認（產品經理 2026-10-16） | 4A.1b |
+| 142 | 對外錯誤一致：輪換、重用撤銷家族同清 cookie 跟決定 6、61、101，唔重複定義。重用、過期、已撤銷、搵唔到，對外一律回同一個 401 錯誤碼同 body（決定 147），唔分開透露狀態；分別只寫入審計（`revoke_reason: reuse-detected` 等）。 | 已確認（產品經理 2026-10-16） | 4A.1、4A.1b |
+| 143 | Cookie `Max-Age` = `min(家族剩餘絕對壽命, 閒置剩餘時間)`，每次輪換重新計（收緊決定 101「唔超過家族剩餘絕對壽命」；決定 143 只可以收緊決定 101，永遠唔可以放寬佢任何 cookie 屬性或者上限）；一定有 `Max-Age`（唔用 session cookie），唔用 `Expires`。`Path=/`、冇 `Domain` 照決定 101；決定 60 嘅 slug Path 只適用 `transport: body`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
+| 144 | Refresh／logout 檢查次序（全部喺讀 cookie 之前做，補充決定 101）：1. method 一定 `POST`（其他回 405）；2. `Origin` 一定存在而且完全等於 `allowed-origins` 其中一個；3. `cross-site` 模式一定有 `X-Vibe-CSRF: 1`（cookie logout 喺任何模式都一定要，決定 145）；2 或 3 失敗對外一律回 403 `CSRF_REJECTED`，詳細原因只寫 server log 同審計；呢類 403 唔清 cookie，cookie 只喺通過檢查之後先會被清；4. cookie 模式只由 cookie 讀 token，忽略 body 入面嘅 `refresh_token`。唔接受 `Referer` 代替 `Origin`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
+| 145 | Cookie 模式 logout 唔要求 access token：瀏覽器 reload 之後記憶體冇 access token，所以 `token-revoke` 喺 `token-source: cookie` 而且 `scope: family` 時，以 cookie 搵家族並撤銷，唔需要 `auth`（決定 65「一定要 `auth`」嘅例外，只限呢個組合）。條件（產品經理 2026-10-16 確認；架構師 2026-10-16 釐清）：(1) 三項檢查，依次：(a) `Origin` 一定存在而且完全等於嗰個 slug 嘅決定 101 `allowed-origins` 其中一個（同 refresh 用同一份設定，冇另外嘅 logout 清單）；(b) 一定帶 `X-Vibe-CSRF: 1`，`same-site` 模式都要；(c) token 只由 `__Host-vibe_rt_{slug}` cookie 讀，永遠唔由 body 或者其他 cookie 名讀。(a) 或 (b) 失敗即 fail closed：403 `CSRF_REJECTED`，唔讀 cookie、唔撤銷、唔清 cookie。(2) (a)、(b) 通過之後，有效 cookie 就撤銷佢對應嘅家族；冇 cookie、cookie 無效、過期或者已撤銷就乜都唔撤銷；兩種情況回應完全一樣：204 加清除 cookie，唔透露有冇 token 或者 token 係咪有效。(3) 只撤銷嗰個 cookie 對應嘅家族，而且家族一定要屬於 URL slug 嗰個租戶（RLS 照舊；租戶唔啱當無效 cookie 處理）；唔影響同一用戶其他家族。(4) 重複 logout 係 idempotent。(5) 同 refresh 一樣套用決定 72 嘅限流同最低回應耗時（300ms），令有效同無效 cookie 喺時間上分唔出。(6) 點解 `same-site` 都要 `X-Vibe-CSRF`：logout 冇 access token（本決定），所以除咗 `Origin` 檢查，CSRF header 係佢唯一嘅來源證明；無條件要求亦令兩個模式用同一條規則。(7) 必要測試見 4A.1b。`scope: all`（全部裝置登出）照舊一定要 `auth`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
+| 146 | Access token 預設 TTL 15 分鐘（上限 1 小時照決定 6）；refresh 家族、`idle-ttl`、`reuse-grace` 嘅預設同上限照決定 6、45、61，唔改。Cookie 模式建議前端喺 access token 到期前 60 秒內 refresh。 | 已確認（產品經理 2026-10-16） | 4A.1、4A.1b |
+| 147 | Refresh／logout 錯誤碼（固定、平台提供，lock 唔使宣告；cookie 同 body transport 一律用同一套，`INVALID_REFRESH_TOKEN` 冇任何別名）：401 `INVALID_REFRESH_TOKEN`（冇 token／冇 cookie、無效、過期、已撤銷、重用；同時清 cookie）；403 `CSRF_REJECTED`（決定 144；唔清 cookie）；405 `METHOD_NOT_ALLOWED`；429 `RATE_LIMITED`（決定 72 限流，帶 `Retry-After`）；503 `TX_CONFLICT`／504 `TX_TIMEOUT`（決定 100）。錯誤 body 唔包含任何 token、hash 或者家族 id。 | 已確認（產品經理 2026-10-16） | 4A.1b、8 |
+| 148 | 向後相容：`transport` 預設照舊 `body`，現有 lock 唔使改；改做 `cookie` 係 opt-in，要重新 build。每個 endpoint version 只接受一種 transport，永遠唔會同時收 body 同 cookie；要遷移就喺新 `{version}` 開 cookie endpoint，舊版 body endpoint 照舊運作直到 deprecate。已發出嘅 body refresh token 唔會自動轉做 cookie，用戶喺新版重新登入。SDK client 預設照舊。 | 已確認（產品經理 2026-10-16） | 4A.1b |
+
 ### 0.12 Challenge provider：Turnstile（決定 131 起，issue #160，已確認（產品經理 2026-10-16））
 
 跟進 #139（#118）嘅實作（[`challenge.md`](challenge.md)）同 #177（共用 replay store）。產品經理已確認（2026-10-16）。只描述防禦設計。
@@ -250,7 +266,7 @@
 | 136 | Secret 處理：`VIBE_TURNSTILE_SECRET` 只可以由環境變數或者 secret manager（例如 CI environment secret）注入；唔准寫入 source、lock、manifest、`.env` commit 或者 log；錯誤訊息同 debug 輸出只顯示「已設定／未設定」。驗證器見到 lock 或者 source 有疑似 secret 值即報 error。設定：`VIBE_CHALLENGE_PROVIDER`（預設 `turnstile`）、`VIBE_TURNSTILE_SECRET`、`VIBE_CHALLENGE_HOSTNAMES`（有 secret 就一定要有）、`VIBE_CHALLENGE_REPLAY_STORE`（production 一定 `postgres`，#177）；預設同 production 規則見 7.2a。 | 已確認（產品經理 2026-10-16） | 7.2a、2A.8.5 |
 | 137 | 同限流組合：route 限流（決定 25、39）同 public 寫入每日配額喺 challenge 之前檢查，超過回 **429**（同 challenge 嘅 503 分開），被限流嘅 request 唔會去到 replay store 或者 provider；challenge 唔取代限流同配額。v1 用固定平台數值：token 壽命 300s、每 client IP 最多 16、每租戶最多 1,000 個未驗證預留（超過回 403 `CHALLENGE_FAILED`，唔 call provider）；**冇租戶 override**。將來如果加 override，只可以調低，唔可以調高。 | 已確認（產品經理 2026-10-16） | 7.2a、4.3 |
 | 138 | Provider 抽象：runtime 經 `ChallengeVerifier` trait 驗證（輸入 token、client IP、預期 action；輸出 通過／失敗／不可用 三種，provider 細節唔外露；「失敗」對應 403，「不可用」對應 503）。之後加 hCaptcha 等 provider 只係新 implementation 同 `VIBE_CHALLENGE_PROVIDER` 新值，lock 語法、replay store 同錯誤碼唔變；未實作嘅值（例如 `hcaptcha`）啟動時拒絕。 | 已確認（產品經理 2026-10-16） | 7.2a |
-| 140 | Challenge token 綁定 request digest（issue #156）：所有 `type: captcha` route（包括 login 類 `when: after-failures`）嘅 token 經 Turnstile `cdata` 綁定 request digest：`rd1.` 加完整 43 字元 base64url（冇 padding）SHA-256，唔截短。Client 每個 request 用 CSPRNG 產生 128 bit nonce，只經 `X-Vibe-Request-Nonce`（剛好 22 字元 base64url）送畀 server，冇或者重用即 fail closed，nonce key `(tenant_id, nonce)`、每個 request 一個紀錄，計入決定 134 同 137 上限，超過即 403 `CHALLENGE_FAILED`；`cdata` 只放 digest（私隱）。Digest 一律涵蓋 nonce、method、正規化 path（包括 tenant slug）、正規化 query 同 raw body 嘅 SHA-256；header 只涵蓋 `Content-Type` 同 `If-Match`；唔包括 client IP。Query raw `+` 無效（空格 `%20`、`+` 送 `%2B`，client helper 自動做）；冇 Unicode 正規化；任何無效 canonical 輸入回現有 403 `CHALLENGE_FAILED`，reason 只入內部 log；log 永遠唔記錄 nonce 或者 body。Server 喺 JSON 解析之前重新計算，同 siteverify `cdata` constant-time 比較，唔一致或者冇即 403 `CHALLENGE_FAILED`（唔講邊部分唔一致），fail closed。Proxy rewrite path 會 fail closed（部署要求）。v1 准 `bind: none` 但出 warning；下一個 minor release 起新 public INSERT route 唔准用 `none`（#245）。前端喺表格完成、送出之前先做 challenge。Session 綁定留到 vNext。實作狀態：未實作，見 7.2b。 | 已確認（產品經理 2026-10-16；演算法修正 2026-10-16 11:58 HKT） | 7.2b |
+| 140 | Challenge token 綁定 request digest（issue #156）：所有 `type: captcha` route（包括 login 類 `when: after-failures`）嘅 token 經 Turnstile `cdata` 綁定 request digest：`rd1.` 加完整 43 字元 base64url（冇 padding）SHA-256，唔截短。Client 每個 request 用 CSPRNG 產生 128 bit nonce，只經 `X-Vibe-Request-Nonce`（剛好 22 字元 base64url）送畀 server，冇或者重用即 fail closed，nonce key `(tenant_id, nonce)`、每個 request 一個紀錄，計入決定 134 同 137 上限：超過決定 137 即 403 `CHALLENGE_FAILED`，超過決定 134 即 429 `CHALLENGE_RATE_LIMITED`（同決定 134 一致）；驗證失敗（包括 nonce 重用）一律 403；`cdata` 只放 digest（私隱）。Digest 一律涵蓋 nonce、method、正規化 path（包括 tenant slug）、正規化 query 同 raw body 嘅 SHA-256；header 只涵蓋 `Content-Type` 同 `If-Match`；唔包括 client IP。Query raw `+` 無效（空格 `%20`、`+` 送 `%2B`，client helper 自動做）；冇 Unicode 正規化；任何無效 canonical 輸入回現有 403 `CHALLENGE_FAILED`，reason 只入內部 log；log 永遠唔記錄 nonce 或者 body。Server 喺 JSON 解析之前重新計算，同 siteverify `cdata` constant-time 比較，唔一致或者冇即 403 `CHALLENGE_FAILED`（唔講邊部分唔一致），fail closed。Proxy rewrite path 會 fail closed（部署要求）。v1 准 `bind: none` 但出 warning；下一個 minor release 起新 public INSERT route 唔准用 `none`（#245）。前端喺表格完成、送出之前先做 challenge。Session 綁定留到 vNext。實作狀態：未實作，見 7.2b。 | 已確認（產品經理 2026-10-16；演算法修正 2026-10-16 11:58 HKT） | 7.2b |
 
 ## 1. 目錄同命名
 
@@ -1097,7 +1113,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 瀏覽器 client：access token 只放記憶體（唔放 cookie、唔放 localStorage），refresh token 放 cookie；重新載入頁面時 call refresh endpoint 攞新 access token。
 
 - **Endpoint**：`POST /{definition}/{version}/{slug}/refresh`（`token-refresh`，`transport: cookie`）同 `POST /{definition}/{version}/{slug}/logout`（`token-revoke`）。Refresh 回 body `{ "access_token", "expires_in" }`，新 refresh token 只喺 `Set-Cookie`。
-- **Cookie 屬性**：`__Host-vibe_rt_{slug}=<token>; HttpOnly; Secure; SameSite=<模式>; Path=/`，冇 `Domain`，`Max-Age` 唔超過家族剩餘絕對壽命。
+- **Cookie 屬性**：`__Host-vibe_rt_{slug}=<token>; HttpOnly; Secure; SameSite=<模式>; Path=/`，冇 `Domain`，`Max-Age` 唔超過家族剩餘絕對壽命（決定 143 收緊做同時唔超過閒置剩餘時間）。
   - `__Host-` 前綴保證 cookie 只屬於呢個 host、一定 Secure，防止 subdomain 寫入或者覆蓋 cookie；但瀏覽器規定 `__Host-` cookie 一定要 `Path=/`，所以唔可以再限定 `Path` 去 refresh endpoint。我哋揀 `__Host-`：`Path` 唔係安全邊界，而 `HttpOnly` 已經令 JS 讀唔到；server 只喺 refresh 同 logout 讀呢個 cookie，其他 endpoint 一律忽略。Cookie 名包括 slug，同一個 host 多個租戶唔會撞。產品經理已確認：防止 subdomain 覆蓋 cookie 比限定 Path 重要（2026-10-14）。
 - **兩個模式**（`token-refresh` 參數 `cookie-mode`）：
   - **`same-site`（預設）**：`SameSite=Strict`。前端同 API 一定要同 site（例如 `app.example.com` 同 `api.example.com`）。
@@ -1105,7 +1121,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
     1. 嚴格 `Origin` 白名單（完全相等，唔准 `*` 或者 wildcard，最少一個 origin）；同埋
     2. 自訂 header CSRF 檢查：refresh 同 logout 一定要帶 `X-Vibe-CSRF: 1`，冇就回 403。自訂 header 令瀏覽器一定先做 CORS preflight，跨 site 表單或者簡單請求帶唔到。
   - 開咗 `cross-site` 但缺少任何一樣，驗證器報 error，`vibe build` 同部署一律失敗。
-  - `same-site` 模式都會檢查 `Origin` 白名單；`X-Vibe-CSRF` 可選。
+  - `same-site` 模式都會檢查 `Origin` 白名單；refresh 嘅 `X-Vibe-CSRF` 可選，cookie logout 一定要（決定 145）。
 - **輪換同重用偵測**：跟 4A.1，每次 refresh 輪換；偵測到重用已失效 token（寬限期外）撤銷成個家族，同時回 `Set-Cookie` 清除 cookie。
 - **CSRF**：refresh 同 logout 一定要有 `Origin` header，而且喺租戶設定嘅前端 origin 白名單入面（完全相等，唔准 wildcard）；冇 `Origin` 或者唔喺白名單回 403，唔讀 cookie。`same-site` 模式再加 `SameSite=Strict`；`cross-site` 模式再加 `X-Vibe-CSRF` header 檢查。只接受 `POST`。
 - **CORS**：只對白名單 origin 回 `Access-Control-Allow-Origin: <origin>`（唔准 `*`）、`Access-Control-Allow-Credentials: true`、`Vary: Origin`；`cross-site` 模式 preflight 回 `Access-Control-Allow-Headers` 包括 `X-Vibe-CSRF`。Credentials **只限** refresh 同 logout endpoint，其他 endpoint 一律唔回 `Access-Control-Allow-Credentials`。
@@ -1137,10 +1153,10 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 | 參數 | 類型 | 預設 | 說明 |
 | --- | --- | --- | --- |
 | `scope` | `family` \| `all` | `family` | `family`：撤銷當前 refresh token 所屬家族（登出）；`all`：撤銷該用戶所有家族（全部裝置登出） |
-| `token-source` | `body` \| `cookie` | 同 `token-refresh` 嘅 `transport` | `scope: family` 時用嚟搵家族；`scope: all` 唔需要 |
+| `token-source` | `body` \| `cookie` | 同 `token-refresh` 嘅 `transport` | `scope: family` 時用嚟搵家族；`scope: all` 唔需要。`cookie` 時冇自己嘅 `allowed-origins`：一律用同一個 slug `token-refresh` 嘅決定 101 `allowed-origins`（決定 145） |
 | `clear-cookie` | boolean | `true`（cookie 時） | 回應帶 `Max-Age=0` 清除 refresh cookie，`Path` 同 `token-refresh` 一樣 |
 
-- 一定要 `auth`；只可以撤銷 `sub` 自己嘅家族；`revoke_reason` 分別寫 `logout`／`logout-all`。
+- 一定要 `auth`，只可以撤銷 `sub` 自己嘅家族。例外：`token-source: cookie` 加 `scope: family`（決定 145）唔使 `auth`，只撤銷嗰個 cookie 對應、屬於 URL slug 租戶嘅家族，並套用決定 72 限流同最低回應耗時；`revoke_reason` 分別寫 `logout`／`logout-all`。
 - 搵唔到 token 或者已撤銷都回 204（idempotent，唔洩漏狀態）。
 
 #### Refresh token 儲存
@@ -1166,6 +1182,114 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 
 - Revoke：一律 UPDATE `revoked_at` 同 `revoke_reason`（家族一次過），唔用 DELETE；過期紀錄唔刪除，冇個人資料（只有 hash 同 id），12.10 刪除時一併 revoke。
 - 只有平台專用 `refresh_store` role 可以讀寫呢張表（見 7.1）。
+
+### 4A.1b Refresh cookie 補充細節（決定 141–148，issue #78，已確認（產品經理 2026-10-16））
+
+> 本節已確認（產品經理 2026-10-16）。只描述防禦設計。
+
+#### 流程
+
+1. Login（`transport: cookie`）：回 body `{ "access_token", "expires_in" }`，同 `Set-Cookie: __Host-vibe_rt_{slug}=…; HttpOnly; Secure; SameSite=<模式>; Path=/; Max-Age=<秒>`；body 冇 `refresh_token`（決定 141）。
+2. 頁面載入／access token 就到期：前端 `POST /{definition}/{version}/{slug}/refresh`，`credentials: "include"`，`cross-site` 模式加 `X-Vibe-CSRF: 1`。
+3. 平台按決定 144 次序檢查，之後先讀 cookie，跟 4A.1 輪換；成功回 200、新 access token 同新 cookie（`Max-Age` 跟決定 143）。
+4. 重用或者無效：回 401 `INVALID_REFRESH_TOKEN` 加清除 cookie；重用時撤銷成個家族（決定 142、101）。
+5. Logout：`POST …/logout`，cookie 模式唔使 access token。先檢查 `Origin`（同 refresh 同一份決定 101 白名單）同 `X-Vibe-CSRF: 1`（`same-site` 都要），任何一項失敗回 403 `CSRF_REJECTED`；之後 token 只由 `__Host-` cookie 讀。通過之後一律 204 加清除 cookie：有效 cookie 撤銷佢嘅家族，冇 cookie 或者無效就乜都唔撤銷，回應一樣；套用決定 72 限流同最低回應耗時（決定 145）。
+
+#### Auth pipeline markdown 寫法
+
+Source（`api/auth/refresh.md`）用自然語言寫，frontmatter 宣告高風險欄位（決定 112）：
+
+```markdown
+---
+kind: api
+public: true
+auth: refresh-cookie
+---
+
+# Refresh token
+
+呢個係 refresh token endpoint，用 httpOnly cookie，前端同 API 同 site。
+簽 token 用 user.sign-access-token。
+```
+
+編譯後 lock（節錄）：
+
+```markdown
+## Route
+
+- method: POST
+- path: /{definition}/{version}/{slug}/refresh
+- public: true
+
+## Pipelines
+
+- -auth
+- token-refresh:
+    sign-method: user.sign-access-token
+    transport: cookie
+    cookie-mode: same-site
+    allowed-origins: [https://app.example.com]
+    refresh-ttl: 30d
+    idle-ttl: 7d
+    reuse-grace: 10s
+```
+
+`cross-site` 例子只改 `cookie-mode: cross-site`，`allowed-origins` 一定最少一個完全相等嘅 origin；平台自動要求 `X-Vibe-CSRF`，唔使喺 lock 再寫。
+
+Logout（節錄）：
+
+```markdown
+## Route
+
+- method: POST
+- path: /{definition}/{version}/{slug}/logout
+- public: true
+
+## Pipelines
+
+- -auth
+- token-revoke:
+    scope: family
+    token-source: cookie
+    clear-cookie: true
+```
+
+驗證器 error：`transport: cookie` 冇 `allowed-origins`；`token-revoke` 自己宣告 `allowed-origins`（cookie logout 一律繼承同一個 slug `token-refresh` 嘅設定，決定 145）；`allowed-origins` 有 `*`、wildcard、path 或者唔係 `https`（dev build 除外）；`cross-site` 但冇 `allowed-origins`；`token-revoke` `scope: all` 但係 `public: true`；`token-revoke` `token-source: cookie` 但同一個 definition 嘅 `token-refresh` 唔係 `transport: cookie`。
+
+#### 錯誤碼（決定 147）
+
+| 狀態 | 錯誤碼 | 幾時 | 清 cookie |
+| --- | --- | --- | --- |
+| 401 | `INVALID_REFRESH_TOKEN` | 冇 cookie、無效、過期、已撤銷、重用 | 係 |
+| 403 | `CSRF_REJECTED` | 冇 `Origin`、唔喺白名單；refresh 喺 `cross-site` 冇 `X-Vibe-CSRF: 1`；cookie logout 喺任何模式（包括 `same-site`）冇 `X-Vibe-CSRF: 1`（決定 145）。冇 cookie 唔係 403（logout 回 204，refresh 回 401）。詳細原因只入 server log 同審計 | 否（只有通過檢查嘅請求先會清 cookie） |
+| 405 | `METHOD_NOT_ALLOWED` | 唔係 `POST` | 否 |
+| 429 | `RATE_LIMITED` | 決定 72 限流 | 否 |
+| 503／504 | `TX_CONFLICT`／`TX_TIMEOUT` | 決定 100 | 否 |
+
+所有回應帶 `Cache-Control: no-store`；body 同 log 永遠唔記錄 token 明文。
+
+#### 向後相容（決定 148）
+
+- `transport: body` 照舊係預設，現有 lock、SDK client 同 login 回應唔變。
+- Cookie 係 opt-in，經新 `{version}` 遷移；每個 endpoint version 只接受一種 transport。
+- Login 同 refresh 嘅 body 都用 `access_token`（現有 login 已經係咁）。
+- 決定 60（slug Path）只喺 body 模式冇作用；cookie 模式跟決定 101 `Path=/`。
+
+#### Cookie logout 必要測試（決定 145）
+
+三項檢查各自單獨失敗（其餘兩項正確，有一個有效 cookie）各一個測試：
+
+1. `Origin` 唔喺 `allowed-origins`（或者冇 `Origin`）：403 `CSRF_REJECTED`，家族冇被撤銷，回應冇 `Set-Cookie`。
+2. 冇 `X-Vibe-CSRF: 1`（`same-site` 同 `cross-site` 各測一次）：403 `CSRF_REJECTED`，家族冇被撤銷，回應冇 `Set-Cookie`。
+3. Token 唔係由 `__Host-vibe_rt_{slug}` cookie 嚟（只喺 body，或者用其他 cookie 名）：204 加清除 cookie，同無效 cookie 回應完全一樣，body／其他 cookie 嘅家族冇被撤銷。
+
+另外：冇 cookie、無效、過期、已撤銷同有效 cookie 嘅 204 回應（status、header、body）完全一樣，同樣受最低回應耗時限制；重複 logout 兩次回應一樣；只有嗰個 cookie 嘅家族被撤銷；其他租戶嘅家族（slug 唔啱）唔會被撤銷；超過決定 72 限流回 429。
+
+#### 實作狀態（對照 main，2026-10-16）
+
+- **main 已實作**：`sign-jwt` 簽 access token，login body 回 `access_token`（`src/runtime/ops.rs`）；sqlguard 拒絕 app SQL 觸及 `_platform_refresh_tokens`（`src/sqlguard.rs`）。
+- **main 未實作**：`token-refresh`／`token-revoke` pipeline、`_platform_refresh_tokens` 儲存同輪換；`sign-jwt issue-refresh` 除 `none` 以外一律 build／runtime error（`src/validate.rs`、`src/runtime/ops.rs`）；`rate-limit key: family` 被拒絕（`src/manifest.rs`）。Cookie transport（決定 101、141–148）全部未實作。
+- **進行中**：PR #95（Refs #26）實作 body transport 嘅 refresh、輪換、重用偵測同 revoke；cookie transport 明確唔包括。#95 用 `INVALID_REFRESH_TOKEN`，同決定 147 一致（產品經理 2026-10-16 確認兩種 transport 都用呢個名，冇別名）。
 
 ### 4A.2 密碼政策（決定 7）
 
@@ -1448,7 +1572,11 @@ Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動�
 - 單次使用：nonce 同 token 一齊喺現有 replay store（決定 132、#177）記錄（只存 SHA-256），有效期同 token 紀錄一樣（replay TTL 360s）；同一個 nonce 喺有效期內再出現即無效。
 - **唯一性範圍**：每租戶。Replay store 嘅 nonce key 係 `(tenant_id, nonce)`（喺租戶自己嘅 schema，同決定 132 replay store 一樣），只喺同一個租戶入面檢查重用。128 bit 隨機值喺唔同租戶之間撞中嘅機會可以忽略；用每租戶範圍可以保持租戶之間嘅隔離，唔使跨租戶查詢。
 - **計數**：每個 request 剛好佔**一個** nonce 紀錄（key `(tenant_id, nonce)`），另加決定 132 原有嘅 token 紀錄。Nonce 紀錄計入決定 134 嘅每租戶容量同每個網段（IPv4 /24、IPv6 /48）上限；因為佢喺驗證之前預留，亦計入決定 137 嘅未驗證預留上限（每 client IP 16、每租戶 1,000）。冇另外、冇上限嘅空間。
-- **超過上限**：因 nonce 紀錄而超過決定 134 或者決定 137 任何一個上限，request 一律 fail closed，回 403 `CHALLENGE_FAILED`。
+- **超過上限**（已確認（產品經理 2026-10-16 12:19 HKT））：
+  - Nonce 紀錄會令決定 137 未驗證預留上限超過 → 403 `CHALLENGE_FAILED`。
+  - Nonce 紀錄會令決定 134 容量上限（每租戶 store 滿、每網段上限）超過 → 429 `CHALLENGE_RATE_LIMITED` 加 `Retry-After`，規則同決定 134 完全一樣（`Retry-After` = 相關最舊紀錄剩餘有效時間，上限 360s，計唔到就 60）。呢個 429 回應除咗 `Retry-After` 嘅值之外，同其他所有決定 134 嘅 429 完全一樣，唔透露內部原因係 nonce；reason 只入 metric 同內部 log。
+  - 所有驗證失敗（包括 nonce 格式錯、同一個 nonce 重用）一律 403，永遠唔係 429。
+- **檢查次序**（固定、deterministic）：① nonce 格式同 canonical 檢查（403）→ ② 重用檢查（403）→ ③ 決定 137 未驗證預留上限（403）→ ④ 決定 134 容量上限（429）。遇到第一個唔通過就停。原因：無效輸入同安全相關嘅 403 優先；容量 429 只會畀本身合法嘅 request。
 
 #### 私隱考慮
 
@@ -1498,7 +1626,7 @@ Digest 一律涵蓋 nonce、method、path、正規化 query 同 body；涵蓋嘅
 2. Request 大小上限（見下面）→ body 超過即 413（同未綁定 route 一樣）。
 3. 冇 `x-challenge-proof` → 400 `CHALLENGE_REQUIRED`。
 4. 檢查 `X-Vibe-Request-Nonce`（存在、唔重複、剛好 22 字元 canonical base64url），再由收到嘅 request 計 digest（JSON 解析之前、未 call provider 之前）。Nonce 無效或者任何 canonicalization 無效（raw `+`、method 唔係大寫 token、壞 percent-encoding、dot segment、重複 header、非 ASCII header 值、有 `Content-Encoding`、超過上限等）→ 403 `CHALLENGE_FAILED`，唔 call provider。
-5. Token 格式、replay store 預留同上限（7.2a 步驟 3，錯誤碼不變）；同一個預留入面一齊預留一個 nonce 紀錄（key `(tenant_id, nonce)`，只存 SHA-256）；nonce 已經用過，或者因 nonce 紀錄超過決定 134（每租戶、每網段）或者決定 137（未驗證預留）上限，即 403 `CHALLENGE_FAILED`。
+5. Token 格式、replay store 預留同上限（7.2a 步驟 3，錯誤碼不變）；同一個預留入面一齊預留一個 nonce 紀錄（key `(tenant_id, nonce)`，只存 SHA-256）；nonce 檢查次序固定：① 格式同 canonical（已喺第 4 步）→ ② nonce 已經用過 → 403 `CHALLENGE_FAILED` → ③ 會超過決定 137 未驗證預留上限 → 403 `CHALLENGE_FAILED` → ④ 會超過決定 134 容量上限（store 滿、網段上限）→ 429 `CHALLENGE_RATE_LIMITED` 加 `Retry-After`（同決定 134 一樣，回應同其他決定 134 嘅 429 一致）。遇到第一個唔通過就停。
 6. Siteverify（決定 132，所有現有檢查不變）。
 7. 比較 siteverify `cdata` 同第 4 步嘅 digest：用 constant-time 比較；`cdata` 冇、空、長度唔啱或者唔相等 → 403 `CHALLENGE_FAILED`。Token 同 nonce 照樣記為已用（單次使用，唔會因為 digest 唔啱而釋放）。
 8. 全部通過先做 JSON 解析同執行 lock steps；之後嘅處理只用第 4 步 hash 過嗰份 body bytes，唔會再讀第二次。
@@ -1717,7 +1845,23 @@ b6366f0d634afe549d3039313154f8e78529a9fd92396fc35a8e52cb6e9bcf09
 | I16 | query 4,097 bytes（超過上限） |
 | I17 | query 65 項（超過上限） |
 
-必要測試（實作時）：上面有效向量逐個相等；無效向量全部 403 `CHALLENGE_FAILED` 而且唔 call provider；nonce、body、query、path、method、`Content-Type`、`If-Match` 任何一樣改咗即 403；`cdata` 冇或者空即 403；同一個 nonce 第二次用即 403；所有 403 回應 byte 一致；digest 唔一致之後 token 同 nonce 都唔可以再用；nonce 紀錄計入決定 134 上限；log 搵唔到 nonce 同 body。
+必要測試（實作時）：上面有效向量逐個相等；無效向量全部 403 `CHALLENGE_FAILED` 而且唔 call provider；nonce、body、query、path、method、`Content-Type`、`If-Match` 任何一樣改咗即 403；`cdata` 冇或者空即 403；同一個 nonce 第二次用即 403；所有 403 回應 byte 一致；digest 唔一致之後 token 同 nonce 都唔可以再用；nonce 紀錄計入決定 134 同 137 上限；log 搵唔到 nonce 同 body；nonce 引起嘅 429 同其他決定 134 嘅 429 除 `Retry-After` 值外 byte 一致。
+
+同時成立嘅條件（檢查次序測試，實作時逐個要有）：
+
+| # | 同時成立 | 結果 |
+| --- | --- | --- |
+| C1 | 只係決定 134 容量超過（nonce 合法、未用過、決定 137 未超過） | 429 `CHALLENGE_RATE_LIMITED` 加 `Retry-After` |
+| C2 | Nonce 格式錯 + nonce 重用 | 403 `CHALLENGE_FAILED` |
+| C3 | Nonce 格式錯 + 決定 137 超過 | 403 `CHALLENGE_FAILED` |
+| C4 | Nonce 格式錯 + 決定 134 超過（store 滿） | 403 `CHALLENGE_FAILED` |
+| C5 | Nonce 重用 + 決定 137 超過 | 403 `CHALLENGE_FAILED` |
+| C6 | Nonce 重用 + 決定 134 超過（store 滿或者網段上限） | 403 `CHALLENGE_FAILED` |
+| C7 | 決定 137 超過 + 決定 134 超過 | 403 `CHALLENGE_FAILED` |
+| C8 | 四個全部同時成立 | 403 `CHALLENGE_FAILED` |
+| C9 | Canonical 輸入無效（例如 raw `+`）+ 決定 134 超過 | 403 `CHALLENGE_FAILED`（第 4 步已拒絕，未到 replay store） |
+
+所有 403 回應 byte 一致；C1 嘅 429 同 store 滿、網段上限嘅 429 除 `Retry-After` 值外一致。
 
 #### 剩餘風險
 
@@ -1728,7 +1872,7 @@ b6366f0d634afe549d3039313154f8e78529a9fd92396fc35a8e52cb6e9bcf09
 - **Client 端計算**：digest 證明 token 係為呢個 request 內容攞嘅，唔證明內容係真人輸入；challenge 本身嘅保證唔變。
 - **部署相容性**：會改 body、path 或者 query encoding 嘅 proxy／CDN（壓縮、prefix rewrite、`%20` 改 `+`）會令所有綁定 request 被拒（fail closed），要喺部署文件講明。
 - **Provider 依賴**：`cdata` 由 Turnstile 原樣回傳；如果 provider 改變 `cdata` 行為，比對會失敗（fail closed），唔會放行。
-- **Replay store 容量**：每個 request 多一個 nonce 紀錄，同 token 共用決定 134 同 137 上限，高流量時會早啲到上限（fail closed）。
+- **Replay store 容量**：每個 request 多一個 nonce 紀錄，同 token 共用決定 134 同 137 上限，高流量時會早啲到上限（決定 137 → 403，決定 134 → 429，都係 fail closed）。
 - **Nonce 喺邊度睇得到**：Operator 自己嘅 reverse proxy 或者 CDN 如果負責 TLS termination，睇得到 nonce 同 body；challenge script 喺我哋自己嘅頁面執行，原則上讀得到頁面內容（包括表格同 nonce）。Nonce 係單次使用、唔含任何 secret，睇到 nonce 唔可以用嚟偽造 request；呢度嘅保護範圍只係令 `cdata` 本身唔可以還原內容。
 - **用戶體驗**（已接受，產品經理 2026-10-16）：用戶做完 challenge 之後再改表格，要重新做 challenge。前端文件教開發者喺表格填好之後、送出之前先做 challenge（[`challenge.md`](challenge.md)）。
 
