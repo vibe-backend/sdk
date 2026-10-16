@@ -68,6 +68,7 @@ fn ctx() -> ChallengeContext {
     ChallengeContext {
         action: "register".into(),
         remote_ip: Some("203.0.113.9".into()),
+        tenant: Some("tenant0001".into()),
     }
 }
 
@@ -105,6 +106,26 @@ async fn turnstile_accepts_only_a_fresh_bound_single_use_token() {
             json!({"success": true, "hostname": "shop.example.com"}),
         ),
         (
+            "no-ts".into(),
+            json!({"success": true, "hostname": "shop.example.com", "action": "register"}),
+        ),
+        (
+            "future".into(),
+            ok_answer(
+                "shop.example.com",
+                "register",
+                now + chrono::Duration::seconds(120),
+            ),
+        ),
+        (
+            "small-skew".into(),
+            ok_answer(
+                "shop.example.com",
+                "register",
+                now + chrono::Duration::seconds(10),
+            ),
+        ),
+        (
             "expired".into(),
             ok_answer(
                 "shop.example.com",
@@ -132,6 +153,8 @@ async fn turnstile_accepts_only_a_fresh_bound_single_use_token() {
     assert_eq!(mock.calls.lock().unwrap().len(), 1);
     // Hostnames compare case-insensitively.
     assert_eq!(v.verify("good2", &ctx()).await, Ok(()));
+    // A timestamp slightly ahead of the local clock is accepted.
+    assert_eq!(v.verify("small-skew", &ctx()).await, Ok(()));
 
     for token in [
         "",
@@ -140,18 +163,21 @@ async fn turnstile_accepts_only_a_fresh_bound_single_use_token() {
         "wrong-host",
         "wrong-action",
         "no-action",
+        "no-ts",
+        "future",
         "expired",
     ] {
         assert!(rejected(v.verify(token, &ctx()).await), "{token:?}");
     }
     assert!(rejected(v.verify(&"x".repeat(2049), &ctx()).await));
-    // A failed token stays used.
+    // A failed token stays reserved for a short while.
     assert!(rejected(v.verify("forged", &ctx()).await));
     // Same token, different route (action): already consumed, and the
     // provider-bound action would not match anyway.
     let other = ChallengeContext {
         action: "login".into(),
         remote_ip: None,
+        tenant: None,
     };
     assert!(rejected(v.verify("good", &other).await));
 }
@@ -240,4 +266,76 @@ async fn production_guarded_client_refuses_a_loopback_siteverify() {
         v.verify("t", &ctx()).await,
         Err(ChallengeError::Unavailable(_))
     ));
+}
+
+async fn mock_with(answers: Vec<(String, Value)>) -> (Mock, String) {
+    let mock = Mock::default();
+    *mock.answers.lock().unwrap() = answers;
+    let url = start(
+        Router::new()
+            .route("/siteverify", post(siteverify))
+            .with_state(mock.clone()),
+    )
+    .await;
+    (mock, url)
+}
+
+#[tokio::test]
+async fn full_replay_cache_answers_unavailable_without_calling_siteverify() {
+    let now = chrono::Utc::now();
+    let (mock, url) = mock_with(vec![
+        ("a".into(), ok_answer("shop.example.com", "register", now)),
+        ("b".into(), ok_answer("shop.example.com", "register", now)),
+    ])
+    .await;
+    let v = verifier(url).with_replay_cache(ReplayCache::new(Duration::from_secs(360), 1));
+    assert_eq!(v.verify("a", &ctx()).await, Ok(()));
+    assert!(matches!(
+        v.verify("b", &ctx()).await,
+        Err(ChallengeError::Unavailable(_))
+    ));
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn rejected_tokens_release_their_slot() {
+    let now = chrono::Utc::now();
+    let (_mock, url) = mock_with(vec![(
+        "good".into(),
+        ok_answer("shop.example.com", "register", now),
+    )])
+    .await;
+    // Room for one token only; rejected tokens are released right away.
+    let v = verifier(url).with_replay_cache(
+        ReplayCache::new(Duration::from_secs(360), 1).with_rejected_hold(Duration::ZERO),
+    );
+    for i in 0..5 {
+        assert!(rejected(v.verify(&format!("unknown-{i}"), &ctx()).await));
+    }
+    assert_eq!(v.verify("good", &ctx()).await, Ok(()));
+    assert!(rejected(v.verify("good", &ctx()).await));
+}
+
+#[tokio::test]
+async fn per_ip_quota_limits_unverified_tokens_before_siteverify() {
+    let now = chrono::Utc::now();
+    let (mock, url) = mock_with(vec![(
+        "good".into(),
+        ok_answer("shop.example.com", "register", now),
+    )])
+    .await;
+    let v = verifier(url)
+        .with_replay_cache(ReplayCache::new(Duration::from_secs(360), 100).with_quotas(2, 100));
+    assert!(rejected(v.verify("unknown-1", &ctx()).await));
+    assert!(rejected(v.verify("unknown-2", &ctx()).await));
+    assert_eq!(mock.calls.lock().unwrap().len(), 2);
+    // Over quota: refused locally, siteverify is not called.
+    assert!(rejected(v.verify("good", &ctx()).await));
+    assert_eq!(mock.calls.lock().unwrap().len(), 2);
+    // Another client IP still gets through.
+    let other = ChallengeContext {
+        remote_ip: Some("198.51.100.7".into()),
+        ..ctx()
+    };
+    assert_eq!(v.verify("good", &other).await, Ok(()));
 }

@@ -26,6 +26,16 @@ pub const TOKEN_LIFETIME: Duration = Duration::from_secs(300);
 /// Turnstile tokens are at most 2048 characters.
 pub const MAX_TOKEN_LEN: usize = 2048;
 const DEFAULT_REPLAY_CAPACITY: usize = 100_000;
+/// Unverified challenge slots per client IP.
+pub const DEFAULT_PENDING_PER_IP: usize = 16;
+/// Unverified challenge slots per tenant.
+pub const DEFAULT_PENDING_PER_TENANT: usize = 1_000;
+/// Upper bound on a pending reservation (siteverify times out after 5 s).
+const DEFAULT_PENDING_HOLD: Duration = Duration::from_secs(30);
+/// How long a token Turnstile rejected stays reserved.
+pub const DEFAULT_REJECTED_HOLD: Duration = Duration::from_secs(10);
+/// Allowed clock skew for a `challenge_ts` in the future.
+pub const MAX_CLOCK_SKEW: Duration = Duration::from_secs(60);
 
 /// What the proof must be bound to.
 #[derive(Clone, Debug)]
@@ -34,6 +44,8 @@ pub struct ChallengeContext {
     pub action: String,
     /// Client IP, forwarded to the provider as a signal.
     pub remote_ip: Option<String>,
+    /// Tenant of the route, for the per-tenant quota of pending tokens.
+    pub tenant: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,12 +82,118 @@ pub fn challenge_action(feature_id: &str) -> String {
         .collect()
 }
 
-/// Used tokens (SHA-256 of the token), kept for the token lifetime. A token is
-/// reserved before the provider is asked, so concurrent reuse is refused too.
+/// Single-use bookkeeping for challenge tokens (SHA-256 of the token).
+///
+/// A token is reserved before the provider is asked, so concurrent reuse is
+/// refused too. While the provider is asked the reservation is *pending* and
+/// counts against a per-client-IP and a per-tenant quota. Only a token the
+/// provider accepted is kept for the full `ttl`; a rejected token is kept for
+/// `rejected_hold` (still counted against the quotas), and a reservation that
+/// ends without an answer (provider unavailable, request dropped) is released.
 pub struct ReplayCache {
     ttl: Duration,
     capacity: usize,
-    seen: Mutex<HashMap<[u8; 32], Instant>>,
+    per_ip: usize,
+    per_tenant: usize,
+    pending_hold: Duration,
+    rejected_hold: Duration,
+    state: Mutex<CacheState>,
+}
+
+#[derive(Default)]
+struct CacheState {
+    entries: HashMap<[u8; 32], Entry>,
+    ip_counts: HashMap<String, usize>,
+    tenant_counts: HashMap<String, usize>,
+}
+
+struct Entry {
+    expires: Instant,
+    /// Counted against the IP and tenant quotas (pending or rejected).
+    counted: bool,
+    ip: Option<String>,
+    tenant: Option<String>,
+}
+
+fn dec(counts: &mut HashMap<String, usize>, key: &Option<String>) {
+    if let Some(key) = key {
+        if let Some(n) = counts.get_mut(key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.remove(key);
+            }
+        }
+    }
+}
+
+impl CacheState {
+    fn uncount(&mut self, entry: &mut Entry) {
+        if entry.counted {
+            entry.counted = false;
+            dec(&mut self.ip_counts, &entry.ip);
+            dec(&mut self.tenant_counts, &entry.tenant);
+        }
+    }
+
+    fn remove(&mut self, key: &[u8; 32]) {
+        if let Some(mut entry) = self.entries.remove(key) {
+            self.uncount(&mut entry);
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        let expired: Vec<[u8; 32]> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.expires <= now)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in expired {
+            self.remove(&key);
+        }
+    }
+}
+
+/// A pending reservation. Dropping it without [`Reservation::verified`] or
+/// [`Reservation::rejected`] releases the slot.
+pub struct Reservation<'a> {
+    cache: &'a ReplayCache,
+    key: [u8; 32],
+    settled: bool,
+}
+
+impl Reservation<'_> {
+    /// The provider accepted the token: keep it for the full TTL.
+    pub fn verified(mut self) {
+        self.settled = true;
+        let mut st = self.cache.lock();
+        let ttl = self.cache.ttl;
+        if let Some(mut entry) = st.entries.remove(&self.key) {
+            st.uncount(&mut entry);
+            entry.expires = Instant::now() + ttl;
+            st.entries.insert(self.key, entry);
+        }
+    }
+
+    /// The provider rejected the token: keep it only briefly.
+    pub fn rejected(mut self) {
+        self.settled = true;
+        let hold = self.cache.rejected_hold;
+        let mut st = self.cache.lock();
+        if hold.is_zero() {
+            st.remove(&self.key);
+        } else if let Some(entry) = st.entries.get_mut(&self.key) {
+            entry.expires = Instant::now() + hold;
+        }
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.cache.lock().remove(&self.key);
+        }
+    }
 }
 
 impl ReplayCache {
@@ -83,34 +201,111 @@ impl ReplayCache {
         Self {
             ttl,
             capacity,
-            seen: Mutex::new(HashMap::new()),
+            per_ip: DEFAULT_PENDING_PER_IP,
+            per_tenant: DEFAULT_PENDING_PER_TENANT,
+            pending_hold: DEFAULT_PENDING_HOLD,
+            rejected_hold: DEFAULT_REJECTED_HOLD,
+            state: Mutex::new(CacheState::default()),
         }
     }
 
-    /// Marks `token` as used. Errors if it was used before, or if the cache
-    /// is full of live tokens (fail closed).
-    pub fn claim(&self, token: &str) -> Result<(), ChallengeError> {
+    /// Unverified (pending or rejected) slots allowed per client IP and per tenant.
+    pub fn with_quotas(mut self, per_ip: usize, per_tenant: usize) -> Self {
+        self.per_ip = per_ip;
+        self.per_tenant = per_tenant;
+        self
+    }
+
+    /// How long a rejected token stays reserved (zero: released at once).
+    pub fn with_rejected_hold(mut self, hold: Duration) -> Self {
+        self.rejected_hold = hold;
+        self
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Number of live entries (for tests and metrics).
+    pub fn len(&self) -> usize {
+        let mut st = self.lock();
+        st.prune(Instant::now());
+        st.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Reserves `token` for a client. Errors if the token is reserved or was
+    /// used, if the IP or tenant is over its quota of unverified slots
+    /// (rejected), or if the cache is full of live tokens (unavailable).
+    pub fn reserve(
+        &self,
+        token: &str,
+        ip: Option<&str>,
+        tenant: Option<&str>,
+    ) -> Result<Reservation<'_>, ChallengeError> {
         let key: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         let now = Instant::now();
-        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(at) = seen.get(&key) {
-            if now.duration_since(*at) < self.ttl {
+        let mut st = self.lock();
+        match st.entries.get(&key) {
+            Some(e) if e.expires > now => {
                 return Err(ChallengeError::Rejected(
                     "challenge token already used".into(),
+                ))
+            }
+            Some(_) => st.remove(&key),
+            None => {}
+        }
+        let over = |counts: &HashMap<String, usize>, k: Option<&str>, limit: usize| {
+            k.map(|k| counts.get(k).copied().unwrap_or(0) >= limit)
+                .unwrap_or(false)
+        };
+        if over(&st.ip_counts, ip, self.per_ip) || over(&st.tenant_counts, tenant, self.per_tenant)
+        {
+            st.prune(now);
+            if over(&st.ip_counts, ip, self.per_ip) {
+                return Err(ChallengeError::Rejected(
+                    "too many unverified challenge tokens from this client".into(),
+                ));
+            }
+            if over(&st.tenant_counts, tenant, self.per_tenant) {
+                return Err(ChallengeError::Rejected(
+                    "too many unverified challenge tokens for this tenant".into(),
                 ));
             }
         }
-        if seen.len() >= self.capacity {
-            let ttl = self.ttl;
-            seen.retain(|_, at| now.duration_since(*at) < ttl);
-            if seen.len() >= self.capacity {
+        if st.entries.len() >= self.capacity {
+            st.prune(now);
+            if st.entries.len() >= self.capacity {
                 return Err(ChallengeError::Unavailable(
                     "challenge replay cache is full".into(),
                 ));
             }
         }
-        seen.insert(key, now);
-        Ok(())
+        let ip = ip.map(str::to_string);
+        let tenant = tenant.map(str::to_string);
+        if let Some(ip) = &ip {
+            *st.ip_counts.entry(ip.clone()).or_default() += 1;
+        }
+        if let Some(tenant) = &tenant {
+            *st.tenant_counts.entry(tenant.clone()).or_default() += 1;
+        }
+        st.entries.insert(
+            key,
+            Entry {
+                expires: now + self.pending_hold,
+                counted: true,
+                ip,
+                tenant,
+            },
+        );
+        Ok(Reservation {
+            cache: self,
+            key,
+            settled: false,
+        })
     }
 }
 
@@ -191,9 +386,28 @@ impl ChallengeVerifier for TurnstileVerifier {
         if token.is_empty() || token.len() > MAX_TOKEN_LEN {
             return Err(ChallengeError::Rejected("malformed challenge token".into()));
         }
-        // Single use: reserve before asking the provider; the reservation
-        // stays even if verification fails.
-        self.replay.claim(token)?;
+        // Single use: reserve before asking the provider, so concurrent reuse
+        // is refused. Only a verified token keeps the slot for the full TTL.
+        let reservation =
+            self.replay
+                .reserve(token, ctx.remote_ip.as_deref(), ctx.tenant.as_deref())?;
+        match self.ask(token, ctx).await {
+            Ok(()) => {
+                reservation.verified();
+                Ok(())
+            }
+            Err(err @ ChallengeError::Rejected(_)) => {
+                reservation.rejected();
+                Err(err)
+            }
+            // No answer: the reservation is released on drop.
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl TurnstileVerifier {
+    async fn ask(&self, token: &str, ctx: &ChallengeContext) -> Result<(), ChallengeError> {
         let mut form = vec![("secret", self.config.secret.as_str()), ("response", token)];
         if let Some(ip) = ctx.remote_ip.as_deref() {
             form.push(("remoteip", ip));
@@ -238,13 +452,20 @@ impl ChallengeVerifier for TurnstileVerifier {
                 body.action, ctx.action
             )));
         }
-        if let Some(ts) = body.challenge_ts.as_deref() {
-            let issued = chrono::DateTime::parse_from_rfc3339(ts)
-                .map_err(|_| ChallengeError::Rejected("challenge_ts is not a timestamp".into()))?;
-            let age = chrono::Utc::now().signed_duration_since(issued);
-            if age > chrono::Duration::from_std(TOKEN_LIFETIME).unwrap_or_default() {
-                return Err(ChallengeError::Rejected("challenge token expired".into()));
-            }
+        let ts = body
+            .challenge_ts
+            .as_deref()
+            .ok_or_else(|| ChallengeError::Rejected("challenge_ts is missing".into()))?;
+        let issued = chrono::DateTime::parse_from_rfc3339(ts)
+            .map_err(|_| ChallengeError::Rejected("challenge_ts is not a timestamp".into()))?;
+        let age = chrono::Utc::now().signed_duration_since(issued);
+        if age > chrono::Duration::from_std(TOKEN_LIFETIME).unwrap_or_default() {
+            return Err(ChallengeError::Rejected("challenge token expired".into()));
+        }
+        if -age > chrono::Duration::from_std(MAX_CLOCK_SKEW).unwrap_or_default() {
+            return Err(ChallengeError::Rejected(
+                "challenge_ts is in the future".into(),
+            ));
         }
         Ok(())
     }
@@ -382,16 +603,84 @@ mod tests {
     #[test]
     fn replay_cache_refuses_reuse_and_fails_closed_when_full() {
         let cache = ReplayCache::new(Duration::from_secs(60), 2);
-        assert!(cache.claim("a").is_ok());
-        assert!(matches!(cache.claim("a"), Err(ChallengeError::Rejected(_))));
-        assert!(cache.claim("b").is_ok());
+        cache.reserve("a", None, None).unwrap().verified();
         assert!(matches!(
-            cache.claim("c"),
+            cache.reserve("a", None, None),
+            Err(ChallengeError::Rejected(_))
+        ));
+        cache.reserve("b", None, None).unwrap().verified();
+        assert!(matches!(
+            cache.reserve("c", None, None),
             Err(ChallengeError::Unavailable(_))
         ));
         let short = ReplayCache::new(Duration::from_millis(0), 1);
-        assert!(short.claim("a").is_ok());
-        assert!(short.claim("b").is_ok(), "expired entries are pruned");
+        short.reserve("a", None, None).unwrap().verified();
+        assert!(
+            short.reserve("b", None, None).is_ok(),
+            "expired entries are pruned"
+        );
+    }
+
+    #[test]
+    fn pending_reservation_blocks_concurrent_reuse_and_is_released_on_drop() {
+        let cache = ReplayCache::new(Duration::from_secs(60), 10);
+        let held = cache.reserve("a", Some("1.1.1.1"), None).unwrap();
+        assert!(matches!(
+            cache.reserve("a", Some("2.2.2.2"), None),
+            Err(ChallengeError::Rejected(_))
+        ));
+        drop(held);
+        assert!(cache.is_empty());
+        assert!(cache.reserve("a", Some("2.2.2.2"), None).is_ok());
+    }
+
+    #[test]
+    fn per_ip_quota_of_unverified_slots() {
+        let cache = ReplayCache::new(Duration::from_secs(60), 100).with_quotas(2, 100);
+        let ip = Some("1.1.1.1");
+        let a = cache.reserve("a", ip, None).unwrap();
+        cache.reserve("b", ip, None).unwrap().rejected();
+        assert!(matches!(
+            cache.reserve("c", ip, None),
+            Err(ChallengeError::Rejected(_))
+        ));
+        // Other clients are unaffected.
+        assert!(cache.reserve("c", Some("2.2.2.2"), None).is_ok());
+        // A verified token no longer counts against the quota.
+        a.verified();
+        assert!(cache.reserve("d", ip, None).is_ok());
+    }
+
+    #[test]
+    fn per_tenant_quota_of_unverified_slots() {
+        let cache = ReplayCache::new(Duration::from_secs(60), 100).with_quotas(100, 1);
+        let _a = cache.reserve("a", Some("1.1.1.1"), Some("t1")).unwrap();
+        assert!(matches!(
+            cache.reserve("b", Some("2.2.2.2"), Some("t1")),
+            Err(ChallengeError::Rejected(_))
+        ));
+        assert!(cache.reserve("b", Some("2.2.2.2"), Some("t2")).is_ok());
+    }
+
+    #[test]
+    fn rejected_tokens_do_not_hold_the_full_ttl() {
+        let cache = ReplayCache::new(Duration::from_secs(3600), 1)
+            .with_rejected_hold(Duration::from_millis(20));
+        cache
+            .reserve("a", Some("1.1.1.1"), None)
+            .unwrap()
+            .rejected();
+        std::thread::sleep(Duration::from_millis(40));
+        // The slot is free again long before the TTL.
+        cache
+            .reserve("b", Some("1.1.1.1"), None)
+            .unwrap()
+            .verified();
+        assert_eq!(cache.len(), 1);
+        let zero =
+            ReplayCache::new(Duration::from_secs(3600), 1).with_rejected_hold(Duration::ZERO);
+        zero.reserve("a", None, None).unwrap().rejected();
+        assert!(zero.is_empty());
     }
 
     #[test]

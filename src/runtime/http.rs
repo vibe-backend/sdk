@@ -635,6 +635,8 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
     }
+    // The challenge runs after the rate limit and the public write quota, so
+    // limited requests never reach the replay cache or siteverify.
     if found.route.public
         && found.route.challenge_type != "none"
         && found.route.challenge_when == "always"
@@ -644,6 +646,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             found.route,
             headers.get("x-challenge-proof"),
             &ip,
+            &principal.tenant_id,
         )
         .await
         {
@@ -1682,6 +1685,7 @@ async fn check_challenge(
     route: &crate::manifest::RouteSpec,
     proof: Option<&String>,
     ip: impl std::fmt::Display,
+    tenant: &str,
 ) -> Option<FailFn> {
     fn fail(status: StatusCode, code: &'static str, message: &'static str) -> Option<FailFn> {
         Some(Box::new(move |request_id: &str| {
@@ -1712,6 +1716,7 @@ async fn check_challenge(
     let ctx = super::challenge::ChallengeContext {
         action: super::challenge::challenge_action(&route.feature_id),
         remote_ip: Some(ip.to_string()),
+        tenant: Some(tenant.to_string()).filter(|t| !t.is_empty()),
     };
     match verifier.verify(token, &ctx).await {
         Ok(()) => None,
@@ -1912,40 +1917,40 @@ mod rate_tests {
         let blank = "  ".to_string();
         // Missing or blank proof.
         assert_eq!(
-            status(check_challenge(Some(&ok), &route, None, "1.2.3.4").await),
+            status(check_challenge(Some(&ok), &route, None, "1.2.3.4", "tenant0001").await),
             Some(StatusCode::BAD_REQUEST)
         );
         assert_eq!(
-            status(check_challenge(Some(&ok), &route, Some(&blank), "1.2.3.4").await),
+            status(check_challenge(Some(&ok), &route, Some(&blank), "1.2.3.4", "tenant0001").await),
             Some(StatusCode::BAD_REQUEST)
         );
         // No verifier configured: an arbitrary proof no longer passes.
         assert_eq!(
-            status(check_challenge(None, &route, Some(&tok), "1.2.3.4").await),
+            status(check_challenge(None, &route, Some(&tok), "1.2.3.4", "tenant0001").await),
             Some(StatusCode::SERVICE_UNAVAILABLE)
         );
         // Verified.
         assert_eq!(
-            status(check_challenge(Some(&ok), &route, Some(&tok), "1.2.3.4").await),
+            status(check_challenge(Some(&ok), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
             None
         );
         // Rejected and unavailable.
         let bad: Arc<dyn ChallengeVerifier> =
             Arc::new(FakeVerifier(Err(ChallengeError::Rejected("x".into()))));
         assert_eq!(
-            status(check_challenge(Some(&bad), &route, Some(&tok), "1.2.3.4").await),
+            status(check_challenge(Some(&bad), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
             Some(StatusCode::FORBIDDEN)
         );
         let down: Arc<dyn ChallengeVerifier> =
             Arc::new(FakeVerifier(Err(ChallengeError::Unavailable("x".into()))));
         assert_eq!(
-            status(check_challenge(Some(&down), &route, Some(&tok), "1.2.3.4").await),
+            status(check_challenge(Some(&down), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
             Some(StatusCode::SERVICE_UNAVAILABLE)
         );
         // `pow` has no verifier in v1: fail closed.
         route.challenge_type = "pow".into();
         assert_eq!(
-            status(check_challenge(Some(&ok), &route, Some(&tok), "1.2.3.4").await),
+            status(check_challenge(Some(&ok), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
             Some(StatusCode::SERVICE_UNAVAILABLE)
         );
     }
