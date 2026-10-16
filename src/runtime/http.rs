@@ -1725,7 +1725,13 @@ async fn check_challenge(
 ) -> Option<FailFn> {
     fn fail(status: StatusCode, code: &'static str, message: &'static str) -> Option<FailFn> {
         Some(Box::new(move |request_id: &str| {
-            error_response(status, code, message, request_id, &[])
+            // D135: 503 CHALLENGE_UNAVAILABLE carries `Retry-After: 5`.
+            let extra: &[(&str, &str)] = if status == StatusCode::SERVICE_UNAVAILABLE {
+                &[("retry-after", "5")]
+            } else {
+                &[]
+            };
+            error_response(status, code, message, request_id, extra)
         }))
     }
     let token = match proof.map(|v| v.trim()) {
@@ -1989,6 +1995,16 @@ mod rate_tests {
             status(check_challenge(Some(&ok), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
             Some(StatusCode::SERVICE_UNAVAILABLE)
         );
+        // D135: 503 carries Retry-After: 5; other failures do not.
+        route.challenge_type = "captcha".into();
+        let resp = check_challenge(Some(&down), &route, Some(&tok), "1.2.3.4", "tenant0001")
+            .await
+            .unwrap()("req");
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+        let resp = check_challenge(Some(&bad), &route, Some(&tok), "1.2.3.4", "tenant0001")
+            .await
+            .unwrap()("req");
+        assert!(resp.headers().get("retry-after").is_none());
     }
 
     fn test_route() -> RouteSpec {

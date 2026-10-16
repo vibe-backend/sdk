@@ -601,6 +601,21 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
     }
     let public =
         find_section(&doc.sections, "Access").and_then(|s| s.get("public")) == Some("true");
+    // D131: `pow` has no verifier in v1; reject it at build/validate/deploy.
+    let (challenge_type, _) = crate::manifest::parse_challenge(
+        find_section(&doc.sections, "Access")
+            .and_then(|s| s.get("challenge"))
+            .unwrap_or(""),
+    );
+    if challenge_type == "pow" {
+        report.push(
+            Diag::error(
+                file,
+                "challenge type pow is not supported in v1; use type: captcha",
+            )
+            .at_section("Access"),
+        );
+    }
     let removed = security::auth_removed(find_section(&doc.sections, "Pipelines"));
     if removed && !public {
         report.push(Diag::error(file, "removing auth requires public: true").at_section("Access"));
@@ -1581,6 +1596,22 @@ mod tests {
             meta: crate::lock::Meta::pending(kind, scope, id, format!("{id}.md")),
             sections: crate::lock::parse_sections(body).unwrap(),
         }
+    }
+
+    #[test]
+    fn challenge_type_pow_is_an_error() {
+        // D131 (#203).
+        let feature = |challenge: &str| {
+            let body = format!(
+                "## Route\n\n- method: GET\n- path: /v1/{{slug}}/items\n\n## Access\n\n- challenge: {challenge}\n"
+            );
+            let d = doc(Kind::Api, Some(Scope::Feature), "shop/v1/items", &body);
+            let mut report = Report::default();
+            check_feature(&d, "items.md", &mut report);
+            format!("{report:?}")
+        };
+        assert!(feature("{ type: pow, when: always }").contains("challenge type pow"));
+        assert!(!feature("{ type: captcha, when: always }").contains("challenge type pow"));
     }
 
     fn target_docs() -> HashMap<String, LockDoc> {
