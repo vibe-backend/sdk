@@ -45,10 +45,18 @@ The single-use state (step 2) lives behind the `ReplayStore` trait
 
 | Variable | Meaning |
 | --- | --- |
-| `VIBE_CHALLENGE_REPLAY_STORE` | `memory` (default, per process) or `postgres` (shared by all instances). |
-| `VIBE_INSTANCES` | Number of instances serving the routes (default 1). |
+| `VIBE_CHALLENGE_REPLAY_STORE` | `postgres` (shared by all instances) or `memory` (per process, development and CI only). No default outside production. |
 
-- `memory` suits a single instance.
+Which store is used, when a verifier is configured:
+
+| Environment | Unset | `postgres` | `memory` |
+| --- | --- | --- | --- |
+| Production | `postgres` | `postgres` | refused at startup |
+| Development / CI | error at startup (choose explicitly) | `postgres` | in-memory |
+
+- Production always uses the shared PostgreSQL store. `vibe serve` refuses to
+  start if `VIBE_CHALLENGE_REPLAY_STORE=memory` is set (with or without a
+  verifier), or if the table is missing or not usable by the runtime role.
 - `postgres` keeps the state in `vibe_platform.challenge_replay` in the
   `VIBE_DATABASE_URL` database, so a token, the per-IP and per-tenant quotas
   and the capacity limit hold across instances. Reservations use
@@ -56,17 +64,15 @@ The single-use state (step 2) lives behind the `ReplayStore` trait
   checks are serialized per IP and per tenant with transaction-level advisory
   locks, and expired rows are removed in small batches on each reservation.
   Client IPs are stored as SHA-256 hashes; tokens as SHA-256 of the token.
-  `vibe migrate` creates the schema and table (owner role) and grants the
-  runtime role `SELECT, INSERT, UPDATE, DELETE` when
-  `VIBE_CHALLENGE_REPLAY_STORE=postgres` is set; `vibe serve` checks the table
-  at startup and refuses to start if it is not usable.
+- `vibe migrate` always creates the schema and table (owner role, idempotent)
+  and grants the runtime role `SELECT, INSERT, UPDATE, DELETE`.
+- `memory` is an explicit opt-in for a single development or CI process. It
+  is the only choice with `--memory`.
 - Any store error (database unreachable, timeout, missing table) answers
   503 `CHALLENGE_UNAVAILABLE`. If a verified token cannot be recorded, it is
   not accepted.
-- With a verifier configured, `VIBE_INSTANCES` greater than 1 requires
-  `VIBE_CHALLENGE_REPLAY_STORE=postgres`: `vibe serve` and `vibe validate`
-  refuse otherwise, in every environment. `postgres` is refused with
-  `--memory`.
+- `vibe validate` applies the same rules to the variables (the table is
+  checked by `vibe serve`).
 
 Turnstile's own single-use check (`timeout-or-duplicate`) applies in addition.
 

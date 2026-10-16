@@ -1195,7 +1195,9 @@ async fn shared_replay_store_fails_closed_when_unusable() {
         .await
         .unwrap();
     let missing = PgReplayStore::new(exec.pool(), "replay_missing_table").unwrap();
-    assert!(missing.check().await.is_err());
+    // The startup check `vibe serve` runs in production: no table, no start.
+    let err = missing.check().await.unwrap_err();
+    assert!(err.contains("run `vibe migrate`"), "{err}");
     assert!(matches!(
         missing.reserve(&token_key("x"), None, None).await,
         Err(ChallengeError::Unavailable(_))

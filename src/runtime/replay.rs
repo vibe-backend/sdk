@@ -104,59 +104,61 @@ pub enum StoreKind {
     Postgres,
 }
 
-/// Replay store and instance count from the environment:
-///
-/// - `VIBE_CHALLENGE_REPLAY_STORE`: `memory` (default) or `postgres`.
-/// - `VIBE_INSTANCES`: number of instances serving the routes (default 1).
-pub fn replay_config_from_vars(
+/// `VIBE_CHALLENGE_REPLAY_STORE`: `memory`, `postgres`, or unset (`None`).
+/// There is no default here; [`resolve_replay_store`] decides.
+pub fn replay_kind_from_vars(
     get: impl Fn(&str) -> Option<String>,
-) -> Result<(StoreKind, u32), String> {
-    let kind = match get("VIBE_CHALLENGE_REPLAY_STORE")
+) -> Result<Option<StoreKind>, String> {
+    match get("VIBE_CHALLENGE_REPLAY_STORE")
         .map(|v| v.trim().to_ascii_lowercase())
         .as_deref()
     {
-        None | Some("") | Some("memory") => StoreKind::Memory,
-        Some("postgres") => StoreKind::Postgres,
-        Some(other) => {
-            return Err(format!(
-                "unknown VIBE_CHALLENGE_REPLAY_STORE {other:?}; use memory or postgres"
-            ))
-        }
-    };
-    let instances = match get("VIBE_INSTANCES").map(|v| v.trim().to_string()) {
-        None => 1,
-        Some(v) if v.is_empty() => 1,
-        Some(v) => match v.parse::<u32>() {
-            Ok(n) if n >= 1 && v.bytes().all(|b| b.is_ascii_digit()) => n,
-            _ => {
-                return Err(format!(
-                    "VIBE_INSTANCES must be a positive integer, got {v:?}"
-                ))
-            }
-        },
-    };
-    Ok((kind, instances))
+        None | Some("") => Ok(None),
+        Some("memory") => Ok(Some(StoreKind::Memory)),
+        Some("postgres") => Ok(Some(StoreKind::Postgres)),
+        Some(other) => Err(format!(
+            "unknown VIBE_CHALLENGE_REPLAY_STORE {other:?}; use postgres (or memory outside production)"
+        )),
+    }
 }
 
-/// Error when several instances would verify challenges with per-process
-/// replay state, or when the shared store has no database to use.
-pub fn replay_store_gate(
+/// The replay store to use, or `None` when no verifier is configured.
+///
+/// - Production: always PostgreSQL. Unset means `postgres`; `memory` is refused
+///   (even without a verifier).
+/// - Development and CI: an explicit `memory` or `postgres` is required when a
+///   verifier is configured; unset is an error.
+/// - `postgres` needs a database (not `--memory`).
+pub fn resolve_replay_store(
+    env: super::http::RunEnv,
     verifier_configured: bool,
-    kind: StoreKind,
-    instances: u32,
+    kind: Option<StoreKind>,
     has_database: bool,
-) -> Result<(), String> {
-    if kind == StoreKind::Postgres && !has_database {
+) -> Result<Option<StoreKind>, String> {
+    let production = env == super::http::RunEnv::Production;
+    if production && kind == Some(StoreKind::Memory) {
         return Err(
-            "VIBE_CHALLENGE_REPLAY_STORE=postgres needs PostgreSQL (VIBE_DATABASE_URL); it is not available with --memory".into(),
+            "VIBE_CHALLENGE_REPLAY_STORE=memory is refused in production; challenge verification uses the shared PostgreSQL store (unset the variable or set it to postgres)".into(),
         );
     }
-    if verifier_configured && instances > 1 && kind != StoreKind::Postgres {
-        return Err(format!(
-            "VIBE_INSTANCES={instances} with challenge verification needs a shared replay store; set VIBE_CHALLENGE_REPLAY_STORE=postgres and run `vibe migrate`"
-        ));
+    if !verifier_configured {
+        return Ok(None);
     }
-    Ok(())
+    let kind = match (kind, production) {
+        (Some(kind), _) => kind,
+        (None, true) => StoreKind::Postgres,
+        (None, false) => {
+            return Err(
+                "challenge verification needs an explicit replay store outside production: set VIBE_CHALLENGE_REPLAY_STORE=memory (single process) or postgres".into(),
+            )
+        }
+    };
+    if kind == StoreKind::Postgres && !has_database {
+        return Err(
+            "the challenge replay store needs PostgreSQL (VIBE_DATABASE_URL); with --memory set VIBE_CHALLENGE_REPLAY_STORE=memory".into(),
+        );
+    }
+    Ok(Some(kind))
 }
 
 /// Replay state in a PostgreSQL table shared by all instances.
@@ -260,7 +262,7 @@ impl PgReplayStore {
             .await
             .map_err(|err| {
                 format!(
-                    "challenge replay table {} is not usable ({err}); run `vibe migrate` with VIBE_CHALLENGE_REPLAY_STORE=postgres",
+                    "challenge replay table {} is not usable ({err}); run `vibe migrate` to create it",
                     self.table
                 )
             })?;
@@ -448,37 +450,66 @@ mod tests {
     }
 
     #[test]
-    fn replay_config_parsing() {
+    fn replay_store_variable_has_no_default() {
+        assert_eq!(replay_kind_from_vars(vars(&[])).unwrap(), None);
         assert_eq!(
-            replay_config_from_vars(vars(&[])).unwrap(),
-            (StoreKind::Memory, 1)
+            replay_kind_from_vars(vars(&[("VIBE_CHALLENGE_REPLAY_STORE", "")])).unwrap(),
+            None
         );
         assert_eq!(
-            replay_config_from_vars(vars(&[
-                ("VIBE_CHALLENGE_REPLAY_STORE", "Postgres"),
-                ("VIBE_INSTANCES", "3")
-            ]))
-            .unwrap(),
-            (StoreKind::Postgres, 3)
+            replay_kind_from_vars(vars(&[("VIBE_CHALLENGE_REPLAY_STORE", "Postgres")])).unwrap(),
+            Some(StoreKind::Postgres)
         );
-        for bad in ["0", "-1", "+2", "two", "1.5"] {
-            assert!(
-                replay_config_from_vars(vars(&[("VIBE_INSTANCES", bad)])).is_err(),
-                "{bad}"
-            );
-        }
-        assert!(
-            replay_config_from_vars(vars(&[("VIBE_CHALLENGE_REPLAY_STORE", "redis")])).is_err()
+        assert_eq!(
+            replay_kind_from_vars(vars(&[("VIBE_CHALLENGE_REPLAY_STORE", "memory")])).unwrap(),
+            Some(StoreKind::Memory)
+        );
+        assert!(replay_kind_from_vars(vars(&[("VIBE_CHALLENGE_REPLAY_STORE", "redis")])).is_err());
+    }
+
+    #[test]
+    fn production_always_uses_the_shared_store() {
+        use super::super::http::RunEnv::Production;
+        // Unset means postgres.
+        assert_eq!(
+            resolve_replay_store(Production, true, None, true).unwrap(),
+            Some(StoreKind::Postgres)
+        );
+        assert_eq!(
+            resolve_replay_store(Production, true, Some(StoreKind::Postgres), true).unwrap(),
+            Some(StoreKind::Postgres)
+        );
+        // The memory switch is refused, with or without a verifier.
+        let err =
+            resolve_replay_store(Production, true, Some(StoreKind::Memory), true).unwrap_err();
+        assert!(err.contains("refused in production"), "{err}");
+        assert!(resolve_replay_store(Production, false, Some(StoreKind::Memory), true).is_err());
+        // No database: refused.
+        assert!(resolve_replay_store(Production, true, None, false).is_err());
+        // No verifier: no store.
+        assert_eq!(
+            resolve_replay_store(Production, false, None, true).unwrap(),
+            None
         );
     }
 
     #[test]
-    fn several_instances_require_the_shared_store() {
-        assert!(replay_store_gate(true, StoreKind::Memory, 1, true).is_ok());
-        assert!(replay_store_gate(true, StoreKind::Memory, 2, true).is_err());
-        assert!(replay_store_gate(true, StoreKind::Postgres, 2, true).is_ok());
-        assert!(replay_store_gate(false, StoreKind::Memory, 2, true).is_ok());
-        assert!(replay_store_gate(true, StoreKind::Postgres, 1, false).is_err());
+    fn development_needs_an_explicit_choice() {
+        use super::super::http::RunEnv::{Ci, Dev};
+        for env in [Dev, Ci] {
+            let err = resolve_replay_store(env, true, None, true).unwrap_err();
+            assert!(err.contains("VIBE_CHALLENGE_REPLAY_STORE=memory"), "{err}");
+            assert_eq!(
+                resolve_replay_store(env, true, Some(StoreKind::Memory), false).unwrap(),
+                Some(StoreKind::Memory)
+            );
+            assert_eq!(
+                resolve_replay_store(env, true, Some(StoreKind::Postgres), true).unwrap(),
+                Some(StoreKind::Postgres)
+            );
+            assert!(resolve_replay_store(env, true, Some(StoreKind::Postgres), false).is_err());
+            assert_eq!(resolve_replay_store(env, false, None, false).unwrap(), None);
+        }
     }
 
     #[test]

@@ -304,11 +304,10 @@ fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
     let always = vibe::runtime::challenge::always_challenge_locks(project);
     let configured = vibe::runtime::challenge::configured_in_env()?;
     vibe::runtime::challenge::production_gate(run_env, configured, &always)?;
-    // #157: refuse several instances without the shared replay store. The
-    // database itself is checked by `vibe serve`.
-    let (replay_kind, instances) =
-        vibe::runtime::replay::replay_config_from_vars(|name| std::env::var(name).ok())?;
-    vibe::runtime::replay::replay_store_gate(configured, replay_kind, instances, true)?;
+    // #157: the replay store choice (the table itself is checked by `vibe serve`).
+    let replay_kind =
+        vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?;
+    vibe::runtime::replay::resolve_replay_store(run_env, configured, replay_kind, true)?;
     print_report(&report);
     if deploy {
         println!("validation ok");
@@ -379,6 +378,15 @@ async fn cmd_serve(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
+    // #157: production always uses the shared PostgreSQL replay store and
+    // refuses the memory switch; dev/CI must choose explicitly. Decided
+    // before loading anything.
+    let replay_choice = vibe::runtime::replay::resolve_replay_store(
+        run_env,
+        vibe::runtime::challenge::configured_in_env()?,
+        vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?,
+        !memory,
+    )?;
     let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
@@ -414,25 +422,20 @@ async fn cmd_serve(
     }
     // #118: refuse `challenge_when: always` in production until a verifier
     // is configured.
-    // #157: several instances need the shared (PostgreSQL) replay store.
-    let (replay_kind, instances) =
-        vibe::runtime::replay::replay_config_from_vars(|name| std::env::var(name).ok())?;
-    let configured = vibe::runtime::challenge::configured_in_env()?;
-    vibe::runtime::replay::replay_store_gate(
-        configured,
-        replay_kind,
-        instances,
-        pg_pool.is_some(),
-    )?;
+    // #157: build the shared store chosen at startup; a missing or unusable
+    // table refuses to start.
     let replay_store: Option<Arc<dyn vibe::runtime::replay::ReplayStore>> =
-        match (replay_kind, pg_pool) {
-            (vibe::runtime::replay::StoreKind::Postgres, Some(pool)) => {
+        match (replay_choice, pg_pool) {
+            (Some(vibe::runtime::replay::StoreKind::Postgres), Some(pool)) => {
                 let store = vibe::runtime::replay::PgReplayStore::new(
                     pool,
                     vibe::runtime::replay::DEFAULT_REPLAY_TABLE,
                 )?;
                 store.check().await?;
                 Some(Arc::new(store))
+            }
+            (Some(vibe::runtime::replay::StoreKind::Postgres), None) => {
+                return Err("the challenge replay store needs PostgreSQL".into())
             }
             _ => None,
         };
@@ -490,20 +493,12 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
         "VIBE_RUNTIME_DB_ROLE is required (the non-owner role `vibe serve` connects as; it is granted SELECT, INSERT, UPDATE)".to_string()
     })?;
     let exec = PgExec::connect(&url).await?;
-    // #157: the shared challenge replay table (idempotent).
-    let (replay_kind, _) =
-        vibe::runtime::replay::replay_config_from_vars(|name| std::env::var(name).ok())?;
-    if replay_kind == vibe::runtime::replay::StoreKind::Postgres {
-        let ddl = vibe::runtime::replay::PgReplayStore::migration_sql(
-            vibe::runtime::replay::DEFAULT_REPLAY_TABLE,
-            &runtime_role,
-        )?;
-        exec.batch(&ddl).await?;
-        println!(
-            "challenge replay table {} ready",
-            vibe::runtime::replay::DEFAULT_REPLAY_TABLE
-        );
-    }
+    // #157: the shared challenge replay table (idempotent, always created).
+    let ddl = vibe::runtime::replay::PgReplayStore::migration_sql(
+        vibe::runtime::replay::DEFAULT_REPLAY_TABLE,
+        &runtime_role,
+    )?;
+    exec.batch(&ddl).await?;
     for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant, &runtime_role).await? {
         println!("{line}");
     }

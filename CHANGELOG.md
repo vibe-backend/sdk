@@ -7,7 +7,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Added
 
-- **Shared challenge replay store (#157):** `VIBE_CHALLENGE_REPLAY_STORE=postgres` keeps challenge single-use state, quotas and capacity in PostgreSQL (`vibe_platform.challenge_replay`, created by `vibe migrate`) so they hold across instances. Store errors fail closed (503). With a verifier configured, `VIBE_INSTANCES` > 1 requires the shared store.
+- **Shared challenge replay store (#157):** Challenge single-use state, quotas and capacity live in PostgreSQL (`vibe_platform.challenge_replay`, always created by `vibe migrate`) so they hold across instances. In production with a verifier configured the shared store is always used; `vibe serve` refuses to start if the table is missing or unusable, or if `VIBE_CHALLENGE_REPLAY_STORE=memory` is set. Outside production the store must be chosen explicitly (`memory` or `postgres`). Store errors fail closed (503).
 
 ### Breaking
 
