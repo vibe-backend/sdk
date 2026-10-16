@@ -1419,6 +1419,8 @@ pub(crate) fn ec_problem_message(what: &str, problem: super::eckey::EcProblem) -
         EcProblem::NotEc => format!("{what}: ES256 key is not a readable EC key"),
         EcProblem::OtherCurve => format!("{what}: ES256 key must use the P-256 curve"),
         EcProblem::BadPoint => format!("{what}: ES256 key has an invalid P-256 public point"),
+        EcProblem::BadScalar => format!("{what}: ES256 private scalar is out of range"),
+        EcProblem::TrailingData => format!("{what}: ES256 key has unexpected data in its encoding"),
     }
 }
 

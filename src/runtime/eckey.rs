@@ -19,6 +19,10 @@ pub enum EcProblem {
     NotEc,
     OtherCurve,
     BadPoint,
+    /// Private scalar d is not in `1..n-1`.
+    BadScalar,
+    /// Bytes left over inside the key encoding.
+    TrailingData,
 }
 
 /// `Ok` when `pem` is a P-256 public key with a valid point.
@@ -48,7 +52,16 @@ pub fn p256_private(pem: &str) -> Result<(), EcProblem> {
             let (_ver, rest) = tlv(seq, 0x02).ok_or(EcProblem::NotEc)?;
             let (alg, rest) = tlv(rest, 0x30).ok_or(EcProblem::NotEc)?;
             curve_of_alg(alg)?;
-            let (key, _) = tlv(rest, 0x04).ok_or(EcProblem::NotEc)?;
+            let (key, mut rest) = tlv(rest, 0x04).ok_or(EcProblem::NotEc)?;
+            // Optional [0] attributes and [1] publicKey (PKCS#8 v2), nothing else.
+            for tag in [0xa0, 0xa1] {
+                if let Some((_, more)) = tlv(rest, tag) {
+                    rest = more;
+                }
+            }
+            if !rest.is_empty() {
+                return Err(EcProblem::TrailingData);
+            }
             sec1_private(key, true)
         }
         "EC PRIVATE KEY" => sec1_private(&der, false),
@@ -78,6 +91,11 @@ fn sec1_private(der: &[u8], curve_known: bool) -> Result<(), EcProblem> {
     if d.len() != 32 {
         return Err(EcProblem::OtherCurve);
     }
+    // 0 < d < n.
+    let scalar = from_be(d);
+    if scalar == [0; 4] || !less(&scalar, &N) {
+        return Err(EcProblem::BadScalar);
+    }
     let mut curve_seen = curve_known;
     if let Some((params, more)) = tlv(rest, 0xa0) {
         match whole(params, 0x06) {
@@ -89,12 +107,16 @@ fn sec1_private(der: &[u8], curve_known: bool) -> Result<(), EcProblem> {
     if !curve_seen {
         return Err(EcProblem::OtherCurve);
     }
-    if let Some((public, _)) = tlv(rest, 0xa1) {
+    if let Some((public, more)) = tlv(rest, 0xa1) {
+        rest = more;
         let bits = whole(public, 0x03).ok_or(EcProblem::NotEc)?;
         match bits.split_first() {
             Some((0, point)) => check_point(point)?,
             _ => return Err(EcProblem::NotEc),
         }
+    }
+    if !rest.is_empty() {
+        return Err(EcProblem::TrailingData);
     }
     Ok(())
 }
@@ -108,6 +130,13 @@ const P: U256 = [
     0x0000_0000_ffff_ffff,
     0x0000_0000_0000_0000,
     0xffff_ffff_0000_0001,
+];
+/// P-256 group order n.
+const N: U256 = [
+    0xf3b9_cac2_fc63_2551,
+    0xbce6_faad_a717_9e84,
+    0xffff_ffff_ffff_ffff,
+    0xffff_ffff_0000_0000,
 ];
 const B: U256 = [
     0x3bce_3c3e_27d2_604b,
@@ -263,6 +292,87 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&der);
         let pem = format!("-----BEGIN {label}-----\n{b64}\n-----END {label}-----\n");
         assert_eq!(p256_public(&pem), Err(EcProblem::BadPoint));
+    }
+
+    const P256_PKCS8: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgxoRRfBXmTDDBak37\n\
+e7KiA/uL9uVmC6SjFqNA0iA3/eChRANCAATSao2qWXXhogkSFioKJEtYlfrdPLpD\n\
+RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
+-----END PRIVATE KEY-----\n";
+
+    const ORDER: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
+        0x25, 0x51,
+    ];
+
+    fn pem(label: &str, der: &[u8]) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+        format!("-----BEGIN {label}-----\n{b64}\n-----END {label}-----\n")
+    }
+
+    /// The PEM with its 32-byte private scalar replaced by `d`.
+    fn with_d(src: &str, d: &[u8; 32]) -> String {
+        let (label, mut der) = pem_der(src).unwrap();
+        let marker = [0x02, 0x01, 0x01, 0x04, 0x20];
+        let at = der.windows(5).position(|w| w == marker).unwrap() + 5;
+        der[at..at + 32].copy_from_slice(d);
+        pem(&label, &der)
+    }
+
+    fn scalars() -> Vec<(&'static str, [u8; 32], bool)> {
+        let mut above = ORDER;
+        above[31] += 1;
+        let mut below = ORDER;
+        below[31] -= 1;
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        vec![
+            ("d = 0", [0; 32], false),
+            ("d = n", ORDER, false),
+            ("d = n + 1", above, false),
+            ("d = 2^256 - 1", [0xff; 32], false),
+            ("d = 1", one, true),
+            ("d = n - 1", below, true),
+        ]
+    }
+
+    #[test]
+    fn private_scalar_must_be_in_range() {
+        assert_eq!(p256_private(P256_PKCS8), Ok(()));
+        for src in [P256_PKCS8, P256_SEC1] {
+            for (name, d, ok) in scalars() {
+                let res = p256_private(&with_d(src, &d));
+                if ok {
+                    assert_eq!(res, Ok(()), "{name}");
+                } else {
+                    assert_eq!(res, Err(EcProblem::BadScalar), "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_data_in_private_keys_is_refused() {
+        for src in [P256_PKCS8, P256_SEC1] {
+            let (label, der) = pem_der(src).unwrap();
+            // After the outer structure.
+            let mut outer = der.clone();
+            outer.extend_from_slice(&[0x05, 0x00]);
+            assert_eq!(p256_private(&pem(&label, &outer)), Err(EcProblem::NotEc));
+            // Inside the outer SEQUENCE (lengths fixed up).
+            let mut inner = der.clone();
+            let len_at = if der[1] == 0x81 { 2 } else { 1 };
+            assert!(inner[len_at] < 0xfe);
+            inner[len_at] += 2;
+            inner.extend_from_slice(&[0x05, 0x00]);
+            assert_eq!(
+                p256_private(&pem(&label, &inner)),
+                Err(EcProblem::TrailingData),
+                "{label}"
+            );
+        }
     }
 
     #[test]
