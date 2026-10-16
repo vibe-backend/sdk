@@ -23,6 +23,7 @@
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
 - 新增產品經理六條基線做決定 89–94（release 簽名只限 `v*` tag 加 required-reviewer environment（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118）、高風險 fail closed（決定 90 已於 2026-10-16 撤回：高風險項目只列入部署報告）、production 拒絕 in-memory、冇 release 簽名就失敗（決定 119 改用 Sigstore keyless）、決定 29／37 恢復、`/latest/` 永遠唔係草稿），同決定 95（create-user 邀請失敗處理）。
 - Lock 係 build 輸出，唔再 commit（`.gitignore`），由 CI／CD 喺部署時由 source build（決定 117，取代決定 80）。
+- `sign-jwt` 簽名算法政策（決定 139，issue #198）：只支援 ES256、RS256，預設 ES256；RS256 key 最少 2048 bit，唔夠 fail closed；驗證端只接受設定嘅一個 alg；EdDSA 留到 vNext（見 4.1a）。
 - Email 正規化（決定 120）：唔合併 plus addressing、保留點；local part NFC→trim→lowercase；domain IDNA UTS #46 punycode→lowercase；只儲存正規化值；遷移遇到衝突 fail closed，人手處理。
 - 租戶 DB role 細節（決定 129）：`tenant_<id>_rw`／`_public_reader`／`_public_writer`、`tenant_<id>_owner` migration role、連線池上限滿即回 503 `DB_POOL_EXHAUSTED`、production 憑證經 secret manager、常數 policy 部署時比對。
 - IP 限流網段 slot 上限（決定 130）：IPv4 /24、IPv6 /48 加 /32 嘅新計數器 slot 上限，跨租戶平台層（`VIBE_RATE_PLATFORM_FACTOR`），60 秒固定窗口 LRU 驅逐，slot 表滿 fail closed（429）。
@@ -234,6 +235,7 @@
 | 120 | Email 正規化（issue #106）：v1 唔合併 plus addressing，`a+x@` 同 `a@` 係兩個唔同地址；local part 入面嘅點（`.`）照樣保留，`a.b@` 同 `ab@` 係兩個唔同地址。Local part：先做 Unicode NFC（唔係 NFKC），再 trim，再 lowercase。Domain：用 IDNA UTS #46 轉做 punycode，再 lowercase；IDNA 轉換失敗回 422 `VALIDATION_FAILED`。唯一 index、查找同發送全部用正規化後嘅值；login、註冊、邀請、驗證、重發同 rate-limit 全部先正規化再儲存同查找（12.11）。v1 只儲存正規化後嘅值，唔另外保留原本地址做顯示。現有資料遷移：migration 先偵測正規化後衝突（只差大小寫或者 Unicode 形式嘅重複地址）；有任何衝突就 fail closed 停止，唔自動合併；衝突報告只列 user id，任何公開 log 都唔出現完整 email；由人手按 12.11 嘅處理程序解決之後先重新跑。 | 已確認（產品經理 2026-10-16） | 4.3、9、12.11 |
 | 129 | 租戶 role 細節（補充決定 97，SDK #147）：(1) Runtime role 係 `tenant_<id>_rw`、`tenant_<id>_public_reader`、`tenant_<id>_public_writer`；`<id>` 係系統產生、只有 `[a-z0-9_]` 嘅不透明 id，永遠唔用用戶提供嘅名；role 名超過 63 bytes 即拒絕，永遠唔截斷。(2) 連線池每個（租戶、role）5 條，每個租戶最多 15 條；另有全 process 上限，預設 200，可以設定（設定名 `VIBE_DB_POOL_MAX_TOTAL`（已確認（產品經理 2026-10-16）））。三個上限（每個（租戶、role）5 條、每個租戶 15 條、全 process）任何一個滿咗，都即刻回 503 `DB_POOL_EXHAUSTED` 加 `Retry-After`（值 `1`（已確認（產品經理 2026-10-16））），並發 metric（名 `vibe_db_pool_exhausted_total{scope="role"\|"tenant"\|"process"}`（已確認（產品經理 2026-10-16）））；永遠唔排隊等 timeout，包括每個（租戶、role）同每個租戶上限。(3) `VIBE_TENANT_DB_SECRETS` JSON 檔只限開發同測試，權限一定 0600，永遠唔 commit、唔寫 log；production 憑證來源係 secret manager，經每個租戶 role 嘅環境變數參照注入（同 #147 實作一致），process 只讀參照、唔落地成檔；production 見到呢個檔就拒絕啟動（fail closed）。Owner role（`tenant_<id>_owner`）憑證：平台只喺每次 migrate 開始時由 secret manager 發一次性密碼，migrate 完成即作廢並將 role 設返 `NOLOGIN`；即係每次 migrate 都輪換，runtime 永遠攞唔到。(4) 閒置連線池 5 分鐘後關閉；呢點阻 GA，唔阻 v1 preview。(5) Migration role 係 `tenant_<id>_owner`，擁有該租戶 schema 同表，只畀 migrate 用。決定 27 嘅例外（已確認（產品經理 2026-10-16））：PostgreSQL owner 天生可以 TRUNCATE／DROP 同重新授權，冇辦法靠收權限禁止，所以 owner 係決定 27 嘅受控例外，條件見 2B「Owner role 條件」：migration parser 用正面白名單、migrate 單一 transaction、finally 由獨立平台 admin 連線收回登入、定期檢查、runtime 連線池永遠唔以 owner 登入；runtime role 唔係 owner，每張表都要 `FORCE ROW LEVEL SECURITY`；migrate 兩樣都檢查，缺任何一樣就失敗。(6) 編譯器輸出每個租戶常數 policy（`TO tenant_<id>_rw`），唔用 `current_setting('app.tenant_id')`；部署時比較編譯出嚟嘅 policy 同 DB 實際安裝嘅 policy，唔一致即 fail closed。 實作狀態（spec 行先過 code）：#147 已包括三層連線池上限即時 503、`VIBE_DB_POOL_MAX_TOTAL`、`vibe_db_pool_exhausted_total{scope}`、production 拒絕 `VIBE_TENANT_DB_SECRETS`、一次性 owner 密碼、`pg_policies` 比對、migrate 拆做主 transaction 加 commit 後 concurrent index 步驟、finally 由獨立 admin 連線將 owner 設返 `NOLOGIN`、定期 owner 檢查（`vibe check-owners`）、連線池拒絕 owner role。未完成：(a) 驗證器用 PostgreSQL parser 嘅 index 資料（唔係文字比對）分流 UNIQUE／`CONCURRENTLY`，同 migration parser 正面白名單（決定 98）——未實作，#206；(b) INVALID index 系統 DROP 只限平台紀錄建立嘅 index（三個條件）——未實作，#207；(c) 閒置連線池 5 分鐘關閉（GA blocker）——未實作，#165。 | 已確認（產品經理 2026-10-16） | 7.1、7.1a、9C |
 | 130 | IP 限流計數鍵同驅逐（SDK #132，v1 blocker；修訂 #73 嘅限流設計）：(1) 網段 slot 上限（跟 #73）：上限係每個網段可以開嘅**新計數器 slot** 數目，唔係 request 次數。計數前 IPv4-mapped IPv6（`::ffff:a.b.c.d`）一律先轉做 IPv4（同 #182 一致）。IPv4 每個（`tenant_id`、/24）最多 10 個新 slot；IPv6 每個（`tenant_id`、/48）最多 10 個，另加每個（`tenant_id`、/32）最多 50 個。Request 次數限流照舊用 4.3 嘅滑動窗口同數字。(2) 平台層：另有一個跨租戶網段 slot 計數器，鍵係 /24 同 /48，預設上限係租戶 slot 上限 ×5（單位同樣係新計數器 slot），倍數用 `VIBE_RATE_PLATFORM_FACTOR` 設定（預設 5，最大 100（已確認（產品經理 2026-10-16）））；兩層都通過先放行；v1 冇每租戶預留。拒絕回 429 加 `Retry-After`，回應永遠唔講係邊一層觸發。(3) 驅逐：固定窗口長度 60 秒，只用喺本決定嘅網段 slot 計數同佢嘅 LRU 驅逐（4.3 request 限流仍然係滑動窗口）；LRU 有上限，先驅逐已過期嘅項目；每個租戶有自己嘅計數器 slot 上限；slot 滿而冇過期項目就 fail closed，回 429 並記 metric；永遠唔驅逐仲喺窗口內嘅計數器。Metric：拒絕記 metric（名 `vibe_rate_limit_slot_refused_total{layer="tenant"\|"platform", reason="network_cap"\|"table_full"\|"tenant_budget_exhausted"\|"prefix_cap_exceeded"}`（已確認（產品經理 2026-10-16））；`layer` 只喺內部 metric 出現，回應唔講）。Slot 表（同 #182 新設計（已確認（產品經理 2026-10-16）））：租戶表：每個租戶有自己一個 4,096 slot 嘅表，滿咗只拒絕嗰個租戶；全部租戶總預算 = `VIBE_RATE_EXPECTED_TENANTS`（預設 256，範圍 1–4096）× 4,096；用緊少過 64 個 slot 嘅租戶一定放行。平台表：IPv4 按 /24、IPv6 按 /32 分開嘅表，每個最多 4,096 項，總共大約 1M 項，作為記憶體上限。多 instance 部署一定要用共用儲存（#157）。#73 嘅 shard 內 owner／reserve 上限（每個網段 100 個 bucket、較闊網段 1,000 個、最後 1,000 個保留 slot）照舊保留，喺本決定之外再疊加（已確認（產品經理 2026-10-16））。剩餘風險：(a) 固定窗口邊界前後，網段新 slot 數目最多可以去到上限 ×2（已接受）；(b) 平台層令一個租戶嘅流量可以用埋同一 /24 或者 /48 其他租戶嘅額度（已接受）；(c) 平台總量仍然共用：要喺 60 秒內填滿大約 1M 個唔同嘅 /24 或者 /48，即係大約 256 個 /32 各自填滿 4,096 個 /48（已確認（產品經理 2026-10-16））；(d) 同時滿咗嘅租戶多過 `VIBE_RATE_EXPECTED_TENANTS`，就只有用緊少過 64 個 slot 嘅租戶可以開新 slot（已確認（產品經理 2026-10-16））；呢個情況一定記 metric reason `tenant_budget_exhausted`（已確認（產品經理 2026-10-16））並發告警，唔可以靜默拒絕；(e) 最差情況每個表大約 300 MB 記憶體（估計，未實測）（已確認（產品經理 2026-10-16））；唔可以靠呢個估計：v1 一定要有硬記憶體上限 `VIBE_RATE_TABLE_MEMORY_MAX_BYTES`（預設 268435456，即 256 MiB，限 limiter 全部 slot 表合計；名同預設已確認（產品經理 2026-10-16）；預設刻意細過單一表最差估計（大約 300 MB），受攻擊時 limiter 會先到 `table_full`（fail closed），#195 實測後再調整預設），超過即以 reason `table_full` fail closed；**GA blocker：記憶體實測（#195）**；(f) 一個 IPv6 /32 每分鐘有多過 4,096 個活躍 /48，嗰個 /32 自己嘅用戶會 fail closed（已確認（產品經理 2026-10-16））；呢個情況一定記 metric reason `prefix_cap_exceeded`（reason 名已確認（產品經理 2026-10-16））並發告警，唔可以靜默拒絕。 實作狀態（spec 行先過 code）：#182 已包括每租戶 4,096 slot 表、`VIBE_RATE_EXPECTED_TENANTS`、保底 64、平台 /24、/32 表、`VIBE_RATE_PLATFORM_FACTOR`、IPv4-mapped 轉 IPv4、metric 同 reason `network_cap`／`table_full`。未完成：(a) reason `tenant_budget_exhausted` 同 `prefix_cap_exceeded` 加告警——未實作，#210；(b) `VIBE_RATE_TABLE_MEMORY_MAX_BYTES` 硬記憶體上限——未實作，#211；(c) 記憶體實測（#195，GA blocker）。 | 已確認（產品經理 2026-10-16） | 4.3、4A.3、7.2 |
+| 139 | `sign-jwt` 簽名算法政策（issue #198）：v1 只支援 ES256 同 RS256，預設 ES256；RS256 用嚟同第三方／JWKS 互通。RS256 key 最少 2048 bit，喺 `vibe validate --deploy`／部署同 `vibe serve` 啟動時檢查，唔夠就 fail closed（拒絕啟動，永遠唔會降級或者改用其他 alg）。驗證端只接受設定好嘅一個 alg；`alg` header 係其他值一律拒絕，包括 `none`、HS*，同埋 ES256／RS256 之中另一個（唔准混用）。EdDSA 留到 vNext。實作狀態：部分未實作，見 4.1a。 | 已確認（產品經理 2026-10-16） | 4.1、4.1a、12.6 |
 
 ## 1. 目錄同命名
 
@@ -993,11 +995,34 @@ security-items:
 | `jwks-uri` | 預設 `{iss}/.well-known/jwks.json`；一定要 https |
 | JWKS cache | 10 分鐘；遇到未知 `kid` 即刻重拉，但同一 issuer 最少相隔 60 秒；拉唔到時最多沿用舊 cache 1 小時，之後所有 token 回 401 |
 | clock skew | `exp`、`nbf`、`iat` 容許 60 秒 |
-| alg 白名單 | ES256、RS256（RSA key 最少 2048 bit）；禁止 `none`、HS*，亦唔准混用；header 一定要有 `kid` |
+| alg 白名單 | ES256、RS256（RSA key 最少 2048 bit），預設 ES256；每個部署只設定一個 alg，驗證只接受呢個 alg；禁止 `none`、HS*，亦唔准混用；header 一定要有 `kid`（決定 139，見 4.1a） |
 | `roles-claim` | 預設 `roles` |
 
 - 要驗 `iss`、`aud`、`exp`、`nbf`；`exp` 距離 `iat` 超過 1 小時（access token 上限）一律拒絕。
 - 改 `iss`、`aud`、`jwks-uri`（例如接外部 IdP）屬高風險安全項目。
+
+### 4.1a 簽名算法政策（決定 139，已確認（產品經理 2026-10-16），issue #198）
+
+呢節係 `sign-jwt`（簽發）同 JWT 驗證（auth pipeline）共用嘅 alg 規則，優先於其他地方較簡略嘅寫法。
+
+| 項目 | 規則 |
+| --- | --- |
+| 支援 alg | 只有 ES256（P-256）同 RS256；預設 ES256。RS256 只建議用嚟同第三方／JWKS 互通。 |
+| RS256 key 長度 | 最少 2048 bit（按 modulus 實際長度計）。簽名私鑰、靜態驗證公鑰同 JWKS 入面嘅 RSA key 都適用。 |
+| 唔符合 key 長度 | 簽名私鑰或者靜態驗證公鑰唔夠長：`vibe validate --deploy`、部署同 `vibe serve` 啟動 fail closed，拒絕啟動；唔會降級、唔會改用其他 alg、唔會只出 warning。JWKS 入面唔夠長嘅 key 當冇呢個 `kid`，用佢簽嘅 token 回 401。 |
+| 驗證 alg | 每個部署（或者每個 issuer）只設定一個 alg。token header 嘅 `alg` 一定要等於設定值；`none`、HS*、ES256／RS256 之中另一個同任何未知值一律回 401。alg 由設定決定，唔由 token header 或者 key 類型推斷。 |
+| key 同 alg 一致 | 設定 alg 同 key 類型唔夾（例如設定 ES256 但 key 係 RSA）：啟動 fail closed。JWKS key 嘅 `kty`／`alg` 同設定 alg 唔夾，嗰個 key 唔用。 |
+| EdDSA | v1 唔支援，留到 vNext（見 14）。 |
+
+錯誤訊息只講邊個設定唔啱同要求（例如「RS256 key 最少 2048 bit」），唔會印出 key 內容。
+
+實作狀態（main，2026-10-16 檢查）：
+
+- 已實作：`vibe validate` 拒絕 ES256／RS256 以外嘅 `sign-jwt` alg；`sign-jwt` 執行時 alg 要同已載入 key 一致；`VIBE_JWT_ALG` 只接受 ES256、RS256；驗證時 header `alg` 要等於 key 嘅 alg（`none`、HS* 會被拒）；JWKS 只載入 P-256 同 ≥ 2048 bit 嘅 RSA key。
+- RS256 簽名私鑰最少 2048 bit 嘅啟動檢查：Implementation status: not yet implemented, follow-up #222.
+- 靜態驗證公鑰（`VIBE_JWT_PUBLIC_KEY_PEM`）RSA 最少 2048 bit 同設定 alg／key 類型一致嘅啟動檢查：Implementation status: not yet implemented, follow-up #224.
+- 用 JWKS 驗證時只接受一個設定 alg（而家每個 key 用自己嘅 alg，JWKS 同時有 EC 同 RSA key 嘅話兩種都收）：Implementation status: not yet implemented, follow-up #225.
+- `sign-jwt` 冇寫 `alg` 時預設 ES256（而家驗證器當錯誤）：Implementation status: not yet implemented, follow-up #226.
 
 ### 4.2 API key 模式（決定 43）
 
@@ -2422,7 +2447,7 @@ api source 寫「用 user.login 驗證帳戶密碼」，編譯成：
   - claim 白名單：method 只可以傳 `sub` 同平台允許嘅自訂 claim（例如 `sid`）；`roles` 由平台喺簽發時從 DB 讀（用 `sub` 喺當前租戶搵用戶）；`tenant_id` 只有一個來源：平台由 slug（public）或者已驗證 token（auth）解析出嚟嘅 `ctx.tenant_id`，唔由 client、method 或者 `users` 表提供（決定 62）。method 唔可以傳入或者覆蓋任何一個。
   - 平台自動加 `iss`、`aud`、`exp`、`nbf`、`iat`、`jti`；method 唔可以覆蓋。
   - `ttl` 有上限（access token 最多 1h）。
-  - 只可以簽 JWT，alg 只准 RS256 或者 ES256；私鑰喺平台 secret，lock 只寫 `key-ref`。
+  - 只可以簽 JWT，alg 只准 ES256（預設）或者 RS256，RS256 key 最少 2048 bit，唔夠就啟動 fail closed（決定 139，見 4.1a）；私鑰喺平台 secret，lock 只寫 `key-ref`。
   - 其他 method（例如 `user.login`）同 pipeline 要簽 token，就用 `method` op 呼叫 `user.sign-token`。
   - refresh token 由 `sign-jwt` 嘅 `issue-refresh` 處理（見 4A.1）。
 - `capabilities: [set-password]`：只有標咗呢個 capability 嘅 model method 可以喺 public 路徑寫 password 欄位，值一定要係 `hash-password` 輸出（見 7.2）；已認證路徑嘅改密碼 method 同樣建議標呢個 capability，方便 review。
@@ -3507,5 +3532,6 @@ security-items:
 - public 寫入內容審核 hook（spam／不當內容），處理 captcha 被破解同低質內容嘅剩餘風險。
 - 私隱刪除嘅資料主體自助提交入口（12.10 流程已經定義，呢度只係加自助入口）。
 - Kill switch 自動觸發（例如錯誤率或者寫入量異常時自動停用）。
+- `sign-jwt` 支援 EdDSA（Ed25519）（決定 139 留到 vNext）。
 - 編譯用 LLM provider 加入 `azure-openai`（要處理 deployment 名同 api-version 等設定）。
 - `openai` adapter 支援 OpenAI Responses API（reasoning model 建議用），v1 只用 Chat Completions。
