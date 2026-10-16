@@ -114,6 +114,7 @@ async fn pg() -> Option<Pg> {
         min_override_ms: None,
         honor_test_ip: true,
         dev_hints: false,
+        challenge: None,
     }));
     Some(Pg {
         app,
