@@ -57,6 +57,18 @@ pub const CLEANUP_BATCH: i64 = 1000;
 /// Batches per cleanup run (bounds the work done by one `vibe migrate`).
 pub const CLEANUP_MAX_BATCHES: i64 = 100;
 
+/// Columns the runtime role may UPDATE (rotation state and revocation).
+/// Everything else is written once by INSERT.
+pub const UPDATABLE_COLUMNS: &[&str] = &[
+    "used_at",
+    "replaced_by",
+    "grace_reissued_at",
+    "revoked_at",
+    "revoke_reason",
+];
+/// Trigger that keeps identity columns immutable and revocation final.
+pub const GUARD_TRIGGER: &str = "_platform_refresh_guard";
+
 fn tenant_of(schema: &str) -> Result<&str, String> {
     schema
         .strip_prefix("t_")
@@ -82,6 +94,31 @@ pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
         format!("CREATE INDEX IF NOT EXISTS _platform_refresh_family ON {qualified} (family_id)"),
         format!("CREATE INDEX IF NOT EXISTS _platform_refresh_user ON {qualified} (user_id)"),
         format!("CREATE INDEX IF NOT EXISTS _platform_refresh_family_expiry ON {qualified} (family_expires_at)"),
+        // Identity columns never change; once revoked, a row stays revoked
+        // with the same time and reason; used_at is set once. Applies to
+        // every role, including the owner.
+        format!(
+            "CREATE OR REPLACE FUNCTION {s}.{GUARD_TRIGGER}() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+             IF NEW.id IS DISTINCT FROM OLD.id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id \
+             OR NEW.family_id IS DISTINCT FROM OLD.family_id OR NEW.user_id IS DISTINCT FROM OLD.user_id \
+             OR NEW.token_hash IS DISTINCT FROM OLD.token_hash OR NEW.parent_id IS DISTINCT FROM OLD.parent_id \
+             OR NEW.created_at IS DISTINCT FROM OLD.created_at \
+             OR NEW.family_expires_at IS DISTINCT FROM OLD.family_expires_at \
+             OR NEW.idle_expires_at IS DISTINCT FROM OLD.idle_expires_at THEN \
+             RAISE EXCEPTION 'refresh token identity columns are immutable' USING ERRCODE = '42501'; END IF; \
+             IF OLD.revoked_at IS NOT NULL AND (NEW.revoked_at IS DISTINCT FROM OLD.revoked_at \
+             OR NEW.revoke_reason IS DISTINCT FROM OLD.revoke_reason) THEN \
+             RAISE EXCEPTION 'refresh token revocation is final' USING ERRCODE = '42501'; END IF; \
+             IF OLD.used_at IS NOT NULL AND NEW.used_at IS DISTINCT FROM OLD.used_at THEN \
+             RAISE EXCEPTION 'refresh token used_at is set once' USING ERRCODE = '42501'; END IF; \
+             RETURN NEW; END $f$",
+            s = super::sql::quote(schema)?
+        ),
+        format!("DROP TRIGGER IF EXISTS {GUARD_TRIGGER} ON {qualified}"),
+        format!(
+            "CREATE TRIGGER {GUARD_TRIGGER} BEFORE UPDATE ON {qualified} FOR EACH ROW EXECUTE FUNCTION {s}.{GUARD_TRIGGER}()",
+            s = super::sql::quote(schema)?
+        ),
         format!("ALTER TABLE {qualified} ENABLE ROW LEVEL SECURITY"),
         format!("ALTER TABLE {qualified} FORCE ROW LEVEL SECURITY"),
         format!("DROP POLICY IF EXISTS tenant_isolation ON {qualified}"),
@@ -119,8 +156,115 @@ pub fn runtime_grant_statements(schema: &str, runtime_role: &str) -> Result<Vec<
             "GRANT USAGE ON SCHEMA {} TO {role}",
             super::sql::quote(schema)?
         ),
-        format!("GRANT SELECT, INSERT, UPDATE ON {qualified} TO {role}"),
+        format!("REVOKE ALL ON {qualified} FROM {role}"),
+        format!("GRANT SELECT, INSERT ON {qualified} TO {role}"),
+        format!(
+            "GRANT UPDATE ({}) ON {qualified} TO {role}",
+            UPDATABLE_COLUMNS.join(", ")
+        ),
     ])
+}
+
+/// What the startup check reads for one tenant's refresh table.
+#[derive(Debug, Default, PartialEq)]
+pub struct StoreStatus {
+    pub can_select_insert: bool,
+    /// DELETE, TRUNCATE, table-wide UPDATE, REFERENCES or TRIGGER.
+    pub excess_table_privileges: bool,
+    pub updatable_columns: Vec<String>,
+    pub guard_trigger_enabled: bool,
+}
+
+impl StoreStatus {
+    pub fn problems(&self, table: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.can_select_insert {
+            out.push(format!("{table}: this role needs SELECT and INSERT"));
+        }
+        if self.excess_table_privileges {
+            out.push(format!(
+                "{table}: this role holds DELETE, TRUNCATE, table-wide UPDATE, REFERENCES or TRIGGER"
+            ));
+        }
+        let mut extra: Vec<&str> = self
+            .updatable_columns
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !UPDATABLE_COLUMNS.contains(c))
+            .collect();
+        extra.sort_unstable();
+        if !extra.is_empty() {
+            out.push(format!(
+                "{table}: this role can UPDATE {}",
+                extra.join(", ")
+            ));
+        }
+        let missing: Vec<&str> = UPDATABLE_COLUMNS
+            .iter()
+            .copied()
+            .filter(|c| !self.updatable_columns.iter().any(|u| u == c))
+            .collect();
+        if !missing.is_empty() {
+            out.push(format!(
+                "{table}: this role cannot UPDATE {}",
+                missing.join(", ")
+            ));
+        }
+        if !self.guard_trigger_enabled {
+            out.push(format!(
+                "{table}: trigger {GUARD_TRIGGER} is missing or disabled"
+            ));
+        }
+        out
+    }
+}
+
+/// Catalog query behind [`check_store`]; `$1` is the qualified table name.
+pub const STORE_STATUS_SQL: &str = "SELECT \
+    has_table_privilege($1, 'SELECT') AND has_table_privilege($1, 'INSERT'), \
+    has_table_privilege($1, 'DELETE') OR has_table_privilege($1, 'TRUNCATE') OR has_table_privilege($1, 'UPDATE') \
+      OR has_table_privilege($1, 'REFERENCES') OR has_table_privilege($1, 'TRIGGER'), \
+    COALESCE((SELECT array_agg(a.attname::text ORDER BY a.attname) FROM pg_attribute a \
+      WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+      AND has_column_privilege($1, a.attname, 'UPDATE')), '{}'), \
+    EXISTS (SELECT 1 FROM pg_trigger g JOIN pg_proc p ON p.oid = g.tgfoid \
+      WHERE g.tgrelid = $1::regclass AND g.tgname = '_platform_refresh_guard' \
+      AND p.proname = '_platform_refresh_guard' AND g.tgenabled IN ('O', 'A') \
+      AND (g.tgtype & 16) <> 0)";
+
+/// Startup check run by `vibe serve` as the runtime role: for every tenant,
+/// the refresh table grants exactly SELECT, INSERT and column UPDATE on
+/// [`UPDATABLE_COLUMNS`] (no DELETE), and the guard trigger is in place.
+/// Any problem refuses to start (fail closed).
+pub async fn check_store(
+    client: &tokio_postgres::Client,
+    tenants: &[String],
+) -> Result<(), String> {
+    let mut problems = Vec::new();
+    for tenant in tenants {
+        let table = format!("t_{tenant}._platform_refresh_tokens");
+        let row = client
+            .query_one(STORE_STATUS_SQL, &[&format!("\"t_{tenant}\"._platform_refresh_tokens")])
+            .await
+            .map_err(|err| {
+                format!("refresh table {table} is not usable ({err}); run `vibe migrate` for this tenant")
+            })?;
+        let status = StoreStatus {
+            can_select_insert: row.get(0),
+            excess_table_privileges: row.get(1),
+            updatable_columns: row.get(2),
+            guard_trigger_enabled: row.get(3),
+        };
+        problems.extend(status.problems(&table));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "refresh token store is not set up safely: {}; run `vibe migrate`",
+            problems.join("; ")
+        ))
+    }
 }
 
 /// Removes refresh rows whose family lifetime ended more than
@@ -608,5 +752,29 @@ mod tests {
     fn table_statements_need_a_tenant_schema() {
         assert!(table_statements("t_tenant0001").is_ok());
         assert!(table_statements("x_tenant0001").is_err());
+    }
+
+    #[test]
+    fn store_status_flags_every_drift() {
+        let ok = StoreStatus {
+            can_select_insert: true,
+            excess_table_privileges: false,
+            updatable_columns: UPDATABLE_COLUMNS.iter().map(|c| c.to_string()).collect(),
+            guard_trigger_enabled: true,
+        };
+        assert!(ok.problems("t").is_empty());
+        let mut extra = StoreStatus {
+            updatable_columns: ok.updatable_columns.clone(),
+            ..ok
+        };
+        extra.updatable_columns.push("token_hash".into());
+        assert_eq!(extra.problems("t").len(), 1);
+        let none = StoreStatus::default();
+        assert_eq!(none.problems("t").len(), 3);
+        let grants = runtime_grant_statements("t_tenant0001", "vibe_app")
+            .unwrap()
+            .join("\n");
+        assert!(grants.contains("GRANT SELECT, INSERT ON"));
+        assert!(!grants.contains("DELETE"));
     }
 }

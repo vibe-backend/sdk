@@ -540,13 +540,9 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
     for stmt in vibe::runtime::refresh::table_statements(&schema).unwrap() {
         admin.batch_execute(&stmt).await.unwrap();
     }
-    admin
-        .batch_execute(&format!(
-            "GRANT USAGE ON SCHEMA {schema} TO {role}; \
-             GRANT SELECT, INSERT, UPDATE ON {schema}._platform_refresh_tokens TO {role};"
-        ))
-        .await
-        .unwrap();
+    for stmt in vibe::runtime::refresh::runtime_grant_statements(&schema, &role).unwrap() {
+        admin.batch_execute(&stmt).await.unwrap();
+    }
     let mut url = url::Url::parse(&admin_url).unwrap();
     url.set_username(&role).unwrap();
     url.set_password(Some("pw")).unwrap();
@@ -651,13 +647,9 @@ async fn postgres_store_rotates_detects_reuse_and_revokes() {
     for stmt in vibe::runtime::refresh::table_statements(&schema2).unwrap() {
         admin.batch_execute(&stmt).await.unwrap();
     }
-    admin
-        .batch_execute(&format!(
-            "GRANT USAGE ON SCHEMA {schema2} TO {role}; \
-             GRANT SELECT, INSERT, UPDATE ON {schema2}._platform_refresh_tokens TO {role};"
-        ))
-        .await
-        .unwrap();
+    for stmt in vibe::runtime::refresh::runtime_grant_statements(&schema2, &role).unwrap() {
+        admin.batch_execute(&stmt).await.unwrap();
+    }
     assert_eq!(exec.refresh_family(&tenant2, "h1b").await.unwrap(), None);
     assert_eq!(
         exec.refresh_rotate(&tenant2, "h1b", "w", policy)
@@ -1028,4 +1020,137 @@ fn startup_rejects_reuse_grace_outside_the_spec_limits() {
             "{err}"
         );
     }
+}
+
+/// Refresh table hardening against a real database: column-level UPDATE,
+/// final revocation, immutable identity columns, and the startup check.
+#[tokio::test]
+async fn postgres_refresh_table_grants_and_guard() {
+    use vibe::runtime::refresh::{check_store, runtime_grant_statements, table_statements};
+    let Ok(admin_url) = std::env::var("VIBE_TEST_PG_ADMIN_URL") else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "VIBE_TEST_PG_ADMIN_URL must be set in CI"
+        );
+        return;
+    };
+    let (admin, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let s = uuid::Uuid::new_v4().simple().to_string()[..10].to_string();
+    let tenant = format!("tg{s}");
+    let schema = format!("t_{tenant}");
+    let role = format!("refresh_rt_{s}");
+    let t = format!("{schema}._platform_refresh_tokens");
+    admin
+        .batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'pw'"))
+        .await
+        .unwrap();
+    let setup = || async {
+        for stmt in table_statements(&schema)
+            .unwrap()
+            .into_iter()
+            .chain(runtime_grant_statements(&schema, &role).unwrap())
+        {
+            admin.batch_execute(&stmt).await.unwrap();
+        }
+    };
+    setup().await;
+    let mut url = url::Url::parse(&admin_url).unwrap();
+    url.set_username(&role).unwrap();
+    url.set_password(Some("pw")).unwrap();
+    let (rt, conn) = tokio_postgres::connect(url.as_str(), tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let tenants = vec![tenant.clone()];
+    check_store(&rt, &tenants).await.unwrap();
+
+    let in_tenant = |sql: String| {
+        format!("BEGIN; SELECT set_config('app.tenant_id', '{tenant}', true); {sql}; COMMIT;")
+    };
+    rt.batch_execute(&in_tenant(format!(
+        "INSERT INTO {t} (id, tenant_id, family_id, user_id, token_hash, created_at, family_expires_at, idle_expires_at) \
+         VALUES (gen_random_uuid(), '{tenant}', gen_random_uuid(), 'u1', 'h1', now(), now() + interval '1 day', now() + interval '1 hour')"
+    )))
+    .await
+    .unwrap();
+    rt.batch_execute(&in_tenant(format!(
+        "UPDATE {t} SET revoked_at = now(), revoke_reason = 'logout' WHERE token_hash = 'h1'"
+    )))
+    .await
+    .unwrap();
+    let _ = rt.batch_execute("ROLLBACK").await;
+    // Revocation is final: no clearing, no moving the time, no new reason.
+    for change in [
+        "revoked_at = NULL",
+        "revoked_at = now() + interval '1 day'",
+        "revoke_reason = 'other'",
+    ] {
+        let err = rt
+            .batch_execute(&in_tenant(format!(
+                "UPDATE {t} SET {change} WHERE token_hash = 'h1'"
+            )))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("final") || format!("{err:?}").contains("final"),
+            "{change}: {err:?}"
+        );
+        let _ = rt.batch_execute("ROLLBACK").await;
+    }
+    // Identity columns: the runtime role has no UPDATE on them, and the
+    // trigger refuses changes from any role (here the superuser).
+    for change in [
+        "token_hash = 'h2'",
+        "family_id = gen_random_uuid()",
+        "tenant_id = 'other'",
+        "user_id = 'u2'",
+    ] {
+        assert!(
+            rt.batch_execute(&in_tenant(format!(
+                "UPDATE {t} SET {change} WHERE token_hash = 'h1'"
+            )))
+            .await
+            .is_err(),
+            "{change}"
+        );
+        let _ = rt.batch_execute("ROLLBACK").await;
+        let err = admin
+            .batch_execute(&format!("UPDATE {t} SET {change} WHERE token_hash = 'h1'"))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("immutable"),
+            "{change}: {err:?}"
+        );
+    }
+    assert!(
+        rt.batch_execute(&in_tenant(format!(
+            "DELETE FROM {t} WHERE token_hash = 'h1'"
+        )))
+        .await
+        .is_err(),
+        "no DELETE for the runtime role"
+    );
+    let _ = rt.batch_execute("ROLLBACK").await;
+
+    // Startup check fails closed on each drift, and passes again after migrate.
+    for drift in [
+        format!("GRANT DELETE ON {t} TO {role}"),
+        format!("GRANT UPDATE ON {t} TO {role}"),
+        format!("GRANT UPDATE (token_hash) ON {t} TO {role}"),
+        format!("REVOKE UPDATE (revoked_at) ON {t} FROM {role}"),
+        format!("REVOKE INSERT ON {t} FROM {role}"),
+        format!("DROP TRIGGER _platform_refresh_guard ON {t}"),
+        format!("ALTER TABLE {t} DISABLE TRIGGER _platform_refresh_guard"),
+    ] {
+        admin.batch_execute(&drift).await.unwrap();
+        assert!(check_store(&rt, &tenants).await.is_err(), "{drift}");
+        setup().await;
+        check_store(&rt, &tenants).await.unwrap();
+    }
+    // A tenant without the table also fails.
+    assert!(check_store(&rt, &[format!("tz{s}")]).await.is_err());
 }

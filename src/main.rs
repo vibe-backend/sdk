@@ -440,6 +440,19 @@ async fn cmd_serve(
         Arc::new(pg)
     };
     let loaded = vibe::runtime::load_project_slugs(project, memory)?;
+    if let (Some(pool), true) = (
+        &pg_pool,
+        manifest.routes.iter().any(|r| r.refresh.is_some()),
+    ) {
+        let mut tenants: Vec<String> = loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
+        tenants.sort();
+        tenants.dedup();
+        let client = pool
+            .get()
+            .await
+            .map_err(|err| format!("refresh token store check: {err}"))?;
+        vibe::runtime::refresh::check_store(&client, &tenants).await?;
+    }
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
