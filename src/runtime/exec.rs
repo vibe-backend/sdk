@@ -1126,7 +1126,7 @@ impl QueryExec for PgExec {
                 "SELECT id::text, family_id::text, user_id, revoke_reason, revoked_at IS NOT NULL, \
                  (now() >= family_expires_at OR now() >= idle_expires_at), \
                  used_at IS NOT NULL, \
-                 (used_at IS NOT NULL AND now() - used_at < make_interval(secs => $2::double precision) AND grace_reissued_at IS NULL \
+                 (used_at IS NOT NULL AND now() - used_at <= make_interval(secs => $2::double precision) AND grace_reissued_at IS NULL \
                   AND EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = t.replaced_by AND c.used_at IS NULL AND c.revoked_at IS NULL)), \
                  replaced_by::text, \
                  floor(extract(epoch FROM family_expires_at - now()))::bigint \

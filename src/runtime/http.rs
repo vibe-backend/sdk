@@ -1258,10 +1258,11 @@ async fn authenticate(
         if auth.public_pem.is_empty() || kid != auth.kid {
             return Err(AuthError::unauthorized("Bearer"));
         }
-        let key = if auth.alg == Algorithm::RS256 {
-            DecodingKey::from_rsa_pem(auth.public_pem.as_bytes())
-        } else {
-            DecodingKey::from_ec_pem(auth.public_pem.as_bytes())
+        let key = match auth.alg {
+            Algorithm::RS256 => DecodingKey::from_rsa_pem(auth.public_pem.as_bytes()),
+            Algorithm::ES256 => DecodingKey::from_ec_pem(auth.public_pem.as_bytes()),
+            // `Algorithm` is non-exhaustive: anything else is rejected.
+            _ => return Err(AuthError::unauthorized("Bearer")),
         }
         .map_err(|_| AuthError::unauthorized("Bearer"))?;
         (auth.alg, key)
@@ -1563,14 +1564,20 @@ fn limit_check(state: &AppState, checks: &[(String, String, u32)], owner: &str) 
 const REFRESH_IP_PER_MINUTE: u32 = 30;
 const REFRESH_FAMILY_PER_MINUTE: u32 = 10;
 
-fn invalid_refresh(request_id: &str) -> HttpResponse {
-    error_response(
-        StatusCode::UNAUTHORIZED,
-        "INVALID_REFRESH_TOKEN",
-        "Invalid refresh token",
-        request_id,
-        &[],
-    )
+static REFRESH_REJECTIONS: std::sync::LazyLock<Mutex<HashMap<&'static str, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn invalid_refresh(_request_id: &str, reason: &'static str) -> HttpResponse {
+    if let Ok(mut counts) = REFRESH_REJECTIONS.lock() {
+        *counts.entry(reason).or_default() += 1;
+    }
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"error":{"code":"INVALID_REFRESH_TOKEN","message":"Invalid refresh token"}}"#,
+        ))
+        .expect("fixed refresh response")
 }
 
 fn refresh_unavailable(request_id: &str) -> HttpResponse {
@@ -1594,7 +1601,7 @@ fn rate_limited_response(request_id: &str, retry: &str) -> HttpResponse {
 }
 
 /// `token-refresh`: rotate the presented token, then sign a new access token
-/// with the route's `sign-method`. Every failure is the same 401.
+/// with the route's `sign-method`.
 async fn refresh_response(
     state: &AppState,
     route: &RouteSpec,
@@ -1618,7 +1625,7 @@ async fn refresh_response(
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty() && t.len() <= 256)
     else {
-        return invalid_refresh(request_id);
+        return invalid_refresh(request_id, "invalid");
     };
     let hash = super::ops::refresh_hash(&state.auth.pepper, token);
     // The family lookup must succeed before rotating: a store error fails
@@ -1641,12 +1648,13 @@ async fn refresh_response(
             .unwrap_or(REFRESH_FAMILY_PER_MINUTE)
             .min(REFRESH_FAMILY_PER_MINUTE);
         let family_check = [(format!("{}:family", route.feature_id), family, per_minute)];
-        // Same 401 as every other failure: a 429 here would tell a caller
-        // that the token exists. Only live tokens count (see refresh_family).
+        // Only live tokens count (see refresh_family).
         if limit_check(state, &family_check, &owner).is_some() {
             tracing::warn!(%request_id, %tenant, "refresh family rate limit reached");
-            return invalid_refresh(request_id);
+            return invalid_refresh(request_id, "family_limit");
         }
+    } else {
+        return invalid_refresh(request_id, "unknown");
     }
     let (new_token, new_hash) = super::ops::new_refresh_token(&state.auth.pepper);
     let policy = super::ops::policy_of(spec);
@@ -1688,22 +1696,22 @@ async fn refresh_response(
                 }
                 Ok(_) => {
                     tracing::error!(%request_id, method = %spec.sign_method, "sign-method returned no access_token");
-                    invalid_refresh(request_id)
+                    invalid_refresh(request_id, "invalid")
                 }
                 Err(fail) => {
                     tracing::error!(%request_id, method = %spec.sign_method, code = %fail.code, message = %fail.message, "refresh sign-method failed");
-                    invalid_refresh(request_id)
+                    invalid_refresh(request_id, "invalid")
                 }
             }
         }
         Ok(Rotated::Reuse { family_id }) => {
             tracing::warn!(%request_id, %tenant, family = %family_id, "refresh token replayed; family revoked");
-            invalid_refresh(request_id)
+            invalid_refresh(request_id, "invalid")
         }
-        Ok(Rotated::Invalid) => invalid_refresh(request_id),
+        Ok(Rotated::Invalid) => invalid_refresh(request_id, "invalid"),
         Err(err) => {
             tracing::error!(%request_id, error = ?err, "refresh rotation failed");
-            invalid_refresh(request_id)
+            invalid_refresh(request_id, "invalid")
         }
     }
 }

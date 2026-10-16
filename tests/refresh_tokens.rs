@@ -118,6 +118,7 @@ struct App {
     app: axum::Router,
     manifest: Manifest,
     exec: Arc<MemoryExec>,
+    state: Arc<AppState>,
 }
 
 fn app(grace: i64) -> App {
@@ -151,7 +152,7 @@ fn app_wrapped(
             public_write: true,
         },
     );
-    let app = router(Arc::new(AppState {
+    let state = Arc::new(AppState {
         manifest: m.clone(),
         exec: wrap(exec.clone()),
         auth: auth(&m),
@@ -164,8 +165,10 @@ fn app_wrapped(
         honor_test_ip: true,
         dev_hints: false,
         challenge: None,
-    }));
+    });
+    let app = router(state.clone());
     App {
+        state,
         app,
         manifest: m,
         exec,
@@ -230,6 +233,35 @@ impl App {
             o.remove("request_id");
         }
         (status, v, started.elapsed().as_millis())
+    }
+
+    async fn raw_refresh(
+        &self,
+        token: &str,
+        ip: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>, u128) {
+        let started = std::time::Instant::now();
+        let res = self
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/v1/acme/token/refresh")
+                    .header("content-type", "application/json")
+                    .header("x-vibe-test-ip", ip)
+                    .body(Body::from(json!({"refresh_token": token}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, headers, body, started.elapsed().as_millis())
     }
 
     async fn refresh(&self, token: &str) -> (StatusCode, Value, u128) {
@@ -326,7 +358,7 @@ async fn family_rate_limit_is_capped() {
     for i in 0..11 {
         let (s, body, _) = a.refresh(&cur).await;
         if s != StatusCode::OK {
-            // Same 401 as an unknown token: no 429 that reveals the token exists.
+            // Family limit response.
             let (_, unknown, _) = a.refresh("not-a-token").await;
             assert_eq!(s, StatusCode::UNAUTHORIZED);
             assert_eq!(body, unknown);
@@ -336,6 +368,38 @@ async fn family_rate_limit_is_capped() {
         cur = tok(&body, "refresh_token");
     }
     assert_eq!(limited, Some(10), "10 per family per minute");
+}
+
+#[tokio::test]
+async fn refresh_limit_responses() {
+    let a = app(10);
+    let mut cur = tok(&a.login().await, "refresh_token");
+    for _ in 0..10 {
+        let (status, body, _) = a.refresh(&cur).await;
+        assert_eq!(status, StatusCode::OK);
+        cur = tok(&body, "refresh_token");
+    }
+    let limited = a.raw_refresh(&cur, "192.0.2.1").await;
+    let invalid = a.raw_refresh("", "192.0.2.1").await;
+    let unknown = a.raw_refresh("nonexistent", "192.0.2.1").await;
+    for response in [&limited, &invalid, &unknown] {
+        assert_eq!(response.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(response.1, limited.1);
+        assert_eq!(response.2, limited.2);
+        assert!(!response.1.contains_key("retry-after"));
+        assert!(response.3 >= 300);
+    }
+    *a.state.rates.lock().unwrap() = Default::default();
+    assert_eq!(a.refresh(&cur).await.0, StatusCode::OK);
+    for _ in 0..30 {
+        a.raw_refresh("", "192.0.2.2").await;
+    }
+    let ip_limited = a.raw_refresh("", "192.0.2.2").await;
+    assert_eq!(ip_limited.0, StatusCode::TOO_MANY_REQUESTS);
+    assert!(ip_limited.1.contains_key("retry-after"));
+    assert!(String::from_utf8(ip_limited.2)
+        .unwrap()
+        .contains("RATE_LIMITED"));
 }
 
 #[tokio::test]
@@ -486,8 +550,18 @@ fn pipeline_blocks_parse_and_check() {
             .map(|s| s.reuse_grace_s)
     };
     assert_eq!(grace("10s").unwrap(), 10);
+    assert_eq!(grace("10000ms").unwrap(), 10);
     assert_eq!(grace("1s").unwrap(), 1);
-    for bad in ["11s", "60s", "1m", "0s", "0"] {
+    for bad in [
+        "10001ms",
+        "10.001s",
+        "10.000000000000000000001s",
+        "11s",
+        "60s",
+        "1m",
+        "0s",
+        "0",
+    ] {
         let err = grace(bad).unwrap_err();
         assert!(err.contains("between 1s and 10s"), "{bad}: {err}");
     }
@@ -1145,6 +1219,8 @@ async fn postgres_refresh_table_grants_and_guard() {
         format!("REVOKE INSERT ON {t} FROM {role}"),
         format!("DROP TRIGGER _platform_refresh_guard ON {t}"),
         format!("ALTER TABLE {t} DISABLE TRIGGER _platform_refresh_guard"),
+        format!("DROP TRIGGER _platform_refresh_guard ON {t}; CREATE TRIGGER _platform_refresh_guard AFTER UPDATE ON {t} FOR EACH ROW EXECUTE FUNCTION {schema}._platform_refresh_guard()"),
+        format!("CREATE OR REPLACE FUNCTION {schema}._platform_refresh_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$"),
     ] {
         admin.batch_execute(&drift).await.unwrap();
         assert!(check_store(&rt, &tenants).await.is_err(), "{drift}");

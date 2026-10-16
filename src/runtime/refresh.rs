@@ -5,6 +5,8 @@
 
 use serde_json::{Map, Value};
 
+pub const GUARD_BODY: &str = "BEGIN IF NEW.id IS DISTINCT FROM OLD.id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR NEW.family_id IS DISTINCT FROM OLD.family_id OR NEW.user_id IS DISTINCT FROM OLD.user_id OR NEW.token_hash IS DISTINCT FROM OLD.token_hash OR NEW.parent_id IS DISTINCT FROM OLD.parent_id OR NEW.created_at IS DISTINCT FROM OLD.created_at OR NEW.family_expires_at IS DISTINCT FROM OLD.family_expires_at OR NEW.idle_expires_at IS DISTINCT FROM OLD.idle_expires_at THEN RAISE EXCEPTION 'refresh token identity columns are immutable' USING ERRCODE = '42501'; END IF; IF OLD.revoked_at IS NOT NULL AND (NEW.revoked_at IS DISTINCT FROM OLD.revoked_at OR NEW.revoke_reason IS DISTINCT FROM OLD.revoke_reason) THEN RAISE EXCEPTION 'refresh token revocation is final' USING ERRCODE = '42501'; END IF; IF OLD.used_at IS NOT NULL AND NEW.used_at IS DISTINCT FROM OLD.used_at THEN RAISE EXCEPTION 'refresh token used_at is set once' USING ERRCODE = '42501'; END IF; RETURN NEW; END";
+
 /// Family lifetime, idle timeout and reuse grace, in seconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RefreshPolicy {
@@ -98,20 +100,7 @@ pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
         // with the same time and reason; used_at is set once. Applies to
         // every role, including the owner.
         format!(
-            "CREATE OR REPLACE FUNCTION {s}.{GUARD_TRIGGER}() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
-             IF NEW.id IS DISTINCT FROM OLD.id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id \
-             OR NEW.family_id IS DISTINCT FROM OLD.family_id OR NEW.user_id IS DISTINCT FROM OLD.user_id \
-             OR NEW.token_hash IS DISTINCT FROM OLD.token_hash OR NEW.parent_id IS DISTINCT FROM OLD.parent_id \
-             OR NEW.created_at IS DISTINCT FROM OLD.created_at \
-             OR NEW.family_expires_at IS DISTINCT FROM OLD.family_expires_at \
-             OR NEW.idle_expires_at IS DISTINCT FROM OLD.idle_expires_at THEN \
-             RAISE EXCEPTION 'refresh token identity columns are immutable' USING ERRCODE = '42501'; END IF; \
-             IF OLD.revoked_at IS NOT NULL AND (NEW.revoked_at IS DISTINCT FROM OLD.revoked_at \
-             OR NEW.revoke_reason IS DISTINCT FROM OLD.revoke_reason) THEN \
-             RAISE EXCEPTION 'refresh token revocation is final' USING ERRCODE = '42501'; END IF; \
-             IF OLD.used_at IS NOT NULL AND NEW.used_at IS DISTINCT FROM OLD.used_at THEN \
-             RAISE EXCEPTION 'refresh token used_at is set once' USING ERRCODE = '42501'; END IF; \
-             RETURN NEW; END $f$",
+            "CREATE OR REPLACE FUNCTION {s}.{GUARD_TRIGGER}() RETURNS trigger LANGUAGE plpgsql AS $f${GUARD_BODY}$f$",
             s = super::sql::quote(schema)?
         ),
         format!("DROP TRIGGER IF EXISTS {GUARD_TRIGGER} ON {qualified}"),
@@ -230,7 +219,11 @@ pub const STORE_STATUS_SQL: &str = "SELECT \
     EXISTS (SELECT 1 FROM pg_trigger g JOIN pg_proc p ON p.oid = g.tgfoid \
       WHERE g.tgrelid = $1::regclass AND g.tgname = '_platform_refresh_guard' \
       AND p.proname = '_platform_refresh_guard' AND g.tgenabled IN ('O', 'A') \
-      AND (g.tgtype & 16) <> 0)";
+      AND g.tgtype = 19 AND NOT g.tgisinternal \
+      AND p.pronamespace = (SELECT relnamespace FROM pg_class WHERE oid = $1::regclass) \
+      AND p.pronargs = 0 AND p.prorettype = 'trigger'::regtype \
+      AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql') \
+      AND p.prosrc = $2)";
 
 /// Startup check run by `vibe serve` as the runtime role: for every tenant,
 /// the refresh table grants exactly SELECT, INSERT and column UPDATE on
@@ -244,7 +237,7 @@ pub async fn check_store(
     for tenant in tenants {
         let table = format!("t_{tenant}._platform_refresh_tokens");
         let row = client
-            .query_one(STORE_STATUS_SQL, &[&format!("\"t_{tenant}\"._platform_refresh_tokens")])
+            .query_one(STORE_STATUS_SQL, &[&format!("\"t_{tenant}\"._platform_refresh_tokens"), &GUARD_BODY])
             .await
             .map_err(|err| {
                 format!("refresh table {table} is not usable ({err}); run `vibe migrate` for this tenant")
@@ -417,7 +410,8 @@ pub fn memory_rotate(
         .iter()
         .find(|r| text(r, "id") == old_child)
         .is_some_and(|r| r["used_at"].is_null() && r["revoked_at"].is_null());
-    let grace_ok = matches!(used_at, Some(used) if now - used < policy.grace)
+    let grace_ok = policy.grace > 0
+        && matches!(used_at, Some(used) if now - used <= policy.grace)
         && cur["grace_reissued_at"].is_null()
         && child_unused;
     if used_at.is_some() && !grace_ok {
@@ -551,6 +545,18 @@ mod tests {
             Rotated::Invalid,
             "other tenant"
         );
+    }
+
+    #[test]
+    fn reuse_grace_boundary() {
+        for (now, accepted) in [(11, true), (12, false)] {
+            let mut rows = Vec::new();
+            memory_issue(&mut rows, T, "u1", "h0", policy(), 0);
+            ok_family(memory_rotate(&mut rows, T, "h0", "h1", policy(), 1));
+            let result = memory_rotate(&mut rows, T, "h0", "h2", policy(), now);
+            assert_eq!(matches!(result, Rotated::Ok { .. }), accepted);
+            assert_eq!(matches!(result, Rotated::Reuse { .. }), !accepted);
+        }
     }
 
     #[test]
