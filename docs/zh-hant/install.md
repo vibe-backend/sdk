@@ -22,7 +22,7 @@
 3. 使用 HTTPS/TLS 1.2+ 下載；下載失敗立即停止。
 4. 必須先核對同一 release 的 `SHA256SUMS`，並強制以已登入的 GitHub CLI 執行 `gh attestation verify`，固定驗證 `vibe-backend/sdk` repository、`release.yml` signer workflow、`refs/tags/v<version>` source ref、該 tag 的 commit SHA，並拒絕 self-hosted runner（決定 118、9C）；驗證身份寫死於腳本，`VIBE_INSTALL_REPOSITORY`／`VIBE_INSTALL_DOWNLOAD_URL` 無法改變；任一驗證失敗都不替換既有版本。
 5. archive 只能包含頂層唯一、非 symlink 的 `vibe`。每個已驗證版本存於不可變版本目錄；對外 `vibe` symlink 以單次 rename 原子切換。操作鎖避免 install、upgrade、remove 競爭。
-6. 腳本不覆寫未管理的 `vibe`。remove 僅接受指向 `.vibe-managed/versions/.../../vibe` 的管理 symlink，只刪除管理根目錄與該 symlink，不刪除安裝目錄或其他檔案。
+6. 腳本不覆寫未管理的 `vibe`。remove 僅接受指向 `.vibe-managed/versions/.../vibe` 的管理 symlink，只刪除管理根目錄與該 symlink，不刪除安裝目錄或其他檔案。
 7. 重複安裝相同且內容一致的版本為 no-op。
 
 ### 信任邊界與限制
