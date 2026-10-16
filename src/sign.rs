@@ -37,7 +37,9 @@ pub fn verify_bytes(bytes: &[u8], signature_hex: &str, key: &VerifyingKey) -> bo
 
 pub fn generate_key() -> SigningKey {
     let mut seed = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+    // OS CSPRNG; panics on failure, matching rand 0.8's OsRng::fill_bytes.
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut seed)
+        .expect("OS random number generator failed");
     SigningKey::from_bytes(&seed)
 }
 
