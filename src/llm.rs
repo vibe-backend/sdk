@@ -1220,6 +1220,7 @@ mod tests {
             seed: 0,
             endpoint_host: "generativelanguage.googleapis.com".into(),
             endpoint_private: false,
+            send_sampling: true,
             api_style: "chat".into(),
         };
         for (model, encoded) in [
