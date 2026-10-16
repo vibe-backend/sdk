@@ -572,3 +572,97 @@ fn lookup_timeout_setting() {
         assert!(timeout_of(Some(bad)).is_err(), "accepted {bad}");
     }
 }
+
+fn list_file(name: &str, mode: u32) -> String {
+    let dir = std::env::temp_dir().join(format!("vibe-breached-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("list.txt");
+    std::fs::write(&path, sha1_hex("hunter2hunter2")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    path.to_string_lossy().into_owned()
+}
+
+#[tokio::test]
+async fn production_outage_fails_closed_without_a_complete_fallback() {
+    let (url, _) = server("500", "").await;
+    let list = OfflineList::parse(sha1_hex("hunter2hunter2").as_bytes()).unwrap();
+    let prod = |complete: bool| {
+        let list = OfflineList::parse(sha1_hex("hunter2hunter2").as_bytes()).unwrap();
+        let api = RangeApi::new("https://passwords.example/range/", true).unwrap();
+        if complete {
+            api.with_complete_fallback(list)
+        } else {
+            api.with_fallback(list)
+        }
+    };
+    let source = BreachedSource::Range(Box::new(prod(false)));
+    assert!(source.describe().contains("fails closed"));
+    let source = BreachedSource::Range(Box::new(prod(true)));
+    assert!(source.describe().contains("complete offline fallback"));
+    // Outside production the fallback is still used.
+    let dev = BreachedSource::Range(Box::new(
+        RangeApi::new(&url, false).unwrap().with_fallback(list),
+    ));
+    assert_eq!(dev.is_breached("hunter2hunter2", 1).await, Ok(true));
+}
+
+#[test]
+fn production_fallback_must_be_declared_complete() {
+    let path = list_file("fallback", 0o600);
+    let get = |complete: Option<&'static str>, file: Option<String>| {
+        move |name: &str| match name {
+            "VIBE_BREACHED_PASSWORDS_FALLBACK_FILE" => file.clone(),
+            "VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE" => complete.map(str::to_string),
+            _ => None,
+        }
+    };
+    let err = BreachedConfig::from_env(&get(None, Some(path.clone())), true)
+        .err()
+        .unwrap();
+    assert!(
+        err.contains("VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE"),
+        "{err}"
+    );
+    let ok = BreachedConfig::from_env(&get(Some("true"), Some(path.clone())), true).unwrap();
+    assert!(ok.source.describe().contains("complete offline fallback"));
+    assert!(BreachedConfig::from_env(&get(None, Some(path.clone())), false).is_ok());
+    assert!(BreachedConfig::from_env(&get(Some("true"), None), false).is_err());
+    assert!(BreachedConfig::from_env(&get(Some("maybe"), Some(path)), false).is_err());
+}
+
+#[test]
+fn min_count_has_an_upper_bound() {
+    let min = |value: &'static str| {
+        let get = move |name: &str| {
+            (name == "VIBE_BREACHED_PASSWORDS_MIN_COUNT").then(|| value.to_string())
+        };
+        BreachedConfig::from_env(&get, false).map(|c| c.min_count)
+    };
+    assert_eq!(min("1").unwrap(), 1);
+    assert_eq!(min("10").unwrap(), vibe::runtime::breached::MAX_MIN_COUNT);
+    for bad in ["0", "11", "1000", "18446744073709551615"] {
+        assert!(min(bad).is_err(), "accepted {bad}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn list_writable_by_group_or_other_is_refused_in_production() {
+    for (name, mode) in [("group", 0o664), ("other", 0o646)] {
+        let path = list_file(name, mode);
+        let err = OfflineList::load(&path, true).err().unwrap();
+        assert!(err.contains("writable by group or other"), "{err}");
+        assert!(OfflineList::load(&path, false).is_ok(), "dev keeps loading");
+        let get = |name: &str| (name == "VIBE_BREACHED_PASSWORDS_FILE").then(|| path.clone());
+        assert!(BreachedConfig::from_env(&get, true).is_err());
+        assert!(BreachedConfig::from_env(&get, false).is_ok());
+    }
+    let path = list_file("owner", 0o644);
+    assert!(OfflineList::load(&path, true).is_ok());
+}
