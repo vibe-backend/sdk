@@ -1156,6 +1156,15 @@ mod version_tests {
     use super::check_server_version;
 
     #[test]
+    fn postgres_minimum_version_boundary() {
+        assert_eq!(
+            check_server_version("150000"),
+            Err("PostgreSQL 16 or later required (server_version_num is 150000)".to_string())
+        );
+        assert_eq!(check_server_version("160000"), Ok(()));
+    }
+
+    #[test]
     fn postgres_below_16_is_refused() {
         for v in ["150000", "150013", "140011", "90624", "159999"] {
             let err = check_server_version(v).unwrap_err();
