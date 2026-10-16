@@ -157,12 +157,27 @@ impl Visitor for Guard {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-        if let Expr::Cast { data_type, .. } | Expr::TypedString { data_type, .. } = expr {
-            if let Some(problem) = cast_type_problem(data_type) {
-                return self.fail(problem);
-            }
-        }
         match expr {
+            Expr::Cast {
+                kind, data_type, ..
+            } => {
+                use sqlparser::ast::CastKind;
+                // Only PostgreSQL CAST / :: forms; reject TRY_CAST / SAFE_CAST.
+                if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) {
+                    return self.fail(format!("cast form {expr} is not allowed in lock SQL"));
+                }
+                if let Some(problem) = cast_type_problem(data_type) {
+                    return self.fail(problem);
+                }
+            }
+            Expr::TypedString { data_type, .. } => {
+                if let Some(problem) = cast_type_problem(data_type) {
+                    return self.fail(problem);
+                }
+            }
+            Expr::Convert { .. } => {
+                return self.fail("CONVERT is not allowed in lock SQL".into());
+            }
             Expr::Collate { collation, .. } if collation.0.len() != 1 => {
                 return self.fail(format!(
                     "collation {collation} must not be schema-qualified"
@@ -226,62 +241,25 @@ pub const ALLOWED_CAST_TYPES: &[&str] = &[
     "bytea",
 ];
 
-/// Decode PostgreSQL Unicode identifier escapes (`\hhhh` / `\+hhhhhh`), then
-/// lowercase. Used so `U&` forms normalize to the same names as plain idents.
-fn normalize_ident_value(raw: &str) -> String {
-    let decoded = decode_unicode_escapes(raw);
-    decoded.to_ascii_lowercase()
-}
-
-fn decode_unicode_escapes(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'+' {
-                let start = i + 2;
-                let end = (start + 6).min(bytes.len());
-                let hex = &input[start..end];
-                if hex.len() == 6 {
-                    if let Ok(v) = u32::from_str_radix(hex, 16) {
-                        if let Some(ch) = char::from_u32(v) {
-                            out.push(ch);
-                            i = end;
-                            continue;
-                        }
-                    }
-                }
-            } else {
-                let start = i + 1;
-                let end = (start + 4).min(bytes.len());
-                let hex = &input[start..end];
-                if hex.len() == 4 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    if let Ok(v) = u32::from_str_radix(hex, 16) {
-                        if let Some(ch) = char::from_u32(v) {
-                            out.push(ch);
-                            i = end;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-        let ch = input[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
+/// Fold an identifier the way PostgreSQL does for type names: unquoted names
+/// are lowercased; quoted names keep their exact spelling (so `"TEXT"` is not
+/// `text`). Backslashes are left as-is — only `U&"..."` would decode them, and
+/// sqlparser does not parse that form as an identifier.
+fn type_ident_name(ident: &Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_ascii_lowercase()
     }
-    out
 }
 
+/// Returns the allowlist key for a (possibly schema-qualified) type name, or
+/// `None` when the schema is not exactly `pg_catalog` under PostgreSQL folding
+/// rules.
 fn normalize_type_name_parts(idents: &[Ident]) -> Option<String> {
-    let parts: Vec<String> = idents
-        .iter()
-        .map(|i| normalize_ident_value(&i.value))
-        .collect();
-    match parts.as_slice() {
-        [base] => Some(base.clone()),
-        [schema, base] if schema == "pg_catalog" => Some(base.clone()),
+    match idents {
+        [base] => Some(type_ident_name(base)),
+        [schema, base] if type_ident_name(schema) == "pg_catalog" => Some(type_ident_name(base)),
         _ => None,
     }
 }
@@ -543,16 +521,35 @@ mod tests {
     }
 
     #[test]
-    fn unicode_ident_escapes_normalize() {
-        assert_eq!(super::normalize_ident_value("\\0072egclass"), "regclass");
-        assert_eq!(super::normalize_ident_value("\\0074ext"), "text");
-        assert_eq!(super::normalize_ident_value("TEXT"), "text");
+    fn quoted_type_idents_keep_exact_spelling() {
+        let text = sqlparser::ast::Ident::new("TEXT");
+        assert_eq!(super::type_ident_name(&text), "text");
+        let quoted = sqlparser::ast::Ident::with_quote('"', "TEXT");
+        assert_eq!(super::type_ident_name(&quoted), "TEXT");
+        assert_eq!(
+            super::normalize_type_name_parts(&[sqlparser::ast::Ident::with_quote('"', "TEXT")]),
+            Some("TEXT".into())
+        );
         assert_eq!(
             super::normalize_type_name_parts(&[sqlparser::ast::Ident::with_quote(
                 '"',
-                "\\0072egclass"
+                "\\0074ext"
             )]),
-            Some("regclass".into())
+            Some("\\0074ext".into())
+        );
+        assert_eq!(
+            super::normalize_type_name_parts(&[
+                sqlparser::ast::Ident::with_quote('"', "PG_CATALOG"),
+                sqlparser::ast::Ident::with_quote('"', "text"),
+            ]),
+            None
+        );
+        assert_eq!(
+            super::normalize_type_name_parts(&[
+                sqlparser::ast::Ident::new("PG_CATALOG"),
+                sqlparser::ast::Ident::new("text"),
+            ]),
+            Some("text".into())
         );
     }
 
@@ -592,6 +589,17 @@ mod tests {
             "select 'x'::cid",
             "select 'x'::tid",
             "select 'x'::public.text",
+            // Quoted names keep exact spelling (not folded like unquoted)
+            "select 'x'::\"TEXT\"",
+            "select \"TEXT\" 'x'",
+            "select 'x'::\"PG_CATALOG\".\"text\"",
+            "select 'x'::\"pg_catalog\".\"TEXT\"",
+            // Backslash is literal in quoted idents, not a unicode escape
+            "select 'x'::\"\\0074ext\"",
+            // Non-PostgreSQL cast forms
+            "select convert('x', text)",
+            "select try_cast('x' as text)",
+            "select safe_cast('x' as text)",
         ] {
             assert!(query_problem(sql).is_some(), "accepted: {sql}");
         }

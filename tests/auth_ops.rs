@@ -128,7 +128,7 @@ async fn random_token_hash_matches_hash_token_and_email_normalizes() {
     let h1 = out["h1"].as_str().unwrap();
     assert!(h1.starts_with("\\x") && h1.len() == 66, "{h1}");
     let plain = {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&auth().pepper).unwrap();
         mac.update(out["vt"]["value"].as_str().unwrap().as_bytes());
         hex::encode(mac.finalize().into_bytes())
@@ -903,15 +903,14 @@ async fn verify_password_only_accepts_platform_hashes_within_bounds() {
     };
     // A valid argon2id hash of the same password, but with other parameters.
     let weak_params = {
-        use argon2::password_hash::{PasswordHasher, SaltString};
-        let salt = SaltString::encode_b64(b"0123456789abcdef").unwrap();
+        use argon2::password_hash::PasswordHasher;
         let argon = argon2::Argon2::new(
             argon2::Algorithm::Argon2id,
             argon2::Version::V0x13,
             argon2::Params::new(8, 1, 1, Some(32)).unwrap(),
         );
         argon
-            .hash_password(b"correct horse battery", &salt)
+            .hash_password_with_salt(b"correct horse battery", b"0123456789abcdef")
             .unwrap()
             .to_string()
     };
