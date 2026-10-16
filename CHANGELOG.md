@@ -7,6 +7,8 @@ added only when the corresponding PR is merged to `main`.
 
 ### Added
 
+- **Manifest audit stamp (#251, decision 118):** `vibe manifest` records an `audit` object in the signed manifest: `tag` (`GITHUB_REF_NAME` when `GITHUB_REF_TYPE=tag`), `commit` (`GITHUB_SHA`), `run_id` (`GITHUB_RUN_ID`), `compiler_hashes` (sorted, de-duplicated lock `compiler-hash` values) and `built_at` (RFC 3339 UTC). Fields that are not available are `null`. The stamp is covered by the manifest signature and never contains keys. Manifests without `audit` still verify.
+
 - **Dependency / advisory CI (#192):** `cargo deny check` (advisories, licenses, bans, sources) runs on pull requests, pushes to main, a daily schedule, and `workflow_dispatch` via `.github/workflows/cargo-deny.yml` (Refs #196).
 
 - **Challenge replay store (#157):** Challenge single-use state, quotas and capacity live in PostgreSQL in each tenant's own schema (`t_<tenant>.vibe_challenge_replay`, created by that tenant's `vibe migrate`, FORCE RLS) so they hold across instances. The runtime role has SELECT and INSERT only; expired rows are ignored and removed by `vibe migrate`. Capacity is per tenant and client IPs are stored as a per-tenant HMAC. In production with a verifier configured the PostgreSQL store is always used; `vibe serve` refuses to start if a tenant's table is missing or has wrong grants, or if `VIBE_CHALLENGE_REPLAY_STORE=memory` is set. Outside production the store must be chosen explicitly (`memory` or `postgres`). Store errors fail closed (503).

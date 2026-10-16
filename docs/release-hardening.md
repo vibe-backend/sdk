@@ -40,6 +40,23 @@ WARN vibe::rate_limit_saturation: rate-limit shard saturated; refusing new keys 
 
 `reason` is `owner_cap`, `network_cap`, `reserve` or `pinned`. Before release, add a log-based alert on that target (for example, any `reason="reserve"` or `reason="pinned"` line, or `refused` above a few dozen per minute), since those mean new clients are being turned away rather than one heavy network being capped.
 
+## Manifest audit stamp (#251, decision 118)
+
+`vibe manifest` adds an `audit` object to the manifest before signing it, so
+the stamp is covered by the manifest signature:
+
+| Field | Source |
+| --- | --- |
+| `tag` | `GITHUB_REF_NAME` when `GITHUB_REF_TYPE=tag`, else `null` |
+| `commit` | `GITHUB_SHA`, else `null` |
+| `run_id` | `GITHUB_RUN_ID`, else `null` |
+| `compiler_hashes` | sorted, de-duplicated `compiler-hash` of every lock in the build |
+| `built_at` | build time, RFC 3339 UTC |
+
+Only these variables are read; no key or secret is ever written to the stamp.
+Local builds get `null` for the CI fields. Manifests produced before this
+change have no `audit` object and still verify.
+
 ## Residual risks
 
 - `release` environment admin bypass is enabled (`can_admins_bypass: true`). An admin can deploy without Jack's environment approval. Jack accepted this risk.

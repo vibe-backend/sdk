@@ -23,7 +23,62 @@ pub struct Manifest {
     pub models: Vec<ModelSpec>,
     pub methods: Vec<MethodSpec>,
     pub migrations: Vec<MigrationSpec>,
+    /// Build audit stamp (decision 118). Covered by the signature. Older
+    /// manifests without it still verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit: Option<AuditStamp>,
     pub signature: String,
+}
+
+/// Audit stamp recorded in every manifest built by `vibe manifest`
+/// (decision 118): tag, commit SHA, workflow run id, compiler-hash and build
+/// time. It never contains keys or other secrets; only the fields below are
+/// read from the environment.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AuditStamp {
+    /// Release tag (`GITHUB_REF_NAME` when `GITHUB_REF_TYPE=tag`), else null.
+    pub tag: Option<String>,
+    /// Commit SHA (`GITHUB_SHA`), else null.
+    pub commit: Option<String>,
+    /// Workflow run id (`GITHUB_RUN_ID`), else null.
+    pub run_id: Option<String>,
+    /// Sorted, de-duplicated `compiler-hash` values of the locks in the build.
+    pub compiler_hashes: Vec<String>,
+    /// Build time, RFC 3339 UTC.
+    pub built_at: String,
+}
+
+impl AuditStamp {
+    /// Build a stamp from the given environment lookup and lock set.
+    pub fn collect(
+        docs: &HashMap<String, LockDoc>,
+        env: &dyn Fn(&str) -> Option<String>,
+        built_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let get = |name: &str| {
+            env(name)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let tag = match get("GITHUB_REF_TYPE").as_deref() {
+            Some("tag") => get("GITHUB_REF_NAME"),
+            _ => None,
+        };
+        let mut compiler_hashes: Vec<String> = docs
+            .values()
+            .map(|doc| doc.meta.compiler_hash.clone())
+            .filter(|hash| !hash.is_empty())
+            .collect();
+        compiler_hashes.sort();
+        compiler_hashes.dedup();
+        AuditStamp {
+            tag,
+            commit: get("GITHUB_SHA"),
+            run_id: get("GITHUB_RUN_ID"),
+            compiler_hashes,
+            built_at: built_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -262,6 +317,11 @@ pub fn manifest_from_project(root: &Path, signing_key: &SigningKey) -> Result<Ma
     })?;
     let docs = load_docs(root)?;
     let mut manifest = build_manifest(&docs)?;
+    manifest.audit = Some(AuditStamp::collect(
+        &docs,
+        &|name| std::env::var(name).ok(),
+        chrono::Utc::now(),
+    ));
     manifest.signature = String::new();
     let bytes =
         serde_json::to_vec(&manifest).map_err(|err| single(format!("manifest json: {err}")))?;
@@ -345,6 +405,7 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
         models,
         methods,
         migrations,
+        audit: None,
         signature: String::new(),
     })
 }
@@ -1198,5 +1259,107 @@ mod rate_key_tests {
         for bad in ["family", "req.ip", "input.", "input.a-b", "everyone"] {
             assert!(check_rate_key(bad, false, "jwt").is_err(), "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::lock::Meta;
+
+    fn doc(id: &str, hash: &str) -> LockDoc {
+        let mut meta = Meta::pending(Kind::Model, None, id, format!("models/{id}.md"));
+        meta.compiler_hash = hash.into();
+        LockDoc {
+            meta,
+            sections: Vec::new(),
+        }
+    }
+
+    fn at() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-10-16T04:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn docs() -> HashMap<String, LockDoc> {
+        let mut docs = HashMap::new();
+        docs.insert("a".into(), doc("a", "h2"));
+        docs.insert("b".into(), doc("b", "h1"));
+        docs.insert("c".into(), doc("c", "h2"));
+        docs
+    }
+
+    #[test]
+    fn stamp_from_tag_build() {
+        let env = |name: &str| {
+            match name {
+                "GITHUB_REF_TYPE" => Some("tag"),
+                "GITHUB_REF_NAME" => Some("v1.8.0"),
+                "GITHUB_SHA" => Some("abc123"),
+                "GITHUB_RUN_ID" => Some("42"),
+                "VIBE_LLM_API_KEY" => Some("must-not-appear"),
+                _ => None,
+            }
+            .map(String::from)
+        };
+        let stamp = AuditStamp::collect(&docs(), &env, at());
+        assert_eq!(stamp.tag.as_deref(), Some("v1.8.0"));
+        assert_eq!(stamp.commit.as_deref(), Some("abc123"));
+        assert_eq!(stamp.run_id.as_deref(), Some("42"));
+        assert_eq!(stamp.compiler_hashes, vec!["h1", "h2"]);
+        assert_eq!(stamp.built_at, "2026-10-16T04:00:00Z");
+        let json = serde_json::to_string(&stamp).unwrap();
+        assert!(!json.contains("must-not-appear"));
+    }
+
+    #[test]
+    fn stamp_outside_ci_and_branch_refs() {
+        let none = |_: &str| None;
+        let stamp = AuditStamp::collect(&docs(), &none, at());
+        assert_eq!(stamp.tag, None);
+        assert_eq!(stamp.commit, None);
+        assert_eq!(stamp.run_id, None);
+        let branch = |name: &str| {
+            match name {
+                "GITHUB_REF_TYPE" => Some("branch"),
+                "GITHUB_REF_NAME" => Some("main"),
+                _ => None,
+            }
+            .map(String::from)
+        };
+        assert_eq!(AuditStamp::collect(&docs(), &branch, at()).tag, None);
+    }
+
+    #[test]
+    fn stamp_is_signed_and_legacy_manifests_verify() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let dir = std::env::temp_dir().join(format!("vibe-audit-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("manifest.json");
+
+        let mut manifest = build_manifest(&HashMap::new()).unwrap();
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("\"audit\""));
+        manifest.signature = sign::sign_bytes(&bytes, &key);
+        write_manifest(&path, &manifest).unwrap();
+        assert!(read_manifest(&path, &key.verifying_key()).is_ok());
+
+        manifest.audit = Some(AuditStamp::collect(&docs(), &|_| None, at()));
+        manifest.signature.clear();
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        manifest.signature = sign::sign_bytes(&bytes, &key);
+        write_manifest(&path, &manifest).unwrap();
+        let read = read_manifest(&path, &key.verifying_key()).unwrap();
+        assert_eq!(read.audit, manifest.audit);
+
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            text.replace("2026-10-16T04:00:00Z", "2026-10-17T04:00:00Z"),
+        )
+        .unwrap();
+        assert!(read_manifest(&path, &key.verifying_key()).is_err());
+        fs::remove_dir_all(&dir).ok();
     }
 }
