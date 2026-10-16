@@ -26,6 +26,10 @@ fn serve(envs: &[(&str, &str)], memory: bool) -> (bool, String) {
         "LLM_PROVIDER",
         "LLM_BASE_URL",
         "OPENAI_API_KEY",
+        "VIBE_TURNSTILE_SECRET",
+        "VIBE_CHALLENGE_HOSTNAMES",
+        "VIBE_CHALLENGE_PROVIDER",
+        "VIBE_CHALLENGE_REPLAY_STORE",
     ] {
         cmd.env_remove(key);
     }
@@ -81,4 +85,40 @@ fn real_database_without_pepper_is_refused_even_when_env_unset() {
     );
     assert!(!ok);
     assert!(err.contains("at least 32 bytes"), "{err}");
+}
+
+const TURNSTILE: [(&str, &str); 2] = [
+    ("VIBE_TURNSTILE_SECRET", "secret"),
+    ("VIBE_CHALLENGE_HOSTNAMES", "shop.example.com"),
+];
+
+#[test]
+fn production_refuses_the_memory_replay_store() {
+    for with_verifier in [true, false] {
+        let mut envs = vec![
+            ("VIBE_ENV", "production"),
+            ("VIBE_CHALLENGE_REPLAY_STORE", "memory"),
+        ];
+        if with_verifier {
+            envs.extend(TURNSTILE);
+        }
+        let (ok, err) = serve(&envs, false);
+        assert!(!ok);
+        assert!(err.contains("refused in production"), "{envs:?}: {err}");
+    }
+}
+
+#[test]
+fn development_needs_an_explicit_replay_store() {
+    let mut envs = vec![("VIBE_ENV", "dev")];
+    envs.extend(TURNSTILE);
+    let (ok, err) = serve(&envs, true);
+    assert!(!ok);
+    assert!(err.contains("needs an explicit replay store"), "{err}");
+    // With the explicit switch, startup gets past the replay check (and stops
+    // later at the missing manifest).
+    envs.push(("VIBE_CHALLENGE_REPLAY_STORE", "memory"));
+    let (ok, err) = serve(&envs, true);
+    assert!(!ok);
+    assert!(!err.contains("replay store"), "{err}");
 }

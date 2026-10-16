@@ -7,6 +7,7 @@ mod limiter;
 mod migrate;
 mod ops;
 pub mod refresh;
+pub mod replay;
 mod slugs;
 mod sql;
 

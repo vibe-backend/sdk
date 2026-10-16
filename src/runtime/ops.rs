@@ -440,7 +440,8 @@ pub async fn sign_jwt(
 /// A fresh opaque refresh token and its stored HMAC.
 pub fn new_refresh_token(pepper: &[u8]) -> (String, String) {
     let mut buf = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut buf);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut buf)
+        .expect("OS random number generator failed");
     let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
     let hash = refresh_hash(pepper, &value);
     (value, hash)

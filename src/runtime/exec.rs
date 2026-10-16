@@ -753,6 +753,11 @@ impl PgExec {
         Ok(exec)
     }
 
+    /// The connection pool (shared with the challenge replay store).
+    pub fn pool(&self) -> deadpool_postgres::Pool {
+        self.pool.clone()
+    }
+
     async fn client(&self) -> Result<deadpool_postgres::Object, String> {
         self.pool.get().await.map_err(pool_error)
     }
