@@ -94,6 +94,12 @@ Turnstile's own single-use check (`timeout-or-duplicate`) applies in addition.
 
 In production (`VIBE_ENV`), `vibe serve` refuses to start and `vibe validate --deploy`
 fails if any route uses `challenge ... when: always` and no verifier is configured.
+
+Only public routes with `when: always` are verified. A challenge declared with
+`when: after-failures` (for example on login routes) or on a non-public
+(authenticated) route is not verified yet, so in production `vibe serve` and
+`vibe validate --deploy` refuse such routes (#199). Development and CI still
+accept them.
 Challenges do not replace server-side rate limits and quotas. The route's rate
 limits and the public write quota are checked before the challenge, so a
 limited request never reaches the replay cache or the provider.
