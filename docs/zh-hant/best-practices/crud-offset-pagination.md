@@ -80,7 +80,7 @@ Validation failure returns 422.
 
 這與 v1.7 §12.8 的 `user` lock 一致。model 層的 `public_writer` 授權是所有公開端點的**聯集**（登入寫入 `last_login_at`；註冊和 verify-email 寫入驗證欄位和密碼）；每個 api 的實際授權只限其本身 lock 用到的欄位（§12.8、§12.11.6、§12.11.7）。可公開寫入的欄位屬於高風險的 `public-writable-column` 安全項目。見 [user-login.md](user-login.md) 和 [user-register.md](user-register.md)。
 
-注入的 `user.list` method 有自己的 lock，由平台產生（`id: user/crud/list`、`source-type: structured`）（§12.9）。
+注入的 `user.list` method 有自己的 lock，由平台產生並簽名（`id: user/crud/list`、`source-type: structured`）（§12.9）。
 
 `api/users/v2/list-users/list-users.lock.md`（僅列 section；`kind: api`、`scope: feature`；`dependencies` 包含 `user/crud/list`）
 

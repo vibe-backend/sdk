@@ -80,7 +80,7 @@ Validation failure returns 422.
 
 This matches the v1.7 §12.8 `user` lock. The `public_writer` grant at model level is the **union** of all public endpoints (login writes `last_login_at`; register and verify-email write the verification columns and password); each api's effective grant is limited to the columns its own lock uses (§12.8, §12.11.6, §12.11.7). Public-writable columns are high-risk `public-writable-column` security items. See [user-login.md](user-login.md) and [user-register.md](user-register.md).
 
-The injected `user.list` method has its own platform-generated lock (`id: user/crud/list`, `source-type: structured`) (§12.9).
+The injected `user.list` method has its own platform-generated, signed lock (`id: user/crud/list`, `source-type: structured`) (§12.9).
 
 `api/users/v2/list-users/list-users.lock.md` (sections only; `kind: api`, `scope: feature`; `dependencies` include `user/crud/list`)
 

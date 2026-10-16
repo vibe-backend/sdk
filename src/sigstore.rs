@@ -19,6 +19,7 @@
 //!    integrated time, with the same exact identity, issuer, commit and ref.
 
 use base64::Engine;
+use der::Decode;
 use std::path::Path;
 
 /// The only accepted OIDC issuer.
@@ -123,11 +124,9 @@ fn extension_text(value: &[u8], der: bool) -> Option<String> {
     if !der {
         return String::from_utf8(value.to_vec()).ok();
     }
-    let (rest, obj) = x509_parser::der_parser::der::parse_der_utf8string(value).ok()?;
-    if !rest.is_empty() {
-        return None;
-    }
-    obj.as_str().ok().map(str::to_string)
+    der::asn1::Utf8StringRef::from_der(value)
+        .ok()
+        .map(|text| text.as_str().to_string())
 }
 
 /// Identity checks on the bundle certificate (decision 119). Every value must
@@ -141,15 +140,20 @@ pub fn check_bundle_identity(bundle_json: &[u8], expected: &Expected) -> Result<
         return Err("Sigstore bundle has no Rekor inclusion proof".into());
     }
     let der = bundle_certificate(&bundle)?;
-    let (_, cert) = x509_parser::parse_x509_certificate(&der)
+    let cert = x509_cert::Certificate::from_der(&der)
         .map_err(|err| format!("Sigstore bundle certificate: {err}"))?;
 
     let identity = release_identity(&expected.version);
     let mut sans = Vec::new();
-    if let Ok(Some(san)) = cert.subject_alternative_name() {
-        for name in &san.value.general_names {
+    if let Ok(Some((_, san))) = cert
+        .tbs_certificate
+        .get::<x509_cert::ext::pkix::SubjectAltName>()
+    {
+        for name in &san.0 {
             match name {
-                x509_parser::extensions::GeneralName::URI(uri) => sans.push(uri.to_string()),
+                x509_cert::ext::pkix::name::GeneralName::UniformResourceIdentifier(uri) => {
+                    sans.push(uri.to_string())
+                }
                 other => sans.push(format!("{other:?}")),
             }
         }
@@ -161,10 +165,13 @@ pub fn check_bundle_identity(bundle_json: &[u8], expected: &Expected) -> Result<
     }
 
     let ext = |oid: &str, der: bool| -> Option<String> {
-        cert.extensions()
+        cert.tbs_certificate
+            .extensions
+            .as_deref()
+            .unwrap_or_default()
             .iter()
-            .find(|e| e.oid.to_id_string() == oid)
-            .and_then(|e| extension_text(e.value, der))
+            .find(|e| e.extn_id.to_string() == oid)
+            .and_then(|e| extension_text(e.extn_value.as_bytes(), der))
     };
     let issuer = ext(OID_ISSUER_V2, true).or_else(|| ext(OID_ISSUER_V1, false));
     let want = [

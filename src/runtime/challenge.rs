@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use super::http::RunEnv;
+pub use super::replay::{token_key, Outcome, PgReplayStore, ReplaySlot, ReplayStore};
 
 /// Cloudflare's siteverify endpoint.
 pub const TURNSTILE_SITEVERIFY_URL: &str =
@@ -166,32 +166,20 @@ impl Reservation<'_> {
     /// The provider accepted the token: keep it for the full TTL.
     pub fn verified(mut self) {
         self.settled = true;
-        let mut st = self.cache.lock();
-        let ttl = self.cache.ttl;
-        if let Some(mut entry) = st.entries.remove(&self.key) {
-            st.uncount(&mut entry);
-            entry.expires = Instant::now() + ttl;
-            st.entries.insert(self.key, entry);
-        }
+        self.cache.settle_key(&self.key, Outcome::Verified);
     }
 
     /// The provider rejected the token: keep it only briefly.
     pub fn rejected(mut self) {
         self.settled = true;
-        let hold = self.cache.rejected_hold;
-        let mut st = self.cache.lock();
-        if hold.is_zero() {
-            st.remove(&self.key);
-        } else if let Some(entry) = st.entries.get_mut(&self.key) {
-            entry.expires = Instant::now() + hold;
-        }
+        self.cache.settle_key(&self.key, Outcome::Rejected);
     }
 }
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         if !self.settled {
-            self.cache.lock().remove(&self.key);
+            self.cache.settle_key(&self.key, Outcome::Released);
         }
     }
 }
@@ -246,7 +234,22 @@ impl ReplayCache {
         ip: Option<&str>,
         tenant: Option<&str>,
     ) -> Result<Reservation<'_>, ChallengeError> {
-        let key: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let key = token_key(token);
+        self.reserve_key(&key, ip, tenant)?;
+        Ok(Reservation {
+            cache: self,
+            key,
+            settled: false,
+        })
+    }
+
+    fn reserve_key(
+        &self,
+        key: &[u8; 32],
+        ip: Option<&str>,
+        tenant: Option<&str>,
+    ) -> Result<(), ChallengeError> {
+        let key = *key;
         let now = Instant::now();
         let mut st = self.lock();
         match st.entries.get(&key) {
@@ -301,11 +304,56 @@ impl ReplayCache {
                 tenant,
             },
         );
-        Ok(Reservation {
-            cache: self,
-            key,
-            settled: false,
+        Ok(())
+    }
+
+    fn settle_key(&self, key: &[u8; 32], outcome: Outcome) {
+        let mut st = self.lock();
+        match outcome {
+            Outcome::Verified => {
+                if let Some(mut entry) = st.entries.remove(key) {
+                    st.uncount(&mut entry);
+                    entry.expires = Instant::now() + self.ttl;
+                    st.entries.insert(*key, entry);
+                }
+            }
+            Outcome::Rejected if !self.rejected_hold.is_zero() => {
+                if let Some(entry) = st.entries.get_mut(key) {
+                    entry.expires = Instant::now() + self.rejected_hold;
+                }
+            }
+            Outcome::Rejected | Outcome::Released => st.remove(key),
+        }
+    }
+}
+
+#[async_trait]
+impl super::replay::ReplayStore for ReplayCache {
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+
+    async fn reserve(
+        &self,
+        key: &[u8; 32],
+        ip: Option<&str>,
+        tenant: Option<&str>,
+    ) -> Result<super::replay::ReplaySlot, ChallengeError> {
+        self.reserve_key(key, ip, tenant)?;
+        Ok(super::replay::ReplaySlot {
+            key: *key,
+            tenant: tenant.map(str::to_string),
+            nonce: [0; 16],
         })
+    }
+
+    async fn settle(
+        &self,
+        slot: &super::replay::ReplaySlot,
+        outcome: Outcome,
+    ) -> Result<(), ChallengeError> {
+        self.settle_key(&slot.key, outcome);
+        Ok(())
     }
 }
 
@@ -330,7 +378,7 @@ pub struct TurnstileConfig {
 pub struct TurnstileVerifier {
     config: TurnstileConfig,
     client: reqwest::Client,
-    replay: ReplayCache,
+    replay: Arc<dyn ReplayStore>,
 }
 
 #[derive(Deserialize)]
@@ -353,13 +401,23 @@ impl TurnstileVerifier {
         Self {
             config,
             client,
-            replay: ReplayCache::default(),
+            replay: Arc::new(ReplayCache::default()),
         }
     }
 
-    pub fn with_replay_cache(mut self, replay: ReplayCache) -> Self {
-        self.replay = replay;
+    pub fn with_replay_cache(self, replay: ReplayCache) -> Self {
+        self.with_replay_store(Arc::new(replay))
+    }
+
+    /// Uses `store` for single-use bookkeeping (e.g. [`PgReplayStore`] when
+    /// several instances serve the same routes).
+    pub fn with_replay_store(mut self, store: Arc<dyn ReplayStore>) -> Self {
+        self.replay = store;
         self
+    }
+
+    pub fn replay_store(&self) -> &'static str {
+        self.replay.name()
     }
 
     /// The production client: 5 s timeout, no redirects, outbound guard
@@ -388,20 +446,30 @@ impl ChallengeVerifier for TurnstileVerifier {
         }
         // Single use: reserve before asking the provider, so concurrent reuse
         // is refused. Only a verified token keeps the slot for the full TTL.
-        let reservation =
-            self.replay
-                .reserve(token, ctx.remote_ip.as_deref(), ctx.tenant.as_deref())?;
+        let key = token_key(token);
+        let slot = self
+            .replay
+            .reserve(&key, ctx.remote_ip.as_deref(), ctx.tenant.as_deref())
+            .await?;
+        let mut guard = super::replay::PendingGuard::new(self.replay.clone(), slot.clone());
         match self.ask(token, ctx).await {
             Ok(()) => {
-                reservation.verified();
+                guard.disarm();
+                // Fail closed: a token that cannot be recorded is not accepted.
+                self.replay.settle(&slot, Outcome::Verified).await?;
                 Ok(())
             }
             Err(err @ ChallengeError::Rejected(_)) => {
-                reservation.rejected();
+                guard.disarm();
+                // Best effort: the pending entry expires on its own.
+                let _ = self.replay.settle(&slot, Outcome::Rejected).await;
                 Err(err)
             }
-            // No answer: the reservation is released on drop.
-            Err(err) => Err(err),
+            Err(err) => {
+                guard.disarm();
+                let _ = self.replay.settle(&slot, Outcome::Released).await;
+                Err(err)
+            }
         }
     }
 }
@@ -483,8 +551,22 @@ pub fn verifier_from_env() -> Result<Option<Arc<dyn ChallengeVerifier>>, String>
     verifier_from_vars(|name| std::env::var(name).ok())
 }
 
+/// [`verifier_from_env`] with a replay store (the in-memory cache when `None`).
+pub fn verifier_from_env_with_store(
+    store: Option<Arc<dyn ReplayStore>>,
+) -> Result<Option<Arc<dyn ChallengeVerifier>>, String> {
+    verifier_from_vars_with_store(|name| std::env::var(name).ok(), store)
+}
+
 pub fn verifier_from_vars(
     get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Arc<dyn ChallengeVerifier>>, String> {
+    verifier_from_vars_with_store(get, None)
+}
+
+pub fn verifier_from_vars_with_store(
+    get: impl Fn(&str) -> Option<String>,
+    store: Option<Arc<dyn ReplayStore>>,
 ) -> Result<Option<Arc<dyn ChallengeVerifier>>, String> {
     let provider = get("VIBE_CHALLENGE_PROVIDER")
         .map(|v| v.trim().to_ascii_lowercase())
@@ -494,7 +576,11 @@ pub fn verifier_from_vars(
         Some(config) => config,
         None => return Ok(None),
     };
-    Ok(Some(Arc::new(TurnstileVerifier::guarded(config)?)))
+    let mut verifier = TurnstileVerifier::guarded(config)?;
+    if let Some(store) = store {
+        verifier = verifier.with_replay_store(store);
+    }
+    Ok(Some(Arc::new(verifier)))
 }
 
 fn turnstile_config(
@@ -552,9 +638,38 @@ pub fn production_gate(env: RunEnv, configured: bool, routes: &[String]) -> Resu
     ))
 }
 
+/// Whether a declared challenge is never verified at runtime: only public
+/// routes with `when: always` are checked, so `after-failures` routes and
+/// non-public (authenticated) routes that declare a challenge are not (#199).
+pub fn challenge_unverified(public: bool, ty: &str, when: &str) -> bool {
+    ty != "none" && !(public && when == "always")
+}
+
+/// Error when production would serve routes whose declared challenge is not
+/// verified at runtime (#199). `routes` are the offending lock or route ids.
+pub fn unverified_gate(env: RunEnv, routes: &[String]) -> Result<(), String> {
+    if env != RunEnv::Production || routes.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "challenge with `when: after-failures` or on an authenticated route is temporarily unsupported in production until verified challenges on these routes are implemented (#201); only public routes with `when: always` are verified (use `type: none` or make the route public with `when: always`); affected: {}",
+        routes.join(", ")
+    ))
+}
+
+/// Lock files (project-relative) whose `## Access` declares a challenge that
+/// is not verified at runtime (see [`challenge_unverified`]).
+pub fn unverified_challenge_locks(root: &Path) -> Vec<String> {
+    scan_locks(root, challenge_unverified)
+}
+
 /// Lock files (project-relative) whose `## Access` declares a challenge with
 /// `when: always`.
 pub fn always_challenge_locks(root: &Path) -> Vec<String> {
+    scan_locks(root, |_, ty, when| ty != "none" && when == "always")
+}
+
+fn scan_locks(root: &Path, matches: impl Fn(bool, &str, &str) -> bool) -> Vec<String> {
     let Ok(sources) = crate::discover::discover(root) else {
         return Vec::new();
     };
@@ -567,14 +682,11 @@ pub fn always_challenge_locks(root: &Path) -> Vec<String> {
         let Ok(doc) = crate::lock::parse_lock(&text) else {
             continue;
         };
-        let raw = doc
-            .sections
-            .iter()
-            .find(|s| s.name == "Access")
-            .and_then(|s| s.get("challenge"))
-            .unwrap_or("");
+        let access = doc.sections.iter().find(|s| s.name == "Access");
+        let raw = access.and_then(|s| s.get("challenge")).unwrap_or("");
+        let public = access.and_then(|s| s.get("public")) == Some("true");
         let (ty, when) = crate::manifest::parse_challenge(raw);
-        if ty != "none" && when == "always" {
+        if matches(public, &ty, &when) {
             out.push(rel);
         }
     }
@@ -706,5 +818,34 @@ mod tests {
         assert!(production_gate(RunEnv::Production, false, &[]).is_ok());
         assert!(production_gate(RunEnv::Dev, false, &routes).is_ok());
         assert!(production_gate(RunEnv::Ci, false, &routes).is_ok());
+    }
+
+    #[test]
+    fn only_public_always_challenges_count_as_verified() {
+        assert!(!challenge_unverified(true, "captcha", "always"));
+        assert!(!challenge_unverified(false, "none", "always"));
+        assert!(!challenge_unverified(true, "none", "after-failures"));
+        assert!(challenge_unverified(true, "captcha", "after-failures"));
+        assert!(challenge_unverified(false, "captcha", "after-failures"));
+        assert!(challenge_unverified(false, "captcha", "always"));
+        assert!(challenge_unverified(false, "pow", "always"));
+    }
+
+    #[test]
+    fn production_refuses_unverified_challenges() {
+        let login = vec!["api/login.lock.md".to_string()];
+        let authed = vec!["api/orders.lock.md".to_string()];
+        for routes in [&login, &authed] {
+            let err = unverified_gate(RunEnv::Production, routes).unwrap_err();
+            assert!(err.contains(&routes[0]), "{err}");
+            assert!(
+                err.contains("temporarily unsupported in production"),
+                "{err}"
+            );
+            assert!(err.contains("#201"), "{err}");
+            assert!(unverified_gate(RunEnv::Dev, routes).is_ok());
+            assert!(unverified_gate(RunEnv::Ci, routes).is_ok());
+        }
+        assert!(unverified_gate(RunEnv::Production, &[]).is_ok());
     }
 }

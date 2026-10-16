@@ -72,6 +72,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         env_name: "test".into(),
         jwks: None,
         roles_claim: "roles".into(),
+        signing_keys: Default::default(),
         route_jwks: Default::default(),
     };
     let loaded = vibe::runtime::load_project_slugs(&root, true).unwrap();
@@ -1089,12 +1090,11 @@ async fn manifest_never_creates_a_key_and_keygen_writes_0600() {
 }
 
 #[tokio::test]
-async fn approve_is_gone_with_a_pointer_to_its_replacement() {
+async fn approve_command_is_not_recognized() {
     let root = copy_shop();
     let (ok, out) = vibe_cli(&root, &["approve", "--reviewer", "a@x"], &[]);
     assert!(!ok);
-    assert!(out.contains("removed in v1.8"), "{out}");
-    assert!(out.contains("pull request"), "{out}");
+    assert!(out.contains("unrecognized subcommand"), "{out}");
 }
 
 #[tokio::test]

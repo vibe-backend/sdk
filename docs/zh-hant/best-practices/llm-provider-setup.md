@@ -154,7 +154,7 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 - Runtime 不可有任何 `LLM_*` 或 `OPENAI_*` 變數；有的話部署失敗（§2A.8.5）。
 - **Sandbox**：compiler 的對外網絡只限 endpoint host；沒有 tools、function calling 或 streaming；除 `LLM_API_KEY` 外沒有其他 secret（§2A.7、§2A.8.6）。
 - CI 和 production 編譯必須用公開 host 的 `https://`；在 CI 使用 loopback、私有 host 或 `LLM_ALLOW_PRIVATE_HOST=true` 屬錯誤（§2A.8.4）。
-- 更換 provider、endpoint host 或 model 屬 **major** 變更：所有 lock 重新編譯，lock 差異經 PR 審核。只改 base URL 的 path 不屬 major，但 CI 確定性檢查仍須通過（§2A.8.7）。
+- 更換 provider、endpoint host 或 model 屬 **major** 變更：所有 lock 重新編譯，涉及自然語言／安全的 lock 需要重新審批。只改 base URL 的 path 不屬 major，但 CI 確定性檢查仍須通過（§2A.8.7）。
 
 ## 規格缺口
 

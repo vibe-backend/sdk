@@ -16,8 +16,8 @@
 
 ## 範例慣例
 
-- 範例中的名稱（`jack@example`、`mei@example`）和 PR 編號（`pr#121` …）均為**虛構**，風格仿照規格中的範例。v1.8 起 lock 不再有核准欄位或簽名（§2A.1）。
-- 雜湊值為縮短的佔位符（`sha256:9a1c...e2`），與規格範例的寫法一致。
+- lock frontmatter 中的審核者名稱（`jack@example`、`mei@example`）、PR 編號（`pr#121` …）和 commit id 均為**虛構**，風格仿照規格中的範例。
+- 雜湊值、簽名和 commit id 為縮短的佔位符（`sha256:9a1c...e2`、`MEUCIQ...`），與規格範例的寫法一致。
 - 以節錄方式（「僅列出 section」）展示的 lock，其 frontmatter 完全依照 §2A.1；api lock 另外帶有 `scope:`（§2A.3）。
 - lock 未使用的 section 以 `(none)` 表示（§2A.2）。
 
@@ -41,10 +41,10 @@
 
 ## 通用規則（適用於每一頁）
 
-- 執行階段永不解譯自然語言；只執行通過部署驗證、經已簽名的 manifest 交付的 lock（§2.1、§9）。
+- 執行階段永不解譯自然語言；只執行已核准並已簽名的 lock（經已簽名的 manifest）（§2.1、§9）。
 - 每個 endpoint 預設都經過 `auth`；移除 `auth`（`-auth`）必須同時 `public: true`（§3、§4）。
 - 任何 lock 都不得有 `DELETE` 或 `TRUNCATE` SQL，`kind: migration` 以外的 lock 不得有 DDL；每個 `UPDATE` 都要有 `WHERE` 加 `scope: pk | rls`（§2A.4、§2B、Decisions 27、51）。
 - SQL 一律參數化（`$1`、`$2` 加 `params`），且只有單一 statement（§2A.2、§2A.4）。
-- lock 不記錄核准（v1.8，Decisions 77–80）。`security-items` 僅作資訊性標示；人手審核經 Git 平台的 pull request 進行（rulesets、CODEOWNERS；見 [pr-review-guide.md](../../pr-review-guide.md)）（§2A.5、§9C）。
+- 自然語言 lock 以及觸及任何安全項目的 lock 都需要人手核准；高風險項目需要兩位非作者的 owner／maintainer；每個 PR 所有 lock 合計最多 5 個安全項目（§2A.5、Decisions 19、33、34）。
 - 租戶內的列層擁有權使用 `owner-key`（Decision 70、§12.6a）；RLS 本身只隔離租戶。
 - Secret（DB 連線、JWT 金鑰、LLM 金鑰）只以引用出現，絕不出現在 source、lock、manifest 或 log（§2A.8.5、§9B）。審計永不記錄明文電郵（Decision 68）。

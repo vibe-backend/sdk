@@ -101,6 +101,9 @@ pub fn validate_loaded(
     check_targets(&docs, &mut report);
     check_migrations(&docs, &mut report);
     check_feature_method_writes(&docs, &mut report);
+    check_method_inherited_writes(&docs, &mut report);
+    let env_roles_claim = std::env::var("VIBE_JWT_ROLES_CLAIM").ok();
+    check_claims_vs_roles_claims(&docs, env_roles_claim.as_deref(), &mut report);
     check_security_items_enriched(&docs, &source_by_id, opts, &mut report);
     if opts.deploy && !report.has_errors() {
         check_recompile(opts.root, sources, &docs, &mut report);
@@ -633,11 +636,33 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
     if let Some(steps) = find_section(&doc.sections, "Steps") {
         for block in &steps.blocks {
             let sql = block_val(block, "sql");
-            if crate::security::sql_writes(sql.trim_matches('`'))
-                && block_val(block, "writes") != "true"
-            {
-                report.push(
+            let sql_writes = crate::security::sql_writes(sql.trim_matches('`'));
+            match crate::manifest::parse_writes(&block.bullets) {
+                Err(err) => report.push(
+                    Diag::error(file, err)
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                ),
+                // `op: method` steps may inherit writes from the callee; that
+                // is checked once all locks are loaded (check_method_inherited_writes).
+                Ok(Some(true)) if !sql_writes && block_val(block, "op") != "method" => report.push(
+                    Diag::error(
+                        file,
+                        "step is marked `writes: true` but its SQL does not write",
+                    )
+                    .at_step(&block.heading)
+                    .at_section("Steps"),
+                ),
+                Ok(marked) if sql_writes && marked != Some(true) => report.push(
                     Diag::error(file, "step SQL writes but is not marked `writes: true`")
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                ),
+                _ => {}
+            }
+            if let Err(err) = crate::manifest::parse_status(&block.bullets) {
+                report.push(
+                    Diag::error(file, err)
                         .at_step(&block.heading)
                         .at_section("Steps"),
                 );
@@ -658,13 +683,22 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
     let caps = find_section(&doc.sections, "Signature")
         .and_then(|section| section.get("capabilities"))
         .unwrap_or("");
-    let writes = find_section(&doc.sections, "Signature").and_then(|section| section.get("writes"))
-        == Some("true");
+    let writes = match find_section(&doc.sections, "Signature") {
+        Some(sig) => match crate::manifest::parse_writes(&sig.bullets) {
+            Ok(w) => w.unwrap_or(false),
+            Err(err) => {
+                report.push(Diag::error(file, err).at_section("Signature"));
+                return;
+            }
+        },
+        None => false,
+    };
     let Some(steps) = find_section(&doc.sections, "Steps") else {
         report.push(Diag::error(file, "method is missing steps").at_section("Steps"));
         return;
     };
     let mut saw_write = false;
+    let calls_method = steps.blocks.iter().any(|b| block_val(b, "op") == "method");
     for block in &steps.blocks {
         let op = block_val(block, "op");
         if !matches!(
@@ -689,7 +723,11 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
         // #77 ops (query, verify-password, hash-password, random-token,
         // hash-token, sign-jwt) keep their own checks below.
         if matches!(op.as_str(), "method" | "validate" | "respond") {
-            for problem in api_step_problems(block, &op) {
+            // Inside a method, `op: method` may mark an inherited write.
+            for problem in api_step_problems(block, &op)
+                .into_iter()
+                .filter(|p| !(op == "method" && p.starts_with("unknown key `writes`")))
+            {
                 report.push(
                     Diag::error(file, problem)
                         .at_step(&block.heading)
@@ -716,6 +754,53 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                     Diag::error(file, "sign-jwt key must be a key-ref").at_step(&block.heading),
                 );
             }
+            if !block_val(block, "roles").is_empty() {
+                report.push(
+                    Diag::error(
+                        file,
+                        "sign-jwt roles come from users.roles (read by the platform); remove `roles`",
+                    )
+                    .at_step(&block.heading),
+                );
+            }
+            if !matches!(block_val(block, "issue-refresh").as_str(), "" | "none") {
+                report.push(
+                    Diag::error(
+                        file,
+                        "sign-jwt issue-refresh is not supported by this runtime yet",
+                    )
+                    .at_step(&block.heading),
+                );
+            }
+            let declared = crate::lock::parse_string_list(&block_val(block, "custom-claims"))
+                .unwrap_or_default();
+            if let Ok(pairs) = crate::lock::parse_inline_map(&block_val(block, "claims")) {
+                let rows: Vec<String> = steps
+                    .blocks
+                    .iter()
+                    .take_while(|b| b.heading != block.heading)
+                    .filter(|b| block_val(b, "op") == "query")
+                    .map(|b| block_val(b, "out"))
+                    .filter(|o| !o.is_empty())
+                    .collect();
+                match pairs.iter().find(|(name, _)| name == "sub") {
+                    Some((_, expr)) => {
+                        if let Some(problem) = crate::runtime::sub_source_problem(expr, &rows) {
+                            report.push(Diag::error(file, problem).at_step(&block.heading));
+                        }
+                    }
+                    None => report.push(
+                        Diag::error(file, "sign-jwt needs a sub claim").at_step(&block.heading),
+                    ),
+                }
+                for (name, _) in pairs.iter().filter(|(name, _)| name != "sub") {
+                    if let Some(problem) =
+                        crate::runtime::custom_claim_problem(name, &declared, &["roles"])
+                    {
+                        report.push(Diag::error(file, problem).at_step(&block.heading));
+                    }
+                }
+            }
             if let Some(ms) = crate::llm::parse_duration_ms(&block_val(block, "ttl")) {
                 if ms > 3_600_000 {
                     report.push(
@@ -725,12 +810,32 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                 }
             }
         }
-        if block_val(block, "writes") == "true" {
-            saw_write = true;
-        }
         if op == "query" {
             let sql = block_val(block, "sql").trim_matches('`').to_string();
-            saw_write |= crate::security::sql_writes(&sql);
+            // Structural checks from the parse tree (sqlguard).
+            match crate::sqlguard::analyze(&sql) {
+                Ok(info) => {
+                    saw_write |= info.writes;
+                    if info.writes && block_val(block, "writes") != "true" {
+                        report.push(
+                            Diag::error(file, "a query step that writes needs writes: true")
+                                .at_step(&block.heading)
+                                .at_section("Steps"),
+                        );
+                    }
+                    if info.targets_rows && block_val(block, "scope").is_empty() {
+                        report.push(
+                            Diag::error(file, "UPDATE/DELETE needs scope: pk or scope: rls")
+                                .at_step(&block.heading),
+                        );
+                    }
+                }
+                Err(problem) => report.push(
+                    Diag::error(file, problem)
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                ),
+            }
             for problem in sql_problems(&sql, &block_val(block, "params"), false) {
                 report.push(
                     Diag::error(file, problem)
@@ -738,34 +843,90 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                         .at_section("Steps"),
                 );
             }
-            if crate::security::sql_writes(&sql) && block_val(block, "scope").is_empty() {
-                let cleaned = crate::security::strip_sql_noise(&sql).to_ascii_lowercase();
-                if cleaned.contains("update") {
-                    report.push(
-                        Diag::error(file, "UPDATE needs scope: pk or scope: rls")
-                            .at_step(&block.heading),
-                    );
-                }
-            }
         }
     }
     if !writes && saw_write {
         report
             .push(Diag::error(file, "writes: false but a step writes SQL").at_section("Signature"));
     }
-    if writes && !saw_write {
-        // Also count explicit writes: true steps without detectable SQL verbs.
-        let marked = steps
-            .blocks
-            .iter()
-            .any(|b| block_val(b, "writes") == "true");
-        if !marked {
+    // With `op: method` steps the write may be inherited from a callee;
+    // check_method_inherited_writes decides once all locks are loaded.
+    if writes && !saw_write && !calls_method {
+        report
+            .push(Diag::error(file, "writes: true but no step writes SQL").at_section("Signature"));
+    }
+}
+
+/// Writes propagate up through `op: method`: a method that calls a writing
+/// method writes too, so its Signature must say `writes: true`.
+fn check_method_inherited_writes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    let mut ids: Vec<&String> = docs.keys().collect();
+    ids.sort();
+    for id in ids {
+        let doc = &docs[id];
+        if doc.meta.kind != Kind::Method {
+            continue;
+        }
+        let Some(steps) = find_section(&doc.sections, "Steps") else {
+            continue;
+        };
+        if !steps.blocks.iter().any(|b| block_val(b, "op") == "method") {
+            continue;
+        }
+        let file = lock_rel(&doc.meta.source);
+        let Ok(declared) = find_section(&doc.sections, "Signature")
+            .map(|sig| crate::manifest::parse_writes(&sig.bullets))
+            .unwrap_or(Ok(None))
+        else {
+            continue; // reported by check_method
+        };
+        let declared = declared.unwrap_or(false);
+        let mut any_write = false;
+        let mut sql_write = false;
+        for block in &steps.blocks {
+            let sql = block_val(block, "sql");
+            if crate::security::sql_writes(sql.trim_matches('`')) {
+                any_write = true;
+                sql_write = true;
+            }
+            if block_val(block, "op") != "method" {
+                continue;
+            }
+            let callee = block_val(block, "target");
+            let inherited = !callee.is_empty() && security::known_method_writes(docs, &callee);
+            any_write |= inherited;
+            match crate::manifest::parse_writes(&block.bullets) {
+                Ok(Some(true)) if !inherited => report.push(
+                    Diag::error(
+                        &file,
+                        format!(
+                            "step is marked `writes: true` but method `{callee}` does not write"
+                        ),
+                    )
+                    .at_step(&block.heading)
+                    .at_section("Steps"),
+                ),
+                Ok(Some(false)) if inherited => report.push(
+                    Diag::error(
+                        &file,
+                        format!("step calls write method `{callee}` but is marked `writes: false`"),
+                    )
+                    .at_step(&block.heading)
+                    .at_section("Steps"),
+                ),
+                _ => {}
+            }
+        }
+        // SQL-only mismatches are already reported by check_method.
+        if !declared && any_write && !sql_write {
             report.push(
-                Diag::error(
-                    file,
-                    "writes: true but no step writes SQL or sets writes: true",
-                )
-                .at_section("Signature"),
+                Diag::error(&file, "writes: false but a called method writes")
+                    .at_section("Signature"),
+            );
+        }
+        if declared && !any_write {
+            report.push(
+                Diag::error(&file, "writes: true but no step writes SQL").at_section("Signature"),
             );
         }
     }
@@ -1059,6 +1220,75 @@ fn check_migration_sql(doc: &LockDoc, file: &str, report: &mut Report) {
             report.push(
                 Diag::error(file, "CREATE INDEX must be CONCURRENTLY").at_step(&block.heading),
             );
+        }
+    }
+}
+
+/// Every roles claim the runtime may read: `roles`, `VIBE_JWT_ROLES_CLAIM`
+/// and each route's `roles-claim`.
+pub fn configured_roles_claims(
+    docs: &HashMap<String, LockDoc>,
+    env_claim: Option<&str>,
+) -> Vec<String> {
+    let mut out = vec!["roles".to_string()];
+    out.extend(
+        env_claim
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string),
+    );
+    for doc in docs.values() {
+        if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
+            for block in &pipes.blocks {
+                let claim = block_val(block, "roles-claim");
+                if !claim.is_empty() {
+                    out.push(claim);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A `sign-jwt` custom claim may not share a name with any roles claim.
+fn check_claims_vs_roles_claims(
+    docs: &HashMap<String, LockDoc>,
+    env_claim: Option<&str>,
+    report: &mut Report,
+) {
+    let claims = configured_roles_claims(docs, env_claim);
+    let claims: Vec<&str> = claims.iter().map(String::as_str).collect();
+    for doc in docs.values().filter(|d| d.meta.kind == Kind::Method) {
+        let Some(steps) = find_section(&doc.sections, "Steps") else {
+            continue;
+        };
+        for block in steps
+            .blocks
+            .iter()
+            .filter(|b| block_val(b, "op") == "sign-jwt")
+        {
+            let declared = crate::lock::parse_string_list(&block_val(block, "custom-claims"))
+                .unwrap_or_default();
+            let Ok(pairs) = crate::lock::parse_inline_map(&block_val(block, "claims")) else {
+                continue;
+            };
+            for name in declared.iter().chain(pairs.iter().map(|(n, _)| n)) {
+                if name == "sub" {
+                    continue;
+                }
+                let all_declared = std::slice::from_ref(name);
+                if let Some(problem) =
+                    crate::runtime::custom_claim_problem(name, all_declared, &claims)
+                {
+                    if crate::runtime::custom_claim_problem(name, all_declared, &["roles"])
+                        .is_none()
+                    {
+                        report.push(Diag::error(&doc.meta.source, problem).at_step(&block.heading));
+                    }
+                }
+            }
         }
     }
 }
@@ -1366,6 +1596,18 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
         }
     }
     problems
+}
+
+/// SQL that writes somewhere other than a leading INSERT/UPDATE, such as
+/// `WITH x AS (INSERT ...)`: a write hidden inside a read. Rejected.
+pub fn writable_cte(sql: &str) -> bool {
+    crate::security::sql_writes(sql) && !plain_write(sql)
+}
+
+/// A statement that is itself an INSERT or UPDATE.
+pub fn plain_write(sql: &str) -> bool {
+    let lower = sql.trim().trim_matches('`').trim().to_ascii_lowercase();
+    lower.starts_with("insert") || lower.starts_with("update")
 }
 
 fn known_type(ty: &str) -> bool {
@@ -1741,6 +1983,235 @@ mod tests {
         assert!(msgs.iter().any(|m| m.contains("nope.get")), "{msgs:?}");
         assert!(msgs.iter().any(|m| m.contains("product.ghost")), "{msgs:?}");
         assert!(!msgs.iter().any(|m| m.contains("example.com")), "{msgs:?}");
+    }
+
+    const WRITER: &str = "## Signature\n- writes: true\n## Steps\n### s1 query\n- op: query\n- sql: `INSERT INTO product (name) VALUES ($1)`\n- params: [input.name]\n- writes: true\n";
+    const READER: &str = "## Signature\n- writes: false\n## Steps\n### s1 query\n- op: query\n- sql: `SELECT id FROM product WHERE id = $1`\n- params: [input.id]\n";
+
+    fn wrapper(sig: &str, target: &str, step_writes: Option<&str>) -> String {
+        let marker = step_writes
+            .map(|w| format!("- writes: {w}\n"))
+            .unwrap_or_default();
+        format!("## Signature\n- writes: {sig}\n## Steps\n### s1 method\n- op: method\n- target: {target}\n- out: r\n{marker}")
+    }
+
+    fn inherited_errors(methods: &[(&str, String)]) -> Vec<String> {
+        let mut docs = HashMap::new();
+        let mut report = Report::new();
+        for (name, body) in methods {
+            let id = format!("models/product/methods/{name}");
+            let d = doc(Kind::Method, None, &id, body);
+            check_method(&d, "x.lock.md", &mut report);
+            docs.insert(format!("product/methods/{name}"), d);
+        }
+        check_method_inherited_writes(&docs, &mut report);
+        report.errors().map(|d| d.message.clone()).collect()
+    }
+
+    #[test]
+    fn wrapper_inherits_writes_from_called_method() {
+        let ok = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("wrap", wrapper("true", "product.save", Some("true"))),
+        ]);
+        assert!(ok.is_empty(), "{ok:?}");
+        let unmarked_step = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("wrap", wrapper("true", "product.save", None)),
+        ]);
+        assert!(unmarked_step.is_empty(), "{unmarked_step:?}");
+    }
+
+    #[test]
+    fn wrapper_marked_writes_false_fails() {
+        let msgs = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("wrap", wrapper("false", "product.save", None)),
+        ]);
+        assert!(
+            msgs.iter()
+                .any(|m| m == "writes: false but a called method writes"),
+            "{msgs:?}"
+        );
+        let msgs = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("wrap", wrapper("true", "product.save", Some("false"))),
+        ]);
+        assert!(
+            msgs.iter().any(|m| m.contains("marked `writes: false`")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn wrapper_of_read_method_cannot_claim_writes() {
+        let msgs = inherited_errors(&[
+            ("get", READER.into()),
+            ("wrap", wrapper("true", "product.get", Some("true"))),
+        ]);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("`product.get` does not write")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m == "writes: true but no step writes SQL"),
+            "{msgs:?}"
+        );
+        let ok = inherited_errors(&[
+            ("get", READER.into()),
+            ("wrap", wrapper("false", "product.get", None)),
+        ]);
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn writes_inherit_through_multiple_levels() {
+        let ok = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("mid", wrapper("true", "product.save", None)),
+            ("top", wrapper("true", "product.mid", None)),
+        ]);
+        assert!(ok.is_empty(), "{ok:?}");
+        let msgs = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("mid", wrapper("true", "product.save", None)),
+            ("top", wrapper("false", "product.mid", None)),
+        ]);
+        assert_eq!(
+            msgs,
+            vec!["writes: false but a called method writes"],
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_writes_terminate_on_cycles() {
+        let msgs = inherited_errors(&[
+            ("a", wrapper("false", "product.b", None)),
+            ("b", wrapper("false", "product.a", None)),
+        ]);
+        assert!(!msgs.iter().any(|m| m.contains("writes")), "{msgs:?}");
+        let mut docs = HashMap::new();
+        for (name, body) in [
+            ("a", wrapper("false", "product.b", None)),
+            (
+                "b",
+                format!(
+                    "{}### s2 method\n- op: method\n- target: product.save\n- out: q\n",
+                    wrapper("false", "product.a", None)
+                ),
+            ),
+            ("save", WRITER.to_string()),
+        ] {
+            let id = format!("models/product/methods/{name}");
+            docs.insert(
+                format!("product/methods/{name}"),
+                doc(Kind::Method, None, &id, &body),
+            );
+        }
+        assert!(crate::security::method_doc_writes(&docs, "product.a"));
+        assert!(crate::security::known_method_writes(&docs, "product.b"));
+    }
+
+    #[test]
+    fn unknown_method_targets_fail_validation_and_count_as_writes() {
+        let mut docs = HashMap::new();
+        docs.insert(
+            "product/methods/wrap".to_string(),
+            doc(
+                Kind::Method,
+                None,
+                "models/product/methods/wrap",
+                &wrapper("false", "product.missing", None),
+            ),
+        );
+        docs.insert(
+            "product".to_string(),
+            doc(Kind::Model, None, "models/product", "## Fields\n"),
+        );
+        // Validation rejects the unknown target...
+        assert!(check_method_target("product.missing", &docs).is_err());
+        assert!(check_method_target("nothing.here", &docs).is_err());
+        // ...and risk grading never treats it as read-only.
+        for target in ["product.missing", "nothing.here", "no-dot", "product.wrap"] {
+            assert!(
+                crate::security::method_doc_writes(&docs, target),
+                "{target} must count as a write for risk"
+            );
+        }
+        // Read-only CRUD on an existing model is not a write; write CRUD is.
+        assert!(!crate::security::method_doc_writes(&docs, "product.get"));
+        assert!(!crate::security::method_doc_writes(&docs, "product.list"));
+        assert!(crate::security::method_doc_writes(&docs, "product.create"));
+        // Validation-side inheritance ignores unresolved targets (reported above).
+        assert!(!crate::security::known_method_writes(
+            &docs,
+            "product.missing"
+        ));
+    }
+
+    fn method_errors(body: &str) -> Vec<String> {
+        let d = doc(Kind::Method, None, "models/product/methods/x", body);
+        let mut report = Report::new();
+        check_method(&d, "x.lock.md", &mut report);
+        report.errors().map(|d| d.message.clone()).collect()
+    }
+
+    #[test]
+    fn writes_must_match_what_the_steps_do() {
+        let select = "### s1 query\n- op: query\n- sql: `select id from t where id = $1`\n- params: [input.id]\n";
+        let insert = "### s1 query\n- op: query\n- sql: `insert into t (a) values ($1)`\n- params: [input.a]\n";
+        // A read step marked as writing.
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: true\n## Steps\n{select}- writes: true\n"
+        ));
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("marked `writes: true` but its SQL does not write")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m == "writes: true but no step writes SQL"),
+            "{msgs:?}"
+        );
+        // A write step without the marker, and a Signature without writes.
+        let msgs = method_errors(&format!("## Signature\n- errors: []\n## Steps\n{insert}"));
+        assert!(
+            msgs.iter().any(|m| m.contains("not marked `writes: true`")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("writes: false but a step writes SQL")),
+            "{msgs:?}"
+        );
+        // Malformed or duplicate values.
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: yes\n## Steps\n{insert}- writes: true\n"
+        ));
+        assert!(
+            msgs.iter().any(|m| m.contains("invalid writes `yes`")),
+            "{msgs:?}"
+        );
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: true\n## Steps\n{insert}- writes: true\n- writes: false\n"
+        ));
+        assert!(
+            msgs.iter().any(|m| m.contains("duplicate `writes`")),
+            "{msgs:?}"
+        );
+        // Consistent locks pass.
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: true\n## Steps\n{insert}- writes: true\n- scope: pk\n"
+        ));
+        assert!(!msgs.iter().any(|m| m.contains("writes")), "{msgs:?}");
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: false\n## Steps\n{select}- writes: false\n"
+        ));
+        assert!(!msgs.iter().any(|m| m.contains("writes")), "{msgs:?}");
     }
 
     #[test]

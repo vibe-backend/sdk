@@ -17,16 +17,20 @@ jobs:
     name: Markdown lint & link check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: DavidAnson/markdownlint-cli2-action@v24
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
         with:
           globs: "**/*.md"
-      - uses: lycheeverse/lychee-action@v2
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
           args: --offline --no-progress --include-fragments './**/*.md'
           fail: true
       - name: Check zh-hant code blocks match English
         run: python3 scripts/check-zh-code-blocks.py
+      - name: Install script tests
+        run: python3 tests/install_manager.py
+      - name: Shellcheck install script
+        run: shellcheck scripts/vibe-install.sh
 
   rust:
     name: Rust fmt / clippy / test
@@ -41,23 +45,34 @@ jobs:
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     env:
+      # Postgres tests fail (not skip) in CI when this is missing.
       VIBE_TEST_PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Detect Cargo.toml
         id: detect
         run: echo "present=${{ hashFiles('Cargo.toml') != '' }}" >> "$GITHUB_OUTPUT"
       - if: steps.detect.outputs.present == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.89"
           components: rustfmt, clippy
       - if: steps.detect.outputs.present == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - if: steps.detect.outputs.present == 'true'
         run: cargo check --locked --all-targets --all-features
+      - if: steps.detect.outputs.present == 'true'
+        name: Dependency check (no rsa crate, no jsonwebtoken rust_crypto)
+        run: |
+          if cargo tree --locked --target all -i rsa >/dev/null 2>&1; then
+            echo "::error::rsa crate is in the dependency tree"; cargo tree --locked --target all -i rsa; exit 1
+          fi
+          if cargo tree --locked --target all -e features -i jsonwebtoken | grep -q 'jsonwebtoken feature "rust_crypto"'; then
+            echo "::error::jsonwebtoken rust_crypto backend is enabled"; exit 1
+          fi
+          echo "OK: rsa absent; jsonwebtoken backend is aws_lc_rs only"
       - if: steps.detect.outputs.present == 'true'
         run: cargo fmt --all -- --check
       - if: steps.detect.outputs.present == 'true'
@@ -66,3 +81,98 @@ jobs:
         run: cargo test --locked --all-features
       - if: steps.detect.outputs.present != 'true'
         run: echo "No Cargo.toml yet; skipping Rust checks."
+
+  postgres-tls:
+    name: Postgres TLS integration tests
+    runs-on: ubuntu-latest
+    env:
+      # Throwaway material generated in this job; not secrets.
+      PG_TLS_DIR: /tmp/pg-tls
+      VIBE_TEST_PG_TLS_URL: postgres://postgres:postgres@localhost:5433/postgres
+      VIBE_TEST_PG_TLS_CERTS: /tmp/pg-tls
+      VIBE_TEST_PG_TLS_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Generate per-run test CA and server certificate
+        run: |
+          scripts/ci/pg-tls-certs.sh "$PG_TLS_DIR"
+          # The postgres image runs as uid 999 and refuses a key readable by others.
+          sudo chown 999:999 "$PG_TLS_DIR/server.key"
+      - name: Start TLS-only Postgres
+        run: |
+          docker run -d --name pg-tls -p 5433:5432 \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 \
+            -v "$PG_TLS_DIR:/tls:ro" \
+            postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3 \
+            -c ssl=on \
+            -c ssl_cert_file=/tls/server.crt \
+            -c ssl_key_file=/tls/server.key \
+            -c hba_file=/tls/pg_hba.conf \
+            -c password_encryption=scram-sha-256
+          for _ in $(seq 1 30); do
+            if docker exec pg-tls pg_isready -U postgres -h localhost >/dev/null 2>&1; then
+              docker logs pg-tls 2>&1 | tail -n 5
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs pg-tls
+          exit 1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.89"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: cargo test --locked --all-features --test postgres_tls
+      - name: Postgres logs
+        if: failure()
+        run: docker logs pg-tls
+
+  release-targets:
+    name: Release build (${{ matrix.target }})
+    # Mirrors the build matrix in release.yml so native-dependency changes
+    # (aws-lc-sys: C compiler / CMake / NASM) are checked on every PR.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.89"
+          targets: ${{ matrix.target }}
+      - name: Install NASM (aws-lc-sys, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm --version=3.2.0 -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install aarch64 Linux linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Build
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+          ls -l target/${{ matrix.target }}/release/ | grep -E 'vibe(\.exe)?$'

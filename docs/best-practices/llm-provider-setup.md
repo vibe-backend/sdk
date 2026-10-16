@@ -154,7 +154,7 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 - Runtime must not have any `LLM_*` or `OPENAI_*` variable; deployment fails if it does (§2A.8.5).
 - **Sandbox**: the compiler's network egress is limited to the endpoint host; no tools, function calling or streaming; no secret other than `LLM_API_KEY` (§2A.7, §2A.8.6).
 - CI and production compiles require `https://` with a public host; loopback, private hosts or `LLM_ALLOW_PRIVATE_HOST=true` in CI are errors (§2A.8.4).
-- Changing provider, endpoint host or model is a **major** change: all locks recompile and the lock diff goes through PR review. Changing only the base URL path is not major, but the CI determinism check must still pass (§2A.8.7).
+- Changing provider, endpoint host or model is a **major** change: all locks recompile and natural/security-touching locks need re-approval. Changing only the base URL path is not major, but the CI determinism check must still pass (§2A.8.7).
 
 ## Spec gaps
 

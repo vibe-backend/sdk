@@ -214,6 +214,17 @@ async fn migrate_in_tx(
         exec.batch(&["RESET search_path".to_string()]).await?;
         log.push(format!("applied {}", migration.id));
     }
+    // #157: this tenant's challenge replay table (SELECT/INSERT for the
+    // runtime role; expired rows are removed here, as the owner).
+    exec.batch(&super::replay::PgReplayStore::migration_sql(
+        tenant,
+        runtime_role,
+    )?)
+    .await?;
+    log.push(format!(
+        "challenge replay table {schema}.{}",
+        super::replay::REPLAY_TABLE
+    ));
     log.extend(protect_schema(exec, &schema).await?);
     // Fail closed: any RLS problem in any tenant schema fails the migration,
     // whether this run introduced it or it was already there (for example
