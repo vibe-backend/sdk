@@ -12,7 +12,7 @@ added only when the corresponding PR is merged to `main`.
 - **Manifest path (#62):** `vibe manifest` without `-o` writes `./manifest.json` in the current working directory, not `<project>/manifest.json`.
 - **Rate limits (#54):** Rate-limit keys follow the spec: a limit keyed by `account` or `input.<field>` must be paired with an `ip` limit on the same route, `family` is rejected until token refresh lands (#26), and only `per-minute` limits are accepted (1–10000). Behind a proxy, the client IP comes from forwarded headers only when the peer is a trusted proxy. `key: account` now means per-email (`input.email`), not per-tenant.
 - **Request validation (#57), possibly breaking:** `vibe validate` rejects `## Request` fields whose type is not `string`, `integer`, `number`, `boolean` or `uuid`. At runtime, requests accepted before can now get 422: non-canonical uuids, query booleans other than `true`/`false`, empty required headers, non-object JSON bodies, and badly typed path params.
-- **Route roles:** `roles: []` on a route now denies every caller; previously an empty list meant no role requirement. Serialized manifests that contain `"roles": []` are denied the same way. A malformed `roles:` list in a lock (for example `roles: staff` without brackets) is now a build error.
+- **Route roles:** An empty `roles: []` list in a lock is a build error (`roles cannot be empty`); previously that form meant no role requirement. Callers who still want no role restriction should omit the `roles` field. A malformed `roles:` list (for example `roles: staff` without brackets) is also a build error.
 
 ### Changed
 
