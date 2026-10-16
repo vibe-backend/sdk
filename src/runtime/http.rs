@@ -1417,6 +1417,9 @@ pub fn detect_jwt_alg(pem: &str) -> Result<Algorithm, String> {
 pub(crate) fn ec_problem_message(what: &str, problem: super::eckey::EcProblem) -> String {
     use super::eckey::EcProblem;
     match problem {
+        EcProblem::Sec1 => {
+            "SEC1 EC PRIVATE KEY is not supported; use PKCS#8 PRIVATE KEY".to_string()
+        }
         EcProblem::InvalidPem => "invalid PEM encoding".to_string(),
         EcProblem::NotEc => format!("{what}: ES256 key is not a readable EC key"),
         EcProblem::OtherCurve => format!("{what}: ES256 key must use the P-256 curve"),

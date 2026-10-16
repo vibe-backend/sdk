@@ -73,6 +73,7 @@ fn bad_keys() -> Vec<(&'static str, Vec<u8>)> {
 #[test]
 fn valid_key_loads_from_pem_and_der() {
     ec_signing_key_from_pem(PRIVATE_PEM.as_bytes()).unwrap();
+    ec_signing_key_from_pem(PRIVATE_PEM.replace('\n', "\\n").as_bytes()).unwrap();
     ec_signing_key_from_der(&der()).unwrap();
     ec_signing_key_from_pem(to_pem(&der()).as_bytes()).unwrap();
 }
@@ -151,8 +152,22 @@ fn sec1_is_rejected_and_pkcs8_of_the_same_key_loads() {
         "SEC1 EC PRIVATE KEY is not supported; use PKCS#8 PRIVATE KEY"
     );
     ec_signing_key_from_der(&pkcs8).unwrap();
-    // DER is PKCS#8 only; raw SEC1 DER is refused.
-    assert!(ec_signing_key_from_der(&sec1).is_err());
+    let expected = "SEC1 EC PRIVATE KEY is not supported; use PKCS#8 PRIVATE KEY";
+    // Single-line environment values are normalized before checking the label.
+    assert_eq!(
+        ec_signing_key_from_pem(pem.replace('\n', "\\n").as_bytes())
+            .err()
+            .unwrap(),
+        expected
+    );
+    // A PKCS#8 label cannot make a bare SEC1 structure acceptable.
+    assert_eq!(
+        ec_signing_key_from_pem(to_pem(&sec1).as_bytes())
+            .err()
+            .unwrap(),
+        expected
+    );
+    assert_eq!(ec_signing_key_from_der(&sec1).err().unwrap(), expected);
 }
 
 #[test]

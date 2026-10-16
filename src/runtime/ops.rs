@@ -443,12 +443,6 @@ pub async fn sign_jwt(
 // jsonwebtoken (aws_lc_rs).
 pub fn ec_signing_key_from_pem(pem: &[u8]) -> Result<jsonwebtoken::EncodingKey, String> {
     let text = std::str::from_utf8(pem).map_err(|_| "invalid PEM encoding".to_string())?;
-    if text
-        .lines()
-        .any(|line| line.trim() == "-----BEGIN EC PRIVATE KEY-----")
-    {
-        return Err("SEC1 EC PRIVATE KEY is not supported; use PKCS#8 PRIVATE KEY".to_string());
-    }
     let der = super::eckey::p256_private(text)
         .map_err(|p| super::http::ec_problem_message("private key", p))?;
     let key = jsonwebtoken::EncodingKey::from_ec_der(&der);
