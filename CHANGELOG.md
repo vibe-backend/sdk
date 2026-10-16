@@ -19,6 +19,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Fixed
 
+- **EC signing keys checked at load (#257):** ES256 private keys (PEM and DER) are now checked when they are loaded. A key with trailing data or a private scalar outside the valid range is refused at startup instead of failing at the first signature.
 - **Postgres TLS (#174):** `TlsMode::Require` (`sslmode=require`) previously did not enable TLS for database connections. It now requires TLS and fails to connect if the server does not offer it. `sslrootcert` is honored, and an unreadable or empty `sslrootcert` file is reported as an error.
 
 ### Breaking

@@ -436,6 +436,37 @@ pub async fn sign_jwt(
     }))
 }
 
+/// Loads an ES256 private key from PEM (PKCS#8) and rejects it at load time
+/// if it cannot sign (trailing data, private scalar out of range, ...).
+pub fn ec_signing_key_from_pem(pem: &[u8]) -> Result<jsonwebtoken::EncodingKey, String> {
+    let key = jsonwebtoken::EncodingKey::from_ec_pem(pem).map_err(|err| err.to_string())?;
+    check_signing_key(&key, jsonwebtoken::Algorithm::ES256)?;
+    Ok(key)
+}
+
+/// Loads an ES256 private key from DER (PKCS#8) and rejects it at load time
+/// if it cannot sign. The backend only parses DER keys lazily, so the key is
+/// checked here instead of at the first signature.
+pub fn ec_signing_key_from_der(der: &[u8]) -> Result<jsonwebtoken::EncodingKey, String> {
+    let key = jsonwebtoken::EncodingKey::from_ec_der(der);
+    check_signing_key(&key, jsonwebtoken::Algorithm::ES256)?;
+    Ok(key)
+}
+
+/// Signs a fixed test payload so an unusable key fails at load time.
+fn check_signing_key(
+    key: &jsonwebtoken::EncodingKey,
+    alg: jsonwebtoken::Algorithm,
+) -> Result<(), String> {
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(alg),
+        &serde_json::json!({ "check": true }),
+        key,
+    )
+    .map(|_| ())
+    .map_err(|err| format!("private key is not usable for {alg:?}: {err}"))
+}
+
 /// Startup: every `sign-jwt` key-ref must be loadable from the environment
 /// variable of the same name (a private PEM matching the step's alg).
 pub fn load_signing_keys(
@@ -461,11 +492,12 @@ pub fn load_signing_keys(
             let (alg, key) = match opt(step, "alg") {
                 "ES256" => (
                     jsonwebtoken::Algorithm::ES256,
-                    jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()),
+                    ec_signing_key_from_pem(pem.as_bytes()),
                 ),
                 "RS256" => (
                     jsonwebtoken::Algorithm::RS256,
-                    jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()),
+                    jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())
+                        .map_err(|err| err.to_string()),
                 ),
                 other => return Err(format!("{}: unsupported alg {other}", method.target)),
             };
