@@ -1,5 +1,6 @@
 # cargo-deny policy (#192). Run locally with `cargo deny check`.
-# CI runs it on every pull request (see .github/workflows/ci.yml).
+# CI runs it on every pull request, push to main, daily schedule, and workflow_dispatch
+# (see .github/workflows/cargo-deny.yml).
 
 [graph]
 all-features = true
