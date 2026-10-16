@@ -5,7 +5,13 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+### Upcoming (advance notice)
+
+- **Challenge `bind: none` (#245, decision 140):** In v1, `bind: none` on a challenge route is allowed but `vibe validate` warns. Starting with the next minor release, new public INSERT routes may not use `bind: none` and must bind to the request digest (`bind: request`).
+
 ### Added
+
+- **Spec: challenge request digest (#156, decision 140):** Spec v1.8 section 7.2b defines binding each Turnstile token to a request digest carried in `cdata` (SHA-256 over method, normalized path, normalized query, `Content-Type`, `If-Match` and the raw body hash; server recomputes and compares, failing closed with 403 `CHALLENGE_FAILED`). Confirmed by the PM on 2026-10-16 (full-length digest, login routes included, client IP not covered; per-request `X-Vibe-Request-Nonce` from a CSPRNG so the provider only sees an unreversible digest; raw `+` in the query is invalid; nonces are unique per tenant, one record per request; a nonce record over the D137 cap gives 403 `CHALLENGE_FAILED`, over a D134 capacity cap gives 429 `CHALLENGE_RATE_LIMITED` with `Retry-After` exactly as D134, and every verification failure including nonce reuse gives 403; fixed check order: format, reuse, D137, D134; `Retry-After` uses the tenant's own oldest record, or its oldest record in that prefix, at most 360 s, 60 s fallback; residual risks tracked in #255 and #256); not yet implemented. Adds `scripts/request-digest-vectors.mjs` with test vectors.
 
 - **Dependency / advisory CI (#192):** `cargo deny check` (advisories, licenses, bans, sources) runs on pull requests, pushes to main, a daily schedule, and `workflow_dispatch` via `.github/workflows/cargo-deny.yml` (Refs #196).
 
@@ -40,6 +46,7 @@ added only when the corresponding PR is merged to `main`.
 ### Security
 
 - **Browser refresh cookie (#78, spec decisions 141–148):** The spec adds to decisions 6, 45, 60, 61, 65, 72 and 101 for the httpOnly `__Host-` refresh cookie: login in cookie mode sets the refresh token only in `Set-Cookie`; `Max-Age` is the lesser of the remaining family and idle lifetimes; method, `Origin` and `X-Vibe-CSRF` checks run before the cookie is read (403 `CSRF_REJECTED`, cookie kept); cookie-mode logout with `scope: family` needs no access token: it must pass the refresh route's Origin allowlist and `X-Vibe-CSRF` (also in same-site mode), otherwise 403 `CSRF_REJECTED`; the token is read only from the `__Host-` cookie; it then always returns 204 and clears the cookie, revoking only that cookie's family in the slug's tenant, with D72 rate limits and minimum response time; fixed error codes (`INVALID_REFRESH_TOKEN` for both transports); cookie transport is opt-in per endpoint version. Spec only; refresh tokens and cookie transport are not yet implemented on main (see spec 4A.1b).
+- **Cookie logout wording (#253, follow-up to #247):** Spec decision 147 and the 4A.1b error table now state that 401 `INVALID_REFRESH_TOKEN` with cookie clearing applies to refresh only; cookie logout returns 204 and clears the cookie (decision 145). Cookie logout required test 3 is split into (a) no cookie with only a body token and (b) a valid cookie plus a different body token, where only the cookie's family is revoked. Decision 145 (5), approved by PM on 2026-10-16: cookie logout applies only the D72 IP limit (30/min, counted as for refresh) and not the D72 family limit, an exception that applies only to cookie logout (refresh keeps the family limit); the 300 ms minimum response time is unchanged, and valid, invalid and missing cookies get identical 429s and response times. A new required test covers this. Spec only.
 - **JWT signing algorithm policy (#198, spec decision 139):** The spec now fixes the `sign-jwt` and JWT verification policy: only ES256 (default) and RS256; RS256 keys must be at least 2048 bits and a shorter key makes startup/deploy fail closed; verification accepts only the one configured alg and rejects any other `alg` header, including `none`, HS* and the other of ES256/RS256; EdDSA is deferred to vNext. Spec only; parts are not yet implemented (see spec 4.1a).
 - **Lock and manifest signatures (#167):** Lock and manifest signature verification now uses `verify_strict`; weak keys and non-canonical signatures are rejected (#151).
 
