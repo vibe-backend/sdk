@@ -304,6 +304,11 @@ fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
     let always = vibe::runtime::challenge::always_challenge_locks(project);
     let configured = vibe::runtime::challenge::configured_in_env()?;
     vibe::runtime::challenge::production_gate(run_env, configured, &always)?;
+    // #159: same widget action check as `vibe serve`, before deploying.
+    if deploy {
+        let ids = vibe::runtime::challenge::challenge_feature_ids(project);
+        vibe::runtime::challenge::action_collisions(ids.iter().map(String::as_str))?;
+    }
     // #199: challenges that are declared but never verified at runtime.
     let unverified = vibe::runtime::challenge::unverified_challenge_locks(project);
     vibe::runtime::challenge::unverified_gate(run_env, &unverified)?;
@@ -474,6 +479,14 @@ async fn cmd_serve(
         .map(|r| r.feature_id.clone())
         .collect();
     vibe::runtime::challenge::production_gate(run_env, challenge.is_some(), &always)?;
+    // #159: no two challenge routes may expect the same widget action.
+    vibe::runtime::challenge::action_collisions(
+        manifest
+            .routes
+            .iter()
+            .filter(|r| r.challenge_type != "none" && !r.challenge_type.is_empty())
+            .map(|r| r.feature_id.as_str()),
+    )?;
     // #199: refuse challenges that are declared but never verified.
     let unverified: Vec<String> = manifest
         .routes

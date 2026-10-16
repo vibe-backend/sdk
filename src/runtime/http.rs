@@ -1937,7 +1937,7 @@ mod rate_tests {
         }
         async fn verify(&self, token: &str, ctx: &ChallengeContext) -> Result<(), ChallengeError> {
             assert_eq!(token, "tok");
-            assert_eq!(ctx.action, "register");
+            assert_eq!(ctx.action, "shop_v1_register");
             self.0.clone()
         }
     }
