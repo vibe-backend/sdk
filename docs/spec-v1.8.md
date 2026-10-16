@@ -31,6 +31,7 @@
 - 補 v1.7 reviewer 提出嘅缺口：11.4 create-user lock 補返 `user.invite` step；新增 `user.register`、`user.invite` 編譯 lock 範例；11.3／11.4 rate-limit 補 `key`；admin `EMAIL_TAKEN` 處理；create-user 改為可以重試（idempotent）並新增 re-invite endpoint（決定 84–88）。
 
 - Challenge provider（issue #160，已確認（產品經理 2026-10-16））：決定 131–138，v1 用 Cloudflare Turnstile（server 端 siteverify、production 共用 Postgres replay store（#177）、`type: pow` build error、fail closed、錯誤碼、secret 處理、同限流組合、固定數值、已認證 endpoint opt-in、provider 抽象），見 0.12、7.2a。
+- Challenge 綁定 request digest（決定 140，issue #156）：方向已確認（產品經理 2026-10-16），token 經 Turnstile `cdata` 綁定 request digest，session 綁定留到 vNext；詳細 spec 待產品經理 review；未實作（見 0.12、7.2b）。
 
 ### v1.7（定稿）
 
@@ -249,6 +250,7 @@
 | 136 | Secret 處理：`VIBE_TURNSTILE_SECRET` 只可以由環境變數或者 secret manager（例如 CI environment secret）注入；唔准寫入 source、lock、manifest、`.env` commit 或者 log；錯誤訊息同 debug 輸出只顯示「已設定／未設定」。驗證器見到 lock 或者 source 有疑似 secret 值即報 error。設定：`VIBE_CHALLENGE_PROVIDER`（預設 `turnstile`）、`VIBE_TURNSTILE_SECRET`、`VIBE_CHALLENGE_HOSTNAMES`（有 secret 就一定要有）、`VIBE_CHALLENGE_REPLAY_STORE`（production 一定 `postgres`，#177）；預設同 production 規則見 7.2a。 | 已確認（產品經理 2026-10-16） | 7.2a、2A.8.5 |
 | 137 | 同限流組合：route 限流（決定 25、39）同 public 寫入每日配額喺 challenge 之前檢查，超過回 **429**（同 challenge 嘅 503 分開），被限流嘅 request 唔會去到 replay store 或者 provider；challenge 唔取代限流同配額。v1 用固定平台數值：token 壽命 300s、每 client IP 最多 16、每租戶最多 1,000 個未驗證預留（超過回 403 `CHALLENGE_FAILED`，唔 call provider）；**冇租戶 override**。將來如果加 override，只可以調低，唔可以調高。 | 已確認（產品經理 2026-10-16） | 7.2a、4.3 |
 | 138 | Provider 抽象：runtime 經 `ChallengeVerifier` trait 驗證（輸入 token、client IP、預期 action；輸出 通過／失敗／不可用 三種，provider 細節唔外露；「失敗」對應 403，「不可用」對應 503）。之後加 hCaptcha 等 provider 只係新 implementation 同 `VIBE_CHALLENGE_PROVIDER` 新值，lock 語法、replay store 同錯誤碼唔變；未實作嘅值（例如 `hcaptcha`）啟動時拒絕。 | 已確認（產品經理 2026-10-16） | 7.2a |
+| 140 | Challenge token 綁定 request digest（issue #156）：`type: captcha` 嘅 token 經 Turnstile `cdata` 綁定 request digest（`rd1.` + base64url 冇 padding 嘅 SHA-256，涵蓋 method、正規化 path（包括 tenant slug）、正規化 query、`Content-Type`、`If-Match` 同 raw body 嘅 SHA-256）；server 喺 JSON 解析之前重新計算，同 siteverify `cdata` constant-time 比較，唔一致或者冇即 403 `CHALLENGE_FAILED`（唔講邊部分唔一致），fail closed。Session 綁定留到 vNext。方向已確認；詳細 spec（canonicalization、上限、proxy、推出、測試向量）待產品經理 review，見 7.2b。實作狀態：未實作。 | 方向已確認（產品經理 2026-10-16）；詳細 spec 待產品經理 review | 7.2b |
 
 ## 1. 目錄同命名
 
@@ -1416,6 +1418,165 @@ Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動�
 | 131 `type: pow` build error | **Implementation status: not yet implemented** | `src/validate.rs` 冇呢個檢查；而家係 runtime 回 503。follow-up issue #203。 |
 | 134 503 範圍 | **Implementation status: not yet implemented**（部分） | Production 冇 verifier 嘅 `when: always` public route 已經喺啟動擋；但 runtime 對「冇 verifier」同 `type: pow` 仍然回 503（應該喺 build／啟動擋）。Replay store 容量滿而家回 503，決定 134（已確認（產品經理 2026-10-16））要求 429 加 `Retry-After`、metric 同告警；每個網段持有上限（IPv4 /24、IPv6 /48，預設 16，429 reason `replay_prefix_cap`）、metric `vibe_challenge_rejected_total{reason}`、告警 `challenge_replay_store_high_usage`（超過 80%）同 `challenge_replay_store_full`（滿）亦未做；所有呢類 429 一律 `CHALLENGE_RATE_LIMITED`、回應除 `Retry-After` 外一致、唔包含 reason，亦未做：not yet implemented，follow-up issue #204。 |
 | 136 Turnstile secret 掃描 | **Implementation status: not yet implemented** | `src/secret.rs` 只比對已設定嘅 LLM key 同 `sk-`／`AKIA` 格式；冇比對 `VIBE_TURNSTILE_SECRET` 嘅值，亦冇 Turnstile secret 格式規則，所以而家捉唔到。follow-up issue #205。 |
+
+### 7.2b Challenge 綁定 request digest（決定 140，issue #156）
+
+> **狀態**：方向（token 綁 request digest；session 綁定留到 vNext）已確認（產品經理 2026-10-16）。本節嘅**詳細 spec 待產品經理 review**（pending PM review）。
+>
+> **Implementation status: not yet implemented**：`main` 而家未有 request digest 計算同 `cdata` 比對，code 未實作；實作跟 #156。
+
+#### 目的
+
+決定 132 驗證 token 嘅 `hostname`、`action`、時間同單次使用；本節再要求每個 token 綁定佢為咗嘅嗰一個 request。Client 喺 render Turnstile widget 之前計好 request digest，經 widget `data-cdata`（Turnstile `cdata`）傳入；server 由收到嘅 request 獨立重新計算，同 siteverify 回應嘅 `cdata` 比較，唔一致即拒絕。Digest 唔經任何 client header 傳送：server 只信自己重新計算嘅值同 siteverify 回應。
+
+#### Lock 語法
+
+```markdown
+- challenge: { type: captcha, when: always, bind: request }
+```
+
+`bind` 准用值：`request`（本節）、`none`（決定 132 現行行為）。新 lock 預設 `request`；過渡期安排見下面「推出」。
+
+#### 涵蓋範圍
+
+Canonical string 由以下 7 行組成，順序固定，每行之間用一個 LF（`0x0A`）分隔，最後一行之後**冇** LF：
+
+| 行 | 內容 |
+| --- | --- |
+| 1 | 固定版本標記 `vibe-request-digest-v1` |
+| 2 | HTTP method，大寫 ASCII（例如 `POST`） |
+| 3 | 正規化 path（見下面規則；包括 tenant slug，所以 digest 已經綁定租戶） |
+| 4 | 正規化 query；冇 query 就係空行 |
+| 5 | `content-type:` 加正規化 `Content-Type` 值；冇呢個 header 就只有 `content-type:` |
+| 6 | `if-match:` 加正規化 `If-Match` 值；冇呢個 header 就只有 `if-match:` |
+| 7 | Body 嘅 SHA-256，64 個小寫 hex 字元 |
+
+唔涵蓋：`Host`（由決定 132 `hostname` 檢查）、`x-challenge-proof` 本身、其他 header（包括 cookie、`Authorization`、`Idempotency-Key`）、client IP（流動網絡會轉 IP）、URL fragment。
+
+#### Canonicalization 規則
+
+- **Byte 編碼**：canonical string 一律 ASCII（正規化之後所有非 ASCII byte 都係 percent-encoded），以 UTF-8 bytes 做 hash 輸入。
+- **Method**：轉大寫 ASCII。
+- **Path**：用 request target 嘅 path 部分（`?` 之前），唔包括 scheme、host、fragment。以 `/` 分段，每段：先將 `%XX` decode 做 byte（`%` 後面唔係兩個 hex 字元即無效），再將 unreserved 字元（`A–Z a–z 0–9 - . _ ~`）以原字元輸出，其他每個 byte 一律輸出成大寫 `%XX`。Raw 非 ASCII byte、控制字元、空格即無效。Decode 之後係 `.` 或者 `..` 嘅段即無效（唔做 dot-segment 解析）。`%2F` 保持 `%2F`，唔會變成分段。空段同結尾 `/` 照樣保留（`/a//b/` 同 `/a/b` 係唔同 path）。
+- **Query**：`?` 之後全部（唔包括 fragment）。以 `&` 分割，丟棄空項；每項以第一個 `=` 分做 name 同 value，冇 `=` 就當 value 係空字串（輸出 `name=`）。Name 同 value 各自用同 path 段一樣嘅 percent 正規化；`+` 唔當空格，正規化之後輸出成 `%2B`。然後按 name、再按 value 以 byte 次序（升序）排序，重複 name 全部保留，用 `&` 接返。
+- **Header 名**：大小寫唔分（按 RFC 9110），canonical string 入面一律寫小寫。同一個 header 出現多過一次即無效。
+- **Header 值**：去頭尾空格同 tab，中間連續空格／tab 變一個空格。`Content-Type` 值再轉小寫 ASCII；`If-Match` 值保持大小寫（ETag 大小寫有意義）。
+- **Body**：hash 輸入係 server 收到嘅 raw body bytes（transfer coding 已解開之後），喺 JSON 解析**之前**計；唔做 JSON 正規化，client 一定要原封不動送出計 digest 嗰份 bytes。冇 body 或者 body 長度 0（包括 GET、DELETE）用空字串嘅 SHA-256：`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`。綁定 route 唔接受 `Content-Encoding`（有就無效），避免壓縮前後 bytes 唔同。
+
+#### Hash、編碼同傳送
+
+- 算法：`digest = "rd1." + base64url(SHA-256(UTF-8(canonical string)))`，base64url 用 RFC 4648 §5 字母表、**冇** padding；即係 `rd1.` 加 43 個字元，共 47 字元，喺 Turnstile `cdata` 255 字元上限之內。唔截短（修訂 #156 提案嘅 32 字元截短）。
+- `rd1.` 前綴標示版本；之後改算法會用新前綴，server 只接受 lock 設定嘅版本，唔會自動降級。
+- 傳送：client 將 digest 設做 widget 嘅 `data-cdata`（或者 `turnstile.render` 嘅 `cdata` 參數）；server 由 siteverify 回應嘅 `cdata` 欄位攞返。Docs 會提供用 `crypto.subtle.digest('SHA-256', …)` 嘅 JS helper；參考實作同測試向量見 [`scripts/request-digest-vectors.mjs`](../scripts/request-digest-vectors.mjs)。
+- 因為 widget 要喺 request 準備好之後先 render，client 一定要喺用戶填好表格之後先計 digest 同 render（或者 `turnstile.reset` 再用新 `cdata` render）；送出前改過 body 就一定要攞新 token。
+
+#### Server 驗證次序
+
+接 7.2a「處理次序」，`bind: request` 嘅 route 改成：
+
+1. 限流同配額（決定 137）→ 429 `RATE_LIMITED`。
+2. Request 大小上限（見下面）→ 超過即 413（同未綁定 route 一樣）。
+3. 冇 `x-challenge-proof` → 400 `CHALLENGE_REQUIRED`。
+4. 由收到嘅 request 計 digest（JSON 解析之前、未 call provider 之前）。任何 canonicalization 無效（壞 percent-encoding、dot segment、重複 header、有 `Content-Encoding` 等）→ 403 `CHALLENGE_FAILED`，唔 call provider。
+5. Token 格式、replay store 預留同上限（7.2a 步驟 3，錯誤碼不變）。
+6. Siteverify（決定 132，所有現有檢查不變）。
+7. 比較 siteverify `cdata` 同第 4 步嘅 digest：用 constant-time 比較；`cdata` 冇、空、長度唔啱或者唔相等 → 403 `CHALLENGE_FAILED`。Token 照樣記為已用（單次使用，唔會因為 digest 唔啱而釋放）。
+8. 全部通過先做 JSON 解析同執行 lock steps；之後嘅處理只用第 4 步 hash 過嗰份 body bytes，唔會再讀第二次。
+
+#### 錯誤碼同 HTTP 狀態
+
+唔加新錯誤碼。Digest 相關失敗（第 4 步同第 7 步）一律 403 `CHALLENGE_FAILED`，回應同其他 token 無效情況完全一樣（決定 135）：body、header、error detail 都唔講係邊一部分（method、path、query、header、body）唔一致，亦唔回傳 server 計出嘅 digest。內部 reason（例如 `digest_mismatch`、`digest_missing`、`digest_invalid_request`）只入 metric `vibe_challenge_rejected_total{reason}` 同 server log；log 唔記錄 body、token 或者 secret，只記錄 digest 前 8 個字元方便排查。
+
+#### 大小上限
+
+| 項目 | 上限 | 超過 |
+| --- | --- | --- |
+| Body | 跟 route body 上限（預設 1MB，2.3），digest 涵蓋成個 body，冇另外截斷 | 413 |
+| Path（正規化前） | 2,048 bytes | 403 `CHALLENGE_FAILED` |
+| Query（正規化前） | 4,096 bytes，最多 64 項 | 403 `CHALLENGE_FAILED` |
+| 每個涵蓋 header 值 | 1,024 bytes | 403 `CHALLENGE_FAILED` |
+| `cdata` | 47 字元（`rd1.` + 43）；Turnstile 上限 255 | 403 `CHALLENGE_FAILED` |
+
+Server 以 streaming 方式計 body hash，同時套用 body 上限；未讀完 body 唔會 call provider。
+
+#### Proxy 同 rewrite
+
+- Digest 按 vibe runtime 收到嘅 request 計。Client 同 runtime 之間嘅 proxy、CDN 或者 gateway **唔可以**改 method、path、query、`Content-Type`、`If-Match` 或者 body，亦唔可以加 `Content-Encoding`；否則 digest 唔一致，request fail closed（403），唔會放行。
+- v1 唔支援 path prefix 剝除或者 rewrite（例如外面 `/api/v1/...`，入面 `/v1/...`）；冇設定可以話 runtime 用另一個 path 計 digest。部署要令外部 path 同 runtime 見到嘅 path 一致。
+- Proxy 只可以做 percent-encoding 層面嘅等價改寫（例如 `%7e` 變 `~`），因為正規化之後結果一樣；proxy 重新排序 query 參數亦唔影響結果。
+- 決定 132 嘅 client IP 照舊只喺 trusted proxy 先讀 forwarded header（#54）；digest 唔涵蓋任何 forwarded header。
+
+#### 推出
+
+- 新 lock 預設 `bind: request`。現有冇寫 `bind` 嘅 lock 當 `none`，維持一個 release，期間 `vibe validate` 出 warning；下一個 release 預設變 `request`。
+- `bind: none` 之後仍然准明確寫，但 `vibe validate` 出 warning（待產品經理確認係咪最終要禁止）。
+
+#### 測試向量
+
+用 [`scripts/request-digest-vectors.mjs`](../scripts/request-digest-vectors.mjs)（Node `crypto`）計，並用 Python `hashlib` 獨立核對 V1。Canonical string 入面嘅換行係 LF。
+
+##### V1：POST JSON（register）
+
+- Request：`POST /v1/t/acme-7f3k/register`，`Content-Type: application/json`，body（UTF-8）`{"email":"a@example.com","password":"correct horse battery staple"}`
+
+```text
+vibe-request-digest-v1
+POST
+/v1/t/acme-7f3k/register
+
+content-type:application/json
+if-match:
+55b5541b48ca3e041cb0eb9bd14e1cf2e61d8573de7751f018418285da65ecb9
+```
+
+- Digest：`rd1.WNOv_9om0-jdQLI-cLYmCk-ehr_js13pQK-lecRLDv8`
+
+##### V2：GET，query 排序、重複 name、percent 正規化、空 body
+
+- Request：`get /v1/t/acme-7f3k/products?sort=price&tag=b%20c&tag=a&q=caf%C3%A9&x=%7e`，冇 `Content-Type`，冇 body
+
+```text
+vibe-request-digest-v1
+GET
+/v1/t/acme-7f3k/products
+q=caf%C3%A9&sort=price&tag=a&tag=b%20c&x=~
+content-type:
+if-match:
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+```
+
+- Digest：`rd1.CONfLhXziWVWjnGTJuh6tPSjcBA1DvOv1f5rROlQ8XM`
+
+##### V3：PATCH，header 名大小寫、header 值空格、path percent 正規化、非 ASCII body
+
+- Request：`PATCH /v1/t/acme-7f3k/items/%61bc`，`CONTENT-TYPE: Application/Merge-Patch+JSON`，`If-Match`（值前面有兩個空格、後面有一個空格嘅 `"v42"`），body（UTF-8）`{"name":"新名"}`
+
+```text
+vibe-request-digest-v1
+PATCH
+/v1/t/acme-7f3k/items/abc
+
+content-type:application/merge-patch+json
+if-match:"v42"
+216e739739607d9cb0aa5a4f63cee52ec6fc705af18edbdad0b9fe81be38d4d0
+```
+
+- Digest：`rd1.EuWSfa-Ohm4klhZqnQX63v9dwEzmfnIh5e6qlj-Gz04`
+
+##### V4：同 V1 一樣，只係 body 最後一個字母唔同（`staplf`）
+
+- Body hash `cc8acf6f7885b7f43746d2abe600b1899c2edb4666181522c40e13463b19b150`，digest `rd1.lNsexO8TnroHasEfQ8NcVtE2efKK02hfwfayb5cGRiw`；同 V1 唔相等，所以 V1 嘅 token 用喺呢個 request 會回 403 `CHALLENGE_FAILED`。
+
+必要測試（實作時）：上面向量逐個相等；body、query、path、method、`Content-Type`、`If-Match` 任何一樣改咗即 403；`cdata` 冇或者空即 403；壞 percent-encoding、dot segment、重複 header、`Content-Encoding` 即 403 而且唔 call provider；所有 403 回應 byte 一致；digest 唔一致之後 token 唔可以再用。
+
+#### 剩餘風險
+
+- **同一個 request 喺 token 有效期內重送**：digest 只綁定 request 內容，唔綁定 session；防線係決定 132 嘅單次使用同 300s 壽命。Session 綁定留到 vNext。
+- **Digest 涵蓋唔到嘅部分**：其他 header、cookie 同 client IP 唔受保護；呢啲唔應該影響綁定 route 嘅業務結果。
+- **Client 端計算**：digest 證明 token 係為呢個 request 內容攞嘅，唔證明內容係真人輸入；challenge 本身嘅保證唔變。
+- **部署相容性**：會改 body 或者 path 嘅 proxy／CDN（壓縮、prefix rewrite）會令所有綁定 request 被拒（fail closed），要喺部署文件講明。
+- **Provider 依賴**：`cdata` 由 Turnstile 原樣回傳；如果 provider 改變 `cdata` 行為，比對會失敗（fail closed），唔會放行。
+- **用戶體驗**：用戶 render widget 之後再改表格，要重新做 challenge。
 
 ### 7.3 schema 升級去 database（離線遷移，CLI `tenant migrate`）
 
