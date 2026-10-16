@@ -397,6 +397,15 @@ async fn cmd_serve(
     let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
+    for route in &manifest.routes {
+        if let Some(problem) = route
+            .refresh
+            .as_ref()
+            .and_then(|spec| vibe::manifest::refresh_spec_problem(&route.feature_id, spec))
+        {
+            return Err(problem);
+        }
+    }
     // `sign-jwt` key-refs name environment variables holding private PEMs.
     auth.signing_keys =
         vibe::runtime::load_signing_keys(&manifest, &|name| std::env::var(name).ok(), &auth.kid)?;
@@ -431,6 +440,19 @@ async fn cmd_serve(
         Arc::new(pg)
     };
     let loaded = vibe::runtime::load_project_slugs(project, memory)?;
+    if let (Some(pool), true) = (
+        &pg_pool,
+        manifest.routes.iter().any(|r| r.refresh.is_some()),
+    ) {
+        let mut tenants: Vec<String> = loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
+        tenants.sort();
+        tenants.dedup();
+        let client = pool
+            .get()
+            .await
+            .map_err(|err| format!("refresh token store check: {err}"))?;
+        vibe::runtime::refresh::check_store(&client, &tenants).await?;
+    }
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }

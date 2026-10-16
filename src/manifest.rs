@@ -88,7 +88,24 @@ pub struct RevokeSpec {
 
 pub const MAX_REFRESH_TTL_S: i64 = 30 * 86_400;
 pub const MAX_IDLE_TTL_S: i64 = 7 * 86_400;
-pub const MAX_REUSE_GRACE_S: i64 = 60;
+/// Spec §4A.1 (decision 61): `reuse-grace` defaults to 10s and is at most 10s.
+pub const DEFAULT_REUSE_GRACE_S: i64 = 10;
+pub const MAX_REUSE_GRACE_S: i64 = 10;
+
+/// Startup check of a manifest's token-refresh settings (a manifest built by
+/// an older compiler may carry values outside the current limits).
+pub fn refresh_spec_problem(route: &str, spec: &RefreshSpec) -> Option<String> {
+    let checks = [
+        ("refresh-ttl", spec.refresh_ttl_s, MAX_REFRESH_TTL_S),
+        ("idle-ttl", spec.idle_ttl_s, MAX_IDLE_TTL_S),
+        ("reuse-grace", spec.reuse_grace_s, MAX_REUSE_GRACE_S),
+    ];
+    checks.iter().find_map(|(name, value, max)| {
+        (!(1..=*max).contains(value)).then(|| {
+            format!("route {route}: token-refresh {name} is {value}s; it must be between 1s and {max}s (spec §4A.1); recompile the lock")
+        })
+    })
+}
 
 fn bullet<'a>(bullets: &'a [crate::lock::Bullet], key: &str) -> Option<&'a str> {
     bullets
@@ -157,7 +174,7 @@ pub fn parse_refresh_block(bullets: &[crate::lock::Bullet]) -> Result<RefreshSpe
         )?,
         reuse_grace_s: secs(
             bullet(bullets, "reuse-grace"),
-            10,
+            DEFAULT_REUSE_GRACE_S,
             MAX_REUSE_GRACE_S,
             "reuse-grace",
         )?,
