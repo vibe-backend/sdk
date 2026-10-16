@@ -1982,6 +1982,13 @@ pub(crate) fn affirms(text: &str, word: &str) -> bool {
         .chars()
         .last()
         .is_some_and(|c| c.is_ascii_alphanumeric());
+    let english_negation = regex::Regex::new(
+            r"(?:^|[^a-z0-9_])(?:not|no|never|without|cannot|nor|neither|none|nobody|[a-z]+n't|non)(?:[\s,-]+(?:a|an|the|be|been|being|is|are|ever|require|requires|need|needs|allow|allows|use|using|under|any|circumstances)){0,5}[\s,-]*$",
+    )
+    .expect("English negation pattern");
+    let chinese_negation =
+        regex::Regex::new(r"[唔不冇無毋非](?:需要|要求|允許|可以|須|需|會|是|要|用|使用|\s){0,3}$")
+            .expect("negation pattern");
     let mut start = 0;
     while let Some(pos) = text[start..].find(word) {
         let at = start + pos;
@@ -2019,16 +2026,8 @@ pub(crate) fn affirms(text: &str, word: &str) -> bool {
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '\''))
             .filter(|w| NEGATORS.contains(w) || w.ends_with("n't") || *w == "non")
             .count();
-        let english_negated = regex::Regex::new(
-            r"(?:^|[^a-z0-9_])(?:not|no|never|without|cannot|nor|neither|none|nobody|[a-z]+n't|non)(?:[\s,-]+(?:a|an|the|be|been|being|is|are|ever|require|requires|need|needs|allow|allows|use|using|under|any|circumstances)){0,5}[\s,-]*$",
-        )
-        .expect("English negation pattern")
-        .is_match(clause);
-        let chinese_negated = regex::Regex::new(
-            r"[唔不冇無毋非](?:需要|要求|允許|可以|須|需|會|是|要|用|使用|\s){0,3}$",
-        )
-        .expect("negation pattern")
-        .is_match(clause);
+        let english_negated = english_negation.is_match(clause);
+        let chinese_negated = chinese_negation.is_match(clause);
         if (negations % 2 == 1 && english_negated) || chinese_negated {
             continue;
         }
