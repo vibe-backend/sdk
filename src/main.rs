@@ -390,6 +390,13 @@ fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
         deploy,
     })
     .map_err(|err| err.to_string())?;
+    // #118: `vibe validate --deploy` (and any validate with a production
+    // VIBE_ENV) refuses `challenge_when: always` until a verifier is configured.
+    let run_env =
+        vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), !deploy);
+    let always = vibe::runtime::challenge::always_challenge_locks(project);
+    let configured = vibe::runtime::challenge::configured_in_env()?;
+    vibe::runtime::challenge::production_gate(run_env, configured, &always)?;
     print_report(&report);
     println!("validation ok");
     Ok(())
@@ -764,7 +771,7 @@ async fn cmd_serve(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
-    let auth = auth_from_env(run_env)?;
+    let mut auth = auth_from_env(run_env)?;
     let manifest = load_manifest(
         manifest_path,
         project,
@@ -774,6 +781,8 @@ async fn cmd_serve(
         insecure_dev,
     )?;
     check_deployable(&manifest, run_env)?;
+    // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
+    auth.add_route_jwks(&manifest.routes)?;
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::new())
     } else {
@@ -782,7 +791,7 @@ async fn cmd_serve(
             .map_err(|_| {
                 "set VIBE_DATABASE_URL or pass --memory for the dev executor".to_string()
             })?;
-        let pg = PgExec::connect(&url).await?;
+        let pg = PgExec::connect_with(&url, vibe::runtime::PgOptions::from_env()?).await?;
         pg.check_runtime_role().await?;
         Arc::new(pg)
     };
@@ -800,6 +809,16 @@ async fn cmd_serve(
             "warning: public routes use {{slug}} but no tenants are configured; copy slugs.example.json to .vibe/slugs.json or run `vibe slug add <slug> --tenant <id>`"
         );
     }
+    // #118: refuse `challenge_when: always` in production until a verifier
+    // is configured.
+    let challenge = vibe::runtime::challenge::verifier_from_env()?;
+    let always: Vec<String> = manifest
+        .routes
+        .iter()
+        .filter(|r| r.public && r.challenge_type != "none" && r.challenge_when == "always")
+        .map(|r| r.feature_id.clone())
+        .collect();
+    vibe::runtime::challenge::production_gate(run_env, challenge.is_some(), &always)?;
     let addr: SocketAddr = addr.parse().map_err(|err| format!("bad address: {err}"))?;
     let state = Arc::new(AppState {
         manifest,
@@ -813,6 +832,7 @@ async fn cmd_serve(
         honor_test_ip: false,
         trusted_proxies: trusted_proxies_from_env()?,
         dev_hints: memory,
+        challenge,
     });
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr)
@@ -924,7 +944,11 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
         return Err("set either VIBE_JWT_PUBLIC_KEY_PEM or VIBE_JWT_JWKS_URI, not both".into());
     }
     if let Some(uri) = jwks_uri {
-        let source = vibe::runtime::jwks::HttpsJwks::new(&uri)?;
+        let allow_private = std::env::var("VIBE_JWT_ALLOW_PRIVATE_HOST").as_deref() == Ok("true");
+        if allow_private && !run_env.is_dev() {
+            return Err("VIBE_JWT_ALLOW_PRIVATE_HOST is only allowed in development".into());
+        }
+        let source = vibe::runtime::jwks::HttpsJwks::with_policy(&uri, allow_private)?;
         auth.jwks = Some(std::sync::Arc::new(vibe::runtime::jwks::JwksCache::new(
             std::sync::Arc::new(source),
         )));

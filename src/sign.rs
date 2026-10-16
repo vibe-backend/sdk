@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use zeroize::Zeroizing;
 
 pub fn sign_bytes(bytes: &[u8], key: &SigningKey) -> String {
@@ -12,7 +12,8 @@ pub fn verify_bytes(bytes: &[u8], signature_hex: &str, key: &VerifyingKey) -> bo
     let Ok(signature) = Signature::from_slice(&raw) else {
         return false;
     };
-    key.verify(bytes, &signature).is_ok()
+    // Reject weak keys and non-canonical / malleable signatures.
+    key.verify_strict(bytes, &signature).is_ok()
 }
 
 pub fn generate_key() -> SigningKey {

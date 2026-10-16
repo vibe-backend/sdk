@@ -685,6 +685,18 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                     .at_step(&block.heading),
             );
         }
+        // Ops this build executes inside methods share the API step grammar.
+        // #77 ops (query, verify-password, hash-password, random-token,
+        // hash-token, sign-jwt) keep their own checks below.
+        if matches!(op.as_str(), "method" | "validate" | "respond") {
+            for problem in api_step_problems(block, &op) {
+                report.push(
+                    Diag::error(file, problem)
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+            }
+        }
         if op == "sign-jwt" {
             if !caps.contains("sign-token") {
                 report.push(
@@ -868,6 +880,28 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
                         report.push(Diag::error(file, err).at_section("Pipelines"));
                     }
                 }
+            }
+        }
+        for block in &pipes.blocks {
+            if pipeline_name(&block.heading) != "auth" {
+                continue;
+            }
+            let get = |k: &str| {
+                block
+                    .bullets
+                    .iter()
+                    .find(|b| b.key == k)
+                    .map(|b| b.value.trim().to_string())
+                    .unwrap_or_default()
+            };
+            if let Some(problem) = crate::manifest::jwt_override_problem(
+                &get("iss"),
+                &get("aud"),
+                &get("jwks-uri"),
+                auth_removed,
+                &auth_mode,
+            ) {
+                report.push(Diag::error(file, problem).at_section("Pipelines"));
             }
         }
         for block in &pipes.blocks {
@@ -1104,13 +1138,46 @@ pub fn check_method_target(target: &str, docs: &HashMap<String, LockDoc>) -> Res
 
 fn check_targets(docs: &HashMap<String, LockDoc>, report: &mut Report) {
     for doc in docs.values() {
-        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+        let feature = doc.meta.kind == Kind::Api && doc.meta.scope == Some(Scope::Feature);
+        let method = doc.meta.kind == Kind::Method;
+        if !feature && !method {
             continue;
+        }
+        if method {
+            // Calls.methods is the static call list the runtime binds at deploy.
+            if let Some(list) = find_section(&doc.sections, "Calls").and_then(|s| s.get("methods"))
+            {
+                let targets = match crate::lock::parse_string_list(list) {
+                    Ok(targets) => targets,
+                    Err(_) => {
+                        // Fail closed: a malformed list must not skip the check.
+                        report.push(
+                            Diag::error(
+                                lock_rel(&doc.meta.source),
+                                "Calls.methods must be a list like `[object.action, ...]`",
+                            )
+                            .at_section("Calls"),
+                        );
+                        Vec::new()
+                    }
+                };
+                for target in targets {
+                    if let Err(err) = check_method_target(&target, docs) {
+                        report
+                            .push(Diag::error(lock_rel(&doc.meta.source), err).at_section("Calls"));
+                    }
+                }
+            }
         }
         let Some(steps) = find_section(&doc.sections, "Steps") else {
             continue;
         };
         for block in &steps.blocks {
+            // In method locks only `op: method` targets are method ids;
+            // `op: call` targets are external endpoints.
+            if method && block_val(block, "op") != "method" {
+                continue;
+            }
             if let Some(target) = block.bullets.iter().find(|b| b.key == "target") {
                 if let Err(err) = check_method_target(&target.value, docs) {
                     report.push(
@@ -1637,6 +1704,60 @@ mod tests {
             "{:?}",
             report.diags
         );
+    }
+
+    #[test]
+    fn malformed_calls_methods_fails_closed() {
+        for list in ["product.publish", "[product.publish", "{ a: b }"] {
+            let mut docs = target_docs();
+            let body = format!("## Calls\n- methods: {list}\n");
+            docs.insert(
+                "product/methods/x".into(),
+                doc(Kind::Method, None, "product/methods/x", &body),
+            );
+            let mut report = Report::new();
+            check_targets(&docs, &mut report);
+            assert!(
+                report
+                    .errors()
+                    .any(|d| d.message.contains("Calls.methods must be a list")),
+                "{list}: {:?}",
+                report.diags
+            );
+        }
+    }
+
+    #[test]
+    fn validate_reports_unknown_method_lock_targets() {
+        let mut docs = target_docs();
+        let body = "## Signature\n- writes: false\n## Calls\n- methods: [product.ghost]\n## Steps\n### s1 method\n- op: method\n- target: nope.get\n- out: r\n### s2 call\n- op: call\n- target: https://example.com/hook\n";
+        docs.insert(
+            "product/methods/caller".into(),
+            doc(Kind::Method, None, "models/product/methods/caller", body),
+        );
+        let mut report = Report::new();
+        check_targets(&docs, &mut report);
+        let msgs: Vec<&str> = report.errors().map(|d| d.message.as_str()).collect();
+        assert!(msgs.iter().any(|m| m.contains("nope.get")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("product.ghost")), "{msgs:?}");
+        assert!(!msgs.iter().any(|m| m.contains("example.com")), "{msgs:?}");
+    }
+
+    #[test]
+    fn method_lock_steps_get_step_grammar_checks() {
+        let body = "## Signature\n- writes: false\n## Calls\n- methods: []\n## Steps\n### s1 method\n- op: method\n- method: product.get\n- out: r\n### s2 validate\n- op: validate\n- when: `r == null`\n### s3 respond\n- op: respond\n- value: r\n- status: 999\n";
+        let d = doc(Kind::Method, None, "models/product/methods/x", body);
+        let mut report = Report::new();
+        check_method(&d, "x.lock.md", &mut report);
+        let msgs: Vec<&str> = report.errors().map(|d| d.message.as_str()).collect();
+        for want in [
+            "unknown key `method` for op method (use `target:`)",
+            "method step needs `target`",
+            "validate step needs a `fail` error code",
+            "status `999` is not an HTTP status",
+        ] {
+            assert!(msgs.contains(&want), "{want} not in {msgs:?}");
+        }
     }
 
     #[test]
