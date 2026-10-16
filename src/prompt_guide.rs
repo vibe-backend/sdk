@@ -104,12 +104,47 @@ pub fn guide(kind: Kind, scope: Option<Scope>) -> String {
 }
 
 /// Bounded number of format-repair re-prompts (`LLM_FORMAT_RETRIES`, 0–5, default 2).
-pub fn format_retries() -> u32 {
-    std::env::var("LLM_FORMAT_RETRIES")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .map(|n| n.min(5))
-        .unwrap_or(2)
+/// An invalid value (not an integer, negative, or above 5) is an error.
+pub fn format_retries() -> Result<u32, String> {
+    parse_format_retries(std::env::var("LLM_FORMAT_RETRIES").ok().as_deref())
+}
+
+pub const MAX_FORMAT_RETRIES: u32 = 5;
+
+pub fn parse_format_retries(value: Option<&str>) -> Result<u32, String> {
+    let Some(raw) = value else { return Ok(2) };
+    match raw.trim().parse::<u32>() {
+        Ok(n) if n <= MAX_FORMAT_RETRIES => Ok(n),
+        _ => Err(format!(
+            "LLM_FORMAT_RETRIES must be an integer from 0 to {MAX_FORMAT_RETRIES} (got {:?})",
+            raw
+        )),
+    }
+}
+
+#[cfg(test)]
+mod format_retries_tests {
+    use super::parse_format_retries;
+
+    #[test]
+    fn unset_defaults_to_two() {
+        assert_eq!(parse_format_retries(None), Ok(2));
+    }
+
+    #[test]
+    fn valid_values_are_accepted() {
+        for (v, n) in [("0", 0), ("3", 3), (" 5 ", 5)] {
+            assert_eq!(parse_format_retries(Some(v)), Ok(n));
+        }
+    }
+
+    #[test]
+    fn invalid_values_fail() {
+        for v in ["", "abc", "-1", "6", "100", "2.5", "99999999999"] {
+            let err = parse_format_retries(Some(v)).unwrap_err();
+            assert!(err.contains("LLM_FORMAT_RETRIES"), "{v}: {err}");
+        }
+    }
 }
 
 /// Follow-up input asking the model to fix its previous answer.

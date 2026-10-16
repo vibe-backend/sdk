@@ -302,6 +302,24 @@ pub trait LlmAdapter: Send + Sync {
     fn provider(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
     async fn compile(&self, request: &LlmRequest) -> Result<LlmResponse, String>;
+    /// True when `compile` reserves from `request.budget` per HTTP attempt
+    /// itself. Other adapters are charged one call by `call_budgeted`.
+    fn enforces_budget(&self) -> bool {
+        false
+    }
+}
+
+/// Every LLM call goes through here so the budget holds for any adapter.
+pub async fn call_budgeted(
+    adapter: &dyn LlmAdapter,
+    request: &LlmRequest,
+) -> Result<LlmResponse, String> {
+    if !adapter.enforces_budget() {
+        if let Some(budget) = &request.budget {
+            budget.reserve()?;
+        }
+    }
+    adapter.compile(request).await
 }
 
 pub struct FakeAdapter<F>
@@ -782,6 +800,10 @@ impl HttpAdapter {
 
 #[async_trait]
 impl LlmAdapter for HttpAdapter {
+    fn enforces_budget(&self) -> bool {
+        true
+    }
+
     fn provider(&self) -> &'static str {
         match self.config.provider.as_str() {
             ANTHROPIC => "anthropic",

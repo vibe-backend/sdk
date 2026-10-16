@@ -109,3 +109,25 @@ async fn a_hanging_call_cannot_overrun_the_time_budget() {
         .unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(3), "{err}");
 }
+
+#[tokio::test]
+async fn the_budget_holds_for_any_adapter() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let seen = calls.clone();
+    let fake = vibe::llm::FakeAdapter {
+        responder: move |_: &LlmRequest| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok("ok".to_string())
+        },
+    };
+    let budget = Arc::new(CallBudget::new(Limits {
+        source_calls: 2,
+        ..Limits::default()
+    }));
+    let req = request(&budget);
+    assert!(vibe::llm::call_budgeted(&fake, &req).await.is_ok());
+    assert!(vibe::llm::call_budgeted(&fake, &req).await.is_ok());
+    let err = vibe::llm::call_budgeted(&fake, &req).await.unwrap_err();
+    assert!(err.contains("call budget"), "{err}");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
