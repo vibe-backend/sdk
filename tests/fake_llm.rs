@@ -66,6 +66,7 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
         seed: 0,
         endpoint_host: "api.openai.com".into(),
         endpoint_private: false,
+        send_sampling: true,
         api_style: "chat".into(),
     };
     let adapter = FakeAdapter {

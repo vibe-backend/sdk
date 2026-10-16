@@ -162,7 +162,12 @@ struct Setup {
 
 /// Migrations fail closed on any RLS problem in any tenant schema, and all
 /// tests share one cluster. Tests that deliberately break RLS take this lock
-/// exclusively (and repair before returning); all others share it.
+/// exclusively (and repair before returning).
+///
+/// Shared holders still interfered with each other (catalog-wide checks seeing
+/// another test's half-built tenant, and lock-order deadlocks between
+/// concurrent migrations; #110), so every test now takes it exclusively and
+/// the Postgres tests run one at a time.
 static CORRUPTION: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 #[allow(dead_code)]
@@ -176,8 +181,7 @@ enum Guard {
 static SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn setup() -> Option<Setup> {
-    let admin_url = admin_url()?;
-    setup_with(admin_url, Guard::Shared(CORRUPTION.read().await)).await
+    setup_exclusive().await
 }
 
 /// For tests that leave RLS broken for a while.

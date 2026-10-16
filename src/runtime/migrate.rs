@@ -332,7 +332,7 @@ async fn protect_schema(exec: &PgSession, tenant: &str) -> Result<Vec<String>, S
     // `app.tenant_id` mid-transaction and read or copy other tenants' rows.
     let definer = exec
         .query_texts(
-            "SELECT format('function %I(%s)', p.proname, pg_get_function_identity_arguments(p.oid)) \
+            "SELECT format('%s %I(%s)', CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END, p.proname, pg_get_function_identity_arguments(p.oid)) \
              FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
              WHERE n.nspname = $1 AND p.prosecdef \
              UNION ALL \
@@ -345,7 +345,7 @@ async fn protect_schema(exec: &PgSession, tenant: &str) -> Result<Vec<String>, S
         .await?;
     if !definer.is_empty() {
         return Err(format!(
-            "{schema}: SECURITY DEFINER functions and triggers are not allowed; they run as their owner and can switch app.tenant_id ({})",
+            "{schema}: SECURITY DEFINER functions, procedures and triggers are not allowed; they run as their owner and can switch app.tenant_id ({})",
             definer.join(", ")
         ));
     }

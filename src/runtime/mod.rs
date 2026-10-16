@@ -16,7 +16,7 @@ pub use http::{
     detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router, ApiKeyFile, AppState,
     AuthConfig, RunEnv, Slug, StoredKey, REQUEST_TYPES,
 };
-pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
+pub use limiter::{saturation_refusals, ProxyNet, QuotaBuckets, RateBuckets};
 pub use memory::{MemoryExec, MEMORY_UNSUPPORTED_SQL};
 pub use migrate::migrate_tenant;
 pub use pools::{parse_tenant_role, TenantPools, MAX_TENANT_POOL_SIZE};
