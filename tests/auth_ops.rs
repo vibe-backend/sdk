@@ -648,6 +648,49 @@ fn missing_signing_key_refuses_to_start() {
     assert!(err.contains("JWT_SIGNING_KEY"), "{err}");
 }
 
+/// PRIVATE_PEM with its private scalar replaced by `d`, or with two bytes
+/// appended after the key.
+fn altered_private_pem(d: Option<[u8; 32]>) -> String {
+    use base64::Engine;
+    let b64: String = PRIVATE_PEM
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect();
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut der = engine.decode(b64).unwrap();
+    match d {
+        Some(d) => {
+            let marker = [0x02, 0x01, 0x01, 0x04, 0x20];
+            let at = der.windows(5).position(|w| w == marker).unwrap() + 5;
+            der[at..at + 32].copy_from_slice(&d);
+        }
+        None => der.extend_from_slice(&[0x05, 0x00]),
+    }
+    format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        engine.encode(der)
+    )
+}
+
+#[test]
+fn unusable_es256_signing_key_refuses_to_start() {
+    let order: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
+        0x25, 0x51,
+    ];
+    for (name, pem) in [
+        ("d = 0", altered_private_pem(Some([0; 32]))),
+        ("d = n", altered_private_pem(Some(order))),
+        ("d = 2^256 - 1", altered_private_pem(Some([0xff; 32]))),
+        ("trailing bytes", altered_private_pem(None)),
+    ] {
+        let res = vibe::runtime::load_signing_keys(&fixture(), &|_| Some(pem.clone()), "local");
+        let err = res.err().unwrap_or_else(|| panic!("{name} accepted"));
+        assert!(err.contains("JWT_SIGNING_KEY"), "{name}: {err}");
+    }
+}
+
 #[tokio::test]
 async fn query_steps_need_postgres() {
     let m = method_manifest(
