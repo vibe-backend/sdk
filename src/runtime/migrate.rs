@@ -1,6 +1,6 @@
 use crate::manifest::Manifest;
 
-use super::exec::PgExec;
+use super::exec::{PgExec, PgSession};
 use super::grants::{parse_grants, pg_grant_statements};
 use super::slugs::valid_tenant;
 use super::sql::{
@@ -36,35 +36,46 @@ pub async fn migrate_tenant(
             }
         }
     }
+    // The pool hands out a different connection per call; pin one so the
+    // transaction covers every statement.
+    let mut session = exec.session().await?;
+    // Until COMMIT/ROLLBACK succeeds, dropping the session (error, panic,
+    // cancelled future) closes the connection instead of pooling it.
+    session.in_transaction(true);
     // REPEATABLE READ: the catalog snapshot used for the cross-tenant checks
     // below must not move while other tenants migrate concurrently.
-    exec.batch(&["BEGIN ISOLATION LEVEL REPEATABLE READ".to_string()])
+    session
+        .batch(&["BEGIN ISOLATION LEVEL REPEATABLE READ".to_string()])
         .await?;
     // Marker that only lives as long as this transaction. If it is gone at
     // the end, the transaction was ended (and maybe restarted) in between.
     let marker = uuid::Uuid::new_v4().simple().to_string();
     let result = async {
-        exec.batch(&[format!("SET LOCAL vibe.migrate_tx = '{marker}'")])
+        session
+            .batch(&[format!("SET LOCAL vibe.migrate_tx = '{marker}'")])
             .await?;
-        let log = migrate_in_tx(exec, manifest, tenant, runtime_role).await?;
-        still_in_transaction(exec, &marker).await?;
+        let log = migrate_in_tx(&session, manifest, tenant, runtime_role).await?;
+        still_in_transaction(&session, &marker).await?;
         Ok::<_, String>(log)
     }
     .await;
     match result {
         Ok(log) => {
-            exec.batch(&["COMMIT".to_string()]).await?;
+            session.batch(&["COMMIT".to_string()]).await?;
+            session.in_transaction(false);
             Ok(log)
         }
         Err(err) => {
-            let _ = exec.batch(&["ROLLBACK".to_string()]).await;
+            if session.batch(&["ROLLBACK".to_string()]).await.is_ok() {
+                session.in_transaction(false);
+            }
             Err(err)
         }
     }
 }
 
 /// Fails unless the transaction opened by `migrate_tenant` is still open.
-async fn still_in_transaction(exec: &PgExec, marker: &str) -> Result<(), String> {
+async fn still_in_transaction(exec: &PgSession, marker: &str) -> Result<(), String> {
     let got = exec
         .query_texts(
             "SELECT coalesce(current_setting('vibe.migrate_tx', true), '') WHERE $1::text IS NOT NULL",
@@ -148,7 +159,7 @@ fn strip_leading_comments(mut sql: &str) -> &str {
 }
 
 async fn migrate_in_tx(
-    exec: &PgExec,
+    exec: &PgSession,
     manifest: &Manifest,
     tenant: &str,
     runtime_role: &str,
@@ -189,10 +200,11 @@ async fn migrate_in_tx(
         .await?;
         log.push(format!("bootstrapped {schema}.{}", model.table));
     }
-    // Migration DDL names tables unqualified; resolve them in the tenant schema.
-    exec.batch(&[format!("SET LOCAL search_path TO {}", quote(&schema)?)])
-        .await?;
+    // Migration DDL names tables unqualified; resolve them in the tenant
+    // schema; each batch sets it for the migration statements that follow.
     for migration in &manifest.migrations {
+        exec.batch(&[format!("SET LOCAL search_path TO {}", quote(&schema)?)])
+            .await?;
         for statement in &migration.statements {
             // One command per call (extended protocol): the server rejects a
             // statement that smuggles `; COMMIT; ...` after the first command.
@@ -200,9 +212,9 @@ async fn migrate_in_tx(
                 .await
                 .map_err(|err| format!("{}: {err}", migration.id))?;
         }
+        exec.batch(&["RESET search_path".to_string()]).await?;
         log.push(format!("applied {}", migration.id));
     }
-    exec.batch(&["RESET search_path".to_string()]).await?;
     // The runtime roles get exactly the effective grants from the lock, on
     // every run (a changed grant is applied by the next migrate).
     for model in &manifest.models {
@@ -253,7 +265,7 @@ async fn migrate_in_tx(
 /// Any policy other than `tenant_isolation` fails too: permissive policies
 /// are OR-combined, so `CREATE POLICY open ON t USING (true)` in a migration
 /// would expose every tenant's rows.
-async fn protect_schema(exec: &PgExec, schema: &str) -> Result<Vec<String>, String> {
+async fn protect_schema(exec: &PgSession, schema: &str) -> Result<Vec<String>, String> {
     let unsafe_rels = exec
         .query_texts(
             "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -340,7 +352,7 @@ async fn protect_schema(exec: &PgExec, schema: &str) -> Result<Vec<String>, Stri
 /// migration for tenant A could otherwise weaken tenant B (e.g. `CREATE POLICY
 /// open ON t_b.notes USING (true)` or `ALTER TABLE ... NO FORCE ROW LEVEL
 /// SECURITY`), and `vibe serve` only checks at startup.
-async fn rls_problems(exec: &PgExec, own_schema: &str) -> Result<Vec<String>, String> {
+async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>, String> {
     exec.query_texts(
         r#"WITH ref AS (
                  -- The expression vibe installs: this tenant's, or before it
@@ -390,7 +402,7 @@ async fn rls_problems(exec: &PgExec, own_schema: &str) -> Result<Vec<String>, St
 /// A digest of every other tenant schema's tables, columns, policies,
 /// triggers, rules, privileges and functions. Migrations run as the owner of
 /// all tenant schemas; this catches changes outside the tenant being migrated.
-async fn tenant_fingerprint(exec: &PgExec, own_schema: &str) -> Result<String, String> {
+async fn tenant_fingerprint(exec: &PgSession, own_schema: &str) -> Result<String, String> {
     let rows = exec
         .query_texts(
             r#"WITH s AS (SELECT oid, nspname FROM pg_namespace

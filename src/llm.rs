@@ -231,6 +231,12 @@ pub fn load_llm_config(
         report.push(Diag::error("env", "LLM_MODEL is missing"));
     }
     if let Some(model) = &model {
+        if !model.is_empty() && !model_id_is_valid(&provider, model) {
+            report.push(Diag::error(
+                "env",
+                "LLM_MODEL contains characters that are not allowed for this provider",
+            ));
+        }
         if !model_is_pinned(model) {
             report.push(Diag::error(
                 "env",
@@ -350,6 +356,23 @@ fn pick(
     }
 }
 
+/// Only a conservative character set is accepted for model ids. Gemini
+/// places the id in the request URL path, so ':' and '/' are rejected there;
+/// other providers send it in the JSON body and may use them (for example
+/// `qwen2.5-coder:32b` or `org/model`).
+pub fn model_id_is_valid(provider: &str, model: &str) -> bool {
+    let path_safe = provider == GEMINI;
+    !model.is_empty()
+        && model.len() <= 256
+        && !model.starts_with('.')
+        && !model.contains("..")
+        && model.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'.' | b'_' | b'-')
+                || (!path_safe && matches!(b, b':' | b'/'))
+        })
+}
+
 pub fn model_is_pinned(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     if lower.is_empty()
@@ -416,34 +439,11 @@ fn classify_endpoint(
 }
 
 fn is_loopback(host: &str) -> bool {
-    let host = host.trim_matches(['[', ']']);
-    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+    crate::netguard::is_loopback_host(host)
 }
 
-fn is_private_host(host: &str) -> bool {
-    let host = host.trim_matches(['[', ']']);
-    if host.eq_ignore_ascii_case("localhost")
-        || host.ends_with(".localhost")
-        || host.ends_with(".internal")
-        || host.ends_with(".local")
-    {
-        return true;
-    }
-    if !host.contains('.') && !host.contains(':') {
-        return true;
-    }
-    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-        return ip.is_private() || ip.is_loopback() || ip.is_link_local();
-    }
-    if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
-        return ip.is_loopback() || is_ula_or_link_local(ip);
-    }
-    false
-}
-
-fn is_ula_or_link_local(ip: std::net::Ipv6Addr) -> bool {
-    let octets = ip.octets();
-    octets[0] & 0xfe == 0xfc || octets[0] == 0xfe && octets[1] & 0xc0 == 0x80
+pub(crate) fn is_private_host(host: &str) -> bool {
+    crate::netguard::is_non_public_host(host)
 }
 
 fn parse_timeout(raw: &str, report: &mut Report) -> Duration {
@@ -598,8 +598,16 @@ pub fn describe_failure(
 
 impl HttpAdapter {
     pub fn new(config: LlmConfig) -> Result<Self, String> {
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .timeout(config.timeout)
+            // A redirect could lead to a host the endpoint check never saw.
+            .redirect(reqwest::redirect::Policy::none());
+        if !config.endpoint_private {
+            // A public endpoint must not resolve to a private address (DNS
+            // rebinding); every resolved address is checked before connecting.
+            builder = crate::netguard::guard_client(builder);
+        }
+        let client = builder
             .build()
             .map_err(|err| format!("http client: {err}"))?;
         Ok(Self { config, client })
@@ -993,6 +1001,30 @@ mod tests {
             false,
         );
         assert!(bad_model.is_err());
+    }
+
+    #[test]
+    fn model_id_charset() {
+        for ok in ["gpt-4o-2024-08-06", "gemini-2.5-pro-001", "a_b.c-1"] {
+            assert!(model_id_is_valid(GEMINI, ok), "{ok}");
+            assert!(model_id_is_valid(OPENAI, ok), "{ok}");
+        }
+        for bad in [
+            "", "../x", "a/b", "a:b", "a?b", "a%2Fb", "a b", ".x", "a..b", "a#b",
+        ] {
+            assert!(!model_id_is_valid(GEMINI, bad), "{bad}");
+        }
+        assert!(model_id_is_valid(OPENAI, "qwen2.5-coder:32b-instruct-q8_0"));
+        assert!(!model_id_is_valid(OPENAI, "a?b"));
+        let report = load_llm_config(
+            &env(&[
+                ("LLM_PROVIDER", "gemini"),
+                ("LLM_API_KEY", "test-value"),
+                ("LLM_MODEL", "gemini-2.5-pro-001:x"),
+            ]),
+            false,
+        );
+        assert!(report.is_err());
     }
 
     #[test]

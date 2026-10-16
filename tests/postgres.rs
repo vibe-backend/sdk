@@ -447,11 +447,91 @@ async fn serve_refuses_tables_without_forced_rls() {
         ))
         .await
         .unwrap();
-    check_as(&s.admin_url, &s.app).await.unwrap(); // Leave no RLS problem behind for other tests (it has no policy).
+    check_as(&s.admin_url, &s.app).await.unwrap();
+    // Leave no RLS problem behind for other tests (it has no policy).
     s.admin
         .batch_execute(&format!("DROP TABLE {schema}.later"))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn slow_queries_time_out_and_do_not_block_other_requests() {
+    let s = require_pg!(setup().await);
+    let exec = std::sync::Arc::new(
+        PgExec::connect_with(
+            &url_as(&s.admin_url, &s.app),
+            vibe::runtime::PgOptions {
+                pool_size: 4,
+                statement_timeout_ms: 300,
+                pool_timeout_ms: 2_000,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    // A request statement over the timeout is cancelled by the server: a
+    // trigger makes inserts into this tenant's notes table sleep for 5s.
+    let schema = format!("t_{}", s.tenant);
+    s.admin
+        .batch_execute(&format!(
+            "CREATE FUNCTION {schema}.slow() RETURNS trigger LANGUAGE plpgsql AS \
+             $$BEGIN PERFORM pg_sleep(5); RETURN NEW; END$$; \
+             CREATE TRIGGER slow BEFORE INSERT ON {schema}.notes \
+             FOR EACH ROW EXECUTE FUNCTION {schema}.slow()"
+        ))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let err = exec
+        .execute(
+            &s.tenant,
+            "app_rw",
+            vibe::runtime::Stmt::Insert {
+                table: "notes".into(),
+                values: vec![
+                    (col("id", "uuid"), json!(uuid::Uuid::new_v4().to_string())),
+                    (col("tenant_id", "string"), json!(s.tenant)),
+                    (col("body", "string"), json!("slow")),
+                ],
+                returning: vec![col("id", "uuid")],
+            },
+        )
+        .await;
+    assert!(err.is_err(), "the insert should be cancelled");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    // While one connection is busy, requests on others still complete.
+    let busy = {
+        let exec = exec.clone();
+        tokio::spawn(async move { exec.batch(&["SELECT pg_sleep(1)".into()]).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let quick = std::time::Instant::now();
+    let rows = exec
+        .execute(
+            &s.tenant,
+            "app_rw",
+            vibe::runtime::Stmt::Select {
+                table: "notes".into(),
+                columns: vec![col("id", "uuid")],
+                id: None,
+                filters: vec![],
+                sort: None,
+                limit: 1,
+                offset: 0,
+            },
+        )
+        .await;
+    assert!(rows.is_ok(), "{rows:?}");
+    assert!(quick.elapsed() < std::time::Duration::from_millis(800));
+    busy.await.unwrap().unwrap();
+}
+
+fn col(name: &str, ty: &str) -> vibe::runtime::Col {
+    vibe::runtime::Col {
+        name: name.into(),
+        ty: ty.into(),
+    }
 }
 
 #[tokio::test]
@@ -709,6 +789,43 @@ async fn postgres_errors_carry_detail() {
         err.contains("no_such_table") && err.contains("42P01"),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn pooled_connections_come_back_clean() {
+    let s = require_pg!(setup().await);
+    let exec = PgExec::connect_with(
+        &url_as(&s.admin_url, &s.app),
+        vibe::runtime::PgOptions {
+            pool_size: 1,
+            statement_timeout_ms: 5_000,
+            pool_timeout_ms: 2_000,
+        },
+    )
+    .await
+    .unwrap();
+    {
+        // Dropped mid-transaction with session state changed.
+        let session = exec.session().await.unwrap();
+        session
+            .batch(&[
+                "BEGIN".into(),
+                "CREATE TEMP TABLE leak (x int)".into(),
+                "SET app.tenant_id = 'leaked'".into(),
+            ])
+            .await
+            .unwrap();
+    }
+    let got = exec
+        .query_texts(
+            "SELECT (to_regclass('pg_temp.leak') IS NULL)::text || '|' || \
+             coalesce(current_setting('app.tenant_id', true), '') || '|' || \
+             coalesce(txid_current_if_assigned()::text, 'none') WHERE $1 = ''",
+            "",
+        )
+        .await
+        .unwrap();
+    assert_eq!(got, vec!["true||none".to_string()]);
 }
 
 #[tokio::test]
@@ -1252,4 +1369,90 @@ async fn missing_tenant_setting_in_postgres() {
         .get(0);
     app.batch_execute("ROLLBACK").await.unwrap();
     assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
+    let s = require_pg!(setup().await);
+    let exec = PgExec::connect_with(
+        &url_as(&s.admin_url, &s.owner),
+        vibe::runtime::PgOptions {
+            pool_size: 1,
+            statement_timeout_ms: 30_000,
+            pool_timeout_ms: 5_000,
+        },
+    )
+    .await
+    .unwrap();
+    let mut m = manifest();
+    m.migrations[0].statements.push("SELECT pg_sleep(5)".into());
+    let tenant = format!("tc{}", suffix());
+    // Cancel the migration while it sleeps inside its transaction, after
+    // reading the pid of the backend running it from pg_stat_activity.
+    let find_pid = async {
+        loop {
+            let rows = s
+                .admin
+                .query(
+                    "SELECT pid FROM pg_stat_activity WHERE usename = $1 \
+                     AND state = 'active' AND query LIKE 'SELECT pg_sleep(5)%'",
+                    &[&s.owner],
+                )
+                .await
+                .unwrap();
+            if let Some(row) = rows.first() {
+                return row.get::<_, i32>(0);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    let migration = migrate_tenant(&exec, &m, &tenant, &s.app);
+    let sleeping_pid = tokio::select! {
+        pid = tokio::time::timeout(std::time::Duration::from_secs(4), find_pid) => {
+            pid.expect("the migration's pg_sleep never showed up in pg_stat_activity")
+        }
+        done = migration => panic!("the migration should still be running: {done:?}"),
+    };
+    // The cancelled future is dropped here. The next query must not wait for
+    // that backend or reuse it: the pool hands out a different backend while
+    // the old one is still sleeping in its transaction.
+    let started = std::time::Instant::now();
+    let pid = exec
+        .query_texts("SELECT pg_backend_pid()::text || $1::text", "")
+        .await
+        .unwrap();
+    assert_ne!(
+        pid,
+        vec![sleeping_pid.to_string()],
+        "the connection was returned to the pool mid-transaction"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "the next query waited for the cancelled transaction"
+    );
+    let old_state = s
+        .admin
+        .query(
+            "SELECT state FROM pg_stat_activity WHERE pid = $1",
+            &[&sleeping_pid],
+        )
+        .await
+        .unwrap();
+    assert!(
+        old_state
+            .first()
+            .is_none_or(|r| r.get::<_, Option<String>>(0).as_deref() != Some("idle")),
+        "the old backend went back to the pool as idle"
+    );
+    // The pool's only connection was discarded, not reused mid-transaction:
+    // a fresh session sees no open transaction and the schema never existed.
+    let got = exec
+        .query_texts(
+            "SELECT coalesce(txid_current_if_assigned()::text, 'none') || '|' || \
+             (SELECT count(*) FROM pg_namespace WHERE nspname = $1)::text",
+            &format!("t_{tenant}"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got, vec!["none|0".to_string()]);
 }
