@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use crate::manifest::{Manifest, RouteSpec};
+use crate::manifest::{Manifest, RouteSpec, StepSpec};
 
 use super::crud::{self, MethodFail};
 use super::exec::QueryExec;
@@ -1264,7 +1264,11 @@ fn verify_jwt(
     validation.validate_nbf = true;
     let data = jsonwebtoken::decode::<Claims>(token, key, &validation)
         .map_err(|_| AuthError::unauthorized("Bearer"))?;
-    if data.claims.exp.saturating_sub(data.claims.iat) > 3600 {
+    if !valid_jwt_times(
+        data.claims.iat,
+        data.claims.exp,
+        chrono::Utc::now().timestamp(),
+    ) {
         return Err(AuthError::unauthorized("Bearer"));
     }
     if !super::slugs::valid_tenant(&data.claims.tenant_id) {
@@ -1282,6 +1286,13 @@ fn verify_jwt(
 }
 
 /// Walks a dotted path (`realm_access.roles`) or a URL-style claim key.
+fn valid_jwt_times(iat: i64, exp: i64, now: i64) -> bool {
+    iat <= now + 60
+        && exp
+            .checked_sub(iat)
+            .is_some_and(|ttl| (0..=3600).contains(&ttl))
+}
+
 fn claim_value<'a>(extra: &'a HashMap<String, Value>, path: &str) -> Option<&'a Value> {
     if path.contains("://") {
         return extra.get(path);
@@ -1441,6 +1452,40 @@ fn scope_allows(scopes: &[String], definition: &str, write: bool) -> bool {
 
 /// Shard and bucket for one rate-limit step. Shards are per route and key
 /// type, so flooding one key type cannot evict another's buckets.
+fn effective_rate_limit(per_minute: u32, high_cost: bool) -> u32 {
+    if high_cost {
+        (per_minute / 2).max(1)
+    } else {
+        per_minute
+    }
+}
+
+/// Password ops (`verify-password`, `hash-password`) are high cost by default;
+/// any other step opts in with `cost: high`.
+fn step_has_high_cost(step: &StepSpec) -> bool {
+    matches!(step.op.as_str(), "verify-password" | "hash-password")
+        || step.opts.get("cost").is_some_and(|cost| cost == "high")
+}
+
+/// True when the route, or any method it reaches through `method` steps
+/// (followed transitively), has a high-cost step. A visited set keeps
+/// recursive method graphs finite.
+fn route_has_high_cost(manifest: &Manifest, route: &RouteSpec) -> bool {
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut pending: Vec<&StepSpec> = route.steps.iter().collect();
+    while let Some(step) = pending.pop() {
+        if step_has_high_cost(step) {
+            return true;
+        }
+        if step.op == "method" && visited.insert(step.target.as_str()) {
+            if let Some(method) = crate::manifest::method(manifest, &step.target) {
+                pending.extend(method.steps.iter());
+            }
+        }
+    }
+    false
+}
+
 fn rate_bucket(
     key: &str,
     route: &RouteSpec,
@@ -1501,8 +1546,10 @@ fn rate_limited(
         .map(|(index, rate)| {
             let (shard, key) =
                 rate_bucket(&rate.key, route, ip, principal, body, &state.auth.pepper);
+            let limit =
+                effective_rate_limit(rate.per_minute, route_has_high_cost(&state.manifest, route));
             // Each block is its own limit, even when two share a key.
-            (format!("{shard}#{index}"), key, rate.per_minute)
+            (format!("{shard}#{index}"), key, limit)
         })
         .collect();
     let Ok(mut rates) = state.rates.lock() else {
@@ -1847,6 +1894,131 @@ mod rate_tests {
     fn xff_ignored_without_trusted_proxy() {
         let got = client_ip(&xff("1.2.3.4"), Some(ip("9.9.9.9")), &[], false);
         assert_eq!(got, "9.9.9.9");
+    }
+
+    fn cost_fixture() -> Manifest {
+        serde_json::from_str(include_str!("../../tests/fixtures/auth-app/manifest.json"))
+            .expect("fixture manifest")
+    }
+
+    fn cost_step(op: &str, target: &str, cost: Option<&str>) -> StepSpec {
+        let mut step = cost_fixture().routes[0].steps[0].clone();
+        step.op = op.to_string();
+        step.target = target.to_string();
+        step.opts.clear();
+        if let Some(c) = cost {
+            step.opts.insert("cost".into(), c.into());
+        }
+        step
+    }
+
+    fn cost_manifest(methods: Vec<(&str, Vec<StepSpec>)>) -> Manifest {
+        let mut m = cost_fixture();
+        let template = m.methods[0].clone();
+        m.methods = methods
+            .into_iter()
+            .map(|(target, steps)| {
+                let mut method = template.clone();
+                method.target = target.to_string();
+                method.steps = steps;
+                method
+            })
+            .collect();
+        m
+    }
+
+    fn cost_route(steps: Vec<StepSpec>) -> RouteSpec {
+        let mut r = cost_fixture().routes[0].clone();
+        r.steps = steps;
+        r
+    }
+
+    #[test]
+    fn password_ops_are_high_cost_by_default() {
+        assert!(step_has_high_cost(&cost_step("verify-password", "", None)));
+        assert!(step_has_high_cost(&cost_step("hash-password", "", None)));
+        assert!(step_has_high_cost(&cost_step(
+            "verify-password",
+            "",
+            Some("low")
+        )));
+        assert!(step_has_high_cost(&cost_step("query", "", Some("high"))));
+        assert!(!step_has_high_cost(&cost_step("query", "", None)));
+    }
+
+    #[test]
+    fn route_cost_includes_transitively_called_methods() {
+        let m = cost_manifest(vec![
+            ("a", vec![cost_step("method", "b", None)]),
+            ("b", vec![cost_step("method", "c", None)]),
+            ("c", vec![cost_step("verify-password", "", None)]),
+            ("plain", vec![cost_step("query", "", None)]),
+        ]);
+        assert!(route_has_high_cost(
+            &m,
+            &cost_route(vec![cost_step("method", "a", None)])
+        ));
+        assert!(!route_has_high_cost(
+            &m,
+            &cost_route(vec![cost_step("method", "plain", None)])
+        ));
+        assert!(route_has_high_cost(
+            &m,
+            &cost_route(vec![cost_step("hash-password", "", None)])
+        ));
+    }
+
+    #[test]
+    fn route_cost_terminates_on_recursive_methods() {
+        let m = cost_manifest(vec![
+            ("x", vec![cost_step("method", "y", None)]),
+            (
+                "y",
+                vec![
+                    cost_step("method", "x", None),
+                    cost_step("method", "y", None),
+                ],
+            ),
+        ]);
+        assert!(!route_has_high_cost(
+            &m,
+            &cost_route(vec![cost_step("method", "x", None)])
+        ));
+        let m = cost_manifest(vec![
+            ("x", vec![cost_step("method", "y", None)]),
+            (
+                "y",
+                vec![
+                    cost_step("method", "x", None),
+                    cost_step("hash-password", "", None),
+                ],
+            ),
+        ]);
+        assert!(route_has_high_cost(
+            &m,
+            &cost_route(vec![cost_step("method", "x", None)])
+        ));
+    }
+
+    #[test]
+    fn high_cost_rate_limit_is_halved_once_with_a_floor() {
+        assert_eq!(effective_rate_limit(10, true), 5);
+        assert_eq!(effective_rate_limit(5, true), 2);
+        assert_eq!(effective_rate_limit(1, true), 1);
+        assert_eq!(effective_rate_limit(10, false), 10);
+    }
+
+    #[test]
+    fn jwt_time_claims_enforce_future_leeway_order_and_ttl() {
+        let now = 1_700_000_000;
+        assert!(valid_jwt_times(now + 60, now + 61, now));
+        assert!(!valid_jwt_times(now + 61, now + 62, now));
+        assert!(valid_jwt_times(now, now, now));
+        assert!(!valid_jwt_times(now, now - 1, now));
+        assert!(valid_jwt_times(now - 3600, now, now));
+        assert!(!valid_jwt_times(now - 3601, now, now));
+        assert!(!valid_jwt_times(i64::MIN, i64::MAX, now));
+        assert!(!valid_jwt_times(i64::MAX, i64::MIN, now));
     }
 
     #[test]

@@ -981,3 +981,114 @@ async fn writing_query_needs_a_method_marked_writes() {
     let err = run(&m, &users(), json!({"n": "x"})).await.unwrap_err();
     assert!(err.1.contains("method is not marked writes"), "{err:?}");
 }
+
+/// A route whose method calls another method with an unannotated
+/// `verify-password` step gets the reduced (halved) rate limit; a route
+/// without password ops keeps the full limit.
+#[tokio::test]
+async fn transitively_called_password_op_halves_route_rate_limit() {
+    let route = |path: &str, target: &str| {
+        serde_json::from_value::<vibe::manifest::RouteSpec>(json!({
+            "method": "POST", "path": path, "feature_id": format!("t{path}"),
+            "public": true, "auth_removed": true, "auth_mode": "jwt", "roles": [],
+            "scopes": [], "rates": [{"per_minute": 4, "key": "ip"}], "body_limit": 4096,
+            "request": [], "transform_in": "{}", "transform_out": "result",
+            "steps": [step("method", "result", json!({"target": target, "args": "transform.in"}))],
+            "errors": [], "min_response_ms": 0, "public_writes": false, "challenge_type": "none",
+            "challenge_when": "always", "deprecated": false, "sunset": ""
+        }))
+        .unwrap()
+    };
+    let method = |target: &str, steps: Value| {
+        serde_json::from_value::<vibe::manifest::MethodSpec>(json!({
+            "target": target, "writes": false, "input": [], "errors": [],
+            "capabilities": [], "crud_model": "", "crud_action": "", "steps": steps
+        }))
+        .unwrap()
+    };
+    let mut m = fixture();
+    m.routes = vec![
+        route("/v1/{slug}/outer", "t.outer"),
+        route("/v1/{slug}/plain", "t.plain"),
+    ];
+    m.methods = vec![
+        method(
+            "t.outer",
+            json!([
+                step("method", "r", json!({"target": "t.inner", "args": "input"})),
+                respond("r")
+            ]),
+        ),
+        method(
+            "t.inner",
+            json!([
+                step(
+                    "verify-password",
+                    "ok",
+                    json!({"opts": {"hash": "input.h", "plain": "input.p", "missing-user": "dummy-hash"}})
+                ),
+                respond("ok")
+            ]),
+        ),
+        method("t.plain", json!([respond("input")])),
+    ];
+    let app = router(Arc::new(AppState {
+        manifest: m,
+        exec: Arc::new(MemoryExec::new()),
+        auth: auth(),
+        slugs: HashMap::from([(
+            "acme".to_string(),
+            Slug {
+                tenant_id: "t1".into(),
+                public_access: true,
+                public_write: true,
+            },
+        )]),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
+        trusted_proxies: Vec::new(),
+        disabled: std::collections::HashSet::new(),
+        min_override_ms: None,
+        honor_test_ip: true,
+        dev_hints: false,
+        challenge: None,
+    }));
+    let call = |path: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+    };
+    let mut outer = Vec::new();
+    for _ in 0..3 {
+        outer.push(call("/v1/acme/outer").await);
+    }
+    assert!(
+        outer[..2]
+            .iter()
+            .all(|s| *s != StatusCode::TOO_MANY_REQUESTS),
+        "{outer:?}"
+    );
+    assert_eq!(outer[2], StatusCode::TOO_MANY_REQUESTS, "{outer:?}");
+    let mut plain = Vec::new();
+    for _ in 0..5 {
+        plain.push(call("/v1/acme/plain").await);
+    }
+    assert!(
+        plain[..4]
+            .iter()
+            .all(|s| *s != StatusCode::TOO_MANY_REQUESTS),
+        "{plain:?}"
+    );
+    assert_eq!(plain[4], StatusCode::TOO_MANY_REQUESTS, "{plain:?}");
+}
