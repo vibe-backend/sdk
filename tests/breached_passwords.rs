@@ -412,18 +412,16 @@ async fn redirects_are_not_followed() {
 }
 
 #[tokio::test]
-async fn outage_uses_the_offline_fallback_list_and_counts_failures() {
+async fn outage_fails_closed_and_counts_failures() {
     let (url, _) = server("500", "").await;
-    let list = OfflineList::parse(sha1_hex("hunter2hunter2").as_bytes()).unwrap();
-    let api = RangeApi::new(&url, false).unwrap().with_fallback(list);
-    let source = BreachedSource::Range(Box::new(api));
-    assert_eq!(source.is_breached("hunter2hunter2", 1).await, Ok(true));
-    assert_eq!(source.is_breached(CLEAN, 1).await, Ok(false));
+    let source = BreachedSource::range(&url, false).unwrap();
+    assert!(source.is_breached("hunter2hunter2", 1).await.is_err());
+    assert!(source.is_breached(CLEAN, 1).await.is_err());
     let BreachedSource::Range(api) = &source else {
         unreachable!()
     };
     assert_eq!(api.failures(), 2);
-    assert!(source.describe().contains("offline fallback"));
+    assert!(source.describe().contains("fails closed"));
 }
 
 #[test]
@@ -603,52 +601,33 @@ fn list_file(name: &str, mode: u32) -> String {
     path.to_string_lossy().into_owned()
 }
 
-#[tokio::test]
-async fn production_outage_fails_closed_without_a_complete_fallback() {
-    let (url, _) = server("500", "").await;
-    let list = OfflineList::parse(sha1_hex("hunter2hunter2").as_bytes()).unwrap();
-    let prod = |complete: bool| {
-        let list = OfflineList::parse(sha1_hex("hunter2hunter2").as_bytes()).unwrap();
-        let api = RangeApi::new("https://passwords.example/range/", true).unwrap();
-        if complete {
-            api.with_complete_fallback(list)
-        } else {
-            api.with_fallback(list)
-        }
-    };
-    let source = BreachedSource::Range(Box::new(prod(false)));
-    assert!(source.describe().contains("fails closed"));
-    let source = BreachedSource::Range(Box::new(prod(true)));
-    assert!(source.describe().contains("complete offline fallback"));
-    // Outside production the fallback is still used.
-    let dev = BreachedSource::Range(Box::new(
-        RangeApi::new(&url, false).unwrap().with_fallback(list),
-    ));
-    assert_eq!(dev.is_breached("hunter2hunter2", 1).await, Ok(true));
-}
-
 #[test]
-fn production_fallback_must_be_declared_complete() {
-    let path = list_file("fallback", 0o600);
-    let get = |complete: Option<&'static str>, file: Option<String>| {
-        move |name: &str| match name {
-            "VIBE_BREACHED_PASSWORDS_FALLBACK_FILE" => file.clone(),
-            "VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE" => complete.map(str::to_string),
-            _ => None,
+fn removed_variables_stop_startup_in_every_environment() {
+    for production in [false, true] {
+        for removed in [
+            "VIBE_BREACHED_PASSWORDS_FALLBACK_FILE",
+            "VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE",
+        ] {
+            for value in ["", " ", "false", "0", "true", "/missing/list", "invalid"] {
+                for offline in [false, true] {
+                    let get = |name: &str| {
+                        if name == removed {
+                            Some(value.to_string())
+                        } else if offline && name == "VIBE_BREACHED_PASSWORDS_FILE" {
+                            Some("/missing/sole-source".to_string())
+                        } else {
+                            None
+                        }
+                    };
+                    let err = BreachedConfig::from_env(&get, production).err().unwrap();
+                    assert!(
+                        err.contains(removed) && err.contains("was removed"),
+                        "{err}"
+                    );
+                }
+            }
         }
-    };
-    let err = BreachedConfig::from_env(&get(None, Some(path.clone())), true)
-        .err()
-        .unwrap();
-    assert!(
-        err.contains("VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE"),
-        "{err}"
-    );
-    let ok = BreachedConfig::from_env(&get(Some("true"), Some(path.clone())), true).unwrap();
-    assert!(ok.source.describe().contains("complete offline fallback"));
-    assert!(BreachedConfig::from_env(&get(None, Some(path.clone())), false).is_ok());
-    assert!(BreachedConfig::from_env(&get(Some("true"), None), false).is_err());
-    assert!(BreachedConfig::from_env(&get(Some("maybe"), Some(path)), false).is_err());
+    }
 }
 
 #[test]

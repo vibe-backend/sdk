@@ -2006,6 +2006,29 @@ mod rate_tests {
         );
     }
 
+    #[tokio::test]
+    async fn non_production_range_outage_carries_retry_after() {
+        use crate::runtime::breached::{BreachedConfig, BreachedSource, RangeApi, MIN_TIMEOUT};
+
+        // Loopback HTTP is non-production only. A refused connection or
+        // lookup deadline must fail closed without an external dependency.
+        let api = RangeApi::new("http://127.0.0.1:9/range/", false)
+            .unwrap()
+            .with_timeout(MIN_TIMEOUT);
+        let mut auth = AuthConfig::anonymous();
+        auth.breached = Arc::new(BreachedConfig {
+            source: BreachedSource::Range(Box::new(api)),
+            min_count: 1,
+        });
+        let err = crate::runtime::ops::hash_new_password(&auth, "a-unique-clean-password")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "SERVICE_UNAVAILABLE");
+        let res = fail_response(&test_route(), err, "req-outage");
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(res.headers().get("retry-after").unwrap(), "1");
+    }
+
     #[test]
     fn unavailable_method_failures_carry_retry_after() {
         let route = test_route();

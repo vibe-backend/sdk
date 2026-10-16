@@ -7,11 +7,9 @@
 //!   cache and a concurrency cap; or
 //! - an offline list of SHA-1 digests (sorted 20-byte digests, binary search).
 //!
-//! The check is mandatory, so a source that cannot answer fails closed. An
-//! optional offline fallback list keeps checking during a range-API outage
-//! outside production. In production a fallback list is only used when the
-//! operator declares it complete (`VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE`);
-//! otherwise an outage fails closed.
+//! The check is mandatory. Range-API errors, timeouts and invalid responses
+//! fail closed in every environment (503 SERVICE_UNAVAILABLE, Retry-After: 1).
+//! An offline list can only be configured as the sole source.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -139,10 +137,6 @@ pub struct RangeApi {
     cache: Mutex<HashMap<String, (Instant, std::sync::Arc<Suffixes>)>>,
     slots: tokio::sync::Semaphore,
     timeout: Duration,
-    fallback: Option<OfflineList>,
-    /// Production: the fallback list is used only when declared complete.
-    production: bool,
-    fallback_complete: bool,
     failures: AtomicU64,
 }
 
@@ -396,9 +390,6 @@ impl RangeApi {
             cache: Mutex::new(HashMap::new()),
             slots: tokio::sync::Semaphore::new(MAX_LOOKUPS),
             timeout: DEFAULT_TIMEOUT,
-            fallback: None,
-            production,
-            fallback_complete: false,
             failures: AtomicU64::new(0),
         })
     }
@@ -413,30 +404,6 @@ impl RangeApi {
     /// The per-lookup timeout in use.
     pub fn timeout(&self) -> Duration {
         self.timeout
-    }
-
-    /// Offline list used while the range API cannot answer. Outside
-    /// production it is used with a warning; in production it is ignored
-    /// (lookups fail closed) unless declared complete with
-    /// [`RangeApi::with_complete_fallback`].
-    pub fn with_fallback(mut self, list: OfflineList) -> Self {
-        self.fallback = Some(list);
-        self.fallback_complete = false;
-        self
-    }
-
-    /// Offline list the operator declares complete (a full breach corpus),
-    /// used during an outage in production as well.
-    pub fn with_complete_fallback(mut self, list: OfflineList) -> Self {
-        self.fallback = Some(list);
-        self.fallback_complete = true;
-        self
-    }
-
-    fn usable_fallback(&self) -> Option<&OfflineList> {
-        self.fallback
-            .as_ref()
-            .filter(|_| !self.production || self.fallback_complete)
     }
 
     pub fn host(&self) -> &str {
@@ -584,15 +551,8 @@ impl BreachedSource {
     pub fn describe(&self) -> String {
         match self {
             Self::Range(api) => format!(
-                "range API {} (only 5-hex SHA-1 prefixes are sent){}",
-                api.host,
-                match (&api.fallback, api.usable_fallback()) {
-                    (None, _) => "",
-                    (Some(_), Some(_)) if api.fallback_complete =>
-                        ", complete offline fallback list",
-                    (Some(_), Some(_)) => ", offline fallback list",
-                    (Some(_), None) => ", fails closed during outages",
-                }
+                "range API {} (only 5-hex SHA-1 prefixes are sent), fails closed during outages",
+                api.host
             ),
             Self::Offline(list) => format!("offline list ({} digests)", list.len()),
         }
@@ -624,18 +584,11 @@ impl BreachedSource {
                             target: "vibe::breached_password_unavailable",
                             reason = err.category(),
                             status,
-                            fallback = api.usable_fallback().is_some(),
                             failures,
                             failures_total = breached_lookup_failures(),
                             "breached-password range lookup failed"
                         );
-                        match api.usable_fallback() {
-                            Some(list) => {
-                                tracing::warn!(reason = err.category(), complete = api.fallback_complete, "breached-password range API failed; using the offline fallback list");
-                                Ok(list.contains(&digest))
-                            }
-                            None => Err(err.to_string()),
-                        }
+                        Err(err.to_string())
                     }
                 }
             }
@@ -653,11 +606,9 @@ impl BreachedConfig {
 
     /// From the environment:
     /// - `VIBE_BREACHED_PASSWORDS_FILE`: offline list only, or
-    /// - `VIBE_BREACHED_PASSWORDS_URL` (default Pwned Passwords) with an
-    ///   optional `VIBE_BREACHED_PASSWORDS_FALLBACK_FILE` used when the API
-    ///   cannot answer. In production the fallback must be declared complete
-    ///   with `VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE=true`, otherwise
-    ///   startup fails; without a fallback an outage fails closed (503);
+    /// - `VIBE_BREACHED_PASSWORDS_URL` (default Pwned Passwords). Errors,
+    ///   timeouts and invalid responses fail closed (503 with Retry-After: 1)
+    ///   in every environment;
     /// - `VIBE_BREACHED_PASSWORDS_MIN_COUNT` (default 1, at most
     ///   [`MAX_MIN_COUNT`]),
     ///   `VIBE_BREACHED_PASSWORDS_TIMEOUT_MS` (default 2000, 100..=10000:
@@ -666,6 +617,16 @@ impl BreachedConfig {
         get: &dyn Fn(&str) -> Option<String>,
         production: bool,
     ) -> Result<Self, String> {
+        for name in [
+            "VIBE_BREACHED_PASSWORDS_FALLBACK_FILE",
+            "VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE",
+        ] {
+            if get(name).is_some() {
+                return Err(format!(
+                    "{name} was removed; unset it. Range-API outages always fail closed"
+                ));
+            }
+        }
         let var = |name: &str| {
             get(name)
                 .map(|v| v.trim().to_string())
@@ -673,16 +634,6 @@ impl BreachedConfig {
         };
         let file = var("VIBE_BREACHED_PASSWORDS_FILE");
         let url = var("VIBE_BREACHED_PASSWORDS_URL");
-        let fallback = var("VIBE_BREACHED_PASSWORDS_FALLBACK_FILE");
-        let fallback_complete = match var("VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE").as_deref() {
-            None | Some("false") | Some("0") => false,
-            Some("true") | Some("1") => true,
-            Some(_) => {
-                return Err(
-                    "VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE must be true or false".into(),
-                )
-            }
-        };
         let min_count = match var("VIBE_BREACHED_PASSWORDS_MIN_COUNT") {
             None => 1,
             Some(raw) => raw
@@ -717,43 +668,10 @@ impl BreachedConfig {
                         .into(),
                 )
             }
-            (Some(path), None) => {
-                if fallback.is_some() || fallback_complete {
-                    return Err(
-                        "VIBE_BREACHED_PASSWORDS_FALLBACK_FILE and VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE only apply to the range API"
-                            .into(),
-                    );
-                }
-                BreachedSource::Offline(OfflineList::load(&path, production)?)
-            }
+            (Some(path), None) => BreachedSource::Offline(OfflineList::load(&path, production)?),
             (None, url) => {
-                let mut api =
-                    RangeApi::new(url.as_deref().unwrap_or(DEFAULT_RANGE_URL), production)?
-                        .with_timeout(timeout);
-                match fallback {
-                    Some(path) => {
-                        if production && !fallback_complete {
-                            return Err(
-                                "VIBE_BREACHED_PASSWORDS_FALLBACK_FILE in production must be a complete breach list; set VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE=true to confirm, or unset the fallback so outages fail closed"
-                                    .into(),
-                            );
-                        }
-                        let list = OfflineList::load(&path, production)?;
-                        api = if fallback_complete {
-                            api.with_complete_fallback(list)
-                        } else {
-                            tracing::warn!("breached-password fallback list is not declared complete; it is used during range-API outages outside production only");
-                            api.with_fallback(list)
-                        };
-                    }
-                    None if fallback_complete => {
-                        return Err(
-                            "VIBE_BREACHED_PASSWORDS_FALLBACK_COMPLETE needs VIBE_BREACHED_PASSWORDS_FALLBACK_FILE"
-                                .into(),
-                        )
-                    }
-                    None => {}
-                }
+                let api = RangeApi::new(url.as_deref().unwrap_or(DEFAULT_RANGE_URL), production)?
+                    .with_timeout(timeout);
                 BreachedSource::Range(Box::new(api))
             }
         };
@@ -762,35 +680,5 @@ impl BreachedConfig {
 
     pub async fn is_breached(&self, plain: &str) -> Result<bool, String> {
         self.source.is_breached(plain, self.min_count).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn production_outage_without_complete_fallback_fails_closed() {
-        let list = || BreachedSource::builtin();
-        let take = |s: BreachedSource| match s {
-            BreachedSource::Offline(l) => l,
-            BreachedSource::Range(_) => unreachable!(),
-        };
-        // Port 9 on loopback refuses connections: the range API cannot answer.
-        let mut api = RangeApi::new("http://127.0.0.1:9/range/", false)
-            .unwrap()
-            .with_timeout(MIN_TIMEOUT)
-            .with_fallback(take(list()));
-        api.production = true;
-        let source = BreachedSource::Range(Box::new(api));
-        assert!(source.is_breached("password1234", 1).await.is_err());
-
-        let mut api = RangeApi::new("http://127.0.0.1:9/range/", false)
-            .unwrap()
-            .with_timeout(MIN_TIMEOUT)
-            .with_complete_fallback(take(list()));
-        api.production = true;
-        let source = BreachedSource::Range(Box::new(api));
-        assert_eq!(source.is_breached("password1234", 1).await, Ok(true));
     }
 }
