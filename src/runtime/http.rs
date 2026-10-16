@@ -628,20 +628,16 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     // Refresh routes answer every bad or missing token with the same 401,
     // so they run before request-table validation (which would give 422).
     if let Some(spec) = &found.route.refresh {
-        let mut response = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(started + Duration::from_millis(REFRESH_WORK_MS)),
-            refresh_response(
-                &state,
-                found.route,
-                spec,
-                &principal.tenant_id,
-                &ip,
-                &body,
-                &request_id,
-            ),
+        let mut response = refresh_response(
+            &state,
+            found.route,
+            spec,
+            &principal.tenant_id,
+            &ip,
+            &body,
+            &request_id,
         )
-        .await
-        .unwrap_or_else(|_| refresh_unavailable(&request_id));
+        .await;
         if response.status() == StatusCode::UNAUTHORIZED {
             if let Some(slug) = found.params.get("slug") {
                 let cookie = format!(
@@ -934,9 +930,9 @@ async fn finish(
     } else {
         0
     });
-    // All refresh paths share a request-start deadline and response floor.
+    // All refresh paths share a minimum response time.
     let min_ms = if route.refresh.is_some() {
-        min_ms.max(REFRESH_WORK_MS)
+        min_ms.max(REFRESH_MIN_RESPONSE_MS)
     } else {
         min_ms
     };
@@ -1263,20 +1259,12 @@ async fn authenticate(
             .key(&kid)
             .await
             .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
-        if found.alg != auth.alg {
-            // Decision 139: only the configured alg; other keys are unused.
-            return Err(AuthError::unauthorized("Bearer"));
-        }
         (found.alg, found.key)
     } else if let Some(jwks) = &auth.jwks {
         let found = jwks
             .key(&kid)
             .await
             .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
-        if found.alg != auth.alg {
-            // Decision 139: only the configured alg; other keys are unused.
-            return Err(AuthError::unauthorized("Bearer"));
-        }
         (found.alg, found.key)
     } else {
         if auth.public_pem.is_empty() || kid != auth.kid {
@@ -1291,7 +1279,7 @@ async fn authenticate(
         .map_err(|_| AuthError::unauthorized("Bearer"))?;
         (auth.alg, key)
     };
-    if jwt_header.alg != alg {
+    if alg != auth.alg || jwt_header.alg != alg {
         return Err(AuthError::unauthorized("Bearer"));
     }
     let iss = if route.jwt_iss.is_empty() {
@@ -1658,7 +1646,7 @@ fn limit_check(state: &AppState, checks: &[(String, String, u32)], owner: &str) 
 /// Platform ceilings for refresh routes (decision 72).
 // Bound database lookup, rotation and signing together; pad early results to
 // the same deadline in finish, including rate-limit and unknown-token paths.
-const REFRESH_WORK_MS: u64 = 300;
+const REFRESH_MIN_RESPONSE_MS: u64 = 300;
 const REFRESH_IP_PER_MINUTE: u32 = 30;
 const REFRESH_FAMILY_PER_MINUTE: u32 = 10;
 
@@ -1714,7 +1702,7 @@ fn rate_limited_response(request_id: &str, retry: &str) -> HttpResponse {
     )
 }
 
-/// `token-refresh`: rotate the presented token, then sign a new access token
+/// `token-refresh`: prepare the access token, then rotate the refresh token
 /// with the route's `sign-method`.
 async fn refresh_response(
     state: &AppState,
@@ -1748,7 +1736,7 @@ async fn refresh_response(
     let family = match state.exec.refresh_family(tenant, &hash).await {
         Ok(family) => family,
         Err(err) => {
-            tracing::error!(%request_id, %tenant, error = ?err, "refresh family lookup failed; failing closed");
+            tracing::error!(%request_id, tenant_hash = %log_id_hash(tenant), error = ?err, "refresh family lookup failed; failing closed");
             return refresh_unavailable(request_id);
         }
     };
@@ -1776,51 +1764,44 @@ async fn refresh_response(
     }
     let (new_token, new_hash) = super::ops::new_refresh_token(&state.auth.pepper);
     let policy = super::ops::policy_of(spec);
+    let user_id = match state.exec.refresh_subject(tenant, &hash).await {
+        Ok(Some(user_id)) => user_id,
+        Ok(None) => return invalid_refresh(request_id, "invalid"),
+        Err(_) => return refresh_unavailable(request_id),
+    };
+    let input = serde_json::json!({ "user_id": user_id });
+    let result = crud::run_method(
+        &state.manifest,
+        state.exec.as_ref(),
+        &spec.sign_method,
+        &input,
+        crud::CallCtx {
+            auth: &state.auth,
+            tenant_id: tenant,
+            role: "public_reader",
+            caller: crud::Caller {
+                subject: &user_id,
+                roles: &[],
+            },
+            refresh_token: Some(&new_token),
+        },
+        1,
+    )
+    .await;
+    let mut value = match result {
+        Ok(result) if result.value.get("access_token").is_some() => result.value,
+        _ => return refresh_unavailable(request_id),
+    };
+    // No fallible signing work remains after the rotation commits.
     match state
         .exec
         .refresh_rotate(tenant, &hash, &new_hash, policy)
         .await
     {
-        Ok(Rotated::Ok {
-            user_id,
-            expires_in,
-            ..
-        }) => {
-            let input = serde_json::json!({ "user_id": user_id });
-            let result = crud::run_method(
-                &state.manifest,
-                state.exec.as_ref(),
-                &spec.sign_method,
-                &input,
-                crud::CallCtx {
-                    auth: &state.auth,
-                    tenant_id: tenant,
-                    role: "public_reader",
-                    caller: crud::Caller {
-                        subject: &user_id,
-                        roles: &[],
-                    },
-                    refresh_token: Some(&new_token),
-                },
-                1,
-            )
-            .await;
-            match result {
-                Ok(result) if result.value.get("access_token").is_some() => {
-                    let mut value = result.value;
-                    value["refresh_token"] = Value::String(new_token);
-                    value["refresh_expires_in"] = Value::from(expires_in);
-                    json_response(StatusCode::OK, value, request_id, &[])
-                }
-                Ok(_) => {
-                    tracing::error!(%request_id, method = %spec.sign_method, "sign-method returned no access_token");
-                    invalid_refresh(request_id, "invalid")
-                }
-                Err(fail) => {
-                    tracing::error!(%request_id, method = %spec.sign_method, code = %fail.code, message = %fail.message, "refresh sign-method failed");
-                    invalid_refresh(request_id, "invalid")
-                }
-            }
+        Ok(Rotated::Ok { expires_in, .. }) => {
+            value["refresh_token"] = Value::String(new_token);
+            value["refresh_expires_in"] = Value::from(expires_in);
+            json_response(StatusCode::OK, value, request_id, &[])
         }
         Ok(Rotated::Reuse { family_id }) => {
             tracing::warn!(tenant_hash = %log_id_hash(tenant), family_hash = %log_id_hash(&family_id), "refresh token reuse detected; family revoked");

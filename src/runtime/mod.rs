@@ -45,3 +45,19 @@ pub use sql::{
     bootstrap_statements, quote as quote_ident, quote as sql_quote, runtime_grant_statements,
     runtime_schema_statements, Col,
 };
+
+/// Render process counters for an internal metrics collector.
+pub fn internal_metrics() -> String {
+    let mut output = format!(
+        "vibe_rate_limit_saturation_refusals_total {}\n",
+        saturation_refusals()
+    );
+    let mut rejections: Vec<_> = refresh_rejections().into_iter().collect();
+    rejections.sort_unstable_by_key(|(reason, _)| *reason);
+    for (reason, count) in rejections {
+        output.push_str(&format!(
+            "vibe_refresh_rejections_total{{reason=\"{reason}\"}} {count}\n"
+        ));
+    }
+    output
+}

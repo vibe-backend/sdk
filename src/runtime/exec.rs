@@ -69,6 +69,17 @@ pub trait QueryExec: Send + Sync {
     ) -> Result<u64, ExecError>;
 
     /// Family id of a stored refresh token hash (for the per-family limit).
+    /// Immutable subject associated with a stored token, before rotation.
+    async fn refresh_subject(
+        &self,
+        _tenant_id: &str,
+        _token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        Err(ExecError::Message(
+            "refresh subject lookup unavailable".into(),
+        ))
+    }
+
     async fn refresh_family(
         &self,
         tenant_id: &str,
@@ -199,6 +210,23 @@ impl QueryExec for MemoryExec {
             return Ok(None);
         };
         roles_from(row.get("roles")).map(Some)
+    }
+
+    async fn refresh_subject(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        let tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        Ok(tables.get(&key(tenant_id, REFRESH_TABLE)).and_then(|rows| {
+            rows.iter()
+                .find(|r| r.get("token_hash").and_then(Value::as_str) == Some(token_hash))
+                .and_then(|r| r.get("user_id").and_then(Value::as_str))
+                .map(str::to_string)
+        }))
     }
 
     async fn refresh_family(
@@ -1014,6 +1042,26 @@ impl QueryExec for PgExec {
         Ok(out)
     }
 
+    async fn refresh_subject(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        let rows = self
+            .run_tx(
+                tenant_id,
+                None,
+                false,
+                "SELECT user_id FROM _platform_refresh_tokens WHERE token_hash = $1",
+                vec![Some(token_hash.to_string())],
+            )
+            .await?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.get("user_id").and_then(Value::as_str))
+            .map(str::to_string))
+    }
+
     async fn refresh_family(
         &self,
         tenant_id: &str,
@@ -1068,7 +1116,7 @@ impl QueryExec for PgExec {
         let idle_ttl = policy.idle_ttl as f64;
         tx.execute(
             "INSERT INTO _platform_refresh_tokens (id, tenant_id, family_id, user_id, token_hash, created_at, family_expires_at, idle_expires_at) \
-             VALUES ($1::text::uuid, $2, $3::text::uuid, $4, $5, now(), now() + make_interval(secs => $6), now() + make_interval(secs => $7))",
+             VALUES ($1::text::uuid, $2, $3::text::uuid, $4, $5, clock_timestamp(), clock_timestamp() + make_interval(secs => $6), clock_timestamp() + make_interval(secs => $7))",
             &[&id, &tenant_id, &family, &user_id, &token_hash, &family_ttl, &idle_ttl],
         )
         .await
@@ -1276,7 +1324,7 @@ impl QueryExec for PgExec {
         }
         let n = tx
             .execute(
-                "UPDATE _platform_refresh_tokens SET revoked_at = now(), revoke_reason = 'logout' \
+                "UPDATE _platform_refresh_tokens SET revoked_at = clock_timestamp(), revoke_reason = 'logout' \
                  WHERE revoked_at IS NULL AND family_id::text = ANY($1)",
                 &[&families],
             )

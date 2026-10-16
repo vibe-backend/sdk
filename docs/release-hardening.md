@@ -45,3 +45,5 @@ WARN vibe::rate_limit_saturation: rate-limit shard saturated; refusing new keys 
 
 - `release` environment admin bypass is enabled (`can_admins_bypass: true`). An admin can deploy without Jack's environment approval. Jack accepted this risk.
 - An admin can bypass the `main` ruleset (OrganizationAdmin bypass). The only human approval gate is Jack approving the `release` environment; the automatic gates remain decisions 113/114/118. The same account (`j113203`) can approve its own release. Admin bypass stays on; Jack accepted this risk.
+
+Internal metrics collectors can call `vibe::runtime::internal_metrics()` for the saturation counter and `vibe_refresh_rejections_total{reason}` counters in Prometheus text format. Keep this export restricted to internal collectors.

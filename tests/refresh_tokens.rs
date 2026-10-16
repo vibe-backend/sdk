@@ -438,6 +438,9 @@ async fn refresh_rejections_are_available_to_internal_metrics() {
         StatusCode::UNAUTHORIZED
     );
     assert!(vibe::runtime::refresh_rejections()["invalid"] > before);
+    let exported = vibe::runtime::internal_metrics();
+    assert!(exported.contains("vibe_refresh_rejections_total{reason=\"invalid\"}"));
+    assert!(exported.contains("vibe_rate_limit_saturation_refusals_total"));
 }
 
 #[tokio::test]
@@ -622,6 +625,125 @@ fn pipeline_blocks_parse_and_check() {
         vibe::manifest::check_rate_key("family", false, "jwt").is_err(),
         "family only on refresh routes"
     );
+}
+
+#[tokio::test]
+async fn slow_rotation_still_returns_new_tokens() {
+    use vibe::runtime::refresh::RefreshPolicy;
+    use vibe::runtime::{PgExec, QueryExec};
+    let Ok(admin_url) = std::env::var("VIBE_TEST_PG_ADMIN_URL") else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "VIBE_TEST_PG_ADMIN_URL must be set in CI"
+        );
+        return;
+    };
+    let (admin, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let s = uuid::Uuid::new_v4().simple().to_string()[..10].to_string();
+    let tenant = format!("tr{s}");
+    let schema = format!("t_{tenant}");
+    let role = format!("refresh_app_{s}");
+    admin
+        .batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'pw'"))
+        .await
+        .unwrap();
+    for stmt in vibe::runtime::refresh::table_statements(&schema).unwrap() {
+        admin.batch_execute(&stmt).await.unwrap();
+    }
+    for stmt in vibe::runtime::refresh::runtime_grant_statements(&schema, &role).unwrap() {
+        admin.batch_execute(&stmt).await.unwrap();
+    }
+    let mut url = url::Url::parse(&admin_url).unwrap();
+    url.set_username(&role).unwrap();
+    url.set_password(Some("pw")).unwrap();
+    let exec = PgExec::connect(url.as_str()).await.unwrap();
+    let policy = RefreshPolicy {
+        family_ttl: 3600,
+        idle_ttl: 600,
+        grace: 10,
+    };
+    // A child insert waits inside the rotation transaction beyond the response floor.
+    admin
+        .batch_execute(&format!(
+            "CREATE FUNCTION {schema}.delay_rotation() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN IF NEW.parent_id IS NOT NULL THEN PERFORM pg_sleep(0.4); END IF; RETURN NEW; END $$;
+         CREATE TRIGGER delay_rotation BEFORE INSERT ON {schema}._platform_refresh_tokens
+         FOR EACH ROW EXECUTE FUNCTION {schema}.delay_rotation();"
+        ))
+        .await
+        .unwrap();
+    let m = manifest(10);
+    let _ = admin
+        .batch_execute("CREATE ROLE public_reader NOLOGIN")
+        .await;
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE {schema}.users (id text PRIMARY KEY, roles text[]);
+         INSERT INTO {schema}.users VALUES ('u1', ARRAY['staff']);
+         GRANT USAGE ON SCHEMA {schema} TO public_reader;
+         GRANT SELECT ON {schema}.users TO public_reader;"
+        ))
+        .await
+        .unwrap();
+    let base = app_with(m.clone());
+    let slugs = HashMap::from([(
+        "acme".into(),
+        Slug {
+            tenant_id: tenant.clone(),
+            public_access: true,
+            public_write: true,
+        },
+    )]);
+    let state = Arc::new(AppState {
+        manifest: m,
+        exec: Arc::new(PgExec::connect(&admin_url).await.unwrap()),
+        auth: base.state.auth.clone(),
+        slugs,
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
+        trusted_proxies: Vec::new(),
+        disabled: std::collections::HashSet::new(),
+        min_override_ms: None,
+        honor_test_ip: true,
+        dev_hints: false,
+        challenge: None,
+    });
+    use hmac::{Hmac, KeyInit, Mac};
+    let token = uuid::Uuid::new_v4().to_string();
+    let mut derive = Hmac::<sha2::Sha256>::new_from_slice(&state.auth.pepper).unwrap();
+    derive.update(b"vibe/refresh-token/v1");
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&derive.finalize().into_bytes()).unwrap();
+    mac.update(token.as_bytes());
+    let hash = hex::encode(mac.finalize().into_bytes());
+    let family = exec
+        .refresh_issue(&tenant, "u1", &hash, policy)
+        .await
+        .unwrap();
+    let a = App {
+        app: router(state.clone()),
+        manifest: state.manifest.clone(),
+        exec: base.exec,
+        state,
+    };
+    let (status, body, elapsed) = a.refresh(&token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(elapsed >= 400);
+    assert!(body.get("access_token").is_some());
+    let (status, body, _) = a.refresh(&tok(&body, "refresh_token")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let revoked: i64 = admin.query_one(&format!(
+        "SELECT count(*) FROM {schema}._platform_refresh_tokens WHERE family_id::text = $1 AND revoked_at IS NOT NULL"
+    ), &[&family]).await.unwrap().get(0);
+    assert_eq!(revoked, 0);
+    admin
+        .batch_execute(&format!(
+            "DROP TRIGGER delay_rotation ON {schema}._platform_refresh_tokens"
+        ))
+        .await
+        .unwrap();
 }
 
 /// The PostgreSQL store (row lock, grace, family revoke) against a real
@@ -954,6 +1076,7 @@ struct FamilyLookupFails {
     down: Arc<std::sync::atomic::AtomicBool>,
     lookup_delay_ms: u64,
     rotate_delay_ms: u64,
+    signer_delay_ms: u64,
 }
 
 #[async_trait::async_trait]
@@ -975,6 +1098,7 @@ impl vibe::runtime::QueryExec for FamilyLookupFails {
         sql: &str,
         params: Vec<Option<String>>,
     ) -> Result<Vec<vibe::runtime::Row>, vibe::runtime::ExecError> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.signer_delay_ms)).await;
         self.inner.raw(tenant_id, role, writes, sql, params).await
     }
 
@@ -1019,6 +1143,14 @@ impl vibe::runtime::QueryExec for FamilyLookupFails {
         self.inner.refresh_revoke(tenant_id, target).await
     }
 
+    async fn refresh_subject(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, vibe::runtime::ExecError> {
+        self.inner.refresh_subject(tenant_id, token_hash).await
+    }
+
     async fn refresh_family(
         &self,
         tenant_id: &str,
@@ -1042,6 +1174,7 @@ async fn family_lookup_error_fails_closed_and_keeps_the_token() {
             down: flag,
             lookup_delay_ms: 0,
             rotate_delay_ms: 0,
+            signer_delay_ms: 0,
         })
     });
     let r0 = tok(&a.login().await, "refresh_token");
@@ -1059,36 +1192,28 @@ async fn family_lookup_error_fails_closed_and_keeps_the_token() {
 }
 
 #[tokio::test]
-async fn refresh_database_waits_share_the_response_deadline() {
-    for (lookup_delay_ms, rotate_delay_ms) in [(100, 100), (1000, 0), (0, 1000)] {
+async fn refresh_waits_complete_and_new_tokens_remain_usable() {
+    for (lookup_delay_ms, rotate_delay_ms, signer_delay_ms) in
+        [(400, 0, 0), (0, 400, 0), (0, 0, 400)]
+    {
         let a = app_wrapped(manifest(10), move |inner| {
             Arc::new(FamilyLookupFails {
                 inner,
                 down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 lookup_delay_ms,
                 rotate_delay_ms,
+                signer_delay_ms,
             })
         });
         let token = tok(&a.login().await, "refresh_token");
-        let valid = a.raw_refresh(&token, "192.0.2.20").await;
-        let unknown = a.raw_refresh("unknown", "192.0.2.21").await;
-        let missing = a.raw_refresh("", "192.0.2.22").await;
-        for response in [&valid, &unknown, &missing] {
-            assert!(response.3 >= 300);
-            assert!(
-                response.3 < 650,
-                "request exceeded response floor: {}ms",
-                response.3
-            );
-        }
-        assert_eq!(
-            valid.0,
-            if lookup_delay_ms + rotate_delay_ms < 300 {
-                StatusCode::OK
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
-        );
+        let (status, body, elapsed) = a.refresh(&token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(elapsed >= 400);
+        assert!(body.get("access_token").is_some());
+        let next = tok(&body, "refresh_token");
+        let (status, body, _) = a.refresh(&next).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("access_token").is_some());
     }
 }
 
