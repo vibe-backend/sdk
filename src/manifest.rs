@@ -774,7 +774,7 @@ fn steps_from(section: Option<&crate::lock::Section>) -> Vec<StepSpec> {
         .collect()
 }
 
-fn parse_challenge(raw: &str) -> (String, String) {
+pub(crate) fn parse_challenge(raw: &str) -> (String, String) {
     let map = crate::lock::parse_inline_map(raw).unwrap_or_default();
     let ty = map
         .iter()
