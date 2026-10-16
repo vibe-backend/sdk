@@ -4,7 +4,7 @@ ROOT=pathlib.Path(__file__).resolve().parents[1]; SCRIPT=ROOT/"scripts/vibe-inst
 class T(unittest.TestCase):
  def setUp(self):
   self.t=pathlib.Path(tempfile.mkdtemp()); self.server=self.t/"server"; self.cmd=self.t/"cmd"; self.dest=self.t/"install"; self.server.mkdir(); self.cmd.mkdir()
-  self.command("uname",'#!/bin/sh\n[ "$1" = "-s" ] && echo Linux || echo x86_64\n'); self.command("gh",'#!/bin/sh\n[ "${MOCK_ATTEST_FAIL:-0}" != 1 ]\n')
+  self.command("uname",'#!/bin/sh\n[ "$1" = "-s" ] && echo Linux || echo x86_64\n'); self.command("gh",'#!/bin/sh\nprintf "%s\\n" "$*" >> "$MOCK_GH_LOG"\nif [ "$1" = api ]; then echo "${MOCK_SHA:-0123456789abcdef0123456789abcdef01234567}"; exit 0; fi\n[ "${MOCK_ATTEST_FAIL:-0}" != 1 ]\n')
   self.command("curl",'''#!/bin/sh
 set -eu
 out=; url=
@@ -13,7 +13,7 @@ if echo "$url"|grep -q '/releases/latest$';then printf '%s/test/repo/releases/ta
 [ "${MOCK_NETWORK_FAIL:-0}" != 1 ]||exit 22
 name=${url##*/};rest=${url#*/download/};version=${rest%%/*};cp "$MOCK_SERVER/$version/$name" "$out"
 ''')
-  self.env=os.environ|{"PATH":f"{self.cmd}:{os.environ['PATH']}","MOCK_SERVER":str(self.server),"VIBE_INSTALL_REPOSITORY":"test/repo","VIBE_INSTALL_DOWNLOAD_URL":"https://mock.invalid","VIBE_INSTALL_DIR":str(self.dest)}; self.release("v1.0.0","one");self.release("v2.0.0","two")
+  self.env=os.environ|{"PATH":f"{self.cmd}:{os.environ['PATH']}","MOCK_SERVER":str(self.server),"MOCK_GH_LOG":str(self.t/"gh.log"),"VIBE_INSTALL_REPOSITORY":"test/repo","VIBE_INSTALL_DOWNLOAD_URL":"https://mock.invalid","VIBE_INSTALL_DIR":str(self.dest)}; self.release("v1.0.0","one");self.release("v2.0.0","two")
  def tearDown(self):shutil.rmtree(self.t)
  def command(self,n,b):p=self.cmd/n;p.write_text(b);p.chmod(0o755)
  def release(self,v,text,bad=False):
@@ -33,4 +33,12 @@ name=${url##*/};rest=${url#*/download/};version=${rest%%/*};cp "$MOCK_SERVER/$ve
  def test_permission_invalid_destination(self):p=self.t/"file";p.write_text("x");self.assertNotEqual(self.runit("install","--version","v1.0.0","--install-dir",str(p)).returncode,0)
  def test_unmanaged_not_overwritten_or_removed(self):self.dest.mkdir();p=self.dest/"vibe";p.write_text("owned");self.assertNotEqual(self.runit("install","--version","v1.0.0").returncode,0);self.assertNotEqual(self.runit("remove").returncode,0);self.assertEqual(p.read_text(),"owned")
  def test_lock_blocks_parallel(self):self.dest.mkdir();(self.dest/".vibe-install.lock").mkdir();self.assertIn("another",self.runit("install","--version","v1.0.0").stderr)
+ def test_attestation_identity_is_pinned(self):
+  self.install1();log=(self.t/"gh.log").read_text().splitlines()
+  self.assertIn("api repos/vibe-backend/sdk/commits/refs/tags/v1.0.0 --jq .sha",log)
+  verify=[l for l in log if l.startswith("attestation verify ")];self.assertEqual(len(verify),1)
+  self.assertTrue(verify[0].endswith(" --repo vibe-backend/sdk --signer-workflow vibe-backend/sdk/.github/workflows/release.yml --source-ref refs/tags/v1.0.0 --source-digest 0123456789abcdef0123456789abcdef01234567 --deny-self-hosted-runners"),verify[0])
+ def test_bad_source_sha_fails(self):self.assertNotEqual(self.runit("install","--version","v1.0.0",env=self.env|{"MOCK_SHA":"not-a-sha"}).returncode,0);self.assertFalse((self.dest/"vibe").exists())
+ def test_curl_https_only(self):
+  t=SCRIPT.read_text();self.assertEqual(t.count("curl -f"),t.count("--proto '=https' --tlsv1.2"))
 if __name__=='__main__':unittest.main(verbosity=2)

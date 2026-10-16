@@ -3,6 +3,9 @@ set -eu
 PROGRAM=vibe
 REPOSITORY=${VIBE_INSTALL_REPOSITORY:-vibe-backend/sdk}
 DOWNLOAD_URL=${VIBE_INSTALL_DOWNLOAD_URL:-https://github.com}
+# Provenance identity is fixed (D118, spec 2C.3b/9C); no environment variable can change it.
+ATTEST_REPO=vibe-backend/sdk
+ATTEST_WORKFLOW=vibe-backend/sdk/.github/workflows/release.yml
 VERSION=
 INSTALL_DIR=${VIBE_INSTALL_DIR:-"${HOME:-}/.local/bin"}
 ACTION=
@@ -46,7 +49,7 @@ if [ "$ACTION" = remove ]; then
 fi
 [ "$ACTION" != install ] || [ -n "$VERSION" ] || die "install requires --version vX.Y.Z"
 need curl; need tar; need awk; need gh
-if [ -z "$VERSION" ]; then latest=$(curl -fsSIL -o /dev/null -w '%{url_effective}' "$DOWNLOAD_URL/$REPOSITORY/releases/latest") || die "failed to resolve latest release"; prefix="$DOWNLOAD_URL/$REPOSITORY/releases/tag/"; case $latest in "$prefix"*) VERSION=${latest#"$prefix"};; *) die "latest release redirected outside expected repository";; esac; fi
+if [ -z "$VERSION" ]; then latest=$(curl -fsSIL --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' "$DOWNLOAD_URL/$REPOSITORY/releases/latest") || die "failed to resolve latest release"; prefix="$DOWNLOAD_URL/$REPOSITORY/releases/tag/"; case $latest in "$prefix"*) VERSION=${latest#"$prefix"};; *) die "latest release redirected outside expected repository";; esac; fi
 printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || die "invalid stable release version: $VERSION"
 os=$(uname -s) || die "cannot detect OS"; arch=$(uname -m) || die "cannot detect architecture"
 case "$os:$arch" in Linux:x86_64|Linux:amd64) target=x86_64-unknown-linux-gnu;; Linux:aarch64|Linux:arm64) target=aarch64-unknown-linux-gnu;; Darwin:x86_64|Darwin:amd64) target=x86_64-apple-darwin;; Darwin:arm64|Darwin:aarch64) target=aarch64-apple-darwin;; *) die "unsupported platform: $os/$arch";; esac
@@ -56,7 +59,9 @@ curl -fL --retry 2 --proto '=https' --tlsv1.2 -o "$tmp/SHA256SUMS" "$base/SHA256
 expected=$(awk -v n="$asset" '$2==n||$2=="*"n{print $1; found++} END{if(found!=1)exit 1}' "$tmp/SHA256SUMS") || die "SHA256SUMS must contain exactly one asset entry"
 case $expected in ''|*[!0-9a-fA-F]*) die "invalid SHA-256";; esac; [ "${#expected}" -eq 64 ] || die "invalid SHA-256 length"
 [ "$(sha256_file "$tmp/$asset")" = "$expected" ] || die "checksum verification failed"
-gh attestation verify "$tmp/$asset" --repo "$REPOSITORY" >/dev/null || die "GitHub artifact attestation verification failed"
+source_sha=$(gh api "repos/$ATTEST_REPO/commits/refs/tags/$VERSION" --jq .sha) || die "failed to resolve commit for $VERSION in $ATTEST_REPO"
+case $source_sha in *[!0-9a-f]*|'') die "invalid commit SHA for $VERSION";; esac; [ "${#source_sha}" -eq 40 ] || die "invalid commit SHA length for $VERSION"
+gh attestation verify "$tmp/$asset" --repo "$ATTEST_REPO" --signer-workflow "$ATTEST_WORKFLOW" --source-ref "refs/tags/$VERSION" --source-digest "$source_sha" --deny-self-hosted-runners >/dev/null || die "GitHub artifact attestation verification failed"
 [ "$(tar -tzf "$tmp/$asset" | wc -l | tr -d ' ')" = 1 ] || die "archive must contain exactly one entry"
 [ "$(tar -tzf "$tmp/$asset")" = vibe ] || die "archive contains an unexpected path"
 mkdir "$tmp/unpack"; tar -xzf "$tmp/$asset" -C "$tmp/unpack" || die "failed to extract archive"; [ -f "$tmp/unpack/vibe" ] && [ ! -L "$tmp/unpack/vibe" ] || die "archive entry must be a regular file"
