@@ -27,9 +27,10 @@ For each request the server:
    reservations at a time; beyond that the request is rejected without calling
    the provider. A verified token is kept for the 300 s token lifetime plus a
    margin; a rejected token is kept for 10 s; a reservation without an answer
-   (provider unavailable) is released. When the cache (100,000 entries) is
+   (provider unavailable) is released; a pending reservation whose request was
+   interrupted is held for 30 s. When the cache (100,000 entries) is
    full of live tokens, the spec (decision 134) answers 429 with `Retry-After`;
-   the current code still answers 503 (not yet implemented, follow-up issue to be opened).
+   the current code still answers 503 (not yet implemented, follow-up issue #204).
 3. Calls `https://challenges.cloudflare.com/turnstile/v0/siteverify` with the
    secret, the token and the client IP (5 s timeout, no redirects, public
    addresses only).
@@ -96,17 +97,18 @@ Turnstile's own single-use check (`timeout-or-duplicate`) applies in addition.
 
 A full replay store still fails closed: a request is never admitted without recording its replay entry. Each occurrence emits the metric `vibe_challenge_rejected_total{reason="replay_store_full"}` and raises the alert `challenge_replay_store_full` (names pending PM confirmation).
 
-Implementation status: not yet aligned with spec decisions 131, 134 and 135 (follow-up issue to be opened):
+Implementation status: not yet aligned with spec decisions 131, 134 and 135 (follow-up issues #202, #203, #204):
 
 - The 503 has no `Retry-After` header yet.
 - The current code also returns 503 when no verifier is configured and for a `type: pow` route; under the spec these are rejected at build or startup (decisions 131, 134).
-- A full replay cache or store returns 503 today; the spec requires 429 with the computed `Retry-After`, the `replay_store_full` metric and the alert (decision 134). Not yet implemented, follow-up issue to be opened.
+- A full replay cache or store returns 503 today; the spec requires 429 with the computed `Retry-After`, the `replay_store_full` metric and the alert (decision 134). Not yet implemented, follow-up issue #204.
+- Per-network-prefix cap (decision 134): in each tenant's replay store, each IPv4 /24 or IPv6 /48 may hold at most 16 entries by default (matching decision 130); over the cap the request gets 429 with reason `replay_prefix_cap`. An alert fires when replay store utilization exceeds 80%. Not yet implemented, follow-up issue #204.
 
 In production (`VIBE_ENV`), `vibe serve` refuses to start and `vibe validate --deploy`
 fails if any route uses `challenge ... when: always` and no verifier is configured.
 Implementation status: the gate only covers public `when: always` routes; spec
 decision 134 also covers `after-failures` and authenticated opt-in routes
-(follow-up issue to be opened).
+(follow-up issues #200, #201).
 Challenges do not replace server-side rate limits and quotas. The route's rate
 limits and the public write quota are checked before the challenge, so a
 limited request never reaches the replay cache or the provider.

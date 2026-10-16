@@ -242,7 +242,7 @@
 | 131 | v1 challenge provider 係 Cloudflare Turnstile：`type: captcha` 一律由 server 端 siteverify 驗證，只有 header 存在唔算通過。`type: pow` v1 唔支援（修訂決定 49：v1 有 INSERT 嘅 public endpoint 一定要 `type: captcha`）；`type: pow` 係 **build 時驗證器 error**，`vibe build`、`vibe validate` 同部署一律失敗，唔會去到 runtime。 | 已確認（產品經理 2026-10-16） | 7.2a、10.7 |
 | 132 | Server 端 siteverify：每個 request 帶 `x-challenge-proof` header；server 先拒絕空或者超過 2048 字元嘅 token，再喺 replay store 預留 token（只存 SHA-256），然後 call Turnstile siteverify（5s timeout、唔跟 redirect、只准公網地址），送 secret、token 同 client IP。一定要 `success: true`、`hostname` 喺 `VIBE_CHALLENGE_HOSTNAMES`、`action` 等於 endpoint 名、`challenge_ts` 存在而且唔超過 300s 前、唔超過 60s 後。每個 token 最多用一次。**Replay store（#177）**：production 一律用共用 Postgres replay store（所有 instance 共用），冇設定或者連唔到就拒絕啟動；per-process cache 只限 dev／test。Turnstile 本身嘅單次使用檢查（`timeout-or-duplicate`）只係額外一層，唔係主要防線。 | 已確認（產品經理 2026-10-16） | 7.2a |
 | 133 | 邊啲 endpoint 要 challenge：跟決定 38、49：有 INSERT 嘅 public endpoint `{ type: captcha, when: always }`；login 類 `{ type: captcha, when: after-failures, after-failures: 3 }`；其他冇 INSERT 嘅 public 寫入可以 `type: none`。已認證 endpoint 預設**唔要**，但可以經 source frontmatter `challenge: captcha` opt-in（lock 寫 `{ type: captcha, when: always }`）；refresh endpoint（決定 72）唔要求。 | 已確認（產品經理 2026-10-16） | 7.2、7.2a |
-| 134 | 失敗、超時同 fail closed：503 `CHALLENGE_UNAVAILABLE` **只限** provider 或者網絡失敗（provider 唔可達、超時、回應唔啱，同 replay store 暫時連唔到），永遠唔會當通過、冇 fallback；token 無效一律係 403，唔會變 503。**Replay store 滿**（已確認（產品經理 2026-10-16））：係流量造成嘅容量限制，唔係 provider 失敗，所以回 **429** `CHALLENGE_RATE_LIMITED`（名稱待產品經理確認）加 `Retry-After`，唔回 503；照樣 fail closed：未成功記錄 replay 就永遠唔准放行。`Retry-After` = store 入面最舊紀錄嘅剩餘有效時間，上限 360s；計唔到就固定 60。同時發 metric `vibe_challenge_rejected_total{reason="replay_store_full"}`（名稱待產品經理確認）並觸發告警 `challenge_replay_store_full`（名稱待產品經理確認）。設定問題喺啟動時擋：production（`VIBE_ENV`）有任何 challenge route 而冇設定 verifier 或者共用 replay store，`vibe serve` 拒絕啟動、`vibe validate --deploy` 失敗。Dev（`vibe dev`）用假 verifier（一律通過，terminal 標示，決定 74），production 永遠唔准用。 | 已確認（產品經理 2026-10-16） | 7.2a、2C.4 |
+| 134 | 失敗、超時同 fail closed：503 `CHALLENGE_UNAVAILABLE` **只限** provider 或者網絡失敗（provider 唔可達、超時、回應唔啱，同 replay store 暫時連唔到），永遠唔會當通過、冇 fallback；token 無效一律係 403，唔會變 503。**Replay store 滿**（已確認（產品經理 2026-10-16））：係流量造成嘅容量限制，唔係 provider 失敗，所以回 **429** `CHALLENGE_RATE_LIMITED`（名稱待產品經理確認）加 `Retry-After`，唔回 503；照樣 fail closed：未成功記錄 replay 就永遠唔准放行。`Retry-After` = store 入面最舊紀錄嘅剩餘有效時間，上限 360s；計唔到就固定 60。同時發 metric `vibe_challenge_rejected_total{reason="replay_store_full"}`（名稱待產品經理確認）並觸發告警 `challenge_replay_store_full`（名稱待產品經理確認）。**每個網段上限**（已確認（產品經理 2026-10-16））：每個租戶嘅 replay store 入面，每個網段（IPv4 /24、IPv6 /48）可以持有嘅記錄有上限，預設 16（同決定 130 一致）；超過回 429，reason `replay_prefix_cap`。Replay store 使用率超過 80% 觸發告警。設定問題喺啟動時擋：production（`VIBE_ENV`）有任何 challenge route 而冇設定 verifier 或者共用 replay store，`vibe serve` 拒絕啟動、`vibe validate --deploy` 失敗。Dev（`vibe dev`）用假 verifier（一律通過，terminal 標示，決定 74），production 永遠唔准用。 | 已確認（產品經理 2026-10-16） | 7.2a、2C.4 |
 | 135 | 錯誤碼：400 `CHALLENGE_REQUIRED`（冇 proof）；403 `CHALLENGE_FAILED`（偽造、重用、過期、時間錯、hostname／action 唔啱、每 IP／每租戶未驗證預留上限，即係所有 token 無效情況）；503 `CHALLENGE_UNAVAILABLE`（只限 provider／網絡失敗，固定帶 `Retry-After: 5`）；429 `CHALLENGE_RATE_LIMITED`（名稱待產品經理確認）（replay store 滿，決定 134，`Retry-After` 按最舊紀錄剩餘時間，上限 360s，計唔到用 60）。限流同配額係另一回事，回 429 `RATE_LIMITED`（帶 `Retry-After`），唔會用 503。錯誤 body 唔包含 token、provider 原始錯誤碼或者 secret；詳細原因只入 server log 同審計。 | 已確認（產品經理 2026-10-16） | 7.2a、8 |
 | 136 | Secret 處理：`VIBE_TURNSTILE_SECRET` 只可以由環境變數或者 secret manager（例如 CI environment secret）注入；唔准寫入 source、lock、manifest、`.env` commit 或者 log；錯誤訊息同 debug 輸出只顯示「已設定／未設定」。驗證器見到 lock 或者 source 有疑似 secret 值即報 error。設定：`VIBE_CHALLENGE_PROVIDER`（預設 `turnstile`）、`VIBE_TURNSTILE_SECRET`、`VIBE_CHALLENGE_HOSTNAMES`（有 secret 就一定要有）、`VIBE_CHALLENGE_REPLAY_STORE`（production 一定 `postgres`，#177）；預設同 production 規則見 7.2a。 | 已確認（產品經理 2026-10-16） | 7.2a、2A.8.5 |
 | 137 | 同限流組合：route 限流（決定 25、39）同 public 寫入每日配額喺 challenge 之前檢查，超過回 **429**（同 challenge 嘅 503 分開），被限流嘅 request 唔會去到 replay store 或者 provider；challenge 唔取代限流同配額。v1 用固定平台數值：token 壽命 300s、每 client IP 最多 16、每租戶最多 1,000 個未驗證預留（超過回 403 `CHALLENGE_FAILED`，唔 call provider）；**冇租戶 override**。將來如果加 override，只可以調低，唔可以調高。 | 已確認（產品經理 2026-10-16） | 7.2a、4.3 |
@@ -1276,7 +1276,7 @@ migration 放喺 ./migrations/main/。
     - 建立資料（有 INSERT）嘅 public endpoint：一定要 `type: captcha` 或者 `pow`，`when: always`（v1 只支援 `captcha`，`pow` 係 build error，見 7.2a 決定 131）。
     - login 類 endpoint：一定要 `{ type: captcha, when: after-failures, after-failures: 3 }`（跟 4A.3）。
     - 其他冇 INSERT 嘅 public 寫入：可以 `type: none`。
-    - Challenge token 單次使用狀態（#157，產品決定）：production 有設定 verifier 時一律用 PostgreSQL replay store；表喺每個租戶自己 schema（`t_<tenant>.vibe_challenge_replay`，有 `tenant_id`、ENABLE + FORCE RLS，owner role 擁有，由該租戶嘅 `vibe migrate` 建立），冇跨租戶共用表（決定 97）。runtime role 只有 SELECT、INSERT，冇 DELETE／UPDATE（決定 27）：預留同結果都係追加記錄，讀取忽略過期記錄，過期記錄只由 owner role 喺 `vibe migrate` 刪除。容量上限同 quota 按租戶計；client IP 用每租戶 key 嘅 HMAC 儲存。表唔存在、用唔到或者 runtime role 權限多過 SELECT／INSERT 就拒絕啟動；production 設 `VIBE_CHALLENGE_REPLAY_STORE=memory` 亦拒絕啟動。dev／CI 一定要明確揀 `memory` 或者 `postgres`，冇預設值。v1 captcha provider 係 Cloudflare Turnstile。
+    - Challenge token 單次使用狀態（#157，產品決定）：production 有設定 verifier 時一律用 PostgreSQL replay store；表喺每個租戶自己 schema（`t_<tenant>.vibe_challenge_replay`，有 `tenant_id`、ENABLE + FORCE RLS，owner role 擁有，由該租戶嘅 `vibe migrate` 建立），冇跨租戶共用表（決定 97）。runtime role 只有 SELECT、INSERT，冇 DELETE／UPDATE（決定 27）：預留同結果都係追加記錄，讀取忽略過期記錄，過期記錄只由 owner role 喺 `vibe migrate` 刪除。Fail closed 唔依賴清理：清理冇做或者延遲，只會令 store 較早滿，滿咗按決定 134 回 429，永遠唔會放行未記錄 replay 嘅 request（見 #193）。容量上限同 quota 按租戶計；client IP 用每租戶 key 嘅 HMAC 儲存。表唔存在、用唔到或者 runtime role 權限多過 SELECT／INSERT 就拒絕啟動；production 設 `VIBE_CHALLENGE_REPLAY_STORE=memory` 亦拒絕啟動。dev／CI 一定要明確揀 `memory` 或者 `postgres`，冇預設值。v1 captcha provider 係 Cloudflare Turnstile。
   - **註冊（password 寫入）**（決定 47）：public 路徑寫 password 類型欄位只准一種方式：
     - method 標 `capabilities: [set-password]`（高風險安全項目），而且寫入 password 欄位嘅值一定係同一 method 內 `hash-password` op 嘅輸出；直接用 request 值寫 password 欄位一律 error。
     - api lock `## Access` 寫 `password-write: allow`，`writable-columns` 明確列出 password 欄位。
@@ -1290,7 +1290,7 @@ migration 放喺 ./migrations/main/。
 
 ### 7.2a Challenge 驗證：Turnstile（決定 131–138，issue #160，已確認（產品經理 2026-10-16））
 
-> 本節已確認（產品經理 2026-10-16）。實作細節見 [`challenge.md`](challenge.md)；共用 replay store 見 #177。
+> 本節已確認（產品經理 2026-10-16），包括 replay store 滿回 429 同每個網段上限（決定 134，2026-10-16 補充）。實作細節見 [`challenge.md`](challenge.md)；共用 replay store 見 #177。
 
 #### 宣告語法
 
@@ -1324,7 +1324,7 @@ Source 用自然語言寫「要 captcha」，frontmatter 一樣要宣告 public 
 
 1. 限流同 public 寫入配額（決定 137）；超過即 **429** `RATE_LIMITED`（同 challenge 嘅 503 分開）。
 2. 冇 `x-challenge-proof` → 400 `CHALLENGE_REQUIRED`。
-3. Token 格式、共用 replay store 預留、每 IP／租戶預留上限 → 無效即 403 `CHALLENGE_FAILED`；store 滿 → 429 `CHALLENGE_RATE_LIMITED`（名稱待產品經理確認）加 `Retry-After`，唔記錄 replay 就唔放行（決定 134）。
+3. Token 格式、共用 replay store 預留、每 IP／租戶預留上限 → 無效即 403 `CHALLENGE_FAILED`；replay store 連唔到或者出錯 → **503** `CHALLENGE_UNAVAILABLE` 加 `Retry-After: 5`（唔係 403）；網段超過上限 → 429（reason `replay_prefix_cap`）；store 滿 → 429 `CHALLENGE_RATE_LIMITED`（名稱待產品經理確認）加 `Retry-After`，唔記錄 replay 就唔放行（決定 134）。
 4. Siteverify（決定 132）→ token 無效 403；provider／網絡失敗（包括 replay store 暫時連唔到）503 加 `Retry-After: 5`（fail closed，決定 134）。
 5. 通過之後先執行 lock steps。
 
@@ -1370,21 +1370,26 @@ Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動�
 | --- | --- |
 | 已驗證 token 保留時間（replay TTL） | 360s（token 壽命 300s + 60s clock skew 邊際） |
 | 被拒 token 保留時間（rejected hold） | 10s |
-| 未有答覆嘅預留（provider 唔可用） | 即時釋放 |
+| 未有答覆嘅預留（provider 唔可用，正常 settle） | 即時釋放 |
+| Request 中斷、未 settle 嘅 pending 預留（pending hold） | 30s |
+| Token 長度上限 | 2048 字元 |
+| Siteverify timeout | 5s |
+| 每個網段（IPv4 /24、IPv6 /48）每租戶持有上限 | 16（同決定 130 一致）；超過回 429，reason `replay_prefix_cap` |
+| 使用率告警 | 超過 80% |
 | 容量上限 | Postgres store：每租戶 10,000；memory store（只限 dev／CI）：每 process 100,000；滿咗回 429（決定 134） |
 
 #### 實作狀態（對比 `main` 4b85de5）
 
-以下決定係產品經理已確認嘅 spec 目標，**唔會因為 code 未做而放寬**；未做嘅部分標明，跟進 issue 會另外開（follow-up issue to be opened）。
+以下決定係產品經理已確認嘅 spec 目標，**唔會因為 code 未做而放寬**；未做嘅部分標明，跟進 issue 見下表（#200–#205）。
 
 | 決定 | 狀態 | 差異 |
 | --- | --- | --- |
-| 134 啟動閘門 | **Implementation status: not yet implemented**（部分） | `src/main.rs` 同 `src/runtime/challenge.rs` `production_gate` 只檢查 `public` 而且 `when: always` 嘅 route；`after-failures` 同決定 133 已認證 opt-in route 冇 verifier 時唔會擋啟動。Follow-up issue to be opened。 |
-| 133 Runtime 執行範圍 | **Implementation status: not yet implemented**（部分） | `src/runtime/http.rs` 只對 `public` 而且 `when: always` 嘅 route 做 challenge；`after-failures`（login）同已認證 opt-in route 而家唔會驗證 challenge。Follow-up issue to be opened。 |
-| 135 `Retry-After: 5` | **Implementation status: not yet implemented** | `src/runtime/http.rs` `check_challenge` 回 503 `CHALLENGE_UNAVAILABLE` 時冇 `Retry-After` header。Follow-up issue to be opened。 |
-| 131 `type: pow` build error | **Implementation status: not yet implemented** | `src/validate.rs` 冇呢個檢查；而家係 runtime 回 503。Follow-up issue to be opened。 |
-| 134 503 範圍 | **Implementation status: not yet implemented**（部分） | Production 冇 verifier 嘅 `when: always` public route 已經喺啟動擋；但 runtime 對「冇 verifier」同 `type: pow` 仍然回 503（應該喺 build／啟動擋）。Replay store 容量滿而家回 503，決定 134（已確認（產品經理 2026-10-16））要求 429 加 `Retry-After`、metric 同告警：not yet implemented，follow-up issue to be opened。 |
-| 136 Turnstile secret 掃描 | **Implementation status: not yet implemented** | `src/secret.rs` 只比對已設定嘅 LLM key 同 `sk-`／`AKIA` 格式；冇比對 `VIBE_TURNSTILE_SECRET` 嘅值，亦冇 Turnstile secret 格式規則，所以而家捉唔到。Follow-up issue to be opened。 |
+| 134 啟動閘門 | **Implementation status: not yet implemented**（部分） | `src/main.rs` 同 `src/runtime/challenge.rs` `production_gate` 只檢查 `public` 而且 `when: always` 嘅 route；`after-failures` 同決定 133 已認證 opt-in route 冇 verifier 時唔會擋啟動。follow-up issue #200。 |
+| 133 Runtime 執行範圍 | **Implementation status: not yet implemented**（部分） | `src/runtime/http.rs` 只對 `public` 而且 `when: always` 嘅 route 做 challenge；`after-failures`（login）同已認證 opt-in route 而家唔會驗證 challenge。follow-up issue #201。 |
+| 135 `Retry-After: 5` | **Implementation status: not yet implemented** | `src/runtime/http.rs` `check_challenge` 回 503 `CHALLENGE_UNAVAILABLE` 時冇 `Retry-After` header。follow-up issue #202。 |
+| 131 `type: pow` build error | **Implementation status: not yet implemented** | `src/validate.rs` 冇呢個檢查；而家係 runtime 回 503。follow-up issue #203。 |
+| 134 503 範圍 | **Implementation status: not yet implemented**（部分） | Production 冇 verifier 嘅 `when: always` public route 已經喺啟動擋；但 runtime 對「冇 verifier」同 `type: pow` 仍然回 503（應該喺 build／啟動擋）。Replay store 容量滿而家回 503，決定 134（已確認（產品經理 2026-10-16））要求 429 加 `Retry-After`、metric 同告警；每個網段持有上限（IPv4 /24、IPv6 /48，預設 16，429 reason `replay_prefix_cap`）同使用率超過 80% 告警亦未做：not yet implemented，follow-up issue #204。 |
+| 136 Turnstile secret 掃描 | **Implementation status: not yet implemented** | `src/secret.rs` 只比對已設定嘅 LLM key 同 `sk-`／`AKIA` 格式；冇比對 `VIBE_TURNSTILE_SECRET` 嘅值，亦冇 Turnstile secret 格式規則，所以而家捉唔到。follow-up issue #205。 |
 
 ### 7.3 schema 升級去 database（離線遷移，CLI `tenant migrate`）
 
