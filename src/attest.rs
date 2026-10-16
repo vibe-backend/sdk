@@ -30,6 +30,7 @@
 //! `--insecure-dev` opt-in when `VIBE_ENV` is unset). Release builds always
 //! require Sigstore verification.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use sigstore_trust_root::{TrustedRoot, SIGSTORE_PRODUCTION_TRUSTED_ROOT};
@@ -185,6 +186,103 @@ pub struct Identity {
     pub rekor_log_index: String,
 }
 
+/// Alert and metric name emitted when a manifest is refused because the
+/// embedded trust root cannot verify it (spec 2C.3b). See
+/// `docs/ci/sigstore-trust-root.md` for the runbook.
+pub const TRUST_ROOT_REJECTED: &str = "manifest_trust_root_rejected";
+/// Early-warning alert: the embedded trust root already lists a key or CA
+/// whose validity window ends or starts in the future, i.e. a rotation that
+/// Sigstore has announced.
+pub const TRUST_ROOT_ROTATION_PENDING: &str = "manifest_trust_root_rotation_pending";
+
+static TRUST_ROOT_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Number of manifests refused with [`TRUST_ROOT_REJECTED`] by this process.
+pub fn trust_root_rejected_total() -> u64 {
+    TRUST_ROOT_REJECTED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Whether a verifier error means the trust root could not vouch for the
+/// bundle (unknown or expired CA / log key, unusable root) rather than a
+/// bad signature, digest or identity.
+pub fn is_trust_root_failure(err: &sigstore_verify::Error) -> bool {
+    use sigstore_verify::{CertificateError, Error, TransparencyLogError};
+    matches!(
+        err,
+        Error::InvalidTrustRoot(_)
+            | Error::TrustRoot(_)
+            | Error::TrustedCertificate(_)
+            | Error::Certificate(
+                CertificateError::ChainInvalid(_) | CertificateError::NoValidAuthority { .. }
+            )
+            | Error::TransparencyLog(TransparencyLogError::UnknownLog { .. })
+    )
+}
+
+/// Counts and logs a trust-root rejection. The log line carries
+/// `alert = "manifest_trust_root_rejected"` for log-based alerting.
+fn record_trust_root_rejection(reason: &str) {
+    let total = TRUST_ROOT_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::error!(
+        alert = TRUST_ROOT_REJECTED,
+        metric = TRUST_ROOT_REJECTED,
+        total,
+        reason,
+        "manifest refused: Sigstore trust root verification failed (see the trust root runbook)"
+    );
+}
+
+/// Rotation notices in a trust root JSON document at `now`: every CA, Rekor
+/// log or CT log whose `validFor.end` is still in the future (being retired)
+/// or whose `validFor.start` is in the future (announced, not active yet).
+pub fn trust_root_rotation_notices(
+    trusted_root_json: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(trusted_root_json) else {
+        return vec!["trust root is not valid JSON".into()];
+    };
+    let mut notices = Vec::new();
+    let sections = [
+        ("certificateAuthorities", "/validFor"),
+        ("tlogs", "/publicKey/validFor"),
+        ("ctlogs", "/publicKey/validFor"),
+    ];
+    for (section, pointer) in sections {
+        for (i, item) in doc[section].as_array().into_iter().flatten().enumerate() {
+            let Some(valid_for) = item.pointer(pointer) else {
+                continue;
+            };
+            let at = |key: &str| {
+                valid_for[key]
+                    .as_str()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(|t| t.with_timezone(&chrono::Utc))
+            };
+            if let Some(start) = at("start").filter(|t| *t > now) {
+                notices.push(format!("{section}[{i}] becomes valid at {start}"));
+            }
+            if let Some(end) = at("end").filter(|t| *t > now) {
+                notices.push(format!("{section}[{i}] stops being valid at {end}"));
+            }
+        }
+    }
+    notices
+}
+
+/// Logs [`TRUST_ROOT_ROTATION_PENDING`] for every rotation notice in the
+/// embedded trust root. Called when a release manifest is verified.
+pub fn warn_on_pending_rotation() {
+    for notice in trust_root_rotation_notices(SIGSTORE_PRODUCTION_TRUSTED_ROOT, chrono::Utc::now())
+    {
+        tracing::warn!(
+            alert = TRUST_ROOT_ROTATION_PENDING,
+            %notice,
+            "embedded Sigstore trust root lists a pending rotation; plan a release with a refreshed trust root"
+        );
+    }
+}
+
 fn verifier() -> Result<&'static Verifier, String> {
     static VERIFIER: OnceLock<Result<Verifier, String>> = OnceLock::new();
     match VERIFIER.get_or_init(|| {
@@ -193,7 +291,10 @@ fn verifier() -> Result<&'static Verifier, String> {
         Verifier::new(&root).map_err(|err| format!("sigstore verifier: {err}"))
     }) {
         Ok(v) => Ok(v),
-        Err(err) => Err(err.clone()),
+        Err(err) => {
+            record_trust_root_rejection(err);
+            Err(err.clone())
+        }
     }
 }
 
@@ -359,7 +460,13 @@ fn verify_parsed_bundle<'a>(
         VerificationPolicy::any_identity().require_issuer(GITHUB_OIDC_ISSUER.to_string());
     let result = verifier()?
         .verify(artifact, bundle, &crypto_policy)
-        .map_err(|err| format!("sigstore bundle: {err}"))?;
+        .map_err(|err| {
+            let msg = format!("sigstore bundle: {err}");
+            if is_trust_root_failure(&err) {
+                record_trust_root_rejection(&msg);
+            }
+            msg
+        })?;
     if !result.certificate_verified() || !result.tlog_verified() {
         return Err(
             "sigstore bundle: certificate chain or Rekor transparency log was not verified".into(),
@@ -427,6 +534,60 @@ pub fn default_bundle_path(manifest: &std::path::Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(t: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(t)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn rotation_notices_report_future_start_and_end() {
+        let root = r#"{
+            "certificateAuthorities": [
+                {"validFor": {"start": "2022-04-13T20:06:15Z", "end": "2027-01-01T00:00:00Z"}},
+                {"validFor": {"start": "2026-12-01T00:00:00Z"}}
+            ],
+            "tlogs": [{"publicKey": {"validFor": {"start": "2021-01-12T11:53:27Z"}}}],
+            "ctlogs": [{"publicKey": {"validFor": {"start": "2021-03-14T00:00:00Z", "end": "2022-10-31T23:59:59Z"}}}]
+        }"#;
+        let notices = trust_root_rotation_notices(root, at("2026-10-16T00:00:00Z"));
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices[0].starts_with("certificateAuthorities[0] stops"));
+        assert!(notices[1].starts_with("certificateAuthorities[1] becomes"));
+        // Already-retired keys are history, not a pending rotation.
+        assert!(trust_root_rotation_notices(root, at("2027-06-01T00:00:00Z")).is_empty());
+    }
+
+    #[test]
+    fn embedded_trust_root_parses_for_rotation_checks() {
+        let notices = trust_root_rotation_notices(
+            SIGSTORE_PRODUCTION_TRUSTED_ROOT,
+            at("2000-01-01T00:00:00Z"),
+        );
+        assert!(
+            !notices.iter().any(|n| n.contains("not valid JSON")),
+            "{notices:?}"
+        );
+        // Every entry has started after 2000, so each one is reported then.
+        assert!(!notices.is_empty());
+    }
+
+    #[test]
+    fn trust_root_failures_are_told_apart_from_bad_signatures() {
+        use sigstore_verify::{CertificateError, Error, TransparencyLogError};
+        assert!(is_trust_root_failure(&Error::Certificate(
+            CertificateError::ChainInvalid("unknown issuer".into())
+        )));
+        assert!(is_trust_root_failure(&Error::TransparencyLog(
+            TransparencyLogError::UnknownLog {
+                log_id: "abc".into()
+            }
+        )));
+        assert!(is_trust_root_failure(&Error::InvalidTrustRoot("x".into())));
+        assert!(!is_trust_root_failure(&Error::SignatureInvalid("x".into())));
+        assert!(!is_trust_root_failure(&Error::ArtifactMismatch("x".into())));
+    }
 
     #[test]
     fn identity_claims_require_the_deployer_version_and_commit() {
