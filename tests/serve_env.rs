@@ -212,7 +212,7 @@ fn production_refuses_after_failures_challenge_lock() {
     let (ok, err) = serve_project(&dir, &[("VIBE_ENV", "production")], false);
     assert!(!ok, "{err}");
     assert!(
-        err.contains("after-failures") || err.contains("not verified"),
+        err.contains("temporarily unsupported in production"),
         "{err}"
     );
     let _ = std::fs::remove_dir_all(&dir);

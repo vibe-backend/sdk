@@ -652,7 +652,7 @@ pub fn unverified_gate(env: RunEnv, routes: &[String]) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "challenge is only verified on public routes with `when: always`; `when: after-failures` and authenticated routes are not verified yet, so production refuses them (use `type: none` or make the route public with `when: always`); affected: {}",
+        "challenge with `when: after-failures` or on an authenticated route is temporarily unsupported in production until verified challenges on these routes are implemented (#201); only public routes with `when: always` are verified (use `type: none` or make the route public with `when: always`); affected: {}",
         routes.join(", ")
     ))
 }
@@ -838,6 +838,11 @@ mod tests {
         for routes in [&login, &authed] {
             let err = unverified_gate(RunEnv::Production, routes).unwrap_err();
             assert!(err.contains(&routes[0]), "{err}");
+            assert!(
+                err.contains("temporarily unsupported in production"),
+                "{err}"
+            );
+            assert!(err.contains("#201"), "{err}");
             assert!(unverified_gate(RunEnv::Dev, routes).is_ok());
             assert!(unverified_gate(RunEnv::Ci, routes).is_ok());
         }

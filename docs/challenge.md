@@ -112,9 +112,10 @@ fails if any route uses `challenge ... when: always` and no verifier is configur
 
 Only public routes with `when: always` are verified. A challenge declared with
 `when: after-failures` (for example on login routes) or on a non-public
-(authenticated) route is not verified yet, so in production `vibe serve` and
-`vibe validate --deploy` refuse such routes even when a verifier is configured
-(#199). Development and CI still accept them. Runtime verification for those
+(authenticated) route is not verified yet. Such challenges are temporarily
+unsupported in production: `vibe serve` and `vibe validate --deploy` refuse
+these routes even when a verifier is configured (#199), until verified
+challenges on these routes are implemented (#201). Development and CI still accept them. Runtime verification for those
 modes is tracked in #201.
 
 Challenges do not replace server-side rate limits and quotas. The route's rate
