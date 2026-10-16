@@ -8,12 +8,14 @@ mod slugs;
 mod sql;
 
 pub use crud::{check_expr, check_when, parse_ownership, run_method, Ownership};
-pub use exec::{etag, role_allows, ExecError, MemoryExec, PgExec, QueryExec, RoleStatus};
+pub use exec::{
+    etag, role_allows, ExecError, MemoryExec, PgExec, PgOptions, PgSession, QueryExec, RoleStatus,
+};
 pub use http::{
     detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router, ApiKeyFile, AppState,
     AuthConfig, RunEnv, Slug, StoredKey, REQUEST_TYPES,
 };
-pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
+pub use limiter::{saturation_refusals, ProxyNet, QuotaBuckets, RateBuckets};
 pub use migrate::migrate_tenant;
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
 pub use sql::{

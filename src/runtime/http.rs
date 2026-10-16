@@ -20,7 +20,9 @@ use crate::manifest::{Manifest, RouteSpec};
 
 use super::crud::{self, MethodFail};
 use super::exec::QueryExec;
-use super::limiter::{ip_bucket, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision};
+use super::limiter::{
+    ip_bucket, owner_of, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -56,9 +58,47 @@ pub struct AuthConfig {
     /// Default claim holding the caller's roles (`VIBE_JWT_ROLES_CLAIM`,
     /// default `roles`); a route's `roles-claim` overrides it.
     pub roles_claim: String,
+    /// JWKS caches for routes with their own `jwks-uri` (or an `iss` whose
+    /// default `{iss}/.well-known/jwks.json` differs), keyed by URI. Built at
+    /// startup; a route whose URI is missing here fails closed.
+    pub route_jwks: HashMap<String, Arc<super::jwks::JwksCache>>,
+}
+
+/// The JWKS URI a route authenticates against when it overrides the issuer:
+/// its `jwks-uri`, else spec §4.1's `{iss}/.well-known/jwks.json`. `None`
+/// means the route uses the process-wide key source.
+pub fn route_jwks_uri(route: &RouteSpec) -> Option<String> {
+    if !route.jwks_uri.is_empty() {
+        Some(route.jwks_uri.clone())
+    } else if !route.jwt_iss.is_empty() {
+        Some(format!(
+            "{}/.well-known/jwks.json",
+            route.jwt_iss.trim_end_matches('/')
+        ))
+    } else {
+        None
+    }
 }
 
 impl AuthConfig {
+    /// Creates one HTTPS JWKS cache per distinct route URI (cache rules apply
+    /// per URI).
+    pub fn add_route_jwks(&mut self, routes: &[RouteSpec]) -> Result<(), String> {
+        for route in routes {
+            if let Some(uri) = route_jwks_uri(route) {
+                if self.route_jwks.contains_key(&uri) {
+                    continue;
+                }
+                // Route URIs come from locks: public hosts only, no dev exception.
+                let source = super::jwks::HttpsJwks::new(&uri)
+                    .map_err(|err| format!("{} {}: {err}", route.method, route.path))?;
+                self.route_jwks
+                    .insert(uri, Arc::new(super::jwks::JwksCache::new(Arc::new(source))));
+            }
+        }
+        Ok(())
+    }
+
     pub fn anonymous() -> Self {
         Self {
             public_pem: String::new(),
@@ -72,6 +112,7 @@ impl AuthConfig {
             env_name: "test".into(),
             jwks: None,
             roles_claim: "roles".into(),
+            route_jwks: HashMap::new(),
         }
     }
 }
@@ -1133,7 +1174,19 @@ async fn authenticate(
         .kid
         .clone()
         .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
-    let (alg, key) = if let Some(jwks) = &auth.jwks {
+    let route_uri = route_jwks_uri(route);
+    let (alg, key) = if let Some(uri) = &route_uri {
+        // Route-level issuer: only its own keys, never the env key source.
+        let jwks = auth
+            .route_jwks
+            .get(uri)
+            .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+        let found = jwks
+            .key(&kid)
+            .await
+            .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+        (found.alg, found.key)
+    } else if let Some(jwks) = &auth.jwks {
         let found = jwks
             .key(&kid)
             .await
@@ -1154,19 +1207,30 @@ async fn authenticate(
     if jwt_header.alg != alg {
         return Err(AuthError::unauthorized("Bearer"));
     }
-    verify_jwt(auth, token, alg, &key, roles_claim)
+    let iss = if route.jwt_iss.is_empty() {
+        auth.iss.as_str()
+    } else {
+        route.jwt_iss.as_str()
+    };
+    let aud = if route.jwt_aud.is_empty() {
+        auth.aud.as_str()
+    } else {
+        route.jwt_aud.as_str()
+    };
+    verify_jwt(token, alg, &key, iss, aud, roles_claim)
 }
 
 fn verify_jwt(
-    auth: &AuthConfig,
     token: &str,
     alg: Algorithm,
     key: &DecodingKey,
+    iss: &str,
+    aud: &str,
     roles_claim: &str,
 ) -> Result<Principal, AuthError> {
     let mut validation = Validation::new(alg);
-    validation.set_issuer(&[&auth.iss]);
-    validation.set_audience(&[&auth.aud]);
+    validation.set_issuer(&[iss]);
+    validation.set_audience(&[aud]);
     validation.leeway = 60;
     validation.validate_nbf = true;
     let data = jsonwebtoken::decode::<Claims>(token, key, &validation)
@@ -1413,7 +1477,7 @@ fn rate_limited(
     let Ok(mut rates) = state.rates.lock() else {
         return Some("1".into());
     };
-    match rates.check(&checks, Instant::now()) {
+    match rates.check(&checks, &owner_of(ip), Instant::now()) {
         RateDecision::Allow => None,
         RateDecision::Limited(wait) => Some(wait.to_string()),
     }
@@ -2091,6 +2155,73 @@ RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
         assert!(!route_scopes_allow(&["Catalog:read".into()], &need));
         assert!(!route_scopes_allow(&["other:*".into()], &need));
         assert!(route_scopes_allow(&["catalog:*".into()], &need));
+    }
+
+    struct Down;
+    #[async_trait::async_trait]
+    impl super::super::jwks::JwksSource for Down {
+        async fn fetch(&self) -> Result<Value, String> {
+            Err("connection refused".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn route_iss_aud_and_jwks_uri_override_env_defaults() {
+        const IDP: &str = "https://idp.example.com/t1";
+        const URI: &str = "https://idp.example.com/t1/keys";
+        let keys = json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "r1", "x": X, "y": Y}]});
+        // Env JWKS has the same key under kid k1; the route must not use it.
+        let mut auth = jwks_auth();
+        auth.route_jwks.insert(
+            URI.into(),
+            Arc::new(super::super::jwks::JwksCache::new(Arc::new(Doc(keys)))),
+        );
+        let r = route(json!({"jwt_iss": IDP, "jwt_aud": "tenant-api", "jwks_uri": URI}));
+        let good = token("r1", json!({"iss": IDP, "aud": "tenant-api"}));
+        assert!(authenticate(&auth, &r, &bearer(&good)).await.is_ok());
+        // Default issuer/audience tokens are refused on the overridden route.
+        let env_tok = token("k1", json!({}));
+        assert!(authenticate(&auth, &r, &bearer(&env_tok)).await.is_err());
+        let wrong_aud = token("r1", json!({"iss": IDP, "aud": "shop"}));
+        assert!(authenticate(&auth, &r, &bearer(&wrong_aud)).await.is_err());
+        // And the route issuer's tokens are refused on default routes.
+        assert!(authenticate(&auth, &route(json!({})), &bearer(&good))
+            .await
+            .is_err());
+        // aud-only override keeps the env key source and issuer.
+        let r_aud = route(json!({"jwt_aud": "tenant-api"}));
+        let t = token("k1", json!({"aud": "tenant-api"}));
+        assert!(authenticate(&auth, &r_aud, &bearer(&t)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn route_jwks_unreachable_or_missing_fails_closed() {
+        const IDP: &str = "https://idp.example.com/t2";
+        let mut auth = jwks_auth();
+        let r = route(json!({"jwt_iss": IDP}));
+        let t = token("k1", json!({"iss": IDP}));
+        // Not registered at startup: 401, no fallback to the env JWKS.
+        assert!(authenticate(&auth, &r, &bearer(&t)).await.is_err());
+        // Registered (derived {iss}/.well-known/jwks.json) but unreachable: 401.
+        assert_eq!(
+            route_jwks_uri(&r).unwrap(),
+            "https://idp.example.com/t2/.well-known/jwks.json"
+        );
+        auth.route_jwks.insert(
+            route_jwks_uri(&r).unwrap(),
+            Arc::new(super::super::jwks::JwksCache::new(Arc::new(Down))),
+        );
+        assert!(authenticate(&auth, &r, &bearer(&t)).await.is_err());
+    }
+
+    #[test]
+    fn add_route_jwks_requires_https() {
+        let mut auth = AuthConfig::anonymous();
+        let ok = route(json!({"jwt_iss": "https://idp.example.com"}));
+        auth.add_route_jwks(&[ok.clone(), ok]).unwrap();
+        assert_eq!(auth.route_jwks.len(), 1, "one cache per URI");
+        let bad = route(json!({"jwt_iss": "https://idp.example.com", "jwks_uri": "http://x/k"}));
+        assert!(auth.add_route_jwks(&[bad]).is_err());
     }
 
     #[test]
