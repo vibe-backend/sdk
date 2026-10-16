@@ -42,42 +42,38 @@ WARN vibe::rate_limit_saturation: rate-limit shard saturated; refusing new keys 
 
 ### Tenant and platform network-range caps (#132, D130)
 
-On top of the shard caps, every request that creates new buckets is charged to two layers of network-range slot counters. They count **new counter slots (reservations)**, not requests, the same meaning as the reserve caps above:
+On top of the shard caps, every request that creates new buckets is charged to two layers of network-range slot counters. They count **new counter slots (reservations)**, not requests, the same meaning as the reserve caps above.
 
 Before counting, IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are converted to IPv4.
 
-- Tenant layer: `(tenant_id, IPv4 /24)` at most 10 new slots per window (`TENANT_NET_CAP`); `(tenant, IPv6 /48)` at most 10 and `(tenant, IPv6 /32)` at most 50 (`TENANT_V6_32_CAP`).
-- Platform layer: IPv4 /24 and IPv6 /48 across all tenants, at most 5x the tenant cap by default (also in new counter slots). Set `VIBE_RATE_PLATFORM_FACTOR` (positive integer, default 5, at most 100) to change the multiplier.
+- Tenant layer: new slots per window are capped per `(tenant_id, IPv4 /24)`, per `(tenant, IPv6 /48)` and per `(tenant, IPv6 /32)` (`TENANT_NET_CAP`, `TENANT_V6_32_CAP`).
+- Platform layer: IPv4 /24 and IPv6 /48 are also capped across all tenants, as a multiple of the tenant cap. `VIBE_RATE_PLATFORM_FACTOR` sets the multiplier (bounded).
 
 A request must pass both layers. Each tenant has a guaranteed minimum share of the platform table and of the memory cap (see below). #73's in-shard owner and reserve caps still apply on top. A refusal is the usual 429 `RATE_LIMITED` with `Retry-After`, and the response never says which layer refused it. `Retry-After` is the time until every live counter the request touches (in both layers) has reset, so its value does not depend on the layer. Requests that only hit existing buckets are not counted.
 
-These counters use **fixed** 60-second windows. Every other limit stays sliding-window. A client can get up to 2x a cap across a window edge (for example 10 new slots at second 59 and 10 more at second 60). This is an accepted risk.
+These counters use **fixed** windows. Every other limit stays sliding-window. A client can get up to twice a cap across a window edge. This is an accepted risk.
 
-Counter slots are bounded and partitioned, so a full partition only refuses requests charged to it:
+Counter slots are bounded per tenant and per network aggregate, and limits are configurable. A full partition only refuses requests charged to it:
 
-- Tenant counters are partitioned by tenant: 4,096 slots per tenant (`slots_per_tenant`). The global tenant budget is sized for `expected_tenants x 4,096` slots (default 256 tenants, about 1M slots; set `VIBE_RATE_EXPECTED_TENANTS`, 1 to 4,096). A tenant holding fewer than 64 slots (`tenant_slot_floor`) is admitted even when the global budget is used up.
-- Platform counters are partitioned by network aggregate (IPv4 /24, IPv6 /32): 4,096 slots per aggregate. Each platform counter is also charged to the tenant that created it. A tenant holding fewer than 64 platform counters (`platform_slot_floor`) is admitted even when the shared platform total is used up; only growth above that floor is refused (`table_full`). The platform total is sized as `tenant budget + expected_tenants x 64` (default 256 x 4,096 + 256 x 64 = 1,064,960 slots; `VIBE_RATE_EXPECTED_TENANTS` resizes both). The aggregate partition still applies inside the floor.
+- Tenant counters are partitioned by tenant (`slots_per_tenant`). The global tenant budget is sized from `VIBE_RATE_EXPECTED_TENANTS`. A tenant below its floor (`tenant_slot_floor`) is admitted even when the global budget is used up.
+- Platform counters are partitioned by network aggregate (IPv4 /24, IPv6 /32). Each platform counter is also charged to the tenant that created it. A tenant below its platform floor (`platform_slot_floor`) is admitted even when the shared platform total is used up; only growth above the floor is refused (`table_full`). The platform total is sized as the tenant budget plus one floor per expected tenant, so other tenants cannot fully occupy the platform table. The aggregate partition still applies inside the floor.
 
-Expired counters are cleared first, oldest first (60-second fixed windows). A counter still inside its window is never evicted. If a slot table is full and nothing has expired, the request fails closed with 429 and the usual `Retry-After`. Every refusal is counted in `vibe_rate_limit_slot_refused_total{layer="tenant"|"platform", reason}` (`vibe::runtime::slot_refused_total` / `slot_refused_metrics`), where `reason` is one of:
+Expired counters are cleared first, oldest first. A counter still inside its window is never evicted. If a slot table is full and nothing has expired, the request fails closed with 429 and the usual `Retry-After`. Every refusal is counted in `vibe_rate_limit_slot_refused_total{layer="tenant"|"platform", reason}` (`vibe::runtime::slot_refused_total` / `slot_refused_metrics`), where `reason` is one of:
 
 - `network_cap`: a network is over its new-slot cap (either layer);
-- `table_full`: a tenant's own 4,096-slot partition, the platform total, or the limiter memory cap is full;
-- `tenant_budget_exhausted`: the global tenant budget is used up and the tenant holds 64 or more slots;
+- `table_full`: a tenant's own partition, the platform total, or the limiter memory cap is full. These series also carry `within_floor="true"|"false"`, which shows whether the refused request stayed within the tenant's floors (`slot_refused_within_floor_total`);
+- `tenant_budget_full`: the global tenant budget is used up and the tenant is at or above its floor;
 - `prefix_cap_exceeded`: a platform IPv4 /24 or IPv6 /32 partition is full.
 
-`counter_slot_refusals()` remains as the total of every reason except `network_cap`. `layer` only appears in this internal metric, never in a response. For every reason except `network_cap` the limiter logs at most once per minute per layer and reason at `WARN` with target `vibe::rate_limit_counter_slots` (fields `layer`, `reason`, `refused`). Add alerts on that target, in particular for `tenant_budget_exhausted` and `prefix_cap_exceeded`.
+`counter_slot_refusals()` remains as the total of every reason except `network_cap`. `layer` and `within_floor` only appear in this internal metric and logs, never in a response. For every reason except `network_cap` the limiter logs at most once per minute per layer and reason at `WARN` with target `vibe::rate_limit_counter_slots` (fields `layer`, `reason`, `within_floor`, `refused`). Add alerts on that target, in particular for `tenant_budget_full`, `prefix_cap_exceeded` and `within_floor=true`.
 
-**Memory cap:** `VIBE_RATE_TABLE_MEMORY_MAX_BYTES` (default 268435456 = 256 MiB, at least 1 MiB) caps the estimated memory of all limiter tables combined: rate-limit shards, both D130 tables and the daily quotas. A request that would push the estimate over the cap is refused with reason `table_full` (same 429 + `Retry-After`); quota growth past the cap is refused the same way.
+**Active-tenant alert:** when the number of tenants holding counters goes above a high share of `VIBE_RATE_EXPECTED_TENANTS`, the limiter logs `rate_limit_active_tenants_high` at `WARN` with target `vibe::rate_limit_alerts` (fields `active_tenants`, `expected_tenants`), at most once per minute. Raise `VIBE_RATE_EXPECTED_TENANTS` or `VIBE_RATE_TABLE_MEMORY_MAX_BYTES` before refusals within the floor occur.
 
-Part of the cap is reserved per-tenant floor within the memory cap: `floor_reserve_bytes` = `expected_tenants x 64 x 3 KiB` (one tenant counter, one platform counter and one rate bucket per floor slot), about 48 MiB at the default 256 tenants (192 KiB per tenant), capped at half of `VIBE_RATE_TABLE_MEMORY_MAX_BYTES`. A request that keeps the tenant within both its tenant floor (64) and platform floor (64) is checked against the full cap; any other growth is checked against the cap minus the reserve. Above-floor growth is bounded by the shared remainder of the memory cap, and a tenant under its floor is not refused because other tenants used the rest. The hard cap still holds for every request. Estimates per entry are upper bounds of the figures measured by `tests/limiter_memory.rs` (counting allocator, 8,000 entries, x86_64 Linux debug build; run with `--nocapture`):
+**Memory cap:** `VIBE_RATE_TABLE_MEMORY_MAX_BYTES` caps the estimated memory of all limiter tables combined: rate-limit shards, both D130 tables and the daily quotas. A request that would push the estimate over the cap is refused with reason `table_full` (same 429 + `Retry-After`); quota growth past the cap is refused the same way.
 
-| Entry | Measured | Estimate used |
-| --- | --- | --- |
-| D130 counter slot (tenant or platform) | ~481 B | 1,024 B (covers worst-case window queues) |
-| Rate bucket (5 hits per window) | ~991 B | 1,024 B + 32 B per allowed hit |
-| Daily quota entry | ~196 B | 256 B |
+Part of the cap is reserved for per-tenant floors (`floor_reserve_bytes`, sized from the expected tenant count and the floors, and never more than half of the cap). A request that keeps the tenant within both its tenant and platform floors is checked against the full cap; any other growth is checked against the cap minus the reserve. Above-floor growth is bounded by the shared remainder of the memory cap, and a tenant under its floor is not refused because other tenants used the rest. The hard cap still holds for every request. Per-entry estimates are upper bounds of the sizes measured by `tests/limiter_memory.rs` (counting allocator; run with `--nocapture`).
 
-At the defaults the slot tables' theoretical capacity exceeds the configured memory cap, so the memory cap binds first: growth above each tenant's floor is bounded by the shared memory budget.
+The memory cap normally binds before the slot tables do: growth above each tenant's floor is bounded by the shared memory budget.
 
 **Test-only client IP override:** set `VIBE_HONOR_TEST_IP=true` to honour the `x-vibe-test-ip` header. The override only takes effect in debug builds (`cfg!(debug_assertions)`). Release builds ignore the header, and `vibe serve` / `router` refuse to start when the setting is enabled in a release build.
 
@@ -85,7 +81,7 @@ At the defaults the slot tables' theoretical capacity exceeds the configured mem
 
 ## Residual risks
 
-- Rate-limit counter slots (D130): the above-floor part of the limiter memory cap (`VIBE_RATE_TABLE_MEMORY_MAX_BYTES` minus the floor reserve) and the above-floor part of the platform slot total are shared by every tenant and network; when they are used up, above-floor growth gets 429 (`table_full`) until counters expire, while each tenant can still grow within its floor. The floor reserve is sized for `VIBE_RATE_EXPECTED_TENANTS`; with many more active tenants than that, floor growth can also reach the hard cap. Rate buckets are reserved at their base size; buckets with high per-minute limits use more than the reserve estimate. The global tenant budget is sized for `VIBE_RATE_EXPECTED_TENANTS`; past it, only tenants still under their floor can open new ones (`tenant_budget_exhausted`). Per-network partition limits apply (values are configurable); when a partition is full, that network's users get `prefix_cap_exceeded`. The platform layer is cross-tenant by design, so one tenant's traffic can still cap other tenants on the same /24 or /48. Measured memory per entry is in the table above (#195).
+- Rate-limit counter slots (D130): the above-floor part of the limiter memory cap and of the platform slot total are shared by every tenant and network; when they are used up, above-floor growth gets 429 (`table_full`) until counters expire, while each tenant can still grow within its floor. The floor reserve is sized for `VIBE_RATE_EXPECTED_TENANTS`; with many more active tenants than that, floor growth can also reach the hard cap (`rate_limit_active_tenants_high` warns in advance). Rate buckets are reserved at their base size; buckets with high per-minute limits use more than the reserve estimate. Past the global tenant budget, only tenants still under their floor can open new counters (`tenant_budget_full`). Per-network partition limits apply and are configurable; when a partition is full, that network's users get `prefix_cap_exceeded`. The platform layer is shared across tenants by design, so one tenant's traffic can still cap other tenants on the same /24 or /48 (#195).
 
 - `release` environment admin bypass is enabled (`can_admins_bypass: true`). An admin can deploy without Jack's environment approval. Jack accepted this risk.
 - An admin can bypass the `main` ruleset (OrganizationAdmin bypass). The only human approval gate is Jack approving the `release` environment; the automatic gates remain decisions 113/114/118. The same account (`j113203`) can approve its own release. Admin bypass stays on; Jack accepted this risk.

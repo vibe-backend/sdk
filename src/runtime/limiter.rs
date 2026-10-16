@@ -183,20 +183,19 @@ pub struct RateBuckets {
 }
 
 /// Default hard cap on the estimated memory of all limiter tables combined
-/// (`VIBE_RATE_TABLE_MEMORY_MAX_BYTES`, 256 MiB).
+/// (`VIBE_RATE_TABLE_MEMORY_MAX_BYTES`).
 pub const TABLE_MEMORY_MAX_BYTES: usize = 256 * 1024 * 1024;
 
-/// Estimated heap bytes per D130 counter slot: about 480 measured
-/// (tests/limiter_memory.rs) with one record per window queue, doubled to
-/// cover queues at their worst-case length (4 records per slot) and hash
-/// table growth. See docs/release-hardening.md.
+/// Estimated heap bytes per D130 counter slot: the size measured by
+/// tests/limiter_memory.rs, with headroom for worst-case window queues and
+/// hash table growth. See docs/release-hardening.md.
 pub const COUNTER_SLOT_BYTES: usize = 1_024;
 /// Estimated bytes per rate bucket, excluding its hit timestamps, including
-/// per-owner bookkeeping (about 990 measured with 5 hits; rounded up).
+/// per-owner bookkeeping (measured size, rounded up).
 pub const BUCKET_BYTES: usize = 1_024;
 /// Bytes per allowed hit of a bucket (`Instant`), doubled for `Vec` growth.
 pub const HIT_BYTES: usize = 2 * std::mem::size_of::<Instant>();
-/// Estimated bytes per daily-quota entry (about 200 measured; rounded up).
+/// Estimated bytes per daily-quota entry (measured size, rounded up).
 pub const QUOTA_ENTRY_BYTES: usize = 256;
 
 /// Shared hard memory budget for every limiter table (rate shards, D130
@@ -587,10 +586,10 @@ impl RateBuckets {
 // two layers that count NEW rate buckets (slot reservations, the same meaning
 // as the #73 reserve caps) per network range in fixed windows of [`WINDOW`]:
 //
-// * tenant layer: `(tenant, IPv4 /24)` cap 10; `(tenant, IPv6 /48)` cap 10
-//   plus `(tenant, IPv6 /32)` cap 50;
+// * tenant layer: `(tenant, IPv4 /24)`, `(tenant, IPv6 /48)` and
+//   `(tenant, IPv6 /32)`, each with its own cap;
 // * platform layer: `IPv4 /24` and `IPv6 /48` across all tenants, cap
-//   `platform_factor` (default 5) times the tenant cap.
+//   `platform_factor` times the tenant cap.
 //
 // A request that creates new buckets must pass both layers; requests that
 // only hit existing buckets are not counted here. Each tenant has a
@@ -598,7 +597,7 @@ impl RateBuckets {
 // cannot tell which layer refused.
 //
 // Fixed windows apply only to these counters; every other limit stays
-// sliding-window. A client can get up to 2x a cap across a window edge
+// sliding-window. A client can get up to twice a cap across a window edge
 // (accepted risk, docs/release-hardening.md).
 //
 // Counter slots are bounded and partitioned: tenant counters by tenant
@@ -629,7 +628,7 @@ impl RateBuckets {
 static COUNTER_SLOT_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Total requests refused (fail closed) because D130 counter slots or the
-/// limiter memory budget were exhausted: the sum of
+/// limiter memory budget were full: the sum of
 /// `vibe_rate_limit_slot_refused_total` over every reason but `network_cap`.
 pub fn counter_slot_refusals() -> u64 {
     COUNTER_SLOT_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
@@ -641,12 +640,34 @@ const SLOT_LAYERS: [&str; 2] = ["tenant", "platform"];
 const SLOT_REASONS: [&str; 4] = [
     "network_cap",
     "table_full",
-    "tenant_budget_exhausted",
+    "tenant_budget_full",
     "prefix_cap_exceeded",
 ];
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SLOT_REFUSED: [std::sync::atomic::AtomicU64; 8] = [ZERO; 8];
+/// `table_full` refusals per layer that happened within the tenant's floors.
+static WITHIN_FLOOR_REFUSED: [std::sync::atomic::AtomicU64; 2] = [ZERO; 2];
+
+/// `table_full` refusals on `layer` where the request stayed within the
+/// tenant's floors (`within_floor="true"`). Internal only; the response is
+/// the same 429 with `Retry-After`.
+pub fn slot_refused_within_floor_total(layer: &str) -> u64 {
+    SLOT_LAYERS.iter().position(|x| *x == layer).map_or(0, |i| {
+        WITHIN_FLOOR_REFUSED[i].load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// Name of the active-tenants alert.
+pub const ACTIVE_TENANTS_ALERT: &str = "rate_limit_active_tenants_high";
+/// Alert when active tenants exceed this percentage of `expected_tenants`.
+const ACTIVE_TENANTS_ALERT_PERCENT: usize = 80;
+static ACTIVE_TENANTS_ALERTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Times the `rate_limit_active_tenants_high` alert was emitted.
+pub fn active_tenants_alerts() -> u64 {
+    ACTIVE_TENANTS_ALERTS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 fn slot_index(layer: &str, reason: &str) -> Option<usize> {
     let l = SLOT_LAYERS.iter().position(|x| *x == layer)?;
@@ -663,7 +684,7 @@ fn record_slot_refused(layer: &str, reason: &str) {
 /// `vibe_rate_limit_slot_refused_total{layer, reason}`: `layer` is `tenant`
 /// or `platform`; `reason` is `network_cap` (a network over its new-slot
 /// cap), `table_full` (a tenant's own partition, the platform total or the
-/// memory budget is full), `tenant_budget_exhausted` (the global tenant
+/// memory budget is full), `tenant_budget_full` (the global tenant
 /// budget is used up) or `prefix_cap_exceeded` (a platform IPv4 /24 or IPv6
 /// /32 partition is full). Internal only;
 /// responses never name the layer.
@@ -678,6 +699,16 @@ pub fn slot_refused_metrics() -> String {
     let mut out = format!("# TYPE {SLOT_REFUSED_METRIC} counter\n");
     for layer in SLOT_LAYERS {
         for reason in SLOT_REASONS {
+            if reason == "table_full" {
+                let within = slot_refused_within_floor_total(layer);
+                let total = slot_refused_total(layer, reason);
+                for (flag, n) in [("true", within), ("false", total.saturating_sub(within))] {
+                    out.push_str(&format!(
+                        "{SLOT_REFUSED_METRIC}{{layer=\"{layer}\",reason=\"{reason}\",within_floor=\"{flag}\"}} {n}\n"
+                    ));
+                }
+                continue;
+            }
             out.push_str(&format!(
                 "{SLOT_REFUSED_METRIC}{{layer=\"{layer}\",reason=\"{reason}\"}} {}\n",
                 slot_refused_total(layer, reason)
@@ -717,7 +748,7 @@ pub const PLATFORM_SLOT_FLOOR: usize = 64;
 /// counter, one platform counter and one rate bucket.
 pub const FLOOR_SLOT_BYTES: usize = 2 * COUNTER_SLOT_BYTES + BUCKET_BYTES;
 /// Default memory reserved for floor growth: `EXPECTED_TENANTS x
-/// PLATFORM_SLOT_FLOOR x FLOOR_SLOT_BYTES` (48 MiB at 256 tenants).
+/// PLATFORM_SLOT_FLOOR x FLOOR_SLOT_BYTES`.
 pub const FLOOR_RESERVE_BYTES: usize = EXPECTED_TENANTS * PLATFORM_SLOT_FLOOR * FLOOR_SLOT_BYTES;
 
 /// D130 limits; see the section comment above.
@@ -1033,6 +1064,10 @@ struct NetLayers {
     /// would create (set by `check_tenant`).
     base_bytes: usize,
     max_bytes: usize,
+    /// Whether the last refused request stayed within the tenant's floors.
+    last_within_floor: bool,
+    /// Last `rate_limit_active_tenants_high` alert.
+    active_alerted: Option<Instant>,
 }
 
 /// Which table a refusal came from (logs only, never the response).
@@ -1040,7 +1075,7 @@ struct NetLayers {
 enum NetRefusal {
     Cap(&'static str, u64),
     /// `(layer, reason, wait)`; reason is `table_full`,
-    /// `tenant_budget_exhausted` or `prefix_cap_exceeded`.
+    /// `tenant_budget_full` or `prefix_cap_exceeded`.
     SlotsFull(&'static str, &'static str, u64),
 }
 
@@ -1061,6 +1096,8 @@ impl NetLayers {
             limits,
             full_logged: HashMap::new(),
             base_bytes: 0,
+            last_within_floor: false,
+            active_alerted: None,
         }
     }
 
@@ -1162,7 +1199,7 @@ impl NetLayers {
             self.platform.room(&group, tenant, &pk, now),
         ) {
             (Err((Bound::Partition, w)), _) => Some(("tenant", "table_full", w)),
-            (Err((Bound::Total, w)), _) => Some(("tenant", "tenant_budget_exhausted", w)),
+            (Err((Bound::Total, w)), _) => Some(("tenant", "tenant_budget_full", w)),
             (_, Err((Bound::Partition, w))) => Some(("platform", "prefix_cap_exceeded", w)),
             (_, Err((Bound::Total, w))) => Some(("platform", "table_full", w)),
             _ if projected > mem_cap => {
@@ -1172,6 +1209,7 @@ impl NetLayers {
             _ => None,
         };
         if let Some((layer, reason, w)) = full {
+            self.last_within_floor = within_floor;
             let w = w.max(self.wait_all(tenant, &tkeys, &group, &pkeys, now));
             return Err(NetRefusal::SlotsFull(layer, reason, w));
         }
@@ -1181,7 +1219,41 @@ impl NetLayers {
         for k in pk {
             self.platform.add(&group, tenant, k, n, now);
         }
+        self.check_active_tenants(now);
         Ok(())
+    }
+
+    /// Tenants currently holding tenant-layer counters.
+    fn active_tenants(&self) -> usize {
+        self.tenants.owner_len.len()
+    }
+
+    /// Emits `rate_limit_active_tenants_high` (at most once per window) when
+    /// active tenants exceed the alert share of `expected_tenants`, so
+    /// operators can raise `VIBE_RATE_EXPECTED_TENANTS` or the memory cap
+    /// before refusals within the floor occur.
+    fn check_active_tenants(&mut self, now: Instant) {
+        let expected =
+            (self.limits.tenant_slots_total / self.limits.slots_per_tenant.max(1)).max(1);
+        let active = self.active_tenants();
+        if active * 100 <= expected * ACTIVE_TENANTS_ALERT_PERCENT {
+            return;
+        }
+        if self
+            .active_alerted
+            .is_some_and(|at| now.duration_since(at) < WINDOW)
+        {
+            return;
+        }
+        self.active_alerted = Some(now);
+        ACTIVE_TENANTS_ALERTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            target: "vibe::rate_limit_alerts",
+            alert = ACTIVE_TENANTS_ALERT,
+            active_tenants = active,
+            expected_tenants = expected,
+            "rate_limit_active_tenants_high: raise VIBE_RATE_EXPECTED_TENANTS or VIBE_RATE_TABLE_MEMORY_MAX_BYTES"
+        );
     }
 
     /// Estimated bytes of both D130 tables.
@@ -1194,6 +1266,12 @@ impl NetLayers {
     fn log_full(&mut self, layer: &'static str, reason: &'static str, now: Instant) {
         COUNTER_SLOT_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         record_slot_refused(layer, reason);
+        let within_floor = reason == "table_full" && self.last_within_floor;
+        if within_floor {
+            if let Some(i) = SLOT_LAYERS.iter().position(|x| *x == layer) {
+                WITHIN_FLOOR_REFUSED[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if self
             .full_logged
             .get(&(layer, reason))
@@ -1206,9 +1284,10 @@ impl NetLayers {
             target: "vibe::rate_limit_counter_slots",
             layer,
             reason,
+            within_floor,
             refused = slot_refused_total(layer, reason),
             refused_total = counter_slot_refusals(),
-            "rate-limit counter slots exhausted; failing closed"
+            "rate-limit counter slots full; failing closed"
         );
     }
 }
@@ -2143,7 +2222,7 @@ mod tests {
     }
 
     #[test]
-    fn d130_tenant_ipv4_24_caps_new_slots_at_10_per_window() {
+    fn d130_tenant_ipv4_24_caps_new_slots_per_window() {
         let now = Instant::now();
         let mut rates = RateBuckets::default();
         assert_eq!(d130_fill(&mut rates, "ta", "198.51.100.1", 6, now), 6);
@@ -2167,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn d130_tenant_ipv6_caps_48_at_10_and_32_at_50() {
+    fn d130_tenant_ipv6_caps_48_and_32() {
         let now = Instant::now();
         let mut rates = RateBuckets::default();
         assert_eq!(d130_fill(&mut rates, "ta", "2001:db8:1::/48", 15, now), 10);
@@ -2202,7 +2281,7 @@ mod tests {
                 10
             );
         }
-        // 50 = 5 x 10 used: a fresh tenant is refused on that /24 and /48.
+        // Platform cap used: a fresh tenant is refused on that /24 and /48.
         assert_eq!(d130_fill(&mut rates, "t5", "198.51.100.7", 10, now), 0);
         assert_eq!(d130_fill(&mut rates, "t5", "2001:db8:1::/48", 10, now), 0);
         // Platform counters are per /48 (another /48 of the /32 is fine).
@@ -2511,7 +2590,7 @@ mod tests {
         assert!(slot_refused_total("platform", "network_cap") > pcap);
         let text = slot_refused_metrics();
         assert!(text.contains(
-            "vibe_rate_limit_slot_refused_total{layer=\"platform\",reason=\"table_full\"}"
+            "vibe_rate_limit_slot_refused_total{layer=\"platform\",reason=\"table_full\",within_floor=\"false\"}"
         ));
     }
 
@@ -2563,7 +2642,7 @@ mod tests {
             refusal(&mut rates, "ta", &v4(5), now),
             NetRefusal::SlotsFull("tenant", "table_full", _)
         ));
-        // tenant_budget_exhausted: the global tenant budget.
+        // tenant_budget_full: the global tenant budget.
         let mut rates = RateBuckets::with_limits(NetLimits {
             slots_per_tenant: 4,
             tenant_slots_total: 4,
@@ -2576,7 +2655,7 @@ mod tests {
         assert!(rates.net.charge("tb", &v4(10), 1, now).is_ok());
         assert!(matches!(
             refusal(&mut rates, "tb", &v4(11), now),
-            NetRefusal::SlotsFull("tenant", "tenant_budget_exhausted", _)
+            NetRefusal::SlotsFull("tenant", "tenant_budget_full", _)
         ));
         // prefix_cap_exceeded: a platform IPv4 /24 partition is full.
         let mut rates = RateBuckets::with_limits(NetLimits {
@@ -2604,7 +2683,7 @@ mod tests {
     #[test]
     fn budget_and_prefix_refusals_are_counted_and_logged() {
         let now = Instant::now();
-        let budget = slot_refused_total("tenant", "tenant_budget_exhausted");
+        let budget = slot_refused_total("tenant", "tenant_budget_full");
         let prefix = slot_refused_total("platform", "prefix_cap_exceeded");
         let mut rates = RateBuckets::with_limits(NetLimits {
             slots_per_tenant: 4,
@@ -2624,7 +2703,7 @@ mod tests {
             assert!(d130(&mut rates, "tc", "2001:db8:1::/48", "c0", now).is_none());
             assert!(d130(&mut rates, "td", "2001:db8:2::/48", "c1", now).is_some());
         });
-        assert!(slot_refused_total("tenant", "tenant_budget_exhausted") >= budget + 2);
+        assert!(slot_refused_total("tenant", "tenant_budget_full") >= budget + 2);
         assert!(slot_refused_total("platform", "prefix_cap_exceeded") > prefix);
         let ours = events
             .iter()
@@ -2674,7 +2753,7 @@ mod tests {
     }
 
     #[test]
-    fn tenant_gets_its_platform_floor_when_the_shared_platform_pool_is_full() {
+    fn new_tenant_admitted_when_platform_table_busy() {
         let now = Instant::now();
         let mut rates = RateBuckets::with_limits(NetLimits {
             platform_slots: 8,
@@ -2736,6 +2815,62 @@ mod tests {
         // Above its floor it is refused like everyone else.
         assert_eq!(d130(&mut rates, "fresh", &v4(1_002), "f2", now), Some(60));
         assert!(rates.estimated_bytes() <= max);
+    }
+
+    #[test]
+    fn table_full_refusal_reports_within_floor() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::with_limits(NetLimits {
+            table_memory_max_bytes: 1,
+            floor_reserve_bytes: 0,
+            ..NetLimits::default()
+        });
+        let before = slot_refused_within_floor_total("tenant");
+        assert!(d130(&mut rates, "wf", &v4(1), "w0", now).is_some());
+        assert!(rates.net.last_within_floor);
+        assert!(slot_refused_within_floor_total("tenant") > before);
+        let metrics = slot_refused_metrics();
+        assert!(metrics.contains("reason=\"table_full\",within_floor=\"true\""));
+        assert!(metrics.contains("reason=\"table_full\",within_floor=\"false\""));
+
+        let mut rates = RateBuckets::with_limits(NetLimits {
+            table_memory_max_bytes: 1,
+            floor_reserve_bytes: 0,
+            tenant_slot_floor: 0,
+            platform_slot_floor: 0,
+            ..NetLimits::default()
+        });
+        assert!(d130(&mut rates, "wf", &v4(1), "w0", now).is_some());
+        assert!(!rates.net.last_within_floor);
+    }
+
+    #[test]
+    fn active_tenants_alert_fires_once_per_window() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::with_limits(NetLimits {
+            slots_per_tenant: 4,
+            tenant_slots_total: 40,
+            ..NetLimits::default()
+        });
+        let alerts = |events: &Events| {
+            events
+                .iter()
+                .filter(|e| e.0 == "vibe::rate_limit_alerts")
+                .count()
+        };
+        let ((), quiet) = capture(|| {
+            for t in 0..8 {
+                assert!(rates.net.charge(&format!("t{t}"), &v4(t), 1, now).is_ok());
+            }
+        });
+        assert_eq!(alerts(&quiet), 0, "{quiet:?}");
+        let ((), loud) = capture(|| {
+            for t in 8..10 {
+                assert!(rates.net.charge(&format!("t{t}"), &v4(t), 1, now).is_ok());
+            }
+        });
+        assert_eq!(alerts(&loud), 1, "at most one alert per window: {loud:?}");
+        assert!(active_tenants_alerts() >= 1);
     }
 
     #[test]

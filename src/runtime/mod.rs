@@ -25,10 +25,11 @@ pub use http::{
     REQUEST_TYPES, TEST_IP_OVERRIDE_AVAILABLE,
 };
 pub use limiter::{
-    counter_slot_refusals, saturation_refusals, slot_refused_metrics, slot_refused_total,
-    LimiterMemory, NetLimits, ProxyNet, QuotaBuckets, RateBuckets, BUCKET_BYTES,
-    COUNTER_SLOT_BYTES, FLOOR_RESERVE_BYTES, FLOOR_SLOT_BYTES, HIT_BYTES, MAX_EXPECTED_TENANTS,
-    MAX_PLATFORM_FACTOR, PLATFORM_SLOT_FLOOR, QUOTA_ENTRY_BYTES, TABLE_MEMORY_MAX_BYTES,
+    active_tenants_alerts, counter_slot_refusals, saturation_refusals, slot_refused_metrics,
+    slot_refused_total, slot_refused_within_floor_total, LimiterMemory, NetLimits, ProxyNet,
+    QuotaBuckets, RateBuckets, ACTIVE_TENANTS_ALERT, BUCKET_BYTES, COUNTER_SLOT_BYTES,
+    FLOOR_RESERVE_BYTES, FLOOR_SLOT_BYTES, HIT_BYTES, MAX_EXPECTED_TENANTS, MAX_PLATFORM_FACTOR,
+    PLATFORM_SLOT_FLOOR, QUOTA_ENTRY_BYTES, TABLE_MEMORY_MAX_BYTES,
 };
 pub use ops::{custom_claim_problem, load_signing_keys, sub_source_problem};
 pub use sql::Stmt;

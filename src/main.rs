@@ -621,13 +621,12 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
 }
 
 /// D130 limits. `VIBE_RATE_PLATFORM_FACTOR` sets the platform cap as a
-/// multiple of the tenant cap (default 5, 1..=100).
-/// `VIBE_RATE_EXPECTED_TENANTS` sizes the global tenant slot budget
-/// (default 256, 1..=4096; budget = tenants x 4,096 slots) and with it the
-/// platform total (budget + tenants x 64 floor slots) and the memory kept
-/// for per-tenant floors (tenants x 64 x 3 KiB, at most half the cap).
+/// multiple of the tenant cap (bounded).
+/// `VIBE_RATE_EXPECTED_TENANTS` sizes the global tenant slot budget and
+/// with it the platform total (budget plus one floor per tenant) and the
+/// memory kept for per-tenant floors (at most half the cap).
 /// `VIBE_RATE_TABLE_MEMORY_MAX_BYTES` caps the estimated memory of all
-/// limiter tables combined (default 268435456 = 256 MiB, at least 1 MiB).
+/// limiter tables combined (bounded below).
 fn net_limits_from_env() -> Result<vibe::runtime::NetLimits, String> {
     let mut limits = vibe::runtime::NetLimits::default();
     if let Ok(raw) = std::env::var("VIBE_RATE_PLATFORM_FACTOR") {
