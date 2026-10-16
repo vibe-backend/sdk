@@ -27,6 +27,43 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0mqNqll14aIJEhYqCiRLWJX63Ty6\n\
 Q0UxBzbmJ2wI9FMVJLw4XEhuIJFqIdA/P6b6ozSNGyOUZK7OjIfGKtpNYw==\n\
 -----END PUBLIC KEY-----\n";
 
+#[test]
+fn jsonwebtoken_rejects_off_curve_key_without_startup_checks() {
+    use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+    use serde_json::{json, Value};
+
+    let token = encode(
+        &Header::new(Algorithm::ES256),
+        &json!({"sub": "test", "exp": 4_102_444_800u64}),
+        &EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let validation = Validation::new(Algorithm::ES256);
+    let valid_key = DecodingKey::from_ec_pem(PUBLIC_PEM.as_bytes()).unwrap();
+    assert!(decode::<Value>(&token, &valid_key, &validation).is_ok());
+
+    // Keep the valid x coordinate and change y's low bit to leave P-256.
+    // Pass the PEM directly to jsonwebtoken, bypassing our startup checks.
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mut der = STANDARD
+        .decode(
+            PUBLIC_PEM
+                .lines()
+                .filter(|line| !line.starts_with("-----"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    let last = der.len() - 1;
+    der[last] ^= 1;
+    let pem = format!(
+        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+        STANDARD.encode(&der)
+    );
+    if let Ok(key) = DecodingKey::from_ec_pem(pem.as_bytes()) {
+        assert!(decode::<Value>(&token, &key, &validation).is_err());
+    }
+}
+
 fn fixture() -> Manifest {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),

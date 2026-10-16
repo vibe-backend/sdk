@@ -1,6 +1,9 @@
 //! EC key curve checks (decision 139, spec §4.1a): ES256 keys must be on
 //! P-256. Static verification keys (`VIBE_JWT_PUBLIC_KEY_PEM`) and ES256
 //! signing keys are checked at startup; other curves refuse to start.
+//! These hand-written curve/point checks are defense-in-depth only, reporting
+//! errors early at startup. Authoritative key parsing and verification are
+//! performed by jsonwebtoken (aws_lc_rs backend). JWKS keys bypass these checks.
 //!
 //! Reads SubjectPublicKeyInfo (`PUBLIC KEY`), PKCS#8 (`PRIVATE KEY`) and
 //! SEC1 (`EC PRIVATE KEY`) PEMs. Public points must be uncompressed and lie

@@ -462,7 +462,9 @@ pub fn load_signing_keys(
             let (alg, key) = match opt(step, "alg") {
                 // Decision 139: ES256 when `alg` is omitted.
                 "ES256" | "" => {
-                    // Decision 139: ES256 signing keys must be P-256.
+                    // Defense-in-depth only: report P-256 curve/point errors at startup.
+                    // jsonwebtoken (aws_lc_rs) performs authoritative parsing and
+                    // verification; JWKS keys bypass these hand-written checks.
                     super::eckey::p256_private(&pem)
                         .map_err(|problem| super::http::ec_problem_message(&key_ref, problem))?;
                     (

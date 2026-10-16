@@ -1470,6 +1470,9 @@ pub fn check_static_jwt_key(pem: &str, alg: Algorithm) -> Result<(), String> {
                     "{WHAT}: VIBE_JWT_ALG is ES256 but the key is not an EC public key"
                 ));
             }
+            // Defense-in-depth only: report P-256 curve/point errors at startup.
+            // jsonwebtoken (aws_lc_rs) performs authoritative parsing and
+            // verification; JWKS keys bypass these hand-written checks.
             super::eckey::p256_public(pem).map_err(|problem| ec_problem_message(WHAT, problem))
         }
         other => Err(format!("{WHAT}: unsupported alg {other:?}")),
