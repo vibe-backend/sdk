@@ -94,8 +94,8 @@ Turnstile's own single-use check (`timeout-or-duplicate`) applies in addition.
 | No proof | 400 `CHALLENGE_REQUIRED` |
 | Proof rejected (forged, replayed, expired, missing or future `challenge_ts`, wrong hostname or action, per-IP or per-tenant quota reached) | 403 `CHALLENGE_FAILED` |
 | Provider or network failure only: provider unreachable, timeout, bad response, replay store unreachable (spec decision 134) | 503 `CHALLENGE_UNAVAILABLE`, `Retry-After: 5` (decision 135) |
-| Per-network-prefix cap reached (IPv4 /24 or IPv6 /48, default 16 per tenant replay store; decision 134) | 429 `CHALLENGE_RATE_LIMITED` with `Retry-After` = remaining validity of the oldest record for that tenant and prefix, capped at 360 s, or a fixed 60 if it cannot be computed (same rule as the full store; PM-approved 2026-10-16); identical to the full-store response apart from `Retry-After` |
-| Replay store full (capacity limit from traffic, not a provider failure; decision 134, PM-confirmed 2026-10-16) | 429 `CHALLENGE_RATE_LIMITED`, `Retry-After` = remaining validity of the oldest record, capped at 360 s, or a fixed 60 if it cannot be computed |
+| Per-network-prefix cap reached (IPv4 /24 or IPv6 /48, default 16 per tenant replay store; decision 134) | 429 `CHALLENGE_RATE_LIMITED` with `Retry-After` = remaining validity of the tenant's oldest record in that prefix, capped at 360 s, or a fixed 60 if it cannot be computed (same rule as the full store; PM-approved 2026-10-16); identical to the full-store response apart from `Retry-After` |
+| Replay store full (capacity limit from traffic, not a provider failure; decision 134, PM-confirmed 2026-10-16) | 429 `CHALLENGE_RATE_LIMITED`, `Retry-After` = remaining validity of the tenant's own oldest record, capped at 360 s, or 60 s if it cannot be computed |
 
 A full replay store still fails closed: a request is never admitted without recording its replay entry. Each occurrence emits the metric `vibe_challenge_rejected_total{reason="replay_store_full"}` and raises the alert `challenge_replay_store_full`. Names confirmed by the PM on 2026-10-16.
 
@@ -151,3 +151,70 @@ accept them and enforce them with the per-process counter.
 Challenges do not replace server-side rate limits and quotas. The route's rate
 limits and the public write quota are checked before the challenge, so a
 limited request never reaches the replay cache or the provider.
+
+## Request binding (#156, decision 140)
+
+Spec v1.8 §7.2b binds each token to a digest of the request it was solved for.
+The digest goes in the widget's `cdata` (`data-cdata`). Binding applies to every
+captcha route, including login routes with `when: after-failures`. Implementation
+status: not yet implemented.
+
+### Request nonce
+
+Every bound request must carry a fresh nonce in the `X-Vibe-Request-Nonce` header:
+
+- 16 random bytes from a CSPRNG (`crypto.getRandomValues`), never `Math.random`.
+- Encoded as base64url with no padding: exactly 22 characters.
+- Single use: never reuse a nonce, including on a retry. A retry needs a new
+  nonce and a new challenge.
+- Send the nonce only in the `X-Vibe-Request-Nonce` header to the vibe server.
+  The protocol puts only the digest in `cdata`, never the nonce, so `cdata` alone
+  can't be used to recover low-entropy bodies (such as login forms).
+- Nonces are unique per tenant (key `(tenant_id, nonce)`). Each request uses one
+  nonce record, which counts toward the replay store caps (decisions 134 and
+  137).
+
+The server checks the nonce in a fixed order and stops at the first failure:
+
+1. Format and canonical form: 403 `CHALLENGE_FAILED`.
+2. Reuse of the same nonce: 403 `CHALLENGE_FAILED`.
+3. Decision 137 unverified-reservation cap: 403 `CHALLENGE_FAILED`.
+4. Decision 134 capacity caps (store full, per-prefix cap): 429
+   `CHALLENGE_RATE_LIMITED` with `Retry-After`. This response is identical to
+   every other decision 134 429, apart from the `Retry-After` value.
+   `Retry-After` is the remaining lifetime of the tenant's own oldest record
+   (store full) or of the tenant's oldest record in that prefix (per-prefix
+   cap), at most 360 seconds, and 60 seconds if it can't be computed.
+
+Every verification failure, including a reused nonce, is 403, never 429. On 429,
+wait `Retry-After` seconds, then retry with a new nonce and a new challenge.
+
+### Frontend: run the challenge just before submit
+
+The digest covers the nonce, method, path, query, `Content-Type`, `If-Match` and
+the exact body bytes, so compute it only after the form is complete:
+
+1. Let the user fill in the whole form. Do not run the challenge on page load.
+2. On submit, serialize the body once (for example `JSON.stringify`) and keep
+   those exact bytes.
+3. Build the URL with the client helper, which encodes the query for you. A space
+   becomes `%20` and a literal `+` becomes `%2B`. A raw `+` in the query is
+   rejected, so do not build query strings by hand or with
+   `URLSearchParams.toString()` (it writes spaces as `+`).
+4. Generate the nonce. Then compute the digest (`rd1.` + base64url SHA-256, see
+   `scripts/request-digest-vectors.mjs`) and render or execute the widget with
+   that `cdata`.
+5. Send the request with exactly the same method (upper case), URL, headers and
+   body bytes, plus `x-challenge-proof` and `X-Vibe-Request-Nonce`.
+6. If the user edits the form after the challenge, call `turnstile.reset` and run
+   the challenge again with a new nonce and digest.
+
+Any invalid input is rejected with the same 403 `CHALLENGE_FAILED`, and the
+response never says which part was wrong. That includes a raw `+`, a lower-case
+method, a duplicate header, a non-ASCII header value, `Content-Encoding`, dot
+segments and bad percent-encoding.
+
+A proxy or CDN in front of the runtime must not rewrite the path, query or body,
+or add `Content-Encoding`. Otherwise every bound request is rejected (fail
+closed). `bind: none` is allowed in v1 with a warning. From the next minor
+release, new public INSERT routes may not use it (#245).
