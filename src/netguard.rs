@@ -168,17 +168,17 @@ fn non_public_v6(ip: Ipv6Addr) -> bool {
     if s[..4].iter().all(|&x| x == 0) && s[4] == 0xffff && s[5] == 0 {
         return true;
     }
-    (s[0] == 0x100 && s[1..4].iter().all(|&x| x == 0)) // 100::/64 discard
-        || (s[0] == 0x64 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0)) // 64:ff9b::/96 NAT64
+    (s[0] == 0x64 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0)) // 64:ff9b::/96 NAT64
         || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1) // 64:ff9b:1::/48 local NAT64
+        || (s[0] == 0x100 && s[1..4].iter().all(|&x| x == 0)) // 100::/64 discard
         || (s[0] == 0x2001 && s[1] == 0) // 2001::/32 Teredo
-        || (s[0] == 0x2001 && s[1] == 0xdb8) // 2001:db8::/32 documentation
         || (s[0] == 0x2001 && s[1] == 2 && s[2] == 0) // 2001:2::/48 benchmarking
         || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x10) // 2001:10::/28 ORCHID
         || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x20) // 2001:20::/28 ORCHIDv2
+        || (s[0] == 0x2001 && s[1] == 0xdb8) // 2001:db8::/32 documentation
+        || s[0] == 0x2002 // 2002::/16 6to4
         || (s[0] == 0x3fff && (s[1] & 0xf000) == 0) // 3fff::/20 documentation
         || s[0] == 0x5f00 // 5f00::/16 SRv6 SIDs
-        || s[0] == 0x2002 // 2002::/16 6to4
         || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
         || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
         || (s[0] & 0xffc0) == 0xfec0 // fec0::/10 site-local
@@ -337,6 +337,38 @@ mod tests {
             .unwrap()
             .collect();
         assert_eq!(got, vec!["93.184.216.34:0".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn resolver_classifies_ipv4_mapped_and_nat64_by_embedded_v4() {
+        use reqwest::dns::Resolve;
+        // IPv4-mapped (::ffff:x): classified by the embedded IPv4.
+        for ip in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            let name: reqwest::dns::Name = "rebind.example.com".parse().unwrap();
+            assert!(fake_dns(ip).resolve(name).await.is_err(), "{ip}");
+        }
+        // Mapped public v4 stays allowed.
+        {
+            let ip: IpAddr = "::ffff:8.8.8.8".parse().unwrap();
+            let name: reqwest::dns::Name = "ok.example.com".parse().unwrap();
+            let got: Vec<_> = fake_dns(ip).resolve(name).await.unwrap().collect();
+            assert_eq!(got, vec![SocketAddr::new(ip, 0)]);
+        }
+        // NAT64 (64:ff9b::/96) of private/link-local IPv4 is refused.
+        for ip in [
+            "64:ff9b::a9fe:a9fe", // 169.254.169.254
+            "64:ff9b::7f00:1",    // 127.0.0.1
+            "64:ff9b::a00:1",     // 10.0.0.1
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            let name: reqwest::dns::Name = "rebind.example.com".parse().unwrap();
+            assert!(fake_dns(ip).resolve(name).await.is_err(), "{ip}");
+        }
     }
 
     #[tokio::test]
