@@ -66,8 +66,10 @@ const GRANTS: &str =
 const RUNTIME_ROLES: [&str; 3] = ["app_rw", "public_reader", "public_writer"];
 
 /// What an operator pre-creates for a tenant: three LOGIN NOINHERIT tenant
-/// roles with no memberships, and a migration role that may create the
-/// tenant schema (and so owns only that schema).
+/// roles, and a migration role that may create the tenant schema (and so
+/// owns only that schema). The only membership is the owner in the
+/// tenant's `_rw` role, granted `WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`
+/// (D129, #246; PostgreSQL 16+).
 async fn ensure_tenant_roles(admin_url: &str, tenant: &str) {
     let _guard = SETUP.lock().await;
     let admin = connect(admin_url).await;
@@ -92,6 +94,8 @@ async fn ensure_tenant_roles(admin_url: &str, tenant: &str) {
              THEN CREATE ROLE {role} LOGIN NOINHERIT PASSWORD 'pw'; END IF; END $$;"
         ));
     }
+    sql.push_str(&vibe::runtime::migrate::owner_membership_grant(tenant).unwrap());
+    sql.push(';');
     admin.batch_execute(&sql).await.unwrap();
 }
 
@@ -265,13 +269,15 @@ async fn tenant_roles_are_accepted_and_limited_to_their_own_schema() {
         "table-wide UPDATE is narrowed to columns (never id/tenant_id/created_at); no CREATE; \
          migration-only tables get no grants"
     );
-    // No shared runtime role, no membership in either direction.
+    // No shared runtime role, no membership in either direction except
+    // the owner in the tenant's own `_rw` role (D129, #246).
     let shared: i64 = s
         .admin
         .query_one(
             "SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid IN (m.member, m.roleid) \
-             WHERE r.rolname = ANY($1)",
-            &[&vec![rw.clone(), reader.clone(), writer.clone()]],
+             WHERE r.rolname = ANY($1) AND NOT (m.roleid = $2::text::regrole AND m.member = $3::text::regrole \
+             AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option)",
+            &[&vec![rw.clone(), reader.clone(), writer.clone()], &rw, &owner_of(&s.tenant)],
         )
         .await
         .unwrap()
@@ -450,6 +456,188 @@ async fn tenant_role_with_cross_tenant_reach_is_refused() {
         .await
         .unwrap_err();
     assert!(err.contains("not the tenant role"), "{err}");
+}
+
+/// Issue #246: the only role membership allowed for a tenant is its owner
+/// as a direct member of its own `_rw` role, granted `WITH ADMIN FALSE,
+/// INHERIT FALSE, SET TRUE`. Any other membership fails the startup check.
+#[tokio::test]
+async fn tenant_membership_check_allows_only_the_owner_grant() {
+    let s = require_pg!(setup().await);
+    let b = second_tenant(&s).await;
+    let rw = trole(&s.tenant, "app_rw");
+    let owner = owner_of(&s.tenant);
+    let rw_b = trole(&b, "app_rw");
+    let mid = format!("mid_{}", suffix());
+    // Allowed case: provisioning issued exactly the owner grant.
+    let row = s
+        .admin
+        .query_one(
+            "SELECT m.admin_option, m.inherit_option, m.set_option FROM pg_auth_members m \
+             WHERE m.roleid = $1::text::regrole AND m.member = $2::text::regrole",
+            &[&rw, &owner],
+        )
+        .await
+        .unwrap();
+    let opts: (bool, bool, bool) = (row.get(0), row.get(1), row.get(2));
+    assert_eq!(opts, (false, false, true));
+    for class in RUNTIME_ROLES {
+        check_tenant(&s.admin_url, &s.tenant, class).await.unwrap();
+    }
+    for (name, change, repair) in [
+        (
+            "owner in another tenant's rw",
+            format!("GRANT {rw_b} TO {owner} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"),
+            format!("REVOKE {rw_b} FROM {owner}"),
+        ),
+        (
+            "INHERIT TRUE",
+            format!("GRANT {rw} TO {owner} WITH INHERIT TRUE"),
+            format!("REVOKE INHERIT OPTION FOR {rw} FROM {owner}"),
+        ),
+        (
+            "ADMIN OPTION",
+            format!("GRANT {rw} TO {owner} WITH ADMIN TRUE"),
+            format!("REVOKE ADMIN OPTION FOR {rw} FROM {owner}"),
+        ),
+        (
+            "SET FALSE",
+            format!("REVOKE SET OPTION FOR {rw} FROM {owner}"),
+            format!("GRANT {rw} TO {owner} WITH SET TRUE"),
+        ),
+        (
+            "reverse membership",
+            // PostgreSQL refuses a circular grant, so drop the allowed one first.
+            format!("REVOKE {rw} FROM {owner}; GRANT {owner} TO {rw} WITH INHERIT FALSE"),
+            format!(
+                "REVOKE {owner} FROM {rw}; \
+                 GRANT {rw} TO {owner} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+            ),
+        ),
+        (
+            "indirect membership via an intermediate role",
+            format!(
+                "CREATE ROLE {mid} NOLOGIN; GRANT {mid} TO {owner} WITH INHERIT FALSE; \
+                 GRANT {rw} TO {mid} WITH INHERIT FALSE"
+            ),
+            format!("DROP ROLE {mid}"),
+        ),
+    ] {
+        s.admin.batch_execute(&change).await.unwrap();
+        let got = check_tenant(&s.admin_url, &s.tenant, "app_rw").await;
+        // Straight to migrate: re-provisioning would reset the grant options.
+        let owner_exec = PgExec::connect(&url_as(&s.admin_url, &owner))
+            .await
+            .unwrap();
+        let migrated = migrate_tenant(&owner_exec, &manifest(), &s.tenant).await;
+        s.admin.batch_execute(&repair).await.unwrap();
+        let err = got.expect_err(&format!("{name}: startup must fail"));
+        assert!(err.contains("refusing to serve"), "{name}: {err}");
+        assert!(migrated.is_err(), "{name}: migrate must refuse");
+    }
+    // Owner of tenant A in tenant B's rw also fails tenant B's startup.
+    s.admin
+        .batch_execute(&format!(
+            "GRANT {rw_b} TO {owner} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+        ))
+        .await
+        .unwrap();
+    let got = check_tenant(&s.admin_url, &b, "app_rw").await;
+    s.admin
+        .batch_execute(&format!("REVOKE {rw_b} FROM {owner}"))
+        .await
+        .unwrap();
+    assert!(got.unwrap_err().contains("refusing to serve"));
+    for class in RUNTIME_ROLES {
+        check_tenant(&s.admin_url, &s.tenant, class).await.unwrap();
+    }
+    migrate_as(&s, &manifest(), &s.tenant).await.unwrap();
+}
+
+/// Issue #250: `tenant_<id>_rw` holds exactly SELECT and INSERT on the
+/// challenge replay table; any other privilege fails the startup check.
+#[tokio::test]
+async fn replay_table_privileges_are_exactly_select_insert() {
+    let s = require_pg!(setup().await);
+    let rw = trole(&s.tenant, "app_rw");
+    let reader = trole(&s.tenant, "public_reader");
+    let t = format!("t_{}.vibe_challenge_replay", s.tenant);
+    check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .unwrap();
+    check_tenant(&s.admin_url, &s.tenant, "public_reader")
+        .await
+        .unwrap();
+    let cases = [
+        (
+            "app_rw",
+            format!("GRANT UPDATE ON {t} TO {rw}"),
+            format!("REVOKE UPDATE ON {t} FROM {rw}"),
+        ),
+        (
+            "app_rw",
+            format!("GRANT DELETE ON {t} TO {rw}"),
+            format!("REVOKE DELETE ON {t} FROM {rw}"),
+        ),
+        (
+            "app_rw",
+            format!("GRANT TRUNCATE ON {t} TO {rw}"),
+            format!("REVOKE TRUNCATE ON {t} FROM {rw}"),
+        ),
+        (
+            "app_rw",
+            format!("GRANT REFERENCES ON {t} TO {rw}"),
+            format!("REVOKE REFERENCES ON {t} FROM {rw}"),
+        ),
+        (
+            "app_rw",
+            format!("GRANT TRIGGER ON {t} TO {rw}"),
+            format!("REVOKE TRIGGER ON {t} FROM {rw}"),
+        ),
+        (
+            "app_rw",
+            format!("GRANT MAINTAIN ON {t} TO {rw}"),
+            format!("REVOKE MAINTAIN ON {t} FROM {rw}"),
+        ),
+        (
+            "app_rw",
+            format!("GRANT UPDATE (state) ON {t} TO {rw}"),
+            format!("REVOKE UPDATE (state) ON {t} FROM {rw}"),
+        ),
+        (
+            "app_rw",
+            format!("GRANT SELECT ON {t} TO {rw} WITH GRANT OPTION"),
+            format!("REVOKE GRANT OPTION FOR SELECT ON {t} FROM {rw}"),
+        ),
+        (
+            "app_rw",
+            format!("GRANT SELECT ON {t} TO PUBLIC"),
+            format!("REVOKE SELECT ON {t} FROM PUBLIC"),
+        ),
+        (
+            "app_rw",
+            format!("REVOKE INSERT ON {t} FROM {rw}"),
+            format!("GRANT INSERT ON {t} TO {rw}"),
+        ),
+        (
+            "public_reader",
+            format!("GRANT SELECT ON {t} TO {reader}"),
+            format!("REVOKE SELECT ON {t} FROM {reader}"),
+        ),
+    ];
+    for (class, change, repair) in cases {
+        s.admin.batch_execute(&change).await.unwrap();
+        let got = check_tenant(&s.admin_url, &s.tenant, class).await;
+        s.admin.batch_execute(&repair).await.unwrap();
+        let err = got.expect_err(&format!("`{change}` must fail startup"));
+        assert!(err.contains("refusing to serve"), "{change}: {err}");
+    }
+    check_tenant(&s.admin_url, &s.tenant, "app_rw")
+        .await
+        .unwrap();
+    check_tenant(&s.admin_url, &s.tenant, "public_reader")
+        .await
+        .unwrap();
 }
 
 /// `vibe migrate` refuses a shared migration login and unsafe tenant roles.

@@ -71,7 +71,12 @@ fn table_problem(name: &ObjectName) -> Option<String> {
 
 /// Names reserved for platform and catalog objects (`pg_*`, `_platform*`,
 /// `vibe_*`, `information_schema`). Lock SQL and migrations both refuse
-/// them.
+/// them. Callers pass the ASCII-lowercased name, so the check is
+/// case-insensitive. PostgreSQL folds unquoted identifiers to lowercase but
+/// keeps quoted ones exactly (`"VIBE_x"` is a different identifier from
+/// `vibe_x`); table references are refused when either the folded or the
+/// literal spelling starts with a reserved prefix, and quoted names that are
+/// not plain lowercase are refused outright.
 pub fn reserved_name(value: &str) -> bool {
     value.starts_with("pg_")
         || value.starts_with("_platform")
@@ -767,5 +772,59 @@ mod tests {
         ] {
             assert!(wrapped_problem(&wrap_for_rows(sql)).is_some(), "accepted: {sql}");
         }
+    }
+
+    /// Every spelling of a reserved `vibe_*` table reference is refused by
+    /// static validation (`analyze`) and by the runtime checks
+    /// (`query_problem`, `wrapped_problem`).
+    #[test]
+    fn reserved_name_rejected_in_all_forms() {
+        for sql in [
+            "select * from VIBE_challenge_replay",
+            "select * from Vibe_challenge_replay",
+            "select * from vIbE_ChAlLeNgE_rEpLaY",
+            "select * from \"vibe_challenge_replay\"",
+            "select * from \"VIBE_challenge_replay\"",
+            "select * from \"Vibe_Challenge_Replay\"",
+            "select * from t_x.vibe_challenge_replay",
+            "select * from \"t_x\".\"vibe_challenge_replay\"",
+            "select * from T_X.VIBE_CHALLENGE_REPLAY",
+            "select * from public.vibe_challenge_replay",
+            "with r as (select * from VIBE_challenge_replay) select * from r",
+            "with vibe_x as (select 1 as a) select * from vibe_x",
+            "select * from (select * from \"vibe_challenge_replay\") s",
+            "select id from users where exists (select 1 from Vibe_challenge_replay)",
+            "select u.id from users u join VIBE_challenge_replay r on r.key = u.id",
+            "select u.id from users u left join t_x.vibe_challenge_replay r on true",
+            "select id from users union select key from \"VIBE_challenge_replay\"",
+            "insert into VIBE_challenge_replay (tenant_id) values ('x')",
+            "insert into \"vibe_challenge_replay\" (tenant_id) values ('x')",
+            "insert into t_x.vibe_challenge_replay (tenant_id) values ('x')",
+            "insert into users (id) select key from Vibe_challenge_replay",
+            "update VIBE_challenge_replay set state = 'released' where true",
+            "update \"t_x\".\"vibe_challenge_replay\" set state = 'x' where true",
+            "update users set name = 'x' from vibe_challenge_replay r where r.key = users.id",
+            "delete from Vibe_challenge_replay where true",
+            "delete from \"VIBE_challenge_replay\" where true",
+            "delete from users using VIBE_challenge_replay r where r.key = users.id",
+        ] {
+            assert!(
+                query_problem(sql).is_some(),
+                "query_problem accepted: {sql}"
+            );
+            assert!(analyze(sql).is_err(), "analyze accepted: {sql}");
+            assert!(
+                wrapped_problem(&wrap_for_rows(sql)).is_some(),
+                "wrapped_problem accepted: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_name_check_is_case_insensitive() {
+        for name in ["vibe_x", "VIBE_x", "Vibe_X", "PG_class", "_PLATFORM_x"] {
+            assert!(super::reserved_name(&name.to_ascii_lowercase()), "{name}");
+        }
+        assert!(!super::reserved_name("vibes"));
     }
 }

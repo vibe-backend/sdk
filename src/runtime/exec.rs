@@ -362,6 +362,10 @@ pub struct RoleStatus {
     /// Policies in its own schema other than the canonical
     /// `tenant_isolation` for this tenant.
     pub foreign_policies: Vec<String>,
+    /// Privileges on `t_<id>.vibe_challenge_replay` that differ from the
+    /// allowed set: `tenant_<id>_rw` holds exactly SELECT and INSERT
+    /// (not grantable), other roles and PUBLIC hold nothing.
+    pub replay_privileges: Vec<String>,
 }
 
 impl RoleStatus {
@@ -394,7 +398,7 @@ impl RoleStatus {
         }
         if !self.memberships.is_empty() {
             out.push(format!(
-                "has role memberships ({}); a tenant role must not be able to SET ROLE to anything",
+                "has role memberships other than tenant_<id>_owner in tenant_<id>_rw WITH ADMIN FALSE, INHERIT FALSE, SET TRUE ({}); a tenant role must not be able to SET ROLE to anything",
                 self.memberships.join(", ")
             ));
         }
@@ -419,6 +423,12 @@ impl RoleStatus {
                 self.foreign_policies.join(", ")
             ));
         }
+        if !self.replay_privileges.is_empty() {
+            out.push(format!(
+                "has privileges on the challenge replay table other than exactly SELECT and INSERT for tenant_<id>_rw ({}); re-run `vibe migrate`",
+                self.replay_privileges.join(", ")
+            ));
+        }
         out
     }
 }
@@ -428,12 +438,7 @@ impl RoleStatus {
 pub fn tenant_role_status_sql() -> String {
     format!(
         r#"SELECT current_user::text, session_user::text, $2::text, r.rolsuper, r.rolbypassrls, r.rolinherit,
- COALESCE((SELECT array_agg(x ORDER BY x) FROM (
-   SELECT 'member of ' || g.rolname::text AS x FROM pg_auth_members m
-     JOIN pg_roles g ON g.oid = m.roleid WHERE m.member = r.oid
-   UNION ALL
-   SELECT 'has member ' || u.rolname::text FROM pg_auth_members m
-     JOIN pg_roles u ON u.oid = m.member WHERE m.roleid = r.oid) y), '{{}}'),
+ COALESCE((SELECT array_agg(x ORDER BY x) FROM ({members}) y(x)), '{{}}'),
  (SELECT count(*) FROM pg_class WHERE relowner = r.oid)
    + (SELECT count(*) FROM pg_proc WHERE proowner = r.oid)
    + (SELECT count(*) FROM pg_type WHERE typowner = r.oid)
@@ -463,9 +468,34 @@ pub fn tenant_role_status_sql() -> String {
    FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
    JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname = 't_' || $1::text
-   AND NOT (p.polname = 'tenant_isolation' AND {canonical})), '{{}}')
+   AND NOT (p.polname = 'tenant_isolation' AND {canonical})), '{{}}'),
+ COALESCE((SELECT array_agg(x ORDER BY x) FROM (
+   SELECT format('%I.%I lacks %s', n.nspname, c.relname, need) AS x
+     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
+     LATERAL (VALUES ('SELECT'), ('INSERT')) v(need)
+     WHERE n.nspname = 't_' || $1::text AND c.relname = 'vibe_challenge_replay'
+     AND $2::text = 'tenant_' || $1::text || '_rw'
+     AND NOT has_table_privilege(r.oid, c.oid, need)
+   UNION ALL
+   SELECT format('%I.%I grants %s to %s', n.nspname, c.relname, a.privilege_type,
+       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(a.grantee::regrole::text) END)
+     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
+     LATERAL aclexplode(c.relacl) a
+     WHERE n.nspname = 't_' || $1::text AND c.relname = 'vibe_challenge_replay'
+     AND (a.grantee = 0 OR a.grantee = r.oid)
+     AND NOT ($2::text = 'tenant_' || $1::text || '_rw' AND a.grantee = r.oid
+       AND a.privilege_type IN ('SELECT', 'INSERT') AND NOT a.is_grantable)
+   UNION ALL
+   SELECT format('%I.%I column %I grants %s to %s', n.nspname, c.relname, t.attname, a.privilege_type,
+       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(a.grantee::regrole::text) END)
+     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     JOIN pg_attribute t ON t.attrelid = c.oid AND t.attacl IS NOT NULL,
+     LATERAL aclexplode(t.attacl) a
+     WHERE n.nspname = 't_' || $1::text AND c.relname = 'vibe_challenge_replay'
+     AND (a.grantee = 0 OR a.grantee = r.oid)) y), '{{}}')
 FROM pg_roles r WHERE r.rolname = current_user"#,
-        canonical = super::migrate::canonical_policy_sql("p", "$1::text")
+        canonical = super::migrate::canonical_policy_sql("p", "$1::text"),
+        members = super::migrate::membership_problems_sql("$1::text", "r.oid")
     )
 }
 
@@ -759,6 +789,7 @@ impl PgExec {
             foreign_access: row.get(8),
             unprotected_relations: row.get(9),
             foreign_policies: row.get(10),
+            replay_privileges: row.get(11),
         };
         let problems = status.problems();
         if problems.is_empty() {
@@ -1266,9 +1297,11 @@ mod role_tests {
             foreign_access: vec!["schema t_other001".into()],
             unprotected_relations: vec!["t_acme0001.later".into()],
             foreign_policies: vec!["t_acme0001.notes:open".into()],
+            replay_privileges: vec!["t_acme0001.vibe_challenge_replay grants UPDATE to x".into()],
         };
         let p = s.problems();
-        assert_eq!(p.len(), 9, "{p:?}");
+        assert_eq!(p.len(), 10, "{p:?}");
+        assert!(p[9].contains("grants UPDATE"));
         assert!(p[0].contains("tenant_acme0001_rw"));
         assert!(p[4].contains("member of app_rw") && p[4].contains("SET ROLE"));
         assert!(p[6].contains("t_other001"));

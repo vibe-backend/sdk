@@ -6,6 +6,44 @@ use super::grants::{parse_grants, pg_grant_statements};
 use super::slugs::valid_tenant;
 use super::sql::{bootstrap_statements, quote, rls_statements, tenant_schema_statements, Col};
 
+/// Role memberships involving tenant `tenant_expr`'s roles (its three
+/// runtime roles and `tenant_<id>_owner`) or role `extra_oid`, other than the
+/// single allowed one (D129, #246): `tenant_<id>_owner` as a direct member of
+/// `tenant_<id>_rw` for the same id, granted `WITH ADMIN FALSE, INHERIT
+/// FALSE, SET TRUE`. One text row per membership; any row fails the caller
+/// closed. Every membership is a direct `pg_auth_members` row, so an
+/// indirect (chained) path always shows up as a row touching one of these
+/// roles. Reads `inherit_option` and `set_option`, so it needs
+/// PostgreSQL 16 or later; older servers fail the query (fail closed).
+pub fn membership_problems_sql(tenant_expr: &str, extra_oid: &str) -> String {
+    format!(
+        "SELECT format('%s is a member of %s (admin %s, inherit %s, set %s)', \
+           quote_ident(mr.rolname), quote_ident(gr.rolname), m.admin_option, m.inherit_option, m.set_option) \
+         FROM pg_auth_members m JOIN pg_roles mr ON mr.oid = m.member JOIN pg_roles gr ON gr.oid = m.roleid \
+         WHERE (m.member = {extra_oid} OR m.roleid = {extra_oid} \
+           OR mr.rolname = ANY (ARRAY['tenant_' || {t} || '_rw', 'tenant_' || {t} || '_public_reader', \
+             'tenant_' || {t} || '_public_writer', 'tenant_' || {t} || '_owner']) \
+           OR gr.rolname = ANY (ARRAY['tenant_' || {t} || '_rw', 'tenant_' || {t} || '_public_reader', \
+             'tenant_' || {t} || '_public_writer', 'tenant_' || {t} || '_owner'])) \
+         AND NOT (gr.rolname = 'tenant_' || {t} || '_rw' AND mr.rolname = 'tenant_' || {t} || '_owner' \
+           AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option)",
+        t = tenant_expr,
+    )
+}
+
+/// The only membership grant provisioning may issue for a tenant (D129,
+/// #246; PostgreSQL 16+ syntax): owner into the tenant's `_rw` role, NOINHERIT,
+/// no ADMIN OPTION, SET TRUE.
+pub fn owner_membership_grant(tenant: &str) -> Result<String, String> {
+    let rw = super::grants::tenant_role(tenant, "app_rw")?;
+    let owner = super::grants::tenant_owner_role(tenant)?;
+    Ok(format!(
+        "GRANT {} TO {} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE",
+        quote(&rw)?,
+        quote(&owner)?
+    ))
+}
+
 /// Problems with a tenant's pre-created roles, as seen by the owner role
 /// (decision 97). `$1` is the tenant id; one row per problem.
 pub const TENANT_ROLE_SETUP_SQL: &str = "\
@@ -21,8 +59,10 @@ SELECT format('%s: %s', w.name, p) FROM want w LEFT JOIN pg_roles r ON r.rolname
    (CASE WHEN r.rolbypassrls THEN 'has BYPASSRLS' END), \
    (CASE WHEN r.rolcreaterole OR r.rolcreatedb OR r.rolreplication \
      THEN 'has CREATEROLE, CREATEDB or REPLICATION' END), \
-   (CASE WHEN EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid OR m.roleid = r.oid) \
-     THEN 'is a member of another role or has members' END), \
+   (CASE WHEN EXISTS (SELECT 1 FROM pg_auth_members m WHERE (m.member = r.oid OR m.roleid = r.oid) \
+     AND NOT (w.name = 'tenant_' || $1::text || '_rw' AND m.member = to_regrole('tenant_' || $1::text || '_owner') \
+       AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option)) \
+     THEN 'has a role membership other than tenant_<id>_owner in tenant_<id>_rw WITH ADMIN FALSE, INHERIT FALSE, SET TRUE' END), \
    (CASE WHEN EXISTS (SELECT 1 FROM pg_class WHERE relowner = r.oid) \
      OR EXISTS (SELECT 1 FROM pg_namespace WHERE nspowner = r.oid) \
      OR EXISTS (SELECT 1 FROM pg_proc WHERE proowner = r.oid) \
@@ -51,7 +91,18 @@ SELECT x FROM ( \
  UNION ALL \
  SELECT format('is or can become tenant role %I', r.rolname) FROM pg_roles r \
    WHERE r.rolname LIKE 'tenant\\_%' AND r.rolname <> current_user \
+   AND r.rolname <> 'tenant_' || $1::text || '_rw' \
    AND pg_has_role(current_user, r.oid, 'MEMBER') \
+ UNION ALL \
+ SELECT 'has a role membership that is not allowed: ' || x FROM ( \
+   SELECT format('%s is a member of %s (admin %s, inherit %s, set %s)', \
+     quote_ident(mr.rolname), quote_ident(gr.rolname), m.admin_option, m.inherit_option, m.set_option) AS x \
+   FROM pg_auth_members m JOIN pg_roles mr ON mr.oid = m.member JOIN pg_roles gr ON gr.oid = m.roleid \
+   WHERE (m.member = (SELECT oid FROM pg_roles WHERE rolname = current_user) \
+     OR m.roleid = (SELECT oid FROM pg_roles WHERE rolname = current_user) \
+     OR gr.rolname = 'tenant_' || $1::text || '_rw') \
+   AND NOT (gr.rolname = 'tenant_' || $1::text || '_rw' AND mr.rolname = 'tenant_' || $1::text || '_owner' \
+     AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option)) z \
 ) y ORDER BY 1";
 
 /// Bootstraps one tenant schema and applies migrations, connected as the
@@ -137,7 +188,7 @@ pub async fn migrate_tenant_recorded(
     let problems = exec.query_texts(TENANT_ROLE_SETUP_SQL, tenant).await?;
     if !problems.is_empty() {
         return Err(format!(
-            "tenant roles are not set up safely: {}; create each as `CREATE ROLE <name> LOGIN NOINHERIT PASSWORD '...'` with no other attributes and no role memberships (decision 97)",
+            "tenant roles are not set up safely: {}; create each as `CREATE ROLE <name> LOGIN NOINHERIT PASSWORD '...'` with no other attributes; the only allowed role membership is `GRANT tenant_<id>_rw TO tenant_<id>_owner WITH ADMIN FALSE, INHERIT FALSE, SET TRUE` (decision 97, D129; PostgreSQL 16+)",
             problems.join("; ")
         ));
     }
