@@ -57,8 +57,9 @@ Details, what is verified where, and what is deferred:
 - Runtime configuration: ship `manifest.json.sigstore.json` next to the
   manifest (or set `VIBE_MANIFEST_BUNDLE`). Repo and workflow identity use the
   compiled-in defaults (`vibe-backend/sdk`, `.github/workflows/release.yml`);
-  overrides need relaxed mode (`VIBE_ENV=development` and a debug build or
-  `--insecure-dev`). Deploy with `--expect-version` / `--expect-commit` (or
+  overrides need relaxed mode, which exists only in debug builds
+  (`VIBE_ENV=development`, or the debug-only `--insecure-dev` when `VIBE_ENV`
+  is unset). Release binaries always require the Sigstore bundle. Deploy with `--expect-version` / `--expect-commit` (or
   `VIBE_EXPECT_VERSION` / `VIBE_EXPECT_COMMIT`) matching the release tag and
   commit recorded in the manifest.
 - Make `preview` a required status check on `main`.

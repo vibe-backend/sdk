@@ -773,7 +773,7 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
 
 - Runtime 同部署器**只**接受 CI 喺 `release` environment 由 source 重新 build（`vibe build`，包括重新編譯）嘅 artifact（manifest 同佢包含嘅 lock 內容）。
 - Artifact 一定要有 GitHub artifact attestation（build provenance，predicate `https://slsa.dev/provenance/v1`），綁定：repo、workflow 路徑（例如 `.github/workflows/release.yml`）、ref（`refs/tags/v*`，決定 96；呢個綁定只證明來源，唔係閘門，見第 5 節）、commit SHA；runner 一定係 GitHub-hosted。
-- 另外要有 Sigstore keyless manifest 簽名（決定 119）：release workflow 喺 `release` environment 用 GitHub OIDC 身份簽，一定要有 Rekor transparency log inclusion。冇任何長期 key。
+- 另外要有 Sigstore keyless manifest 簽名（決定 119）：release workflow 喺 `release` environment 用 GitHub OIDC 身份簽，一定要有 Rekor transparency log inclusion。冇任何長期 key。只有 release job（喺 `release` environment 簽名嗰個 job）有 `id-token: write`；其他 job（install、preview、policy、deploy）一律冇 `id-token`。
 - 部署器全部驗證，任何一樣失敗即拒絕部署：
   - Attestation：例如 `gh attestation verify <artifact> --repo <owner>/<repo> --signer-workflow <owner>/<repo>/.github/workflows/release.yml --source-ref refs/tags/v<version> --source-digest <commit sha> --deny-self-hosted-runners`，或者用 sigstore 驗證同樣條件。
   - Manifest 簽名：Sigstore 驗證（例如 `cosign verify-blob --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`（只接受完全相等；如果工具一定要用 regex，只可以用完全錨定、正確轉義、寫死部署版本嘅式，例如 `^https://github\.com/vibe-backend/sdk/\.github/workflows/release\.yml@refs/tags/v1\.8\.0$`，唔可以用 `v.*` 之類寬鬆配對），加 `--certificate-github-workflow-sha <commit sha>`、`--certificate-github-workflow-repository vibe-backend/sdk`，同埋證書 extension 證明係 GitHub-hosted runner），一定要有 Rekor inclusion；身份同 attestation 一致（決定 119）。

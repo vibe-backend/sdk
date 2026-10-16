@@ -62,8 +62,9 @@ check:
 2. The `v*` tag ruleset (no update, deletion or non-fast-forward).
 3. Copy `docs/ci/vibe-release.yml` to `.github/workflows/release.yml`
    (the path the identity check expects). Repo/workflow overrides and other
-   relaxed config need `VIBE_ENV=development` **and** either a debug build or
-   `--insecure-dev` / `VIBE_INSECURE_DEV` (release binaries stay strict when
-   only `VIBE_ENV` is set).
+   relaxed config exist only in debug builds and need `VIBE_ENV=development`
+   (or the debug-only `--insecure-dev` / `VIBE_INSECURE_DEV` when `VIBE_ENV`
+   is unset). Release binaries have no `--insecure-dev` flag and always
+   require a verified Sigstore bundle, whatever `VIBE_ENV` or `--memory` say.
 4. Ship `manifest.json.sigstore.json` next to `manifest.json` (or set
    `VIBE_MANIFEST_BUNDLE`).
