@@ -81,10 +81,15 @@ need curl; need tar; need awk; need gh
 if [ -z "$VERSION" ]; then latest=$(curl -fsSIL --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' "$DOWNLOAD_URL/$REPOSITORY/releases/latest") || die "failed to resolve latest release"; prefix="$DOWNLOAD_URL/$REPOSITORY/releases/tag/"; case $latest in "$prefix"*) VERSION=${latest#"$prefix"};; *) die "latest release redirected outside expected repository";; esac; fi
 if [ "$(printf '%s\n' "$VERSION" | wc -l)" -eq 1 ] && printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then :; else die "invalid stable release version: $VERSION"; fi
 [ "$(semver_cmp "$VERSION" "$MIN_VERSION")" -ge 0 ] || die "refusing $VERSION: below the minimum supported version $MIN_VERSION (older releases may lack security fixes)"
-if cur=$(managed_target 2>/dev/null) && [ -f "${cur%/vibe}/manifest" ]; then
- installed=$(awk -F= '$1=="version"{print $2; exit}' "${cur%/vibe}/manifest")
- if [ -n "$installed" ]; then
-  if [ "$(printf '%s\n' "$installed" | wc -l)" -eq 1 ] && printf '%s\n' "$installed" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+if cur=$(managed_target 2>/dev/null); then
+ man="${cur%/vibe}/manifest"
+ if [ ! -f "$man" ]; then
+  [ "$ALLOW_DOWNGRADE" = 1 ] || die "refusing to replace managed install with missing manifest; pass --allow-downgrade to override"
+ else
+  installed=$(awk -F= '$1=="version"{sub(/^[^=]*=/,""); print; exit}' "$man")
+  if [ -z "$installed" ]; then
+   [ "$ALLOW_DOWNGRADE" = 1 ] || die "refusing to replace managed install with missing or empty version in manifest; pass --allow-downgrade to override"
+  elif [ "$(printf '%s\n' "$installed" | wc -l)" -eq 1 ] && printf '%s\n' "$installed" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
    if [ "$(semver_cmp "$VERSION" "$installed")" -lt 0 ]; then
     [ "$ALLOW_DOWNGRADE" = 1 ] || die "refusing downgrade from $installed to $VERSION; pass --allow-downgrade to override"
    fi
