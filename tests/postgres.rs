@@ -554,6 +554,48 @@ async fn tenant_membership_check_allows_only_the_owner_grant() {
     migrate_as(&s, &manifest(), &s.tenant).await.unwrap();
 }
 
+/// sign-jwt reads `users.roles` through the tenant's `_rw` login pool. That
+/// login is the tenant role itself (decision 97), so no `SET ROLE` is needed
+/// and the default model grants let it read the column.
+#[tokio::test]
+async fn user_roles_lookup_runs_as_the_tenant_login() {
+    let s = require_pg!(setup().await);
+    let mut m: Value = serde_json::to_value(manifest()).unwrap();
+    let mut users = m["models"][0].clone();
+    users["id"] = json!("user");
+    users["table"] = json!("users");
+    users["grants"] = json!("app_rw [SELECT, INSERT, UPDATE], public_reader [], public_writer []");
+    users["fields"] = json!([
+        field("id", "uuid"),
+        field("tenant_id", "string"),
+        field("email", "string"),
+        field("roles", "string[]"),
+        field("created_at", "timestamp"),
+        field("updated_at", "timestamp"),
+        field("deleted_at", "timestamp")
+    ]);
+    m["models"].as_array_mut().unwrap().push(users);
+    let m: Manifest = serde_json::from_value(m).unwrap();
+    migrate_as(&s, &m, &s.tenant).await.unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    s.admin
+        .batch_execute(&format!(
+            "INSERT INTO t_{t}.users (id, tenant_id, email, roles, created_at, updated_at) \
+             VALUES ('{id}', '{t}', 'a@example.com', ARRAY['admin','editor'], now(), now())",
+            t = s.tenant
+        ))
+        .await
+        .unwrap();
+    let pools = pools_for(&s.admin_url, &[&s.tenant]);
+    let got = pools.user_roles(&s.tenant, &id).await.unwrap();
+    assert_eq!(got, Some(vec!["admin".to_string(), "editor".to_string()]));
+    let missing = uuid::Uuid::new_v4().to_string();
+    assert_eq!(pools.user_roles(&s.tenant, &missing).await.unwrap(), None);
+    // The lookup ran as the tenant login, not as any other role.
+    let exec = pools.pool(&s.tenant, "app_rw").await.unwrap();
+    exec.check_tenant_role(&s.tenant, "app_rw").await.unwrap();
+}
+
 /// Concurrent first requests for one role open and check its pool once and
 /// all get the same pool.
 #[tokio::test]
