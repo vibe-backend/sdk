@@ -123,23 +123,46 @@ The digest goes in the widget's `cdata` (`data-cdata`). Binding applies to every
 captcha route, including login routes with `when: after-failures`. Implementation
 status: not yet implemented.
 
+### Request nonce
+
+Every bound request must carry a fresh nonce in the `X-Vibe-Request-Nonce` header:
+
+- 16 random bytes from a CSPRNG (`crypto.getRandomValues`), never `Math.random`.
+- Encoded as base64url with no padding: exactly 22 characters.
+- Single use: never reuse a nonce, including on a retry. A retry needs a new
+  nonce and a new challenge.
+- The nonce goes only to the vibe server. It is never sent to the challenge
+  provider, which only sees the digest. The nonce stops the provider from
+  recovering low-entropy bodies (such as login forms) from the digest.
+
+A missing, malformed or reused nonce is rejected with 403 `CHALLENGE_FAILED`.
+
 ### Frontend: run the challenge just before submit
 
-The digest covers the method, path, query, `Content-Type`, `If-Match` and the
-exact body bytes, so compute it only after the form is complete:
+The digest covers the nonce, method, path, query, `Content-Type`, `If-Match` and
+the exact body bytes, so compute it only after the form is complete:
 
-1. Let the user fill in the whole form. Do not render the widget on page load.
+1. Let the user fill in the whole form. Do not run the challenge on page load.
 2. On submit, serialize the body once (for example `JSON.stringify`) and keep
    those exact bytes.
-3. Compute the digest (`rd1.` + base64url SHA-256, see
+3. Build the URL with the client helper, which encodes the query for you. A space
+   becomes `%20` and a literal `+` becomes `%2B`. A raw `+` in the query is
+   rejected, so do not build query strings by hand or with
+   `URLSearchParams.toString()` (it writes spaces as `+`).
+4. Generate the nonce. Then compute the digest (`rd1.` + base64url SHA-256, see
    `scripts/request-digest-vectors.mjs`) and render or execute the widget with
    that `cdata`.
-4. Send the request with exactly the same method, URL, headers and body bytes,
-   plus `x-challenge-proof`.
-5. If the user edits the form after the challenge, call `turnstile.reset` and
-   run the challenge again with the new digest.
+5. Send the request with exactly the same method (upper case), URL, headers and
+   body bytes, plus `x-challenge-proof` and `X-Vibe-Request-Nonce`.
+6. If the user edits the form after the challenge, call `turnstile.reset` and run
+   the challenge again with a new nonce and digest.
 
-A proxy or CDN in front of the runtime must not rewrite the path, query or body
-or add `Content-Encoding`. Otherwise every bound request is rejected (403
-`CHALLENGE_FAILED`, fail closed). `bind: none` is allowed in v1 with a warning.
-From the next minor release, new public INSERT routes may not use it (#245).
+Any invalid input is rejected with the same 403 `CHALLENGE_FAILED`, and the
+response never says which part was wrong. That includes a raw `+`, a lower-case
+method, a duplicate header, a non-ASCII header value, `Content-Encoding`, dot
+segments and bad percent-encoding.
+
+A proxy or CDN in front of the runtime must not rewrite the path, query or body,
+or add `Content-Encoding`. Otherwise every bound request is rejected (fail
+closed). `bind: none` is allowed in v1 with a warning. From the next minor
+release, new public INSERT routes may not use it (#245).
