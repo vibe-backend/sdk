@@ -445,4 +445,14 @@ for (const loc of locales) {
 }
 for (const rel of allRels) write(rel, picker(rel));
 
-console.log(`Built ${count} pages in ${locales.length} locales (${docs.length} docs each) + ${allRels.length} language pickers into ${path.relative(root, out)}/`);
+// The former project Pages URL was /sdk/. Keep one fixed, same-origin redirect so
+// bookmarks land on the organization site without allowing an open redirect.
+write('sdk/index.html', `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="robots" content="noindex"><link rel="canonical" href="${SITE_URL}">
+<meta http-equiv="refresh" content="0; url=${SITE_URL}">
+<title>vibe-backend documentation moved</title></head>
+<body><p>This documentation has moved to <a href="${SITE_URL}">${SITE_URL}</a>.</p>
+<script>location.replace('/' + location.search + location.hash)</script></body></html>`);
+
+console.log(`Built ${count} pages in ${locales.length} locales (${docs.length} docs each) + ${allRels.length} language pickers + 1 legacy redirect into ${path.relative(root, out)}/`);
