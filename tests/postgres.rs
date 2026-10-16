@@ -5,6 +5,8 @@
 use serde_json::{json, Value};
 use tokio_postgres::{Client, NoTls};
 use vibe::manifest::Manifest;
+use vibe::runtime::challenge::ChallengeError;
+use vibe::runtime::replay::{token_key, Outcome, PgReplayStore, ReplayStore};
 use vibe::runtime::{migrate_tenant, Col, PgExec, QueryExec, Stmt, TenantPools};
 
 fn admin_url() -> Option<String> {
@@ -2225,4 +2227,244 @@ async fn tenant_pools_refuse_at_the_role_cap_without_waiting() {
     assert!(started.elapsed() < std::time::Duration::from_millis(200));
     assert!(vibe::runtime::pool_exhausted_count(vibe::runtime::PoolScope::Role) > before);
     drop(held);
+}
+
+// #157: challenge replay store (one table per tenant schema).
+
+const IP_SECRET: &[u8] = b"test-ip-secret-test-ip-secret-00";
+
+async fn replay_pool(s: &Setup) -> deadpool_postgres::Pool {
+    PgExec::connect(&url_as(&s.admin_url, &s.app))
+        .await
+        .unwrap()
+        .pool()
+}
+
+/// Two "instances": separate pools as the runtime role.
+async fn replay_stores(s: &Setup) -> (PgReplayStore, PgReplayStore) {
+    (
+        PgReplayStore::new(replay_pool(s).await, IP_SECRET),
+        PgReplayStore::new(replay_pool(s).await, IP_SECRET),
+    )
+}
+
+fn is_rejected<T>(r: Result<T, ChallengeError>) -> bool {
+    matches!(r, Err(ChallengeError::Rejected(_)))
+}
+
+fn is_unavailable<T>(r: Result<T, ChallengeError>) -> bool {
+    matches!(r, Err(ChallengeError::Unavailable(_)))
+}
+
+#[tokio::test]
+async fn replay_store_is_single_use_across_instances() {
+    let s = require_pg!(setup().await);
+    let (a, b) = replay_stores(&s).await;
+    let t = Some(s.tenant.as_str());
+    a.check(std::slice::from_ref(&s.tenant)).await.unwrap();
+    let k = token_key("tok-1");
+    let slot = a.reserve(&k, Some("203.0.113.1"), t).await.unwrap();
+    // Pending on A: B refuses concurrent use.
+    assert!(is_rejected(b.reserve(&k, Some("203.0.113.2"), t).await));
+    a.settle(&slot, Outcome::Verified).await.unwrap();
+    assert!(is_rejected(b.reserve(&k, None, t).await));
+    // Releasing a verified reservation afterwards changes nothing.
+    b.settle(&slot, Outcome::Released).await.unwrap();
+    assert!(is_rejected(b.reserve(&k, None, t).await));
+    // Released and rejected (with no hold) slots are free again.
+    let k2 = token_key("tok-2");
+    let s1 = a.reserve(&k2, None, t).await.unwrap();
+    a.settle(&s1, Outcome::Released).await.unwrap();
+    let s2 = b.reserve(&k2, None, t).await.unwrap();
+    // A stale reservation cannot settle a newer one.
+    assert!(is_unavailable(a.settle(&s1, Outcome::Verified).await));
+    let b0 = PgReplayStore::new(replay_pool(&s).await, IP_SECRET)
+        .with_rejected_hold(std::time::Duration::ZERO);
+    b0.settle(&s2, Outcome::Rejected).await.unwrap();
+    let s3 = a.reserve(&k2, None, t).await.unwrap();
+    // With a hold, a rejected token stays blocked.
+    a.settle(&s3, Outcome::Rejected).await.unwrap();
+    assert!(is_rejected(b.reserve(&k2, None, t).await));
+}
+
+#[tokio::test]
+async fn replay_store_concurrent_reservations_admit_one() {
+    let s = require_pg!(setup().await);
+    let (a, b) = replay_stores(&s).await;
+    let t = Some(s.tenant.as_str());
+    for i in 0..5 {
+        let k = token_key(&format!("race-{i}"));
+        let (ra, rb) = tokio::join!(a.reserve(&k, None, t), b.reserve(&k, None, t));
+        assert_eq!(
+            [ra.is_ok(), rb.is_ok()].iter().filter(|ok| **ok).count(),
+            1,
+            "round {i}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_store_runtime_role_has_no_delete_or_update() {
+    let s = require_pg!(setup().await);
+    let table = format!("t_{}.vibe_challenge_replay", s.tenant);
+    let rows = s
+        .admin
+        .query(
+            "SELECT has_table_privilege($1, $2::text::regclass, 'SELECT'), \
+             has_table_privilege($1, $2::text::regclass, 'INSERT'), \
+             has_table_privilege($1, $2::text::regclass, 'DELETE'), \
+             has_table_privilege($1, $2::text::regclass, 'UPDATE'), \
+             has_table_privilege($1, $2::text::regclass, 'TRUNCATE')",
+            &[&s.app, &table],
+        )
+        .await
+        .unwrap();
+    let got: Vec<bool> = (0..5).map(|i| rows[0].get(i)).collect();
+    assert_eq!(got, vec![true, true, false, false, false]);
+    // A verified row cannot be removed or shortened by the runtime role.
+    let (a, b) = replay_stores(&s).await;
+    let t = Some(s.tenant.as_str());
+    let k = token_key("kept");
+    let slot = a.reserve(&k, None, t).await.unwrap();
+    a.settle(&slot, Outcome::Verified).await.unwrap();
+    let app = connect(&url_as(&s.admin_url, &s.app)).await;
+    let set = format!("SET app.tenant_id = '{}'", s.tenant);
+    app.batch_execute(&set).await.unwrap();
+    assert!(app
+        .batch_execute(&format!("DELETE FROM {table}"))
+        .await
+        .is_err());
+    assert!(app
+        .batch_execute(&format!("UPDATE {table} SET expires_at = now()"))
+        .await
+        .is_err());
+    assert!(app
+        .batch_execute(&format!("TRUNCATE {table}"))
+        .await
+        .is_err());
+    assert!(is_rejected(b.reserve(&k, None, t).await));
+    // No shared object outside tenant schemas.
+    let shared: i64 = s
+        .admin
+        .query_one(
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = 'vibe_challenge_replay' AND n.nspname NOT LIKE 't\\_%'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(shared, 0);
+}
+
+#[tokio::test]
+async fn replay_store_isolates_tenants() {
+    let s = require_pg!(setup().await);
+    let other = second_tenant(&s).await;
+    // D129: each tenant's rows go through that tenant's own app_rw pool.
+    let pools = std::sync::Arc::new(pools_for(&s.admin_url, &[&s.tenant, &other]));
+    let a = PgReplayStore::for_tenant_pools(pools.clone(), IP_SECRET).with_capacity(2);
+    let b = PgReplayStore::for_tenant_pools(pools, IP_SECRET).with_capacity(2);
+    a.check(&[s.tenant.clone(), other.clone()]).await.unwrap();
+    let (ta, tb) = (Some(s.tenant.as_str()), Some(other.as_str()));
+    let k = token_key("same-token");
+    a.reserve(&k, Some("192.0.2.7"), ta).await.unwrap();
+    // The same token is independent per tenant.
+    b.reserve(&k, Some("192.0.2.7"), tb).await.unwrap();
+    // Per-tenant capacity: filling one tenant leaves the other usable.
+    a.reserve(&token_key("fill"), None, ta).await.unwrap();
+    assert!(is_unavailable(
+        a.reserve(&token_key("over"), None, ta).await
+    ));
+    b.reserve(&token_key("other-ok"), None, tb).await.unwrap();
+    // One tenant's role cannot reach the other tenant's table at all.
+    let app = connect(&url_as(&s.admin_url, &trole(&other, "app_rw"))).await;
+    assert!(app
+        .query_one(
+            &format!("SELECT count(*) FROM t_{}.vibe_challenge_replay", s.tenant),
+            &[],
+        )
+        .await
+        .is_err());
+    let own: i64 = app
+        .query_one(
+            &format!("SELECT count(*) FROM t_{other}.vibe_challenge_replay"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(own > 0);
+    // Rows for another tenant cannot be written through this tenant's role.
+    assert!(app
+        .batch_execute(&format!(
+            "INSERT INTO t_{other}.vibe_challenge_replay (tenant_id, key, nonce, state, expires_at) \
+             VALUES ('{t}', '\\x00', '\\x00', 'verified', now() + interval '1 hour')",
+            t = s.tenant
+        ))
+        .await
+        .is_err());
+    // IP digests differ per tenant.
+    let digests = s
+        .admin
+        .query(
+            &format!(
+                "SELECT ip_hash FROM t_{}.vibe_challenge_replay WHERE ip_hash IS NOT NULL \
+                 UNION ALL SELECT ip_hash FROM t_{other}.vibe_challenge_replay WHERE ip_hash IS NOT NULL",
+                s.tenant
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(digests.len(), 2);
+    assert_ne!(
+        digests[0].get::<_, Vec<u8>>(0),
+        digests[1].get::<_, Vec<u8>>(0)
+    );
+}
+
+#[tokio::test]
+async fn replay_store_quotas_hold_across_instances() {
+    let s = require_pg!(setup().await);
+    let (a, b) = replay_stores(&s).await;
+    let a = a.with_quotas(2, 3);
+    let b = b.with_quotas(2, 3);
+    let t = Some(s.tenant.as_str());
+    let ip = Some("198.51.100.9");
+    let q1 = a.reserve(&token_key("q1"), ip, t).await.unwrap();
+    b.reserve(&token_key("q2"), ip, t).await.unwrap();
+    // Third unverified token from the same IP, on either instance.
+    assert!(is_rejected(a.reserve(&token_key("q3"), ip, t).await));
+    // Tenant quota counts across IPs and instances.
+    b.reserve(&token_key("q4"), Some("198.51.100.10"), t)
+        .await
+        .unwrap();
+    assert!(is_rejected(
+        a.reserve(&token_key("q5"), Some("198.51.100.11"), t).await
+    ));
+    // Verified tokens leave the quota.
+    a.settle(&q1, Outcome::Verified).await.unwrap();
+    assert!(b.reserve(&token_key("q6"), ip, t).await.is_ok());
+}
+
+#[tokio::test]
+async fn replay_store_fails_closed_when_unusable() {
+    let s = require_pg!(setup().await);
+    let store = PgReplayStore::new(replay_pool(&s).await, IP_SECRET);
+    // The startup check `vibe serve` runs: a tenant without the table.
+    let err = store
+        .check(&["nomigrate0001".to_string()])
+        .await
+        .unwrap_err();
+    assert!(err.contains("run `vibe migrate`"), "{err}");
+    assert!(is_unavailable(
+        store
+            .reserve(&token_key("x"), None, Some("nomigrate0001"))
+            .await
+    ));
+    // No tenant: no reservation.
+    assert!(is_unavailable(
+        store.reserve(&token_key("x"), None, None).await
+    ));
 }

@@ -312,6 +312,10 @@ fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
     let always = vibe::runtime::challenge::always_challenge_locks(project);
     let configured = vibe::runtime::challenge::configured_in_env()?;
     vibe::runtime::challenge::production_gate(run_env, configured, &always)?;
+    // #157: the replay store choice (the table itself is checked by `vibe serve`).
+    let replay_kind =
+        vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?;
+    vibe::runtime::replay::resolve_replay_store(run_env, configured, replay_kind, true)?;
     print_report(&report);
     if deploy {
         println!("validation ok");
@@ -382,6 +386,15 @@ async fn cmd_serve(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
+    // #157: production always uses the PostgreSQL replay store and
+    // refuses the memory switch; dev/CI must choose explicitly. Decided
+    // before loading anything.
+    let replay_choice = vibe::runtime::replay::resolve_replay_store(
+        run_env,
+        vibe::runtime::challenge::configured_in_env()?,
+        vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?,
+        !memory,
+    )?;
     let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
@@ -404,6 +417,7 @@ async fn cmd_serve(
     }
     // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
     auth.add_route_jwks(&manifest.routes)?;
+    let mut pg_pools = None;
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::from_manifest(&manifest)?)
     } else {
@@ -417,7 +431,9 @@ async fn cmd_serve(
             pools.describe_secrets(),
             pools.max_connections()
         );
-        Arc::new(pools)
+        let pools = Arc::new(pools);
+        pg_pools = Some(pools.clone());
+        pools
     };
     let loaded = vibe::runtime::load_project_slugs(project, memory)?;
     for warning in &loaded.warnings {
@@ -435,7 +451,28 @@ async fn cmd_serve(
     }
     // #118: refuse `challenge_when: always` in production until a verifier
     // is configured.
-    let challenge = vibe::runtime::challenge::verifier_from_env()?;
+    // #157: build the per-tenant store chosen at startup; a missing or unusable
+    // table refuses to start.
+    let replay_store: Option<Arc<dyn vibe::runtime::replay::ReplayStore>> =
+        match (replay_choice, pg_pools) {
+            (Some(vibe::runtime::replay::StoreKind::Postgres), Some(pools)) => {
+                // Per-tenant tables; the IP digest is keyed per tenant from
+                // the API-key pepper.
+                let store =
+                    vibe::runtime::replay::PgReplayStore::for_tenant_pools(pools, &auth.pepper);
+                let mut tenants: Vec<String> =
+                    loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
+                tenants.sort();
+                tenants.dedup();
+                store.check(&tenants).await?;
+                Some(Arc::new(store))
+            }
+            (Some(vibe::runtime::replay::StoreKind::Postgres), None) => {
+                return Err("the challenge replay store needs PostgreSQL".into())
+            }
+            _ => None,
+        };
+    let challenge = vibe::runtime::challenge::verifier_from_env_with_store(replay_store)?;
     let always: Vec<String> = manifest
         .routes
         .iter()

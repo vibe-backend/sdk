@@ -10,6 +10,7 @@ mod memory;
 pub mod migrate;
 mod ops;
 mod pools;
+pub mod replay;
 mod slugs;
 mod sql;
 

@@ -382,6 +382,17 @@ async fn migrate_in_tx(
             .await?;
         log.push(format!("granted {schema}.{}", model.table));
     }
+    // #157: this tenant's challenge replay table (SELECT/INSERT for the
+    // tenant's app_rw role only).
+    exec.batch(&super::replay::PgReplayStore::migration_sql(
+        tenant,
+        &super::grants::tenant_role(tenant, "app_rw")?,
+    )?)
+    .await?;
+    log.push(format!(
+        "challenge replay table {schema}.{}",
+        super::replay::REPLAY_TABLE
+    ));
     log.extend(protect_schema(exec, tenant).await?);
     // Fail closed: any RLS problem in any tenant schema fails the migration,
     // whether this run introduced it or it was already there (for example
