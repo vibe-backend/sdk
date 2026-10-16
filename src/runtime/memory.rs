@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
-use super::exec::{reject_tenant_input, role_error, ExecError, QueryExec, Row};
+use super::exec::{reject_tenant_input, role_error, roles_from, ExecError, QueryExec, Row};
 use super::grants::{effective, parse_grants, RoleGrant, RUNTIME_ROLES};
 use super::sql::{Col, Stmt};
 
@@ -56,8 +56,8 @@ fn squash(text: &str) -> String {
 }
 
 impl MemoryExec {
-    /// Executor without models; every statement is refused. Only for tests.
-    #[cfg(test)]
+    /// Executor without models: every CRUD statement is refused. For tests
+    /// that only need `seed` / `user_roles`.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
@@ -108,6 +108,13 @@ impl MemoryExec {
             models,
         })
     }
+
+    /// Adds a row to a tenant table directly (dev data and tests).
+    pub fn seed(&self, tenant_id: &str, table: &str, row: Row) {
+        if let Ok(mut tables) = self.tables.lock() {
+            tables.entry(key(tenant_id, table)).or_default().push(row);
+        }
+    }
 }
 
 fn denied(table: &str) -> ExecError {
@@ -117,6 +124,24 @@ fn denied(table: &str) -> ExecError {
 
 #[async_trait]
 impl QueryExec for MemoryExec {
+    async fn user_roles(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, ExecError> {
+        let tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        let Some(row) = tables.get(&key(tenant_id, "users")).and_then(|rows| {
+            rows.iter()
+                .find(|r| r.get("id").and_then(Value::as_str) == Some(user_id))
+        }) else {
+            return Ok(None);
+        };
+        roles_from(row.get("roles")).map(Some)
+    }
+
     async fn execute(
         &self,
         tenant_id: &str,
