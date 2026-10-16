@@ -744,64 +744,90 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
         .filter(|v| !v.is_empty())
         .collect();
     known.extend(secrets.iter().map(|v| v.to_string()));
-    // Longest values first so overlapping credentials are removed completely.
-    known.sort_by_key(|v| std::cmp::Reverse(v.len()));
     let mut text = text.to_string();
+    let mut ranges = Vec::new();
     for secret in known {
         if !secret.is_empty() {
-            text = text.replace(&secret, "[redacted]");
-        }
-    }
-    // Compile once, outside replacement loops. Escaped delimiters belong to
-    // the value and must never leave a credential suffix in the dump.
-    static PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> = std::sync::LazyLock::new(|| {
-        [
-            r#"(?i)[a-z][a-z0-9+.-]*://(?:\\.|[^\s/"'<>\\])*@(?:\\.|[^\s"'<>\\])*"#,
-            r#"(?i)[a-z][a-z0-9+.-]*%3a%2f%2f[^\s"'<>]*"#,
-            r#"(?i)\b[a-z0-9_]*(?:password|passwd|pwd|database_url)[a-z0-9_]*[\s"']*[:=]\s*(?:"(?:\\+.|[^"\\])*(?:"|$)|'(?:\\+.|[^'\\])*(?:'|$)|(?:\\.|[^;\s,}\\])+)"#,
-            r"(?i)\b(?:password|passwd|pwd)\s*=\s*[^;\r\n]*",
-            r"(?im)authorization\s*:[^\r\n]*",
-            r"(?i)bearer\s+[a-z0-9._~+/=-]+",
-            r"\b(?:sk-|xai-|ghp_)[A-Za-z0-9_-]+",
-        ].into_iter().map(|pattern| regex::Regex::new(pattern).expect("redaction pattern")).collect()
-    });
-    // Decode with byte offsets so matches remove the corresponding original span.
-    let mut decoded = text.as_bytes().to_vec();
-    let mut spans: Vec<_> = (0..decoded.len()).map(|i| (i, i + 1)).collect();
-    for _ in 0..4 {
-        let mut next = Vec::new();
-        let mut next_spans = Vec::new();
-        let mut i = 0;
-        while i < decoded.len() {
-            if decoded[i] == b'%' && i + 2 < decoded.len() {
-                let hex = |b: u8| (b as char).to_digit(16);
-                if let (Some(a), Some(b)) = (hex(decoded[i + 1]), hex(decoded[i + 2])) {
-                    next.push((a * 16 + b) as u8);
-                    next_spans.push((spans[i].0, spans[i + 2].1));
-                    i += 3;
-                    continue;
-                }
-            }
-            next.push(decoded[i]);
-            next_spans.push(spans[i]);
-            i += 1;
-        }
-        if next == decoded {
-            break;
-        }
-        decoded = next;
-        spans = next_spans;
-    }
-    let mut ranges = Vec::new();
-    for pattern in PATTERNS.iter() {
-        ranges.extend(pattern.find_iter(&text).map(|m| (m.start(), m.end())));
-        if let Ok(decoded) = std::str::from_utf8(&decoded) {
             ranges.extend(
-                pattern
-                    .find_iter(decoded)
-                    .map(|m| (spans[m.start()].0, spans[m.end() - 1].1)),
+                text.match_indices(&secret)
+                    .map(|(start, value)| (start, start + value.len())),
             );
         }
+    }
+    static PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> = std::sync::LazyLock::new(|| {
+        [
+            r#"(?i)\b[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[ _-]?key|database_url)[a-z0-9_]*[\s"']*[:=]\s*"#,
+            r"(?i)authorization\s*:",
+            r"(?i)bearer\s+",
+        ]
+        .into_iter()
+        .map(|pattern| regex::Regex::new(pattern).expect("redaction pattern"))
+        .collect()
+    });
+    static CREDENTIALS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?i)[a-z][a-z0-9+.-]*://(?:\\.|[^\s/"'<>\\])*@(?:\\.|[^\s"'<>\\])*|\b(?:sk-|xai-|ghp_)[A-Za-z0-9_-]+"#,
+        )
+        .expect("credential pattern")
+    });
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let original = line.trim_end_matches(['\r', '\n']);
+        let mut view = original.as_bytes().to_vec();
+        let mut spans: Vec<_> = (0..view.len()).map(|i| (i, i + 1)).collect();
+        for iteration in 0..=16 {
+            // Lossy conversion is local: invalid bytes cannot hide other fields.
+            let mut readable = String::new();
+            let mut mapped = Vec::new();
+            let mut cursor = 0;
+            while cursor < view.len() {
+                let (valid, invalid) = match std::str::from_utf8(&view[cursor..]) {
+                    Ok(_) => (view.len() - cursor, 0),
+                    Err(err) => (
+                        err.valid_up_to(),
+                        err.error_len()
+                            .unwrap_or(view.len() - cursor - err.valid_up_to()),
+                    ),
+                };
+                readable.push_str(
+                    std::str::from_utf8(&view[cursor..cursor + valid]).expect("valid prefix"),
+                );
+                mapped.extend_from_slice(&spans[cursor..cursor + valid]);
+                cursor += valid;
+                if invalid > 0 {
+                    readable.push('\u{fffd}');
+                    mapped.extend(std::iter::repeat_n(
+                        (spans[cursor].0, spans[cursor + invalid - 1].1),
+                        3,
+                    ));
+                    cursor += invalid;
+                }
+            }
+            for pattern in PATTERNS.iter() {
+                for found in pattern.find_iter(&readable) {
+                    let start = mapped[found.start()].0;
+                    let value = mapped[found.end() - 1].1;
+                    ranges.push((offset + start, offset + redaction_end(original, value)));
+                }
+            }
+            for found in CREDENTIALS.find_iter(&readable) {
+                ranges.push((
+                    offset + mapped[found.start()].0,
+                    offset + mapped[found.end() - 1].1,
+                ));
+            }
+            let (next, next_spans) = decode_redaction_view(&view, &spans);
+            if next == view {
+                break;
+            }
+            if iteration == 16 {
+                ranges.push((offset, offset + original.len()));
+                break;
+            }
+            view = next;
+            spans = next_spans;
+        }
+        offset += line.len();
     }
     ranges.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
@@ -816,6 +842,86 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
         text.replace_range(start..end, "[redacted]");
     }
     text
+}
+
+// Delimiters are interpreted only in the original text. An escaped opening
+// quote has no reliable closing boundary at this level.
+fn redaction_end(line: &str, value: usize) -> usize {
+    let tail = &line[value..];
+    if tail.starts_with('\\')
+        || tail.starts_with('%')
+        || (tail.starts_with(['\'', '"']) && tail.contains('\\'))
+    {
+        return line.len();
+    }
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in tail.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+        } else if let Some(open) = quote {
+            if ch == open {
+                return value + index + ch.len_utf8();
+            }
+        } else if index == 0 && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if matches!(ch, ';' | ',' | '}' | ']' | '&') {
+            return value + index;
+        }
+    }
+    line.len()
+}
+
+fn decode_redaction_view(bytes: &[u8], spans: &[(usize, usize)]) -> (Vec<u8>, Vec<(usize, usize)>) {
+    let mut next = Vec::new();
+    let mut mapped = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut replacement = None;
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(a), Some(b)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                replacement = Some((vec![(a * 16 + b) as u8], 3));
+            }
+        } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'u' && i + 5 < bytes.len() {
+                if let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 6]) {
+                    if let Some(ch) = u32::from_str_radix(hex, 16).ok().and_then(char::from_u32) {
+                        replacement = Some((ch.to_string().into_bytes(), 6));
+                    }
+                }
+            } else {
+                let ch = match bytes[i + 1] {
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'b' => 8,
+                    b'f' => 12,
+                    other => other,
+                };
+                replacement = Some((vec![ch], 2));
+            }
+        }
+        if let Some((decoded, consumed)) = replacement {
+            mapped.extend(std::iter::repeat_n(
+                (spans[i].0, spans[i + consumed - 1].1),
+                decoded.len(),
+            ));
+            next.extend(decoded);
+            i += consumed;
+        } else {
+            next.push(bytes[i]);
+            mapped.push(spans[i]);
+            i += 1;
+        }
+    }
+    (next, mapped)
 }
 
 pub struct HttpAdapter {
@@ -833,7 +939,7 @@ pub fn mask_secrets(text: &str, api_key: &str) -> String {
     // Query, fragment, and `;`-separated params: key / api_key / token / …
     static KEY_PARAM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-            r"(?i)([?&#;](?:key|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|token|secret|password|auth)=)[^&\s#;]*",
+            r"(?i)([?&#;](?:key|api[ _-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|token|secret|password|auth)=)[^&\s#;]*",
         )
         .expect("regex")
     });
@@ -1375,6 +1481,58 @@ pub fn runtime_llm_env_present() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_json_escaped_opening_quote() {
+        assert_eq!(
+            redact(r#"{"password": \"a\"b tail\"}"#, &[]),
+            r#"{"[redacted]"#
+        );
+    }
+
+    #[test]
+    fn redact_nested_json_escaped_opening_quote() {
+        let original = r#"{"password": \"a\"b tail\"}"#;
+        let nested = serde_json::to_string(original).unwrap();
+        let output = redact(&nested, &[]);
+        assert!(output.ends_with("[redacted]"), "{output}");
+        assert!(
+            !output.contains("tail") && !output.contains("b"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn redact_invalid_percent_byte_with_encoded_separator() {
+        assert_eq!(redact("%FF password%3Dsecret", &[]), "%FF [redacted]");
+    }
+
+    #[test]
+    fn redact_many_percent_encoding_layers() {
+        assert_eq!(redact("password%252525253Dsecret", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_nested_json_password() {
+        assert_eq!(
+            redact(r#"{"outer":{"password":"secret"}}"#, &[]),
+            r#"{"outer":{"[redacted]}}"#
+        );
+    }
+
+    #[test]
+    fn redact_percent_encoding_iteration_limit() {
+        let encoded = format!("password%{}3Dsecret; remainder", "25".repeat(20));
+        assert_eq!(redact(&encoded, &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_preserves_other_lines() {
+        assert_eq!(
+            redact("plain text\npassword=secret\nmore text", &[]),
+            "plain text\n[redacted]\nmore text"
+        );
+    }
 
     #[test]
     fn redact_multilevel_escaped_quoted_values_including_tail() {
