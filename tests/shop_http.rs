@@ -84,6 +84,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         env_name: "test".into(),
         jwks: None,
         roles_claim: "roles".into(),
+        signing_keys: Default::default(),
         route_jwks: Default::default(),
     };
     let loaded = vibe::runtime::load_project_slugs(&root, true).unwrap();
