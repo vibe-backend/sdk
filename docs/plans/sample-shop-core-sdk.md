@@ -37,20 +37,23 @@
 
 SDK 目前有多個未合併且部分相互堆疊的 PR。直接在 `main` 重做會造成衝突，實作前須先決定合併／重建順序：
 
-- #75：reference field／expand（Draft、DIRTY）
-- #77、#95、#106：auth 三階段（其中 #77 DIRTY）
-- #88：method step validator（BLOCKED）
-- #92、#93、#96：自然語言編譯與中文 source（#92 DIRTY、#93 BLOCKED）
-- #99：MemoryExec RLS／grant（Draft、DIRTY）
+- #75：reference field／expand（Draft；2026-10-16 已合併 `main` 解衝突；產品決定延至 v1.1，見下方風險）
+- #77、#95、#106：auth 三階段（#95 已合併其 base 解衝突；#77 與 `main` 仍有衝突）
+- #88：method step validator（已合併入 `main`）
+- #92、#93、#96：自然語言編譯與中文 source（#92 已合併 `main` 解衝突；#93 仍需處理）
+- #99：MemoryExec RLS／grant（Draft；已合併 `main` 解衝突；其 PostgreSQL 共用 runtime login 模型與 spec v1.8 決定 97 的租戶 login role 模型不一致，需重新對齊）
 - #116：release signing（與核心 runtime 無直接依賴）
+
+以上狀態於 2026-10-16 更新；實作前須以當時 PR 狀態重新確認。
 
 ### 主要風險
 
 1. **規格與契約漂移**：PR #62 文件仍提及 v1.7 與舊 SDK commit，但 `main` 已合併 spec v1.8。
 2. **堆疊 PR 衝突**：不可把「已有 open PR」視為 SDK 已具備能力；每項能力都須在整合基線重新測試。
 3. **安全**：auth、refresh cookie、CORS credentials、tenant isolation、RLS、冪等資料與錯誤內容均涉及跨租戶或敏感資料風險。
-4. **發布**：crate 仍為 `0.1.0`，目前沒有 GitHub Release；版本與 release scope 尚未核准。
-5. **測試環境**：本機盤點時沒有 `cargo`，尚未取得本機基線結果；CI 使用 Rust 1.89 與 PostgreSQL 17。開始程式修改前須補齊工具鏈並跑完整基線。
+4. **範圍衝突**：#75（ref／expand）已由產品決定延至 v1.1，但本計畫將 ref／expand 列入本階段；須先確認 sample-shop 購物車商品摘要改用其他方式，或由產品重新納入範圍。
+5. **發布**：crate 仍為 `0.1.0`，目前沒有 GitHub Release；版本與 release scope 尚未核准。
+6. **測試環境**：本機盤點時沒有 `cargo`，尚未取得本機基線結果；CI 使用 Rust 1.89 與 PostgreSQL 17。開始程式修改前須補齊工具鏈並跑完整基線。
 
 ## 3. 前端需求與 SDK 能力對照
 
@@ -210,7 +213,7 @@ vibe compile [SOURCE ...] [--keep-going] [--dump-llm DIR]
 ## 9. 待確認事項
 
 1. 產品範圍是否採「PR #62 核心契約」而非 frontend 全部 `ShopFeatures`。
-2. #75、#77、#92、#99 等 DIRTY／Draft PR 是由原作者 rebase，還是由本工作以新整合 PR 重建。
+2. #75、#77、#92、#99 等 DIRTY／Draft PR 是由原作者合併 base 更新（不 rebase），還是由本工作以新整合 PR 重建。
 3. refresh cookie 的實際部署 topology、SameSite 與 credentials 策略。
 4. `details` 的公開 schema，以及 `PRODUCT_UNAVAILABLE` 可揭露欄位。
 5. 第一個可發布版本是維持 `0.1.0`、升 `0.1.1`，或在 scope 完成後定義其他版本；未確認前不發布。
