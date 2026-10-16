@@ -59,6 +59,9 @@ pub struct RouteSpec {
     pub public_writes: bool,
     pub challenge_type: String,
     pub challenge_when: String,
+    /// `after-failures: <n>` of a `when: after-failures` challenge (#201).
+    #[serde(default = "default_after_failures")]
+    pub challenge_after_failures: u32,
     pub deprecated: bool,
     pub sunset: String,
 }
@@ -675,6 +678,9 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         public_writes: access.and_then(|s| s.get("public-writes")) == Some("true"),
         challenge_type,
         challenge_when,
+        challenge_after_failures: parse_after_failures(
+            access.and_then(|s| s.get("challenge")).unwrap_or(""),
+        ),
         deprecated,
         sunset,
     })
@@ -809,6 +815,21 @@ pub(crate) fn parse_challenge(raw: &str) -> (String, String) {
         .map(|(_, v)| v.clone())
         .unwrap_or_else(|| "always".into());
     (ty, when)
+}
+
+fn default_after_failures() -> u32 {
+    crate::runtime::failures::DEFAULT_AFTER_FAILURES
+}
+
+/// `after-failures: <n>` of a challenge declaration; the §4A.3 default (3)
+/// when absent. A value that is not a number gives 0, which challenges every
+/// request (fail closed).
+pub(crate) fn parse_after_failures(raw: &str) -> u32 {
+    let map = crate::lock::parse_inline_map(raw).unwrap_or_default();
+    match map.iter().find(|(k, _)| k == "after-failures") {
+        Some((_, v)) => v.trim().parse().unwrap_or(0),
+        None => default_after_failures(),
+    }
 }
 
 fn number_rule(rules: &str, key: &str) -> Option<i64> {

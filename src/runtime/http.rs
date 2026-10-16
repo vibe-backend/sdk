@@ -150,6 +150,8 @@ pub struct AppState {
     pub dev_hints: bool,
     /// Verifies `x-challenge-proof` (#118). `None`: challenge routes fail closed.
     pub challenge: Option<Arc<dyn super::challenge::ChallengeVerifier>>,
+    /// Failure counts of `when: after-failures` challenge routes (#201).
+    pub failures: super::failures::FailureCounter,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -650,11 +652,24 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         .await;
     }
     // The challenge runs after the rate limit and the public write quota, so
-    // limited requests never reach the replay cache or siteverify.
-    if found.route.public
-        && found.route.challenge_type != "none"
-        && found.route.challenge_when == "always"
-    {
+    // limited requests never reach the replay cache or siteverify (decision
+    // 137). It applies to public and authenticated routes alike (decision
+    // 133): `when: always` on every request, `when: after-failures` once the
+    // client has reached the route's failure threshold (#201). Any other
+    // `when` value fails closed and challenges every request.
+    let failure_key = (found.route.challenge_type != "none"
+        && found.route.challenge_when == "after-failures")
+        .then(|| super::failures::failure_key(&principal.tenant_id, &found.route.feature_id, &ip));
+    let challenge_needed = match (found.route.challenge_type.as_str(), &failure_key) {
+        ("none", _) => false,
+        (_, Some(key)) => state.failures.challenge_required(
+            key,
+            found.route.challenge_after_failures,
+            Instant::now(),
+        ),
+        _ => true,
+    };
+    if challenge_needed {
         if let Some(fail) = check_challenge(
             state.challenge.as_ref(),
             found.route,
@@ -667,211 +682,228 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             return finish(found.route, &state, started, fail(&request_id)).await;
         }
     }
-    let mut query_values = BTreeMap::new();
-    for field in &found.route.request {
-        if field.location == "query" {
-            if let Some(raw) = query.get(&field.name) {
-                query_values.insert(field.name.clone(), coerce(raw, &field.ty));
+    let response: HttpResponse = async {
+        let mut query_values = BTreeMap::new();
+        for field in &found.route.request {
+            if field.location == "query" {
+                if let Some(raw) = query.get(&field.name) {
+                    query_values.insert(field.name.clone(), coerce(raw, &field.ty));
+                }
             }
         }
-    }
-    let mut header_values = BTreeMap::new();
-    for field in &found.route.request {
-        if field.location == "header" {
-            if let Some(value) = headers.get(&field.name.to_ascii_lowercase()) {
-                header_values.insert(field.name.to_ascii_lowercase(), value.clone());
+        let mut header_values = BTreeMap::new();
+        for field in &found.route.request {
+            if field.location == "header" {
+                if let Some(value) = headers.get(&field.name.to_ascii_lowercase()) {
+                    header_values.insert(field.name.to_ascii_lowercase(), value.clone());
+                }
             }
         }
-    }
-    let req_value = crud::req_var(body, query_values, found.params.clone(), header_values);
-    let mut vars = Map::new();
-    vars.insert("req".into(), req_value);
-    vars.insert(
-        "ctx".into(),
-        crud::ctx_var(&crud::CallCtx {
-            auth: &state.auth,
-            tenant_id: &principal.tenant_id,
-            role: "",
-            caller: crud::Caller {
-                subject: &principal.subject,
-                roles: &principal.roles,
-            },
-        }),
-    );
-    let input = match crud::eval_expr(&found.route.transform_in, &vars) {
-        Ok(value) => value,
-        Err(err) => {
-            return finish(found.route, &state, started, {
-                tracing::warn!(%request_id, error = %err, "transform.in failed");
-                error_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "VALIDATION_FAILED",
-                    "Invalid request",
-                    &request_id,
-                    &[],
-                )
-            })
-            .await;
-        }
-    };
-    let role = if found.route.public {
-        if found.route.public_writes {
-            "public_writer"
+        let req_value = crud::req_var(body, query_values, found.params.clone(), header_values);
+        let mut vars = Map::new();
+        vars.insert("req".into(), req_value);
+        vars.insert(
+            "ctx".into(),
+            crud::ctx_var(&crud::CallCtx {
+                auth: &state.auth,
+                tenant_id: &principal.tenant_id,
+                role: "",
+                caller: crud::Caller {
+                    subject: &principal.subject,
+                    roles: &principal.roles,
+                },
+            }),
+        );
+        let input = match crud::eval_expr(&found.route.transform_in, &vars) {
+            Ok(value) => value,
+            Err(err) => {
+                return finish(found.route, &state, started, {
+                    tracing::warn!(%request_id, error = %err, "transform.in failed");
+                    error_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "VALIDATION_FAILED",
+                        "Invalid request",
+                        &request_id,
+                        &[],
+                    )
+                })
+                .await;
+            }
+        };
+        let role = if found.route.public {
+            if found.route.public_writes {
+                "public_writer"
+            } else {
+                "public_reader"
+            }
         } else {
-            "public_reader"
-        }
-    } else {
-        "app_rw"
-    };
-    let mut result_value = Value::Null;
-    let mut result_etag = None;
-    let mut status = StatusCode::OK;
-    for step in &found.route.steps {
-        match step.op.as_str() {
-            "method" => {
-                let args = if step.args == "transform.in" || step.args.is_empty() {
-                    input.clone()
-                } else {
-                    vars.insert("input".into(), input.clone());
-                    match crud::eval_expr(&step.args, &vars) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            return finish(found.route, &state, started, {
-                                tracing::warn!(%request_id, error = %err, "step args failed");
-                                error_response(
-                                    StatusCode::UNPROCESSABLE_ENTITY,
-                                    "VALIDATION_FAILED",
-                                    "Invalid request",
-                                    &request_id,
-                                    &[],
-                                )
-                            })
+            "app_rw"
+        };
+        let mut result_value = Value::Null;
+        let mut result_etag = None;
+        let mut status = StatusCode::OK;
+        for step in &found.route.steps {
+            match step.op.as_str() {
+                "method" => {
+                    let args = if step.args == "transform.in" || step.args.is_empty() {
+                        input.clone()
+                    } else {
+                        vars.insert("input".into(), input.clone());
+                        match crud::eval_expr(&step.args, &vars) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                return finish(found.route, &state, started, {
+                                    tracing::warn!(%request_id, error = %err, "step args failed");
+                                    error_response(
+                                        StatusCode::UNPROCESSABLE_ENTITY,
+                                        "VALIDATION_FAILED",
+                                        "Invalid request",
+                                        &request_id,
+                                        &[],
+                                    )
+                                })
+                                .await;
+                            }
+                        }
+                    };
+                    match crud::run_method(
+                        &state.manifest,
+                        state.exec.as_ref(),
+                        &step.target,
+                        &args,
+                        crud::CallCtx {
+                            auth: &state.auth,
+                            tenant_id: &principal.tenant_id,
+                            role,
+                            caller: crud::Caller {
+                                subject: &principal.subject,
+                                roles: &principal.roles,
+                            },
+                        },
+                        1,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            result_etag = result.etag.or(result_etag);
+                            if !step.out.is_empty() {
+                                vars.insert(step.out.clone(), result.value.clone());
+                            }
+                            result_value = result.value;
+                            if result.status == 204 {
+                                status = StatusCode::NO_CONTENT;
+                            }
+                        }
+                        Err(fail) => {
+                            return finish(
+                                found.route,
+                                &state,
+                                started,
+                                fail_response(found.route, fail, &request_id),
+                            )
                             .await;
                         }
                     }
-                };
-                match crud::run_method(
-                    &state.manifest,
-                    state.exec.as_ref(),
-                    &step.target,
-                    &args,
-                    crud::CallCtx {
-                        auth: &state.auth,
-                        tenant_id: &principal.tenant_id,
-                        role,
-                        caller: crud::Caller {
-                            subject: &principal.subject,
-                            roles: &principal.roles,
-                        },
-                    },
-                    1,
-                )
-                .await
-                {
-                    Ok(result) => {
-                        result_etag = result.etag.or(result_etag);
-                        if !step.out.is_empty() {
-                            vars.insert(step.out.clone(), result.value.clone());
+                }
+                "respond" => {
+                    let value = if step.value == "transform.out" || step.value.is_empty() {
+                        match crud::eval_expr(&found.route.transform_out, &vars) {
+                            Ok(value) => value,
+                            Err(_) => result_value.clone(),
                         }
-                        result_value = result.value;
-                        if result.status == 204 {
-                            status = StatusCode::NO_CONTENT;
-                        }
+                    } else {
+                        result_value.clone()
+                    };
+                    result_value = value;
+                    if step.status != 0 {
+                        status = StatusCode::from_u16(step.status).unwrap_or(StatusCode::OK);
                     }
-                    Err(fail) => {
+                }
+                "validate" => {
+                    vars.insert("input".into(), input.clone());
+                    if crud::when_matches(&step.when_expr, &vars) {
+                        let code = if step.fail.is_empty() {
+                            "VALIDATION_FAILED".to_string()
+                        } else {
+                            step.fail.clone()
+                        };
+                        let mapped = found.route.errors.iter().find(|e| e.from == code);
+                        let status = mapped
+                            .and_then(|e| StatusCode::from_u16(e.status).ok())
+                            .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+                        let public_code = mapped.map(|e| e.code.clone()).unwrap_or(code);
                         return finish(
                             found.route,
                             &state,
                             started,
-                            fail_response(found.route, fail, &request_id),
+                            error_response(
+                                status,
+                                &public_code,
+                                "Invalid request",
+                                &request_id,
+                                &[],
+                            ),
                         )
                         .await;
                     }
                 }
-            }
-            "respond" => {
-                let value = if step.value == "transform.out" || step.value.is_empty() {
-                    match crud::eval_expr(&found.route.transform_out, &vars) {
-                        Ok(value) => value,
-                        Err(_) => result_value.clone(),
-                    }
-                } else {
-                    result_value.clone()
-                };
-                result_value = value;
-                if step.status != 0 {
-                    status = StatusCode::from_u16(step.status).unwrap_or(StatusCode::OK);
-                }
-            }
-            "validate" => {
-                vars.insert("input".into(), input.clone());
-                if crud::when_matches(&step.when_expr, &vars) {
-                    let code = if step.fail.is_empty() {
-                        "VALIDATION_FAILED".to_string()
-                    } else {
-                        step.fail.clone()
-                    };
-                    let mapped = found.route.errors.iter().find(|e| e.from == code);
-                    let status = mapped
-                        .and_then(|e| StatusCode::from_u16(e.status).ok())
-                        .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
-                    let public_code = mapped.map(|e| e.code.clone()).unwrap_or(code);
+                "transform" => {}
+                _ => {
                     return finish(
                         found.route,
                         &state,
                         started,
-                        error_response(status, &public_code, "Invalid request", &request_id, &[]),
+                        error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "INTERNAL",
+                            "Unsupported api step",
+                            &request_id,
+                            &[],
+                        ),
                     )
                     .await;
                 }
             }
-            "transform" => {}
-            _ => {
-                return finish(
-                    found.route,
-                    &state,
-                    started,
-                    error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "INTERNAL",
-                        "Unsupported api step",
-                        &request_id,
-                        &[],
-                    ),
-                )
-                .await;
+        }
+        tracing::info!(
+            request_id = %request_id,
+            route = %found.route.feature_id,
+            status = status.as_u16(),
+            tenant = %principal.tenant_id,
+            subject = %principal.subject,
+            "request"
+        );
+        let mut extra = Vec::new();
+        if let Some(tag) = result_etag {
+            extra.push(("etag".into(), tag));
+        }
+        if status == StatusCode::CREATED {
+            if let Some(id) = result_value.get("id").and_then(Value::as_str) {
+                extra.push(("location".into(), format!("{path}/{id}")));
             }
         }
+        if found.route.deprecated {
+            extra.push(("deprecation".into(), "true".into()));
+            if found.route.sunset != "(none)" && !found.route.sunset.is_empty() {
+                extra.push(("sunset".into(), found.route.sunset.clone()));
+            }
+        }
+        let response = if status == StatusCode::NO_CONTENT {
+            empty_response(status, &request_id, &extra)
+        } else {
+            json_response(status, result_value, &request_id, &extra)
+        };
+        finish(found.route, &state, started, response).await
     }
-    tracing::info!(
-        request_id = %request_id,
-        route = %found.route.feature_id,
-        status = status.as_u16(),
-        tenant = %principal.tenant_id,
-        subject = %principal.subject,
-        "request"
-    );
-    let mut extra = Vec::new();
-    if let Some(tag) = result_etag {
-        extra.push(("etag".into(), tag));
-    }
-    if status == StatusCode::CREATED {
-        if let Some(id) = result_value.get("id").and_then(Value::as_str) {
-            extra.push(("location".into(), format!("{path}/{id}")));
+    .await;
+    // A 401 from the route itself (for login: wrong credentials) counts as a
+    // failure for `when: after-failures` (§4A.3).
+    if let Some(key) = &failure_key {
+        if response.status() == StatusCode::UNAUTHORIZED {
+            state.failures.record_failure(key, Instant::now());
         }
     }
-    if found.route.deprecated {
-        extra.push(("deprecation".into(), "true".into()));
-        if found.route.sunset != "(none)" && !found.route.sunset.is_empty() {
-            extra.push(("sunset".into(), found.route.sunset.clone()));
-        }
-    }
-    let response = if status == StatusCode::NO_CONTENT {
-        empty_response(status, &request_id, &extra)
-    } else {
-        json_response(status, result_value, &request_id, &extra)
-    };
-    finish(found.route, &state, started, response).await
+    response
 }
 
 async fn finish(
@@ -1713,7 +1745,8 @@ fn platform_status(code: &str) -> StatusCode {
 
 type FailFn = Box<dyn FnOnce(&str) -> HttpResponse + Send>;
 
-/// Verifies the challenge proof of a `when: always` route. Fails closed: no
+/// Verifies the challenge proof of a route that needs one now (`when:
+/// always`, or `when: after-failures` over its threshold). Fails closed: no
 /// proof is 400, no verifier, a `pow` route or an unreachable provider is 503,
 /// a rejected proof is 403.
 async fn check_challenge(
