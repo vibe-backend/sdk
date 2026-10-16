@@ -83,8 +83,14 @@ if [ "$(printf '%s\n' "$VERSION" | wc -l)" -eq 1 ] && printf '%s\n' "$VERSION" |
 [ "$(semver_cmp "$VERSION" "$MIN_VERSION")" -ge 0 ] || die "refusing $VERSION: below the minimum supported version $MIN_VERSION (older releases may lack security fixes)"
 if cur=$(managed_target 2>/dev/null) && [ -f "${cur%/vibe}/manifest" ]; then
  installed=$(awk -F= '$1=="version"{print $2; exit}' "${cur%/vibe}/manifest")
- if [ -n "$installed" ] && [ "$(semver_cmp "$VERSION" "$installed")" -lt 0 ]; then
-  [ "$ALLOW_DOWNGRADE" = 1 ] || die "refusing downgrade from $installed to $VERSION; pass --allow-downgrade to override"
+ if [ -n "$installed" ]; then
+  if [ "$(printf '%s\n' "$installed" | wc -l)" -eq 1 ] && printf '%s\n' "$installed" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+   if [ "$(semver_cmp "$VERSION" "$installed")" -lt 0 ]; then
+    [ "$ALLOW_DOWNGRADE" = 1 ] || die "refusing downgrade from $installed to $VERSION; pass --allow-downgrade to override"
+   fi
+  else
+   [ "$ALLOW_DOWNGRADE" = 1 ] || die "refusing to replace non-semver installed version $installed with $VERSION; pass --allow-downgrade to override"
+  fi
  fi
 fi
 os=$(uname -s) || die "cannot detect OS"; arch=$(uname -m) || die "cannot detect architecture"

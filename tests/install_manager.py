@@ -54,6 +54,12 @@ name=${url##*/};rest=${url#*/download/};version=${rest%%/*};cp "$MOCK_SERVER/$ve
   r=self.runit("install","--version","v1.0.0","--allow-downgrade");self.assertEqual(r.returncode,0,r.stderr);self.assertEqual(self.two(),"one")
  def test_allow_downgrade_never_below_minimum(self):
   self.release("v0.0.9","old");self.install1();r=self.runit("install","--version","v0.0.9","--allow-downgrade");self.assertNotEqual(r.returncode,0);self.assertIn("below the minimum",r.stderr);self.assertEqual(self.two(),"one")
+ def test_nonsemver_installed_refused(self):
+  self.install1();man=next((self.dest/".vibe-managed"/"versions").glob("*/manifest"));man.write_text(man.read_text().replace("version=v1.0.0","version=1"))
+  r=self.runit("install","--version","v2.0.0");self.assertNotEqual(r.returncode,0);self.assertIn("non-semver",r.stderr);self.assertEqual(self.two(),"one")
+  r=self.runit("install","--version","v2.0.0","--allow-downgrade");self.assertEqual(r.returncode,0,r.stderr);self.assertEqual(self.two(),"two")
+  self.release("v0.0.9","old");man=next((self.dest/".vibe-managed"/"versions").glob("*/manifest"));man.write_text(man.read_text().replace("version=v2.0.0","version=1"))
+  r=self.runit("install","--version","v0.0.9","--allow-downgrade");self.assertNotEqual(r.returncode,0);self.assertIn("below the minimum",r.stderr);self.assertEqual(self.two(),"two")
  def test_sha256_match_and_mismatch(self):
   h=hashlib.sha256((self.server/"v1.0.0"/ASSET).read_bytes()).hexdigest()
   r=self.runit("install","--version","v1.0.0","--sha256","f"*64);self.assertNotEqual(r.returncode,0);self.assertIn("does not match --sha256",r.stderr);self.assertFalse((self.dest/"vibe").exists())
