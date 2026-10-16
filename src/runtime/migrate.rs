@@ -754,9 +754,9 @@ pub fn close_owner_window_sql(owner: &str) -> Result<Vec<String>, String> {
 /// A random one-time password (256 bits, hex). Only its SCRAM verifier is
 /// sent to the server; the password itself is never logged.
 fn one_time_password() -> String {
-    use rand::RngCore;
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes)
+        .expect("OS random number generator failed");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
