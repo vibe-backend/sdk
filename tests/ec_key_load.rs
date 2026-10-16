@@ -136,7 +136,7 @@ fn decode_pem(pem: &str) -> Vec<u8> {
 }
 
 #[test]
-fn sec1_and_pkcs8_of_the_same_key_load_from_pem() {
+fn sec1_is_rejected_and_pkcs8_of_the_same_key_loads() {
     // Extract the ECPrivateKey from this PKCS#8 and add its named curve.
     let pkcs8 = der();
     let mut sec1 = pkcs8[29..].to_vec();
@@ -146,7 +146,10 @@ fn sec1_and_pkcs8_of_the_same_key_load_from_pem() {
     sec1[1] += 12;
     let pem = to_pem(&sec1).replace("PRIVATE KEY", "EC PRIVATE KEY");
     ec_signing_key_from_pem(PRIVATE_PEM.as_bytes()).unwrap();
-    ec_signing_key_from_pem(pem.as_bytes()).unwrap();
+    assert_eq!(
+        ec_signing_key_from_pem(pem.as_bytes()).err().unwrap(),
+        "SEC1 EC PRIVATE KEY is not supported; use PKCS#8 PRIVATE KEY"
+    );
     ec_signing_key_from_der(&pkcs8).unwrap();
     // DER is PKCS#8 only; raw SEC1 DER is refused.
     assert!(ec_signing_key_from_der(&sec1).is_err());

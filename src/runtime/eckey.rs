@@ -3,7 +3,8 @@
 //! signing keys are checked at startup; other curves refuse to start.
 //! These hand-written curve/point checks are defense-in-depth only, reporting
 //! errors early at startup. Authoritative key parsing and verification are
-//! performed by jsonwebtoken (aws_lc_rs backend). JWKS keys bypass these checks.
+//! performed by jsonwebtoken (aws_lc_rs backend). JWKS public keys are also checked
+//! when loaded.
 //!
 //! Reads SubjectPublicKeyInfo (`PUBLIC KEY`), PKCS#8 (`PRIVATE KEY`) and
 //! SEC1 (`EC PRIVATE KEY`) PEMs. Public points must be uncompressed and lie
