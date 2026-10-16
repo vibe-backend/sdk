@@ -387,6 +387,8 @@ async fn cmd_serve(
             );
         }
     }
+    // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
+    auth.add_route_jwks(&manifest.routes)?;
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::new())
     } else {
@@ -395,7 +397,7 @@ async fn cmd_serve(
             .map_err(|_| {
                 "set VIBE_DATABASE_URL or pass --memory for the dev executor".to_string()
             })?;
-        let pg = PgExec::connect(&url).await?;
+        let pg = PgExec::connect_with(&url, vibe::runtime::PgOptions::from_env()?).await?;
         pg.check_runtime_role().await?;
         Arc::new(pg)
     };
@@ -532,7 +534,11 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
         return Err("set either VIBE_JWT_PUBLIC_KEY_PEM or VIBE_JWT_JWKS_URI, not both".into());
     }
     if let Some(uri) = jwks_uri {
-        let source = vibe::runtime::jwks::HttpsJwks::new(&uri)?;
+        let allow_private = std::env::var("VIBE_JWT_ALLOW_PRIVATE_HOST").as_deref() == Ok("true");
+        if allow_private && !run_env.is_dev() {
+            return Err("VIBE_JWT_ALLOW_PRIVATE_HOST is only allowed in development".into());
+        }
+        let source = vibe::runtime::jwks::HttpsJwks::with_policy(&uri, allow_private)?;
         auth.jwks = Some(std::sync::Arc::new(vibe::runtime::jwks::JwksCache::new(
             std::sync::Arc::new(source),
         )));
