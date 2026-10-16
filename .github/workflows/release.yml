@@ -110,6 +110,8 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          # Use prebuilt NASM for Windows x86_64; aws-lc-sys ignores this elsewhere.
+          AWS_LC_SYS_PREBUILT_NASM: '1'
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package tar.gz
         if: endsWith(matrix.asset, '.tar.gz')
