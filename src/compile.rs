@@ -60,7 +60,12 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         }
         if !structured {
             if let Some(config) = opts.llm_config {
-                if !crate::llm::sampling_registered(&config.provider, &config.model) {
+                if !config.send_sampling {
+                    report.push(Diag::warning(
+                        &source.rel,
+                        "LLM_SEND_SAMPLING=0; sampling parameters were not sent",
+                    ));
+                } else if !crate::llm::sampling_registered(&config.provider, &config.model) {
                     report.push(Diag::warning(
                         &source.rel,
                         "model is not in the capability table; sampling parameters were not sent",
@@ -1299,6 +1304,7 @@ mod stamp_tests {
             endpoint_host: "api.openai.com".into(),
             endpoint_private: false,
             api_style: "responses".into(),
+            send_sampling: true,
         };
         let stamp = stamp_from(Some(&config));
         assert_eq!(stamp.llm_provider, "openai-responses");
