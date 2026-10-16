@@ -122,3 +122,33 @@ fn development_needs_an_explicit_replay_store() {
     assert!(!ok);
     assert!(!err.contains("replay store"), "{err}");
 }
+
+#[test]
+fn static_jwt_key_must_match_the_configured_alg() {
+    // Decision 139: checked by `vibe serve` before anything else is loaded.
+    let ec = include_str!("../src/runtime/testdata/ec-p256-p.pem");
+    let p384 = include_str!("../src/runtime/testdata/ec-p384-p.pem");
+    let (ok, err) = serve(
+        &[
+            ("VIBE_ENV", "development"),
+            ("VIBE_JWT_PUBLIC_KEY_PEM", ec),
+            ("VIBE_JWT_ALG", "RS256"),
+        ],
+        true,
+    );
+    assert!(!ok);
+    assert!(err.contains("not an RSA public key"), "{err}");
+    let (ok, err) = serve(
+        &[
+            ("VIBE_ENV", "development"),
+            ("VIBE_JWT_PUBLIC_KEY_PEM", p384),
+        ],
+        true,
+    );
+    assert!(!ok);
+    assert!(err.contains("P-256"), "{err}");
+    assert!(
+        !err.contains("MH"),
+        "key material must not be printed: {err}"
+    );
+}

@@ -461,10 +461,15 @@ pub fn load_signing_keys(
                 })?;
             let (alg, key) = match opt(step, "alg") {
                 // Decision 139: ES256 when `alg` is omitted.
-                "ES256" | "" => (
-                    jsonwebtoken::Algorithm::ES256,
-                    jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()),
-                ),
+                "ES256" | "" => {
+                    // Decision 139: ES256 signing keys must be P-256.
+                    super::eckey::p256_private(&pem)
+                        .map_err(|problem| super::http::ec_problem_message(&key_ref, problem))?;
+                    (
+                        jsonwebtoken::Algorithm::ES256,
+                        jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()),
+                    )
+                }
                 "RS256" => {
                     // Decision 139: RS256 signing keys need >= 2048 bits.
                     super::rsakey::check_rsa_pem(&key_ref, &pem)?;

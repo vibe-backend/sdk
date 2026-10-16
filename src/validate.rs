@@ -1566,6 +1566,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sign_jwt_alg_may_be_omitted_but_not_unknown() {
+        // Decision 139 (#226): an omitted alg means ES256.
+        let body = |alg: &str| {
+            format!(
+                "## Signature\n- input: {{email: string}}\n- output: {{t: string}}\n- writes: false\n- capabilities: [sign-token]\n\n## Steps\n\n### s1\n\n- op: sign-jwt\n{alg}- key-ref: VIBE_JWT_PRIVATE_KEY\n- out: t\n"
+            )
+        };
+        let alg_errors = |text: String| {
+            let lock = doc(Kind::Method, None, "user/methods/issue", &text);
+            let mut report = Report::new();
+            check_method(&lock, "issue.md", &mut report);
+            report
+                .errors()
+                .filter(|d| d.message.contains("alg must be"))
+                .count()
+        };
+        assert_eq!(alg_errors(body("")), 0);
+        assert_eq!(alg_errors(body("- alg: ES256\n")), 0);
+        assert_eq!(alg_errors(body("- alg: RS256\n")), 0);
+        assert_eq!(alg_errors(body("- alg: HS256\n")), 1);
+        assert_eq!(alg_errors(body("- alg: none\n")), 1);
+    }
+
+    #[test]
     fn delete_sql_is_rejected() {
         let problems = sql_problems("delete from users where id = $1", "[input.id]", false);
         assert!(problems.iter().any(|p| p.contains("DELETE")));

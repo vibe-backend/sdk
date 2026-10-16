@@ -1037,3 +1037,27 @@ fn sign_jwt_without_alg_defaults_to_es256() {
     .unwrap();
     assert_eq!(keys["JWT_SIGNING_KEY"].alg, jsonwebtoken::Algorithm::ES256);
 }
+
+#[test]
+fn es256_signing_key_must_be_p256() {
+    // Decision 139: other curves refuse to start.
+    for pem in [
+        include_str!("../src/runtime/testdata/ec-p384-k.pem"),
+        include_str!("../src/runtime/testdata/ec-p384-sec1.pem"),
+    ] {
+        for alg in [Some("ES256"), None] {
+            let err = vibe::runtime::load_signing_keys(
+                &fixture_with_alg(alg),
+                &|name| (name == "JWT_SIGNING_KEY").then(|| pem.to_string()),
+                "local",
+            )
+            .err()
+            .unwrap();
+            assert!(err.contains("P-256"), "{err}");
+            assert!(
+                !err.contains("MI"),
+                "key material must not be printed: {err}"
+            );
+        }
+    }
+}

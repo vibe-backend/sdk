@@ -1,0 +1,277 @@
+//! EC key curve checks (decision 139, spec §4.1a): ES256 keys must be on
+//! P-256. Static verification keys (`VIBE_JWT_PUBLIC_KEY_PEM`) and ES256
+//! signing keys are checked at startup; other curves refuse to start.
+//!
+//! Reads SubjectPublicKeyInfo (`PUBLIC KEY`), PKCS#8 (`PRIVATE KEY`) and
+//! SEC1 (`EC PRIVATE KEY`) PEMs. Public points must be uncompressed and lie
+//! on the curve.
+
+use super::rsakey::{algorithm_identifier, pem_der, tlv, whole};
+
+/// id-ecPublicKey (1.2.840.10045.2.1).
+const EC_PUBLIC_KEY_OID: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+/// prime256v1 / P-256 (1.2.840.10045.3.1.7).
+const P256_OID: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+
+/// Curve check failure; never carries key material.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EcProblem {
+    NotEc,
+    OtherCurve,
+    BadPoint,
+}
+
+/// `Ok` when `pem` is a P-256 public key with a valid point.
+pub fn p256_public(pem: &str) -> Result<(), EcProblem> {
+    let (label, der) = pem_der(pem).ok_or(EcProblem::NotEc)?;
+    if label != "PUBLIC KEY" {
+        return Err(EcProblem::NotEc);
+    }
+    // SEQUENCE { AlgorithmIdentifier, BIT STRING }
+    let seq = whole(&der, 0x30).ok_or(EcProblem::NotEc)?;
+    let (alg, rest) = tlv(seq, 0x30).ok_or(EcProblem::NotEc)?;
+    curve_of_alg(alg)?;
+    let bits = whole(rest, 0x03).ok_or(EcProblem::NotEc)?;
+    match bits.split_first() {
+        Some((0, point)) => check_point(point),
+        _ => Err(EcProblem::NotEc),
+    }
+}
+
+/// `Ok` when `pem` is a P-256 private key (PKCS#8 or SEC1).
+pub fn p256_private(pem: &str) -> Result<(), EcProblem> {
+    let (label, der) = pem_der(pem).ok_or(EcProblem::NotEc)?;
+    match label.as_str() {
+        "PRIVATE KEY" => {
+            // SEQUENCE { INTEGER version, AlgorithmIdentifier, OCTET STRING, ... }
+            let seq = whole(&der, 0x30).ok_or(EcProblem::NotEc)?;
+            let (_ver, rest) = tlv(seq, 0x02).ok_or(EcProblem::NotEc)?;
+            let (alg, rest) = tlv(rest, 0x30).ok_or(EcProblem::NotEc)?;
+            curve_of_alg(alg)?;
+            let (key, _) = tlv(rest, 0x04).ok_or(EcProblem::NotEc)?;
+            sec1_private(key, true)
+        }
+        "EC PRIVATE KEY" => sec1_private(&der, false),
+        _ => Err(EcProblem::NotEc),
+    }
+}
+
+/// AlgorithmIdentifier must be id-ecPublicKey with the P-256 named curve.
+fn curve_of_alg(alg: &[u8]) -> Result<(), EcProblem> {
+    let (oid, params) = algorithm_identifier(alg).ok_or(EcProblem::NotEc)?;
+    if oid != EC_PUBLIC_KEY_OID {
+        return Err(EcProblem::NotEc);
+    }
+    match whole(params, 0x06) {
+        Some(curve) if curve == P256_OID => Ok(()),
+        _ => Err(EcProblem::OtherCurve),
+    }
+}
+
+/// ECPrivateKey: SEQUENCE { INTEGER 1, OCTET STRING d, [0] curve OPTIONAL,
+/// [1] publicKey OPTIONAL }. The [0] curve is required unless the
+/// surrounding PKCS#8 already named it.
+fn sec1_private(der: &[u8], curve_known: bool) -> Result<(), EcProblem> {
+    let seq = whole(der, 0x30).ok_or(EcProblem::NotEc)?;
+    let (_ver, rest) = tlv(seq, 0x02).ok_or(EcProblem::NotEc)?;
+    let (d, mut rest) = tlv(rest, 0x04).ok_or(EcProblem::NotEc)?;
+    if d.len() != 32 {
+        return Err(EcProblem::OtherCurve);
+    }
+    let mut curve_seen = curve_known;
+    if let Some((params, more)) = tlv(rest, 0xa0) {
+        match whole(params, 0x06) {
+            Some(curve) if curve == P256_OID => curve_seen = true,
+            _ => return Err(EcProblem::OtherCurve),
+        }
+        rest = more;
+    }
+    if !curve_seen {
+        return Err(EcProblem::OtherCurve);
+    }
+    if let Some((public, _)) = tlv(rest, 0xa1) {
+        let bits = whole(public, 0x03).ok_or(EcProblem::NotEc)?;
+        match bits.split_first() {
+            Some((0, point)) => check_point(point)?,
+            _ => return Err(EcProblem::NotEc),
+        }
+    }
+    Ok(())
+}
+
+// --- P-256 point validation -------------------------------------------------
+
+type U256 = [u64; 4]; // little-endian limbs
+
+const P: U256 = [
+    0xffff_ffff_ffff_ffff,
+    0x0000_0000_ffff_ffff,
+    0x0000_0000_0000_0000,
+    0xffff_ffff_0000_0001,
+];
+const B: U256 = [
+    0x3bce_3c3e_27d2_604b,
+    0x651d_06b0_cc53_b0f6,
+    0xb3eb_bd55_7698_86bc,
+    0x5ac6_35d8_aa3a_93e7,
+];
+
+/// Uncompressed SEC1 point (0x04 || x || y) with x, y < p and
+/// y² = x³ − 3x + b (mod p).
+fn check_point(point: &[u8]) -> Result<(), EcProblem> {
+    if point.len() != 65 || point[0] != 0x04 {
+        return Err(EcProblem::BadPoint);
+    }
+    let x = from_be(&point[1..33]);
+    let y = from_be(&point[33..65]);
+    if !less(&x, &P) || !less(&y, &P) {
+        return Err(EcProblem::BadPoint);
+    }
+    let lhs = mul_mod(&y, &y);
+    let x3 = mul_mod(&mul_mod(&x, &x), &x);
+    let three_x = add_mod(&add_mod(&x, &x), &x);
+    let rhs = add_mod(&sub_mod(&x3, &three_x), &B);
+    if lhs == rhs {
+        Ok(())
+    } else {
+        Err(EcProblem::BadPoint)
+    }
+}
+
+fn from_be(bytes: &[u8]) -> U256 {
+    let mut out = [0u64; 4];
+    for (i, chunk) in bytes.rchunks(8).enumerate() {
+        out[i] = chunk.iter().fold(0u64, |a, b| (a << 8) | *b as u64);
+    }
+    out
+}
+
+fn less(a: &U256, b: &U256) -> bool {
+    for i in (0..4).rev() {
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        }
+    }
+    false
+}
+
+/// a − b, wrapping; returns the borrow.
+fn sub_raw(a: &U256, b: &U256) -> (U256, bool) {
+    let mut out = [0u64; 4];
+    let mut borrow = false;
+    for i in 0..4 {
+        let (d, b1) = a[i].overflowing_sub(b[i]);
+        let (d, b2) = d.overflowing_sub(borrow as u64);
+        out[i] = d;
+        borrow = b1 || b2;
+    }
+    (out, borrow)
+}
+
+/// a + b, wrapping; returns the carry.
+fn add_raw(a: &U256, b: &U256) -> (U256, bool) {
+    let mut out = [0u64; 4];
+    let mut carry = false;
+    for i in 0..4 {
+        let (s, c1) = a[i].overflowing_add(b[i]);
+        let (s, c2) = s.overflowing_add(carry as u64);
+        out[i] = s;
+        carry = c1 || c2;
+    }
+    (out, carry)
+}
+
+fn add_mod(a: &U256, b: &U256) -> U256 {
+    let (s, carry) = add_raw(a, b);
+    if carry || !less(&s, &P) {
+        sub_raw(&s, &P).0
+    } else {
+        s
+    }
+}
+
+fn sub_mod(a: &U256, b: &U256) -> U256 {
+    let (d, borrow) = sub_raw(a, b);
+    if borrow {
+        add_raw(&d, &P).0
+    } else {
+        d
+    }
+}
+
+/// a · b mod p: schoolbook product, then bitwise reduction (startup only).
+fn mul_mod(a: &U256, b: &U256) -> U256 {
+    let mut wide = [0u64; 8];
+    for i in 0..4 {
+        let mut carry = 0u128;
+        for j in 0..4 {
+            let t = wide[i + j] as u128 + a[i] as u128 * b[j] as u128 + carry;
+            wide[i + j] = t as u64;
+            carry = t >> 64;
+        }
+        wide[i + 4] = carry as u64;
+    }
+    let mut r = [0u64; 4];
+    for bit in (0..512).rev() {
+        // r = 2r + bit (mod p); r < p so 2r fits after one subtraction.
+        let top = r[3] >> 63;
+        for i in (1..4).rev() {
+            r[i] = (r[i] << 1) | (r[i - 1] >> 63);
+        }
+        r[0] = (r[0] << 1) | ((wide[bit / 64] >> (bit % 64)) & 1);
+        if top == 1 || !less(&r, &P) {
+            r = sub_raw(&r, &P).0;
+        }
+    }
+    r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const P256_PUB: &str = include_str!("testdata/ec-p256-p.pem");
+    const P256_SEC1: &str = include_str!("testdata/ec-p256-sec1.pem");
+    const P384_PUB: &str = include_str!("testdata/ec-p384-p.pem");
+    const P384_PKCS8: &str = include_str!("testdata/ec-p384-k.pem");
+    const P384_SEC1: &str = include_str!("testdata/ec-p384-sec1.pem");
+
+    #[test]
+    fn p256_keys_are_accepted() {
+        assert_eq!(p256_public(P256_PUB), Ok(()));
+        assert_eq!(p256_private(P256_SEC1), Ok(()));
+    }
+
+    #[test]
+    fn other_curves_are_refused() {
+        assert_eq!(p256_public(P384_PUB), Err(EcProblem::OtherCurve));
+        assert_eq!(p256_private(P384_PKCS8), Err(EcProblem::OtherCurve));
+        assert_eq!(p256_private(P384_SEC1), Err(EcProblem::OtherCurve));
+        assert_eq!(
+            p256_public(include_str!("testdata/rsa-p2048.pem")),
+            Err(EcProblem::NotEc)
+        );
+        assert_eq!(p256_public("garbage"), Err(EcProblem::NotEc));
+    }
+
+    #[test]
+    fn points_off_the_curve_are_refused() {
+        use base64::Engine;
+        let (label, mut der) = pem_der(P256_PUB).unwrap();
+        let last = der.len() - 1;
+        der[last] ^= 1;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&der);
+        let pem = format!("-----BEGIN {label}-----\n{b64}\n-----END {label}-----\n");
+        assert_eq!(p256_public(&pem), Err(EcProblem::BadPoint));
+    }
+
+    #[test]
+    fn field_arithmetic_matches_known_values() {
+        let one = [1, 0, 0, 0];
+        let p_minus_1 = sub_raw(&P, &one).0;
+        // (p-1)^2 = 1 mod p
+        assert_eq!(mul_mod(&p_minus_1, &p_minus_1), one);
+        assert_eq!(add_mod(&p_minus_1, &one), [0; 4]);
+        assert_eq!(sub_mod(&[0; 4], &one), p_minus_1);
+    }
+}

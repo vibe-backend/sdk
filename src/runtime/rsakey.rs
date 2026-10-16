@@ -9,8 +9,12 @@ use base64::Engine;
 /// Smallest accepted RSA modulus, in bits.
 pub const MIN_RSA_BITS: usize = 2048;
 
-/// Modulus size in bits, or `None` when the PEM is not a readable RSA key.
-pub fn rsa_pem_bits(pem: &str) -> Option<usize> {
+/// rsaEncryption (1.2.840.113549.1.1.1) as a DER OBJECT IDENTIFIER body.
+const RSA_ENCRYPTION_OID: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+
+/// The first PEM block: (label, DER bytes). Escaped `\\n` newlines (as in
+/// env values) are accepted.
+pub(crate) fn pem_der(pem: &str) -> Option<(String, Vec<u8>)> {
     let pem = pem.replace("\\n", "\n");
     let mut label = None;
     let mut body = String::new();
@@ -27,14 +31,41 @@ pub fn rsa_pem_bits(pem: &str) -> Option<usize> {
     let der = base64::engine::general_purpose::STANDARD
         .decode(body.as_bytes())
         .ok()?;
-    match label?.as_str() {
+    Some((label?, der))
+}
+
+/// The single top-level DER element with `tag`; trailing bytes after it
+/// make the input unreadable.
+pub(crate) fn whole(der: &[u8], tag: u8) -> Option<&[u8]> {
+    let (inner, rest) = tlv(der, tag)?;
+    rest.is_empty().then_some(inner)
+}
+
+/// AlgorithmIdentifier: SEQUENCE { OID algorithm, parameters }. Returns
+/// (algorithm OID body, raw parameters).
+pub(crate) fn algorithm_identifier(alg: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (oid, params) = tlv(alg, 0x06)?;
+    Some((oid, params))
+}
+
+/// Modulus size in bits, or `None` when the PEM is not a readable RSA key.
+///
+/// The DER is checked strictly: no trailing bytes after the outer
+/// structure, and for SubjectPublicKeyInfo / PKCS#8 the AlgorithmIdentifier
+/// must be rsaEncryption.
+pub fn rsa_pem_bits(pem: &str) -> Option<usize> {
+    let (label, der) = pem_der(pem)?;
+    match label.as_str() {
         "RSA PUBLIC KEY" => pkcs1_public_bits(&der),
         "RSA PRIVATE KEY" => pkcs1_private_bits(&der),
         "PUBLIC KEY" => {
             // SEQUENCE { AlgorithmIdentifier, BIT STRING }
-            let (seq, _) = tlv(&der, 0x30)?;
-            let (_alg, rest) = tlv(seq, 0x30)?;
-            let (bits, _) = tlv(rest, 0x03)?;
+            let seq = whole(&der, 0x30)?;
+            let (alg, rest) = tlv(seq, 0x30)?;
+            if algorithm_identifier(alg)?.0 != RSA_ENCRYPTION_OID {
+                return None;
+            }
+            let bits = whole(rest, 0x03)?;
             let (unused, key) = bits.split_first()?;
             if *unused != 0 {
                 return None;
@@ -42,11 +73,14 @@ pub fn rsa_pem_bits(pem: &str) -> Option<usize> {
             pkcs1_public_bits(key)
         }
         "PRIVATE KEY" => {
-            // SEQUENCE { INTEGER version, AlgorithmIdentifier, OCTET STRING }
-            let (seq, _) = tlv(&der, 0x30)?;
+            // SEQUENCE { INTEGER version, AlgorithmIdentifier, OCTET STRING, ... }
+            let seq = whole(&der, 0x30)?;
             let (_ver, rest) = tlv(seq, 0x02)?;
-            let (_alg, rest) = tlv(rest, 0x30)?;
-            let (key, _) = tlv(rest, 0x04)?;
+            let (alg, rest) = tlv(rest, 0x30)?;
+            if algorithm_identifier(alg)?.0 != RSA_ENCRYPTION_OID {
+                return None;
+            }
+            let (key, _attributes) = tlv(rest, 0x04)?;
             pkcs1_private_bits(key)
         }
         _ => None,
@@ -67,14 +101,14 @@ pub fn check_rsa_pem(what: &str, pem: &str) -> Result<(), String> {
 
 /// RSAPublicKey: SEQUENCE { INTEGER n, INTEGER e }
 fn pkcs1_public_bits(der: &[u8]) -> Option<usize> {
-    let (seq, _) = tlv(der, 0x30)?;
+    let seq = whole(der, 0x30)?;
     let (n, _) = tlv(seq, 0x02)?;
     int_bits(n)
 }
 
 /// RSAPrivateKey: SEQUENCE { INTEGER version, INTEGER n, ... }
 fn pkcs1_private_bits(der: &[u8]) -> Option<usize> {
-    let (seq, _) = tlv(der, 0x30)?;
+    let seq = whole(der, 0x30)?;
     let (_ver, rest) = tlv(seq, 0x02)?;
     let (n, _) = tlv(rest, 0x02)?;
     int_bits(n)
@@ -86,7 +120,7 @@ fn int_bits(bytes: &[u8]) -> Option<usize> {
 }
 
 /// One DER element with the expected tag: (contents, remainder).
-fn tlv(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+pub(crate) fn tlv(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
     let (&t, rest) = input.split_first()?;
     if t != tag {
         return None;
@@ -145,5 +179,35 @@ mod tests {
         assert!(!err.contains("MII"), "{err}");
         assert!(check_rsa_pem("K", PUB_1024).is_err());
         assert!(check_rsa_pem("K", "garbage").is_err());
+    }
+
+    fn reencode(label: &str, der: &[u8]) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+        format!("-----BEGIN {label}-----\n{b64}\n-----END {label}-----\n")
+    }
+
+    #[test]
+    fn trailing_bytes_and_other_algorithms_are_unreadable() {
+        let (label, mut der) = pem_der(PUB_2048).unwrap();
+        der.push(0);
+        assert_eq!(rsa_pem_bits(&reencode(&label, &der)), None);
+        let (label, mut der) = pem_der(PRIV_2048).unwrap();
+        der.extend([0x05, 0x00]);
+        assert_eq!(rsa_pem_bits(&reencode(&label, &der)), None);
+        // An EC SubjectPublicKeyInfo is not read as RSA.
+        assert_eq!(rsa_pem_bits(include_str!("testdata/ec-p256-p.pem")), None);
+        assert_eq!(rsa_pem_bits(include_str!("testdata/ec-p384-k.pem")), None);
+    }
+
+    #[test]
+    fn modulus_bits_ignore_leading_zeros() {
+        // 2047-bit value with a DER sign byte: 0x00 0x40 ...
+        let mut n = vec![0u8, 0x40];
+        n.extend(vec![1u8; 255]);
+        assert_eq!(int_bits(&n), Some(2047));
+        let mut n = vec![0u8, 0x80];
+        n.extend(vec![1u8; 255]);
+        assert_eq!(int_bits(&n), Some(2048));
+        assert_eq!(int_bits(&[0, 0]), None);
     }
 }

@@ -1,5 +1,6 @@
 pub mod challenge;
 mod crud;
+pub mod eckey;
 mod exec;
 mod http;
 pub mod jwks;
@@ -22,7 +23,8 @@ pub use exec::{
 };
 pub use http::{
     check_static_jwt_key, detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router,
-    ApiKeyFile, AppState, AuthConfig, RunEnv, SigningKey, Slug, StoredKey, REQUEST_TYPES,
+    static_jwt_alg, ApiKeyFile, AppState, AuthConfig, RunEnv, SigningKey, Slug, StoredKey,
+    REQUEST_TYPES,
 };
 pub use ops::{custom_claim_problem, load_signing_keys, sub_source_problem};
 pub use sql::Stmt;
