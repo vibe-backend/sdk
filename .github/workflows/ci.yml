@@ -72,6 +72,31 @@ jobs:
       - if: steps.detect.outputs.present != 'true'
         run: echo "No Cargo.toml yet; skipping Rust checks."
 
+  postgres-16:
+    name: Postgres 16 (minimum supported) integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      VIBE_TEST_PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+      VIBE_TEST_PG_MAJOR: "16"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: cargo test --locked --all-features --test postgres --test auth_ops
+
   postgres-tls:
     name: Postgres TLS integration tests
     runs-on: ubuntu-latest

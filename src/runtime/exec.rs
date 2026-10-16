@@ -588,6 +588,22 @@ pub struct PgExec {
     options: PgOptions,
 }
 
+/// Lowest supported `server_version_num` (PostgreSQL 16, decision 129).
+pub const MIN_SERVER_VERSION_NUM: u32 = 160000;
+
+/// Fails closed unless `server_version_num` is PostgreSQL 16 or later.
+pub fn check_server_version(server_version_num: &str) -> Result<(), String> {
+    let num: u32 = server_version_num.trim().parse().map_err(|_| {
+        format!("PostgreSQL 16 or later required (unreadable server_version_num {server_version_num:?})")
+    })?;
+    if num < MIN_SERVER_VERSION_NUM {
+        return Err(format!(
+            "PostgreSQL 16 or later required (server_version_num is {num})"
+        ));
+    }
+    Ok(())
+}
+
 impl PgExec {
     pub async fn connect(url: &str) -> Result<Self, String> {
         Self::connect_with(url, PgOptions::default()).await
@@ -636,7 +652,13 @@ impl PgExec {
             .build()
             .map_err(|err| err.to_string())?;
         // Fail at startup, not on the first request.
-        drop(pool.get().await.map_err(pool_error)?);
+        let client = pool.get().await.map_err(pool_error)?;
+        let row = client
+            .query_one("SHOW server_version_num", &[])
+            .await
+            .map_err(|err| format!("reading PostgreSQL server version: {err}"))?;
+        check_server_version(row.get::<_, &str>(0))?;
+        drop(client);
         Ok(Self { pool, options })
     }
 
@@ -1126,5 +1148,39 @@ mod tls_tests {
         assert_eq!(o.pool_size, 16);
         assert_eq!(o.statement_timeout_ms, 5_000);
         assert_eq!(o.pool_timeout_ms, 5_000);
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::check_server_version;
+
+    #[test]
+    fn postgres_below_16_is_refused() {
+        for v in ["150000", "150013", "140011", "90624", "159999"] {
+            let err = check_server_version(v).unwrap_err();
+            assert!(
+                err.contains("PostgreSQL 16 or later required"),
+                "{v}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_16_and_later_are_accepted() {
+        for v in ["160000", "160004", "170002", "180000"] {
+            check_server_version(v).unwrap();
+        }
+    }
+
+    #[test]
+    fn unreadable_version_is_refused() {
+        for v in ["", "16.4", "abc"] {
+            let err = check_server_version(v).unwrap_err();
+            assert!(
+                err.contains("PostgreSQL 16 or later required"),
+                "{v}: {err}"
+            );
+        }
     }
 }

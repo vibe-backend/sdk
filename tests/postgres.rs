@@ -1363,3 +1363,20 @@ async fn sslmode_require_fails_against_server_without_tls() {
         panic!("sslmode=require must not connect to a server without TLS (ssl: {ssl:?})");
     }
 }
+
+#[tokio::test]
+async fn supported_server_version_is_accepted_at_connect() {
+    let admin_url = require_pg!(admin_url());
+    let admin = connect(&admin_url).await;
+    let row = admin
+        .query_one("SHOW server_version_num", &[])
+        .await
+        .unwrap();
+    let num: u32 = row.get::<_, &str>(0).parse().unwrap();
+    assert!(num >= vibe::runtime::MIN_SERVER_VERSION_NUM, "{num}");
+    // PgExec::connect (used by `vibe migrate` and `vibe serve`) checks the version.
+    PgExec::connect(&admin_url).await.unwrap();
+    if let Ok(major) = std::env::var("VIBE_TEST_PG_MAJOR") {
+        assert_eq!(num / 10000, major.parse::<u32>().unwrap());
+    }
+}
