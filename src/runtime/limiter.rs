@@ -593,8 +593,8 @@ impl RateBuckets {
 //   `platform_factor` (default 5) times the tenant cap.
 //
 // A request that creates new buckets must pass both layers; requests that
-// only hit existing buckets are not counted here. There is no per-tenant
-// reservation in v1. A refusal is a plain 429 with `Retry-After`; the caller
+// only hit existing buckets are not counted here. Each tenant has a
+// guaranteed floor in both layers (see below). A refusal is a plain 429 with `Retry-After`; the caller
 // cannot tell which layer refused.
 //
 // Fixed windows apply only to these counters; every other limit stays
@@ -607,8 +607,16 @@ impl RateBuckets {
 // refuses requests charged to that partition. The global tenant budget is
 // sized for `expected_tenants` full partitions, and a tenant below
 // `tenant_slot_floor` slots is admitted even past it. The platform total is a
-// memory bound (see docs/release-hardening.md for the remaining risk). Expired counters are cleared first (oldest first); a counter
-// inside its window is NEVER evicted. When no slot can be freed the request
+// memory bound shared by all tenants; every platform counter is also charged
+// to the tenant that created it, and a tenant holding fewer than
+// `platform_slot_floor` platform counters is admitted even when the shared
+// platform total is used up (only above-floor growth is refused there). The
+// platform total is sized as `tenant budget + expected_tenants x
+// platform_slot_floor` ([`NetLimits::sized_for`]). The memory cap keeps
+// `floor_reserve_bytes` for floor growth: requests that stay within the
+// tenant's floors are checked against the full cap, everything else against
+// the cap minus the reserve. Expired counters are cleared first (oldest
+// first); a counter inside its window is NEVER evicted. When no slot can be freed the request
 // fails closed (429) and `vibe_rate_limit_slot_refused_total{layer,
 // reason="table_full"}` is incremented ([`slot_refused_total`]; the older
 // [`counter_slot_refusals`] is kept as an alias). Network-cap refusals count
@@ -697,8 +705,20 @@ pub const MAX_EXPECTED_TENANTS: usize = 4_096;
 pub const TENANT_SLOT_FLOOR: usize = 64;
 /// Platform counter slots one network aggregate (IPv4 /24, IPv6 /32) may hold.
 pub const PLATFORM_SLOTS_PER_AGGREGATE: usize = 4_096;
-/// Platform counter slots across all aggregates (memory bound).
-pub const PLATFORM_SLOTS_TOTAL: usize = 1 << 20;
+/// Platform counter slots across all aggregates (memory bound) for the
+/// default sizing: the default tenant budget plus every expected tenant's
+/// platform floor.
+pub const PLATFORM_SLOTS_TOTAL: usize =
+    EXPECTED_TENANTS * SLOTS_PER_TENANT + EXPECTED_TENANTS * PLATFORM_SLOT_FLOOR;
+/// Platform counters a tenant always gets, even when the shared platform
+/// total is used up.
+pub const PLATFORM_SLOT_FLOOR: usize = 64;
+/// Estimated bytes reserved per floor slot in the memory cap: one tenant
+/// counter, one platform counter and one rate bucket.
+pub const FLOOR_SLOT_BYTES: usize = 2 * COUNTER_SLOT_BYTES + BUCKET_BYTES;
+/// Default memory reserved for floor growth: `EXPECTED_TENANTS x
+/// PLATFORM_SLOT_FLOOR x FLOOR_SLOT_BYTES` (48 MiB at 256 tenants).
+pub const FLOOR_RESERVE_BYTES: usize = EXPECTED_TENANTS * PLATFORM_SLOT_FLOOR * FLOOR_SLOT_BYTES;
 
 /// D130 limits; see the section comment above.
 #[derive(Clone, Debug)]
@@ -719,6 +739,12 @@ pub struct NetLimits {
     pub platform_slots_per_aggregate: usize,
     /// Platform counter slots across all aggregates.
     pub platform_slots: usize,
+    /// Platform counters every tenant may create even when the shared
+    /// platform total is used up.
+    pub platform_slot_floor: usize,
+    /// Part of `table_memory_max_bytes` kept for requests within a tenant's
+    /// floors (at most half of the cap is reserved).
+    pub floor_reserve_bytes: usize,
     /// Hard cap on the estimated bytes of all limiter tables combined.
     pub table_memory_max_bytes: usize,
 }
@@ -734,16 +760,31 @@ impl Default for NetLimits {
             tenant_slot_floor: TENANT_SLOT_FLOOR,
             platform_slots_per_aggregate: PLATFORM_SLOTS_PER_AGGREGATE,
             platform_slots: PLATFORM_SLOTS_TOTAL,
+            platform_slot_floor: PLATFORM_SLOT_FLOOR,
+            floor_reserve_bytes: FLOOR_RESERVE_BYTES,
             table_memory_max_bytes: TABLE_MEMORY_MAX_BYTES,
         }
     }
 }
 
 impl NetLimits {
-    /// Sizes the global tenant budget for `tenants` tenants at full use.
+    /// Sizes the global tenant budget for `tenants` tenants at full use, the
+    /// platform total for that budget plus every tenant's platform floor,
+    /// and the memory reserve for every tenant's floor.
     pub fn sized_for(mut self, tenants: usize) -> Self {
-        self.tenant_slots_total = tenants.max(1).saturating_mul(self.slots_per_tenant);
+        let tenants = tenants.max(1);
+        self.tenant_slots_total = tenants.saturating_mul(self.slots_per_tenant);
+        let floors = tenants.saturating_mul(self.platform_slot_floor);
+        self.platform_slots = self.tenant_slots_total.saturating_add(floors);
+        self.floor_reserve_bytes = floors.saturating_mul(FLOOR_SLOT_BYTES);
         self
+    }
+
+    /// Memory kept for floor growth: `floor_reserve_bytes`, at most half of
+    /// the cap.
+    fn floor_reserve(&self) -> usize {
+        self.floor_reserve_bytes
+            .min(self.table_memory_max_bytes / 2)
     }
 
     fn platform_cap(&self) -> u32 {
@@ -755,6 +796,8 @@ impl NetLimits {
 struct FixedCounter {
     start: Instant,
     count: u32,
+    /// Tenant charged for this slot (its floor).
+    owner: String,
 }
 
 impl FixedCounter {
@@ -764,9 +807,10 @@ impl FixedCounter {
 }
 
 /// Fixed-window counters grouped into partitions (a tenant, or a network
-/// aggregate), with a per-group slot cap and a total slot cap. A group below
-/// `floor` slots is admitted even when the total is used up, so a full table
-/// never refuses a group that holds few counters. Queues hold `(group, key, window start)` in start order; records whose
+/// aggregate), with a per-group slot cap and a total slot cap. Every slot is
+/// also charged to the tenant that created it; a tenant below `floor` slots
+/// is admitted even when the total is used up, so a full table never refuses
+/// a tenant that holds few counters. Queues hold `(group, key, window start)` in start order; records whose
 /// counter was removed or restarted are stale and skipped.
 struct CounterTable {
     per_group: usize,
@@ -774,6 +818,7 @@ struct CounterTable {
     floor: usize,
     entries: HashMap<(String, String), FixedCounter>,
     group_len: HashMap<String, usize>,
+    owner_len: HashMap<String, usize>,
     group_queue: HashMap<String, VecDeque<(String, Instant)>>,
     queue: VecDeque<(String, String, Instant)>,
 }
@@ -786,6 +831,7 @@ impl CounterTable {
             floor: floor.min(per_group),
             entries: HashMap::new(),
             group_len: HashMap::new(),
+            owner_len: HashMap::new(),
             group_queue: HashMap::new(),
             queue: VecDeque::new(),
         }
@@ -797,12 +843,19 @@ impl CounterTable {
             .is_some_and(|c| c.start == start)
     }
 
+    /// Slots charged to `owner`.
+    fn owned(&self, owner: &str) -> usize {
+        self.owner_len.get(owner).copied().unwrap_or(0)
+    }
+
     fn remove(&mut self, group: &str, key: &str) {
-        if self
-            .entries
-            .remove(&(group.to_string(), key.to_string()))
-            .is_some()
-        {
+        if let Some(c) = self.entries.remove(&(group.to_string(), key.to_string())) {
+            if let Some(n) = self.owner_len.get_mut(&c.owner) {
+                *n -= 1;
+                if *n == 0 {
+                    self.owner_len.remove(&c.owner);
+                }
+            }
             if let Some(n) = self.group_len.get_mut(group) {
                 *n -= 1;
                 if *n == 0 {
@@ -858,7 +911,13 @@ impl CounterTable {
     /// Slots that must be free to add the absent `keys`, versus free slots
     /// (after [`sweep`](Self::sweep)). `Err` carries seconds until the oldest
     /// live counter in the way expires.
-    fn room(&self, group: &str, keys: &[&str], now: Instant) -> Result<(), (Bound, u64)> {
+    fn room(
+        &self,
+        group: &str,
+        owner: &str,
+        keys: &[&str],
+        now: Instant,
+    ) -> Result<(), (Bound, u64)> {
         let missing = keys
             .iter()
             .filter(|k| {
@@ -869,7 +928,7 @@ impl CounterTable {
             .count();
         let used = self.group_len.get(group).copied().unwrap_or(0);
         let within_total =
-            self.entries.len() + missing <= self.total || used + missing <= self.floor;
+            self.entries.len() + missing <= self.total || self.owned(owner) + missing <= self.floor;
         if used + missing <= self.per_group && within_total {
             return Ok(());
         }
@@ -908,7 +967,7 @@ impl CounterTable {
 
     /// Adds `n` to `key`, restarting its window if expired. Call only after
     /// [`room`](Self::room) succeeded.
-    fn add(&mut self, group: &str, key: &str, n: u32, now: Instant) {
+    fn add(&mut self, group: &str, owner: &str, key: &str, n: u32, now: Instant) {
         let id = (group.to_string(), key.to_string());
         match self.entries.get_mut(&id) {
             Some(c) if c.live(now) => {
@@ -925,9 +984,11 @@ impl CounterTable {
                     FixedCounter {
                         start: now,
                         count: n,
+                        owner: owner.to_string(),
                     },
                 );
                 *self.group_len.entry(group.to_string()).or_insert(0) += 1;
+                *self.owner_len.entry(owner.to_string()).or_insert(0) += 1;
             }
         }
         self.group_queue
@@ -994,7 +1055,7 @@ impl NetLayers {
             platform: CounterTable::new(
                 limits.platform_slots_per_aggregate,
                 limits.platform_slots,
-                0,
+                limits.platform_slot_floor,
             ),
             max_bytes: limits.table_memory_max_bytes,
             limits,
@@ -1087,15 +1148,24 @@ impl NetLayers {
             .base_bytes
             .saturating_add(self.bytes())
             .saturating_add((new_t + new_p) * COUNTER_SLOT_BYTES);
+        // Growth within both of the tenant's floors may use the reserved part
+        // of the memory cap; any other growth may not.
+        let within_floor = self.tenants.owned(tenant) + new_t <= self.tenants.floor
+            && self.platform.owned(tenant) + new_p <= self.platform.floor;
+        let mem_cap = if within_floor {
+            self.max_bytes
+        } else {
+            self.max_bytes.saturating_sub(self.limits.floor_reserve())
+        };
         let full = match (
-            self.tenants.room(tenant, &tk, now),
-            self.platform.room(&group, &pk, now),
+            self.tenants.room(tenant, tenant, &tk, now),
+            self.platform.room(&group, tenant, &pk, now),
         ) {
             (Err((Bound::Partition, w)), _) => Some(("tenant", "table_full", w)),
             (Err((Bound::Total, w)), _) => Some(("tenant", "tenant_budget_exhausted", w)),
             (_, Err((Bound::Partition, w))) => Some(("platform", "prefix_cap_exceeded", w)),
             (_, Err((Bound::Total, w))) => Some(("platform", "table_full", w)),
-            _ if projected > self.max_bytes => {
+            _ if projected > mem_cap => {
                 let layer = if new_t > 0 { "tenant" } else { "platform" };
                 Some((layer, "table_full", WINDOW.as_secs()))
             }
@@ -1106,10 +1176,10 @@ impl NetLayers {
             return Err(NetRefusal::SlotsFull(layer, reason, w));
         }
         for k in tk {
-            self.tenants.add(tenant, k, n, now);
+            self.tenants.add(tenant, tenant, k, n, now);
         }
         for k in pk {
-            self.platform.add(&group, k, n, now);
+            self.platform.add(&group, tenant, k, n, now);
         }
         Ok(())
     }
@@ -2067,6 +2137,7 @@ mod tests {
             tenant_slot_floor: 0,
             platform_slots_per_aggregate: platform,
             platform_slots: platform,
+            platform_slot_floor: 0,
             ..NetLimits::default()
         })
     }
@@ -2520,6 +2591,7 @@ mod tests {
         // table_full: the platform total.
         let mut rates = RateBuckets::with_limits(NetLimits {
             platform_slots: 1,
+            platform_slot_floor: 0,
             ..NetLimits::default()
         });
         assert!(rates.net.charge("ta", &v4(0), 1, now).is_ok());
@@ -2599,5 +2671,93 @@ mod tests {
         assert!(!quotas.check(day, &[("ip", "d".into(), 50)]));
         assert!(quotas.check(day, &[("ip", "a".into(), 50)]));
         assert_eq!(rates.estimated_bytes(), 3 * QUOTA_ENTRY_BYTES);
+    }
+
+    #[test]
+    fn tenant_gets_its_platform_floor_when_the_shared_platform_pool_is_full() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::with_limits(NetLimits {
+            platform_slots: 8,
+            platform_slot_floor: 2,
+            ..NetLimits::default()
+        });
+        for i in 0..4 {
+            assert!(rates.net.charge("ta", &v4(i), 1, now).is_ok());
+            assert!(rates.net.charge("tb", &v4(10 + i), 1, now).is_ok());
+        }
+        assert_eq!(rates.net.platform.entries.len(), 8);
+        // Above-floor growth is refused by the shared total.
+        assert!(matches!(
+            rates.net.charge("tb", &v4(20), 1, now),
+            Err(NetRefusal::SlotsFull("platform", "table_full", _))
+        ));
+        // A tenant with no slots still gets its floor, IPv4 and IPv6.
+        assert!(rates.net.charge("fresh", &v4(30), 1, now).is_ok());
+        assert!(rates.net.charge("fresh", "2001:db8:1::/48", 1, now).is_ok());
+        assert!(matches!(
+            rates.net.charge("fresh", &v4(31), 1, now),
+            Err(NetRefusal::SlotsFull("platform", "table_full", _))
+        ));
+        assert!(rates.net.charge("other", &v4(32), 1, now).is_ok());
+        // Expired counters release the floor again.
+        assert!(rates.net.charge("fresh", &v4(31), 1, now + WINDOW).is_ok());
+    }
+
+    #[test]
+    fn tenant_gets_its_floor_when_the_memory_budget_is_used_by_other_tenants() {
+        let now = Instant::now();
+        let max = 200 * 1024;
+        let reserve = 40 * 1024;
+        let mut rates = RateBuckets::with_limits(NetLimits {
+            tenant_slot_floor: 2,
+            platform_slot_floor: 2,
+            floor_reserve_bytes: reserve,
+            table_memory_max_bytes: max,
+            ..NetLimits::default()
+        });
+        let full = slot_refused_total("tenant", "table_full");
+        let mut refused = 0;
+        for t in 0..4 {
+            for i in 0..100 {
+                let tenant = format!("h{t}");
+                let key = format!("{tenant}-{i}");
+                if d130(&mut rates, &tenant, &v4(t * 100 + i), &key, now).is_some() {
+                    refused += 1;
+                }
+            }
+        }
+        assert!(refused > 0, "the above-floor budget must be used up");
+        // Only the heavy tenants' own floor slots may use the reserve.
+        assert!(rates.estimated_bytes() <= max - reserve + 4 * 2 * FLOOR_SLOT_BYTES * 2);
+        assert!(slot_refused_total("tenant", "table_full") > full);
+        // A tenant with no slots gets its floor from the reserve.
+        assert_eq!(d130(&mut rates, "fresh", &v4(1_000), "f0", now), None);
+        assert_eq!(d130(&mut rates, "fresh", &v4(1_001), "f1", now), None);
+        // Above its floor it is refused like everyone else.
+        assert_eq!(d130(&mut rates, "fresh", &v4(1_002), "f2", now), Some(60));
+        assert!(rates.estimated_bytes() <= max);
+    }
+
+    #[test]
+    fn sizing_reserves_every_tenant_floor() {
+        let limits = NetLimits::default().sized_for(EXPECTED_TENANTS);
+        assert_eq!(limits.platform_slots, PLATFORM_SLOTS_TOTAL);
+        assert_eq!(limits.floor_reserve_bytes, FLOOR_RESERVE_BYTES);
+        assert_eq!(
+            limits.platform_slots,
+            limits.tenant_slots_total + EXPECTED_TENANTS * limits.platform_slot_floor
+        );
+        let big = NetLimits::default().sized_for(1_024);
+        assert_eq!(
+            big.platform_slots,
+            1_024 * (SLOTS_PER_TENANT + PLATFORM_SLOT_FLOOR)
+        );
+        assert_eq!(
+            big.floor_reserve_bytes,
+            1_024 * PLATFORM_SLOT_FLOOR * FLOOR_SLOT_BYTES
+        );
+        // At most half of the memory cap is reserved.
+        assert_eq!(big.floor_reserve(), TABLE_MEMORY_MAX_BYTES / 2);
+        assert_eq!(FLOOR_RESERVE_BYTES, 48 * 1024 * 1024);
     }
 }

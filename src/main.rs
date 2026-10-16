@@ -469,6 +469,8 @@ async fn cmd_serve(
     vibe::runtime::challenge::production_gate(run_env, challenge.is_some(), &always)?;
     let addr: SocketAddr = addr.parse().map_err(|err| format!("bad address: {err}"))?;
     let rates = vibe::runtime::RateBuckets::with_limits(net_limits_from_env()?);
+    let honor_test_ip = false;
+    vibe::runtime::check_test_ip_override(honor_test_ip)?;
     let state = Arc::new(AppState {
         manifest,
         exec,
@@ -478,7 +480,7 @@ async fn cmd_serve(
         rates: std::sync::Mutex::new(rates),
         disabled: load_disabled(project),
         min_override_ms: None,
-        honor_test_ip: false,
+        honor_test_ip,
         trusted_proxies: trusted_proxies_from_env()?,
         dev_hints: memory,
         challenge,
@@ -598,7 +600,9 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
 /// D130 limits. `VIBE_RATE_PLATFORM_FACTOR` sets the platform cap as a
 /// multiple of the tenant cap (default 5, 1..=100).
 /// `VIBE_RATE_EXPECTED_TENANTS` sizes the global tenant slot budget
-/// (default 256, 1..=4096; budget = tenants x 4,096 slots).
+/// (default 256, 1..=4096; budget = tenants x 4,096 slots) and with it the
+/// platform total (budget + tenants x 64 floor slots) and the memory kept
+/// for per-tenant floors (tenants x 64 x 3 KiB, at most half the cap).
 /// `VIBE_RATE_TABLE_MEMORY_MAX_BYTES` caps the estimated memory of all
 /// limiter tables combined (default 268435456 = 256 MiB, at least 1 MiB).
 fn net_limits_from_env() -> Result<vibe::runtime::NetLimits, String> {
