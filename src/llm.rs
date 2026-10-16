@@ -231,6 +231,12 @@ pub fn load_llm_config(
         report.push(Diag::error("env", "LLM_MODEL is missing"));
     }
     if let Some(model) = &model {
+        if !model.is_empty() && !model_id_is_valid(&provider, model) {
+            report.push(Diag::error(
+                "env",
+                "LLM_MODEL contains characters that are not allowed for this provider",
+            ));
+        }
         if !model_is_pinned(model) {
             report.push(Diag::error(
                 "env",
@@ -348,6 +354,23 @@ fn pick(
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }
+}
+
+/// Only a conservative character set is accepted for model ids. Gemini
+/// places the id in the request URL path, so ':' and '/' are rejected there;
+/// other providers send it in the JSON body and may use them (for example
+/// `qwen2.5-coder:32b` or `org/model`).
+pub fn model_id_is_valid(provider: &str, model: &str) -> bool {
+    let path_safe = provider == GEMINI;
+    !model.is_empty()
+        && model.len() <= 256
+        && !model.starts_with('.')
+        && !model.contains("..")
+        && model.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'.' | b'_' | b'-')
+                || (!path_safe && matches!(b, b':' | b'/'))
+        })
 }
 
 pub fn model_is_pinned(model: &str) -> bool {
@@ -978,6 +1001,30 @@ mod tests {
             false,
         );
         assert!(bad_model.is_err());
+    }
+
+    #[test]
+    fn model_id_charset() {
+        for ok in ["gpt-4o-2024-08-06", "gemini-2.5-pro-001", "a_b.c-1"] {
+            assert!(model_id_is_valid(GEMINI, ok), "{ok}");
+            assert!(model_id_is_valid(OPENAI, ok), "{ok}");
+        }
+        for bad in [
+            "", "../x", "a/b", "a:b", "a?b", "a%2Fb", "a b", ".x", "a..b", "a#b",
+        ] {
+            assert!(!model_id_is_valid(GEMINI, bad), "{bad}");
+        }
+        assert!(model_id_is_valid(OPENAI, "qwen2.5-coder:32b-instruct-q8_0"));
+        assert!(!model_id_is_valid(OPENAI, "a?b"));
+        let report = load_llm_config(
+            &env(&[
+                ("LLM_PROVIDER", "gemini"),
+                ("LLM_API_KEY", "test-value"),
+                ("LLM_MODEL", "gemini-2.5-pro-001:x"),
+            ]),
+            false,
+        );
+        assert!(report.is_err());
     }
 
     #[test]
