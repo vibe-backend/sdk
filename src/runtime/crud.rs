@@ -869,6 +869,7 @@ fn db(err: ExecError) -> MethodFail {
         ExecError::NotFound => MethodFail::code("NOT_FOUND", "not found"),
         ExecError::Conflict => MethodFail::code("CONFLICT", "conflict"),
         ExecError::Precondition => MethodFail::code("PRECONDITION_FAILED", "precondition failed"),
+        ExecError::IssuanceFailed => MethodFail::code("INTERNAL", "refresh issuance failed"),
         ExecError::Message(message) => MethodFail::code("INTERNAL", message),
     }
 }

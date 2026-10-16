@@ -134,6 +134,7 @@ pub async fn query(
             ExecError::Message(msg) if msg.contains("--memory") => internal(msg),
             // SQLSTATE 23505 (unique violation), mapped in exec.
             ExecError::Conflict => MethodFail::code("CONFLICT", "already exists"),
+            ExecError::Timeout => MethodFail::code("TX_TIMEOUT", "transaction timed out"),
             other => {
                 tracing::warn!(error = ?other, "query step failed");
                 internal("query failed")
@@ -404,9 +405,13 @@ pub async fn sign_jwt(
     let roles = exec
         .user_roles(ctx.tenant_id, &sub)
         .await
-        .map_err(|err| {
-            tracing::warn!(error = ?err, "sign-jwt roles lookup failed");
-            internal("sign-jwt roles lookup failed")
+        .map_err(|err| match err {
+            ExecError::Timeout => MethodFail::code("TX_TIMEOUT", "transaction timed out"),
+            ExecError::Conflict => MethodFail::code("TX_CONFLICT", "transaction conflict"),
+            other => {
+                tracing::warn!(error = ?other, "sign-jwt roles lookup failed");
+                internal("sign-jwt roles lookup failed")
+            }
         })?
         .ok_or_else(|| internal("sign-jwt sub is not a user"))?;
     let now = chrono::Utc::now().timestamp();

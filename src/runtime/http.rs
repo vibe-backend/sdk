@@ -1699,23 +1699,23 @@ fn invalid_refresh(request_id: &str, reason: &'static str) -> HttpResponse {
 }
 
 fn refresh_unavailable(request_id: &str, err: &ExecError) -> HttpResponse {
-    error_response(
+    json_response(
         if matches!(err, ExecError::Timeout) {
             StatusCode::GATEWAY_TIMEOUT
         } else {
             StatusCode::SERVICE_UNAVAILABLE
         },
-        if matches!(err, ExecError::Timeout) {
-            "TX_TIMEOUT"
-        } else {
-            "TX_CONFLICT"
-        },
-        "Token refresh is temporarily unavailable; try again later",
+        json!({"error": {
+            "code": if matches!(err, ExecError::Timeout) { "TX_TIMEOUT" } else { "TX_CONFLICT" },
+            "message": "Token refresh is temporarily unavailable; try again later",
+            "request_id": request_id,
+            "retryable": true,
+        }}),
         request_id,
         &[
-            ("retry-after", "1"),
-            ("cache-control", "no-store"),
-            ("pragma", "no-cache"),
+            ("retry-after".into(), "1".into()),
+            ("cache-control".into(), "no-store".into()),
+            ("pragma".into(), "no-cache".into()),
         ],
     )
 }
@@ -1850,9 +1850,11 @@ impl super::exec::RefreshIssuer for HttpRefreshIssuer<'_> {
         .await;
         match result {
             Ok(result) if result.value.get("access_token").is_some() => Ok(result.value),
-            _ => Err(super::exec::ExecError::Message(
-                "refresh issuance failed".into(),
-            )),
+            Err(err) if err.code == "TX_TIMEOUT" => Err(ExecError::Timeout),
+            Err(err) if matches!(err.code.as_str(), "TX_CONFLICT" | "CONFLICT") => {
+                Err(ExecError::Conflict)
+            }
+            _ => Err(ExecError::IssuanceFailed),
         }
     }
 }
@@ -3195,6 +3197,7 @@ mod refresh_response_tests {
                 .unwrap();
             let value: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(value["error"]["code"], code);
+            assert_eq!(value["error"]["retryable"], true);
         }
     }
 }

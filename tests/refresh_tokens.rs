@@ -706,7 +706,7 @@ async fn check_postgres_reservation(mode: &str) {
                     .await
                 {
                     Err(vibe::runtime::ExecError::Conflict) => tokio::task::yield_now().await,
-                    Ok(vibe::runtime::refresh::Rotated::Reuse { .. }) => break,
+                    Ok(vibe::runtime::refresh::Rotated::Ok { .. }) => break,
                     other => panic!("finalize failure rotated: {other:?}"),
                 }
             }
@@ -777,7 +777,7 @@ async fn check_postgres_reservation(mode: &str) {
             )
             .await
             .unwrap(),
-            vibe::runtime::refresh::Rotated::Reuse { .. }
+            vibe::runtime::refresh::Rotated::Ok { .. }
         ));
         assert_eq!(
             exec.refresh_family(&tenant, "expiry-child").await.unwrap(),
@@ -794,7 +794,7 @@ async fn check_postgres_reservation(mode: &str) {
             exec.refresh_rotate(&tenant, "lease-parent", "lease-child", lease_policy)
                 .await
                 .unwrap(),
-            vibe::runtime::refresh::Rotated::Reuse { .. }
+            vibe::runtime::refresh::Rotated::Ok { .. }
         ));
     }
     let policy = RefreshPolicy {
@@ -802,7 +802,7 @@ async fn check_postgres_reservation(mode: &str) {
         idle_ttl: 600,
         grace: 10,
     };
-    if mode == "slow" {
+    if mode == "slow" || mode == "http-pool-timeout" {
         // A child insert waits inside the rotation transaction beyond the response floor.
         admin
             .batch_execute(&format!(
@@ -835,9 +835,21 @@ async fn check_postgres_reservation(mode: &str) {
                 public_write: true,
             },
         )]);
+        let http_exec = Arc::new(
+            PgExec::connect_with(
+                &admin_url,
+                vibe::runtime::PgOptions {
+                    pool_size: 1,
+                    pool_timeout_ms: 100,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
         let state = Arc::new(AppState {
             manifest: m,
-            exec: Arc::new(PgExec::connect(&admin_url).await.unwrap()),
+            exec: http_exec.clone(),
             auth: base.state.auth.clone(),
             slugs,
             rates: std::sync::Mutex::new(Default::default()),
@@ -867,6 +879,13 @@ async fn check_postgres_reservation(mode: &str) {
             exec: base.exec,
             state,
         };
+        if mode == "http-pool-timeout" {
+            let held = http_exec.pool().get().await.unwrap();
+            let (status, body, _) = a.refresh(&token).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+            assert_eq!(body["error"]["code"], "TX_TIMEOUT");
+            drop(held);
+        }
         let (status, body, elapsed) = a.refresh(&token).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(elapsed >= 400);
@@ -972,12 +991,10 @@ async fn check_postgres_reservation(mode: &str) {
     };
     if let Some(parent) = failed_parent {
         let row = admin.query_one(&format!("SELECT revoked_at IS NOT NULL, replaced_by IS NULL FROM {schema}._platform_refresh_tokens WHERE token_hash = $1"), &[&parent]).await.unwrap();
-        assert!(row.get::<_, bool>(0), "family must be revoked");
-        if mode != "past-grace" {
-            assert!(row.get::<_, bool>(1), "abandoned token must never rotate");
-        }
+        let revoked = mode == "past-grace";
+        assert_eq!(row.get::<_, bool>(0), revoked);
         let live: i64 = admin.query_one(&format!("SELECT count(*) FROM {schema}._platform_refresh_tokens WHERE family_id = (SELECT family_id FROM {schema}._platform_refresh_tokens WHERE token_hash = $1) AND revoked_at IS NULL"), &[&parent]).await.unwrap().get(0);
-        assert_eq!(live, 0);
+        assert_eq!(live, if revoked { 0 } else { 2 });
     }
     admin
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE; DROP ROLE {role}"))
@@ -1323,6 +1340,7 @@ struct FamilyLookupFails {
     lookup_delay_ms: u64,
     rotate_delay_ms: u64,
     signer_delay_ms: u64,
+    signer_timeout: bool,
     signer_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1347,6 +1365,9 @@ impl vibe::runtime::QueryExec for FamilyLookupFails {
     ) -> Result<Vec<vibe::runtime::Row>, vibe::runtime::ExecError> {
         tokio::time::sleep(std::time::Duration::from_millis(self.signer_delay_ms)).await;
         if self.signer_down.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.signer_timeout {
+                return Err(vibe::runtime::ExecError::Timeout);
+            }
             return Err(vibe::runtime::ExecError::Message(
                 "issuance unavailable".into(),
             ));
@@ -1448,6 +1469,7 @@ async fn refresh_timeout_returns_504_tx_timeout_and_preserves_token() {
             lookup_delay_ms: 0,
             rotate_delay_ms: 0,
             signer_delay_ms: 0,
+            signer_timeout: false,
             signer_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     });
@@ -1477,6 +1499,7 @@ async fn refresh_waits_complete_and_new_tokens_remain_usable() {
                 lookup_delay_ms,
                 rotate_delay_ms,
                 signer_delay_ms,
+                signer_timeout: false,
                 signer_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             })
         });
@@ -1751,6 +1774,7 @@ fn app_with_issuance_control(
             lookup_delay_ms: 0,
             rotate_delay_ms: 0,
             signer_delay_ms: 0,
+            signer_timeout: false,
             signer_down: flag,
         })
     });
@@ -2073,7 +2097,7 @@ async fn check_issuance_without_store_connection(
                     .await
                 {
                     Err(ExecError::Conflict) => tokio::task::yield_now().await,
-                    Ok(Rotated::Reuse { .. }) => break,
+                    Ok(Rotated::Ok { .. }) => break,
                     other => panic!("cancelled reservation rotated: {other:?}"),
                 }
             }
@@ -2084,20 +2108,11 @@ async fn check_issuance_without_store_connection(
             exec.refresh_family(tenant, "cancel-child").await.unwrap(),
             None
         );
-        assert_eq!(
-            exec.refresh_family(tenant, "cancel-retry").await.unwrap(),
-            None
-        );
-        assert_eq!(
-            exec.refresh_rotate(tenant, "cancel-parent", "cancel-later", policy)
-                .await
-                .unwrap(),
-            Rotated::Invalid
-        );
-        assert_eq!(
-            exec.refresh_family(tenant, "cancel-later").await.unwrap(),
-            None
-        );
+        assert!(exec
+            .refresh_family(tenant, "cancel-retry")
+            .await
+            .unwrap()
+            .is_some());
     }
     if scenario == "pending" {
         exec.refresh_issue(tenant, "pending-user", "pending-parent", policy)
@@ -2264,7 +2279,17 @@ async fn check_issuance_without_store_connection(
                 None
             );
         } else {
-            assert_eq!(result.unwrap().0, Rotated::Invalid);
+            if scenario == "child-rotation" {
+                assert!(matches!(result.unwrap().0, Rotated::Reuse { .. }));
+                assert_eq!(
+                    exec.refresh_rotate(tenant, "child-descendant", "descendant-retry", policy)
+                        .await
+                        .unwrap(),
+                    Rotated::Invalid
+                );
+            } else {
+                assert_eq!(result.unwrap().0, Rotated::Invalid);
+            }
             assert_eq!(exec.refresh_family(tenant, &new_child).await.unwrap(), None);
             if scenario == "past-grace" {
                 assert_eq!(
@@ -2381,6 +2406,7 @@ async fn pending_refresh_returns_retryable_response_without_clearing_cookie() {
             lookup_delay_ms: 0,
             rotate_delay_ms: 0,
             signer_delay_ms: 600,
+            signer_timeout: false,
             signer_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     });
@@ -2409,6 +2435,7 @@ async fn pending_refresh_returns_retryable_response_without_clearing_cookie() {
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["code"], "TX_CONFLICT");
+        assert_eq!(body["error"]["retryable"], true);
     };
     let (first, ()) = tokio::join!(first, second);
     assert_eq!(first.0, StatusCode::OK);
@@ -2447,7 +2474,7 @@ async fn memory_presentation_while_pending_after_grace_revokes_family() {
 }
 
 #[tokio::test]
-async fn memory_dropped_reservation_revokes_family() {
+async fn memory_dropped_reservation_allows_retry() {
     check_issuance_without_store_connection(&MemoryExec::new(), TENANT, "cancel").await;
 }
 
@@ -2477,7 +2504,7 @@ async fn postgres_presentation_while_pending_after_grace_revokes_family() {
 }
 
 #[tokio::test]
-async fn postgres_dropped_reservation_revokes_family() {
+async fn postgres_dropped_reservation_allows_retry() {
     check_postgres_reservation("cancel").await;
 }
 
@@ -2492,7 +2519,7 @@ async fn postgres_child_rotation_during_parent_grace_reissue() {
 }
 
 #[tokio::test]
-async fn postgres_expired_reservation_presentation_revokes_family() {
+async fn postgres_expired_reservation_allows_retry() {
     check_postgres_reservation("expired").await;
 }
 
@@ -2502,7 +2529,7 @@ async fn postgres_expired_reservation_prevents_original_finalization() {
 }
 
 #[tokio::test]
-async fn postgres_finalization_failure_revokes_family() {
+async fn postgres_finalization_failure_allows_retry() {
     check_postgres_reservation("finalize-failure").await;
 }
 
@@ -2523,4 +2550,39 @@ async fn memory_retry_after_in_flight_rotation_obeys_grace() {
 #[tokio::test]
 async fn postgres_retry_after_in_flight_rotation_obeys_grace() {
     check_postgres_reservation("retry").await;
+}
+
+#[tokio::test]
+async fn postgres_http_pool_timeout_allows_refresh_retry() {
+    check_postgres_reservation("http-pool-timeout").await;
+}
+
+#[tokio::test]
+async fn issuance_timeout_returns_504_and_allows_retry() {
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = down.clone();
+    let a = app_wrapped(manifest(0), move |inner| {
+        Arc::new(FamilyLookupFails {
+            inner,
+            down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lookup_delay_ms: 0,
+            rotate_delay_ms: 0,
+            signer_delay_ms: 0,
+            signer_timeout: true,
+            signer_down: flag,
+        })
+    });
+    let token = tok(&a.login().await, "refresh_token");
+    down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, body, _) = a.refresh(&token).await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["error"]["code"], "TX_TIMEOUT");
+    assert_eq!(body["error"]["retryable"], true);
+    down.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (status, body, _) = a.refresh(&token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        a.refresh(&tok(&body, "refresh_token")).await.0,
+        StatusCode::OK
+    );
 }

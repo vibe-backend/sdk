@@ -15,6 +15,7 @@ pub enum ExecError {
     Conflict,
     Precondition,
     Timeout,
+    IssuanceFailed,
     Message(String),
 }
 
@@ -328,10 +329,6 @@ impl QueryExec for MemoryExec {
                     .and_then(Value::as_i64)
                     .is_some_and(|until| until <= validated_at)
                 {
-                    if row["used_at"].is_null() {
-                        row.insert("used_at".into(), validated_at.into());
-                    }
-                    row.insert("replaced_by".into(), Value::Null);
                     row.remove("pending_rotation");
                     row.remove("pending_until");
                 }
@@ -387,10 +384,6 @@ impl QueryExec for MemoryExec {
                                 == Some(&reservation)
                     })
                 {
-                    if row["used_at"].is_null() {
-                        row.insert("used_at".into(), chrono::Utc::now().timestamp().into());
-                    }
-                    row.insert("replaced_by".into(), Value::Null);
                     row.remove("pending_rotation");
                     row.remove("pending_until");
                 }
@@ -420,12 +413,6 @@ impl QueryExec for MemoryExec {
                     .get("pending_until")
                     .and_then(Value::as_i64)
                     .is_some_and(|until| until > chrono::Utc::now().timestamp());
-                if !reserved {
-                    if row["used_at"].is_null() {
-                        row.insert("used_at".into(), chrono::Utc::now().timestamp().into());
-                    }
-                    row.insert("replaced_by".into(), Value::Null);
-                }
                 row.remove("pending_rotation");
                 row.remove("pending_until");
             }
@@ -438,14 +425,32 @@ impl QueryExec for MemoryExec {
         let current = rows.iter().find(|row| row["token_hash"] == token_hash);
         if !current.is_some_and(|row| {
             row["revoked_at"].is_null() && row["replaced_by"] == parent["replaced_by"]
-        }) || (!parent["used_at"].is_null()
+        }) {
+            return Ok((Rotated::Invalid, None));
+        }
+        if !parent["used_at"].is_null()
             && !rows.iter().any(|row| {
                 row["id"] == parent["replaced_by"]
                     && row["used_at"].is_null()
                     && row["revoked_at"].is_null()
-            }))
+                    && row["replaced_by"].is_null()
+            })
         {
-            return Ok((Rotated::Invalid, None));
+            for row in rows
+                .iter_mut()
+                .filter(|row| row["family_id"] == parent["family_id"])
+            {
+                if row["revoked_at"].is_null() {
+                    row.insert("revoked_at".into(), chrono::Utc::now().timestamp().into());
+                    row.insert("revoke_reason".into(), "reuse-detected".into());
+                }
+            }
+            return Ok((
+                Rotated::Reuse {
+                    family_id: parent["family_id"].as_str().unwrap().to_owned(),
+                },
+                None,
+            ));
         }
         let rotated = super::refresh::memory_rotate(
             rows,
@@ -1366,7 +1371,7 @@ impl QueryExec for PgExec {
         )
         .await
         .map_err(map_pg)?;
-        tx.execute("UPDATE _platform_refresh_tokens SET used_at = COALESCE(used_at, clock_timestamp()), replaced_by = NULL, pending_rotation = NULL, pending_until = NULL WHERE token_hash = $1 AND pending_rotation IS NOT NULL AND pending_until <= clock_timestamp()", &[&token_hash]).await.map_err(map_pg)?;
+        tx.execute("UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE token_hash = $1 AND pending_rotation IS NOT NULL AND pending_until <= clock_timestamp()", &[&token_hash]).await.map_err(map_pg)?;
         let row = tx
             .query_opt(
                 "SELECT id::text, family_id::text, user_id, revoke_reason, revoked_at IS NOT NULL, \
@@ -1449,7 +1454,7 @@ impl QueryExec for PgExec {
                 if let Ok(mut client) = pool.get().await {
                     if let Ok(tx) = client.transaction().await {
                         if tx.query("SELECT set_config('search_path', $1, true), set_config('app.tenant_id', $2, true), set_config('statement_timeout', $3, true), set_config('lock_timeout', $3, true)", &[&cleanup_schema, &cleanup_tenant, &cleanup_timeout]).await.is_ok() {
-                            let _ = tx.execute("UPDATE _platform_refresh_tokens SET used_at = COALESCE(used_at, clock_timestamp()), replaced_by = NULL, pending_until = clock_timestamp() WHERE id = $1::text::uuid AND pending_rotation = $2 AND revoked_at IS NULL", &[&cleanup_id, &cleanup_reservation]).await;
+                            let _ = tx.execute("UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE id = $1::text::uuid AND pending_rotation = $2 AND revoked_at IS NULL", &[&cleanup_id, &cleanup_reservation]).await;
                             let _ = tx.commit().await;
                         }
                     }
@@ -1483,6 +1488,21 @@ impl QueryExec for PgExec {
         )
         .await
         .map_err(map_pg)?;
+        if used && issued.is_ok() {
+            let child_changed: bool = tx.query_one(
+                "SELECT EXISTS (SELECT 1 FROM _platform_refresh_tokens p WHERE p.id = $1::text::uuid AND p.pending_rotation = $2 AND p.pending_until > clock_timestamp() AND p.revoked_at IS NULL AND NOT EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = $3::text::uuid AND c.used_at IS NULL AND c.revoked_at IS NULL AND c.replaced_by IS NULL))",
+                &[&id, &reservation, &old_child],
+            ).await.map_err(map_pg)?.get(0);
+            if child_changed {
+                tx.execute(revoke_family, &[&family])
+                    .await
+                    .map_err(map_pg)?;
+                tx.execute("UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE id = $1::text::uuid AND pending_rotation = $2", &[&id, &reservation]).await.map_err(map_pg)?;
+                tx.commit().await.map_err(map_pg)?;
+                guard.0.take();
+                return Ok((Rotated::Reuse { family_id: family }, None));
+            }
+        }
         let current = tx.execute(
             "UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE id = $1::text::uuid AND pending_rotation = $2 AND revoked_at IS NULL AND pending_until > clock_timestamp() AND replaced_by IS NOT DISTINCT FROM $3::text::uuid AND (NOT $4 OR EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = $3::text::uuid AND c.used_at IS NULL AND c.revoked_at IS NULL))",
             &[&id, &reservation, &old_child, &used],
@@ -1968,16 +1988,17 @@ mod reservation_tests {
             exec.refresh_rotate(tenant, "parent", "other-child", policy)
                 .await
                 .unwrap(),
-            Rotated::Reuse { .. }
+            Rotated::Ok { .. }
         ));
         assert_eq!(
             exec.refresh_family(tenant, "original-child").await.unwrap(),
             None
         );
-        assert_eq!(
-            exec.refresh_family(tenant, "other-child").await.unwrap(),
-            None
-        );
+        assert!(exec
+            .refresh_family(tenant, "other-child")
+            .await
+            .unwrap()
+            .is_some());
     }
     async fn check_expired_memory_reservation(finalize: bool) {
         let exec = MemoryExec::new();
@@ -2012,24 +2033,28 @@ mod reservation_tests {
             exec.refresh_rotate(tenant, "parent", "retry", policy)
                 .await
                 .unwrap(),
-            Rotated::Reuse { .. }
+            Rotated::Ok { .. }
         ));
         assert_eq!(exec.refresh_family(tenant, "child").await.unwrap(), None);
-        assert_eq!(exec.refresh_family(tenant, "retry").await.unwrap(), None);
+        assert!(exec
+            .refresh_family(tenant, "retry")
+            .await
+            .unwrap()
+            .is_some());
         let tables = exec.tables.lock().unwrap();
         let rows = &tables[&key(tenant, REFRESH_TABLE)];
-        assert_eq!(rows.len(), 1);
-        assert!(!rows[0]["revoked_at"].is_null());
-        assert!(rows[0]["replaced_by"].is_null());
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["revoked_at"].is_null()));
+        assert!(!rows[0]["replaced_by"].is_null());
     }
 
     #[tokio::test]
-    async fn memory_expired_reservation_presentation_revokes_family() {
+    async fn memory_expired_reservation_allows_retry() {
         check_expired_memory_reservation(false).await;
     }
 
     #[tokio::test]
-    async fn memory_finalization_failure_revokes_family() {
+    async fn memory_finalization_failure_allows_retry() {
         check_expired_memory_reservation(true).await;
     }
 
