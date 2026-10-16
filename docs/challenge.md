@@ -115,3 +115,31 @@ decision 134 also covers `after-failures` and authenticated opt-in routes
 Challenges do not replace server-side rate limits and quotas. The route's rate
 limits and the public write quota are checked before the challenge, so a
 limited request never reaches the replay cache or the provider.
+
+## Request binding (#156, decision 140)
+
+Spec v1.8 §7.2b binds each token to a digest of the request it was solved for.
+The digest goes in the widget's `cdata` (`data-cdata`). Binding applies to every
+captcha route, including login routes with `when: after-failures`. Implementation
+status: not yet implemented.
+
+### Frontend: run the challenge just before submit
+
+The digest covers the method, path, query, `Content-Type`, `If-Match` and the
+exact body bytes, so compute it only after the form is complete:
+
+1. Let the user fill in the whole form. Do not render the widget on page load.
+2. On submit, serialize the body once (for example `JSON.stringify`) and keep
+   those exact bytes.
+3. Compute the digest (`rd1.` + base64url SHA-256, see
+   `scripts/request-digest-vectors.mjs`) and render or execute the widget with
+   that `cdata`.
+4. Send the request with exactly the same method, URL, headers and body bytes,
+   plus `x-challenge-proof`.
+5. If the user edits the form after the challenge, call `turnstile.reset` and
+   run the challenge again with the new digest.
+
+A proxy or CDN in front of the runtime must not rewrite the path, query or body
+or add `Content-Encoding`. Otherwise every bound request is rejected (403
+`CHALLENGE_FAILED`, fail closed). `bind: none` is allowed in v1 with a warning.
+From the next minor release, new public INSERT routes may not use it (#245).

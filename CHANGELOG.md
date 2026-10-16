@@ -5,9 +5,13 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+### Upcoming (advance notice)
+
+- **Challenge `bind: none` (#245, decision 140):** In v1, `bind: none` on a challenge route is allowed but `vibe validate` warns. Starting with the next minor release, new public INSERT routes may not use `bind: none` and must bind to the request digest (`bind: request`).
+
 ### Added
 
-- **Spec: challenge request digest (#156, decision 140):** Spec v1.8 section 7.2b defines binding each Turnstile token to a request digest carried in `cdata` (SHA-256 over method, normalized path, normalized query, `Content-Type`, `If-Match` and the raw body hash; server recomputes and compares, failing closed with 403 `CHALLENGE_FAILED`). Direction confirmed by the PM on 2026-10-16; detailed spec pending PM review; not yet implemented. Adds `scripts/request-digest-vectors.mjs` with test vectors.
+- **Spec: challenge request digest (#156, decision 140):** Spec v1.8 section 7.2b defines binding each Turnstile token to a request digest carried in `cdata` (SHA-256 over method, normalized path, normalized query, `Content-Type`, `If-Match` and the raw body hash; server recomputes and compares, failing closed with 403 `CHALLENGE_FAILED`). Confirmed by the PM on 2026-10-16 (full-length digest, login routes included, client IP not covered); not yet implemented. Adds `scripts/request-digest-vectors.mjs` with test vectors.
 
 - **Dependency / advisory CI (#192):** `cargo deny check` (advisories, licenses, bans, sources) runs on pull requests, pushes to main, a daily schedule, and `workflow_dispatch` via `.github/workflows/cargo-deny.yml` (Refs #196).
 
