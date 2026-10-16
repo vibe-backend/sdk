@@ -178,10 +178,10 @@ async fn natural_language_lock_with_tautological_where_cannot_deploy() {
         timeout: Duration::from_secs(1),
         max_retries: 0,
         seed: 0,
+        send_sampling: true,
         endpoint_host: "api.openai.com".into(),
         endpoint_private: false,
         api_style: "chat".into(),
-        send_sampling: true,
     };
     let adapter = FakeAdapter {
         responder: |request: &LlmRequest| {
