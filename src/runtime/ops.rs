@@ -356,7 +356,8 @@ pub async fn sign_jwt(
         .get(key_ref)
         .ok_or_else(|| internal(format!("signing key {key_ref} is not loaded")))?;
     let alg = match opt(step, "alg") {
-        "ES256" => jsonwebtoken::Algorithm::ES256,
+        // Decision 139: ES256 when `alg` is omitted.
+        "ES256" | "" => jsonwebtoken::Algorithm::ES256,
         "RS256" => jsonwebtoken::Algorithm::RS256,
         other => return Err(internal(format!("unsupported alg {other}"))),
     };
@@ -436,111 +437,27 @@ pub async fn sign_jwt(
     }))
 }
 
-/// Loads an ES256 private key from PEM (PKCS#8) and rejects it at load time
-/// unless the encoding is exact (no trailing data) and the private scalar is
-/// in `1..n-1`.
+/// Loads a P-256 private key from PKCS#8 or SEC1 PEM, checking it at load time.
+// The hand-written P-256 checks in eckey are defense-in-depth only to report
+// errors early at startup; authoritative parsing and verification is done by
+// jsonwebtoken (aws_lc_rs).
 pub fn ec_signing_key_from_pem(pem: &[u8]) -> Result<jsonwebtoken::EncodingKey, String> {
-    let der = pem_body(pem, "PRIVATE KEY")?;
-    check_p256_pkcs8(&der)?;
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(pem).map_err(|err| err.to_string())?;
+    let text = std::str::from_utf8(pem).map_err(|_| "invalid PEM encoding".to_string())?;
+    let der = super::eckey::p256_private(text)
+        .map_err(|p| super::http::ec_problem_message("private key", p))?;
+    let key = jsonwebtoken::EncodingKey::from_ec_der(&der);
     check_signing_key(&key, jsonwebtoken::Algorithm::ES256)?;
     Ok(key)
 }
 
-/// Loads an ES256 private key from DER (PKCS#8) with the same checks as
-/// [`ec_signing_key_from_pem`]. The backend does not check DER keys when they
-/// are loaded, so they are checked here instead of at the first signature.
+/// Loads PKCS#8 DER with the same validation and test signature as PEM.
+/// Raw SEC1 DER is not supported by the signing backend.
 pub fn ec_signing_key_from_der(der: &[u8]) -> Result<jsonwebtoken::EncodingKey, String> {
-    check_p256_pkcs8(der)?;
+    super::eckey::p256_private_der(der)
+        .map_err(|p| super::http::ec_problem_message("private key", p))?;
     let key = jsonwebtoken::EncodingKey::from_ec_der(der);
     check_signing_key(&key, jsonwebtoken::Algorithm::ES256)?;
     Ok(key)
-}
-
-/// The single `label` block of a PEM document, base64-decoded. Anything other
-/// than whitespace around the block is refused.
-fn pem_body(pem: &[u8], label: &str) -> Result<Vec<u8>, String> {
-    let text = std::str::from_utf8(pem).map_err(|_| "PEM is not UTF-8".to_string())?;
-    let begin = format!("-----BEGIN {label}-----");
-    let end = format!("-----END {label}-----");
-    let rest = text
-        .trim()
-        .strip_prefix(&begin)
-        .and_then(|r| r.strip_suffix(&end))
-        .ok_or_else(|| format!("expected a single {label} PEM block"))?;
-    let b64: String = rest.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|err| format!("invalid PEM base64: {err}"))
-}
-
-/// One DER TLV: returns (tag, value, rest). Only minimal definite lengths.
-fn der_tlv(input: &[u8]) -> Result<(u8, &[u8], &[u8]), String> {
-    let bad = || "malformed DER in private key".to_string();
-    let (&tag, rest) = input.split_first().ok_or_else(bad)?;
-    let (&first, mut rest) = rest.split_first().ok_or_else(bad)?;
-    let len = if first < 0x80 {
-        first as usize
-    } else {
-        let n = (first & 0x7f) as usize;
-        if n == 0 || n > 2 || rest.len() < n || rest[0] == 0 {
-            return Err(bad());
-        }
-        let len = rest[..n].iter().fold(0usize, |a, &b| (a << 8) | b as usize);
-        if len < 0x80 {
-            return Err(bad());
-        }
-        rest = &rest[n..];
-        len
-    };
-    if rest.len() < len {
-        return Err(bad());
-    }
-    Ok((tag, &rest[..len], &rest[len..]))
-}
-
-/// P-256 group order n.
-const P256_ORDER: [u8; 32] = [
-    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
-];
-
-/// Checks a PKCS#8 P-256 private key: the outer structure and the embedded
-/// ECPrivateKey cover their input exactly, and 0 < d < n.
-fn check_p256_pkcs8(der: &[u8]) -> Result<(), String> {
-    let bad = |what: &str| format!("invalid ES256 private key: {what}");
-    let (tag, body, rest) = der_tlv(der)?;
-    if tag != 0x30 || !rest.is_empty() {
-        return Err(bad("unexpected data after the key"));
-    }
-    let (tag, _version, body) = der_tlv(body)?;
-    if tag != 0x02 {
-        return Err(bad("missing version"));
-    }
-    let (tag, _alg, body) = der_tlv(body)?;
-    if tag != 0x30 {
-        return Err(bad("missing algorithm"));
-    }
-    let (tag, inner, _attrs) = der_tlv(body)?;
-    if tag != 0x04 {
-        return Err(bad("missing private key"));
-    }
-    let (tag, ec, rest) = der_tlv(inner)?;
-    if tag != 0x30 || !rest.is_empty() {
-        return Err(bad("unexpected data after the private key"));
-    }
-    let (tag, _v, ec) = der_tlv(ec)?;
-    if tag != 0x02 {
-        return Err(bad("missing private key version"));
-    }
-    let (tag, d, _) = der_tlv(ec)?;
-    if tag != 0x04 || d.len() != 32 {
-        return Err(bad("private scalar must be 32 bytes"));
-    }
-    if d.iter().all(|&b| b == 0) || d >= &P256_ORDER[..] {
-        return Err(bad("private scalar out of range"));
-    }
-    Ok(())
 }
 
 /// Signs a fixed test payload so an unusable key fails at load time.
@@ -580,15 +497,20 @@ pub fn load_signing_keys(
                     )
                 })?;
             let (alg, key) = match opt(step, "alg") {
-                "ES256" => (
+                // Decision 139: ES256 when `alg` is omitted.
+                "ES256" | "" => (
                     jsonwebtoken::Algorithm::ES256,
                     ec_signing_key_from_pem(pem.as_bytes()),
                 ),
-                "RS256" => (
-                    jsonwebtoken::Algorithm::RS256,
-                    jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())
-                        .map_err(|err| err.to_string()),
-                ),
+                "RS256" => {
+                    // Decision 139: RS256 signing keys need >= 2048 bits.
+                    super::rsakey::check_rsa_pem(&key_ref, &pem)?;
+                    (
+                        jsonwebtoken::Algorithm::RS256,
+                        jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())
+                            .map_err(|_| "invalid RSA private key".to_string()),
+                    )
+                }
                 other => return Err(format!("{}: unsupported alg {other}", method.target)),
             };
             let key = key.map_err(|err| format!("{key_ref}: {err}"))?;

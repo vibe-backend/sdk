@@ -127,3 +127,60 @@ fn truncated_der_is_rejected() {
     assert!(ec_signing_key_from_der(&der[..der.len() - 1]).is_err());
     assert!(ec_signing_key_from_der(&[]).is_err());
 }
+
+fn decode_pem(pem: &str) -> Vec<u8> {
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .unwrap()
+}
+
+#[test]
+fn sec1_and_pkcs8_of_the_same_key_load_from_pem() {
+    // Extract the ECPrivateKey from this PKCS#8 and add its named curve.
+    let pkcs8 = der();
+    let mut sec1 = pkcs8[29..].to_vec();
+    assert_eq!(&sec1[..7], &[0x30, 0x6b, 2, 1, 1, 4, 32]);
+    let curve = [0xa0, 10, 6, 8, 0x2a, 0x86, 0x48, 0xce, 0x3d, 3, 1, 7];
+    sec1.splice(39..39, curve);
+    sec1[1] += 12;
+    let pem = to_pem(&sec1).replace("PRIVATE KEY", "EC PRIVATE KEY");
+    ec_signing_key_from_pem(PRIVATE_PEM.as_bytes()).unwrap();
+    ec_signing_key_from_pem(pem.as_bytes()).unwrap();
+    ec_signing_key_from_der(&pkcs8).unwrap();
+    // DER is PKCS#8 only; raw SEC1 DER is refused.
+    assert!(ec_signing_key_from_der(&sec1).is_err());
+}
+
+#[test]
+fn wrong_curve_and_off_curve_private_public_points_are_refused() {
+    let p384 = include_str!("../src/runtime/testdata/ec-p384-k.pem");
+    assert!(ec_signing_key_from_pem(p384.as_bytes()).is_err());
+    assert!(ec_signing_key_from_der(&decode_pem(p384)).is_err());
+    let sec1 = include_str!("../src/runtime/testdata/ec-p384-sec1.pem");
+    assert!(ec_signing_key_from_pem(sec1.as_bytes()).is_err());
+    assert!(ec_signing_key_from_der(&decode_pem(sec1)).is_err());
+    let mut off_curve = der();
+    *off_curve.last_mut().unwrap() ^= 1;
+    assert!(ec_signing_key_from_pem(to_pem(&off_curve).as_bytes()).is_err());
+    assert!(ec_signing_key_from_der(&off_curve).is_err());
+}
+
+#[test]
+fn invalid_pem_errors_never_disclose_decoder_details() {
+    for body in ["ABCD!EFG", "ABCDéEFG", "MIGHAgE"] {
+        let pem = format!("-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\n");
+        let err = ec_signing_key_from_pem(pem.as_bytes()).err().unwrap();
+        assert_eq!(err, "invalid PEM encoding");
+        for secret in [body, "ABCD", "EFG", "MIGH", "!", "é"] {
+            assert!(!err.contains(secret));
+        }
+        assert!(!err.chars().any(|c| c.is_ascii_digit()));
+    }
+    for pem in ["-----BEGIN PRIVATE KEY-----\nAAAA", "not PEM"] {
+        assert_eq!(
+            ec_signing_key_from_pem(pem.as_bytes()).err().unwrap(),
+            "invalid PEM encoding"
+        );
+    }
+}

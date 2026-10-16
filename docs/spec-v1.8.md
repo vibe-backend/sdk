@@ -1066,10 +1066,10 @@ security-items:
 實作狀態（main，2026-10-16 檢查）：
 
 - 已實作：`vibe validate` 拒絕 ES256／RS256 以外嘅 `sign-jwt` alg；`sign-jwt` 執行時 alg 要同已載入 key 一致；`VIBE_JWT_ALG` 只接受 ES256、RS256；驗證時 header `alg` 要等於 key 嘅 alg（`none`、HS* 會被拒）；JWKS 只載入 P-256 同 ≥ 2048 bit 嘅 RSA key。
-- RS256 簽名私鑰最少 2048 bit 嘅啟動檢查：Implementation status: not yet implemented, follow-up #222.
-- 靜態驗證公鑰（`VIBE_JWT_PUBLIC_KEY_PEM`）RSA 最少 2048 bit 同設定 alg／key 類型一致嘅啟動檢查：Implementation status: not yet implemented, follow-up #224.
-- 用 JWKS 驗證時只接受一個設定 alg（而家每個 key 用自己嘅 alg，JWKS 同時有 EC 同 RSA key 嘅話兩種都收）：Implementation status: not yet implemented, follow-up #225.
-- `sign-jwt` 冇寫 `alg` 時預設 ES256（而家驗證器當錯誤）：Implementation status: not yet implemented, follow-up #226.
+- RS256 簽名私鑰最少 2048 bit；ES256 簽名私鑰一定要係 P-256，私鑰純量 d 要喺 `1..n-1` 範圍內，編碼入面唔可以有多餘資料：`vibe serve` 啟動時檢查，唔符合就拒絕啟動（#222）。`vibe validate --deploy` 讀唔到執行環境嘅私鑰，所以唔檢查 key 大細或者曲線；呢個檢查只喺 `vibe serve` 啟動時做。
+- 靜態驗證公鑰（`VIBE_JWT_PUBLIC_KEY_PEM`）：啟動時檢查 key 類型同設定 alg 一致，RSA 最少 2048 bit，ES256 一定要係 P-256 同有效點（P-384 等其他曲線拒絕啟動）（#224）。
+- JWKS 驗證只用設定 alg（`VIBE_JWT_ALG`，預設 ES256）嘅 key：解析 JWKS 時就按 kty／crv／alg 篩走其他 key；同一個 kid 喺文件出現多過一次就成個 kid 都唔用（記錄警告）；結果同 key 次序無關。route 層 issuer 嘅 JWKS 暫時用同一個部署設定 alg（#225）。
+- `sign-jwt` 冇寫 `alg` 時預設 ES256（#226）。
 
 ### 4.2 API key 模式（決定 43）
 

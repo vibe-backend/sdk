@@ -2,8 +2,10 @@
 //! keys are cached for 10 minutes; an unknown `kid` triggers an immediate
 //! refetch, at most once every 60 seconds; when fetching fails, the old cache
 //! is used for at most 1 hour after the last successful fetch, after which
-//! every token is rejected. Only ES256 (P-256) and RS256 (>= 2048-bit) keys
-//! are accepted, and every key needs a `kid`.
+//! every token is rejected. Only keys of the configured alg are kept
+//! (ES256: EC P-256; RS256: RSA >= 2048-bit), filtered when the document is
+//! parsed, and every key needs a `kid`. A `kid` that appears more than once
+//! in the document is not used at all (decision 139).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -116,13 +118,22 @@ struct State {
 
 pub struct JwksCache {
     source: Arc<dyn JwksSource>,
+    /// The only alg whose keys are kept.
+    alg: Algorithm,
     state: Mutex<State>,
 }
 
 impl JwksCache {
+    /// ES256 keys only (the default `VIBE_JWT_ALG`).
     pub fn new(source: Arc<dyn JwksSource>) -> Self {
+        Self::with_alg(source, Algorithm::ES256)
+    }
+
+    /// Keeps only keys of `alg` (decision 139).
+    pub fn with_alg(source: Arc<dyn JwksSource>, alg: Algorithm) -> Self {
         Self {
             source,
+            alg,
             state: Mutex::new(State {
                 keys: HashMap::new(),
                 fetched_at: None,
@@ -163,7 +174,7 @@ impl JwksCache {
             state.in_flight = false;
             match result {
                 Ok(doc) => {
-                    state.keys = parse_jwks(&doc);
+                    state.keys = parse_jwks(&doc, self.alg);
                     state.fetched_at = Some(now);
                 }
                 Err(err) => tracing::warn!(%err, "JWKS fetch failed"),
@@ -180,41 +191,53 @@ impl JwksCache {
     }
 }
 
-/// Parses a JWKS document, keeping only acceptable signing keys.
-pub fn parse_jwks(doc: &Value) -> HashMap<String, JwkKey> {
+/// Parses a JWKS document, keeping only signing keys of `alg`.
+///
+/// Keys are filtered by `alg` (kty, crv and `alg` must match) before they
+/// are put in the kid map, so a key of another type is never stored. A
+/// `kid` that appears more than once among the document's keys (of any
+/// type) is ambiguous and is not used at all; a warning is logged. The
+/// result does not depend on key order.
+pub fn parse_jwks(doc: &Value, alg: Algorithm) -> HashMap<String, JwkKey> {
     let mut out = HashMap::new();
     let Some(keys) = doc.get("keys").and_then(Value::as_array) else {
         return out;
     };
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for jwk in keys {
+        if let Some(kid) = jwk.get("kid").and_then(Value::as_str) {
+            *seen.entry(kid).or_default() += 1;
+        }
+    }
+    let duplicates = seen.values().filter(|n| **n > 1).count();
+    if duplicates > 0 {
+        tracing::warn!(
+            duplicate_kids = duplicates,
+            "JWKS has keys sharing a kid; those kids are ignored"
+        );
+    }
     for jwk in keys {
         let s = |k: &str| jwk.get(k).and_then(Value::as_str);
         let Some(kid) = s("kid").filter(|k| !k.is_empty()) else {
             continue;
         };
+        if seen.get(kid).copied().unwrap_or(0) > 1 {
+            continue;
+        }
         if s("use").is_some_and(|u| u != "sig") {
             continue;
         }
-        let parsed = match (s("kty"), s("alg")) {
-            (Some("EC"), None | Some("ES256")) if s("crv") == Some("P-256") => {
+        let parsed = match (alg, s("kty"), s("alg")) {
+            (Algorithm::ES256, Some("EC"), None | Some("ES256")) if s("crv") == Some("P-256") => {
                 match (s("x"), s("y")) {
-                    (Some(x), Some(y)) => {
-                        DecodingKey::from_ec_components(x, y)
-                            .ok()
-                            .map(|key| JwkKey {
-                                alg: Algorithm::ES256,
-                                key,
-                            })
-                    }
+                    (Some(x), Some(y)) => DecodingKey::from_ec_components(x, y).ok(),
                     _ => None,
                 }
             }
-            (Some("RSA"), None | Some("RS256")) => match (s("n"), s("e")) {
-                (Some(n), Some(e)) if rsa_bits(n) >= 2048 => DecodingKey::from_rsa_components(n, e)
-                    .ok()
-                    .map(|key| JwkKey {
-                        alg: Algorithm::RS256,
-                        key,
-                    }),
+            (Algorithm::RS256, Some("RSA"), None | Some("RS256")) => match (s("n"), s("e")) {
+                (Some(n), Some(e)) if rsa_bits(n) >= 2048 => {
+                    DecodingKey::from_rsa_components(n, e).ok()
+                }
                 _ => None,
             },
             _ => None,
@@ -223,7 +246,7 @@ pub fn parse_jwks(doc: &Value) -> HashMap<String, JwkKey> {
             if out.len() >= MAX_KEYS {
                 break;
             }
-            out.insert(kid.to_string(), key);
+            out.insert(kid.to_string(), JwkKey { alg, key });
         }
     }
     out
@@ -347,15 +370,73 @@ mod tests {
 
     #[test]
     fn only_acceptable_keys_are_kept() {
-        let keys = parse_jwks(&json!({"keys": [
-            {"kty": "EC", "crv": "P-256", "kid": "ok", "x": X, "y": Y},
-            {"kty": "EC", "crv": "P-256", "x": X, "y": Y},
-            {"kty": "EC", "crv": "P-384", "kid": "p384", "x": X, "y": Y},
-            {"kty": "EC", "crv": "P-256", "kid": "enc", "use": "enc", "x": X, "y": Y},
-            {"kty": "RSA", "kid": "small", "n": "AQAB", "e": "AQAB"},
-            {"kty": "oct", "kid": "hmac", "k": "c2VjcmV0"}
-        ]}));
+        let keys = parse_jwks(
+            &json!({"keys": [
+                {"kty": "EC", "crv": "P-256", "kid": "ok", "x": X, "y": Y},
+                {"kty": "EC", "crv": "P-256", "kid": "wrong-alg", "alg": "RS256", "x": X, "y": Y},
+                {"kty": "EC", "crv": "P-256", "x": X, "y": Y},
+                {"kty": "EC", "crv": "P-384", "kid": "p384", "x": X, "y": Y},
+                {"kty": "EC", "crv": "P-256", "kid": "enc", "use": "enc", "x": X, "y": Y},
+                {"kty": "RSA", "kid": "small", "n": "AQAB", "e": "AQAB"},
+                {"kty": "oct", "kid": "hmac", "k": "c2VjcmV0"}
+            ]}),
+            Algorithm::ES256,
+        );
         assert_eq!(keys.keys().collect::<Vec<_>>(), vec!["ok"]);
+    }
+
+    /// 2048-bit RSA modulus (src/runtime/testdata/rsa-p2048.pem).
+    const RSA_N: &str = "tupUT5sUR0iufz_2dX_ZWfdJ9oluerIsYtUELeYxbe_Bu71_oJUILJiNUyceUtmDJRNHj6NWalJ36zkykGm3ZU65cAI91A9d7mSN0ryaDn6-b45VINQIEtMSutWrGh2I7FgxLNGmDFMLQQ1sDVCS1lwtAD_EtYzzWrqjxdqRal1eaGF58dtMjqCk_rrGcQ7oEm_tTBZVge24sf7bQUliuwZQo6t7SI2tvocawcgDuZvFMU_I99dyGJNQxyY1pKkPqIdMxtrTrBoHcBXNvlSu8IoFslK49w3XY8kpkb7KGoJvDmT6NYQxXtjNY0_-ZZIdM_egJboeibuVVzi549nPjQ";
+
+    fn ec(kid: &str) -> Value {
+        json!({"kty": "EC", "crv": "P-256", "kid": kid, "x": X, "y": Y})
+    }
+
+    fn rsa(kid: &str) -> Value {
+        json!({"kty": "RSA", "kid": kid, "n": RSA_N, "e": "AQAB"})
+    }
+
+    #[test]
+    fn keys_are_filtered_by_the_configured_alg_at_parse_time() {
+        let doc = json!({"keys": [ec("e1"), rsa("r1")]});
+        let es = parse_jwks(&doc, Algorithm::ES256);
+        assert_eq!(es.keys().collect::<Vec<_>>(), vec!["e1"]);
+        assert_eq!(es["e1"].alg, Algorithm::ES256);
+        let rs = parse_jwks(&doc, Algorithm::RS256);
+        assert_eq!(rs.keys().collect::<Vec<_>>(), vec!["r1"]);
+        assert_eq!(rs["r1"].alg, Algorithm::RS256);
+    }
+
+    #[test]
+    fn duplicate_kids_are_ignored_in_any_order() {
+        for alg in [Algorithm::ES256, Algorithm::RS256] {
+            for keys in [
+                vec![ec("k1"), rsa("k1"), ec("ok"), rsa("rok")],
+                vec![rsa("k1"), ec("k1"), rsa("rok"), ec("ok")],
+                vec![ec("k1"), ec("k1"), ec("ok"), rsa("rok")],
+            ] {
+                let parsed = parse_jwks(&json!({ "keys": keys }), alg);
+                assert!(!parsed.contains_key("k1"), "{alg:?}: duplicate kid used");
+                let want = if alg == Algorithm::ES256 { "ok" } else { "rok" };
+                assert!(parsed.contains_key(want), "{alg:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn parsing_does_not_depend_on_key_order() {
+        let keys = vec![ec("a"), rsa("b"), ec("c"), rsa("c"), ec("d"), rsa("e")];
+        for alg in [Algorithm::ES256, Algorithm::RS256] {
+            let forward = parse_jwks(&json!({ "keys": keys }), alg);
+            let mut reversed = keys.clone();
+            reversed.reverse();
+            let backward = parse_jwks(&json!({ "keys": reversed }), alg);
+            let mut f: Vec<_> = forward.keys().collect();
+            let mut b: Vec<_> = backward.keys().collect();
+            f.sort();
+            b.sort();
+            assert_eq!(f, b, "{alg:?}");
+        }
     }
 
     #[test]
