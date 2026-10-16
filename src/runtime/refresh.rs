@@ -64,11 +64,10 @@ fn tenant_of(schema: &str) -> Result<&str, String> {
         .ok_or_else(|| format!("refresh store schema {schema} is not t_<tenant>"))
 }
 
-/// Columns of `_platform_refresh_tokens`. The tenant policy compares
-/// `tenant_id` with the schema's own tenant id as a constant, so access never
-/// depends on the `app.tenant_id` session setting.
+/// Columns of `_platform_refresh_tokens`. The tenant policy has the same
+/// shape as every other tenant table's (`vibe migrate` checks it).
 pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
-    let tenant = tenant_of(schema)?;
+    tenant_of(schema)?;
     let qualified = format!("{}._platform_refresh_tokens", super::sql::quote(schema)?);
     Ok(vec![
         format!("CREATE SCHEMA IF NOT EXISTS {}", super::sql::quote(schema)?),
@@ -87,8 +86,7 @@ pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
         format!("ALTER TABLE {qualified} FORCE ROW LEVEL SECURITY"),
         format!("DROP POLICY IF EXISTS tenant_isolation ON {qualified}"),
         format!(
-            "CREATE POLICY tenant_isolation ON {qualified} USING (tenant_id = {t}::text) WITH CHECK (tenant_id = {t}::text)",
-            t = sql_literal(tenant)
+            "CREATE POLICY tenant_isolation ON {qualified} USING (\"tenant_id\" = current_setting('app.tenant_id', false)) WITH CHECK (\"tenant_id\" = current_setting('app.tenant_id', false))"
         ),
         // Until the dedicated refresh-store role lands (#51), app `query`
         // steps run as public_reader / public_writer: take away their access
@@ -129,17 +127,20 @@ pub fn runtime_grant_statements(schema: &str, runtime_role: &str) -> Result<Vec<
 /// [`CLEANUP_RETENTION_SECS`] ago, in batches of [`CLEANUP_BATCH`] and at
 /// most [`CLEANUP_MAX_BATCHES`] batches per run. Run by `vibe migrate` as the
 /// table owner (the runtime role has no DELETE), like the challenge replay
-/// table cleanup.
+/// table cleanup. The owner is subject to FORCE RLS, so the tenant setting
+/// is set for the statement's transaction first.
 pub fn cleanup_statements(schema: &str) -> Result<Vec<String>, String> {
-    tenant_of(schema)?;
+    let tenant = tenant_of(schema)?;
     let qualified = format!("{}._platform_refresh_tokens", super::sql::quote(schema)?);
     Ok(vec![format!(
-        "DO $$ DECLARE n bigint; i int := 0; BEGIN LOOP \
+        "DO $$ DECLARE n bigint; i int := 0; BEGIN \
+         PERFORM set_config('app.tenant_id', {t}, true); LOOP \
          DELETE FROM {qualified} WHERE id IN (SELECT id FROM {qualified} \
          WHERE family_expires_at <= now() - make_interval(secs => {CLEANUP_RETENTION_SECS}) \
          LIMIT {CLEANUP_BATCH}); \
          GET DIAGNOSTICS n = ROW_COUNT; i := i + 1; \
-         EXIT WHEN n < {CLEANUP_BATCH} OR i >= {CLEANUP_MAX_BATCHES}; END LOOP; END $$"
+         EXIT WHEN n < {CLEANUP_BATCH} OR i >= {CLEANUP_MAX_BATCHES}; END LOOP; END $$",
+        t = sql_literal(tenant)
     )])
 }
 
@@ -604,13 +605,8 @@ mod tests {
     }
 
     #[test]
-    fn tenant_policy_uses_a_constant_tenant_id() {
-        let sql = table_statements("t_tenant0001").unwrap().join("\n");
-        assert!(
-            sql.contains("USING (tenant_id = 'tenant0001'::text)"),
-            "{sql}"
-        );
-        assert!(!sql.contains("current_setting"));
+    fn table_statements_need_a_tenant_schema() {
+        assert!(table_statements("t_tenant0001").is_ok());
         assert!(table_statements("x_tenant0001").is_err());
     }
 }

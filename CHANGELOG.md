@@ -28,7 +28,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Changed
 
-- **Refresh tokens (#95):** `vibe migrate` now removes refresh-token families whose lifetime ended more than a day ago, in bounded batches (1000 rows per batch, at most 100 batches per run); live families are never removed. The `_platform_refresh_tokens` RLS policy compares `tenant_id` with the tenant id as a constant instead of the `app.tenant_id` setting; re-run `vibe migrate` to update existing tenants. Refresh endpoint, policy settings and grace behaviour are documented in `docs/runtime-config.md`.
+- **Refresh tokens (#95):** `vibe migrate` now removes refresh-token families whose lifetime ended more than a day ago, in bounded batches (1000 rows per batch, at most 100 batches per run); live families are never removed. Refresh endpoint, policy settings and grace behaviour are documented in `docs/runtime-config.md`.
 - **Refresh tokens (#95):** Hardening: when the refresh-token family lookup fails (for example a database or pool error), token refresh fails closed with a retryable 503 `SERVICE_UNAVAILABLE` instead of skipping the per-family limit. The presented token is not consumed.
 
 - **LLM errors (#62):** Failed LLM calls report the real HTTP status (only 401/403 blame the API key; 400, 404, 429 and 5xx are worded by status). HTML responses and 404s add a hint to check `LLM_BASE_URL` (OpenAI-compatible endpoints usually end in `/v1`). The message includes the request URL and the first 200 characters of the response; the API key and `key=`/`api_key=` query values are masked as `***` before truncation.
