@@ -5,7 +5,7 @@
 use std::sync::OnceLock;
 
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value};
 use sha2::Sha256;
 
@@ -151,7 +151,7 @@ pub const MAX_PASSWORD_CHARS: usize = 256;
 
 /// Only hashes made with the platform's own argon2id parameters verify.
 fn pinned_hash(hash: &str) -> bool {
-    use argon2::password_hash::PasswordHash;
+    use argon2::password_hash::phc::PasswordHash;
     let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
     };
@@ -192,7 +192,7 @@ pub async fn verify_password(
     };
     let _slot = argon_slot().await?;
     let ok = tokio::task::spawn_blocking(move || {
-        use argon2::password_hash::{PasswordHash, PasswordVerifier};
+        use argon2::password_hash::{phc::PasswordHash, PasswordVerifier};
         let Ok(parsed) = PasswordHash::new(&hash) else {
             return false;
         };

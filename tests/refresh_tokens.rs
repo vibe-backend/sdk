@@ -156,6 +156,7 @@ fn app_with(m: Manifest) -> App {
         min_override_ms: None,
         honor_test_ip: true,
         dev_hints: false,
+        challenge: None,
     }));
     App {
         app,
