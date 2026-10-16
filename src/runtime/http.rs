@@ -1228,10 +1228,11 @@ async fn authenticate(
         if auth.public_pem.is_empty() || kid != auth.kid {
             return Err(AuthError::unauthorized("Bearer"));
         }
-        let key = if auth.alg == Algorithm::RS256 {
-            DecodingKey::from_rsa_pem(auth.public_pem.as_bytes())
-        } else {
-            DecodingKey::from_ec_pem(auth.public_pem.as_bytes())
+        let key = match auth.alg {
+            Algorithm::RS256 => DecodingKey::from_rsa_pem(auth.public_pem.as_bytes()),
+            Algorithm::ES256 => DecodingKey::from_ec_pem(auth.public_pem.as_bytes()),
+            // `Algorithm` is non-exhaustive: anything else is rejected.
+            _ => return Err(AuthError::unauthorized("Bearer")),
         }
         .map_err(|_| AuthError::unauthorized("Bearer"))?;
         (auth.alg, key)
