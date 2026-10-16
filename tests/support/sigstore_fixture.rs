@@ -74,7 +74,14 @@ fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
 impl Fixture {
     /// The bundle JSON for `manifest_bytes`.
     pub fn bundle(&self, manifest_bytes: &[u8]) -> Vec<u8> {
-        let signing = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let signing = loop {
+            let mut seed = [0u8; 32];
+            rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut seed)
+                .expect("OS random number generator failed");
+            if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&seed) {
+                break key;
+            }
+        };
         let der = signing.to_pkcs8_der().unwrap();
         let key_pair = rcgen::KeyPair::try_from(der.as_bytes()).unwrap();
         let signer = format!(

@@ -5,6 +5,10 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+### Added
+
+- **Challenge replay store (#157):** Challenge single-use state, quotas and capacity live in PostgreSQL in each tenant's own schema (`t_<tenant>.vibe_challenge_replay`, created by that tenant's `vibe migrate`, FORCE RLS) so they hold across instances. The runtime role has SELECT and INSERT only; expired rows are ignored and removed by `vibe migrate`. Capacity is per tenant and client IPs are stored as a per-tenant HMAC. In production with a verifier configured the PostgreSQL store is always used; `vibe serve` refuses to start if a tenant's table is missing or has wrong grants, or if `VIBE_CHALLENGE_REPLAY_STORE=memory` is set. Outside production the store must be chosen explicitly (`memory` or `postgres`). Store errors fail closed (503).
+
 ### Breaking
 
 - **Release builds and deploy gate (spec v1.8):** Locks are build output and are not committed (`*.lock.md` is gitignored). `vibe manifest --release` compiles every source in memory (lock files on disk are never read), validates the result, signs with `VIBE_RELEASE_SIGNING_KEY` only, never reads the project `.env`, sends the LLM key only to an allowlisted host (the default `api.openai.com` included), and fails closed on high-risk items until release-environment approval verification (#80) lands; a `--release-approval` string is not approval. The signed manifest records the build mode, commit, per-lock `lock_sha256` / content / source / compiler hashes, and all security items. Outside development, `serve` and `migrate` verify with the pinned release key (a key compiled in via `VIBE_RELEASE_PUBKEY`, which `VIBE_MANIFEST_PUBKEY` cannot override; otherwise `VIBE_MANIFEST_PUBKEY`), ignore `.vibe/signing.pub`, and run only release manifests. `vibe manifest` no longer creates a key: run `vibe keygen` (mode 0600) for development. `vibe compile --check` now builds in memory and runs the deploy policy instead of comparing with locks on disk. A reference workflow with attestation and `gh attestation verify` is in `docs/ci/`.
@@ -26,6 +30,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Security
 
+- **JWT signing algorithm policy (#198, spec decision 139):** The spec now fixes the `sign-jwt` and JWT verification policy: only ES256 (default) and RS256; RS256 keys must be at least 2048 bits and a shorter key makes startup/deploy fail closed; verification accepts only the one configured alg and rejects any other `alg` header, including `none`, HS* and the other of ES256/RS256; EdDSA is deferred to vNext. Spec only; parts are not yet implemented (see spec 4.1a).
 - **Lock and manifest signatures (#167):** Lock and manifest signature verification now uses `verify_strict`; weak keys and non-canonical signatures are rejected (#151).
 
 <!--
