@@ -17,11 +17,15 @@ added only when the corresponding PR is merged to `main`.
 
 - **Challenge replay store (#157):** Challenge single-use state, quotas and capacity live in PostgreSQL in each tenant's own schema (`t_<tenant>.vibe_challenge_replay`, created by that tenant's `vibe migrate`, FORCE RLS) so they hold across instances. The runtime role has SELECT and INSERT only; expired rows are ignored and removed by `vibe migrate`. Capacity is per tenant and client IPs are stored as a per-tenant HMAC. In production with a verifier configured the PostgreSQL store is always used; `vibe serve` refuses to start if a tenant's table is missing or has wrong grants, or if `VIBE_CHALLENGE_REPLAY_STORE=memory` is set. Outside production the store must be chosen explicitly (`memory` or `postgres`). Store errors fail closed (503).
 
+- **Tenant role checks (#246, #250):** `vibe serve` and `vibe migrate` accept exactly one role membership per tenant, `GRANT tenant_<id>_rw TO tenant_<id>_owner WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`, and refuse to start on any other membership of the tenant's roles. `tenant_<id>_rw` must hold exactly `SELECT, INSERT` on `t_<id>.vibe_challenge_replay`, and no other role or `PUBLIC` may hold any privilege on it. Migration SQL validation is tighter for `tenant_id` defaults, foreign key `ON UPDATE` actions and locking clauses.
+
 ### Fixed
 
 - **Postgres TLS (#174):** `TlsMode::Require` (`sslmode=require`) previously did not enable TLS for database connections. It now requires TLS and fails to connect if the server does not offer it. `sslrootcert` is honored, and an unreadable or empty `sslrootcert` file is reported as an error.
 
 ### Breaking
+
+- **PostgreSQL 16 or later required (#246):** `vibe serve` and `vibe migrate` stop with "PostgreSQL 16 or later required" on older servers. Upgrade path: upgrade the server, grant each tenant's owner membership as above, revoke other grants on the replay table, then run `vibe migrate` for each tenant (see `docs/runtime-config.md`, "Upgrading tenant roles").
 
 - **Unverified challenges (#199):** Challenges are verified only on public routes with `when: always`. In production, `vibe serve` and `vibe validate --deploy` now refuse routes that declare a challenge with `when: after-failures` (such as login routes) or on a non-public (authenticated) route, since those challenges are not verified yet. This is temporarily unsupported until verified challenges on these routes are implemented (#201). Development and CI still accept them.
 - **Challenge verification (#118):** `x-challenge-proof` is no longer accepted just because it is non-empty. Routes with `challenge: { type: captcha, when: always }` verify the token with Cloudflare Turnstile siteverify (hostname and action checked, each token single-use) and fail closed (403 `CHALLENGE_FAILED`, 503 `CHALLENGE_UNAVAILABLE` when no verifier is configured, the provider is unreachable, or the route uses `pow`). In production, `vibe serve` and `vibe validate --deploy` refuse such routes until `VIBE_TURNSTILE_SECRET` and `VIBE_CHALLENGE_HOSTNAMES` are set.

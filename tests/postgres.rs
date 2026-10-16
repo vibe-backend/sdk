@@ -554,6 +554,29 @@ async fn tenant_membership_check_allows_only_the_owner_grant() {
     migrate_as(&s, &manifest(), &s.tenant).await.unwrap();
 }
 
+/// Concurrent first requests for one role open and check its pool once and
+/// all get the same pool.
+#[tokio::test]
+async fn concurrent_first_use_opens_one_pool() {
+    let s = require_pg!(setup().await);
+    let pools = std::sync::Arc::new(pools_for(&s.admin_url, &[&s.tenant]));
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let pools = pools.clone();
+        let tenant = s.tenant.clone();
+        tasks.push(tokio::spawn(async move {
+            pools.pool(&tenant, "app_rw").await.unwrap()
+        }));
+    }
+    let mut got = Vec::new();
+    for t in tasks {
+        got.push(t.await.unwrap());
+    }
+    assert!(got.iter().all(|p| std::sync::Arc::ptr_eq(p, &got[0])));
+    assert_eq!(pools.opens_started(), 1);
+    assert_eq!(pools.open_pools().await, 1);
+}
+
 /// Issue #250: `tenant_<id>_rw` holds exactly SELECT and INSERT on the
 /// challenge replay table; any other privilege fails the startup check.
 #[tokio::test]

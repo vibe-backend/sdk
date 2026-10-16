@@ -316,6 +316,12 @@ pub struct TenantPools {
     role_slots: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     tenant_slots: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     pools: tokio::sync::Mutex<HashMap<String, OpenPool>>,
+    /// One lock per role, held while that role's pool is opened and checked,
+    /// so opening is a single step per role: concurrent first requests wait
+    /// for the one in progress and reuse its result.
+    opening: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Pool opens started (connect + role check), for metrics and tests.
+    opens_started: AtomicU64,
     /// A pool unused for this long is closed (D129 (4)); reopened lazily.
     idle_timeout: std::time::Duration,
 }
@@ -383,6 +389,8 @@ impl TenantPools {
             role_slots: std::sync::Mutex::default(),
             tenant_slots: std::sync::Mutex::default(),
             pools: tokio::sync::Mutex::default(),
+            opening: std::sync::Mutex::default(),
+            opens_started: AtomicU64::new(0),
             idle_timeout: POOL_IDLE_TIMEOUT,
         })
     }
@@ -533,6 +541,11 @@ impl TenantPools {
         Ok(url.to_string())
     }
 
+    /// How many pool opens (connect + role check) have started.
+    pub fn opens_started(&self) -> u64 {
+        self.opens_started.load(Ordering::Relaxed)
+    }
+
     /// The pool for one tenant and role class, opened (and its role checked
     /// with [`PgExec::check_tenant_role`]) on first use.
     pub async fn pool(&self, tenant: &str, class: &str) -> Result<Arc<PgExec>, String> {
@@ -544,17 +557,27 @@ impl TenantPools {
                 return Ok(open.exec.clone());
             }
         }
-        // The pools lock is not held while connecting or checking the role.
+        // Only one task opens a given role's pool at a time; the pools map
+        // lock itself is not held while connecting or checking the role.
+        let gate = self
+            .opening
+            .lock()
+            .map_err(|_| "pool registry lock poisoned".to_string())?
+            .entry(role.clone())
+            .or_default()
+            .clone();
+        let _opening = gate.lock().await;
+        if let Some(open) = self.pools.lock().await.get_mut(&role) {
+            // Opened by the task that held the gate before us.
+            open.last_used = std::time::Instant::now();
+            return Ok(open.exec.clone());
+        }
+        self.opens_started.fetch_add(1, Ordering::Relaxed);
         // Connection errors from PgExec never include the URL (password).
         let pool = PgExec::connect_with(&self.url_for(&role)?, self.options.clone()).await?;
         pool.check_tenant_role(tenant, class).await?;
         let pool = Arc::new(pool);
         let mut pools = self.pools.lock().await;
-        if let Some(open) = pools.get_mut(&role) {
-            // Another request opened it meanwhile; keep that one.
-            open.last_used = std::time::Instant::now();
-            return Ok(open.exec.clone());
-        }
         pools.insert(
             role,
             OpenPool {

@@ -364,7 +364,8 @@ pub struct RoleStatus {
     pub foreign_policies: Vec<String>,
     /// Privileges on `t_<id>.vibe_challenge_replay` that differ from the
     /// allowed set: `tenant_<id>_rw` holds exactly SELECT and INSERT
-    /// (not grantable), other roles and PUBLIC hold nothing.
+    /// (not grantable); every other role (any tenant's, legacy shared roles
+    /// such as `app_rw`) and PUBLIC hold nothing. The owner is not listed.
     pub replay_privileges: Vec<String>,
 }
 
@@ -433,6 +434,18 @@ impl RoleStatus {
     }
 }
 
+/// Oldest supported server (`server_version_num`): PostgreSQL 16.
+pub const MIN_SERVER_VERSION_NUM: i32 = 160000;
+
+/// The error for a server older than [`MIN_SERVER_VERSION_NUM`], if any.
+pub fn server_version_problem(version_num: i32) -> Option<String> {
+    (version_num < MIN_SERVER_VERSION_NUM).then(|| {
+        format!(
+            "PostgreSQL 16 or later required (server_version_num {version_num}); upgrade the database server"
+        )
+    })
+}
+
 /// Catalog query behind [`PgExec::check_tenant_role`], run while logged in
 /// as the tenant role. `$1` is the tenant id, `$2` the expected role name.
 pub fn tenant_role_status_sql() -> String {
@@ -482,8 +495,8 @@ pub fn tenant_role_status_sql() -> String {
      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
      LATERAL aclexplode(c.relacl) a
      WHERE n.nspname = 't_' || $1::text AND c.relname = 'vibe_challenge_replay'
-     AND (a.grantee = 0 OR a.grantee = r.oid)
-     AND NOT ($2::text = 'tenant_' || $1::text || '_rw' AND a.grantee = r.oid
+     AND a.grantee <> c.relowner
+     AND NOT (a.grantee = to_regrole('tenant_' || $1::text || '_rw')
        AND a.privilege_type IN ('SELECT', 'INSERT') AND NOT a.is_grantable)
    UNION ALL
    SELECT format('%I.%I column %I grants %s to %s', n.nspname, c.relname, t.attname, a.privilege_type,
@@ -492,7 +505,7 @@ pub fn tenant_role_status_sql() -> String {
      JOIN pg_attribute t ON t.attrelid = c.oid AND t.attacl IS NOT NULL,
      LATERAL aclexplode(t.attacl) a
      WHERE n.nspname = 't_' || $1::text AND c.relname = 'vibe_challenge_replay'
-     AND (a.grantee = 0 OR a.grantee = r.oid)) y), '{{}}')
+     AND a.grantee <> c.relowner) y), '{{}}')
 FROM pg_roles r WHERE r.rolname = current_user"#,
         canonical = super::migrate::canonical_policy_sql("p", "$1::text"),
         members = super::migrate::membership_problems_sql("$1::text", "r.oid")
@@ -747,6 +760,20 @@ impl PgExec {
         self.pool.clone()
     }
 
+    /// Fails with a clear error unless the server is PostgreSQL 16 or later
+    /// (the role checks read `pg_auth_members.inherit_option`/`set_option`).
+    pub async fn require_supported_server(&self) -> Result<(), String> {
+        let client = self.client().await?;
+        let row = client
+            .query_one("SELECT current_setting('server_version_num')::int", &[])
+            .await
+            .map_err(pg_error)?;
+        match server_version_problem(row.get(0)) {
+            Some(problem) => Err(problem),
+            None => Ok(()),
+        }
+    }
+
     async fn client(&self) -> Result<deadpool_postgres::Object, String> {
         self.pool.get().await.map_err(pool_error)
     }
@@ -768,6 +795,7 @@ impl PgExec {
     /// tables with the canonical policy inside it.
     pub async fn check_tenant_role(&self, tenant: &str, class: &str) -> Result<(), String> {
         let expected = super::grants::tenant_role(tenant, class)?;
+        self.require_supported_server().await?;
         let client = self.client().await?;
         let rows = client
             .query(&tenant_role_status_sql(), &[&tenant, &expected])
@@ -1281,6 +1309,17 @@ mod role_tests {
             "tenant_acme0001_rw"
         ));
         assert!(!super::super::grants::is_owner_role_name("owner"));
+    }
+
+    #[test]
+    fn old_servers_get_a_clear_error() {
+        for v in [90624, 130012, 150008, 159999] {
+            let p = server_version_problem(v).unwrap();
+            assert!(p.contains("PostgreSQL 16 or later required"), "{p}");
+        }
+        for v in [160000, 160004, 170011, 180000] {
+            assert_eq!(server_version_problem(v), None);
+        }
     }
 
     #[test]

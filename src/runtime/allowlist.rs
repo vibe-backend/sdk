@@ -25,8 +25,8 @@
 
 use sqlparser::ast::{
     helpers::stmt_create_table::CreateTableBuilder, AlterColumnOperation, AlterTableOperation,
-    ColumnDef, ColumnOption, CreateIndex, HiveFormat, Ident, ObjectName, ObjectType, Statement,
-    TableConstraint, TableFactor,
+    ColumnDef, ColumnOption, CreateIndex, HiveFormat, Ident, ObjectName, ObjectType,
+    ReferentialAction, Statement, TableConstraint, TableFactor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -205,16 +205,37 @@ fn column_ok(column: &ColumnDef) -> Result<(), String> {
     for option in &column.options {
         match &option.option {
             ColumnOption::Null | ColumnOption::NotNull => {}
+            // The platform supplies tenant_id; its only sanctioned form
+            // has no DEFAULT (same rule as ALTER COLUMN tenant_id SET DEFAULT).
+            ColumnOption::Default(_) if plain(&column.name).as_deref() == Some("tenant_id") => {
+                return Err(refuse("DEFAULT on tenant_id"));
+            }
             ColumnOption::Default(expr) => default_ok(expr)?,
             ColumnOption::Check(expr) => expr_ok(expr)?,
             ColumnOption::Unique { .. } => {}
-            ColumnOption::ForeignKey { foreign_table, .. } => {
+            ColumnOption::ForeignKey {
+                foreign_table,
+                on_update,
+                ..
+            } => {
                 local_name(foreign_table, "referenced table")?;
+                on_update_ok(on_update)?;
             }
             other => return Err(refuse(&format!("column option `{other}`"))),
         }
     }
     Ok(())
+}
+
+/// Foreign keys may only use `ON UPDATE NO ACTION` or `ON UPDATE RESTRICT`
+/// (or leave it out, which is NO ACTION).
+fn on_update_ok(action: &Option<ReferentialAction>) -> Result<(), String> {
+    match action {
+        None | Some(ReferentialAction::NoAction | ReferentialAction::Restrict) => Ok(()),
+        Some(other) => Err(refuse(&format!(
+            "ON UPDATE {other} (foreign keys allow only ON UPDATE NO ACTION or RESTRICT)"
+        ))),
+    }
 }
 
 fn constraint_ok(constraint: &TableConstraint) -> Result<(), String> {
@@ -231,8 +252,13 @@ fn constraint_ok(constraint: &TableConstraint) -> Result<(), String> {
             index_options,
             ..
         } if index_options.is_empty() => Ok(()),
-        TableConstraint::ForeignKey { foreign_table, .. } => {
-            local_name(foreign_table, "referenced table").map(|_| ())
+        TableConstraint::ForeignKey {
+            foreign_table,
+            on_update,
+            ..
+        } => {
+            local_name(foreign_table, "referenced table")?;
+            on_update_ok(on_update)
         }
         TableConstraint::Check { expr, .. } => expr_ok(expr),
         other => Err(refuse(&format!("table constraint `{other}`"))),
@@ -585,6 +611,9 @@ mod tests {
         let mut bad = Vec::new();
         for sql in [
             "CREATE TABLE audit (tenant_id text, note text)",
+            "CREATE TABLE f1 (tenant_id text NOT NULL, u uuid REFERENCES users (id) ON UPDATE NO ACTION)",
+            "CREATE TABLE f2 (tenant_id text, u uuid REFERENCES users (id) ON UPDATE RESTRICT)",
+            "CREATE TABLE f3 (tenant_id text, u uuid, FOREIGN KEY (u) REFERENCES users (id) ON UPDATE RESTRICT)",
             "create table if not exists t (tenant_id text)",
             "CREATE TABLE email_outbox (id uuid primary key, user_id uuid null, email text not null check (char_length(email) <= 254), recipient_hash bytea not null, template text not null, token bytea null, sent_at timestamptz null)",
             "CREATE TABLE o (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), at timestamptz NOT NULL DEFAULT now(), n numeric(10,2), u uuid REFERENCES users (id), UNIQUE (tenant_id, id), CHECK (n >= 0))",
@@ -675,6 +704,15 @@ mod tests {
             ("CREATE TABLE r (x other.mood)", "type"),
             ("CREATE TABLE d (x text DEFAULT current_setting('app.tenant_id'))", "current_setting"),
             ("CREATE TABLE d (x int DEFAULT pg_backend_pid())", "pg_backend_pid"),
+            ("CREATE TABLE d (tenant_id text DEFAULT 'x')", "DEFAULT on tenant_id"),
+            ("CREATE TABLE d (tenant_id text NOT NULL DEFAULT current_setting('app.tenant_id'))", "DEFAULT on tenant_id"),
+            ("ALTER TABLE t ADD COLUMN tenant_id text DEFAULT ''", "DEFAULT on tenant_id"),
+            ("CREATE TABLE d (\"tenant_id\" text DEFAULT now())", "DEFAULT on tenant_id"),
+            ("CREATE TABLE d (u uuid REFERENCES users (id) ON UPDATE CASCADE)", "ON UPDATE"),
+            ("CREATE TABLE d (u uuid REFERENCES users (id) ON UPDATE SET NULL)", "ON UPDATE"),
+            ("CREATE TABLE d (u uuid REFERENCES users (id) ON UPDATE SET DEFAULT)", "ON UPDATE"),
+            ("CREATE TABLE d (u uuid, FOREIGN KEY (u) REFERENCES users (id) ON UPDATE CASCADE)", "ON UPDATE"),
+            ("ALTER TABLE t ADD CONSTRAINT f FOREIGN KEY (u) REFERENCES users (id) ON DELETE RESTRICT ON UPDATE CASCADE", "ON UPDATE"),
             ("CREATE TABLE d (x int GENERATED ALWAYS AS IDENTITY)", "not allowed"),
             ("CREATE TABLE f (x uuid REFERENCES t_other.users (id))", "schema-qualified"),
             ("ALTER TABLE t ADD COLUMN y text DEFAULT set_config('a','b',false)", "set_config"),

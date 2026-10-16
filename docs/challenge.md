@@ -59,7 +59,9 @@ Which store is used, when a verifier is configured:
 - Production always uses the PostgreSQL store. `vibe serve` refuses to
   start if `VIBE_CHALLENGE_REPLAY_STORE=memory` is set (with or without a
   verifier), or if a configured tenant's table is missing, not usable by the
-  runtime role, or grants it DELETE, UPDATE or TRUNCATE.
+  runtime role, or has any privilege other than exactly `SELECT, INSERT`
+  for `tenant_<id>_rw` (any other privilege, any grant to another role,
+  including legacy shared roles such as `app_rw`, or to `PUBLIC`).
 - `postgres` keeps the state per tenant in `t_<tenant>.vibe_challenge_replay`
   (decision 97: no table shared between tenants). The table has `tenant_id`
   under ENABLE + FORCE row level security with the standard
@@ -73,6 +75,12 @@ Which store is used, when a verifier is configured:
   that nonce. A `released` row only cancels its own `pending` row, so a
   verified token stays used for its whole TTL. Reads ignore expired rows;
   expired rows are deleted only by the owner role when `vibe migrate` runs.
+- Retention: a row is kept at most for its TTL plus the time until the next
+  `vibe migrate` of that tenant, which deletes expired rows. Rows that are
+  not yet deleted count against the tenant's capacity, so the table size is
+  bounded by the per-tenant capacity whether or not cleanup has run; when it
+  is full, new challenges get 429 `CHALLENGE_RATE_LIMITED` (fail closed).
+  Run `vibe migrate` periodically to keep capacity available.
   Checks are serialized per tenant with a transaction-level advisory lock.
 - Client IPs are stored as HMAC-SHA256 under a per-tenant key derived from
   `VIBE_API_KEY_PEPPER`; tokens as SHA-256 of the token.

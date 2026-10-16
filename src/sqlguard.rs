@@ -136,6 +136,13 @@ impl Visitor for Guard {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        for lock in &query.locks {
+            if let Some(name) = &lock.of {
+                if let Some(problem) = table_problem(name) {
+                    return self.fail(problem);
+                }
+            }
+        }
         if let Some(problem) = set_expr_problem(&query.body) {
             return self.fail(problem);
         }
@@ -818,6 +825,28 @@ mod tests {
                 "wrapped_problem accepted: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn reserved_name_rejected_in_locking_clauses() {
+        for sql in [
+            "select id from users for update of vibe_challenge_replay",
+            "select id from users for share of VIBE_challenge_replay",
+            "select id from users for update of \"vibe_challenge_replay\"",
+            "select id from users for no key update of t_x.vibe_challenge_replay",
+            "select id from users for key share of pg_class",
+            "select id from users u for update of u, _platform_x",
+        ] {
+            assert!(
+                query_problem(sql).is_some(),
+                "query_problem accepted: {sql}"
+            );
+            assert!(analyze(sql).is_err(), "analyze accepted: {sql}");
+        }
+        assert_eq!(
+            query_problem("select id from users u for update of u"),
+            None
+        );
     }
 
     #[test]
