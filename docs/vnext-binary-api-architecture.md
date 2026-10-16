@@ -2,7 +2,7 @@
 
 - **Status:** Discussion draft; not approved for implementation
 - **Draft date:** 2026-10-15 (UTC); revised 2026-10-16 (PM directions, review round 2)
-- **Baseline:** `main` at `37198cabe8562edfff2a0ef6f1a3b91355c8bc2e` (merged into this branch), spec `docs/spec-v1.8.md`
+- **Baseline:** `main` at `d3e7ea3b97f6f9ec866549de124758c331ef4daf` (merged into this branch), spec `docs/spec-v1.8.md`
 - **Scope:** vNext only, **not in v1 scope**.
 - **Implementation state:** Documentation proposal only; no runtime implementation, milestone, or delivery ETA is approved
 - **Protocol choices:** Every protocol choice in this document (media types, envelopes, encoding, headers, URLs, error mapping, limits) is a **proposal pending a spec PR**. Nothing here amends `spec-v1.8.md` until a spec PR is merged.
