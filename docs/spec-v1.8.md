@@ -25,12 +25,15 @@
 - Lock 係 build 輸出，唔再 commit（`.gitignore`），由 CI／CD 喺部署時由 source build（決定 117，取代決定 80）。
 - `sign-jwt` 簽名算法政策（決定 139，issue #198）：只支援 ES256、RS256，預設 ES256；RS256 key 最少 2048 bit，唔夠 fail closed；驗證端只接受設定嘅一個 alg；EdDSA 留到 vNext（見 4.1a）。
 - Email 正規化（決定 120）：唔合併 plus addressing、保留點；local part NFC→trim→lowercase；domain IDNA UTS #46 punycode→lowercase；只儲存正規化值；遷移遇到衝突 fail closed，人手處理。
+- 租戶 DB role 細節（決定 129）：`tenant_<id>_rw`／`_public_reader`／`_public_writer`、`tenant_<id>_owner` migration role、連線池上限滿即回 503 `DB_POOL_EXHAUSTED`、production 憑證經 secret manager、常數 policy 部署時比對。
+- IP 限流網段 slot 上限（決定 130）：IPv4 /24、IPv6 /48 加 /32 嘅新計數器 slot 上限，跨租戶平台層（`VIBE_RATE_PLATFORM_FACTOR`），60 秒固定窗口 LRU 驅逐，slot 表滿 fail closed（429）。
 - 撤回 `--release-approval`（產品經理 2026-10-16）：唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（2C.3a、9C）。
 - CLI `--project` 預設係目前目錄；README 簡化做兩行（決定 81、82，見 2C.1）。
 - 新增 9C「冇人手 review 嘅安全模型」：寫明未經人手 review 嘅 LLM 輸出而家可以直接部署、剩餘風險同仍然有效嘅防線；另附 PR review 指引草稿（[`pr-review-guide.md`](pr-review-guide.md)，決定 83）。
 - 補 v1.7 reviewer 提出嘅缺口：11.4 create-user lock 補返 `user.invite` step；新增 `user.register`、`user.invite` 編譯 lock 範例；11.3／11.4 rate-limit 補 `key`；admin `EMAIL_TAKEN` 處理；create-user 改為可以重試（idempotent）並新增 re-invite endpoint（決定 84–88）。
 
 - Challenge provider（issue #160，已確認（產品經理 2026-10-16））：決定 131–138，v1 用 Cloudflare Turnstile（server 端 siteverify、production 共用 Postgres replay store（#177）、`type: pow` build error、fail closed、錯誤碼、secret 處理、同限流組合、固定數值、已認證 endpoint opt-in、provider 抽象），見 0.12、7.2a。
+- Refresh cookie 補充（issue #78，已確認（產品經理 2026-10-16））：決定 141–148（cookie 模式 login、對外錯誤一致、`Max-Age`、CSRF 次序、cookie logout、access token 預設 TTL、錯誤碼、向後相容），喺決定 6、45、60、61、65、72、101 之上補充，見 0.11、4A.1b；實作狀態見 4A.1b。
 
 ### v1.7（定稿）
 
@@ -121,7 +124,7 @@
 | 48 | 樂觀鎖用 HTTP `ETag`／`If-Match`：update 一定要帶 `If-Match`，缺少回 428，唔對應回 412；method input 欄位叫 `if_match`，只可以由 `req.header.if-match` 映射。 | 8、12.9 |
 | 49 | challenge 語法統一：`challenge: { type: none \| captcha \| pow, when: always \| after-failures, after-failures: <n> }`；有 INSERT 嘅 public endpoint 一定要 `when: always`。Challenge token 單次使用狀態存喺每個租戶自己 schema（決定 97），runtime role 只有 SELECT／INSERT（決定 27）。 | 7.2、10.7 |
 | 50 | 私隱刪除流程已經喺 12.10 定義（決定 42），後續版本改為「資料主體自助提交入口」，唔再列「正式流程」。 | 14 |
-| 51 | 新增 `kind: migration`：source `migrations/{provider}/{seq}-{name}.md`，lock `.lock.md`；DDL 只准喺呢度；用臨時 migration role；一律標高風險安全項目（v1.8 決定 78：資訊性，唔再要人手確認，已確認（產品經理 2026-10-14））；平台自動加 `tenant_id`、RLS、FORCE；DROP 租戶資料要行「棄用 30 日」流程。 | 2B |
+| 51 | 新增 `kind: migration`：source `migrations/{provider}/{seq}-{name}.md`，lock `.lock.md`；DDL 只准喺呢度；用 migration role：v1.8 起改為長期存在、只喺 migrate 期間可以登入嘅 `tenant_<id>_owner`（決定 129，已確認（產品經理 2026-10-16））。原因：決定 129 要求 runtime role 唔係 owner 同表要 `FORCE ROW LEVEL SECURITY`，表一定要有一個固定 owner；臨時 role 每次建立再刪除會令 ownership 轉移同授權變得複雜。剩餘風險：登入窗口期間外洩嘅 owner 憑證對表有完整權力，靠一次性密碼、parser 白名單、審計同定期檢查緩解；一律標高風險安全項目（v1.8 決定 78：資訊性，唔再要人手確認，已確認（產品經理 2026-10-14））；平台自動加 `tenant_id`、RLS、FORCE；DROP 租戶資料要行「棄用 30 日」流程。 | 2B |
 
 ### 0.6 v1.6 修正嘅前後矛盾
 
@@ -209,7 +212,7 @@
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 已確認（產品經理 2026-10-14） | 文件標頭、網站 |
 | 95 | create-user 邀請（v1.8 修訂）：邀請信寫入 transactional outbox（同其他寫入同一個 transaction）之後，create-user 同 re-invite 回 **202**，body 帶 `user_id` 同 `invite_status: invite_pending`。Mail worker 喺背景寄同重試；超過重試上限標 `delivery_failed`。邀請狀態（`invite_pending`／`sent`／`delivery_failed`）可以查詢，亦可以經 re-invite 重寄。只有 transaction 失敗（outbox 冇寫入，成個 request rollback，決定 99）先回 503 `INVITE_NOT_QUEUED`（帶 `Retry-After`）。`INVITE_DELIVERY_FAILED` 唔再係 503 錯誤碼，改為狀態值 `delivery_failed`。同 issue #26 相關。 | 已確認（產品經理 2026-10-14） | 11.4、11.4a、11.4b |
 | 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i) 做**臨時方案**）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。人手批准把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；自動閘門仍然係決定 113／114／118；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。`--release-approval` 已撤回（產品經理 2026-10-16），冇額外把關。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，同時開返 Prevent self-review。另外 live `release` environment `can_admins_bypass: true` 由 Jack 直接決定保持開啟，係已接受嘅風險（admin 可以跳過 environment 批准）。上面 ruleset 設定照舊要求，但 SDK 唔讀（原本嘅 ruleset 檢查屬 `--release-approval`，已撤回）。`main` ruleset 保留 OrganizationAdmin bypass。剩餘風險（Jack 已接受）：admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass）；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；同一個帳戶（`j113203`）可以自己批准；`release` environment admin bypass 保持開啟。 | 已確認（產品經理 2026-10-14） | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
-| 97 | 租戶隔離身份（v1 blocker）：runtime 為每個（租戶、role 類別）開獨立連線池，直接以 `LOGIN` 租戶 role 登入再執行 lock SQL；runtime 連線 role 同租戶 role 之間冇任何 membership，租戶連線入面冇辦法切返其他身份（唔用 `SET LOCAL ROLE`；除非之後證明 PostgreSQL 17 嘅 `SET LOCAL ROLE` 不可逆）。租戶 role `NOINHERIT`、只有自己 schema 嘅權限、唔係其他 role 嘅成員；憑證只存 runtime secret store。平台表（refresh token、idempotency、outbox）只喺租戶自己 schema，租戶 role 讀唔到任何跨租戶共用表。`app.tenant_id` 之類 GUC 只可以輔助（例如 log），永遠唔係身份來源。安全細節經私人 security advisory 處理。 | 已確認（產品經理 2026-10-14） | 7.1、7.1a、9C |
+| 97 | 租戶隔離身份（v1 blocker）：runtime 為每個（租戶、role 類別）開獨立連線池，直接以 `LOGIN` 租戶 role 登入再執行 lock SQL；runtime 連線 role 同租戶 role 之間冇任何 membership，租戶連線入面冇辦法切返其他身份（唔用 `SET LOCAL ROLE`；除非之後證明 PostgreSQL 17 嘅 `SET LOCAL ROLE` 不可逆）。租戶 role `NOINHERIT`、只有自己 schema 嘅權限、唔係其他 role 嘅成員；憑證只存 runtime secret store。平台表（refresh token、idempotency、outbox）只喺租戶自己 schema，租戶 role 讀唔到任何跨租戶共用表。`app.tenant_id` 之類 GUC 只可以輔助（例如 log），永遠唔係身份來源。安全細節經私人 security advisory 處理。Role 命名、連線池上限、憑證、閒置關閉、owner role 同 policy 比對見決定 129。 | 已確認（產品經理 2026-10-14） | 7.1、7.1a、9C |
 | 98 | Lock SQL parser 白名單：用 PostgreSQL 解析器（例如 `pg_query`）解析，只准單一 DML statement；禁止 transaction 控制、身份切換語句、會話設定修改同 schema-qualified 名稱；function 同 type 只准白名單；解析失敗即 fail closed。Conformance 要有跨租戶負面測試。 補充（已確認（產品經理 2026-10-14），Code Reviewer）：function 白名單係正面清單，冇列就禁止（動態 SQL／XML 查詢函數、introspection、取檔／外連函數、large object 全部唔喺入面）；lock SQL 唔可以有任何會話設定修改；唔可以引用平台表；migration 同樣用 parser 檢查（禁止提權 function、非白名單語言嘅 function／trigger、role 同權限操作、會話設定修改）；全部 fail closed，並有對應負面測試。 | 已確認（產品經理 2026-10-14） | 2A.4、7.1a、10.1 |
 | 99 | 跨 model transaction：一個 request = 一個 runtime 管理嘅 transaction（`READ COMMITTED`）；用戶 SQL 控制唔到 transaction 邊界；庫存扣減用條件 UPDATE（`WHERE stock >= qty`）再檢查 affected rows，唔夠就 409 同 rollback；冇跨 request、跨 DB 或者分散式 transaction；寫入按固定次序、喺租戶 role 之下執行。取代 7.1「每個 query 獨立 transaction」。 | 已確認（產品經理 2026-10-14） | 7.1、7.4、12.6 |
 | 100 | Transaction 超時同衝突：預設 `statement_timeout` 5s、transaction 總時間 10s、`idle_in_transaction_session_timeout` 5s；超時 rollback，回 504 `TX_TIMEOUT`。Deadlock（`40P01`）同 serialization failure（`40001`）回 503 `TX_CONFLICT`，body `retryable: true`，帶 `Retry-After: 1`；平台永遠唔會自動重試非冪等寫入。 | 已確認（產品經理 2026-10-14） | 7.4、8 |
@@ -233,7 +236,24 @@
 | 118 | Build once, promote：release job 只喺 `v*` tag build 一次，同一個 artifact 原封不動 promote 去各環境，唔重新 build；部署器用 `gh attestation verify --source-ref refs/tags/v<version>` 驗證。PR CI build 只係非權威預覽，結果唔可以部署。LLM key：release 用 `release` environment secret `VIBE_LLM_API_KEY`，PR 預覽用 `VIBE_LLM_API_KEY_PREVIEW`，兩條分開。Artifact 入面要有審計戳記（tag、commit SHA、workflow run id、compiler-hash、build 時間），唔包含任何 key。閘門：臨時方案 (i) 下任何有寫權限嘅人都可以開 `v*` tag，所以 tag 唔係真正閘門；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（`--release-approval` 已撤回）。將來目標係方案 (iii)：專用 release App 係唯一可以開 `v*` tag 嘅 actor，並開啟 `prevent_self_review`。兩條 LLM secret 由 Jack 本人建立。 | 已確認（產品經理 2026-10-14） | 2A.8、2C.3b |
 | 119 | Manifest 簽名改用 Sigstore keyless（Jack 決定，取代 KMS）：release manifest 由 release workflow 喺 `release` environment 用 GitHub OIDC 身份經 Sigstore（Fulcio 證書）簽，簽名一定要記錄喺 Rekor transparency log。驗證時證書身份一定要完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`（只接受完全相等，唔可以寬鬆配對 `refs/tags/v*`；如果工具一定要用 regex，只可以用完全錨定、正確轉義、寫死部署版本嘅式，例如 `^https://github\.com/vibe-backend/sdk/\.github/workflows/release\.yml@refs/tags/v1\.8\.0$`），commit SHA 同 GitHub-hosted runner 都要對，同決定 113 attestation 一致；issuer pin 死 `https://token.actions.githubusercontent.com`；冇 Rekor inclusion 證明即拒絕。驗證離線做：Rekor inclusion proof／SET 隨 Sigstore bundle 一齊交付；trust root（`trusted_root.json`：Fulcio CA、Rekor 公鑰、CT log key）由 Sigstore TUF repository 取得，release 時 pin 一份入 runtime binary，見 2C.3b。Keyless 身份只證明邊個 workflow 同 tag 產生呢個 build，唔證明邊個批准；佢唔會加多一個人，因為任何 `j113203` agent 都可以開 tag 再自己批准。冇任何長期簽名 key 或者 KMS，冇自管簽名 key 輪換（Sigstore trust root 輪換見 2C.3b）。Environment secret（例如簽名 secret）只可以用喺 dev／test，永遠唔用嚟簽 release。剩餘風險：臨時方案 (i) 下 tag 身份唔係閘門，唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；trust root 更新都係經同一個 `release` environment 出，同一個帳戶可以自己批准，冇額外嘅人把關。 | 已確認（產品經理 2026-10-14） | 2C.2、2C.3、2C.3b、9B、9C |
 | 120 | Email 正規化（issue #106）：v1 唔合併 plus addressing，`a+x@` 同 `a@` 係兩個唔同地址；local part 入面嘅點（`.`）照樣保留，`a.b@` 同 `ab@` 係兩個唔同地址。Local part：先做 Unicode NFC（唔係 NFKC），再 trim，再 lowercase。Domain：用 IDNA UTS #46 轉做 punycode，再 lowercase；IDNA 轉換失敗回 422 `VALIDATION_FAILED`。唯一 index、查找同發送全部用正規化後嘅值；login、註冊、邀請、驗證、重發同 rate-limit 全部先正規化再儲存同查找（12.11）。v1 只儲存正規化後嘅值，唔另外保留原本地址做顯示。現有資料遷移：migration 先偵測正規化後衝突（只差大小寫或者 Unicode 形式嘅重複地址）；有任何衝突就 fail closed 停止，唔自動合併；衝突報告只列 user id，任何公開 log 都唔出現完整 email；由人手按 12.11 嘅處理程序解決之後先重新跑。 | 已確認（產品經理 2026-10-16） | 4.3、9、12.11 |
+| 129 | 租戶 role 細節（補充決定 97，SDK #147）：(1) Runtime role 係 `tenant_<id>_rw`、`tenant_<id>_public_reader`、`tenant_<id>_public_writer`；`<id>` 係系統產生、只有 `[a-z0-9_]` 嘅不透明 id，永遠唔用用戶提供嘅名；role 名超過 63 bytes 即拒絕，永遠唔截斷。(2) 連線池每個（租戶、role）5 條，每個租戶最多 15 條；另有全 process 上限，預設 200，可以設定（設定名 `VIBE_DB_POOL_MAX_TOTAL`（已確認（產品經理 2026-10-16）））。三個上限（每個（租戶、role）5 條、每個租戶 15 條、全 process）任何一個滿咗，都即刻回 503 `DB_POOL_EXHAUSTED` 加 `Retry-After`（值 `1`（已確認（產品經理 2026-10-16））），並發 metric（名 `vibe_db_pool_exhausted_total{scope="role"\|"tenant"\|"process"}`（已確認（產品經理 2026-10-16）））；永遠唔排隊等 timeout，包括每個（租戶、role）同每個租戶上限。(3) `VIBE_TENANT_DB_SECRETS` JSON 檔只限開發同測試，權限一定 0600，永遠唔 commit、唔寫 log；production 憑證來源係 secret manager，經每個租戶 role 嘅環境變數參照注入（同 #147 實作一致），process 只讀參照、唔落地成檔；production 見到呢個檔就拒絕啟動（fail closed）。Owner role（`tenant_<id>_owner`）憑證：平台只喺每次 migrate 開始時由 secret manager 發一次性密碼，migrate 完成即作廢並將 role 設返 `NOLOGIN`；即係每次 migrate 都輪換，runtime 永遠攞唔到。(4) 閒置連線池 5 分鐘後關閉（v1 固定，冇環境變數設定）；呢點阻 GA，唔阻 v1 preview。(5) Migration role 係 `tenant_<id>_owner`，擁有該租戶 schema 同表，只畀 migrate 用。決定 27 嘅例外（已確認（產品經理 2026-10-16））：PostgreSQL owner 天生可以 TRUNCATE／DROP 同重新授權，冇辦法靠收權限禁止，所以 owner 係決定 27 嘅受控例外，條件見 2B「Owner role 條件」：migration parser 用正面白名單、migrate 單一 transaction、finally 由獨立平台 admin 連線收回登入、定期檢查、runtime 連線池永遠唔以 owner 登入；runtime role 唔係 owner，每張表都要 `FORCE ROW LEVEL SECURITY`；migrate 兩樣都檢查，缺任何一樣就失敗。(6) 編譯器輸出每個租戶常數 policy（`TO tenant_<id>_rw`），唔用 `current_setting('app.tenant_id')`；部署時比較編譯出嚟嘅 policy 同 DB 實際安裝嘅 policy，唔一致即 fail closed。 實作狀態（對照 #147 @8066b69）：#147 已包括三層連線池上限即時 503、`VIBE_DB_POOL_MAX_TOTAL`、`vibe_db_pool_exhausted_total{scope}`、production 拒絕 `VIBE_TENANT_DB_SECRETS`、一次性 owner 密碼、`pg_policies` 比對、migrate 拆做主 transaction 加 commit 後 concurrent index 步驟、finally 由獨立 admin 連線將 owner 設返 `NOLOGIN`、定期 owner 檢查（`vibe check-owners`）、連線池拒絕 owner role、parser 白名單（2B.3，#206）、INVALID index 只 drop 平台紀錄嘅（#207）、閒置連線池固定 5 分鐘關閉（v1 冇環境變數設定，#165）。受控 membership 例外（已確認（產品經理 2026-10-16））：每個租戶剛好一行 membership `tenant_<id>_rw` ← `tenant_<id>_owner`，`ADMIN FALSE`、`INHERIT FALSE`、`SET TRUE`（PostgreSQL 16+），反方向同其他任何 membership 令啟動失敗；owner migrate 以外 `NOLOGIN` 加定期偏差檢查；必須測試跨租戶、INHERIT、ADMIN OPTION 三種失敗情況——未實作，#246（#147 啟動檢查要調整）。另外嘅 lock 驗證器加固由 #147 進行中。未完成：backfill 同 replay 清理按租戶設定 RLS context、參數化同分批——未實作，#233。未完成：v1 要求 PostgreSQL 16 或以上（架構師決定 2026-10-16），16 以下 `vibe migrate`／`vibe serve` 啟動時 fail closed 並報明確錯誤，冇 fallback——未實作（code 仲未檢查版本），#254。 | 已確認（產品經理 2026-10-16）；owner `SET ROLE` 剩餘風險已接受（產品經理 2026-10-16） | 7.1、7.1a、9C |
+| 130 | IP 限流計數鍵同驅逐（SDK #132，v1 blocker；修訂 #73 嘅限流設計）：(1) 網段 slot 上限（跟 #73）：上限係每個網段可以開嘅**新計數器 slot** 數目，唔係 request 次數。計數前 IPv4-mapped IPv6（`::ffff:a.b.c.d`）一律先轉做 IPv4（同 #182 一致）。IPv4 每個（`tenant_id`、/24）最多 10 個新 slot；IPv6 每個（`tenant_id`、/48）最多 10 個，另加每個（`tenant_id`、/32）最多 50 個。Request 次數限流照舊用 4.3 嘅滑動窗口同數字。(2) 平台層：另有一個跨租戶網段 slot 計數器，鍵係 /24 同 /48，預設上限係租戶 slot 上限 ×5（單位同樣係新計數器 slot），倍數用 `VIBE_RATE_PLATFORM_FACTOR` 設定（預設 5，最大 100（已確認（產品經理 2026-10-16）））；兩層都通過先放行；平台層亦保證每個租戶 64 slot 保底。拒絕回 429 加 `Retry-After`，回應永遠唔講係邊一層觸發。(3) 驅逐：固定窗口長度 60 秒，只用喺本決定嘅網段 slot 計數同佢嘅 LRU 驅逐（4.3 request 限流仍然係滑動窗口）；LRU 有上限，先驅逐已過期嘅項目；每個租戶有自己嘅計數器 slot 上限；slot 滿而冇過期項目就 fail closed，回 429 並記 metric；永遠唔驅逐仲喺窗口內嘅計數器。Metric：拒絕記 metric（名 `vibe_rate_limit_slot_refused_total{layer="tenant"\|"platform", reason="network_cap"\|"table_full"\|"tenant_budget_exhausted"\|"prefix_cap_exceeded"}`（已確認（產品經理 2026-10-16））；`layer` 只喺內部 metric 出現，回應唔講）。Slot 表（同 #182 新設計（已確認（產品經理 2026-10-16）））：租戶表：每個租戶有自己一個 4,096 slot 嘅表，滿咗只拒絕嗰個租戶；全部租戶總預算 = `VIBE_RATE_EXPECTED_TENANTS`（預設 256，範圍 1–4096）× 4,096；用緊少過 64 個 slot 嘅租戶一定放行。平台表：IPv4 按 /24、IPv6 按 /32 分開嘅表，每個最多 4,096 項。平台表保證每個租戶嘅 64 slot 保底：平台總量 = 租戶總預算 + 租戶數 × 64，預設 1,064,960（256 × 4,096 + 256 × 64），所以就算好多租戶填滿平台表，新租戶都唔會冇 slot 可用。多 instance 部署一定要用共用儲存（#157）。#73 嘅 shard 內 owner／reserve 上限（每個網段 100 個 bucket、較闊網段 1,000 個、最後 1,000 個保留 slot）照舊保留，喺本決定之外再疊加（已確認（產品經理 2026-10-16））。Test IP 覆寫由環境變數 `VIBE_HONOR_TEST_IP=true` 開啟，只喺 debug build 生效；release build 唔理 `x-vibe-test-ip` header，而且設定咗 `VIBE_HONOR_TEST_IP=true` 時 `vibe serve`／router 拒絕啟動（fail closed）。剩餘風險：(a) 固定窗口邊界前後，網段新 slot 數目最多可以去到上限 ×2（已接受）；(b) 平台層令一個租戶嘅流量可以用埋同一 /24 或者 /48 其他租戶嘅額度（已接受）；(c) 平台總量只有保底以上嘅部分係跨租戶共用；共用部分喺一個窗口內用晒嘅話，保底以上嘅新 slot 會被拒絕，保底照樣保證（已確認（產品經理 2026-10-16））；(d) 同時滿咗嘅租戶多過 `VIBE_RATE_EXPECTED_TENANTS`，就只有用緊少過 64 個 slot 嘅租戶可以開新 slot（已確認（產品經理 2026-10-16））；呢個情況一定記 metric reason `tenant_budget_exhausted`（已確認（產品經理 2026-10-16））並發 WARN 告警（每分鐘最多一次），唔可以靜默拒絕；(e) 最差情況每個表大約 300 MB 記憶體（估計，未實測）（已確認（產品經理 2026-10-16））；唔可以靠呢個估計：v1 一定要有硬記憶體上限 `VIBE_RATE_TABLE_MEMORY_MAX_BYTES`（預設 268435456，即 256 MiB，限 limiter 全部 slot 表合計；名同預設已確認（產品經理 2026-10-16）；預設刻意細過單一表最差估計（大約 300 MB），滿載時 limiter 會先到 `table_full`（fail closed），#195 實測後再調整預設），超過即以 reason `table_full` fail closed。記憶體上限預先保留保底份額：租戶數 × 64 × 3 KiB（每個保底 slot 一個租戶計數器、一個平台計數器同一個 bucket），256 個租戶即 48 MiB，最多佔上限一半。保底以內嘅增長對照完整上限檢查；其他增長對照「上限減保留」檢查，超過即 `table_full`。#195 實測：每個 slot 大約 481 B，上限按每個 slot 1 KiB 估算；**GA blocker：記憶體實測（#195）**；(f) 活躍租戶多過 `VIBE_RATE_EXPECTED_TENANTS` 時，就算喺保底以內嘅請求都可能撞到硬記憶體上限，以 `table_full` fail closed（已接受（產品經理 2026-10-16））；接受條件：活躍租戶超過 `VIBE_RATE_EXPECTED_TENANTS` 嘅 80% 就發告警 `rate_limit_active_tenants_high`；保底以內嘅 `table_full` 拒絕要喺 `vibe_rate_limit_slot_refused_total{reason="table_full"}` 用 `within_floor` label 分辨（或者只寫入內部 log），永遠唔出現喺任何回應；#195 實測要一併驗證呢個風險同保底記憶體預留嘅大小；營運調整見 4.3；(g) 一個 IPv6 /32 入面活躍 /48 太多、超過該 /32 嘅平台表上限時，嗰個 /32 自己嘅用戶會 fail closed（已確認（產品經理 2026-10-16））；呢個情況一定記 metric reason `prefix_cap_exceeded`（reason 名已確認（產品經理 2026-10-16））並發 WARN 告警（每分鐘最多一次），唔可以靜默拒絕。 實作狀態（對照 #182 @679e128（2026-10-16 核對））：#182 實作每租戶 4,096 slot 表、`VIBE_RATE_EXPECTED_TENANTS`、64 slot 保底（平台表同記憶體保留，保底以內增長對照完整上限）、平台 /24、/32 表（預設總量 1,064,960）、`VIBE_RATE_PLATFORM_FACTOR`、IPv4-mapped 轉 IPv4、四個 reason、每分鐘最多一次嘅 WARN 告警、`VIBE_RATE_TABLE_MEMORY_MAX_BYTES` 硬上限（#210、#211），同埋 release build 唔理 test IP header。未完成：告警 `rate_limit_active_tenants_high`——#182 未實作，#234；`within_floor` 分辨——#182 未實作，#235；release build 設定 `VIBE_HONOR_TEST_IP=true` 時拒絕啟動——#182 已實作（自 @c12736c 由環境變數讀取，有測試），#230 喺 #182 merge 之後由 maintainer 關閉。記憶體實測見 #195（GA blocker）。 | 已確認（產品經理 2026-10-16） | 4.3、4A.3、7.2 |
 | 139 | `sign-jwt` 簽名算法政策（issue #198）：v1 只支援 ES256 同 RS256，預設 ES256；RS256 用嚟同第三方／JWKS 互通。RS256 key 最少 2048 bit，喺 `vibe validate --deploy`／部署同 `vibe serve` 啟動時檢查，唔夠就 fail closed（拒絕啟動，永遠唔會降級或者改用其他 alg）。驗證端只接受設定好嘅一個 alg；`alg` header 係其他值一律拒絕，包括 `none`、HS*，同埋 ES256／RS256 之中另一個（唔准混用）。EdDSA 留到 vNext。實作狀態：部分未實作，見 4.1a。 | 已確認（產品經理 2026-10-16） | 4.1、4.1a、12.6 |
+
+### 0.11 v1.8 refresh cookie 補充（決定 141 起，issue #78，已確認（產品經理 2026-10-16））
+
+決定 6、45、60、61、65、72 同 101 已經定咗 refresh 輪換、重用偵測、寬限期、pipeline 參數、限流、cookie 名同屬性、兩個模式同 CSRF／CORS 原則；以下只補返 issue #78 仲未寫清楚嘅部分。產品經理已確認（2026-10-16）。實作狀態見 4A.1b。
+
+| # | 決定 | 狀態 | 位置 |
+| --- | --- | --- | --- |
+| 141 | Cookie 模式下 login 都用 cookie：`transport: cookie` 時，login（`sign-jwt` `issue-refresh: new-family`）同 refresh（決定 101）一樣，新 refresh token **只**喺 `Set-Cookie` 出現，response body 唔包含 `refresh_token`；body 只有 `access_token` 同 `expires_in`（login 而家已經用 `access_token` 欄位名）。`transport: body` 照舊（決定 6、45）。 | 已確認（產品經理 2026-10-16） | 4A.1b |
+| 142 | 對外錯誤一致：輪換、重用撤銷家族同清 cookie 跟決定 6、61、101，唔重複定義。重用、過期、已撤銷、搵唔到，對外一律回同一個 401 錯誤碼同 body（決定 147），唔分開透露狀態；分別只寫入審計（`revoke_reason: reuse-detected` 等）。 | 已確認（產品經理 2026-10-16） | 4A.1、4A.1b |
+| 143 | Cookie `Max-Age` = `min(家族剩餘絕對壽命, 閒置剩餘時間)`，每次輪換重新計（收緊決定 101「唔超過家族剩餘絕對壽命」；決定 143 只可以收緊決定 101，永遠唔可以放寬佢任何 cookie 屬性或者上限）；一定有 `Max-Age`（唔用 session cookie），唔用 `Expires`。`Path=/`、冇 `Domain` 照決定 101；決定 60 嘅 slug Path 只適用 `transport: body`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
+| 144 | Refresh／logout 檢查次序（全部喺讀 cookie 之前做，補充決定 101）：1. method 一定 `POST`（其他回 405）；2. `Origin` 一定存在而且完全等於 `allowed-origins` 其中一個；3. `cross-site` 模式一定有 `X-Vibe-CSRF: 1`（cookie logout 喺任何模式都一定要，決定 145）；2 或 3 失敗對外一律回 403 `CSRF_REJECTED`，詳細原因只寫 server log 同審計；呢類 403 唔清 cookie，cookie 只喺通過檢查之後先會被清；4. cookie 模式只由 cookie 讀 token，忽略 body 入面嘅 `refresh_token`。唔接受 `Referer` 代替 `Origin`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
+| 145 | Cookie 模式 logout 唔要求 access token：瀏覽器 reload 之後記憶體冇 access token，所以 `token-revoke` 喺 `token-source: cookie` 而且 `scope: family` 時，以 cookie 搵家族並撤銷，唔需要 `auth`（決定 65「一定要 `auth`」嘅例外，只限呢個組合）。條件（產品經理 2026-10-16 確認；架構師 2026-10-16 釐清）：(1) 三項檢查，依次：(a) `Origin` 一定存在而且完全等於嗰個 slug 嘅決定 101 `allowed-origins` 其中一個（同 refresh 用同一份設定，冇另外嘅 logout 清單）；(b) 一定帶 `X-Vibe-CSRF: 1`，`same-site` 模式都要；(c) token 只由 `__Host-vibe_rt_{slug}` cookie 讀，永遠唔由 body 或者其他 cookie 名讀。(a) 或 (b) 失敗即 fail closed：403 `CSRF_REJECTED`，唔讀 cookie、唔撤銷、唔清 cookie。(2) (a)、(b) 通過之後，有效 cookie 就撤銷佢對應嘅家族；冇 cookie、cookie 無效、過期或者已撤銷就乜都唔撤銷；兩種情況回應完全一樣：204 加清除 cookie，唔透露有冇 token 或者 token 係咪有效。(3) 只撤銷嗰個 cookie 對應嘅家族，而且家族一定要屬於 URL slug 嗰個租戶（RLS 照舊；租戶唔啱當無效 cookie 處理）；唔影響同一用戶其他家族。(4) 重複 logout 係 idempotent。(5) 同 refresh 一樣套用決定 72 嘅限流同最低回應耗時（300ms），令有效同無效 cookie 喺時間上分唔出。(6) 點解 `same-site` 都要 `X-Vibe-CSRF`：logout 冇 access token（本決定），所以除咗 `Origin` 檢查，CSRF header 係佢唯一嘅來源證明；無條件要求亦令兩個模式用同一條規則。(7) 必要測試見 4A.1b。`scope: all`（全部裝置登出）照舊一定要 `auth`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
+| 146 | Access token 預設 TTL 15 分鐘（上限 1 小時照決定 6）；refresh 家族、`idle-ttl`、`reuse-grace` 嘅預設同上限照決定 6、45、61，唔改。Cookie 模式建議前端喺 access token 到期前 60 秒內 refresh。 | 已確認（產品經理 2026-10-16） | 4A.1、4A.1b |
+| 147 | Refresh／logout 錯誤碼（固定、平台提供，lock 唔使宣告；cookie 同 body transport 一律用同一套，`INVALID_REFRESH_TOKEN` 冇任何別名）：401 `INVALID_REFRESH_TOKEN`（冇 token／冇 cookie、無效、過期、已撤銷、重用；同時清 cookie）；403 `CSRF_REJECTED`（決定 144；唔清 cookie）；405 `METHOD_NOT_ALLOWED`；429 `RATE_LIMITED`（決定 72 限流，帶 `Retry-After`）；503 `TX_CONFLICT`／504 `TX_TIMEOUT`（決定 100）。錯誤 body 唔包含任何 token、hash 或者家族 id。 | 已確認（產品經理 2026-10-16） | 4A.1b、8 |
+| 148 | 向後相容：`transport` 預設照舊 `body`，現有 lock 唔使改；改做 `cookie` 係 opt-in，要重新 build。每個 endpoint version 只接受一種 transport，永遠唔會同時收 body 同 cookie；要遷移就喺新 `{version}` 開 cookie endpoint，舊版 body endpoint 照舊運作直到 deprecate。已發出嘅 body refresh token 唔會自動轉做 cookie，用戶喺新版重新登入。SDK client 預設照舊。 | 已確認（產品經理 2026-10-16） | 4A.1b |
 
 ### 0.12 Challenge provider：Turnstile（決定 131 起，issue #160，已確認（產品經理 2026-10-16））
 
@@ -890,15 +910,35 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
 
 ### 2B.3 規則
 
-- DDL 只准喺 migration lock 出現；准用：`CREATE TABLE`、`ALTER TABLE ... ADD COLUMN`、`ALTER TABLE ... ALTER COLUMN`（只限放寬或者加約束）、`CREATE INDEX`（一律 `CONCURRENTLY`）、`DROP INDEX`、`DROP COLUMN`／`DROP TABLE`（受棄用流程限制）。唔准：`TRUNCATE`、`DELETE`、`GRANT`、`REVOKE`、`ALTER ROLE`、`CREATE FUNCTION`、`CREATE EXTENSION`、`DISABLE ROW LEVEL SECURITY`、`NO FORCE`、改 policy。
+- DDL 只准喺 migration lock 出現。本節係**白名單**：冇列出嘅 statement 一律拒絕（例如 `COMMENT`、`CREATE TYPE`、`CREATE SEQUENCE`、`INSERT`）。准用：`CREATE TABLE`、`ALTER TABLE ... ADD COLUMN`、`ALTER TABLE ... ADD` constraint、`ALTER TABLE ... ALTER COLUMN` 只限 `SET NOT NULL`／`DROP NOT NULL`／`SET DEFAULT`／`DROP DEFAULT`（`SET DATA TYPE` 一律拒絕，因為判斷唔到係放寬定收窄）、`CREATE INDEX`（非 UNIQUE、純效能 index 一律 `CONCURRENTLY` 而且一定要有名，因為平台要按名紀錄，冇名即拒絕；喺主 transaction commit 之後建；UNIQUE index 同 constraint 一律唔用 `CONCURRENTLY`，喺主 transaction 入面建，見「Owner role 條件」第 5 點）、`DROP INDEX`。`DROP TABLE` 同 `DROP COLUMN` 一律拒絕，因為 v1 冇棄用流程（見下）。（對照 #147 @8066b69）唔准：`TRUNCATE`、`DELETE`、`GRANT`、`REVOKE`、`ALTER ROLE`、`CREATE FUNCTION`、`CREATE EXTENSION`、`DISABLE ROW LEVEL SECURITY`、`NO FORCE`、改 policy。
 - 補充（決定 98，已確認（產品經理 2026-10-14））：migration SQL 一樣用 PostgreSQL 解析器檢查，解析失敗或者遇到唔認識嘅 node 即 fail closed：
   - 唔准 `SECURITY DEFINER`；唔准 `CREATE FUNCTION`、`CREATE PROCEDURE`、`CREATE TRIGGER`（將來如果開放，只准平台白名單語言同 `SECURITY INVOKER`）。
   - 唔准任何 role 同權限操作（建立或者修改 role、授權同收回、預設權限），唔准任何會話設定修改（包括物件層級嘅設定）。
   - 唔准 schema-qualified 名稱，唔准觸及其他 schema、平台表或者 system catalog。
 - `CREATE TABLE`：平台自動加 `tenant_id` 欄位、`ENABLE` 同 `FORCE ROW LEVEL SECURITY`、標準 policy、`created_at`／`updated_at`／`deleted_at`／`erased_at` 系統欄位，同埋按 model lock 產生 grant；source 自己寫呢啲會被忽略並出 warning。
-- 執行：由平台發出臨時 migration role（有 DDL 權限，冇 `BYPASSRLS`、冇 DELETE／TRUNCATE），按租戶逐個 schema 執行，完成即撤銷；全程審計（同 7.3 一致）。補充（已確認（產品經理 2026-10-14））：每個租戶一個 migration role，只擁有嗰個租戶 schema，對其他 schema、平台表同 role 管理冇任何權限，唔係任何 role 嘅成員。
+- 執行：由平台用 migration role（決定 129 嘅 `tenant_<id>_owner`，長期存在，只喺 migrate 期間可以登入）按租戶逐個 schema 執行；全程審計（同 7.3 一致）。每個租戶一個 migration role，只擁有嗰個租戶 schema，對其他 schema、平台表同 role 管理冇任何權限，只以 `NOINHERIT` 做自己租戶嘅 `tenant_<id>_rw` 成員（2B backfill／決定 129 嘅受控例外，見 7.1），唔係任何其他 role 嘅成員（已確認（產品經理 2026-10-14））。
+  - 點解由臨時 role 改做長期 owner（已確認（產品經理 2026-10-16））：決定 129 要求 runtime role 唔係 owner、每張表 `FORCE ROW LEVEL SECURITY`，表要有一個固定 owner；臨時 role 每次建立同刪除會令 ownership 轉移同授權複雜又易錯。改為長期 owner 但 migrate 以外 `NOLOGIN`。
+- Owner role 條件（決定 27 受控例外，已確認（產品經理 2026-10-16））：
+  1. Migration parser 用**正面白名單**（同決定 97、98 一致）：只有上面准用嘅 statement 先放行，其他一律拒絕。以下永遠拒絕：`DELETE`、`TRUNCATE`、`GRANT`、`REVOKE`、`ALTER ... OWNER`、`DISABLE` 或者 `NO FORCE ROW LEVEL SECURITY`、`DROP POLICY`、`SECURITY DEFINER`、任何 GUC 修改。
+  2. 登入窗口：migrate 開始時平台由 secret manager 發一次性密碼並開 `LOGIN`；所有 `ddl` step 喺**單一 transaction** 入面執行（backfill 按租戶分批，見下面「Backfill 同 FORCE RLS」）。無論成功定失敗，都喺 finally 步驟由獨立嘅平台 admin 連線將 owner 設返 `NOLOGIN` 同作廢密碼（失敗咗嘅 transaction 入面做唔到）。
+  3. 定期檢查：平台定期檢查每個 owner role；migrate 以外發現可以登入，即刻停用並發告警。
+  4. Runtime 連線池永遠唔以 owner 登入：`vibe serve` 啟動時檢查每個連線池嘅登入 role 唔係任何 `tenant_<id>_owner`，唔係就拒絕啟動（fail closed）。
+  5. `CREATE INDEX CONCURRENTLY`（已確認（產品經理 2026-10-16））：佢唔可以喺 transaction 入面跑。只有非 UNIQUE、純效能嘅 index 可以喺主 transaction commit 之後，喺**同一個 owner 登入窗口**入面逐條用獨立、有審計嘅 concurrent index 步驟建，之後先做 finally 收回登入；揀呢個做法係因為 concurrent index 唔會長時間鎖住大表。UNIQUE index 同 UNIQUE／其他 constraint 一定喺主 transaction 入面用非 concurrent 方式建，令唯一性同資料改動一齊 commit 或者 rollback。Index 步驟失敗會留低 INVALID index：下次 migrate 開始時平台先 drop 再重建。呢個系統 DROP 係白名單動作，唔使行 2B 棄用流程，寫審計；只可以針對同時符合三個條件嘅 index：(i) 平台自己嘅 concurrent index 步驟有紀錄係佢建立；(ii) 喺該租戶 schema 入面；(iii) database catalog 標記為無效（`pg_index.indisvalid = false`）。Index 名一律由平台紀錄攞，永遠唔由 migration source 攞。平台冇紀錄嘅 INVALID index：寫審計並發 ALERT，但唔令 migrate 失敗，亦永遠唔 drop；migration 報告標記失敗並發告警。
+- Backfill 同 FORCE RLS（已確認（產品經理 2026-10-16），#233）：
+  - Backfill 同 #193 replay 清理每個租戶各自跑；UPDATE 參數化同分批，固定批量（每個 transaction 1,000 行）；失敗按租戶處理：寫審計、可以重試、唔影響其他租戶。永遠唔用 `BYPASSRLS`、owner bypass、GUC 或者改 policy。
+  - Context 機制（機制修正已確認（產品經理 2026-10-16））：每一批由 migrate runner 開 transaction，執行 `SET LOCAL ROLE tenant_<id>_rw`；`<id>` 由系統提供，role 係該租戶現有嘅 role，唔新建任何 role。Migration role 以 `NOINHERIT` 成為自己租戶嘅 `tenant_<id>_rw` 嘅成員，所以唔 `SET ROLE` 就用唔到租戶權限。咁現有嘅常數 policy（`TO tenant_<id>_rw`）只會令嗰個租戶嘅行可見。Transaction 完結時 role 自動還原。原因：決定 97 嘅 policy 唔讀 GUC，所以之前寫嘅「`SET LOCAL` 設定 GUC」冇效；已確認嘅方向唔變，只係修正機制。呢個做法同之前否決嘅「每個租戶專用 role」唔同：佢重用租戶現有 role，唔加新 role。
+  - Migration role 就係 owner：spec（決定 129、7.1）同 #147 都只有一個 migration role，即係每個租戶嘅 `tenant_<id>_owner`；main 而家嘅 code 未有呢個 role（#147 未 merge）。佢以 `NOINHERIT` 成為自己租戶嘅 `tenant_<id>_rw` 成員，所以係高權限 role，照 owner 規則處理（已確認（產品經理 2026-10-16））：平時 `NOLOGIN`，只喺 migrate 窗口用一次性密碼登入；每次 `SET ROLE` 都寫審計；定期檢查 membership 同登入狀態有冇偏差；永遠唔用嚟做 runtime 登入（`vibe serve` 啟動檢查照舊拒絕以 owner 登入嘅連線池）。
+  - 呢個 membership 係 7.1 migration role membership 限制同 `vibe serve`「租戶 role 唔可以有成員」檢查嘅受控例外（已確認（產品經理 2026-10-16）），只限同一租戶嘅 owner → `tenant_<id>_rw`（`NOINHERIT`）。條件：(1) 啟動檢查用正面條件寫：每個租戶剛好有一行 membership，`tenant_<id>_rw` ← `tenant_<id>_owner`（同一個 `<id>`），選項係 `ADMIN FALSE`、`INHERIT FALSE`、`SET TRUE`（PostgreSQL 16 或以上）；反方向同其他任何 membership（包括跨租戶、額外或者連鎖／間接）一律拒絕，啟動失敗。(2) Owner 喺 migrate 以外照舊 `NOLOGIN`，有定期偏差檢查（決定 129）。(3) 必須測試：owner 做其他租戶 rw 嘅成員、INHERIT、有 ADMIN OPTION，三種情況啟動都失敗。實作狀態：未實作，#147 嘅啟動檢查要調整，#246。決定 97（runtime 連線 role 同租戶 role 之間冇 membership）唔變。
+  - 權限（已確認（產品經理 2026-10-16））：backfill 只可以做 `tenant_<id>_rw` 本身已經准做嘅嘢，永遠唔為 backfill 加 grant。權限唔夠就令該租戶 backfill 失敗（寫審計），改動交返產品經理決定。
+  - Grant（PostgreSQL 16 或以上）：`GRANT tenant_<id>_rw TO tenant_<id>_owner WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`。
+  - PostgreSQL 版本（架構師決定 2026-10-16）：v1 要求 PostgreSQL 16 或以上。16 以下表達唔到上面嘅 grant 選項，所以 `vibe migrate` 同 `vibe serve` 啟動時一律 fail closed，報明確錯誤（要求 PostgreSQL 16+），冇任何 fallback。實作狀態：未實作（code 仲未檢查版本），#254 跟進（包括最低版本測試）。
+  - Batch transaction：一定用明確嘅 `BEGIN` 開始；batch 入面禁止 savepoint；owner 連線永遠唔加入任何共用連線池。
+  - 條件：(1) 只有 migrate runner 可以發 `SET ROLE`；用戶寫嘅 migration SQL 唔可以用 `SET ROLE`、`RESET ROLE`、`SET SESSION AUTHORIZATION` 或者改 GUC，決定 129 白名單 parser（2B.3、Owner role 條件第 1 點）一律拒絕。(2) 每個 batch UPDATE 之前同之後都核對 `current_user` 等於處理緊嗰個租戶嘅 `tenant_<id>_rw`、`session_user` 等於 `tenant_<id>_owner`，任何唔一致即中止（fail closed）；FORCE RLS 同部署時 policy 比對全程有效。(3) #193 replay 清理用同一個做法。(4) 必須測試：用租戶 A context 跑嘅 backfill 對租戶 B 改動零行。
+  - 實作狀態：未實作，#233（#147 @8066b69 而家以 owner 跑一條冇參數化、冇分批嘅 `UPDATE … WHERE`，喺 FORCE RLS 下睇唔到任何行）。
+  - 剩餘風險（已接受（產品經理 2026-10-16））：owner role 可以 `SET ROLE` 去自己租戶嘅 rw role，所以 owner 憑證如果喺登入窗口外洩，亦會有該租戶平台表（outbox、idempotency）嘅 rw 權限。緩解：只有 migrate runner 可以發 `SET ROLE`，用戶 migration SQL 一律被白名單拒絕；owner 平時 `NOLOGIN`、一次性密碼、每次 `SET ROLE` 寫審計、定期偏差檢查。接受理由：owner 本身已經擁有該租戶嘅表，owner 憑證外洩對該租戶已經係最壞情況，可以 `SET ROLE` 做 rw 唔會擴大影響範圍；而且決定 129 下 owner 平時 `NOLOGIN`、用一次性密碼（見上面「Owner role 條件」第 2 點），暴露窗口只限 migrate 執行期間。接受條件：每次 `SET ROLE` 寫審計（見上面「Migration role 就係 owner」）同定期偏差檢查（見上面受控例外條件 (2)、決定 129 `vibe check-owners`）一定要持續生效。
+  - 剩餘風險（已接受）：登入窗口期間外洩嘅 owner 憑證對表有完整權力；靠一次性密碼、parser 白名單、審計同定期檢查緩解。
 - 安全項目：migration lock 一律標 `migration-ddl`（高風險，資訊性，決定 78）；SDK 唔要求人手確認，建議 `migrations/` 受 CODEOWNERS 保護（見 [`pr-review-guide.md`](pr-review-guide.md)）。
-- 棄用流程（DROP 租戶資料）：
+- 棄用流程（DROP 租戶資料）：**v1 未提供**，所以 `DROP TABLE`／`DROP COLUMN` 一律拒絕；以下係將來版本嘅設計：
   1. 先有一個 migration 將欄位或者表標做 deprecated（`## Data` 寫 `deprecated-since`），同時所有 lock 唔可以再引用佢。
   2. 最少 30 日之後，先可以有 `destructive: true` 嘅 migration DROP 佢。
   3. DROP 之前平台自動做該租戶 schema 嘅快照備份（跟 35 日備份保留期）。
@@ -947,7 +987,7 @@ security-items:
 
 ### s2 ddl
 - op: ddl
-- sql: `create unique index concurrently users_email_key on users (tenant_id, email)`
+- sql: `create unique index users_email_key on users (tenant_id, email)`
 - source-lines: 3-3
 
 ## Verify
@@ -1056,6 +1096,10 @@ security-items:
 | `fail` | 錯誤碼 | 否 | 預設 `RATE_LIMITED`（429，帶 `Retry-After`） |
 
 - 計數用滑動窗口，按 `tenant_id` 分開儲存；`key: ip` 嘅 IP 由平台按受信任 proxy 設定解析，唔讀 client 自報 header。
+- `key: ip` 網段 slot 上限（決定 130，同 request 次數分開）：計數前 IPv4-mapped IPv6 先轉做 IPv4；每個網段可以開嘅新計數器 slot 數目有上限：IPv4 每個（`tenant_id`、/24）10 個；IPv6 每個（`tenant_id`、/48）10 個，另加每個（`tenant_id`、/32）50 個。平台層另有跨租戶網段 slot 計數器（/24、/48），預設上限係租戶 slot 上限 ×5（`VIBE_RATE_PLATFORM_FACTOR`，預設 5，最大 100（已確認（產品經理 2026-10-16）））；兩層都通過先放行；平台層保證每個租戶 64 slot 保底。拒絕一律回 429 加 `Retry-After`，唔講係邊一層觸發。
+- Slot 計數同 LRU 驅逐用 60 秒固定窗口（只限決定 130 呢部分）：先驅逐已過期項目；每個租戶有自己嘅 slot 上限；slot 滿而冇過期項目就 fail closed（429 加 metric）；永遠唔驅逐仲喺窗口內嘅計數器；多 instance 一定要用共用儲存（#157）。拒絕記 `vibe_rate_limit_slot_refused_total`（`layer`；reason：`network_cap`、`table_full`、`tenant_budget_exhausted`、`prefix_cap_exceeded`）（已確認（產品經理 2026-10-16））。Slot 表（同 #182 新設計（已確認（產品經理 2026-10-16）））：租戶表：每個租戶有自己一個 4,096 slot 嘅表，滿咗只拒絕嗰個租戶；全部租戶總預算 = `VIBE_RATE_EXPECTED_TENANTS`（預設 256，範圍 1–4096）× 4,096；用緊少過 64 個 slot 嘅租戶一定放行。平台表：IPv4 按 /24、IPv6 按 /32 分開嘅表，每個最多 4,096 項。平台表保證每個租戶嘅 64 slot 保底：平台總量 = 租戶總預算 + 租戶數 × 64，預設 1,064,960（256 × 4,096 + 256 × 64），所以就算好多租戶填滿平台表，新租戶都唔會冇 slot 可用。#73 嘅 shard 內 owner／reserve 上限照舊保留（已確認（產品經理 2026-10-16））。剩餘風險：(a) 固定窗口邊界前後，網段新 slot 數目最多可以去到上限 ×2（已接受）；(b) 平台層令一個租戶嘅流量可以用埋同一 /24 或者 /48 其他租戶嘅額度（已接受）；(c) 平台總量只有保底以上嘅部分係跨租戶共用；共用部分喺一個窗口內用晒嘅話，保底以上嘅新 slot 會被拒絕，保底照樣保證（已確認（產品經理 2026-10-16））；(d) 同時滿咗嘅租戶多過 `VIBE_RATE_EXPECTED_TENANTS`，就只有用緊少過 64 個 slot 嘅租戶可以開新 slot（已確認（產品經理 2026-10-16））；呢個情況一定記 metric reason `tenant_budget_exhausted`（已確認（產品經理 2026-10-16））並發 WARN 告警（每分鐘最多一次），唔可以靜默拒絕；(e) 最差情況每個表大約 300 MB 記憶體（估計，未實測）（已確認（產品經理 2026-10-16））；唔可以靠呢個估計：v1 一定要有硬記憶體上限 `VIBE_RATE_TABLE_MEMORY_MAX_BYTES`（預設 268435456，即 256 MiB，限 limiter 全部 slot 表合計；名同預設已確認（產品經理 2026-10-16）；預設刻意細過單一表最差估計（大約 300 MB），滿載時 limiter 會先到 `table_full`（fail closed），#195 實測後再調整預設），超過即以 reason `table_full` fail closed。記憶體上限預先保留保底份額：租戶數 × 64 × 3 KiB（每個保底 slot 一個租戶計數器、一個平台計數器同一個 bucket），256 個租戶即 48 MiB，最多佔上限一半。保底以內嘅增長對照完整上限檢查；其他增長對照「上限減保留」檢查，超過即 `table_full`。#195 實測：每個 slot 大約 481 B，上限按每個 slot 1 KiB 估算；**GA blocker：記憶體實測（#195）**；(f) 活躍租戶多過 `VIBE_RATE_EXPECTED_TENANTS` 時，就算喺保底以內嘅請求都可能撞到硬記憶體上限，以 `table_full` fail closed（已接受（產品經理 2026-10-16））；接受條件：活躍租戶超過 `VIBE_RATE_EXPECTED_TENANTS` 嘅 80% 就發告警 `rate_limit_active_tenants_high`；保底以內嘅 `table_full` 拒絕要喺 `vibe_rate_limit_slot_refused_total{reason="table_full"}` 用 `within_floor` label 分辨（或者只寫入內部 log），永遠唔出現喺任何回應；#195 實測要一併驗證呢個風險同保底記憶體預留嘅大小；營運調整見 4.3；(g) 一個 IPv6 /32 入面活躍 /48 太多、超過該 /32 嘅平台表上限時，嗰個 /32 自己嘅用戶會 fail closed（已確認（產品經理 2026-10-16））；呢個情況一定記 metric reason `prefix_cap_exceeded`（reason 名已確認（產品經理 2026-10-16））並發 WARN 告警（每分鐘最多一次），唔可以靜默拒絕。
+- Test IP 覆寫（決定 130）：`VIBE_HONOR_TEST_IP=true` 開啟 `x-vibe-test-ip` header（只限測試嘅 client IP 覆寫），只喺 debug build 生效；release build 唔理呢個 header，設定咗就拒絕啟動（fail closed）。#182 已實作（#230）。
+- 營運調整（決定 130）：活躍租戶接近 `VIBE_RATE_EXPECTED_TENANTS`（告警 `rate_limit_active_tenants_high`，超過 80% 觸發）時，可以：(1) 調高 `VIBE_RATE_EXPECTED_TENANTS`（最大 4096）：租戶總預算同平台總量跟住增加，記憶體保留 = 租戶數 × 64 × 3 KiB（256 個租戶 48 MiB；4096 個租戶 768 MiB），保留最多佔上限一半，所以可能要同時調高記憶體上限；(2) 調高 `VIBE_RATE_TABLE_MEMORY_MAX_BYTES`：保底以上可用記憶體增加，保留部分唔變。改完要重新啟動，並對照 #195 實測數字。
 - 同一 endpoint 可以有多個 `rate-limit` step；任何一個超過就拒絕。
 
 ### 4.4 `## Order` 准用值（決定 65）
@@ -1095,7 +1139,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 瀏覽器 client：access token 只放記憶體（唔放 cookie、唔放 localStorage），refresh token 放 cookie；重新載入頁面時 call refresh endpoint 攞新 access token。
 
 - **Endpoint**：`POST /{definition}/{version}/{slug}/refresh`（`token-refresh`，`transport: cookie`）同 `POST /{definition}/{version}/{slug}/logout`（`token-revoke`）。Refresh 回 body `{ "access_token", "expires_in" }`，新 refresh token 只喺 `Set-Cookie`。
-- **Cookie 屬性**：`__Host-vibe_rt_{slug}=<token>; HttpOnly; Secure; SameSite=<模式>; Path=/`，冇 `Domain`，`Max-Age` 唔超過家族剩餘絕對壽命。
+- **Cookie 屬性**：`__Host-vibe_rt_{slug}=<token>; HttpOnly; Secure; SameSite=<模式>; Path=/`，冇 `Domain`，`Max-Age` 唔超過家族剩餘絕對壽命（決定 143 收緊做同時唔超過閒置剩餘時間）。
   - `__Host-` 前綴保證 cookie 只屬於呢個 host、一定 Secure，防止 subdomain 寫入或者覆蓋 cookie；但瀏覽器規定 `__Host-` cookie 一定要 `Path=/`，所以唔可以再限定 `Path` 去 refresh endpoint。我哋揀 `__Host-`：`Path` 唔係安全邊界，而 `HttpOnly` 已經令 JS 讀唔到；server 只喺 refresh 同 logout 讀呢個 cookie，其他 endpoint 一律忽略。Cookie 名包括 slug，同一個 host 多個租戶唔會撞。產品經理已確認：防止 subdomain 覆蓋 cookie 比限定 Path 重要（2026-10-14）。
 - **兩個模式**（`token-refresh` 參數 `cookie-mode`）：
   - **`same-site`（預設）**：`SameSite=Strict`。前端同 API 一定要同 site（例如 `app.example.com` 同 `api.example.com`）。
@@ -1103,7 +1147,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
     1. 嚴格 `Origin` 白名單（完全相等，唔准 `*` 或者 wildcard，最少一個 origin）；同埋
     2. 自訂 header CSRF 檢查：refresh 同 logout 一定要帶 `X-Vibe-CSRF: 1`，冇就回 403。自訂 header 令瀏覽器一定先做 CORS preflight，跨 site 表單或者簡單請求帶唔到。
   - 開咗 `cross-site` 但缺少任何一樣，驗證器報 error，`vibe build` 同部署一律失敗。
-  - `same-site` 模式都會檢查 `Origin` 白名單；`X-Vibe-CSRF` 可選。
+  - `same-site` 模式都會檢查 `Origin` 白名單；refresh 嘅 `X-Vibe-CSRF` 可選，cookie logout 一定要（決定 145）。
 - **輪換同重用偵測**：跟 4A.1，每次 refresh 輪換；偵測到重用已失效 token（寬限期外）撤銷成個家族，同時回 `Set-Cookie` 清除 cookie。
 - **CSRF**：refresh 同 logout 一定要有 `Origin` header，而且喺租戶設定嘅前端 origin 白名單入面（完全相等，唔准 wildcard）；冇 `Origin` 或者唔喺白名單回 403，唔讀 cookie。`same-site` 模式再加 `SameSite=Strict`；`cross-site` 模式再加 `X-Vibe-CSRF` header 檢查。只接受 `POST`。
 - **CORS**：只對白名單 origin 回 `Access-Control-Allow-Origin: <origin>`（唔准 `*`）、`Access-Control-Allow-Credentials: true`、`Vary: Origin`；`cross-site` 模式 preflight 回 `Access-Control-Allow-Headers` 包括 `X-Vibe-CSRF`。Credentials **只限** refresh 同 logout endpoint，其他 endpoint 一律唔回 `Access-Control-Allow-Credentials`。
@@ -1135,10 +1179,10 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 | 參數 | 類型 | 預設 | 說明 |
 | --- | --- | --- | --- |
 | `scope` | `family` \| `all` | `family` | `family`：撤銷當前 refresh token 所屬家族（登出）；`all`：撤銷該用戶所有家族（全部裝置登出） |
-| `token-source` | `body` \| `cookie` | 同 `token-refresh` 嘅 `transport` | `scope: family` 時用嚟搵家族；`scope: all` 唔需要 |
+| `token-source` | `body` \| `cookie` | 同 `token-refresh` 嘅 `transport` | `scope: family` 時用嚟搵家族；`scope: all` 唔需要。`cookie` 時冇自己嘅 `allowed-origins`：一律用同一個 slug `token-refresh` 嘅決定 101 `allowed-origins`（決定 145） |
 | `clear-cookie` | boolean | `true`（cookie 時） | 回應帶 `Max-Age=0` 清除 refresh cookie，`Path` 同 `token-refresh` 一樣 |
 
-- 一定要 `auth`；只可以撤銷 `sub` 自己嘅家族；`revoke_reason` 分別寫 `logout`／`logout-all`。
+- 一定要 `auth`，只可以撤銷 `sub` 自己嘅家族。例外：`token-source: cookie` 加 `scope: family`（決定 145）唔使 `auth`，只撤銷嗰個 cookie 對應、屬於 URL slug 租戶嘅家族，並套用決定 72 限流同最低回應耗時；`revoke_reason` 分別寫 `logout`／`logout-all`。
 - 搵唔到 token 或者已撤銷都回 204（idempotent，唔洩漏狀態）。
 
 #### Refresh token 儲存
@@ -1165,6 +1209,114 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 - Revoke：一律 UPDATE `revoked_at` 同 `revoke_reason`（家族一次過），唔用 DELETE；過期紀錄唔刪除，冇個人資料（只有 hash 同 id），12.10 刪除時一併 revoke。
 - 只有平台專用 `refresh_store` role 可以讀寫呢張表（見 7.1）。
 
+### 4A.1b Refresh cookie 補充細節（決定 141–148，issue #78，已確認（產品經理 2026-10-16））
+
+> 本節已確認（產品經理 2026-10-16）。只描述防禦設計。
+
+#### 流程
+
+1. Login（`transport: cookie`）：回 body `{ "access_token", "expires_in" }`，同 `Set-Cookie: __Host-vibe_rt_{slug}=…; HttpOnly; Secure; SameSite=<模式>; Path=/; Max-Age=<秒>`；body 冇 `refresh_token`（決定 141）。
+2. 頁面載入／access token 就到期：前端 `POST /{definition}/{version}/{slug}/refresh`，`credentials: "include"`，`cross-site` 模式加 `X-Vibe-CSRF: 1`。
+3. 平台按決定 144 次序檢查，之後先讀 cookie，跟 4A.1 輪換；成功回 200、新 access token 同新 cookie（`Max-Age` 跟決定 143）。
+4. 重用或者無效：回 401 `INVALID_REFRESH_TOKEN` 加清除 cookie；重用時撤銷成個家族（決定 142、101）。
+5. Logout：`POST …/logout`，cookie 模式唔使 access token。先檢查 `Origin`（同 refresh 同一份決定 101 白名單）同 `X-Vibe-CSRF: 1`（`same-site` 都要），任何一項失敗回 403 `CSRF_REJECTED`；之後 token 只由 `__Host-` cookie 讀。通過之後一律 204 加清除 cookie：有效 cookie 撤銷佢嘅家族，冇 cookie 或者無效就乜都唔撤銷，回應一樣；套用決定 72 限流同最低回應耗時（決定 145）。
+
+#### Auth pipeline markdown 寫法
+
+Source（`api/auth/refresh.md`）用自然語言寫，frontmatter 宣告高風險欄位（決定 112）：
+
+```markdown
+---
+kind: api
+public: true
+auth: refresh-cookie
+---
+
+# Refresh token
+
+呢個係 refresh token endpoint，用 httpOnly cookie，前端同 API 同 site。
+簽 token 用 user.sign-access-token。
+```
+
+編譯後 lock（節錄）：
+
+```markdown
+## Route
+
+- method: POST
+- path: /{definition}/{version}/{slug}/refresh
+- public: true
+
+## Pipelines
+
+- -auth
+- token-refresh:
+    sign-method: user.sign-access-token
+    transport: cookie
+    cookie-mode: same-site
+    allowed-origins: [https://app.example.com]
+    refresh-ttl: 30d
+    idle-ttl: 7d
+    reuse-grace: 10s
+```
+
+`cross-site` 例子只改 `cookie-mode: cross-site`，`allowed-origins` 一定最少一個完全相等嘅 origin；平台自動要求 `X-Vibe-CSRF`，唔使喺 lock 再寫。
+
+Logout（節錄）：
+
+```markdown
+## Route
+
+- method: POST
+- path: /{definition}/{version}/{slug}/logout
+- public: true
+
+## Pipelines
+
+- -auth
+- token-revoke:
+    scope: family
+    token-source: cookie
+    clear-cookie: true
+```
+
+驗證器 error：`transport: cookie` 冇 `allowed-origins`；`token-revoke` 自己宣告 `allowed-origins`（cookie logout 一律繼承同一個 slug `token-refresh` 嘅設定，決定 145）；`allowed-origins` 有 `*`、wildcard、path 或者唔係 `https`（dev build 除外）；`cross-site` 但冇 `allowed-origins`；`token-revoke` `scope: all` 但係 `public: true`；`token-revoke` `token-source: cookie` 但同一個 definition 嘅 `token-refresh` 唔係 `transport: cookie`。
+
+#### 錯誤碼（決定 147）
+
+| 狀態 | 錯誤碼 | 幾時 | 清 cookie |
+| --- | --- | --- | --- |
+| 401 | `INVALID_REFRESH_TOKEN` | 冇 cookie、無效、過期、已撤銷、重用 | 係 |
+| 403 | `CSRF_REJECTED` | 冇 `Origin`、唔喺白名單；refresh 喺 `cross-site` 冇 `X-Vibe-CSRF: 1`；cookie logout 喺任何模式（包括 `same-site`）冇 `X-Vibe-CSRF: 1`（決定 145）。冇 cookie 唔係 403（logout 回 204，refresh 回 401）。詳細原因只入 server log 同審計 | 否（只有通過檢查嘅請求先會清 cookie） |
+| 405 | `METHOD_NOT_ALLOWED` | 唔係 `POST` | 否 |
+| 429 | `RATE_LIMITED` | 決定 72 限流 | 否 |
+| 503／504 | `TX_CONFLICT`／`TX_TIMEOUT` | 決定 100 | 否 |
+
+所有回應帶 `Cache-Control: no-store`；body 同 log 永遠唔記錄 token 明文。
+
+#### 向後相容（決定 148）
+
+- `transport: body` 照舊係預設，現有 lock、SDK client 同 login 回應唔變。
+- Cookie 係 opt-in，經新 `{version}` 遷移；每個 endpoint version 只接受一種 transport。
+- Login 同 refresh 嘅 body 都用 `access_token`（現有 login 已經係咁）。
+- 決定 60（slug Path）只喺 body 模式冇作用；cookie 模式跟決定 101 `Path=/`。
+
+#### Cookie logout 必要測試（決定 145）
+
+三項檢查各自單獨失敗（其餘兩項正確，有一個有效 cookie）各一個測試：
+
+1. `Origin` 唔喺 `allowed-origins`（或者冇 `Origin`）：403 `CSRF_REJECTED`，家族冇被撤銷，回應冇 `Set-Cookie`。
+2. 冇 `X-Vibe-CSRF: 1`（`same-site` 同 `cross-site` 各測一次）：403 `CSRF_REJECTED`，家族冇被撤銷，回應冇 `Set-Cookie`。
+3. Token 唔係由 `__Host-vibe_rt_{slug}` cookie 嚟（只喺 body，或者用其他 cookie 名）：204 加清除 cookie，同無效 cookie 回應完全一樣，body／其他 cookie 嘅家族冇被撤銷。
+
+另外：冇 cookie、無效、過期、已撤銷同有效 cookie 嘅 204 回應（status、header、body）完全一樣，同樣受最低回應耗時限制；重複 logout 兩次回應一樣；只有嗰個 cookie 嘅家族被撤銷；其他租戶嘅家族（slug 唔啱）唔會被撤銷；超過決定 72 限流回 429。
+
+#### 實作狀態（對照 main，2026-10-16）
+
+- **main 已實作**：`sign-jwt` 簽 access token，login body 回 `access_token`（`src/runtime/ops.rs`）；sqlguard 拒絕 app SQL 觸及 `_platform_refresh_tokens`（`src/sqlguard.rs`）。
+- **main 未實作**：`token-refresh`／`token-revoke` pipeline、`_platform_refresh_tokens` 儲存同輪換；`sign-jwt issue-refresh` 除 `none` 以外一律 build／runtime error（`src/validate.rs`、`src/runtime/ops.rs`）；`rate-limit key: family` 被拒絕（`src/manifest.rs`）。Cookie transport（決定 101、141–148）全部未實作。
+- **進行中**：PR #95（Refs #26）實作 body transport 嘅 refresh、輪換、重用偵測同 revoke；cookie transport 明確唔包括。#95 用 `INVALID_REFRESH_TOKEN`，同決定 147 一致（產品經理 2026-10-16 確認兩種 transport 都用呢個名，冇別名）。
+
 ### 4A.2 密碼政策（決定 7）
 
 - 平台底線：最少 12 個字元，最多 256 個字元；冇強制複雜度規則；一定做洩漏密碼檢查。
@@ -1185,7 +1337,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 - 同一帳戶或者同一 IP 15 分鐘內失敗 3 次之後，之後嘅登入一定要 captcha（防止被人用嚟惡意鎖死帳戶）。
 - 鎖定期間，用戶可以經 email 重設密碼連結即時解鎖；鎖定同解鎖都寫審計記錄並通知用戶。
 - 鎖定期間回應同密碼錯完全一樣（401 `INVALID_CREDENTIALS`），耗時都補到 500ms，唔洩露帳戶狀態。
-- 另加 IP 限流：每個 IP 每分鐘 10 次登入（見 11.2 `login-guard`）。
+- 另加 IP 限流：每分鐘 10 次登入（見 11.2 `login-guard`）；request 次數用滑動窗口；另外每個網段新計數器 slot 數目按決定 130 限制（IPv4 /24、IPv6 /48 加 /32，加平台層跨租戶網段 slot 上限，固定窗口）。
 
 ## 5. 資料庫提供者 `providers/{name}.md`
 
@@ -1233,16 +1385,16 @@ migration 放喺 ./migrations/main/。
 
 - 每個 request 喺一個 runtime 管理嘅 transaction 入面執行（決定 99，見 7.4）：由該租戶（同 role 類別）嘅連線池攞一條以租戶 role 登入嘅連線，`BEGIN`，按次序執行 lock SQL，最後 `COMMIT`（決定 97 補充，見下）。
 - 每張表都一定要有 `tenant_id` 欄位，要 `ENABLE` 同 `FORCE ROW LEVEL SECURITY`。
-- RLS policy 由平台按租戶產生，`TO tenant_<id>`，租戶 id 係常數；`app.tenant_id` GUC 只可以用嚟 log 同診斷，**永遠唔會出現喺任何 policy 或者權限判斷**；租戶邊界係租戶 `LOGIN` role 加佢自己 schema（決定 97）。冇切換到租戶 role 嘅話，query 會因為冇權限直接報錯，唔會回空結果。
+- RLS policy 由編譯器按租戶產生常數 policy，`TO tenant_<id>_rw`（同其他租戶 role），租戶 id 係常數，唔用 `current_setting('app.tenant_id')`；部署時比較編譯出嚟嘅 policy 同 DB 實際安裝嘅 policy，唔一致即 fail closed（決定 129）；`app.tenant_id` GUC 只可以用嚟 log 同診斷，**永遠唔會出現喺任何 policy 或者權限判斷**；租戶邊界係租戶 `LOGIN` role 加佢自己 schema（決定 97）。冇切換到租戶 role 嘅話，query 會因為冇權限直接報錯，唔會回空結果。
 - `search_path` 由平台固定產生：schema 模式係 `t_{tenant_id}`，唔包括 `public`；`public` schema 嘅 CREATE 權限要收走。
 - 連線 role 唔可以係表嘅 owner，亦唔可以有 `BYPASSRLS`。
-  - SDK 實作（決定 97）：冇共用 runtime role。每個租戶有自己嘅 migration role（只擁有自己 schema，唔係任何租戶 role 嘅成員），`vibe migrate` 用佢喺該租戶 schema 跑 migration，再將 `SELECT`、`INSERT`、`UPDATE` 逐張表授權畀該租戶嘅 `LOGIN` role（`tenant_<id>_rw` 等），收走 `CREATE`；唔用 `ALTER DEFAULT PRIVILEGES` 跨租戶授權。跑完 migration 之後，schema 入面每張表都會 `ENABLE` + `FORCE ROW LEVEL SECURITY` 同埋加 `TO` 該租戶 role、寫死租戶 id 常數嘅 policy；冇 `tenant_id` 欄嘅表、view、materialized view 或 foreign table 會令 migrate 失敗。`vibe serve` 為每個（租戶、role 類別）用租戶 `LOGIN` role 開連線池，啟動時檢查每個租戶 role：係 superuser、有 `BYPASSRLS`、係任何其他 role 嘅成員或者有其他 role 係佢成員、擁有任何 schema、relation、function 或 type、又或者可以存取其他租戶 schema 或者冇 `ENABLE` + `FORCE ROW LEVEL SECURITY` 嘅 relation，就拒絕啟動。
+  - SDK 實作（決定 97）：冇共用 runtime role。每個租戶有自己嘅 migration role `tenant_<id>_owner`（擁有自己 schema，只畀 migrate 用，只以 `NOINHERIT` 做自己租戶嘅 `tenant_<id>_rw` 成員（2B backfill／決定 129 嘅受控例外，見 7.1），唔係任何其他 role 嘅成員；決定 129），`vibe migrate` 用佢喺該租戶 schema 跑 migration，再將 `SELECT`、`INSERT`、`UPDATE` 逐張表授權畀該租戶嘅 `LOGIN` role（`tenant_<id>_rw` 等），收走 `CREATE`；唔用 `ALTER DEFAULT PRIVILEGES` 跨租戶授權。跑完 migration 之後，schema 入面每張表都會 `ENABLE` + `FORCE ROW LEVEL SECURITY` 同埋加 `TO` 該租戶 role、寫死租戶 id 常數嘅 policy；冇 `tenant_id` 欄嘅表、view、materialized view 或 foreign table 會令 migrate 失敗；migrate 亦檢查 runtime role 唔係 owner 同每張表有 `FORCE ROW LEVEL SECURITY`，缺任何一樣即失敗（決定 129）。`vibe serve` 為每個（租戶、role 類別）用租戶 `LOGIN` role 開連線池，啟動時檢查每個租戶 role：係 superuser、有 `BYPASSRLS`、係任何其他 role 嘅成員或者有其他 role 係佢成員（唯一受控例外見下）、擁有任何 schema、relation、function 或 type、又或者可以存取其他租戶 schema 或者冇 `ENABLE` + `FORCE ROW LEVEL SECURITY` 嘅 relation，就拒絕啟動。
 - 所有 runtime DB role 類別（`app_rw`、`public_reader`、`public_writer`；每個係**每個租戶各自一個** role 類別，例如 `tenant_<id>_rw`，見下面租戶身份）都冇 `DELETE`、`TRUNCATE`、DDL 權限（決定 27）。
 - 平台專用 role（用戶 lock 唔可以用）：
 
   | role | 權限 | 用途 |
   | --- | --- | --- |
-  | migration（每個租戶一個，臨時） | 只喺自己租戶 schema 准用嘅 DDL（見 2B），冇 DELETE／TRUNCATE／BYPASSRLS，唔係任何租戶 role 嘅成員 | 執行 migration，完成即撤銷 |
+  | migration `tenant_<id>_owner`（每個租戶一個，決定 129） | 擁有自己租戶 schema 同表；只喺自己 schema 准用嘅 DDL（見 2B）；冇 BYPASSRLS，只以 `NOINHERIT` 做自己租戶嘅 `tenant_<id>_rw` 成員（2B backfill／決定 129 嘅受控例外，見 7.1），唔係任何其他 role 嘅成員。Owner 天生可以 TRUNCATE／DROP，係決定 27 嘅受控例外（已確認（產品經理 2026-10-16））：migrate 以外 `NOLOGIN`、一次性憑證、parser 正面白名單、單一 transaction、finally 收回登入、定期檢查、全程審計（見 2B「Owner role 條件」） | 只用嚟執行 migration；runtime 永遠唔用 |
   | `credential_rehash` | 只有 password 類型欄位嘅 UPDATE | 4A.2 rehash |
   | `refresh_store` | `_platform_refresh_tokens` 嘅 SELECT、INSERT、UPDATE | 4A.1 |
   | `erasure` | 個人欄位嘅 UPDATE | 12.10 |
@@ -1251,10 +1403,11 @@ migration 放喺 ./migrations/main/。
   全部都冇 DELETE、TRUNCATE、BYPASSRLS，全部行為寫審計記錄。
 
 - 租戶身份（決定 97；登入方式補充 已確認（產品經理 2026-10-14））：
-  - 每個租戶、每個 role 類別（`app_rw`、`public_reader`、`public_writer`）一個 DB role，例如 `tenant_<id>_rw`：`LOGIN`、`NOINHERIT`、只有自己 schema（database 模式：自己 database）嘅權限，唔係任何其他 role 嘅成員，亦冇其他 role 係佢嘅成員。
+  - 每個租戶、每個 role 類別（`app_rw`、`public_reader`、`public_writer`）一個 DB role：`tenant_<id>_rw`、`tenant_<id>_public_reader`、`tenant_<id>_public_writer`（決定 129；`<id>` 係系統產生、只有 `[a-z0-9_]` 嘅不透明 id，唔用用戶提供嘅名；role 名超過 63 bytes 即拒絕，唔截斷）：`LOGIN`、`NOINHERIT`、只有自己 schema（database 模式：自己 database）嘅權限，唔係任何其他 role 嘅成員，亦冇其他 role 係佢嘅成員（唯一受控例外：同一租戶 `tenant_<id>_owner` 以 `NOINHERIT` 做 `tenant_<id>_rw` 成員，見下）。
   - **揀直接登入，唔用 role 切換**：如果 runtime 連線 role 係租戶 role 嘅成員再切換過去，呢個做法冇辦法保證單向。產品經理決定：除非之後證明 PostgreSQL 17 嘅交易內 role 切換可以做到不可逆，否則一律用每個租戶 `LOGIN` role 嘅連線池（預設設計）。所以 runtime 為每個（租戶、role 類別）開獨立連線池，直接用租戶 role 登入；連線入面冇任何更高權限身份可以切返，身份切換語句一律冇效或者報錯。
-  - 租戶 role 嘅登入憑證由平台產生同輪換，只存喺 runtime 嘅 secret store；唔寫入 repo、lock、manifest、log 或者錯誤訊息。
-  - 連線池按需要開、閒置就收，每個租戶有連線上限（見下）；PgBouncer 用 per-user pool。
+  - 租戶 role 嘅登入憑證由平台產生同輪換，只存喺 runtime 嘅 secret store；唔寫入 repo、lock、manifest、log 或者錯誤訊息。Production 用 secret manager 參照；`VIBE_TENANT_DB_SECRETS` JSON 檔只限開發同測試（權限 0600、唔 commit、唔寫 log），production 見到呢個檔即拒絕啟動（決定 129）。
+  - 連線池按需要開；每個（租戶、role）5 條，每個租戶最多 15 條，另有全 process 上限（預設 200，可以設定）。超過上限即刻回 503 `DB_POOL_EXHAUSTED` 加 `Retry-After` 並發 metric，唔排隊。閒置連線池 5 分鐘後關閉（阻 GA，唔阻 v1 preview）。PgBouncer 用 per-user pool（決定 129）。
+  - 受控 membership 例外（已確認（產品經理 2026-10-16），決定 129、2B backfill）：`tenant_<id>_owner` 可以以 `NOINHERIT` 做同一租戶 `tenant_<id>_rw` 嘅成員，等 backfill 用 `SET LOCAL ROLE`。條件：(1) 啟動檢查用正面條件寫：每個租戶剛好有一行 membership，`tenant_<id>_rw` ← `tenant_<id>_owner`（同一個 `<id>`），選項係 `ADMIN FALSE`、`INHERIT FALSE`、`SET TRUE`（PostgreSQL 16 或以上）；反方向同其他任何 membership（包括跨租戶、額外或者連鎖／間接）一律拒絕，啟動失敗。(2) Owner 喺 migrate 以外照舊 `NOLOGIN`，有定期偏差檢查（決定 129）。(3) 必須測試：owner 做其他租戶 rw 嘅成員、INHERIT、有 ADMIN OPTION，三種情況啟動都失敗。實作狀態：未實作，#147 嘅啟動檢查要調整，#246。
   - Runtime 自己嘅管理連線（例如 mail worker、清理 job）用平台專用 role，唔執行 lock SQL，亦唔係租戶 role 嘅成員。
 - **平台表**（`_platform_refresh_tokens`、`_platform_idempotency`、`email_outbox` 等）只喺租戶自己 schema；**唔准有任何跨租戶共用而租戶 role 讀得到嘅表**。租戶 role 對平台表只有同一個 transaction 必需嘅最少權限（例如 outbox 同 idempotency 嘅 INSERT），而 lock SQL 一律唔可以引用平台表名（parser 檢查，見 7.1a），只可以經平台 op 存取。
 - 連線池同 cache 都按租戶分開；cache key 一定要包含 `tenant_id`。
@@ -1296,7 +1449,7 @@ migration 放喺 ./migrations/main/。
   - **UPDATE**：一定要有 `WHERE`，用主鍵或者 RLS 限定，而且 RLS 生效。
   - **租戶**：`tenant_id` 由平台按 slug 解析後注入；request body 入面有 `tenant_id`、`id`、`created_by` 一律 422 拒絕（決定 23）。
   - **配額**：每租戶每日 public 寫入配額強制，預設 1,000 次，另每 IP 每日 50 次；租戶 admin 可以調低，調高最多到 10,000 要經平台申請（決定 39）；用完之後只封鎖 public 寫入（回 429 同 `Retry-After`），已認證請求同 public 讀取照常（決定 21）。
-  - **限流**：IP 加租戶兩層限流強制；lock 標 `cost: high` 嘅昂貴 step（例如 `verify-password`、`hash-password`、大範圍 query）自動用更嚴嘅限流，即係 endpoint 上限嘅一半（決定 25、39）。
+  - **限流**：IP 加租戶兩層限流強制（request 次數用 4.3 滑動窗口；網段新計數器 slot 上限、平台層同固定窗口驅逐見決定 130）；lock 標 `cost: high` 嘅昂貴 step（例如 `verify-password`、`hash-password`、大範圍 query）自動用更嚴嘅限流，即係 endpoint 上限嘅一半（決定 25、39）。
   - **防機器人**（決定 49）：lock `## Access` 用統一語法 `challenge: { type: none | captcha | pow, when: always | after-failures, after-failures: <n> }`。
     - 建立資料（有 INSERT）嘅 public endpoint：一定要 `type: captcha` 或者 `pow`，`when: always`（v1 只支援 `captcha`，`pow` 係 build error，見 7.2a 決定 131）。
     - login 類 endpoint：一定要 `{ type: captcha, when: after-failures, after-failures: 3 }`（跟 4A.3）。
@@ -1459,9 +1612,9 @@ Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動�
 | 415 | Content-Type 唔支援 |
 | 422 | 驗證唔通過，或者有未宣告欄位；`IDEMPOTENCY_KEY_REUSED`（2.3b）、`EMPTY_PATCH`（2.3c）、`WEAK_PASSWORD`（長度唔喺 12–256）、`BREACHED_PASSWORD`（洩漏密碼，#90；4A.2）；錯誤唔回顯密碼 |
 | 428 | 需要 `If-Match` 但冇帶（RFC 6585） |
-| 429 | 請求太多，要帶 `Retry-After` |
+| 429 | 請求太多，要帶 `Retry-After`（`RATE_LIMITED`；決定 130 嘅網段 slot 上限同 slot 表滿都用呢個 code，唔講係邊一層） |
 | 500 | 未宣告嘅錯誤，code 一律係 `INTERNAL`，唔會洩露內部資料 |
-| 503 | 暫時唔可用（包括遷移期間凍結寫入、kill switch 停用咗嘅 endpoint、`TX_CONFLICT`（7.4，帶 `Retry-After: 1`）），可以帶 `Retry-After` |
+| 503 | 暫時唔可用（包括遷移期間凍結寫入、kill switch 停用咗嘅 endpoint、`TX_CONFLICT`（7.4，帶 `Retry-After: 1`）、`DB_POOL_EXHAUSTED`（決定 129，連線池任何上限滿咗，帶 `Retry-After`；值 `1`，已確認（產品經理 2026-10-16））），可以帶 `Retry-After` |
 | 504 | 對外 call 超時，或者 transaction 超時 `TX_TIMEOUT`（7.4） |
 
 - 錯誤 body 統一格式：`{ "error": { "code", "message", "request_id" } }`。
@@ -1622,7 +1775,7 @@ Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動�
 - sql 用咗物件以外嘅表或者 provider（寫入其他物件一定要經佢自己嘅 method）。
 - `writes: false` 但有 INSERT／UPDATE sql。
 - migration 以外嘅 lock 出現 DDL；任何 lock（包括 migration）出現 `DELETE`、`TRUNCATE`、`GRANT`、`REVOKE`。
-- Migration：用咗 2B.3 唔准嘅 DDL；`seq` 跳號或者重複；`CREATE INDEX` 冇 `CONCURRENTLY`；`backfill` 冇 WHERE 或者冇 `batch`；`destructive: true` 但冇 `deprecated-since` 或者未夠 30 日；DROP 嘅欄位仲有 lock 引用；冇 `## Verify`。
+- Migration：用咗 2B.3 唔准嘅 DDL；`seq` 跳號或者重複；非 UNIQUE `CREATE INDEX` 冇 `CONCURRENTLY` 或者冇名，或者 UNIQUE index 用咗 `CONCURRENTLY`；`ALTER COLUMN ... SET DATA TYPE`；`DROP TABLE`／`DROP COLUMN`；`backfill` 冇 WHERE 或者冇 `batch`；`destructive: true` 但冇 `deprecated-since` 或者未夠 30 日；DROP 嘅欄位仲有 lock 引用；冇 `## Verify`。
 - CRUD update 或者自訂 update method 用樂觀鎖但 input 唔係 `if_match`，或者 `if_match` 唔係由 `req.header.if-match` 映射。
 - `UPDATE` 冇 `WHERE`，或者冇 `scope: pk | rls`，或者 `scope: pk` 但 WHERE 唔係主鍵／唯一鍵。
 - `validate` 嘅 `fail` 用咗未宣告嘅錯誤碼；參照咗未定義嘅變數。
@@ -3035,7 +3188,7 @@ users 表嘅 password 改為可以冇；加 email_verify_purpose（register 或�
 
 ### s4 ddl
 - op: ddl
-- sql: `create unique index concurrently users_email_verify_hash_uq on users (tenant_id, email_verify_hash)`
+- sql: `create unique index users_email_verify_hash_uq on users (tenant_id, email_verify_hash)`
 - source-lines: 2-2
 
 ### s4a ddl
