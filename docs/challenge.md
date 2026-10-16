@@ -93,7 +93,7 @@ Turnstile's own single-use check (`timeout-or-duplicate`) applies in addition.
 | No proof | 400 `CHALLENGE_REQUIRED` |
 | Proof rejected (forged, replayed, expired, missing or future `challenge_ts`, wrong hostname or action, per-IP or per-tenant quota reached) | 403 `CHALLENGE_FAILED` |
 | Provider or network failure only: provider unreachable, timeout, bad response, replay store unreachable (spec decision 134) | 503 `CHALLENGE_UNAVAILABLE`, `Retry-After: 5` (decision 135) |
-| Per-network-prefix cap reached (IPv4 /24 or IPv6 /48, default 16 per tenant replay store; decision 134) | 429 `CHALLENGE_RATE_LIMITED` with `Retry-After`; identical to the full-store response apart from `Retry-After` |
+| Per-network-prefix cap reached (IPv4 /24 or IPv6 /48, default 16 per tenant replay store; decision 134) | 429 `CHALLENGE_RATE_LIMITED` with `Retry-After` = remaining validity of the oldest record for that tenant and prefix, capped at 360 s, or a fixed 60 if it cannot be computed (same rule as the full store; PM-approved 2026-10-16); identical to the full-store response apart from `Retry-After` |
 | Replay store full (capacity limit from traffic, not a provider failure; decision 134, PM-confirmed 2026-10-16) | 429 `CHALLENGE_RATE_LIMITED`, `Retry-After` = remaining validity of the oldest record, capped at 360 s, or a fixed 60 if it cannot be computed |
 
 A full replay store still fails closed: a request is never admitted without recording its replay entry. Each occurrence emits the metric `vibe_challenge_rejected_total{reason="replay_store_full"}` and raises the alert `challenge_replay_store_full`. Names confirmed by the PM on 2026-10-16.
