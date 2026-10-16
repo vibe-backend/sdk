@@ -21,6 +21,14 @@ updates:
     schedule:
       interval: weekly
     groups:
+      rustcrypto:
+        patterns:
+          - "sha2"
+          - "hmac"
+          - "digest"
+          - "argon2"
+          - "password-hash"
+        update-types: ["minor", "patch"]
       cargo:
         patterns: ["*"]
         update-types: ["minor", "patch"]

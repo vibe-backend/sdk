@@ -986,14 +986,31 @@ fn gemini_call(
     config: &LlmConfig,
     request: &LlmRequest,
 ) -> (String, Value, Vec<(&'static str, String)>) {
-    let url = join_url(
-        &config.base_url,
-        &format!("models/{}:generateContent", request.model),
-    );
+    let model = encode_path_segment(&request.model);
+    let url = join_url(&config.base_url, &format!("models/{model}:generateContent"));
     let params = sent_params(config, &request.model);
     let body = gemini_body(request, &params);
     let headers = vec![("x-goog-api-key", config.api_key.clone())];
     (url, body, headers)
+}
+
+/// Percent-encode a single URL path segment (RFC 3986 unreserved left as-is).
+fn encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 fn join_url(base: &str, path: &str) -> String {
@@ -1178,6 +1195,23 @@ mod tests {
         ] {
             assert!(!model_id_is_valid(GEMINI, bad), "{bad}");
         }
+        // #131 negative cases: backslash, controls, non-ASCII, '@', over 256 bytes
+        for bad in [
+            "a\\b",
+            "a\nb",
+            "a\0b",
+            "a\tb",
+            "caf\u{e9}",
+            "\u{4e2d}",
+            "a@b",
+        ] {
+            assert!(!model_id_is_valid(GEMINI, bad), "{bad:?}");
+            assert!(!model_id_is_valid(OPENAI, bad), "{bad:?}");
+        }
+        let over_256 = "a".repeat(257);
+        assert!(!model_id_is_valid(GEMINI, &over_256));
+        assert!(!model_id_is_valid(OPENAI, &over_256));
+        assert!(model_id_is_valid(GEMINI, &"a".repeat(256)));
         assert!(model_id_is_valid(OPENAI, "qwen2.5-coder:32b-instruct-q8_0"));
         assert!(!model_id_is_valid(OPENAI, "a?b"));
         let report = load_llm_config(
@@ -1189,6 +1223,69 @@ mod tests {
             false,
         );
         assert!(report.is_err());
+    }
+
+    #[test]
+    fn gemini_model_is_percent_encoded_in_path() {
+        let config = LlmConfig {
+            provider: GEMINI.into(),
+            base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+            api_key: "test-value".into(),
+            model: "unused".into(),
+            timeout: Duration::from_secs(5),
+            max_retries: 0,
+            seed: 0,
+            endpoint_host: "generativelanguage.googleapis.com".into(),
+            endpoint_private: false,
+            send_sampling: true,
+            api_style: "chat".into(),
+        };
+        for (model, encoded) in [
+            ("a/b", "a%2Fb"),
+            ("a?b", "a%3Fb"),
+            ("a#b", "a%23b"),
+            ("a%b", "a%25b"),
+            ("../x", "..%2Fx"),
+            ("a..b", "a..b"),
+            ("a b", "a%20b"),
+        ] {
+            let request = LlmRequest {
+                system: "s".into(),
+                input: "i".into(),
+                model: model.into(),
+                seed: 0,
+                timeout: Duration::from_secs(5),
+            };
+            let (url, _, _) = gemini_call(&config, &request);
+            let expected = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{encoded}:generateContent"
+            );
+            assert_eq!(url, expected, "{model}");
+            let parsed = url::Url::parse(&url).unwrap();
+            assert!(parsed.query().is_none(), "{model} must not inject a query");
+            assert!(
+                parsed.fragment().is_none(),
+                "{model} must not inject a fragment"
+            );
+            let segs: Vec<_> = parsed.path_segments().unwrap().collect();
+            assert_eq!(
+                segs,
+                ["v1beta", "models", &format!("{encoded}:generateContent")],
+                "{model}"
+            );
+        }
+        let request = LlmRequest {
+            system: "s".into(),
+            input: "i".into(),
+            model: "gemini-2.5-pro-001".into(),
+            seed: 0,
+            timeout: Duration::from_secs(5),
+        };
+        let (url, _, _) = gemini_call(&config, &request);
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-001:generateContent"
+        );
     }
 
     #[test]
