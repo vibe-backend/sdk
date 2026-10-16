@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 pub fn sign_lock(text_with_none: &str, key: &SigningKey) -> String {
     let signature = hex::encode(key.sign(text_with_none.as_bytes()).to_bytes());
@@ -31,7 +31,8 @@ pub fn verify_bytes(bytes: &[u8], signature_hex: &str, key: &VerifyingKey) -> bo
     let Ok(signature) = Signature::from_slice(&raw) else {
         return false;
     };
-    key.verify(bytes, &signature).is_ok()
+    // Reject weak keys and non-canonical / malleable signatures.
+    key.verify_strict(bytes, &signature).is_ok()
 }
 
 pub fn generate_key() -> SigningKey {
@@ -69,4 +70,43 @@ pub fn load_public(dir: &std::path::Path) -> Result<VerifyingKey, String> {
         .try_into()
         .map_err(|_| "public key must be 32 bytes".to_string())?;
     VerifyingKey::from_bytes(&bytes).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn round_trip_uses_strict_verification() {
+        let key = generate_key();
+        let msg = b"manifest-bytes";
+        let sig = sign_bytes(msg, &key);
+        assert!(verify_bytes(msg, &sig, &key.verifying_key()));
+        assert!(!verify_bytes(b"other", &sig, &key.verifying_key()));
+    }
+
+    #[test]
+    fn weak_public_key_is_rejected() {
+        // Identity point (order 1) — a classic weak ed25519 public key.
+        let mut weak = [0u8; 32];
+        weak[0] = 1;
+        let vk = VerifyingKey::from_bytes(&weak).expect("identity encodes");
+        assert!(vk.is_weak());
+        let msg = b"anyone can forge under a weak key";
+        // A zero signature is enough: verify_strict must refuse the weak key
+        // before accepting any message.
+        let sig = Signature::from_bytes(&[0u8; 64]);
+        assert!(vk.verify_strict(msg, &sig).is_err());
+        assert!(!verify_bytes(msg, &hex::encode(sig.to_bytes()), &vk));
+    }
+
+    #[test]
+    fn non_canonical_signature_scalar_is_rejected() {
+        let key = generate_key();
+        let msg = b"payload";
+        let mut raw = key.sign(msg).to_bytes();
+        // Force s outside [0, L). Signature::from_slice may still accept the
+        // bytes; verify_strict must refuse the non-canonical scalar.
+        raw[63] |= 0xe0;
+        assert!(!verify_bytes(msg, &hex::encode(raw), &key.verifying_key()));
+    }
 }
