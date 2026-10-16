@@ -309,6 +309,9 @@ fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
         let ids = vibe::runtime::challenge::challenge_feature_ids(project);
         vibe::runtime::challenge::action_collisions(ids.iter().map(String::as_str))?;
     }
+    // #199: challenges that are declared but never verified at runtime.
+    let unverified = vibe::runtime::challenge::unverified_challenge_locks(project);
+    vibe::runtime::challenge::unverified_gate(run_env, &unverified)?;
     // #157: the replay store choice (the table itself is checked by `vibe serve`).
     let replay_kind =
         vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?;
@@ -383,6 +386,10 @@ async fn cmd_serve(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
+    // #199: refuse locks whose challenge is not verified at runtime, before
+    // loading the database or the manifest (locks in the project tree).
+    let unverified_locks = vibe::runtime::challenge::unverified_challenge_locks(project);
+    vibe::runtime::challenge::unverified_gate(run_env, &unverified_locks)?;
     // #157: production always uses the PostgreSQL replay store and
     // refuses the memory switch; dev/CI must choose explicitly. Decided
     // before loading anything.
@@ -480,6 +487,20 @@ async fn cmd_serve(
             .filter(|r| r.challenge_type != "none" && !r.challenge_type.is_empty())
             .map(|r| r.feature_id.as_str()),
     )?;
+    // #199: refuse challenges that are declared but never verified.
+    let unverified: Vec<String> = manifest
+        .routes
+        .iter()
+        .filter(|r| {
+            vibe::runtime::challenge::challenge_unverified(
+                r.public,
+                &r.challenge_type,
+                &r.challenge_when,
+            )
+        })
+        .map(|r| r.feature_id.clone())
+        .collect();
+    vibe::runtime::challenge::unverified_gate(run_env, &unverified)?;
     let addr: SocketAddr = addr.parse().map_err(|err| format!("bad address: {err}"))?;
     let state = Arc::new(AppState {
         manifest,

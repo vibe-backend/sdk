@@ -117,9 +117,15 @@ Implementation status: not yet aligned with spec decisions 131, 134 and 135 (fol
 
 In production (`VIBE_ENV`), `vibe serve` refuses to start and `vibe validate --deploy`
 fails if any route uses `challenge ... when: always` and no verifier is configured.
-Implementation status: the gate only covers public `when: always` routes; spec
-decision 134 also covers `after-failures` and authenticated opt-in routes
-(follow-up issues #200, #201).
+
+Only public routes with `when: always` are verified. A challenge declared with
+`when: after-failures` (for example on login routes) or on a non-public
+(authenticated) route is not verified yet. Such challenges are temporarily
+unsupported in production: `vibe serve` and `vibe validate --deploy` refuse
+these routes even when a verifier is configured (#199), until verified
+challenges on these routes are implemented (#201). Development and CI still accept them. Runtime verification for those
+modes is tracked in #201.
+
 Challenges do not replace server-side rate limits and quotas. The route's rate
 limits and the public write quota are checked before the challenge, so a
 limited request never reaches the replay cache or the provider.
