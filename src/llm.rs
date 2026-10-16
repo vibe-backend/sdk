@@ -1195,6 +1195,23 @@ mod tests {
         ] {
             assert!(!model_id_is_valid(GEMINI, bad), "{bad}");
         }
+        // #131 negative cases: backslash, controls, non-ASCII, '@', over 256 bytes
+        for bad in [
+            "a\\b",
+            "a\nb",
+            "a\0b",
+            "a\tb",
+            "caf\u{e9}",
+            "\u{4e2d}",
+            "a@b",
+        ] {
+            assert!(!model_id_is_valid(GEMINI, bad), "{bad:?}");
+            assert!(!model_id_is_valid(OPENAI, bad), "{bad:?}");
+        }
+        let over_256 = "a".repeat(257);
+        assert!(!model_id_is_valid(GEMINI, &over_256));
+        assert!(!model_id_is_valid(OPENAI, &over_256));
+        assert!(model_id_is_valid(GEMINI, &"a".repeat(256)));
         assert!(model_id_is_valid(OPENAI, "qwen2.5-coder:32b-instruct-q8_0"));
         assert!(!model_id_is_valid(OPENAI, "a?b"));
         let report = load_llm_config(
