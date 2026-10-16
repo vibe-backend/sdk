@@ -15,6 +15,7 @@ pub mod llm_budget;
 pub mod lock;
 pub mod lockcommit;
 pub mod manifest;
+pub mod netguard;
 pub mod prompt_guide;
 pub mod runtime;
 pub mod scan;

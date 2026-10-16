@@ -22,6 +22,7 @@ fn config(base_url: &str, max_retries: u32) -> LlmConfig {
         seed: 0,
         endpoint_host: "127.0.0.1".into(),
         endpoint_private: false,
+        send_sampling: true,
         api_style: "chat".into(),
     }
 }

@@ -7,7 +7,28 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
   - package-ecosystem: npm
     directory: /site
     schedule:
       interval: weekly
+    groups:
+      npm:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      rustcrypto:
+        patterns:
+          - "sha2"
+          - "hmac"
+          - "digest"
+          - "argon2"
+          - "password-hash"
+        update-types: ["minor", "patch"]
+      cargo:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

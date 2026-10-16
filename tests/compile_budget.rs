@@ -60,6 +60,7 @@ async fn format_retries_stop_at_the_call_budget() {
         seed: 0,
         endpoint_host: "127.0.0.1".into(),
         endpoint_private: false,
+        send_sampling: true,
         api_style: "chat".into(),
     };
     let adapter = HttpAdapter::new(config.clone()).unwrap();

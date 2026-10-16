@@ -81,7 +81,12 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         }
         if !structured {
             if let Some(config) = opts.llm_config {
-                if !crate::llm::sampling_registered(&config.provider, &config.model) {
+                if !config.send_sampling {
+                    report.push(Diag::warning(
+                        &source.rel,
+                        "LLM_SEND_SAMPLING=0; sampling parameters were not sent",
+                    ));
+                } else if !crate::llm::sampling_registered(&config.provider, &config.model) {
                     report.push(Diag::warning(
                         &source.rel,
                         "model is not in the capability table; sampling parameters were not sent",
@@ -166,7 +171,17 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                         model_snapshot: stamp.model_snapshot.clone(),
                         hash: hash.clone(),
                     });
-                    record_translation_for_audit(opts.root, &source.id, &hash, &text);
+                    if let Err(e) =
+                        record_translation_for_audit(opts.root, &source.id, &hash, &text)
+                    {
+                        report.push(Diag::error(
+                            &source.rel,
+                            format!(
+                                "could not write the D109 translation audit record under {TRANSLATION_AUDIT_DIR}: {e}"
+                            ),
+                        ));
+                        continue;
+                    }
                     english.insert(source.id.clone(), text);
                 }
                 Err(diag) => {
@@ -501,16 +516,19 @@ pub const TRANSLATION_AUDIT_DIR: &str = ".vibe/audit/translations";
 /// #97). When the release job builds it, include every file under
 /// `TRANSLATION_AUDIT_DIR` so its digest is covered by the attestation, and
 /// check each file's sha256 against the lock's `translation.hash`.
-fn record_translation_for_audit(root: &std::path::Path, id: &str, hash: &str, text: &str) {
+fn record_translation_for_audit(
+    root: &std::path::Path,
+    id: &str,
+    hash: &str,
+    text: &str,
+) -> std::io::Result<()> {
     let dir = root.join(TRANSLATION_AUDIT_DIR);
-    if fs::create_dir_all(&dir).is_err() {
-        return;
-    }
+    fs::create_dir_all(&dir)?;
     let name = id.replace('/', "__");
-    let _ = fs::write(
+    fs::write(
         dir.join(format!("{name}.txt")),
         format!("lock-id: {id}\ntranslation-hash: {hash}\n\n{text}"),
-    );
+    )
 }
 
 /// Prose outside code spans contains non-ASCII text.
@@ -1286,7 +1304,12 @@ fn dependencies(id: &str, docs: &HashMap<String, LockDoc>) -> Result<Vec<Depende
             }
             if let Some(calls) = find_section(&doc.sections, "Calls") {
                 if let Some(list) = calls.get("methods") {
-                    for target in parse_name_list(list) {
+                    let targets = parse_name_list(list, "Calls.methods")
+                        .map_err(|err| Diag::error(&doc.meta.source, err).at_section("Calls"))?;
+                    for target in targets {
+                        if let Err(err) = crate::validate::check_method_target(&target, docs) {
+                            return Err(Diag::error(&doc.meta.source, err).at_section("Calls"));
+                        }
                         if let Some(dep) = method_id(&target) {
                             ids.push((dep, Kind::Method));
                         }
@@ -1298,7 +1321,11 @@ fn dependencies(id: &str, docs: &HashMap<String, LockDoc>) -> Result<Vec<Depende
             Some(Scope::Definition) => {
                 if let Some(providers) = find_section(&doc.sections, "Providers") {
                     if let Some(list) = providers.get("allowlist") {
-                        for name in parse_name_list(list) {
+                        let names =
+                            parse_name_list(list, "Providers.allowlist").map_err(|err| {
+                                Diag::error(&doc.meta.source, err).at_section("Providers")
+                            })?;
+                        for name in names {
                             ids.push((name, Kind::Provider));
                         }
                     }
@@ -2080,8 +2107,9 @@ fn render_inline_list(items: &[String]) -> String {
     }
 }
 
-fn parse_name_list(raw: &str) -> Vec<String> {
-    crate::lock::parse_string_list(raw).unwrap_or_default()
+/// Fail closed: a malformed list is an error, never an empty list.
+fn parse_name_list(raw: &str, what: &str) -> Result<Vec<String>, String> {
+    crate::lock::parse_string_list(raw).map_err(|_| format!("{what} must be a list like `[a, b]`"))
 }
 
 #[cfg(test)]
@@ -2251,23 +2279,37 @@ mod prompt_tests {
         assert!(!data.contains('`'));
     }
 
-    /// #92 review P4: the API example is private + authenticated and passes
-    /// the full validator inside the shop project.
+    /// The prompt examples, written as structured sources into the shop
+    /// project, compile and pass the full validator (not just section checks).
+    /// The API example is private + authenticated (#92 review P4).
     #[tokio::test]
-    async fn authenticated_api_example_passes_full_validate() {
-        let prompt = system_prompt(Kind::Api, Some(Scope::Feature));
-        let body = prompt.split_once("LOCK BODY:\n").expect("example").1;
-        assert!(body.contains("- public: false") && body.contains("### auth\n- mode: jwt"));
-        assert!(!body.contains("-auth"));
-        let dir = std::env::temp_dir().join(format!("vibe-api-ex-{}", uuid::Uuid::new_v4()));
+    async fn prompt_examples_pass_full_validate() {
+        let dir = std::env::temp_dir().join(format!("vibe-examples-{}", uuid::Uuid::new_v4()));
         copy_dir(&shop_fixture(), &dir);
-        let path = dir.join("api/catalog/v1/example-get/example-get.md");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            body.replace("/products/{id}", "/example-products/{id}"),
-        )
-        .unwrap();
+        for (kind, scope, rel) in [
+            (Kind::Method, None, "models/product/methods/example.md"),
+            (
+                Kind::Api,
+                Some(Scope::Feature),
+                "api/catalog/v1/example-get/example-get.md",
+            ),
+        ] {
+            let prompt = system_prompt(kind, scope);
+            let body = prompt.split_once("LOCK BODY:\n").expect("example").1;
+            if kind == Kind::Api {
+                assert!(body.contains("- public: false") && body.contains("### auth\n- mode: jwt"));
+                assert!(!body.contains("-auth"));
+            }
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // The API example's route is already served by the shop; move it
+            // to its own path.
+            std::fs::write(
+                &path,
+                body.replace("/products/{id}", "/example-products/{id}"),
+            )
+            .unwrap();
+        }
         let opts = super::CompileOptions {
             root: &dir,
             llm: None,
@@ -2737,6 +2779,7 @@ mod stamp_tests {
             endpoint_host: "api.openai.com".into(),
             endpoint_private: false,
             api_style: "responses".into(),
+            send_sampling: true,
         };
         let stamp = stamp_from(Some(&config));
         assert_eq!(stamp.llm_provider, "openai-responses");

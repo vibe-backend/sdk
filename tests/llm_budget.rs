@@ -45,6 +45,7 @@ fn adapter(base_url: String, timeout: Duration) -> HttpAdapter {
         seed: 0,
         endpoint_host: "127.0.0.1".into(),
         endpoint_private: false,
+        send_sampling: true,
         api_style: "chat".into(),
     })
     .unwrap()

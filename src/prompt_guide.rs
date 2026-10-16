@@ -29,7 +29,7 @@ MODEL KEYS:
 
 const METHOD_KEYS: &str = "\
 METHOD KEYS:
-- ## Signature bullets: input ({ name: { type: T, required: true } }), output, errors ([CODE, ...]), writes (true|false), capabilities ([] or [sign-token] / [set-password] only when the source says so).
+- ## Signature bullets: input ({ name: { type: T, required: true } }), output, errors ([CODE, ...]), writes (true|false), capabilities ([] or [sign-token] / [set-password] / [confirm-verification] only when the source says so).
 - ## Calls: `- methods: [object.action, ...]` (platform recomputes it from steps).
 - ## Steps keys per op (plus `op` first and `source-lines` last on every step):
   - query: sql (`one parameterized statement` in backticks), params ([input.x, ctx.user.id, prev.x]), writes (true|false), scope (pk|rls, required for UPDATE), out.

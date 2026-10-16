@@ -79,6 +79,7 @@ fn config() -> LlmConfig {
         endpoint_host: "api.openai.com".into(),
         endpoint_private: false,
         api_style: "chat".into(),
+        send_sampling: true,
     }
 }
 
