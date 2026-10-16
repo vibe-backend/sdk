@@ -64,7 +64,7 @@ case $source_sha in *[!0-9a-f]*|'') die "invalid commit SHA for $VERSION";; esac
 gh attestation verify "$tmp/$asset" --repo "$ATTEST_REPO" --signer-workflow "$ATTEST_WORKFLOW" --source-ref "refs/tags/$VERSION" --source-digest "$source_sha" --deny-self-hosted-runners >/dev/null || die "GitHub artifact attestation verification failed"
 [ "$(tar -tzf "$tmp/$asset" | wc -l | tr -d ' ')" = 1 ] || die "archive must contain exactly one entry"
 [ "$(tar -tzf "$tmp/$asset")" = vibe ] || die "archive contains an unexpected path"
-mkdir "$tmp/unpack"; tar -xzf "$tmp/$asset" -C "$tmp/unpack" || die "failed to extract archive"; [ -f "$tmp/unpack/vibe" ] && [ ! -L "$tmp/unpack/vibe" ] || die "archive entry must be a regular file"
+mkdir "$tmp/unpack"; tar -xzf "$tmp/$asset" -C "$tmp/unpack" || die "failed to extract archive"; if [ -f "$tmp/unpack/vibe" ] && [ ! -L "$tmp/unpack/vibe" ]; then :; else die "archive entry must be a regular file"; fi
 chmod 755 "$tmp/unpack/vibe"; binary_sha=$(sha256_file "$tmp/unpack/vibe"); release_dir="$ROOT/versions/$VERSION-$binary_sha"
 if old=$(managed_target 2>/dev/null) && [ "$old" = "$release_dir/vibe" ] && [ -x "$old" ]; then printf 'vibe %s is already installed at %s\n' "$VERSION" "$BIN"; exit 0; fi
 if [ -e "$BIN" ] || [ -L "$BIN" ]; then managed_target >/dev/null || die "$BIN exists but is not managed by this script"; fi
