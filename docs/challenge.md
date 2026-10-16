@@ -110,7 +110,6 @@ Implementation status: not yet aligned with spec decisions 131, 134 and 135 (fol
 In production (`VIBE_ENV`), `vibe serve` refuses to start and `vibe validate --deploy`
 fails if any route uses `challenge ... when: always` and no verifier is configured.
 
-
 Only public routes with `when: always` are verified. A challenge declared with
 `when: after-failures` (for example on login routes) or on a non-public
 (authenticated) route is not verified yet, so in production `vibe serve` and
