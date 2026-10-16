@@ -99,6 +99,12 @@ jobs:
         with:
           toolchain: "1.89"
           targets: ${{ matrix.target }}
+      - name: Install NASM (aws-lc-sys, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Install aarch64 Linux linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
