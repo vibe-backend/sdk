@@ -377,6 +377,23 @@ async fn cmd_serve(
     let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
+    // `sign-jwt` key-refs name environment variables holding private PEMs.
+    auth.signing_keys =
+        vibe::runtime::load_signing_keys(&manifest, &|name| std::env::var(name).ok(), &auth.kid)?;
+    if memory {
+        let with_query: Vec<&str> = manifest
+            .methods
+            .iter()
+            .filter(|m| m.steps.iter().any(|s| s.op == "query"))
+            .map(|m| m.target.as_str())
+            .collect();
+        if !with_query.is_empty() {
+            eprintln!(
+                "warning: --memory does not run `query` steps; these methods will fail until you use PostgreSQL: {}",
+                with_query.join(", ")
+            );
+        }
+    }
     // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
     auth.add_route_jwks(&manifest.routes)?;
     let exec: Arc<dyn QueryExec> = if memory {
