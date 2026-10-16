@@ -33,6 +33,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Security
 
+- **Installer version policy (#169):** `scripts/vibe-install.sh` refuses releases below a hard-coded minimum (`v0.1.0`), including when `latest` resolves to an older tag through an overridden download source; the minimum cannot be changed by environment variables or arguments. Versions are compared per SemVer, downgrades require `--allow-downgrade` (never below the minimum), and `--sha256 <digest>` optionally pins the archive digest.
 - **JWT signing algorithm policy (#198, spec decision 139):** The spec now fixes the `sign-jwt` and JWT verification policy: only ES256 (default) and RS256; RS256 keys must be at least 2048 bits and a shorter key makes startup/deploy fail closed; verification accepts only the one configured alg and rejects any other `alg` header, including `none`, HS* and the other of ES256/RS256; EdDSA is deferred to vNext. Spec only; parts are not yet implemented (see spec 4.1a).
 - **Lock and manifest signatures (#167):** Lock and manifest signature verification now uses `verify_strict`; weak keys and non-canonical signatures are rejected (#151).
 

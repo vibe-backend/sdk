@@ -19,6 +19,7 @@
 
 1. 平台採 allowlist；不支援的平台 fail closed。
 2. install 強制明確 stable `vX.Y.Z`；upgrade 未指定版本時，僅接受相同 repository 的 GitHub `releases/latest` redirect。
+   - 腳本內硬編碼最低版本（`MIN_VERSION`，目前為 `v0.1.0`），環境變數（包括 `VIBE_INSTALL_*`）或參數都無法更改；低於最低版本的 `--version` 或解析出的 `latest` 一律拒絕（#169）。版本按 SemVer 逐段數值比較；降級需 `--allow-downgrade`，且仍不得低於最低版本。`--sha256 <digest>` 可選擇固定封存檔摘要，不符即失敗。
 3. 所有下載只用 HTTPS（`--proto '=https'`）及 TLS 1.2 以上（`--tlsv1.2`）；任何下載失敗都會立即停止。
 4. 資產必須先符合同一 release 的 `SHA256SUMS`，再以已登入的 GitHub CLI 通過 `gh attestation verify`（決定 118、spec 2C.3b／9C）：
 
