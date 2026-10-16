@@ -40,6 +40,21 @@ WARN vibe::rate_limit_saturation: rate-limit shard saturated; refusing new keys 
 
 `reason` is `owner_cap`, `network_cap`, `reserve` or `pinned`. Before release, add a log-based alert on that target (for example, any `reason="reserve"` or `reason="pinned"` line, or `refused` above a few dozen per minute), since those mean new clients are being turned away rather than one heavy network being capped.
 
+### Tenant and platform network-range caps (#132, D130)
+
+On top of the shard caps, every request that creates new buckets is charged to two layers of network-range slot counters. They count **new counter slots (reservations)**, not requests, the same meaning as the reserve caps above:
+
+- Tenant layer: `(tenant, IPv4 /24)` at most 10 new slots per window (`TENANT_NET_CAP`); `(tenant, IPv6 /48)` at most 10 and `(tenant, IPv6 /32)` at most 50 (`TENANT_V6_32_CAP`).
+- Platform layer: IPv4 /24 and IPv6 /48 across all tenants, at most 5x the tenant cap by default. Set `VIBE_RATE_PLATFORM_FACTOR` to change the multiplier.
+
+A request must pass both layers. There is no per-tenant reservation in v1. A refusal is the usual 429 `RATE_LIMITED` with `Retry-After`, and the response does not say which layer refused it. Requests that only hit existing buckets are not counted.
+
+These counters use **fixed** 60-second windows. Every other limit stays sliding-window. A client can get up to 2x a cap across a window edge (for example 10 new slots at second 59 and 10 more at second 60). This is an accepted risk.
+
+Counter slots are bounded: each tenant has its own slot cap (`slots_per_tenant`), so one tenant cannot take them all, and there are global caps for tenant and platform counters. Expired counters are cleared first, oldest first. A counter still inside its window is never evicted. If the slots are full and nothing has expired, the request fails closed with 429. Each such refusal increments `vibe::runtime::counter_slot_refusals()`, and the limiter logs at most once per minute at `WARN` with target `vibe::rate_limit_counter_slots`. Add an alert on that target.
+
+**Multi-instance deploys:** all limiter state, including these counters, lives in process memory, so each instance enforces its own caps. Deploys with more than one instance need shared storage (#157).
+
 ## Residual risks
 
 - `release` environment admin bypass is enabled (`can_admins_bypass: true`). An admin can deploy without Jack's environment approval. Jack accepted this risk.

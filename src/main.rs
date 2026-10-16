@@ -421,7 +421,9 @@ async fn cmd_serve(
         exec,
         auth,
         slugs: loaded.slugs,
-        rates: std::sync::Mutex::new(Default::default()),
+        rates: std::sync::Mutex::new(vibe::runtime::RateBuckets::with_limits(
+            net_limits_from_env()?,
+        )),
         quotas: std::sync::Mutex::new(Default::default()),
         disabled: load_disabled(project),
         min_override_ms: None,
@@ -544,6 +546,23 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
 
 /// `VIBE_TRUSTED_PROXIES`: comma-separated proxy IPs or CIDR blocks whose
 /// `X-Forwarded-For` is honoured. Unset = trust no proxy (use the peer).
+/// D130 limits; `VIBE_RATE_PLATFORM_FACTOR` sets the platform cap as a
+/// multiple of the tenant cap (default 5).
+fn net_limits_from_env() -> Result<vibe::runtime::NetLimits, String> {
+    let mut limits = vibe::runtime::NetLimits::default();
+    if let Ok(raw) = std::env::var("VIBE_RATE_PLATFORM_FACTOR") {
+        limits.platform_factor = raw
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|f| *f >= 1)
+            .ok_or_else(|| {
+                format!("VIBE_RATE_PLATFORM_FACTOR must be a positive integer, got {raw}")
+            })?;
+    }
+    Ok(limits)
+}
+
 fn trusted_proxies_from_env() -> Result<Vec<vibe::runtime::ProxyNet>, String> {
     let Ok(raw) = std::env::var("VIBE_TRUSTED_PROXIES") else {
         return Ok(Vec::new());

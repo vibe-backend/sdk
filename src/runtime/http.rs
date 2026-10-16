@@ -1475,7 +1475,7 @@ fn rate_limited(
     let Ok(mut rates) = state.rates.lock() else {
         return Some("1".into());
     };
-    match rates.check(&checks, &owner_of(ip), Instant::now()) {
+    match rates.check_tenant(&checks, &principal.tenant_id, &owner_of(ip), Instant::now()) {
         RateDecision::Allow => None,
         RateDecision::Limited(wait) => Some(wait.to_string()),
     }

@@ -175,10 +175,17 @@ impl<V> BoundedMap<V> {
     }
 }
 
-/// Sliding one-minute windows, sharded by `(route, key type)`.
-#[derive(Default)]
+/// Sliding one-minute windows, sharded by `(route, key type)`, plus the D130
+/// tenant and platform network-range layers.
 pub struct RateBuckets {
     shards: HashMap<String, RateShard>,
+    net: NetLayers,
+}
+
+impl Default for RateBuckets {
+    fn default() -> Self {
+        Self::with_limits(NetLimits::default())
+    }
 }
 
 /// One shard plus the per-network accounting of who created its buckets.
@@ -364,12 +371,41 @@ pub enum RateDecision {
 }
 
 impl RateBuckets {
-    /// `checks` = `(shard, bucket key, per-minute limit)`; `owner` is the
-    /// client network ([`owner_of`]) that new buckets are charged to. The
-    /// request is counted only when every bucket admits it.
-    pub fn check(
+    pub fn with_limits(limits: NetLimits) -> Self {
+        Self {
+            shards: HashMap::new(),
+            net: NetLayers::new(limits),
+        }
+    }
+
+    /// Shard logic only (D130 layers off), for the #73 tests.
+    #[cfg(test)]
+    fn shard_only() -> Self {
+        Self::with_limits(NetLimits {
+            tenant_net_cap: 0,
+            ..NetLimits::default()
+        })
+    }
+
+    /// [`check_tenant`](Self::check_tenant) for one fixed tenant.
+    #[cfg(test)]
+    fn check(
         &mut self,
         checks: &[(String, String, u32)],
+        owner: &str,
+        now: Instant,
+    ) -> RateDecision {
+        self.check_tenant(checks, "t0", owner, now)
+    }
+
+    /// `checks` = `(shard, bucket key, per-minute limit)`; `owner` is the
+    /// client network ([`owner_of`]) that new buckets are charged to, within
+    /// `tenant` (D130). The request is counted only when every bucket and
+    /// both D130 layers admit it.
+    pub fn check_tenant(
+        &mut self,
+        checks: &[(String, String, u32)],
+        tenant: &str,
         owner: &str,
         now: Instant,
     ) -> RateDecision {
@@ -414,6 +450,22 @@ impl RateBuckets {
                 return RateDecision::Limited(WINDOW.as_secs());
             }
         }
+        // D130: tenant and platform network-range slot counters. Same
+        // response for either layer.
+        let new = checks
+            .iter()
+            .filter(|(shard, key, _)| self.shards[shard].map.get(key).is_none())
+            .map(|(shard, key, _)| (shard.as_str(), key.as_str()))
+            .collect::<std::collections::HashSet<_>>()
+            .len() as u32;
+        match self.net.charge(tenant, owner, new, now) {
+            Ok(()) => {}
+            Err(NetRefusal::Cap(wait)) => return RateDecision::Limited(wait),
+            Err(NetRefusal::SlotsFull(layer, wait)) => {
+                self.net.log_full(layer, now);
+                return RateDecision::Limited(wait);
+            }
+        }
         for (shard, key, limit) in checks {
             let rs = self.shards.get_mut(shard).expect("created above");
             if rs.map.get(key).is_some() {
@@ -434,6 +486,366 @@ impl RateBuckets {
             }
         }
         RateDecision::Allow
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D130 (#132): tenant-scoped and platform network-range slot counters.
+//
+// The per-shard caps above are shared by every tenant on a route. D130 adds
+// two layers that count NEW rate buckets (slot reservations, the same meaning
+// as the #73 reserve caps) per network range in fixed windows of [`WINDOW`]:
+//
+// * tenant layer: `(tenant, IPv4 /24)` cap 10; `(tenant, IPv6 /48)` cap 10
+//   plus `(tenant, IPv6 /32)` cap 50;
+// * platform layer: `IPv4 /24` and `IPv6 /48` across all tenants, cap
+//   `platform_factor` (default 5) times the tenant cap.
+//
+// A request that creates new buckets must pass both layers; requests that
+// only hit existing buckets are not counted here. There is no per-tenant
+// reservation in v1. A refusal is a plain 429 with `Retry-After`; the caller
+// cannot tell which layer refused.
+//
+// Fixed windows apply only to these counters; every other limit stays
+// sliding-window. A client can get up to 2x a cap across a window edge
+// (accepted risk, docs/release-hardening.md).
+//
+// Counter slots are bounded: each tenant has its own slot cap and there is a
+// global one. Expired counters are cleared first (oldest first); a counter
+// inside its window is NEVER evicted. When no slot can be freed the request
+// fails closed (429) and [`counter_slot_refusals`] is incremented.
+//
+// State is per process: multi-instance deploys need shared storage (#157).
+// ---------------------------------------------------------------------------
+
+/// Requests refused because D130 counter slots were full of live counters.
+static COUNTER_SLOT_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total requests refused (fail closed) because D130 counter slots were full.
+pub fn counter_slot_refusals() -> u64 {
+    COUNTER_SLOT_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// New-bucket caps per window for one tenant: IPv4 /24 and IPv6 /48.
+pub const TENANT_NET_CAP: u32 = 10;
+/// New-bucket cap per window for one tenant's IPv6 /32.
+pub const TENANT_V6_32_CAP: u32 = 50;
+/// Default platform cap multiplier (platform cap = factor x tenant cap).
+pub const PLATFORM_FACTOR: u32 = 5;
+
+/// D130 limits; see the section comment above.
+#[derive(Clone, Debug)]
+pub struct NetLimits {
+    /// `0` disables the D130 layers (tests of the shard logic only).
+    pub tenant_net_cap: u32,
+    pub tenant_v6_32_cap: u32,
+    pub platform_factor: u32,
+    /// Counter slots one tenant may hold.
+    pub slots_per_tenant: usize,
+    /// Counter slots across all tenants.
+    pub tenant_slots_total: usize,
+    /// Counter slots of the platform layer.
+    pub platform_slots: usize,
+}
+
+impl Default for NetLimits {
+    fn default() -> Self {
+        Self {
+            tenant_net_cap: TENANT_NET_CAP,
+            tenant_v6_32_cap: TENANT_V6_32_CAP,
+            platform_factor: PLATFORM_FACTOR,
+            slots_per_tenant: 4_096,
+            tenant_slots_total: 65_536,
+            platform_slots: 65_536,
+        }
+    }
+}
+
+impl NetLimits {
+    fn platform_cap(&self) -> u32 {
+        self.tenant_net_cap.saturating_mul(self.platform_factor)
+    }
+}
+
+/// One fixed-window counter.
+struct FixedCounter {
+    start: Instant,
+    count: u32,
+}
+
+impl FixedCounter {
+    fn live(&self, now: Instant) -> bool {
+        now.duration_since(self.start) < WINDOW
+    }
+}
+
+/// Fixed-window counters grouped by tenant, with a per-group and a total slot
+/// cap. Queues hold `(group, key, window start)` in start order; records whose
+/// counter was removed or restarted are stale and skipped.
+struct CounterTable {
+    per_group: usize,
+    total: usize,
+    entries: HashMap<(String, String), FixedCounter>,
+    group_len: HashMap<String, usize>,
+    group_queue: HashMap<String, VecDeque<(String, Instant)>>,
+    queue: VecDeque<(String, String, Instant)>,
+}
+
+impl CounterTable {
+    fn new(per_group: usize, total: usize) -> Self {
+        Self {
+            per_group: per_group.max(1),
+            total: total.max(1),
+            entries: HashMap::new(),
+            group_len: HashMap::new(),
+            group_queue: HashMap::new(),
+            queue: VecDeque::new(),
+        }
+    }
+
+    fn is_current(&self, group: &str, key: &str, start: Instant) -> bool {
+        self.entries
+            .get(&(group.to_string(), key.to_string()))
+            .is_some_and(|c| c.start == start)
+    }
+
+    fn remove(&mut self, group: &str, key: &str) {
+        if self
+            .entries
+            .remove(&(group.to_string(), key.to_string()))
+            .is_some()
+        {
+            if let Some(n) = self.group_len.get_mut(group) {
+                *n -= 1;
+                if *n == 0 {
+                    self.group_len.remove(group);
+                    self.group_queue.remove(group);
+                }
+            }
+        }
+    }
+
+    /// Clears expired counters, oldest first: `group`'s, then any group's.
+    /// Stops at the first live counter (later ones started later), so live
+    /// counters are never removed. Amortized O(1).
+    fn sweep(&mut self, group: &str, now: Instant) {
+        while let Some((key, start)) = self.group_queue.get(group).and_then(|q| q.front()).cloned()
+        {
+            if self.is_current(group, &key, start) {
+                if now.duration_since(start) < WINDOW {
+                    break;
+                }
+                self.remove(group, &key);
+            }
+            if let Some(q) = self.group_queue.get_mut(group) {
+                q.pop_front();
+            }
+        }
+        while let Some((g, key, start)) = self.queue.front().cloned() {
+            if self.is_current(&g, &key, start) {
+                if now.duration_since(start) < WINDOW {
+                    break;
+                }
+                self.remove(&g, &key);
+            }
+            self.queue.pop_front();
+        }
+    }
+
+    /// Live count for `key` (0 when absent or expired).
+    fn count(&self, group: &str, key: &str, now: Instant) -> u32 {
+        self.entries
+            .get(&(group.to_string(), key.to_string()))
+            .filter(|c| c.live(now))
+            .map_or(0, |c| c.count)
+    }
+
+    /// Seconds until `key`'s window ends.
+    fn wait(&self, group: &str, key: &str, now: Instant) -> u64 {
+        self.entries
+            .get(&(group.to_string(), key.to_string()))
+            .map_or(1, |c| retry_after(c.start, now))
+    }
+
+    /// Slots that must be free to add the absent `keys`, versus free slots
+    /// (after [`sweep`](Self::sweep)). `Err` carries seconds until the oldest
+    /// live counter in the way expires.
+    fn room(&self, group: &str, keys: &[&str], now: Instant) -> Result<(), u64> {
+        let missing = keys
+            .iter()
+            .filter(|k| {
+                !self
+                    .entries
+                    .contains_key(&(group.to_string(), k.to_string()))
+            })
+            .count();
+        let used = self.group_len.get(group).copied().unwrap_or(0);
+        if used + missing <= self.per_group && self.entries.len() + missing <= self.total {
+            return Ok(());
+        }
+        let oldest = if used + missing > self.per_group {
+            self.group_queue
+                .get(group)
+                .and_then(|q| q.iter().find(|(k, s)| self.is_current(group, k, *s)))
+                .map(|(_, s)| *s)
+        } else {
+            self.queue
+                .iter()
+                .find(|(g, k, s)| self.is_current(g, k, *s))
+                .map(|(_, _, s)| *s)
+        };
+        Err(oldest.map_or(WINDOW.as_secs(), |s| retry_after(s, now)))
+    }
+
+    /// Adds `n` to `key`, restarting its window if expired. Call only after
+    /// [`room`](Self::room) succeeded.
+    fn add(&mut self, group: &str, key: &str, n: u32, now: Instant) {
+        let id = (group.to_string(), key.to_string());
+        match self.entries.get_mut(&id) {
+            Some(c) if c.live(now) => {
+                c.count += n;
+                return;
+            }
+            Some(c) => {
+                c.start = now;
+                c.count = n;
+            }
+            None => {
+                self.entries.insert(
+                    id,
+                    FixedCounter {
+                        start: now,
+                        count: n,
+                    },
+                );
+                *self.group_len.entry(group.to_string()).or_insert(0) += 1;
+            }
+        }
+        self.group_queue
+            .entry(group.to_string())
+            .or_default()
+            .push_back((key.to_string(), now));
+        self.queue
+            .push_back((group.to_string(), key.to_string(), now));
+        if self.queue.len() > self.entries.len() * 4 + 64 {
+            let entries = &self.entries;
+            self.queue.retain(|(g, k, s)| {
+                entries
+                    .get(&(g.clone(), k.clone()))
+                    .is_some_and(|c| c.start == *s)
+            });
+            for (g, q) in self.group_queue.iter_mut() {
+                q.retain(|(k, s)| {
+                    entries
+                        .get(&(g.clone(), k.clone()))
+                        .is_some_and(|c| c.start == *s)
+                });
+            }
+        }
+    }
+}
+
+/// The D130 layers.
+struct NetLayers {
+    limits: NetLimits,
+    tenants: CounterTable,
+    platform: CounterTable,
+    full_logged: Option<Instant>,
+}
+
+/// Which table a refusal came from (logs only, never the response).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NetRefusal {
+    Cap(u64),
+    SlotsFull(&'static str, u64),
+}
+
+impl NetLayers {
+    fn new(limits: NetLimits) -> Self {
+        Self {
+            tenants: CounterTable::new(limits.slots_per_tenant, limits.tenant_slots_total),
+            platform: CounterTable::new(limits.platform_slots, limits.platform_slots),
+            limits,
+            full_logged: None,
+        }
+    }
+
+    /// `(tenant keys with caps, platform keys)` for an [`owner_of`] string.
+    fn keys(&self, owner: &str) -> (Vec<(String, u32)>, Vec<String>) {
+        let [net, wider] = owner_levels(owner);
+        let cap = self.limits.tenant_net_cap;
+        if net.ends_with("/48") {
+            (
+                vec![(net.clone(), cap), (wider, self.limits.tenant_v6_32_cap)],
+                vec![net],
+            )
+        } else {
+            (vec![(wider.clone(), cap)], vec![wider])
+        }
+    }
+
+    /// Charges `n` new buckets to `tenant` and the client's network ranges, or
+    /// refuses without counting anything.
+    fn charge(
+        &mut self,
+        tenant: &str,
+        owner: &str,
+        n: u32,
+        now: Instant,
+    ) -> Result<(), NetRefusal> {
+        if self.limits.tenant_net_cap == 0 || n == 0 {
+            return Ok(());
+        }
+        let (tkeys, pkeys) = self.keys(owner);
+        let pcap = self.limits.platform_cap();
+        self.tenants.sweep(tenant, now);
+        self.platform.sweep("", now);
+        let mut wait = 0;
+        for (k, cap) in &tkeys {
+            if self.tenants.count(tenant, k, now) + n > *cap {
+                wait = wait.max(self.tenants.wait(tenant, k, now));
+            }
+        }
+        for k in &pkeys {
+            if self.platform.count("", k, now) + n > pcap {
+                wait = wait.max(self.platform.wait("", k, now));
+            }
+        }
+        if wait > 0 {
+            return Err(NetRefusal::Cap(wait));
+        }
+        let tk: Vec<&str> = tkeys.iter().map(|(k, _)| k.as_str()).collect();
+        let pk: Vec<&str> = pkeys.iter().map(String::as_str).collect();
+        if let Err(w) = self.tenants.room(tenant, &tk, now) {
+            return Err(NetRefusal::SlotsFull("tenant", w));
+        }
+        if let Err(w) = self.platform.room("", &pk, now) {
+            return Err(NetRefusal::SlotsFull("platform", w));
+        }
+        for k in tk {
+            self.tenants.add(tenant, k, n, now);
+        }
+        for k in pk {
+            self.platform.add("", k, n, now);
+        }
+        Ok(())
+    }
+
+    fn log_full(&mut self, layer: &'static str, now: Instant) {
+        COUNTER_SLOT_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self
+            .full_logged
+            .is_some_and(|at| now.duration_since(at) < WINDOW)
+        {
+            return;
+        }
+        self.full_logged = Some(now);
+        tracing::warn!(
+            target: "vibe::rate_limit_counter_slots",
+            layer,
+            refused_total = counter_slot_refusals(),
+            "rate-limit counter slots full of live counters; failing closed"
+        );
     }
 }
 
@@ -606,7 +1018,7 @@ mod tests {
 
     #[test]
     fn flooding_one_shard_does_not_block_a_normal_client() {
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         let now = Instant::now();
         let shard = "login:input.email".to_string();
         for i in 0..(SHARD_CAPACITY * 2) {
@@ -640,7 +1052,7 @@ mod tests {
 
     #[test]
     fn rotating_junk_keys_cannot_reset_a_limited_bucket() {
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         let now = Instant::now();
         let shard = "login:input.email".to_string();
         let victim = [(shard.clone(), "victim@x".to_string(), 3)];
@@ -681,7 +1093,7 @@ mod tests {
 
     #[test]
     fn full_pinned_shard_refuses_only_new_keys_in_that_shard() {
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         let now = Instant::now();
         let shard = "login:input.email".to_string();
         for i in 0..SHARD_CAPACITY {
@@ -749,7 +1161,7 @@ mod tests {
 
     #[test]
     fn saturation_refusals_are_counted() {
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         let now = Instant::now();
         let shard = "signup:input.email".to_string();
         let before = saturation_refusals();
@@ -778,7 +1190,7 @@ mod tests {
     fn many_ipv6_64s_from_one_48_cannot_fill_a_shard() {
         // Issue #71: every /64 gets its own IP bucket, so a client with many
         // /64s could pin a whole shard with at-limit buckets.
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         let now = Instant::now();
         let shard = "login:ip".to_string();
         let mut refused = 0;
@@ -811,7 +1223,7 @@ mod tests {
 
     #[test]
     fn owner_cap_frees_up_after_the_window() {
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         let now = Instant::now();
         let shard = "signup:input.email".to_string();
         let owner = "2001:db8:1::/48";
@@ -840,7 +1252,7 @@ mod tests {
 
     #[test]
     fn owner_cap_is_per_shard_and_eviction_releases_ownership() {
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         let now = Instant::now();
         let owner = "198.51.100.7";
         for i in 0..OWNER_CAP {
@@ -887,14 +1299,14 @@ mod tests {
     fn a_hundred_ipv6_48s_cannot_lock_out_new_clients() {
         let now = Instant::now();
         // Same /32: the wider-network cap stops them at NETWORK_CAP.
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         for n in 0..100 {
             let owner = format!("2001:db8:{n:x}::/48");
             pinned_fill(&mut rates, "login:ip", &owner, OWNER_CAP, &owner, now);
         }
         assert_eq!(rates.shards["login:ip"].map.entries.len(), NETWORK_CAP);
         // 100 /48s in 100 different /32s: the reserve keeps room.
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         for n in 0..100 {
             let owner = format!("2001:{:x}:1::/48", 0x100 + n);
             pinned_fill(&mut rates, "login:ip", &owner, OWNER_CAP, &owner, now);
@@ -916,14 +1328,14 @@ mod tests {
         let now = Instant::now();
         let shard = "login:input.email";
         // One /24.
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         for n in 0..100 {
             let owner = format!("198.51.100.{n}");
             pinned_fill(&mut rates, shard, &owner, OWNER_CAP, &owner, now);
         }
         assert_eq!(rates.shards[shard].map.entries.len(), NETWORK_CAP);
         // 100 different /24s.
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         for n in 0..100 {
             let owner = format!("100.{n}.0.1");
             pinned_fill(&mut rates, shard, &owner, OWNER_CAP, &owner, now);
@@ -950,7 +1362,7 @@ mod tests {
         // VIBE_TRUSTED_PROXIES is unset) share that address's allowance.
         let now = Instant::now();
         let shard = "signup:input.email";
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         let cgnat = "100.64.0.1";
         for user in 0..OWNER_CAP {
             assert!(matches!(
@@ -1091,7 +1503,7 @@ mod tests {
         // (one line), then again after the window (a second line counting
         // the refusals since the first).
         let (_, events) = capture(|| {
-            let mut rates = RateBuckets::default();
+            let mut rates = RateBuckets::shard_only();
             let shard = "s".to_string();
             for i in 0..OWNER_CAP + 2 {
                 rates.check(&[(shard.clone(), format!("k{i}"), 1)], "192.0.2.1", now);
@@ -1109,7 +1521,7 @@ mod tests {
         // buckets 30s later and is refused twice (no line), then once more a
         // minute after line 1 while its buckets are still live (line 2).
         let (_, events) = capture(|| {
-            let mut rates = RateBuckets::default();
+            let mut rates = RateBuckets::shard_only();
             let shard = "s";
             let a = "192.0.2.1";
             let b = "198.51.100.1";
@@ -1125,7 +1537,7 @@ mod tests {
 
         // network_cap: 11 addresses of one /24.
         let (_, events) = capture(|| {
-            let mut rates = RateBuckets::default();
+            let mut rates = RateBuckets::shard_only();
             for host in 0..11 {
                 let owner = format!("198.51.100.{host}");
                 pinned_fill(&mut rates, "s", &owner, OWNER_CAP, &owner, now);
@@ -1140,7 +1552,7 @@ mod tests {
         // reserve with pinned buckets and the next new key is refused
         // (pinned).
         let (_, events) = capture(|| {
-            let mut rates = RateBuckets::default();
+            let mut rates = RateBuckets::shard_only();
             fill_29_24s(&mut rates, "a", 9, now);
             assert_eq!(rates.shards["a"].map.len(), SHARD_CAPACITY - RESERVE);
             pinned_fill(
@@ -1151,7 +1563,7 @@ mod tests {
                 "r",
                 now,
             );
-            let mut rates = RateBuckets::default();
+            let mut rates = RateBuckets::shard_only();
             fill_29_24s(&mut rates, "b", 9, now);
             for n in 0..RESERVE / RESERVE_OWNER_CAP {
                 let owner = format!("172.{}.{}.1", 16 + n / 256, n % 256);
@@ -1179,7 +1591,7 @@ mod tests {
         // reserve keeps room for new clients.
         let now = Instant::now();
         let shard = "login:input.email";
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         let refused = fill_29_24s(&mut rates, shard, 29, now);
         let len = rates.shards[shard].map.len();
         assert!(len < SHARD_CAPACITY, "shard is full: {len}");
@@ -1222,7 +1634,7 @@ mod tests {
     #[test]
     fn reserve_caps_each_ipv6_48_at_10() {
         let now = Instant::now();
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         fill_outside_reserve(&mut rates, "s", now);
         assert_eq!(
             new_keys(&mut rates, "s", "2001:db8:1::/48", 30, now),
@@ -1238,7 +1650,7 @@ mod tests {
     #[test]
     fn reserve_caps_each_ipv6_32_at_50_across_many_48s() {
         let now = Instant::now();
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         fill_outside_reserve(&mut rates, "s", now);
         let got: usize = (0..40)
             .map(|n| new_keys(&mut rates, "s", &format!("2001:db8:{n:x}::/48"), 30, now))
@@ -1254,7 +1666,7 @@ mod tests {
     #[test]
     fn reserve_caps_for_ipv4_are_unchanged() {
         let now = Instant::now();
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         fill_outside_reserve(&mut rates, "s", now);
         assert_eq!(
             new_keys(&mut rates, "s", "198.51.100.1", 30, now),
@@ -1272,7 +1684,7 @@ mod tests {
     #[test]
     fn reserve_still_admits_new_clients_after_heavy_ipv6_32s() {
         let now = Instant::now();
-        let mut rates = RateBuckets::default();
+        let mut rates = RateBuckets::shard_only();
         fill_outside_reserve(&mut rates, "s", now);
         // 10 /32s, each spreading over 20 /48s, use their reserve allowance.
         for a in 0..10 {
@@ -1290,5 +1702,259 @@ mod tests {
         assert_eq!(new_keys(&mut rates, "s", "203.0.113.9", 1, now), 1);
         let v6 = ip_bucket("2a00:1450:4001::1".parse().unwrap());
         assert_eq!(new_keys(&mut rates, "s", &owner_of(&v6), 1, now), 1);
+    }
+
+    // ---- D130 (#132) ----
+
+    /// `None` when allowed, else the Retry-After seconds.
+    fn d130(
+        rates: &mut RateBuckets,
+        tenant: &str,
+        owner: &str,
+        key: &str,
+        now: Instant,
+    ) -> Option<u64> {
+        match rates.check_tenant(&[("s".into(), key.into(), 5)], tenant, owner, now) {
+            RateDecision::Allow => None,
+            RateDecision::Limited(w) => Some(w),
+        }
+    }
+
+    /// New keys admitted out of `n` for `tenant` from `owner`.
+    fn d130_fill(
+        rates: &mut RateBuckets,
+        tenant: &str,
+        owner: &str,
+        n: usize,
+        now: Instant,
+    ) -> usize {
+        (0..n)
+            .filter(|i| d130(rates, tenant, owner, &format!("{tenant}-{owner}-{i}"), now).is_none())
+            .count()
+    }
+
+    fn small_slots(per_tenant: usize, total: usize, platform: usize) -> RateBuckets {
+        RateBuckets::with_limits(NetLimits {
+            slots_per_tenant: per_tenant,
+            tenant_slots_total: total,
+            platform_slots: platform,
+            ..NetLimits::default()
+        })
+    }
+
+    #[test]
+    fn d130_tenant_ipv4_24_caps_new_slots_at_10_per_window() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::default();
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.100.1", 6, now), 6);
+        // The cap is per /24, not per address.
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.100.2", 10, now), 4);
+        assert_eq!(d130(&mut rates, "ta", "198.51.100.3", "x", now), Some(60));
+        let t = now + Duration::from_secs(20);
+        assert_eq!(d130(&mut rates, "ta", "198.51.100.3", "x", t), Some(40));
+        // Another /24 is unaffected.
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.101.1", 10, now), 10);
+        // Existing buckets are not new slots and keep working.
+        assert_eq!(
+            d130(&mut rates, "ta", "198.51.100.1", "ta-198.51.100.1-0", now),
+            None
+        );
+        // Fixed window: a fresh allowance once it ends.
+        assert_eq!(
+            d130_fill(&mut rates, "ta", "198.51.100.9", 11, now + WINDOW),
+            10
+        );
+    }
+
+    #[test]
+    fn d130_tenant_ipv6_caps_48_at_10_and_32_at_50() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::default();
+        assert_eq!(d130_fill(&mut rates, "ta", "2001:db8:1::/48", 15, now), 10);
+        let got: usize = (2..20)
+            .map(|n| d130_fill(&mut rates, "ta", &format!("2001:db8:{n:x}::/48"), 15, now))
+            .sum();
+        assert_eq!(got, 40, "the /32 allows 50 in total");
+        assert_eq!(d130_fill(&mut rates, "ta", "2001:db9:1::/48", 15, now), 10);
+    }
+
+    #[test]
+    fn d130_tenants_are_isolated() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::default();
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.100.1", 30, now), 10);
+        assert_eq!(d130_fill(&mut rates, "tb", "198.51.100.1", 30, now), 10);
+        assert_eq!(d130_fill(&mut rates, "ta", "2001:db8:1::/48", 30, now), 10);
+        assert_eq!(d130_fill(&mut rates, "tb", "2001:db8:1::/48", 30, now), 10);
+    }
+
+    #[test]
+    fn d130_platform_caps_a_network_across_tenants() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::default();
+        for t in 0..5 {
+            assert_eq!(
+                d130_fill(&mut rates, &format!("t{t}"), "198.51.100.1", 10, now),
+                10
+            );
+            assert_eq!(
+                d130_fill(&mut rates, &format!("t{t}"), "2001:db8:1::/48", 10, now),
+                10
+            );
+        }
+        // 50 = 5 x 10 used: a fresh tenant is refused on that /24 and /48.
+        assert_eq!(d130_fill(&mut rates, "t5", "198.51.100.7", 10, now), 0);
+        assert_eq!(d130_fill(&mut rates, "t5", "2001:db8:1::/48", 10, now), 0);
+        // Platform counters are per /48 (another /48 of the /32 is fine).
+        assert_eq!(d130_fill(&mut rates, "t5", "2001:db8:2::/48", 10, now), 10);
+        assert_eq!(d130_fill(&mut rates, "t5", "198.51.101.1", 10, now), 10);
+    }
+
+    #[test]
+    fn d130_platform_factor_is_configurable() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::with_limits(NetLimits {
+            platform_factor: 2,
+            ..NetLimits::default()
+        });
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.100.1", 10, now), 10);
+        assert_eq!(d130_fill(&mut rates, "tb", "198.51.100.1", 10, now), 10);
+        assert_eq!(d130_fill(&mut rates, "tc", "198.51.100.1", 10, now), 0);
+    }
+
+    #[test]
+    fn d130_refusal_does_not_reveal_the_layer() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::default();
+        // Tenant layer refusal.
+        d130_fill(&mut rates, "ta", "198.51.100.1", 10, now);
+        let tenant = d130(&mut rates, "ta", "198.51.100.1", "x", now);
+        // Platform layer refusal on another /24.
+        for t in 0..5 {
+            d130_fill(&mut rates, &format!("p{t}"), "203.0.113.1", 10, now);
+        }
+        let platform = d130(&mut rates, "fresh", "203.0.113.1", "x", now);
+        assert_eq!(tenant, Some(60));
+        assert_eq!(tenant, platform);
+    }
+
+    #[test]
+    fn d130_refused_request_counts_nothing() {
+        let now = Instant::now();
+        let mut rates = RateBuckets::default();
+        d130_fill(&mut rates, "ta", "198.51.100.1", 10, now);
+        let checks = [
+            ("s".to_string(), "new".to_string(), 5),
+            ("ip".to_string(), "198.51.100.1".to_string(), 5),
+        ];
+        assert!(!allowed(rates.check_tenant(
+            &checks,
+            "ta",
+            "198.51.100.1",
+            now
+        )));
+        assert!(rates.shards["s"].map.get("new").is_none());
+        assert!(rates
+            .shards
+            .get("ip")
+            .is_none_or(|s| s.map.get("198.51.100.1").is_none()));
+    }
+
+    #[test]
+    fn d130_full_slots_with_nothing_expired_fail_closed_with_metric() {
+        let now = Instant::now();
+        let mut rates = small_slots(2, 100, 100);
+        let ((), events) = capture(|| {
+            assert_eq!(d130_fill(&mut rates, "ta", "198.51.100.1", 1, now), 1);
+            assert_eq!(d130_fill(&mut rates, "ta", "198.51.101.1", 1, now), 1);
+            let before = counter_slot_refusals();
+            let t = now + Duration::from_secs(15);
+            assert_eq!(d130(&mut rates, "ta", "198.51.102.1", "x", t), Some(45));
+            assert_eq!(d130(&mut rates, "ta", "198.51.102.1", "y", t), Some(45));
+            assert!(counter_slot_refusals() >= before + 2);
+        });
+        let ours: Vec<_> = events
+            .iter()
+            .filter(|e| e.0 == "vibe::rate_limit_counter_slots")
+            .collect();
+        assert_eq!(ours.len(), 1, "rate-limited log line: {events:?}");
+        // Per-tenant slot caps: another tenant is unaffected.
+        assert_eq!(d130_fill(&mut rates, "tb", "198.51.102.1", 1, now), 1);
+        // Expired counters are cleared first, then the slot is reused.
+        assert_eq!(
+            d130(&mut rates, "ta", "198.51.102.1", "x", now + WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn d130_total_and_platform_slot_caps_fail_closed() {
+        let now = Instant::now();
+        let mut rates = small_slots(10, 2, 100);
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.100.1", 1, now), 1);
+        assert_eq!(d130_fill(&mut rates, "tb", "198.51.100.1", 1, now), 1);
+        assert_eq!(d130_fill(&mut rates, "tc", "198.51.100.1", 1, now), 0);
+        let mut rates = small_slots(10, 100, 1);
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.100.1", 1, now), 1);
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.101.1", 1, now), 0);
+        assert_eq!(
+            d130_fill(&mut rates, "ta", "198.51.101.1", 1, now + WINDOW),
+            1
+        );
+    }
+
+    #[test]
+    fn d130_never_evicts_a_counter_inside_its_window() {
+        let now = Instant::now();
+        let mut rates = small_slots(3, 3, 3);
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.100.1", 10, now), 10);
+        let t = now + Duration::from_secs(10);
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.101.1", 1, t), 1);
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.102.1", 1, t), 1);
+        // Full of live counters: many attempts from new /24s must not evict.
+        let late = now + Duration::from_secs(59);
+        for n in 0..50 {
+            assert!(d130(&mut rates, "ta", &format!("10.0.{n}.1"), "k", late).is_some());
+        }
+        assert_eq!(rates.net.tenants.count("ta", "198.51.100.0/24", late), 10);
+        assert_eq!(rates.net.platform.count("", "198.51.100.0/24", late), 10);
+        assert_eq!(d130(&mut rates, "ta", "198.51.100.2", "k", late), Some(1));
+        // Once the oldest window ends, only that counter is cleared.
+        let end = now + WINDOW;
+        assert_eq!(d130(&mut rates, "ta", "10.0.0.1", "k", end), None);
+        assert_eq!(rates.net.tenants.count("ta", "198.51.101.0/24", end), 1);
+        assert_eq!(rates.net.tenants.count("ta", "198.51.102.0/24", end), 1);
+    }
+
+    #[test]
+    fn d130_fixed_window_edge_allows_up_to_2x() {
+        // Accepted risk (docs/release-hardening.md).
+        let now = Instant::now();
+        let mut rates = RateBuckets::default();
+        let edge = now + Duration::from_secs(59);
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.100.1", 1, now), 1);
+        assert_eq!(d130_fill(&mut rates, "ta", "198.51.100.2", 9, edge), 9);
+        assert_eq!(
+            d130_fill(&mut rates, "ta", "198.51.100.3", 10, now + WINDOW),
+            10
+        );
+    }
+
+    #[test]
+    fn d130_layers_bound_counter_queues() {
+        let now = Instant::now();
+        let mut rates = small_slots(8, 8, 8);
+        for i in 0..2_000u64 {
+            let t = now + WINDOW * (i as u32);
+            d130(
+                &mut rates,
+                "ta",
+                &format!("10.{}.0.1", i % 8),
+                &format!("k{i}"),
+                t,
+            );
+        }
+        assert!(rates.net.tenants.queue.len() <= 8 * 4 + 64 + 1);
+        assert!(rates.net.tenants.entries.len() <= 8);
     }
 }
