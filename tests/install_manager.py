@@ -39,6 +39,7 @@ name=${url##*/};rest=${url#*/download/};version=${rest%%/*};cp "$MOCK_SERVER/$ve
   verify=[l for l in log if l.startswith("attestation verify ")];self.assertEqual(len(verify),1)
   self.assertTrue(verify[0].endswith(" --repo vibe-backend/sdk --signer-workflow vibe-backend/sdk/.github/workflows/release.yml --source-ref refs/tags/v1.0.0 --source-digest 0123456789abcdef0123456789abcdef01234567 --deny-self-hosted-runners"),verify[0])
  def test_bad_source_sha_fails(self):self.assertNotEqual(self.runit("install","--version","v1.0.0",env=self.env|{"MOCK_SHA":"not-a-sha"}).returncode,0);self.assertFalse((self.dest/"vibe").exists())
+ def test_multiline_version_rejected(self):r=self.runit("install","--version","x\nv1.0.0\ny",env=self.env|{"MOCK_NETWORK_FAIL":"1"});self.assertNotEqual(r.returncode,0);self.assertIn("invalid stable release version",r.stderr);self.assertFalse((self.t/"gh.log").exists())
  def test_curl_https_only(self):
   t=SCRIPT.read_text();self.assertEqual(t.count("curl -f"),t.count("--proto '=https' --tlsv1.2"))
 if __name__=='__main__':unittest.main(verbosity=2)
