@@ -17,31 +17,14 @@ curl http://localhost:8080/catalog/v1/acme/items
 
 ## Install
 
-Download `vibe` from [GitHub Releases](https://github.com/vibe-backend/sdk/releases). The CLI is not published to crates.io and it is not published as a container image.
-
-| Platform | Archive |
-| --- | --- |
-| Linux x86_64 | `vibe-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux aarch64 | `vibe-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS x86_64 | `vibe-x86_64-apple-darwin.tar.gz` |
-| macOS aarch64 | `vibe-aarch64-apple-darwin.tar.gz` |
-| Windows x86_64 | `vibe-x86_64-pc-windows-msvc.zip` |
-
-Each release also has `SHA256SUMS`. On Linux or macOS:
+There are currently no published tags, GitHub Releases, or downloadable release assets for this repository. The `vibe` CLI is not published to crates.io or as a container image. For now, build it from a source checkout with Rust 1.89:
 
 ```bash
-tag=v0.1.0
-asset=vibe-x86_64-unknown-linux-gnu.tar.gz
-curl -fsSL -O "https://github.com/vibe-backend/sdk/releases/download/${tag}/${asset}"
-curl -fsSL -O "https://github.com/vibe-backend/sdk/releases/download/${tag}/SHA256SUMS"
-sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf "$asset"
-install -m 755 vibe "$HOME/.local/bin/vibe"
+cargo build --release --locked
+./target/release/vibe --help
 ```
 
-On Windows, download `vibe-x86_64-pc-windows-msvc.zip`, check it against `SHA256SUMS`, and unpack `vibe.exe`.
-
-A checkout with Rust 1.89 can also build the binary with `cargo build --release --locked`.
+Do not use guessed release tags or `releases/download` URLs; they are not a supported installation path until an actual release has been published and verified.
 
 ## Run a project
 
@@ -86,9 +69,9 @@ cargo test --all-features
 
 ## Status
 
-Implemented in 0.1.0: discovery and source hashing, OpenAI-compatible / Anthropic / Gemini adapters, a fake adapter for tests, deterministic compile of structured markdown, lock rendering, the validator, local ed25519 approval, a signed manifest, JWT and API-key auth, built-in CRUD, offset pagination (platform `max-page-size` 500), soft delete, per-row `owner-key` scoping, and a single-connection Postgres executor with schema-per-tenant RLS settings.
+Implemented in the current source tree (not yet published as a release): discovery and source hashing, OpenAI-compatible / Anthropic / Gemini adapters, a fake adapter for tests, deterministic compile of structured markdown, lock rendering, the validator, local ed25519 approval, a signed manifest, JWT and API-key auth, built-in CRUD, offset pagination (platform `max-page-size` 500), soft delete, per-row `owner-key` scoping, and a single-connection Postgres executor with schema-per-tenant RLS settings.
 
-Deferred: platform KMS and GitHub review binding, refresh tokens, account lockout, real captcha, persisted quotas, cross-instance rate limits, crypto-shredding, the email outbox, webhooks, queues, schedules, Postgres TLS, and a connection pool per tenant. Custom method steps other than `method`, `respond`, and `validate` are not executed. Challenge proofs are accepted when the header is non-empty.
+Deferred: platform KMS and GitHub review binding, refresh tokens, account lockout, pow challenges and hCaptcha, persisted quotas, cross-instance rate limits, crypto-shredding, the email outbox, webhooks, queues, schedules, Postgres TLS, and a connection pool per tenant. Custom method steps other than `method`, `respond`, and `validate` are not executed. Challenge proofs (`challenge: { type: captcha, when: always }`) are verified server-side with Cloudflare Turnstile; see [docs/challenge.md](docs/challenge.md).
 
 ## License
 
@@ -101,5 +84,9 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 Required CI checks are **Markdown lint & link check** and **Rust fmt / clippy / test**. There is no Docker image job.
 
 - **CI** (`.github/workflows/ci.yml`, on PRs and pushes to `main`): Markdown lint + local link check; Rust 1.89 `cargo check --locked`, `fmt`, `clippy`, and `test` once a `Cargo.toml` exists.
-- **Release** (`.github/workflows/release.yml`, on tags `v*`): builds `vibe` for Linux x86_64 and aarch64, macOS x86_64 and aarch64, and Windows x86_64. Archives are `tar.gz` (Unix) or `zip` (Windows), plus `SHA256SUMS`, on a GitHub Release. Nothing is pushed to GHCR or crates.io.
+- **Release workflow** (`.github/workflows/release.yml`, on tags `v*`): is configured to build platform archives and `SHA256SUMS`, but no tag or GitHub Release has been published. Nothing is pushed to GHCR or crates.io.
 - **CD** (`.github/workflows/cd.yml`): GHCR image publishing is disabled.
+
+## Binary installation
+
+The install/upgrade/remove manager in [docs/install.md](docs/install.md) is an unreleased review candidate only. It is not a public installation method, because there are no published tags, Releases, or assets to install. Continue using a source checkout until the release and provenance flow has passed review and end-to-end verification.
