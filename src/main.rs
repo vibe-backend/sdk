@@ -378,7 +378,7 @@ async fn cmd_serve(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
-    // #157: production always uses the shared PostgreSQL replay store and
+    // #157: production always uses the PostgreSQL replay store and
     // refuses the memory switch; dev/CI must choose explicitly. Decided
     // before loading anything.
     let replay_choice = vibe::runtime::replay::resolve_replay_store(
@@ -422,16 +422,19 @@ async fn cmd_serve(
     }
     // #118: refuse `challenge_when: always` in production until a verifier
     // is configured.
-    // #157: build the shared store chosen at startup; a missing or unusable
+    // #157: build the per-tenant store chosen at startup; a missing or unusable
     // table refuses to start.
     let replay_store: Option<Arc<dyn vibe::runtime::replay::ReplayStore>> =
         match (replay_choice, pg_pool) {
             (Some(vibe::runtime::replay::StoreKind::Postgres), Some(pool)) => {
-                let store = vibe::runtime::replay::PgReplayStore::new(
-                    pool,
-                    vibe::runtime::replay::DEFAULT_REPLAY_TABLE,
-                )?;
-                store.check().await?;
+                // Per-tenant tables; the IP digest is keyed per tenant from
+                // the API-key pepper.
+                let store = vibe::runtime::replay::PgReplayStore::new(pool, &auth.pepper);
+                let mut tenants: Vec<String> =
+                    loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
+                tenants.sort();
+                tenants.dedup();
+                store.check(&tenants).await?;
                 Some(Arc::new(store))
             }
             (Some(vibe::runtime::replay::StoreKind::Postgres), None) => {
@@ -493,12 +496,6 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
         "VIBE_RUNTIME_DB_ROLE is required (the non-owner role `vibe serve` connects as; it is granted SELECT, INSERT, UPDATE)".to_string()
     })?;
     let exec = PgExec::connect(&url).await?;
-    // #157: the shared challenge replay table (idempotent, always created).
-    let ddl = vibe::runtime::replay::PgReplayStore::migration_sql(
-        vibe::runtime::replay::DEFAULT_REPLAY_TABLE,
-        &runtime_role,
-    )?;
-    exec.batch(&ddl).await?;
     for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant, &runtime_role).await? {
         println!("{line}");
     }

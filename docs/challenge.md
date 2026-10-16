@@ -45,7 +45,7 @@ The single-use state (step 2) lives behind the `ReplayStore` trait
 
 | Variable | Meaning |
 | --- | --- |
-| `VIBE_CHALLENGE_REPLAY_STORE` | `postgres` (shared by all instances) or `memory` (per process, development and CI only). No default outside production. |
+| `VIBE_CHALLENGE_REPLAY_STORE` | `postgres` (per tenant, shared by all instances) or `memory` (per process, development and CI only). No default outside production. |
 
 Which store is used, when a verifier is configured:
 
@@ -54,18 +54,26 @@ Which store is used, when a verifier is configured:
 | Production | `postgres` | `postgres` | refused at startup |
 | Development / CI | error at startup (choose explicitly) | `postgres` | in-memory |
 
-- Production always uses the shared PostgreSQL store. `vibe serve` refuses to
+- Production always uses the PostgreSQL store. `vibe serve` refuses to
   start if `VIBE_CHALLENGE_REPLAY_STORE=memory` is set (with or without a
-  verifier), or if the table is missing or not usable by the runtime role.
-- `postgres` keeps the state in `vibe_platform.challenge_replay` in the
-  `VIBE_DATABASE_URL` database, so a token, the per-IP and per-tenant quotas
-  and the capacity limit hold across instances. Reservations use
-  `INSERT ... ON CONFLICT` (an expired row is taken over atomically), quota
-  checks are serialized per IP and per tenant with transaction-level advisory
-  locks, and expired rows are removed in small batches on each reservation.
-  Client IPs are stored as SHA-256 hashes; tokens as SHA-256 of the token.
-- `vibe migrate` always creates the schema and table (owner role, idempotent)
-  and grants the runtime role `SELECT, INSERT, UPDATE, DELETE`.
+  verifier), or if a configured tenant's table is missing, not usable by the
+  runtime role, or grants it DELETE, UPDATE or TRUNCATE.
+- `postgres` keeps the state per tenant in `t_<tenant>.vibe_challenge_replay`
+  (decision 97: no table shared between tenants). The table has `tenant_id`
+  under ENABLE + FORCE row level security with the standard
+  `tenant_isolation` policy, is owned by the owner role and is created by that
+  tenant's `vibe migrate`. Every instance shares it, so a token, the per-IP
+  and per-tenant quotas and the per-tenant capacity limit hold across
+  instances; one tenant cannot use up another tenant's capacity.
+- The runtime role has only `SELECT, INSERT` on it (decision 27). The table is
+  an append-only log: a reservation inserts a `pending` row with a random
+  nonce; settling it inserts a `verified`, `rejected` or `released` row for
+  that nonce. A `released` row only cancels its own `pending` row, so a
+  verified token stays used for its whole TTL. Reads ignore expired rows;
+  expired rows are deleted only by the owner role when `vibe migrate` runs.
+  Checks are serialized per tenant with a transaction-level advisory lock.
+- Client IPs are stored as HMAC-SHA256 under a per-tenant key derived from
+  `VIBE_API_KEY_PEPPER`; tokens as SHA-256 of the token.
 - `memory` is an explicit opt-in for a single development or CI process. It
   is the only choice with `--memory`.
 - Any store error (database unreachable, timeout, missing table) answers

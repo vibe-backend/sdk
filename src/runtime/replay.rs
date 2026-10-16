@@ -1,16 +1,24 @@
 //! Single-use bookkeeping for challenge tokens behind a trait (#157).
 //!
 //! [`ReplayCache`](super::challenge::ReplayCache) keeps the state in process
-//! memory and suits a single instance. [`PgReplayStore`] keeps it in a
-//! PostgreSQL table shared by every instance, so a token, the per-IP and
-//! per-tenant quotas and the capacity limit hold across instances. Every
-//! store error is reported as [`ChallengeError::Unavailable`]: the request
-//! fails closed.
+//! memory and suits a single instance. [`PgReplayStore`] keeps it in a table
+//! inside each tenant's own schema (`t_<tenant>.vibe_challenge_replay`,
+//! created by that tenant's `vibe migrate`, `tenant_id` under FORCE RLS), so a
+//! token, the per-IP and per-tenant quotas and the per-tenant capacity hold
+//! across instances. No object is shared between tenants.
+//!
+//! The runtime role only has SELECT and INSERT on the table: the table is an
+//! append-only log. A reservation is a `pending` row; settling it appends a
+//! `verified`, `rejected` or `released` row. Reads ignore expired rows, and
+//! only the owner role deletes them (during `vibe migrate`), so the runtime
+//! cannot remove or shorten a live verified row. Every store error is
+//! reported as [`ChallengeError::Unavailable`]: the request fails closed.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use super::challenge::{
@@ -18,14 +26,11 @@ use super::challenge::{
     TOKEN_LIFETIME,
 };
 
-/// Schema holding the shared table (created by `vibe migrate`).
-pub const REPLAY_SCHEMA: &str = "vibe_platform";
-/// Default shared table, in [`REPLAY_SCHEMA`].
-pub const DEFAULT_REPLAY_TABLE: &str = "challenge_replay";
-const DEFAULT_CAPACITY: i64 = 100_000;
+/// Table in each tenant schema (created by `vibe migrate`).
+pub const REPLAY_TABLE: &str = "vibe_challenge_replay";
+/// Live rows allowed per tenant.
+const DEFAULT_CAPACITY: i64 = 10_000;
 const PENDING_HOLD: Duration = Duration::from_secs(30);
-/// Expired rows removed per reservation.
-const CLEANUP_BATCH: i64 = 100;
 
 /// Replay-cache key for a token (SHA-256; the token itself is never stored).
 pub fn token_key(token: &str) -> [u8; 32] {
@@ -43,6 +48,15 @@ pub enum Outcome {
     Released,
 }
 
+/// A reservation handed out by [`ReplayStore::reserve`]. The nonce ties the
+/// settlement to this reservation only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplaySlot {
+    pub key: [u8; 32],
+    pub tenant: Option<String>,
+    pub nonce: [u8; 16],
+}
+
 #[async_trait]
 pub trait ReplayStore: Send + Sync {
     /// `memory` or `postgres`.
@@ -55,43 +69,40 @@ pub trait ReplayStore: Send + Sync {
         key: &[u8; 32],
         ip: Option<&str>,
         tenant: Option<&str>,
-    ) -> Result<(), ChallengeError>;
+    ) -> Result<ReplaySlot, ChallengeError>;
     /// Ends a reservation.
-    async fn settle(&self, key: &[u8; 32], outcome: Outcome) -> Result<(), ChallengeError>;
+    async fn settle(&self, slot: &ReplaySlot, outcome: Outcome) -> Result<(), ChallengeError>;
 }
 
 /// Releases a pending reservation when the request is dropped mid-check.
 pub(crate) struct PendingGuard {
     store: Arc<dyn ReplayStore>,
-    key: [u8; 32],
-    armed: bool,
+    slot: Option<ReplaySlot>,
 }
 
 impl PendingGuard {
-    pub(crate) fn new(store: Arc<dyn ReplayStore>, key: [u8; 32]) -> Self {
+    pub(crate) fn new(store: Arc<dyn ReplayStore>, slot: ReplaySlot) -> Self {
         Self {
             store,
-            key,
-            armed: true,
+            slot: Some(slot),
         }
     }
 
     pub(crate) fn disarm(&mut self) {
-        self.armed = false;
+        self.slot = None;
     }
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        if !self.armed {
+        let Some(slot) = self.slot.take() else {
             return;
-        }
+        };
         let store = self.store.clone();
-        let key = self.key;
         // Without a runtime the pending entry still expires on its own.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _ = store.settle(&key, Outcome::Released).await;
+                let _ = store.settle(&slot, Outcome::Released).await;
             });
         }
     }
@@ -138,7 +149,7 @@ pub fn resolve_replay_store(
     let production = env == super::http::RunEnv::Production;
     if production && kind == Some(StoreKind::Memory) {
         return Err(
-            "VIBE_CHALLENGE_REPLAY_STORE=memory is refused in production; challenge verification uses the shared PostgreSQL store (unset the variable or set it to postgres)".into(),
+            "VIBE_CHALLENGE_REPLAY_STORE=memory is refused in production; challenge verification uses the PostgreSQL store (unset the variable or set it to postgres)".into(),
         );
     }
     if !verifier_configured {
@@ -161,22 +172,15 @@ pub fn resolve_replay_store(
     Ok(Some(kind))
 }
 
-/// Replay state in a PostgreSQL table shared by all instances.
+/// Replay state in each tenant's schema, shared by all instances.
 pub struct PgReplayStore {
     pool: deadpool_postgres::Pool,
-    table: String,
+    ip_secret: Vec<u8>,
     ttl: Duration,
     capacity: i64,
     per_ip: i64,
     per_tenant: i64,
     rejected_hold: Duration,
-}
-
-fn valid_table(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_')
-        && name.len() <= 48
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 fn unavailable(err: impl std::fmt::Display) -> ChallengeError {
@@ -187,20 +191,46 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+fn table_for(tenant: &str) -> Result<String, ChallengeError> {
+    if !super::slugs::valid_tenant(tenant) {
+        return Err(unavailable("invalid tenant id"));
+    }
+    Ok(format!("\"t_{tenant}\".{REPLAY_TABLE}"))
+}
+
+/// A live hold: an unreleased pending row, or a rejected or verified row.
+const LIVE: &str = "expires_at > now() AND (state IN ('verified', 'rejected') OR NOT EXISTS (\
+     SELECT 1 FROM {t} x WHERE x.key = r.key AND x.nonce = r.nonce AND x.state = 'released'))";
+
+fn live(t: &str) -> String {
+    LIVE.replace("{t}", t)
+}
+
+/// HMAC-SHA256 of the client IP under a per-tenant key derived from `secret`
+/// (the API-key pepper), so the stored value is not comparable across tenants
+/// and cannot be reversed by hashing the IPv4 space.
+pub fn ip_digest(secret: &[u8], tenant: &str, ip: &str) -> Vec<u8> {
+    let mut kdf = <Hmac<Sha256> as KeyInit>::new_from_slice(secret).expect("hmac key");
+    kdf.update(b"vibe-challenge-replay-ip\0");
+    kdf.update(tenant.as_bytes());
+    let tenant_key = kdf.finalize().into_bytes();
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&tenant_key).expect("hmac key");
+    mac.update(ip.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
 impl PgReplayStore {
-    pub fn new(pool: deadpool_postgres::Pool, table: &str) -> Result<Self, String> {
-        if !valid_table(table) {
-            return Err(format!("invalid replay table name {table:?}"));
-        }
-        Ok(Self {
+    /// `ip_secret` keys the per-tenant IP digest (the API-key pepper).
+    pub fn new(pool: deadpool_postgres::Pool, ip_secret: &[u8]) -> Self {
+        Self {
             pool,
-            table: format!("{REPLAY_SCHEMA}.{table}"),
+            ip_secret: ip_secret.to_vec(),
             ttl: TOKEN_LIFETIME + Duration::from_secs(60),
             capacity: DEFAULT_CAPACITY,
             per_ip: DEFAULT_PENDING_PER_IP as i64,
             per_tenant: DEFAULT_PENDING_PER_TENANT as i64,
             rejected_hold: DEFAULT_REJECTED_HOLD,
-        })
+        }
     }
 
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
@@ -208,6 +238,7 @@ impl PgReplayStore {
         self
     }
 
+    /// Live rows allowed per tenant.
     pub fn with_capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity as i64;
         self
@@ -224,157 +255,177 @@ impl PgReplayStore {
         self
     }
 
-    /// DDL for the shared table, run by `vibe migrate` as the owner role.
-    /// The runtime role gets SELECT, INSERT, UPDATE and DELETE on it.
-    pub fn migration_sql(table: &str, runtime_role: &str) -> Result<Vec<String>, String> {
-        if !valid_table(table) {
-            return Err(format!("invalid replay table name {table:?}"));
+    /// DDL for one tenant's table, run inside that tenant's `vibe migrate`
+    /// as the owner role (before the schema's RLS pass, which adds ENABLE +
+    /// FORCE RLS and the tenant policy). The runtime role gets SELECT and
+    /// INSERT only. Also removes expired rows (as the owner).
+    pub fn migration_sql(tenant: &str, runtime_role: &str) -> Result<Vec<String>, String> {
+        if !super::slugs::valid_tenant(tenant) {
+            return Err("invalid tenant id".into());
         }
         let role = quote_ident(runtime_role);
-        let name = table;
-        let table = format!("{REPLAY_SCHEMA}.{name}");
+        let t = format!("\"t_{tenant}\".{REPLAY_TABLE}");
         Ok(vec![
-            format!("CREATE SCHEMA IF NOT EXISTS {REPLAY_SCHEMA}"),
-            format!("REVOKE ALL ON SCHEMA {REPLAY_SCHEMA} FROM PUBLIC"),
-            format!("GRANT USAGE ON SCHEMA {REPLAY_SCHEMA} TO {role}"),
+            format!("CREATE SCHEMA IF NOT EXISTS \"t_{tenant}\""),
+            format!("GRANT USAGE ON SCHEMA \"t_{tenant}\" TO {role}"),
             format!(
-                "CREATE TABLE IF NOT EXISTS {table} (key bytea PRIMARY KEY, expires_at timestamptz NOT NULL, counted boolean NOT NULL, ip_hash bytea, tenant text)"
+                "CREATE TABLE IF NOT EXISTS {t} (tenant_id text NOT NULL, key bytea NOT NULL, nonce bytea NOT NULL, \
+                 state text NOT NULL CHECK (state IN ('pending', 'verified', 'rejected', 'released')), \
+                 expires_at timestamptz NOT NULL, ip_hash bytea, PRIMARY KEY (tenant_id, key, nonce, state))"
             ),
-            format!("CREATE INDEX IF NOT EXISTS {name}_expires ON {table} (expires_at)"),
-            format!("CREATE INDEX IF NOT EXISTS {name}_ip ON {table} (ip_hash) WHERE counted"),
-            format!("CREATE INDEX IF NOT EXISTS {name}_tenant ON {table} (tenant) WHERE counted"),
-            format!("REVOKE ALL ON {table} FROM PUBLIC"),
-            format!("GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO {role}"),
+            format!("CREATE INDEX IF NOT EXISTS {REPLAY_TABLE}_expires ON {t} (tenant_id, expires_at)"),
+            format!("REVOKE ALL ON {t} FROM PUBLIC"),
+            format!("REVOKE ALL ON {t} FROM {role}"),
+            format!("GRANT SELECT, INSERT ON {t} TO {role}"),
+            format!("ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"),
+            format!("ALTER TABLE {t} FORCE ROW LEVEL SECURITY"),
+            format!("SELECT set_config('app.tenant_id', '{tenant}', true)"),
+            format!("DELETE FROM {t} WHERE expires_at <= now()"),
         ])
     }
 
-    /// Fails unless the runtime role can use the table (startup check).
-    pub async fn check(&self) -> Result<(), String> {
-        let client = self.pool.get().await.map_err(|err| err.to_string())?;
-        client
-            .execute(
-                &format!(
-                    "SELECT 1 FROM {t} WHERE false FOR UPDATE",
-                    t = self.table
-                ),
-                &[],
-            )
+    /// Startup check run by `vibe serve`: every listed tenant has the table,
+    /// usable by this role, and the role cannot DELETE, UPDATE or TRUNCATE it.
+    pub async fn check(&self, tenants: &[String]) -> Result<(), String> {
+        let client = self
+            .pool
+            .get()
             .await
-            .map_err(|err| {
-                format!(
-                    "challenge replay table {} is not usable ({err}); run `vibe migrate` to create it",
-                    self.table
+            .map_err(|err| format!("challenge replay store: {err}"))?;
+        for tenant in tenants {
+            let t = table_for(tenant).map_err(|err| format!("{err:?}"))?;
+            let row = client
+                .query_one(
+                    "SELECT has_table_privilege($1, 'SELECT') AND has_table_privilege($1, 'INSERT'), \
+                     has_table_privilege($1, 'DELETE') OR has_table_privilege($1, 'UPDATE') OR has_table_privilege($1, 'TRUNCATE')",
+                    &[&t],
                 )
-            })?;
+                .await
+                .map_err(|err| {
+                    format!("challenge replay table {t} is not usable ({err}); run `vibe migrate` for this tenant")
+                })?;
+            let (usable, too_much): (bool, bool) = (row.get(0), row.get(1));
+            if !usable {
+                return Err(format!(
+                    "challenge replay table {t} is not readable and writable by this role; run `vibe migrate` for this tenant"
+                ));
+            }
+            if too_much {
+                return Err(format!(
+                    "challenge replay table {t} grants DELETE, UPDATE or TRUNCATE to this role; run `vibe migrate` to reset its grants"
+                ));
+            }
+        }
         Ok(())
+    }
+
+    async fn begin<'a>(
+        client: &'a mut deadpool_postgres::Object,
+        tenant: &str,
+    ) -> Result<deadpool_postgres::Transaction<'a>, ChallengeError> {
+        let tx = client.transaction().await.map_err(unavailable)?;
+        tx.query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('statement_timeout', '2s', true), \
+             pg_advisory_xact_lock(hashtextextended('vibe-replay:' || $1, 0))",
+            &[&tenant],
+        )
+        .await
+        .map_err(unavailable)?;
+        Ok(tx)
+    }
+
+    async fn count(
+        tx: &deadpool_postgres::Transaction<'_>,
+        sql: &str,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<i64, ChallengeError> {
+        Ok(tx.query_one(sql, params).await.map_err(unavailable)?.get(0))
     }
 
     async fn try_reserve(
         &self,
         key: &[u8; 32],
         ip: Option<&str>,
-        tenant: Option<&str>,
-    ) -> Result<(), ChallengeError> {
-        let t = &self.table;
+        tenant: &str,
+    ) -> Result<ReplaySlot, ChallengeError> {
+        let t = table_for(tenant)?;
+        let live = live(&t);
+        let k = key.as_slice();
         let mut client = self.pool.get().await.map_err(unavailable)?;
-        let tx = client.transaction().await.map_err(unavailable)?;
-        tx.batch_execute("SET LOCAL statement_timeout = '2s'")
-            .await
-            .map_err(unavailable)?;
-        tx.execute(
+        // One lock per tenant serializes the checks below across instances.
+        let tx = Self::begin(&mut client, tenant).await?;
+        let used = Self::count(
+            &tx,
             &format!(
-                "DELETE FROM {t} WHERE ctid IN (SELECT ctid FROM {t} WHERE expires_at <= now() LIMIT {CLEANUP_BATCH})"
+                "SELECT count(*) FROM (SELECT 1 FROM {t} r WHERE r.key = $1 AND {live} LIMIT 1) s"
             ),
-            &[],
+            &[&k],
         )
-        .await
-        .map_err(unavailable)?;
-        let ip_hash: Option<Vec<u8>> = ip.map(|ip| Sha256::digest(ip.as_bytes()).to_vec());
-        // Serialize quota checks per IP and per tenant across instances.
+        .await?;
+        if used > 0 {
+            return Err(ChallengeError::Rejected(
+                "challenge token already used".into(),
+            ));
+        }
+        let ip_hash = ip.map(|ip| ip_digest(&self.ip_secret, tenant, ip));
+        let unverified = format!("r.state IN ('pending', 'rejected') AND {live}");
         if let Some(h) = &ip_hash {
-            tx.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended('vibe-replay-ip:' || encode($1, 'hex'), 0))",
-                &[h],
+            let n = Self::count(
+                &tx,
+                &format!("SELECT count(*) FROM (SELECT 1 FROM {t} r WHERE r.ip_hash = $1 AND {unverified} LIMIT $2) s"),
+                &[h, &self.per_ip],
             )
-            .await
-            .map_err(unavailable)?;
-            let n: i64 = tx
-                .query_one(
-                    &format!("SELECT count(*) FROM {t} WHERE counted AND ip_hash = $1 AND expires_at > now()"),
-                    &[h],
-                )
-                .await
-                .map_err(unavailable)?
-                .get(0);
+            .await?;
             if n >= self.per_ip {
                 return Err(ChallengeError::Rejected(
                     "too many unverified challenge tokens from this client".into(),
                 ));
             }
         }
-        if let Some(tenant) = tenant {
-            tx.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended('vibe-replay-tenant:' || $1, 0))",
-                &[&tenant],
-            )
-            .await
-            .map_err(unavailable)?;
-            let n: i64 = tx
-                .query_one(
-                    &format!("SELECT count(*) FROM {t} WHERE counted AND tenant = $1 AND expires_at > now()"),
-                    &[&tenant],
-                )
-                .await
-                .map_err(unavailable)?
-                .get(0);
-            if n >= self.per_tenant {
-                return Err(ChallengeError::Rejected(
-                    "too many unverified challenge tokens for this tenant".into(),
-                ));
-            }
+        let n = Self::count(
+            &tx,
+            &format!("SELECT count(*) FROM (SELECT 1 FROM {t} r WHERE {unverified} LIMIT $1) s"),
+            &[&self.per_tenant],
+        )
+        .await?;
+        if n >= self.per_tenant {
+            return Err(ChallengeError::Rejected(
+                "too many unverified challenge tokens for this tenant".into(),
+            ));
         }
-        let live: i64 = tx
-            .query_one(
-                &format!(
-                    "SELECT count(*) FROM (SELECT 1 FROM {t} WHERE expires_at > now() LIMIT $1) s"
-                ),
-                &[&self.capacity],
-            )
-            .await
-            .map_err(unavailable)?
-            .get(0);
-        if live >= self.capacity {
+        let n = Self::count(
+            &tx,
+            &format!("SELECT count(*) FROM (SELECT 1 FROM {t} r WHERE {live} LIMIT $1) s"),
+            &[&self.capacity],
+        )
+        .await?;
+        if n >= self.capacity {
             return Err(ChallengeError::Unavailable(
                 "challenge replay cache is full".into(),
             ));
         }
-        // A live row means the token is reserved or used; an expired row is
-        // taken over atomically.
-        let inserted = tx
-            .query_opt(
-                &format!(
-                    "INSERT INTO {t} AS r (key, expires_at, counted, ip_hash, tenant) \
-                     VALUES ($1, now() + make_interval(secs => $2), true, $3, $4) \
-                     ON CONFLICT (key) DO UPDATE SET expires_at = EXCLUDED.expires_at, counted = true, \
-                     ip_hash = EXCLUDED.ip_hash, tenant = EXCLUDED.tenant WHERE r.expires_at <= now() \
-                     RETURNING 1"
-                ),
-                &[
-                    &key.as_slice(),
-                    &PENDING_HOLD.as_secs_f64(),
-                    &ip_hash,
-                    &tenant,
-                ],
-            )
-            .await
-            .map_err(unavailable)?;
-        if inserted.is_none() {
-            return Err(ChallengeError::Rejected(
-                "challenge token already used".into(),
-            ));
-        }
+        let nonce = *uuid::Uuid::new_v4().as_bytes();
+        tx.execute(
+            &format!(
+                "INSERT INTO {t} (tenant_id, key, nonce, state, expires_at, ip_hash) \
+                 VALUES ($1, $2, $3, 'pending', now() + make_interval(secs => $4), $5)"
+            ),
+            &[
+                &tenant,
+                &k,
+                &nonce.as_slice(),
+                &PENDING_HOLD.as_secs_f64(),
+                &ip_hash,
+            ],
+        )
+        .await
+        .map_err(unavailable)?;
         tx.commit().await.map_err(unavailable)?;
-        Ok(())
+        Ok(ReplaySlot {
+            key: *key,
+            tenant: Some(tenant.to_string()),
+            nonce,
+        })
     }
 }
 
@@ -389,49 +440,59 @@ impl ReplayStore for PgReplayStore {
         key: &[u8; 32],
         ip: Option<&str>,
         tenant: Option<&str>,
-    ) -> Result<(), ChallengeError> {
+    ) -> Result<ReplaySlot, ChallengeError> {
+        // Rows live in the tenant's schema: no tenant, no reservation.
+        let tenant = tenant.ok_or_else(|| unavailable("no tenant for this request"))?;
         self.try_reserve(key, ip, tenant).await
     }
 
-    async fn settle(&self, key: &[u8; 32], outcome: Outcome) -> Result<(), ChallengeError> {
-        let t = &self.table;
-        let client = self.pool.get().await.map_err(unavailable)?;
-        let k = key.as_slice();
-        match outcome {
-            Outcome::Verified => {
-                let n = client
-                    .execute(
-                        &format!("UPDATE {t} SET expires_at = now() + make_interval(secs => $2), counted = false WHERE key = $1 AND counted"),
-                        &[&k, &self.ttl.as_secs_f64()],
-                    )
-                    .await
-                    .map_err(unavailable)?;
-                if n != 1 {
-                    // The reservation lapsed; do not accept the token.
-                    return Err(ChallengeError::Unavailable(
-                        "challenge reservation expired before it was recorded".into(),
-                    ));
-                }
-            }
-            Outcome::Rejected if !self.rejected_hold.is_zero() => {
-                client
-                    .execute(
-                        &format!("UPDATE {t} SET expires_at = now() + make_interval(secs => $2) WHERE key = $1 AND counted"),
-                        &[&k, &self.rejected_hold.as_secs_f64()],
-                    )
-                    .await
-                    .map_err(unavailable)?;
-            }
-            Outcome::Rejected | Outcome::Released => {
-                client
-                    .execute(
-                        &format!("DELETE FROM {t} WHERE key = $1 AND counted"),
-                        &[&k],
-                    )
-                    .await
-                    .map_err(unavailable)?;
-            }
+    async fn settle(&self, slot: &ReplaySlot, outcome: Outcome) -> Result<(), ChallengeError> {
+        let tenant = slot
+            .tenant
+            .as_deref()
+            .ok_or_else(|| unavailable("no tenant for this request"))?;
+        let t = table_for(tenant)?;
+        let live = live(&t);
+        let (k, nonce) = (slot.key.as_slice(), slot.nonce.as_slice());
+        let mut client = self.pool.get().await.map_err(unavailable)?;
+        let tx = Self::begin(&mut client, tenant).await?;
+        // Only this reservation, while it is still live and pending.
+        let pending = Self::count(
+            &tx,
+            &format!("SELECT count(*) FROM {t} r WHERE r.key = $1 AND r.nonce = $2 AND r.state = 'pending' AND {live}"),
+            &[&k, &nonce],
+        )
+        .await?;
+        if pending == 0 {
+            return match outcome {
+                // The reservation lapsed; do not accept the token.
+                Outcome::Verified => Err(ChallengeError::Unavailable(
+                    "challenge reservation expired before it was recorded".into(),
+                )),
+                _ => Ok(()),
+            };
         }
+        let append = |state: &'static str, secs: f64| {
+            format!(
+                "INSERT INTO {t} (tenant_id, key, nonce, state, expires_at, ip_hash) \
+                 SELECT tenant_id, key, nonce, '{state}', now() + make_interval(secs => {secs}), ip_hash \
+                 FROM {t} WHERE key = $1 AND nonce = $2 AND state = 'pending'"
+            )
+        };
+        let mut steps = Vec::new();
+        match outcome {
+            Outcome::Verified => steps.push(append("verified", self.ttl.as_secs_f64())),
+            Outcome::Rejected if !self.rejected_hold.is_zero() => {
+                steps.push(append("rejected", self.rejected_hold.as_secs_f64()))
+            }
+            Outcome::Rejected | Outcome::Released => {}
+        }
+        // The pending row stops counting once released; it expires with it.
+        steps.push(append("released", PENDING_HOLD.as_secs_f64()));
+        for sql in steps {
+            tx.execute(&sql, &[&k, &nonce]).await.map_err(unavailable)?;
+        }
+        tx.commit().await.map_err(unavailable)?;
         Ok(())
     }
 }
@@ -513,12 +574,24 @@ mod tests {
     }
 
     #[test]
-    fn table_names_are_checked() {
-        assert!(valid_table("vibe_challenge_replay"));
-        assert!(!valid_table("x; drop table y"));
-        assert!(!valid_table("Upper"));
-        assert!(PgReplayStore::migration_sql("bad name", "app").is_err());
-        let sql = PgReplayStore::migration_sql("t1", "app\"x").unwrap();
-        assert!(sql.last().unwrap().ends_with("TO \"app\"\"x\""));
+    fn migration_grants_only_select_and_insert() {
+        assert!(PgReplayStore::migration_sql("Bad name", "app").is_err());
+        let sql = PgReplayStore::migration_sql("tenant0001", "app\"x").unwrap();
+        assert!(sql.iter().all(|s| !s.contains("vibe_platform")));
+        assert!(sql.iter().any(|s| s
+            == "GRANT SELECT, INSERT ON \"t_tenant0001\".vibe_challenge_replay TO \"app\"\"x\""));
+        assert!(sql
+            .iter()
+            .filter(|s| s.starts_with("GRANT"))
+            .all(|s| !s.contains("DELETE") && !s.contains("UPDATE")));
+    }
+
+    #[test]
+    fn ip_digest_is_keyed_per_tenant() {
+        let a = ip_digest(b"secret", "tenant0001", "203.0.113.1");
+        assert_eq!(a, ip_digest(b"secret", "tenant0001", "203.0.113.1"));
+        assert_ne!(a, ip_digest(b"secret", "tenant0002", "203.0.113.1"));
+        assert_ne!(a, ip_digest(b"other", "tenant0001", "203.0.113.1"));
+        assert_ne!(a, Sha256::digest(b"203.0.113.1").to_vec());
     }
 }

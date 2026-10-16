@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use super::http::RunEnv;
-pub use super::replay::{token_key, Outcome, PgReplayStore, ReplayStore};
+pub use super::replay::{token_key, Outcome, PgReplayStore, ReplaySlot, ReplayStore};
 
 /// Cloudflare's siteverify endpoint.
 pub const TURNSTILE_SITEVERIFY_URL: &str =
@@ -338,12 +338,21 @@ impl super::replay::ReplayStore for ReplayCache {
         key: &[u8; 32],
         ip: Option<&str>,
         tenant: Option<&str>,
-    ) -> Result<(), ChallengeError> {
-        self.reserve_key(key, ip, tenant)
+    ) -> Result<super::replay::ReplaySlot, ChallengeError> {
+        self.reserve_key(key, ip, tenant)?;
+        Ok(super::replay::ReplaySlot {
+            key: *key,
+            tenant: tenant.map(str::to_string),
+            nonce: [0; 16],
+        })
     }
 
-    async fn settle(&self, key: &[u8; 32], outcome: Outcome) -> Result<(), ChallengeError> {
-        self.settle_key(key, outcome);
+    async fn settle(
+        &self,
+        slot: &super::replay::ReplaySlot,
+        outcome: Outcome,
+    ) -> Result<(), ChallengeError> {
+        self.settle_key(&slot.key, outcome);
         Ok(())
     }
 }
@@ -438,26 +447,27 @@ impl ChallengeVerifier for TurnstileVerifier {
         // Single use: reserve before asking the provider, so concurrent reuse
         // is refused. Only a verified token keeps the slot for the full TTL.
         let key = token_key(token);
-        self.replay
+        let slot = self
+            .replay
             .reserve(&key, ctx.remote_ip.as_deref(), ctx.tenant.as_deref())
             .await?;
-        let mut guard = super::replay::PendingGuard::new(self.replay.clone(), key);
+        let mut guard = super::replay::PendingGuard::new(self.replay.clone(), slot.clone());
         match self.ask(token, ctx).await {
             Ok(()) => {
                 guard.disarm();
                 // Fail closed: a token that cannot be recorded is not accepted.
-                self.replay.settle(&key, Outcome::Verified).await?;
+                self.replay.settle(&slot, Outcome::Verified).await?;
                 Ok(())
             }
             Err(err @ ChallengeError::Rejected(_)) => {
                 guard.disarm();
                 // Best effort: the pending entry expires on its own.
-                let _ = self.replay.settle(&key, Outcome::Rejected).await;
+                let _ = self.replay.settle(&slot, Outcome::Rejected).await;
                 Err(err)
             }
             Err(err) => {
                 guard.disarm();
-                let _ = self.replay.settle(&key, Outcome::Released).await;
+                let _ = self.replay.settle(&slot, Outcome::Released).await;
                 Err(err)
             }
         }
