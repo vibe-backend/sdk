@@ -757,8 +757,9 @@ jobs:
 ### 2C.3a `--release-approval`（已撤回，產品經理 2026-10-16）
 
 - 產品經理撤回 `--release-approval`（原決定 90），唔會實作。SDK 唔驗證 PR review、tree 相等、CODEOWNERS 設定、`main` 或者 tag ruleset，亦唔讀 environment 批准紀錄；高風險 `security-items` 只列入部署報告，唔阻 release。
+- **SDK 同 release workflow 都唔讀 ruleset／`bypass_actors`**（決定 90／#127；決定 96）：`.github/workflows/release.yml` 而家冇任何 ruleset／`bypass_actors` 檢查。如果將來 `release.yml` 加呢類步驟，只可以係唯讀、資訊性、永遠唔會擋 release（決定 96 已接受例外；`main` ruleset `bypass_actors` 唔係空唔阻 release）。
 - 唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118。
-- `main` 同 `v*` tag ruleset 照舊按 [`pr-review-guide.md`](pr-review-guide.md) 設定，但 SDK 唔檢查。
+- `main` 同 `v*` tag ruleset 照舊按 [`pr-review-guide.md`](pr-review-guide.md) 設定，但 SDK 同 release workflow 都唔檢查。
 - **剩餘風險（Jack 已接受）**：
   - Admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass 保持開啟）。
   - 唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118。
