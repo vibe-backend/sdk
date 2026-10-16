@@ -90,10 +90,18 @@ Turnstile's own single-use check (`timeout-or-duplicate`) applies in addition.
 | --- | --- |
 | No proof | 400 `CHALLENGE_REQUIRED` |
 | Proof rejected (forged, replayed, expired, missing or future `challenge_ts`, wrong hostname or action, per-IP or per-tenant quota reached) | 403 `CHALLENGE_FAILED` |
-| No verifier configured, replay cache full, replay store unavailable, provider unreachable, timeout, bad response, `type: pow` | 503 `CHALLENGE_UNAVAILABLE` |
+| Provider or network failure only: provider unreachable, timeout, bad response, replay store unreachable (spec decision 134) | 503 `CHALLENGE_UNAVAILABLE`, `Retry-After: 5` (decision 135) |
+
+Implementation status: not yet aligned with spec decisions 131, 134 and 135 (follow-up issue to be opened):
+
+- The 503 has no `Retry-After` header yet.
+- The current code also returns 503 when no verifier is configured, for a `type: pow` route, and when the replay cache or store is full. Under the spec, a missing verifier and `type: pow` are rejected at build or startup (decisions 131, 134); how a full store is classified is pending PM confirmation.
 
 In production (`VIBE_ENV`), `vibe serve` refuses to start and `vibe validate --deploy`
 fails if any route uses `challenge ... when: always` and no verifier is configured.
+Implementation status: the gate only covers public `when: always` routes; spec
+decision 134 also covers `after-failures` and authenticated opt-in routes
+(follow-up issue to be opened).
 Challenges do not replace server-side rate limits and quotas. The route's rate
 limits and the public write quota are checked before the challenge, so a
 limited request never reaches the replay cache or the provider.

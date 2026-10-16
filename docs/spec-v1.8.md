@@ -1363,6 +1363,28 @@ v1 challenge provider 係 **Cloudflare Turnstile**（決定 131），由 server 
 
 Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動；Turnstile 本身嘅單次使用檢查（`timeout-or-duplicate`）只係額外一層。
 
+#### Replay store 數值（同 main 嘅 code 一致）
+
+| 項目 | 值 |
+| --- | --- |
+| 已驗證 token 保留時間（replay TTL） | 360s（token 壽命 300s + 60s clock skew 邊際） |
+| 被拒 token 保留時間（rejected hold） | 10s |
+| 未有答覆嘅預留（provider 唔可用） | 即時釋放 |
+| 容量上限 | Postgres store：每租戶 10,000；memory store（只限 dev／CI）：每 process 100,000 |
+
+#### 實作狀態（對比 `main` 4b85de5）
+
+以下決定係產品經理已確認嘅 spec 目標，**唔會因為 code 未做而放寬**；未做嘅部分標明，跟進 issue 會另外開（follow-up issue to be opened）。
+
+| 決定 | 狀態 | 差異 |
+| --- | --- | --- |
+| 134 啟動閘門 | **Implementation status: not yet implemented**（部分） | `src/main.rs` 同 `src/runtime/challenge.rs` `production_gate` 只檢查 `public` 而且 `when: always` 嘅 route；`after-failures` 同決定 133 已認證 opt-in route 冇 verifier 時唔會擋啟動。Follow-up issue to be opened。 |
+| 133 Runtime 執行範圍 | **Implementation status: not yet implemented**（部分） | `src/runtime/http.rs` 只對 `public` 而且 `when: always` 嘅 route 做 challenge；`after-failures`（login）同已認證 opt-in route 而家唔會驗證 challenge。Follow-up issue to be opened。 |
+| 135 `Retry-After: 5` | **Implementation status: not yet implemented** | `src/runtime/http.rs` `check_challenge` 回 503 `CHALLENGE_UNAVAILABLE` 時冇 `Retry-After` header。Follow-up issue to be opened。 |
+| 131 `type: pow` build error | **Implementation status: not yet implemented** | `src/validate.rs` 冇呢個檢查；而家係 runtime 回 503。Follow-up issue to be opened。 |
+| 134 503 範圍 | **Implementation status: not yet implemented**（部分） | Production 冇 verifier 嘅 `when: always` public route 已經喺啟動擋；但 runtime 對「冇 verifier」同 `type: pow` 仍然回 503（應該喺 build／啟動擋）。Replay store 容量滿而家亦回 503；決定 134 冇將容量滿列做 provider／網絡失敗，點樣分類要產品經理確認。Follow-up issue to be opened。 |
+| 136 Turnstile secret 掃描 | **Implementation status: not yet implemented** | `src/secret.rs` 只比對已設定嘅 LLM key 同 `sk-`／`AKIA` 格式；冇比對 `VIBE_TURNSTILE_SECRET` 嘅值，亦冇 Turnstile secret 格式規則，所以而家捉唔到。Follow-up issue to be opened。 |
+
 ### 7.3 schema 升級去 database（離線遷移，CLI `tenant migrate`）
 
 1. 平台發出一個臨時遷移 role，全程寫入審計記錄。
