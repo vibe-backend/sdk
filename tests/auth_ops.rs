@@ -444,17 +444,83 @@ async fn sign_jwt_refuses_issue_refresh_until_supported() {
     assert!(err.1.contains("issue-refresh"), "{err:?}");
 }
 
-/// The runtime's own JWT verification accepts what sign-jwt issues: a
-/// role-gated route lets the signed token through.
-#[tokio::test]
-async fn signed_token_round_trips_through_runtime_verification() {
+const RSA_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCV1TuPgK11dA6o\n\
+HIiBaAue2y1tMYish6kP/0n831p6EK4q86z7zyTUI9uQLY9QdvHA1JzEaZIrIk31\n\
+eS2M44mteGh0/u+yAgs0vkBwuiZ62twBC/FwN2cMlV/e1Scc9zOWKsOalauYmLO7\n\
+Mibj5qCGyhP6T6Uvhu78gKrE++YW8sPJN/8+EByOvZhw7dwhd11RybxxAnAzPYDl\n\
+wwcVH5zp1+I406MvGbZifX17kpf0rQoWGgdGsipGeCLGPwakz4Oq6kVYc4WAueWA\n\
+tYxuZy5BlW1AVHjrS9wYzLuyc69FAyDQC+icc0bmAc+6Cyfl4VpeRBjIDSRf4Qq8\n\
+qo+uJGBLAgMBAAECggEAOnunCl3LFt/MgsDUZVJjysc5RXhCpTk0e6qFSh8yNRgC\n\
+q4A+gnE5qlYusumdmWY7+azjXeTpKU30CP8aEPaVfDDV8Oi7TYtvrVAfXgDC2UxI\n\
++F2diVQOtIIvkA45/JvetlwNym5mMqNT8BrkxCr2eHYy8w6YZuMvsD5WqZm7FzRk\n\
+3HIvF+Iwt2xuLoS7uRHtTHOFR681+Zh15czZJH2qnpbC9Gg5rNVohUu0ymhLwshf\n\
+aY/LjsXmvs+p4k4z4oy84JjFs6+oLCQmGpeUvQXq2Ye/8wszNCacehjPzCH9NncG\n\
+xENGLMhwSfYu35Q4Sco/aiBr92ucP65bRA56cLCzFQKBgQDHxKcqJMTPlbIB2Ju5\n\
+4t/GvaLpUXmWQ3A7Z+QDJSDSgLgtXijXQorshUbb0q1sAz0g4LXHqc8EhQdVRKsI\n\
+T2wH/IpiNgcgQ1iY7pPY3PkVHgs+wShphJ01sXBsu3TO61AY10aWhiSrt2CGFO8+\n\
+AimSPJInzmhDYl8ntnklvS+u5wKBgQDAAjvIQNs/06FbNdTn7VLgjmi6Qx8smgRj\n\
+dPeHlZksEo3ZlJjVAqilCf2AidNfFM7JSjcjT4OGQxNGSdmLaJJt+3yfA1N+L4+z\n\
+tkRvQUhPiSlDVGctfto8p/eHGmebkYZDxPiOKEZMlAmdIYSTHkrKrMCtNctKm5jD\n\
+yADSZOSK/QKBgQCGaxqYTvlnPLD0cQ4H/FLa5cty93G63FHuhy9ztk3pltdXH56X\n\
+iZz1HZDaZV5v6ZX+Q3XNjcNQpTqT84qqItbsYM+02endmbNJ5G7zY2zu+rJSXaKV\n\
+rbgi4uxlHZWxjcDtlh1XN5gBO3jlf7yjmsziK4Ok6Uxa2xxwGmZWMICfTQKBgHKg\n\
+oroBZiLrn/fI4mr3drPSsNkJ+1FwPVB24tORztjN1ttfaAI6zR2CIlIbdhHcZTss\n\
+UFCHRrjf0GD086fTbR+1tIdlv/GkSUD7fk2BBr9c3kJw4Av8ICN4D0Eb1WC9dw98\n\
+RvrvNlC/TCH/gZsmyXXHvltpswy+aWvwOfVhAEOtAoGADt7iadF7r8Urkw+qWJs5\n\
+0DkUePxzfCXL9zLLzsZGWOrH2Z4kwagIDV7QXkmtNpJ5yCz1hglwRpWuWs0CS6sK\n\
+sUU5Jdw+uTdMDkC4LZ6yy9/FbDjcD514xyg/CiGzFM1B3CbAaQiahTWQaIyxtrVl\n\
+xjwFjbNtOH5kVjRCe+Q0Hlk=\n\
+-----END PRIVATE KEY-----\n";
+
+const RSA_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAldU7j4CtdXQOqByIgWgL\n\
+ntstbTGIrIepD/9J/N9aehCuKvOs+88k1CPbkC2PUHbxwNScxGmSKyJN9XktjOOJ\n\
+rXhodP7vsgILNL5AcLometrcAQvxcDdnDJVf3tUnHPczlirDmpWrmJizuzIm4+ag\n\
+hsoT+k+lL4bu/ICqxPvmFvLDyTf/PhAcjr2YcO3cIXddUcm8cQJwMz2A5cMHFR+c\n\
+6dfiONOjLxm2Yn19e5KX9K0KFhoHRrIqRngixj8GpM+DqupFWHOFgLnlgLWMbmcu\n\
+QZVtQFR460vcGMy7snOvRQMg0AvonHNG5gHPugsn5eFaXkQYyA0kX+EKvKqPriRg\n\
+SwIDAQAB\n\
+-----END PUBLIC KEY-----\n";
+
+/// Signs a token through a `sign-jwt` step with `alg` and the given private
+/// key, then sends it through the runtime verifier configured with
+/// `public_pem`. Returns the statuses for the token and a tampered copy.
+async fn sign_and_verify(
+    alg: &str,
+    private_pem: &str,
+    public_pem: &str,
+    verifier_alg: Algorithm,
+) -> (StatusCode, StatusCode, String) {
     let m = method_manifest(
         &["sign-token"],
-        sign_steps(json!({"claims": "{ sub: u.id }"})),
+        sign_steps(json!({"alg": alg, "claims": "{ sub: u.id }"})),
     );
+    let mut auth = AuthConfig::anonymous();
+    auth.public_pem = public_pem.into();
+    auth.alg = verifier_alg;
+    auth.signing_keys = vibe::runtime::load_signing_keys(
+        &m,
+        &|name| (name == "JWT_SIGNING_KEY").then(|| private_pem.to_string()),
+        "local",
+    )
+    .unwrap();
     let exec = users();
-    let out = run(&m, &exec, json!({"sub": "u1"})).await.unwrap();
+    let out = run_method(
+        &m,
+        &exec,
+        "t.run",
+        &json!({"sub": "u1"}),
+        ctx(&auth, "tenant0001"),
+        0,
+    )
+    .await
+    .map_err(|f| f.message)
+    .unwrap()
+    .value;
     let token = out["access_token"].as_str().unwrap().to_string();
+    let header = jsonwebtoken::decode_header(&token).unwrap();
+    assert_eq!(format!("{:?}", header.alg), alg);
     let mut gated = fixture();
     gated.routes = vec![serde_json::from_value(json!({
         "method": "GET", "path": "/v1/me", "feature_id": "me/v1/get",
@@ -469,7 +535,7 @@ async fn signed_token_round_trips_through_runtime_verification() {
     let app = router(Arc::new(AppState {
         manifest: gated,
         exec: Arc::new(exec),
-        auth: auth(),
+        auth,
         slugs: HashMap::new(),
         rates: std::sync::Mutex::new(Default::default()),
         quotas: std::sync::Mutex::new(Default::default()),
@@ -495,17 +561,67 @@ async fn signed_token_round_trips_through_runtime_verification() {
             .status()
         }
     };
-    assert_eq!(
-        call(format!("Bearer {token}")).await,
-        StatusCode::NO_CONTENT
-    );
+    let ok = call(format!("Bearer {token}")).await;
     let mut tampered = token.clone();
     tampered.pop();
     tampered.push(if token.ends_with('A') { 'B' } else { 'A' });
+    let bad = call(format!("Bearer {tampered}")).await;
+    (ok, bad, token)
+}
+
+/// The runtime's own JWT verification accepts what sign-jwt issues: a
+/// role-gated route lets the signed token through (ES256).
+#[tokio::test]
+async fn signed_token_round_trips_through_runtime_verification() {
+    let (ok, bad, _) = sign_and_verify("ES256", PRIVATE_PEM, PUBLIC_PEM, Algorithm::ES256).await;
+    assert_eq!(ok, StatusCode::NO_CONTENT);
+    assert_eq!(bad, StatusCode::UNAUTHORIZED);
+}
+
+/// Same round trip with an RS256 signing key and RSA public key.
+#[tokio::test]
+async fn rs256_signed_token_round_trips_through_runtime_verification() {
+    let (ok, bad, token) =
+        sign_and_verify("RS256", RSA_PRIVATE_PEM, RSA_PUBLIC_PEM, Algorithm::RS256).await;
+    assert_eq!(ok, StatusCode::NO_CONTENT);
+    assert_eq!(bad, StatusCode::UNAUTHORIZED);
+    let mut v = Validation::new(Algorithm::RS256);
+    v.validate_aud = false;
+    jsonwebtoken::decode::<Value>(
+        &token,
+        &DecodingKey::from_rsa_pem(RSA_PUBLIC_PEM.as_bytes()).unwrap(),
+        &v,
+    )
+    .unwrap();
+}
+
+/// A verifier configured for one algorithm rejects tokens signed with the other.
+#[tokio::test]
+async fn verifier_rejects_tokens_signed_with_a_different_algorithm() {
+    let (ok, _, _) = sign_and_verify("ES256", PRIVATE_PEM, RSA_PUBLIC_PEM, Algorithm::RS256).await;
+    assert_eq!(ok, StatusCode::UNAUTHORIZED);
+    let (ok, _, _) = sign_and_verify("RS256", RSA_PRIVATE_PEM, PUBLIC_PEM, Algorithm::ES256).await;
+    assert_eq!(ok, StatusCode::UNAUTHORIZED);
+}
+
+/// The verifier only accepts the algorithms it knows; others fail closed.
+#[tokio::test]
+async fn verifier_rejects_unsupported_configured_algorithm() {
+    let (ok, _, _) = sign_and_verify("ES256", PRIVATE_PEM, PUBLIC_PEM, Algorithm::ES384).await;
+    assert_eq!(ok, StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn detect_jwt_alg_picks_rs256_and_es256() {
     assert_eq!(
-        call(format!("Bearer {tampered}")).await,
-        StatusCode::UNAUTHORIZED
+        vibe::runtime::detect_jwt_alg(RSA_PUBLIC_PEM).unwrap(),
+        Algorithm::RS256
     );
+    assert_eq!(
+        vibe::runtime::detect_jwt_alg(PUBLIC_PEM).unwrap(),
+        Algorithm::ES256
+    );
+    assert!(vibe::runtime::detect_jwt_alg("not a pem").is_err());
 }
 
 #[tokio::test]

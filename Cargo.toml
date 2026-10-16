@@ -22,7 +22,7 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "3"
 hex = "0.4"
 hmac = "0.13"
-jsonwebtoken = "9"
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 rand = "0.10"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
