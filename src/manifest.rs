@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -233,6 +234,10 @@ pub struct StepSpec {
     pub when_expr: String,
     pub writes: bool,
     pub table: String,
+    /// Every bullet of the step, raw (op-specific settings such as `hash`,
+    /// `plain`, `bytes`, `claims`, `ttl`, `key-ref`).
+    #[serde(default)]
+    pub opts: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1018,6 +1023,11 @@ fn steps_from(section: Option<&crate::lock::Section>, file: &str) -> Result<Vec<
             when_expr: get("when"),
             writes: get("writes") == "true",
             table: get("table"),
+            opts: block
+                .bullets
+                .iter()
+                .map(|b| (b.key.clone(), b.value.clone()))
+                .collect(),
         });
     }
     Ok(steps)

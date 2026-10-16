@@ -27,6 +27,10 @@ jobs:
           fail: true
       - name: Check zh-hant code blocks match English
         run: python3 scripts/check-zh-code-blocks.py
+      - name: Install script tests
+        run: python3 tests/install_manager.py
+      - name: Shellcheck install script
+        run: shellcheck scripts/vibe-install.sh
 
   rust:
     name: Rust fmt / clippy / test
@@ -41,6 +45,7 @@ jobs:
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     env:
+      # Postgres tests fail (not skip) in CI when this is missing.
       VIBE_TEST_PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v7
