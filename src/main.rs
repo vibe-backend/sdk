@@ -381,6 +381,10 @@ async fn cmd_serve(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
+    // #199: refuse locks whose challenge is not verified at runtime, before
+    // loading the database or the manifest (locks in the project tree).
+    let unverified_locks = vibe::runtime::challenge::unverified_challenge_locks(project);
+    vibe::runtime::challenge::unverified_gate(run_env, &unverified_locks)?;
     // #157: production always uses the PostgreSQL replay store and
     // refuses the memory switch; dev/CI must choose explicitly. Decided
     // before loading anything.
