@@ -82,7 +82,9 @@ jobs:
       VIBE_TEST_PG_TLS_CERTS: /tmp/pg-tls
       VIBE_TEST_PG_TLS_REQUIRED: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Generate per-run test CA and server certificate
         run: |
           scripts/ci/pg-tls-certs.sh "$PG_TLS_DIR"
@@ -94,7 +96,7 @@ jobs:
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 \
             -v "$PG_TLS_DIR:/tls:ro" \
-            postgres:17 \
+            postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3 \
             -c ssl=on \
             -c ssl_cert_file=/tls/server.crt \
             -c ssl_key_file=/tls/server.key \
@@ -109,10 +111,10 @@ jobs:
           done
           docker logs pg-tls
           exit 1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.89"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - run: cargo test --locked --all-features --test postgres_tls
