@@ -7,7 +7,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Upcoming (advance notice)
 
-- **Refresh 家族限流（決定 147，文件更新）：** 超過每個 refresh 家族嘅限流上限之後，要重新登入。
+- **Refresh 家族限流（決定 147，文件更新）：** 超過上限會要求重新登入。
 
 - **Challenge `bind: none` (#245, decision 140):** In v1, `bind: none` on a challenge route is allowed but `vibe validate` warns. Starting with the next minor release, new public INSERT routes may not use `bind: none` and must bind to the request digest (`bind: request`).
 
