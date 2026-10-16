@@ -125,6 +125,13 @@ fn app(grace: i64) -> App {
 }
 
 fn app_with(m: Manifest) -> App {
+    app_wrapped(m, |exec| exec)
+}
+
+fn app_wrapped(
+    m: Manifest,
+    wrap: impl FnOnce(Arc<MemoryExec>) -> Arc<dyn vibe::runtime::QueryExec>,
+) -> App {
     let exec = Arc::new(MemoryExec::new());
     exec.stub_queries("id");
     exec.seed(
@@ -146,7 +153,7 @@ fn app_with(m: Manifest) -> App {
     );
     let app = router(Arc::new(AppState {
         manifest: m.clone(),
-        exec: exec.clone(),
+        exec: wrap(exec.clone()),
         auth: auth(&m),
         slugs,
         rates: std::sync::Mutex::new(Default::default()),
@@ -156,6 +163,7 @@ fn app_with(m: Manifest) -> App {
         min_override_ms: None,
         honor_test_ip: true,
         dev_hints: false,
+        challenge: None,
     }));
     App {
         app,
@@ -828,4 +836,106 @@ fn app_sql_cannot_reach_the_refresh_table() {
     ] {
         assert!(vibe::sqlguard::query_problem(sql).is_some(), "{sql}");
     }
+}
+
+/// Memory store whose family lookup can be switched to fail (for example a
+/// pool timeout); everything else is delegated.
+struct FamilyLookupFails {
+    inner: Arc<MemoryExec>,
+    down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl vibe::runtime::QueryExec for FamilyLookupFails {
+    async fn execute(
+        &self,
+        tenant_id: &str,
+        role: &str,
+        stmt: vibe::runtime::Stmt,
+    ) -> Result<Vec<vibe::runtime::Row>, vibe::runtime::ExecError> {
+        self.inner.execute(tenant_id, role, stmt).await
+    }
+
+    async fn raw(
+        &self,
+        tenant_id: &str,
+        role: &str,
+        writes: bool,
+        sql: &str,
+        params: Vec<Option<String>>,
+    ) -> Result<Vec<vibe::runtime::Row>, vibe::runtime::ExecError> {
+        self.inner.raw(tenant_id, role, writes, sql, params).await
+    }
+
+    async fn user_roles(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, vibe::runtime::ExecError> {
+        self.inner.user_roles(tenant_id, user_id).await
+    }
+
+    async fn refresh_issue(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        token_hash: &str,
+        policy: vibe::runtime::refresh::RefreshPolicy,
+    ) -> Result<String, vibe::runtime::ExecError> {
+        self.inner
+            .refresh_issue(tenant_id, user_id, token_hash, policy)
+            .await
+    }
+
+    async fn refresh_rotate(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: vibe::runtime::refresh::RefreshPolicy,
+    ) -> Result<vibe::runtime::refresh::Rotated, vibe::runtime::ExecError> {
+        self.inner
+            .refresh_rotate(tenant_id, token_hash, new_hash, policy)
+            .await
+    }
+
+    async fn refresh_revoke(
+        &self,
+        tenant_id: &str,
+        target: vibe::runtime::refresh::RevokeTarget<'_>,
+    ) -> Result<u64, vibe::runtime::ExecError> {
+        self.inner.refresh_revoke(tenant_id, target).await
+    }
+
+    async fn refresh_family(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, vibe::runtime::ExecError> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(vibe::runtime::ExecError::Message("pool timed out".into()));
+        }
+        self.inner.refresh_family(tenant_id, token_hash).await
+    }
+}
+
+#[tokio::test]
+async fn family_lookup_error_fails_closed_and_keeps_the_token() {
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = down.clone();
+    let a = app_wrapped(manifest(0), move |inner| {
+        Arc::new(FamilyLookupFails { inner, down: flag })
+    });
+    let r0 = tok(&a.login().await, "refresh_token");
+    let (s, body, _) = a.refresh(&r0).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.to_string().contains("SERVICE_UNAVAILABLE"), "{body}");
+    assert!(body.get("access_token").is_none());
+    // Unknown tokens get the same retryable answer while the store is down.
+    let (s, _, _) = a.refresh("not-a-token").await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    // The token was not consumed: it rotates once the store answers again.
+    down.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (s, body, _) = a.refresh(&r0).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
 }

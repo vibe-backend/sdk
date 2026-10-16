@@ -5,7 +5,7 @@
 use std::sync::OnceLock;
 
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value};
 use sha2::Sha256;
 
@@ -156,7 +156,7 @@ pub const MAX_PASSWORD_CHARS: usize = 256;
 
 /// Only hashes made with the platform's own argon2id parameters verify.
 fn pinned_hash(hash: &str) -> bool {
-    use argon2::password_hash::PasswordHash;
+    use argon2::password_hash::phc::PasswordHash;
     let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
     };
@@ -197,7 +197,7 @@ pub async fn verify_password(
     };
     let _slot = argon_slot().await?;
     let ok = tokio::task::spawn_blocking(move || {
-        use argon2::password_hash::{PasswordHash, PasswordVerifier};
+        use argon2::password_hash::{phc::PasswordHash, PasswordVerifier};
         let Ok(parsed) = PasswordHash::new(&hash) else {
             return false;
         };
@@ -232,7 +232,8 @@ pub fn random_token(step: &StepSpec, ctx: CallCtx<'_>) -> Result<Value, MethodFa
         return Err(internal("random-token is always 32 bytes"));
     }
     let mut buf = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut buf);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut buf)
+        .map_err(|_| internal("random-token: system random source unavailable"))?;
     let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
     let hash = token_hash(&ctx.auth.pepper, &value);
     Ok(serde_json::json!({"value": value, "hash": hash}))
@@ -445,7 +446,8 @@ pub async fn sign_jwt(
 /// A fresh opaque refresh token and its stored HMAC.
 pub fn new_refresh_token(pepper: &[u8]) -> (String, String) {
     let mut buf = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut buf);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut buf)
+        .expect("OS random number generator failed");
     let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
     let hash = refresh_hash(pepper, &value);
     (value, hash)

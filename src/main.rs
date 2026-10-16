@@ -297,6 +297,17 @@ fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
         }
         (Err(report), None) => return Err(report.to_string()),
     };
+    // #118: `vibe validate --deploy` (and any validate with a production
+    // VIBE_ENV) refuses `challenge_when: always` until a verifier is configured.
+    let run_env =
+        vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), !deploy);
+    let always = vibe::runtime::challenge::always_challenge_locks(project);
+    let configured = vibe::runtime::challenge::configured_in_env()?;
+    vibe::runtime::challenge::production_gate(run_env, configured, &always)?;
+    // #157: the replay store choice (the table itself is checked by `vibe serve`).
+    let replay_kind =
+        vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?;
+    vibe::runtime::replay::resolve_replay_store(run_env, configured, replay_kind, true)?;
     print_report(&report);
     if deploy {
         println!("validation ok");
@@ -367,6 +378,15 @@ async fn cmd_serve(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
+    // #157: production always uses the PostgreSQL replay store and
+    // refuses the memory switch; dev/CI must choose explicitly. Decided
+    // before loading anything.
+    let replay_choice = vibe::runtime::replay::resolve_replay_store(
+        run_env,
+        vibe::runtime::challenge::configured_in_env()?,
+        vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?,
+        !memory,
+    )?;
     let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
@@ -387,6 +407,9 @@ async fn cmd_serve(
             );
         }
     }
+    // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
+    auth.add_route_jwks(&manifest.routes)?;
+    let mut pg_pool = None;
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(vibe::runtime::MemoryExec::new())
     } else {
@@ -395,8 +418,9 @@ async fn cmd_serve(
             .map_err(|_| {
                 "set VIBE_DATABASE_URL or pass --memory for the dev executor".to_string()
             })?;
-        let pg = PgExec::connect(&url).await?;
+        let pg = PgExec::connect_with(&url, vibe::runtime::PgOptions::from_env()?).await?;
         pg.check_runtime_role().await?;
+        pg_pool = Some(pg.pool());
         Arc::new(pg)
     };
     let loaded = vibe::runtime::load_project_slugs(project, memory)?;
@@ -413,6 +437,36 @@ async fn cmd_serve(
             "warning: public routes use {{slug}} but no tenants are configured; copy slugs.example.json to .vibe/slugs.json or run `vibe slug add <slug> --tenant <id>`"
         );
     }
+    // #118: refuse `challenge_when: always` in production until a verifier
+    // is configured.
+    // #157: build the per-tenant store chosen at startup; a missing or unusable
+    // table refuses to start.
+    let replay_store: Option<Arc<dyn vibe::runtime::replay::ReplayStore>> =
+        match (replay_choice, pg_pool) {
+            (Some(vibe::runtime::replay::StoreKind::Postgres), Some(pool)) => {
+                // Per-tenant tables; the IP digest is keyed per tenant from
+                // the API-key pepper.
+                let store = vibe::runtime::replay::PgReplayStore::new(pool, &auth.pepper);
+                let mut tenants: Vec<String> =
+                    loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
+                tenants.sort();
+                tenants.dedup();
+                store.check(&tenants).await?;
+                Some(Arc::new(store))
+            }
+            (Some(vibe::runtime::replay::StoreKind::Postgres), None) => {
+                return Err("the challenge replay store needs PostgreSQL".into())
+            }
+            _ => None,
+        };
+    let challenge = vibe::runtime::challenge::verifier_from_env_with_store(replay_store)?;
+    let always: Vec<String> = manifest
+        .routes
+        .iter()
+        .filter(|r| r.public && r.challenge_type != "none" && r.challenge_when == "always")
+        .map(|r| r.feature_id.clone())
+        .collect();
+    vibe::runtime::challenge::production_gate(run_env, challenge.is_some(), &always)?;
     let addr: SocketAddr = addr.parse().map_err(|err| format!("bad address: {err}"))?;
     let state = Arc::new(AppState {
         manifest,
@@ -426,6 +480,7 @@ async fn cmd_serve(
         honor_test_ip: false,
         trusted_proxies: trusted_proxies_from_env()?,
         dev_hints: memory,
+        challenge,
     });
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr)
@@ -537,7 +592,11 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
         return Err("set either VIBE_JWT_PUBLIC_KEY_PEM or VIBE_JWT_JWKS_URI, not both".into());
     }
     if let Some(uri) = jwks_uri {
-        let source = vibe::runtime::jwks::HttpsJwks::new(&uri)?;
+        let allow_private = std::env::var("VIBE_JWT_ALLOW_PRIVATE_HOST").as_deref() == Ok("true");
+        if allow_private && !run_env.is_dev() {
+            return Err("VIBE_JWT_ALLOW_PRIVATE_HOST is only allowed in development".into());
+        }
+        let source = vibe::runtime::jwks::HttpsJwks::with_policy(&uri, allow_private)?;
         auth.jwks = Some(std::sync::Arc::new(vibe::runtime::jwks::JwksCache::new(
             std::sync::Arc::new(source),
         )));

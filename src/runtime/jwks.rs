@@ -34,17 +34,41 @@ pub struct HttpsJwks {
     client: reqwest::Client,
 }
 
+/// True for hosts a JWKS fetch must not reach: loopback, private, link-local
+/// (cloud metadata), CGNAT, unspecified, single-label and `.local`/
+/// `.internal`/`.localhost` names (SSRF). Uses the shared
+/// [`crate::netguard`] classifier (trailing dots and case normalized).
+pub fn non_public_host(host: &str) -> bool {
+    crate::netguard::is_non_public_host(host)
+}
+
 impl HttpsJwks {
+    /// Public https hosts only.
     pub fn new(uri: &str) -> Result<Self, String> {
+        Self::with_policy(uri, false)
+    }
+
+    /// `allow_private` is the development-only escape hatch
+    /// (`VIBE_JWT_ALLOW_PRIVATE_HOST=true` with a development `VIBE_ENV`).
+    pub fn with_policy(uri: &str, allow_private: bool) -> Result<Self, String> {
         let parsed = url::Url::parse(uri).map_err(|err| format!("jwks-uri: {err}"))?;
         if parsed.scheme() != "https" {
             return Err("jwks-uri must use https".into());
         }
-        let client = reqwest::Client::builder()
+        let host = parsed.host_str().unwrap_or("");
+        if !allow_private && non_public_host(host) {
+            return Err(format!(
+                "jwks-uri host {host} is loopback, private or link-local; use a public https host"
+            ));
+        }
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|err| err.to_string())?;
+            .redirect(reqwest::redirect::Policy::none());
+        if !allow_private {
+            // Also check every address the name resolves to (DNS rebinding).
+            builder = crate::netguard::guard_client(builder);
+        }
+        let client = builder.build().map_err(|err| err.to_string())?;
         Ok(Self {
             uri: uri.to_string(),
             client,
@@ -392,5 +416,23 @@ mod tests {
     fn https_is_required() {
         assert!(HttpsJwks::new("http://idp.example.com/jwks.json").is_err());
         assert!(HttpsJwks::new("https://idp.example.com/jwks.json").is_ok());
+        for bad in [
+            "https://127.0.0.1/jwks.json",
+            "https://localhost/jwks.json",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.5/k",
+            "https://192.168.1.1/k",
+            "https://172.16.0.1/k",
+            "https://100.64.0.1/k",
+            "https://0.0.0.0/k",
+            "https://[::1]/k",
+            "https://[::ffff:127.0.0.1]/k",
+            "https://[fe80::1]/k",
+            "https://idp.internal/k",
+            "https://intranet/k",
+        ] {
+            assert!(HttpsJwks::new(bad).is_err(), "{bad}");
+        }
+        assert!(HttpsJwks::with_policy("https://localhost/jwks.json", true).is_ok());
     }
 }
