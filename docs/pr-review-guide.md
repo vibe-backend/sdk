@@ -17,17 +17,13 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 
 - 專用 **tag ruleset**（target：Tag，enforcement：Active），target `refs/tags/v*`（UI 入面 include pattern `v*`）。
 - 只開 **Restrict updates**、**Restrict deletions**、**Block force pushes**；**唔開 Restrict creations**（產品經理代 Jack 決定採用 (i)）。任何有 write 權限嘅人都可以開 `v*` tag，開咗就改唔到、刪唔到。
-- **Bypass list 一定要留空**，admin 都唔例外；唔設白名單。高風險 release build 會讀呢個 ruleset，讀唔到、唔係空、唔係 Active、缺少上面三條規則、或者冇 target 到今次嘅 tag 就失敗。
+- **Bypass list 一定要留空**，admin 都唔例外；唔設白名單。呢個 ruleset 係營運設定，SDK 唔讀、唔檢查；唯一 release 閘門係 `release` environment 批准（spec 決定 96、2C.3a）。
 - Release 只可以由 `v*` tag 出，tag 一定要指向 `main` 上嘅 commit。
 - 把關：開 tag 唔會自動發佈；發佈 job 要經 `release` environment 批准（live reviewer：`j113203`，`prevent_self_review: false`）。`--release-approval` 已撤回（產品經理 2026-10-16），冇額外保護。
 - **剩餘風險（Jack 已接受）**：所有 agent 都用 `j113203` push，任何 `j113203` agent 都可以開 `v*` tag **再自己批准 release**。
 - 以上係**臨時方案 (i)**。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一開 `v*` tag 嘅 actor，同時開返 Prevent self-review。
 - `release` environment `can_admins_bypass: true` 保持開啟（Jack 決定保留，已接受風險：admin 可以跳過 `release` environment 嘅批准，即係跳過真正閘門）。
-- 讀 ruleset 嘅專用 GitHub App：只裝喺呢個 repo，喺 `release` environment job 入面 mint installation token：
-  - 權限只畀 repository **Administration: read** 同 **Metadata: read**；**唔畀 Administration: write**。
-  - GitHub 只會將 `bypass_actors` 回畀對 ruleset 有寫權限嘅 caller；如果 read 睇唔到，高風險 release build 會失敗，要另外搵產品經理批准，唔好自己加權限。
-  - App private key 放 `release` environment secret；mint token 時收窄到呢個 repo；token 唔好印出嚟。
-  - 冇呢個 App 嘅話，高風險 release build 會失敗；普通 build 只記錄。
+- 唔需要讀 ruleset 嘅 GitHub App：`--release-approval` 已撤回，SDK 唔讀 tag ruleset 或者 `bypass_actors`，冇 App 或者讀唔到都唔影響任何 build；ruleset 只係營運設定，唯一 release 閘門係 `release` environment 批准（spec 決定 96、2C.3a）。
 
 ## 2. CODEOWNERS（必須，spec 決定 29、37）
 
