@@ -10,12 +10,21 @@ Locks are build output. They are not committed (`*.lock.md` is in
    compiles in memory and runs the deterministic policy, then writes the
    result to the job summary. It is informational and never deployed. It uses
    `VIBE_LLM_API_KEY_PREVIEW`.
-2. **Build once, on a `v*` tag.** `release-build` runs in the `release`
-   environment (Jack approves the run): `vibe build` compiles every source in
-   memory, validates the in-memory locks (policy, dependency hashes, SQL
-   allowlist, inherited auth), records per-lock hashes and the commit, and
-   fails closed on high-risk items without `--release-approval`. It takes
-   **no signing key** and refuses `VIBE_RELEASE_SIGNING_KEY`.
+2. **Build once, on a `v*` tag.** An `install` job with no secrets builds
+   vibe from a pinned SDK commit (`VIBE_SDK_REV`) and later jobs check its
+   digest. `release-policy` runs the LLM compile and deploy policy with the
+   LLM key only. `release-build` then runs in the `release` environment
+   (Jack approves the run): `vibe build` compiles every source in memory,
+   validates the in-memory locks (policy, dependency hashes, SQL allowlist,
+   inherited auth), records per-lock hashes and the commit, and writes the
+   compiled locks to a local build directory (`--locks-dir`, default
+   `.vibe/build/locks`; never the repo). Lock files on disk are not read.
+   High-risk items fail closed until release-environment approval
+   verification (#80) is implemented; `--release-approval` is not approval.
+   Release builds never read `.env` and send the LLM key only to an
+   allowlisted host (`api.openai.com`, the default when `LLM_BASE_URL` is
+   unset; `api.anthropic.com`; `generativelanguage.googleapis.com`). The
+   build takes **no signing key** and refuses `VIBE_RELEASE_SIGNING_KEY`.
 3. **Sign keyless.** The same job attests `manifest.json` with
    `actions/attest-build-provenance`: Sigstore keyless signing with the
    job's GitHub OIDC token, a short-lived Fulcio certificate and a Rekor
@@ -44,8 +53,6 @@ Details, what is verified where, and what is deferred:
   whether to delete it is Jack's call.
 - Repo or PR-scoped secret `VIBE_LLM_API_KEY_PREVIEW` (low quota, cannot reach
   release secrets).
-- Optional environment variable `VIBE_RELEASE_APPROVAL` (reference recorded
-  for high-risk items).
 - `staging` and `production` environments for the deploy job.
 - Runtime configuration: ship `manifest.json.sigstore.json` next to the
   manifest (or set `VIBE_MANIFEST_BUNDLE`). Set `VIBE_RELEASE_REPO` /
@@ -55,8 +62,13 @@ Details, what is verified where, and what is deferred:
 
 ## Local development
 
+Add `.vibe/` to your project's `.gitignore`: it holds the dev signing key,
+the build record, the LLM output cache, and the build output
+(`.vibe/build/locks`).
+
 `vibe keygen` creates `.vibe/signing.key` (mode 0600). `vibe build --dev`
 signs with it and marks the manifest `build-mode: dev`; production refuses
 dev manifests. `vibe compile` writes locks and `.vibe/build-record.json`;
-the record is a local tripwire, not a trust root; only the attested release
-artifact is deployable.
+`vibe validate --deploy` and `vibe manifest` refuse locks that differ from
+that record. The record is a local tripwire, not a trust root; only the
+attested release artifact is deployable.

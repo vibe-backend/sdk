@@ -69,7 +69,8 @@ impl Provenance {
 /// How a manifest is built.
 #[derive(Clone, Debug, Default)]
 pub struct BuildInfo {
-    /// Release build: high-risk items need `release_approval` (decision 90).
+    /// Release build. High-risk items fail closed until release-environment
+    /// approval verification (#80) lands (decision 90/118).
     pub release: bool,
     pub release_approval: Option<String>,
     pub commit: String,
@@ -379,7 +380,11 @@ fn build_unsigned(
             .clone()
             .filter(|r| !r.trim().is_empty()),
     };
-    if info.release && manifest.provenance.release_approval.is_none() {
+    // Decision 90/118: the approval is the `release` environment approval,
+    // verified against the platform (#80). Until that verification exists,
+    // a release build with high-risk items fails closed; no
+    // `--release-approval` value counts as approval.
+    if info.release {
         let high: Vec<String> = manifest
             .provenance
             .high_risk()
@@ -388,7 +393,7 @@ fn build_unsigned(
             .collect();
         if !high.is_empty() {
             return Err(single(format!(
-                "release build has high-risk items and no release approval: {}; pass --release-approval <ref>",
+                "release build has high-risk items: {}; release-environment approval verification (#80) is not implemented yet, so high-risk release builds fail closed (--release-approval is not accepted as approval)",
                 high.join(", ")
             )));
         }
@@ -414,8 +419,10 @@ pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), St
     if provenance.locks.is_empty() {
         return Err("manifest has no lock provenance".into());
     }
-    if !provenance.high_risk().is_empty() && provenance.release_approval.is_none() {
-        return Err("manifest has high-risk items without a release approval".into());
+    // Fail closed until release-environment approval verification (#80):
+    // a recorded approval string is not proof of approval.
+    if !provenance.high_risk().is_empty() {
+        return Err("manifest has high-risk items without a verified release approval".into());
     }
     Ok(())
 }

@@ -237,9 +237,19 @@ async fn compile_docs(
                 continue;
             }
         };
+        let mut probe = docs[id].clone();
+        probe.meta.dependencies = deps.clone();
+        let mode_changed = security::auth_mode_changed(&probe, &docs);
         let doc = docs.get_mut(id).expect("doc inserted");
         doc.meta.dependencies = deps;
         let mut items = security::extract_items(doc);
+        if mode_changed {
+            items.push(crate::lock::SecurityItem {
+                item: "auth-mode-change".into(),
+                risk: crate::lock::Risk::High,
+                reason: String::new(),
+            });
+        }
         if doc
             .meta
             .security_items

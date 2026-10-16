@@ -1125,6 +1125,24 @@ async fn release_build_ignores_lock_files_in_the_repo() {
     let root = compiled_shop().await;
     tamper_product_lock(&root);
     rerecord(&root);
+    let (loaded, _) = vibe::compile::compile_in_memory(&root, None, None)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+    let product = loaded
+        .lock_texts
+        .iter()
+        .flatten()
+        .find(|text| text.contains("id: product\n"))
+        .expect("product lock");
+    assert!(
+        !product.contains("100000"),
+        "repo lock leaked into the release"
+    );
+    let on_disk = fs::read_to_string(root.join(PRODUCT_LOCK)).unwrap();
+    assert_ne!(*product, on_disk);
+    // The CLI release build reaches the policy only after compiling from
+    // source; the shop has high-risk items, so it fails closed (#80) even
+    // with a --release-approval string, and writes nothing.
     let (ok, out) = vibe_cli(
         &root,
         &[
@@ -1141,31 +1159,82 @@ async fn release_build_ignores_lock_files_in_the_repo() {
         ],
         &[],
     );
-    assert!(ok, "{out}");
-    let manifest: vibe::Manifest =
-        serde_json::from_slice(&fs::read(root.join("release.json")).unwrap()).unwrap();
-    assert_eq!(manifest.signature, vibe::attest::SIGSTORE_SIGNATURE);
-    let json = serde_json::to_string(&manifest.routes).unwrap()
-        + &serde_json::to_string(&manifest.models).unwrap();
+    assert!(!ok, "{out}");
     assert!(
-        !json.contains("100000"),
-        "repo lock leaked into the release"
+        out.contains("high-risk release builds fail closed"),
+        "{out}"
     );
-    let p = &manifest.provenance;
-    assert_eq!(p.build_mode, "release");
-    assert_eq!(p.commit, "abc123");
-    assert_eq!(p.release_approval.as_deref(), Some("pr:1"));
-    let product = p.locks.iter().find(|l| l.id == "product").unwrap();
-    let on_disk = fs::read_to_string(root.join(PRODUCT_LOCK)).unwrap();
-    assert_ne!(product.lock_sha256, vibe::buildrecord::lock_hash(&on_disk));
-    assert!(product.content_hash.starts_with("sha256:"));
-    assert!(product.source_hash.starts_with("sha256:"));
-    assert!(product.compiler_hash.starts_with("sha256:"));
-    assert!(!p.high_risk().is_empty());
+    assert!(!root.join("release.json").exists());
     // The same old lock cannot reach a dev manifest either.
     sign::create_dev_key(&root).unwrap();
     let (ok, out) = vibe_cli(&root, &["manifest", "--project", "."], &[]);
     assert!(!ok, "{out}");
+}
+
+#[tokio::test]
+async fn release_build_never_reads_the_project_env_file() {
+    let root = compiled_shop().await;
+    fs::write(
+        root.join(".env"),
+        "LLM_BASE_URL=https://attacker.example/v1\nLLM_API_KEY=sk-from-env-file\nLLM_MODEL=gpt-5.1-2026-01-01\n",
+    )
+    .unwrap();
+    let (ok, out) = vibe_cli(
+        &root,
+        &[
+            "manifest",
+            "--project",
+            ".",
+            "--release",
+            "-o",
+            "release.json",
+        ],
+        &[],
+    );
+    assert!(!ok);
+    assert!(!out.contains("attacker.example"), "{out}");
+    assert!(
+        out.contains("high-risk release builds fail closed"),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn release_build_refuses_a_non_allowlisted_llm_host() {
+    let root = compiled_shop().await;
+    let (ok, out) = vibe_cli(
+        &root,
+        &[
+            "manifest",
+            "--project",
+            ".",
+            "--release",
+            "-o",
+            "release.json",
+        ],
+        &[
+            ("VIBE_LLM_API_KEY", "sk-release-compiler-key"),
+            ("LLM_MODEL", "gpt-5.1-2026-01-01"),
+            ("LLM_BASE_URL", "https://llm.attacker.example/v1"),
+        ],
+    );
+    assert!(!ok);
+    assert!(out.contains("allowlisted host"), "{out}");
+    assert!(out.contains("llm.attacker.example"), "{out}");
+    assert!(!root.join("release.json").exists());
+    // The default endpoint (LLM_BASE_URL unset) is allowlisted.
+    let config = vibe::llm::load_llm_config(
+        &[
+            ("LLM_API_KEY".to_string(), "sk-test-value".to_string()),
+            ("LLM_MODEL".to_string(), "gpt-5.1-2026-01-01".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(config.endpoint_host, "api.openai.com");
+    vibe::llm::check_release_endpoint(&config).unwrap();
 }
 
 #[tokio::test]
@@ -1193,8 +1262,8 @@ async fn release_build_is_immune_to_lock_edits_during_the_build() {
         &loaded,
         &key,
         &vibe::manifest::BuildInfo {
-            release: true,
-            release_approval: Some("pr:1".into()),
+            release: false,
+            release_approval: None,
             commit: "abc".into(),
         },
     )
@@ -1231,10 +1300,24 @@ async fn release_build_with_high_risk_items_needs_an_approval() {
     .unwrap_err()
     .to_string();
     assert!(
-        err.contains("high-risk items and no release approval"),
+        err.contains("high-risk release builds fail closed"),
         "{err}"
     );
     assert!(err.contains("public"), "{err}");
+    // An arbitrary approval string is not approval.
+    let err = vibe::manifest::build_signed(
+        &root,
+        &loaded,
+        &key,
+        &vibe::manifest::BuildInfo {
+            release: true,
+            release_approval: Some("pr:1".into()),
+            commit: String::new(),
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("not accepted as approval"), "{err}");
 }
 
 #[tokio::test]
@@ -1250,7 +1333,10 @@ async fn production_runs_only_attested_release_manifests() {
     let mut forged = dev.clone();
     forged.provenance.build_mode = "release".into();
     let err = vibe::manifest::check_deployable(&forged, false).unwrap_err();
-    assert!(err.contains("without a release approval"), "{err}");
+    assert!(err.contains("without a verified release approval"), "{err}");
+    forged.provenance.release_approval = Some("pr:1".into());
+    let err = vibe::manifest::check_deployable(&forged, false).unwrap_err();
+    assert!(err.contains("without a verified release approval"), "{err}");
 }
 
 #[tokio::test]
@@ -1296,20 +1382,31 @@ async fn production_serve_ignores_the_project_public_key() {
 mod sigstore_fixture;
 
 /// Writes a keyless release manifest of the shop and returns its path.
+/// `vibe build` refuses high-risk release builds until release approval
+/// verification (#80) exists, so this builds the manifest content, drops
+/// the high-risk items and marks it as a keyless release to exercise the
+/// runtime's bundle checks.
 async fn release_manifest(root: &Path) -> PathBuf {
     let (loaded, _) = vibe::compile::compile_in_memory(root, None, None)
         .await
         .unwrap();
-    let manifest = vibe::manifest::build_release(
+    let mut manifest = vibe::manifest::build_signed(
         root,
         &loaded,
+        &sign::generate_key(),
         &vibe::manifest::BuildInfo {
-            release: true,
-            release_approval: Some("pr:1".into()),
+            release: false,
+            release_approval: None,
             commit: "abc123".into(),
         },
     )
     .unwrap_or_else(|err| panic!("{err}"));
+    manifest.provenance.build_mode = "release".into();
+    manifest
+        .provenance
+        .security_items
+        .retain(|item| item.risk != "high");
+    manifest.signature = vibe::attest::SIGSTORE_SIGNATURE.into();
     let path = root.join("manifest.json");
     vibe::manifest::write_manifest(&path, &manifest).unwrap();
     path
@@ -1398,4 +1495,96 @@ async fn production_serve_verifies_the_sigstore_bundle() {
     let (ok, out) = production_serve(&root, &[("VIBE_MANIFEST_PUBKEY", &public)]);
     assert!(!ok);
     assert!(out.contains("Sigstore bundle"), "{out}");
+}
+
+#[tokio::test]
+async fn auth_mode_change_is_high_risk_and_keeps_the_inherited_roles() {
+    let root = compiled_shop().await;
+    let lock =
+        fs::read_to_string(root.join("api/catalog/v1/import-product/import-product.lock.md"))
+            .unwrap();
+    assert!(lock.contains("auth-mode-change"), "{lock}");
+
+    // A mode change cannot widen the inherited roles.
+    let root = copy_shop();
+    edit(
+        &root,
+        "api/catalog/v1/import-product/import-product.md",
+        "- mode: api-key",
+        "- mode: api-key\n- roles: [staff, customer]",
+    );
+    let err = compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .err()
+    .map(|r| r.to_string())
+    .unwrap_or_default();
+    let text = if err.is_empty() {
+        validate_text(&root)
+    } else {
+        err
+    };
+    assert!(
+        text.contains("auth role customer widens the inherited roles"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn auth_mode_change_without_the_high_risk_item_fails() {
+    let root = compiled_shop().await;
+    let rel = "api/catalog/v1/import-product/import-product.lock.md";
+    let text = fs::read_to_string(root.join(rel)).unwrap();
+    let stripped: String = text
+        .lines()
+        .filter(|line| !line.contains("auth-mode-change"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_ne!(text, stripped);
+    fs::write(root.join(rel), stripped).unwrap();
+    let report = validate_text(&root);
+    assert!(
+        report.contains("not recorded as a high-risk item")
+            || report.contains("security-items do not match"),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn auth_roles_merge_every_parent_auth_block() {
+    // The version adds its own auth block; the definition's roles still apply.
+    let root = copy_shop();
+    edit(
+        &root,
+        "api/catalog/v1/_version.md",
+        "## Pipelines\n\n(none)",
+        "## Pipelines\n\n### auth\n\n- mode: jwt\n- roles: [admin]",
+    );
+    edit(
+        &root,
+        "api/catalog/v1/import-product/import-product.md",
+        "- mode: api-key",
+        "- mode: jwt\n- roles: [staff, admin, customer]",
+    );
+    let err = compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .err()
+    .map(|r| r.to_string())
+    .unwrap_or_default();
+    let text = if err.is_empty() {
+        validate_text(&root)
+    } else {
+        err
+    };
+    assert!(text.contains("auth role customer widens"), "{text}");
+    assert!(!text.contains("auth role staff widens"), "{text}");
 }
