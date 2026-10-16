@@ -68,6 +68,8 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
     check_targets(&docs, &mut report);
     check_migrations(&docs, &mut report);
     check_feature_method_writes(&docs, &mut report);
+    let env_roles_claim = std::env::var("VIBE_JWT_ROLES_CLAIM").ok();
+    check_claims_vs_roles_claims(&docs, env_roles_claim.as_deref(), &mut report);
     check_security_items_enriched(&docs, &source_by_id, opts, &mut report);
     if opts.deploy {
         check_approval_set(&docs, &source_by_id, opts, &mut report);
@@ -435,6 +437,18 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                     .at_step(&block.heading),
             );
         }
+        // Ops this build executes inside methods share the API step grammar.
+        // #77 ops (query, verify-password, hash-password, random-token,
+        // hash-token, sign-jwt) keep their own checks below.
+        if matches!(op.as_str(), "method" | "validate" | "respond") {
+            for problem in api_step_problems(block, &op) {
+                report.push(
+                    Diag::error(file, problem)
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+            }
+        }
         if op == "sign-jwt" {
             if !caps.contains("sign-token") {
                 report.push(
@@ -454,6 +468,53 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                     Diag::error(file, "sign-jwt key must be a key-ref").at_step(&block.heading),
                 );
             }
+            if !block_val(block, "roles").is_empty() {
+                report.push(
+                    Diag::error(
+                        file,
+                        "sign-jwt roles come from users.roles (read by the platform); remove `roles`",
+                    )
+                    .at_step(&block.heading),
+                );
+            }
+            if !matches!(block_val(block, "issue-refresh").as_str(), "" | "none") {
+                report.push(
+                    Diag::error(
+                        file,
+                        "sign-jwt issue-refresh is not supported by this runtime yet",
+                    )
+                    .at_step(&block.heading),
+                );
+            }
+            let declared = crate::lock::parse_string_list(&block_val(block, "custom-claims"))
+                .unwrap_or_default();
+            if let Ok(pairs) = crate::lock::parse_inline_map(&block_val(block, "claims")) {
+                let rows: Vec<String> = steps
+                    .blocks
+                    .iter()
+                    .take_while(|b| b.heading != block.heading)
+                    .filter(|b| block_val(b, "op") == "query")
+                    .map(|b| block_val(b, "out"))
+                    .filter(|o| !o.is_empty())
+                    .collect();
+                match pairs.iter().find(|(name, _)| name == "sub") {
+                    Some((_, expr)) => {
+                        if let Some(problem) = crate::runtime::sub_source_problem(expr, &rows) {
+                            report.push(Diag::error(file, problem).at_step(&block.heading));
+                        }
+                    }
+                    None => report.push(
+                        Diag::error(file, "sign-jwt needs a sub claim").at_step(&block.heading),
+                    ),
+                }
+                for (name, _) in pairs.iter().filter(|(name, _)| name != "sub") {
+                    if let Some(problem) =
+                        crate::runtime::custom_claim_problem(name, &declared, &["roles"])
+                    {
+                        report.push(Diag::error(file, problem).at_step(&block.heading));
+                    }
+                }
+            }
             if let Some(ms) = crate::llm::parse_duration_ms(&block_val(block, "ttl")) {
                 if ms > 3_600_000 {
                     report.push(
@@ -468,22 +529,36 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
         }
         if op == "query" {
             let sql = block_val(block, "sql").trim_matches('`').to_string();
-            saw_write |= crate::security::sql_writes(&sql);
+            // Structural checks from the parse tree (sqlguard).
+            match crate::sqlguard::analyze(&sql) {
+                Ok(info) => {
+                    saw_write |= info.writes;
+                    if info.writes && block_val(block, "writes") != "true" {
+                        report.push(
+                            Diag::error(file, "a query step that writes needs writes: true")
+                                .at_step(&block.heading)
+                                .at_section("Steps"),
+                        );
+                    }
+                    if info.targets_rows && block_val(block, "scope").is_empty() {
+                        report.push(
+                            Diag::error(file, "UPDATE/DELETE needs scope: pk or scope: rls")
+                                .at_step(&block.heading),
+                        );
+                    }
+                }
+                Err(problem) => report.push(
+                    Diag::error(file, problem)
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                ),
+            }
             for problem in sql_problems(&sql, &block_val(block, "params"), false) {
                 report.push(
                     Diag::error(file, problem)
                         .at_step(&block.heading)
                         .at_section("Steps"),
                 );
-            }
-            if crate::security::sql_writes(&sql) && block_val(block, "scope").is_empty() {
-                let cleaned = crate::security::strip_sql_noise(&sql).to_ascii_lowercase();
-                if cleaned.contains("update") {
-                    report.push(
-                        Diag::error(file, "UPDATE needs scope: pk or scope: rls")
-                            .at_step(&block.heading),
-                    );
-                }
             }
         }
     }
@@ -801,6 +876,75 @@ fn check_migration_sql(doc: &LockDoc, file: &str, report: &mut Report) {
     }
 }
 
+/// Every roles claim the runtime may read: `roles`, `VIBE_JWT_ROLES_CLAIM`
+/// and each route's `roles-claim`.
+pub fn configured_roles_claims(
+    docs: &HashMap<String, LockDoc>,
+    env_claim: Option<&str>,
+) -> Vec<String> {
+    let mut out = vec!["roles".to_string()];
+    out.extend(
+        env_claim
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string),
+    );
+    for doc in docs.values() {
+        if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
+            for block in &pipes.blocks {
+                let claim = block_val(block, "roles-claim");
+                if !claim.is_empty() {
+                    out.push(claim);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A `sign-jwt` custom claim may not share a name with any roles claim.
+fn check_claims_vs_roles_claims(
+    docs: &HashMap<String, LockDoc>,
+    env_claim: Option<&str>,
+    report: &mut Report,
+) {
+    let claims = configured_roles_claims(docs, env_claim);
+    let claims: Vec<&str> = claims.iter().map(String::as_str).collect();
+    for doc in docs.values().filter(|d| d.meta.kind == Kind::Method) {
+        let Some(steps) = find_section(&doc.sections, "Steps") else {
+            continue;
+        };
+        for block in steps
+            .blocks
+            .iter()
+            .filter(|b| block_val(b, "op") == "sign-jwt")
+        {
+            let declared = crate::lock::parse_string_list(&block_val(block, "custom-claims"))
+                .unwrap_or_default();
+            let Ok(pairs) = crate::lock::parse_inline_map(&block_val(block, "claims")) else {
+                continue;
+            };
+            for name in declared.iter().chain(pairs.iter().map(|(n, _)| n)) {
+                if name == "sub" {
+                    continue;
+                }
+                let all_declared = std::slice::from_ref(name);
+                if let Some(problem) =
+                    crate::runtime::custom_claim_problem(name, all_declared, &claims)
+                {
+                    if crate::runtime::custom_claim_problem(name, all_declared, &["roles"])
+                        .is_none()
+                    {
+                        report.push(Diag::error(&doc.meta.source, problem).at_step(&block.heading));
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn check_routes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
     let mut seen: HashMap<String, String> = HashMap::new();
     for doc in docs.values() {
@@ -876,13 +1020,46 @@ pub fn check_method_target(target: &str, docs: &HashMap<String, LockDoc>) -> Res
 
 fn check_targets(docs: &HashMap<String, LockDoc>, report: &mut Report) {
     for doc in docs.values() {
-        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+        let feature = doc.meta.kind == Kind::Api && doc.meta.scope == Some(Scope::Feature);
+        let method = doc.meta.kind == Kind::Method;
+        if !feature && !method {
             continue;
+        }
+        if method {
+            // Calls.methods is the static call list the runtime binds at deploy.
+            if let Some(list) = find_section(&doc.sections, "Calls").and_then(|s| s.get("methods"))
+            {
+                let targets = match crate::lock::parse_string_list(list) {
+                    Ok(targets) => targets,
+                    Err(_) => {
+                        // Fail closed: a malformed list must not skip the check.
+                        report.push(
+                            Diag::error(
+                                lock_rel(&doc.meta.source),
+                                "Calls.methods must be a list like `[object.action, ...]`",
+                            )
+                            .at_section("Calls"),
+                        );
+                        Vec::new()
+                    }
+                };
+                for target in targets {
+                    if let Err(err) = check_method_target(&target, docs) {
+                        report
+                            .push(Diag::error(lock_rel(&doc.meta.source), err).at_section("Calls"));
+                    }
+                }
+            }
         }
         let Some(steps) = find_section(&doc.sections, "Steps") else {
             continue;
         };
         for block in &steps.blocks {
+            // In method locks only `op: method` targets are method ids;
+            // `op: call` targets are external endpoints.
+            if method && block_val(block, "op") != "method" {
+                continue;
+            }
             if let Some(target) = block.bullets.iter().find(|b| b.key == "target") {
                 if let Err(err) = check_method_target(&target.value, docs) {
                     report.push(
@@ -1119,6 +1296,18 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
         }
     }
     problems
+}
+
+/// SQL that writes somewhere other than a leading INSERT/UPDATE, such as
+/// `WITH x AS (INSERT ...)`: a write hidden inside a read. Rejected.
+pub fn writable_cte(sql: &str) -> bool {
+    crate::security::sql_writes(sql) && !plain_write(sql)
+}
+
+/// A statement that is itself an INSERT or UPDATE.
+pub fn plain_write(sql: &str) -> bool {
+    let lower = sql.trim().trim_matches('`').trim().to_ascii_lowercase();
+    lower.starts_with("insert") || lower.starts_with("update")
 }
 
 fn known_type(ty: &str) -> bool {
@@ -1451,6 +1640,60 @@ mod tests {
             "{:?}",
             report.diags
         );
+    }
+
+    #[test]
+    fn malformed_calls_methods_fails_closed() {
+        for list in ["product.publish", "[product.publish", "{ a: b }"] {
+            let mut docs = target_docs();
+            let body = format!("## Calls\n- methods: {list}\n");
+            docs.insert(
+                "product/methods/x".into(),
+                doc(Kind::Method, None, "product/methods/x", &body),
+            );
+            let mut report = Report::new();
+            check_targets(&docs, &mut report);
+            assert!(
+                report
+                    .errors()
+                    .any(|d| d.message.contains("Calls.methods must be a list")),
+                "{list}: {:?}",
+                report.diags
+            );
+        }
+    }
+
+    #[test]
+    fn validate_reports_unknown_method_lock_targets() {
+        let mut docs = target_docs();
+        let body = "## Signature\n- writes: false\n## Calls\n- methods: [product.ghost]\n## Steps\n### s1 method\n- op: method\n- target: nope.get\n- out: r\n### s2 call\n- op: call\n- target: https://example.com/hook\n";
+        docs.insert(
+            "product/methods/caller".into(),
+            doc(Kind::Method, None, "models/product/methods/caller", body),
+        );
+        let mut report = Report::new();
+        check_targets(&docs, &mut report);
+        let msgs: Vec<&str> = report.errors().map(|d| d.message.as_str()).collect();
+        assert!(msgs.iter().any(|m| m.contains("nope.get")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("product.ghost")), "{msgs:?}");
+        assert!(!msgs.iter().any(|m| m.contains("example.com")), "{msgs:?}");
+    }
+
+    #[test]
+    fn method_lock_steps_get_step_grammar_checks() {
+        let body = "## Signature\n- writes: false\n## Calls\n- methods: []\n## Steps\n### s1 method\n- op: method\n- method: product.get\n- out: r\n### s2 validate\n- op: validate\n- when: `r == null`\n### s3 respond\n- op: respond\n- value: r\n- status: 999\n";
+        let d = doc(Kind::Method, None, "models/product/methods/x", body);
+        let mut report = Report::new();
+        check_method(&d, "x.lock.md", &mut report);
+        let msgs: Vec<&str> = report.errors().map(|d| d.message.as_str()).collect();
+        for want in [
+            "unknown key `method` for op method (use `target:`)",
+            "method step needs `target`",
+            "validate step needs a `fail` error code",
+            "status `999` is not an HTTP status",
+        ] {
+            assert!(msgs.contains(&want), "{want} not in {msgs:?}");
+        }
     }
 
     #[test]
