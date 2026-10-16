@@ -165,6 +165,13 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// always ignore the header.
 pub const TEST_IP_OVERRIDE_AVAILABLE: bool = cfg!(debug_assertions);
 
+/// Reads `VIBE_HONOR_TEST_IP`. When set to `true`, client IPs may be
+/// overridden via the `x-vibe-test-ip` header (debug builds only; see
+/// [`check_test_ip_override`]).
+pub fn honor_test_ip_from_env() -> bool {
+    std::env::var("VIBE_HONOR_TEST_IP").as_deref() == Ok("true")
+}
+
 /// Startup check: `honor_test_ip` may only be set in debug builds.
 pub fn check_test_ip_override(honor_test_ip: bool) -> Result<(), String> {
     if honor_test_ip && !TEST_IP_OVERRIDE_AVAILABLE {
@@ -2675,6 +2682,19 @@ mod test_ip_override_tests {
             cfg!(debug_assertions),
             "release builds refuse honor_test_ip at startup"
         );
+    }
+
+    /// Release-profile path: with the override requested, startup must Err.
+    /// Covered by `cargo test --release` (builds without debug_assertions).
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn release_build_refuses_honor_test_ip_at_startup() {
+        let err = check_test_ip_override(true).expect_err("release must refuse");
+        assert!(
+            err.contains("honor_test_ip") && err.contains("release"),
+            "{err}"
+        );
+        assert!(check_test_ip_override(false).is_ok());
     }
 
     #[test]

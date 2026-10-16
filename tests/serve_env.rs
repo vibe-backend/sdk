@@ -30,6 +30,7 @@ fn serve(envs: &[(&str, &str)], memory: bool) -> (bool, String) {
         "VIBE_CHALLENGE_HOSTNAMES",
         "VIBE_CHALLENGE_PROVIDER",
         "VIBE_CHALLENGE_REPLAY_STORE",
+        "VIBE_HONOR_TEST_IP",
     ] {
         cmd.env_remove(key);
     }
@@ -122,3 +123,28 @@ fn development_needs_an_explicit_replay_store() {
     assert!(!ok);
     assert!(!err.contains("replay store"), "{err}");
 }
+
+#[test]
+fn honor_test_ip_override_is_gated_by_build_profile() {
+    let mut envs = vec![
+        ("VIBE_ENV", "dev"),
+        ("VIBE_CHALLENGE_REPLAY_STORE", "memory"),
+        ("VIBE_HONOR_TEST_IP", "true"),
+    ];
+    envs.extend(TURNSTILE);
+    let (ok, err) = serve(&envs, true);
+    assert!(!ok);
+    if cfg!(debug_assertions) {
+        // Debug builds honour the setting; startup fails later (missing project key/manifest).
+        assert!(
+            !err.contains("honor_test_ip is a test-only setting"),
+            "debug must not refuse honor_test_ip: {err}"
+        );
+    } else {
+        assert!(
+            err.contains("honor_test_ip is a test-only setting"),
+            "release must refuse honor_test_ip: {err}"
+        );
+    }
+}
+

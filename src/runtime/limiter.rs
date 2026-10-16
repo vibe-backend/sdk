@@ -1147,7 +1147,7 @@ impl NetLayers {
         let projected = self
             .base_bytes
             .saturating_add(self.bytes())
-            .saturating_add((new_t + new_p) * COUNTER_SLOT_BYTES);
+            .saturating_add((new_t + new_p).saturating_mul(COUNTER_SLOT_BYTES));
         // Growth within both of the tenant's floors may use the reserved part
         // of the memory cap; any other growth may not.
         let within_floor = self.tenants.owned(tenant) + new_t <= self.tenants.floor

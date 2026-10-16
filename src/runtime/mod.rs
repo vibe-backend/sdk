@@ -20,9 +20,9 @@ pub use exec::{
     Row,
 };
 pub use http::{
-    check_test_ip_override, detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router,
-    ApiKeyFile, AppState, AuthConfig, RunEnv, SigningKey, Slug, StoredKey, REQUEST_TYPES,
-    TEST_IP_OVERRIDE_AVAILABLE,
+    check_test_ip_override, detect_jwt_alg, hash_api_secret, honor_test_ip_from_env, load_api_keys,
+    resolve_pepper, router, ApiKeyFile, AppState, AuthConfig, RunEnv, SigningKey, Slug, StoredKey,
+    REQUEST_TYPES, TEST_IP_OVERRIDE_AVAILABLE,
 };
 pub use limiter::{
     counter_slot_refusals, saturation_refusals, slot_refused_metrics, slot_refused_total,

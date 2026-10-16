@@ -387,6 +387,10 @@ async fn cmd_serve(
         vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?,
         !memory,
     )?;
+    // Test-only client IP override (`VIBE_HONOR_TEST_IP=true`). Debug builds
+    // honour it; release builds refuse to start when it is set.
+    let honor_test_ip = vibe::runtime::honor_test_ip_from_env();
+    vibe::runtime::check_test_ip_override(honor_test_ip)?;
     let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
@@ -469,8 +473,6 @@ async fn cmd_serve(
     vibe::runtime::challenge::production_gate(run_env, challenge.is_some(), &always)?;
     let addr: SocketAddr = addr.parse().map_err(|err| format!("bad address: {err}"))?;
     let rates = vibe::runtime::RateBuckets::with_limits(net_limits_from_env()?);
-    let honor_test_ip = false;
-    vibe::runtime::check_test_ip_override(honor_test_ip)?;
     let state = Arc::new(AppState {
         manifest,
         exec,
