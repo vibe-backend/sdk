@@ -4,6 +4,15 @@
 - **Draft date:** 2026-10-15 (UTC)
 - **Baseline:** Latest `main` containing PR #119 merge commit `39179a873c290af7fdce8dc5674107c4540815c6`
 - **Implementation state:** Documentation proposal only; no runtime implementation, milestone, or delivery ETA is approved
+- **Protocol choices:** Every protocol choice in this document (media types, envelopes, encoding, headers, URLs, error mapping, limits) is a **proposal pending a spec PR**. Nothing here amends `spec-v1.8.md` until a spec PR is merged.
+
+## 0. Confirmed direction
+
+The following direction is confirmed and is the frame for the rest of this draft:
+
+1. **v2 stays REST.** Resources are addressed by path and HTTP verb (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`), the same model as the spec v1.8 routes. There is no generic `/v2/operations` RPC envelope.
+2. **Bodies are binary.** Request and response bodies use a binary encoding: MessagePack or CBOR. The comparison is in §5.0; the final choice is pending (§15).
+3. **Generated Markdown API description.** SDK generation also emits a small, automatically generated Markdown description of the REST resources for frontend AI agents (§9).
 
 ## 1. Intent
 
@@ -21,7 +30,7 @@ Non-goal: binary encoding is not encryption, authentication, authorization, or a
 
 ### Required for the first vNext release
 
-- MessagePack request and response bodies.
+- Binary (MessagePack or CBOR, §5.0) request and response bodies on REST resources.
 - A canonical, versioned schema from which backend and SDK codecs are generated.
 - Stable numeric field IDs with explicit compatibility rules.
 - SDK-generated semantic APIs that hide transport details.
@@ -36,10 +45,6 @@ Non-goal: binary encoding is not encryption, authentication, authorization, or a
 
 ### Conditional
 
-- Optional server-side semantic decision pipeline for Markdown feature inference:
-  - Jev is the preferred provider when configured.
-  - An LLM may be configured as a fallback only for uncertain or unsupported Jev outcomes.
-  - Deployments remain functional when neither provider is configured.
 - Zstandard compression, enabled only above a benchmark-derived threshold.
 - Batch requests, if measurements show meaningful header/round-trip savings.
 
@@ -47,22 +52,23 @@ Non-goal: binary encoding is not encryption, authentication, authorization, or a
 
 - Bidirectional streaming.
 - Large binary results carried inside SSE.
-- Base64-encoded MessagePack events.
-- Custom MessagePack extension types unless a concrete schema need is proven.
+- Base64-encoded binary events.
+- Custom MessagePack extension types or CBOR tags unless a concrete schema need is proven.
 - Automatic retry of non-idempotent writes.
 - Large default documentation or tutorials.
 
 ## 3. Architectural principles
 
-1. **Semantic interface first:** Users and AI consume SDK methods and semantic values, not field numbers or raw MessagePack.
+1. **Semantic interface first:** Users and AI consume SDK methods and semantic values, not field numbers or raw binary bodies.
 2. **One schema authority:** The canonical schema drives server codecs, SDK codecs, compatibility tests, errors, and documentation.
 3. **Compact wire, simple guide:** Compactness belongs on the wire; simplicity belongs in the generated AI interface.
-4. **SSE for control and progress:** SSE improves perceived latency, but final binary output remains a normal MessagePack response.
+4. **SSE for control and progress:** SSE improves perceived latency, but final binary output remains a normal binary REST response.
 5. **Explicit compatibility:** No implicit tolerance based only on successful decoding.
 6. **Bound every resource:** Decode depth, sizes, stream duration, reconnect window, event retention, result retention, and concurrent operations must have limits.
 7. **Debugging without leaking:** Human-readable diagnostics are explicit, authorized, redacted, and disabled by default in production.
-8. **Optional intelligence:** Jev and LLM integrations are replaceable server-side providers, never SDK or protocol dependencies.
-9. **Policy is authoritative:** Probabilistic provider output cannot bypass deterministic validation, authorization, safety controls, or explicit user choices.
+8. **REST resources:** Each operation is a resource path plus HTTP verb; no generic RPC envelope.
+9. **Tenant isolation:** Tenant comes only from the slug or a verified token (§11).
+10. **Policy is authoritative:** Deterministic validation and authorization always decide; nothing in the request body can override them.
 
 ## 4. Proposed system model
 
@@ -72,85 +78,54 @@ AI / application
       v
 Generated SDK
   - input validation
-  - MessagePack codec
+  - binary codec (MessagePack or CBOR)
   - protocol/schema checks
   - operation lifecycle
   - fetch-based SSE client
   - reconnect/deduplication
   - error conversion
       |
-      +-- POST binary request --------------------------+
+      +-- REST verb + binary body on a resource --------+
       |                                                |
-      +-- GET SSE progress/control stream -------------+--> vibe-backend
+      +-- GET SSE progress stream (same origin) -------+--> vibe-backend
       |                                                |
-      +-- GET binary final result ----------------------+
+      +-- GET binary result resource (same origin) ----+
 ```
 
 The SDK must make a fast operation appear as a normal request and a long operation appear as a promise and/or async event iterator. The AI-facing Markdown does not explain transport mechanics.
 
-### 4.1 Optional semantic decision pipeline
+### 4.1 Semantic decision pipeline (moved)
 
-Some operations may need to infer from user-authored Markdown whether a feature is required. That inference is a backend concern and is separate from binary encoding, transport negotiation, and generated AI guidance.
-
-```text
-Markdown + explicit feature preference
-      |
-      v
-Deterministic validation and policy pre-checks
-      |
-      +-- explicit or determinable outcome ------------------+
-      |                                                      |
-      +-- ambiguous --> Jev (when configured)                |
-                            |                                 |
-                            +-- sufficient result ------------+
-                            |                                 |
-                            +-- uncertain/unsupported         |
-                                  |                           |
-                                  +--> LLM fallback           |
-                                       (when configured)      |
-                                                            v
-                                             Authoritative backend policy
-                                                            |
-                                                            v
-                                               Provider-neutral decision
-```
-
-Provider order and absence rules:
-
-1. Deterministic checks always run for syntax, schema, declared feature preferences, permissions, safety constraints, size, and compatibility.
-2. If the outcome remains ambiguous and Jev is configured, the backend calls Jev as the preferred semantic provider.
-3. An LLM is called only when it is configured as a fallback and Jev is unavailable, unsupported, uncertain, or below the deployment's confidence threshold. A deployment may explicitly allow the LLM fallback when Jev is not configured; this must not make either provider mandatory.
-4. The backend policy layer makes the final decision. If no provider is configured, or confidence remains insufficient, it returns `needs_review` or requires an explicit feature choice.
-5. Explicit user choices take precedence within authorization and safety constraints. Provider output alone cannot enable billing, elevate permissions, delete data, or trigger other high-risk behavior.
-
-The SDK does not call Jev or an LLM, select providers, interpret provider-specific confidence, or own fallback policy. It submits Markdown plus an optional explicit feature preference and receives a provider-neutral result. The stable contract should use semantic fields such as:
-
-```json
-{
-  "feature": "binary_api",
-  "decision": "required",
-  "reason_code": "SEMANTIC_FEATURE_MATCH",
-  "decision_source": "jev",
-  "fallback_used": false,
-  "policy_version": "1"
-}
-```
-
-`decision` is one of `required`, `not_required`, or `needs_review`. `decision_source` is diagnostic provenance, not a client routing instruction; clients must tolerate new source values. Exact probabilities should be omitted unless they have a stable, calibrated meaning across provider and model versions.
-
-Jev and LLM adapters implement an internal `DecisionProvider` boundary with bounded inputs, timeouts, stable normalized outcomes, and provider-specific failures translated to backend error/review semantics. Raw Markdown is sent to an external provider only when deployment privacy, residency, retention, and consent policy permit it. Prefer derived structured signals when they are sufficient. Record provider type, provider/model version, policy version, fallback use, latency, and reason code without logging raw sensitive content.
-
-This pipeline is optional. Without Jev and without an LLM, deterministic rules, explicit feature preferences, and `needs_review` preserve a complete supported behavior. Provider availability must not change protocol compatibility or make generated SDK installation depend on provider packages.
+The optional Jev/LLM semantic decision pipeline is out of scope for this document. It now lives in a separate proposal: [`proposals/vnext-semantic-decision-pipeline.md`](proposals/vnext-semantic-decision-pipeline.md). Nothing in the binary API, SDK, or generated Markdown depends on it.
 
 ## 5. Wire protocol proposal
+
+### 5.0 MessagePack vs CBOR
+
+Both are compact, schemaless binary encodings with a JSON-like data model. Comparison for this project (to be confirmed by the §13 benchmarks):
+
+| Aspect | MessagePack | CBOR (RFC 8949) |
+| --- | --- | --- |
+| Standardization | Community spec (msgpack.org) | IETF standard (RFC 8949), IANA tag registry |
+| Size | Very compact; small ints and short strings in 1 byte overhead | Comparable; within a few percent of MessagePack on typical payloads |
+| Deterministic encoding | No standard canonical form; must define our own | Defined "core deterministic encoding" (RFC 8949 §4.2), useful for hashing and signatures |
+| Extensibility | Extension types (application-defined, -1..127 app range) | Registered tags (e.g. date/time, bignum, decimal) |
+| Integer / map keys | Integer keys supported | Integer keys supported |
+| Duplicate keys | Not defined by spec; decoder policy needed | Spec says invalid in well-formed "valid" data; decoders can reject |
+| Indefinite-length items | No | Yes (must be disabled/limited by our decode policy) |
+| Ecosystem | Mature libraries in JS, Rust, Go, Python; wide adoption | Mature libraries in JS, Rust, Go, Python; used by COSE/WebAuthn |
+| Browser support | Library required | Library required |
+| Security review | Simpler grammar | More features (tags, indefinite length) to restrict |
+
+Draft assessment, not a decision: MessagePack has a simpler grammar and slightly smaller output; CBOR has a standard, deterministic encoding and a tag registry, which help if bodies are hashed (for example the request hash in spec decision 104 idempotency). Whichever is chosen, the decoder profile must forbid indefinite-length items, unknown tags/extension types, and duplicate keys, and enforce §11 limits. The choice is a product/architecture decision listed in §15.
 
 ### 5.1 Media types and headers
 
 Initial proposal:
 
 ```http
-Content-Type: application/vnd.vibe.msgpack
-Accept: application/vnd.vibe.msgpack
+Content-Type: application/vnd.vibe.v2+msgpack   # or application/vnd.vibe.v2+cbor, per §5.0
+Accept: application/vnd.vibe.v2+msgpack
 Vibe-Protocol-Version: 2
 Vibe-Schema-Fingerprint: <compact fingerprint>
 Content-Encoding: zstd  # optional; never assumed
@@ -163,10 +138,10 @@ Open question: whether protocol version belongs only in headers, in a compact en
 Illustrative only; final numeric field assignments belong in the canonical schema.
 
 ```text
-Request  = [protocol_version, request_id, operation_id, input]
+Request  = <resource input record>   # path + verb select the operation; no operation_id envelope
 Success  = [request_id, result]
 Failure  = [request_id, error_code, error_fields]
-Accepted = [request_id, operation_id, event_url, result_url, cancel_url]
+Accepted = [request_id, operation_id, event_url, result_url, cancel_url]   # all URLs same-origin, see §8.3
 ```
 
 Envelope arrays minimize key overhead. Domain records may use numeric-key maps when optional/evolving fields make positional arrays unsafe.
@@ -202,8 +177,8 @@ Rules proposed:
 For work expected to complete quickly:
 
 ```text
-SDK -> POST MessagePack request
-Server -> 200 MessagePack success/failure
+SDK -> <VERB> /{definition}/{version}/{slug}/{resource}[/{id}] with binary body
+Server -> 2xx binary body, or 4xx/5xx binary error (§10)
 ```
 
 Do not create an SSE stream for routine fast CRUD.
@@ -211,11 +186,12 @@ Do not create an SSE stream for routine fast CRUD.
 ### 6.2 Long-running operation
 
 ```text
-1. SDK -> POST /v2/operations with MessagePack body
-2. Server -> 202 Accepted with compact operation metadata
-3. SDK -> GET /v2/operations/{id}/events using fetch-based SSE
+1. SDK -> POST /{definition}/{version}/{slug}/{resource} with binary body
+2. Server -> 202 Accepted, Location: .../{resource}/jobs/{job_id}, compact metadata
+3. SDK -> GET .../{resource}/jobs/{job_id}/events using fetch-based SSE
 4. Server -> progress/stage/heartbeat/terminal events
-5. SDK -> GET /v2/operations/{id}/result with MessagePack Accept
+5. SDK -> GET .../{resource}/jobs/{job_id}/result with binary Accept
+6. Cancel: DELETE .../{resource}/jobs/{job_id}
 ```
 
 The transition to asynchronous execution may be operation-defined or decided by the server. The SDK presents one stable semantic method either way.
@@ -297,19 +273,22 @@ for await (const event of vibe.generateStream({ prompt })) {
 ### 8.3 SDK responsibilities
 
 - Validate semantic inputs before encoding.
-- Encode/decode MessagePack using generated codecs.
+- Encode/decode the chosen binary format (§5.0) using generated codecs.
 - Apply limits before allocation where possible.
 - Send protocol version and schema fingerprint.
 - Handle synchronous and accepted-operation responses behind one API.
 - Authenticate SSE without reusable URL tokens.
 - Reconnect, resume, deduplicate, and reconcile state.
 - Fetch and decode the final result.
+- Follow `event_url`, `result_url`, `cancel_url`, and `Location` **only** when their origin (scheme, host, port) exactly equals the configured API origin; otherwise stop and return `UNTRUSTED_URL` without sending any credentials. Relative URLs are resolved against the configured origin. Redirects to another origin are not followed with credentials.
 - Expose cancellation and timeouts.
 - Convert transport/protocol errors into stable semantic SDK errors.
 - Provide an opt-in redacted diagnostic formatter.
-- Never require AI callers to interpret MessagePack, SSE framing, numeric field IDs, or transport URLs.
+- Never require AI callers to interpret binary bodies, SSE framing, numeric field IDs, or transport URLs.
 
 ## 9. Generated Markdown for AI
+
+SDK generation automatically produces a Markdown description of the v2 REST resources for frontend AI agents. It is generated from the canonical schema, never hand-written.
 
 ### 9.1 Design constraints
 
@@ -325,7 +304,7 @@ The default guide should contain only:
 
 Exclude by default:
 
-- MessagePack details.
+- Binary encoding details.
 - HTTP headers and endpoints.
 - Numeric field IDs.
 - SSE reconnection rules.
@@ -349,7 +328,7 @@ Progress: may be reported before completion.
 const result = await vibe.generate({prompt})
 ```
 
-Errors: `INVALID_INPUT`, `UNAUTHORIZED`, `LIMITED`, `FAILED`
+Errors: `UNAUTHORIZED`, `FORBIDDEN`, `RATE_LIMITED`, `INTERNAL`
 ````
 
 ### 9.3 Size policy
@@ -363,28 +342,34 @@ The generator must fail CI when required semantic documentation is absent or exc
 
 ## 10. Errors
 
-Minimum protocol/SDK error taxonomy:
+Error codes align with `spec-v1.8.md` §8; v2 changes only the body encoding, not the codes or status mapping. The binary error body carries the same fields as the v1.8 JSON error (`code`, `message`, `request_id`); `message` stays safe and short.
 
-- `INVALID_INPUT`
-- `UNAUTHORIZED`
-- `FORBIDDEN`
-- `NOT_FOUND`
-- `CONFLICT`
-- `LIMITED`
-- `UNSUPPORTED_PROTOCOL`
-- `SCHEMA_MISMATCH`
-- `MALFORMED_PAYLOAD`
-- `PAYLOAD_TOO_LARGE`
-- `OPERATION_EXPIRED`
-- `CANCELLED`
-- `FAILED`
-- `TEMPORARILY_UNAVAILABLE`
+| Status | Code | Source |
+| --- | --- | --- |
+| 400 | `MALFORMED_PAYLOAD` (proposed), `INVALID_CURSOR` (decision 106), `IDEMPOTENCY_KEY_REQUIRED` (decision 104) | v1.8 §8, 2.3b |
+| 401 | `UNAUTHORIZED` (with `WWW-Authenticate`) | v1.8 §8 |
+| 403 | `FORBIDDEN` | v1.8 §8 |
+| 404 | `NOT_FOUND` | v1.8 §8 / 7.2 |
+| 409 | `UNIQUE_VIOLATION` (decision 107), `IDEMPOTENCY_IN_PROGRESS` (decision 104), declared business conflicts | v1.8 §8 |
+| 412 / 428 | `If-Match` mismatch / required | v1.8 §8, decision 48 |
+| 413 | `PAYLOAD_TOO_LARGE` | v1.8 §8 |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` (unknown binary media type) | v1.8 §8 |
+| 422 | validation codes, `IDEMPOTENCY_KEY_REUSED` (decision 104), `EMPTY_PATCH` | v1.8 §8 |
+| 429 | `RATE_LIMITED` (with `Retry-After`) | v1.8 §8 / 4.3 |
+| 500 | `INTERNAL` | v1.8 §8 |
+| 503 | `TX_CONFLICT` (decision 100), temporarily unavailable | v1.8 §8 |
+| 504 | `TX_TIMEOUT` (decision 100) | v1.8 §8 |
 
-Wire errors carry only a stable code and bounded structured safe fields. Human-readable localized prose is produced by the SDK/application where needed, not required on the wire.
+New v2-only codes (proposed, pending spec PR): `UNSUPPORTED_PROTOCOL`, `SCHEMA_MISMATCH`, `MALFORMED_PAYLOAD`, `JOB_EXPIRED`, `CANCELLED`, and SDK-side `UNTRUSTED_URL` (§8.3, never sent on the wire). The earlier generic codes `INVALID_INPUT`, `LIMITED`, `CONFLICT`, `FAILED`, and `TEMPORARILY_UNAVAILABLE` are dropped in favour of the v1.8 codes above.
+
+Idempotency (decision 104) applies unchanged to v2 `POST`/`PATCH`: same `Idempotency-Key` header, same `(tenant, subject, route, key)` scope. The request hash is computed over the decoded canonical record, not the raw bytes, so equivalent encodings of the same input hash equally (this favours a deterministic encoding, §5.0).
 
 ## 11. Security and abuse controls
 
 Binary formats and persistent streams expand the attack surface. Required gates:
+
+- **Tenant isolation (spec decisions 23, 62, 97):** the tenant comes only from the URL slug (public endpoints) or from a verified token (authenticated endpoints), resolved by the platform into `ctx.tenant_id`. A tenant in the binary body, a header, or a query parameter is never trusted; a body field named `tenant_id` is rejected as in decision 23. Each request runs on the per-tenant role connection of decision 97.
+- Jobs, SSE events, and results are scoped to `(tenant, subject)`: storage keys include both; every events, result, status, and cancel request re-checks that the caller's tenant and subject match the job's owner, and a mismatch returns `NOT_FOUND` (no existence leak). A job ID from one tenant is never valid in another.
 
 - Authentication and authorization on request, event stream, status, result, and cancellation endpoints.
 - Ownership checks must not rely only on possession of an operation ID.
@@ -430,15 +415,13 @@ Provisional acceptance targets, subject to measurement and product confirmation:
 - Incompatible schemas fail explicitly before returning a misleading result.
 - Malformed payloads fail safely and consistently across backend implementations.
 - Generated default Markdown passes an agreed operation-level and total token/byte budget.
-- Provider-disabled deployments pass deterministic and explicit-choice conformance tests.
-- Jev timeout, unavailable, uncertain, and unsupported outcomes exercise the configured fallback policy without leaking provider-specific errors to SDK callers.
-- LLM fallback is never invoked when disabled, and high-risk actions cannot be enabled solely by either provider.
-- Semantic decisions include auditable provider/policy provenance without raw Markdown in standard logs.
+- Cross-tenant tests: a job, event stream, or result of tenant A is never readable or cancellable from tenant B.
+- SDK refuses `event_url`/`result_url`/`cancel_url` on a different origin.
 - No credentials, reusable stream tokens, or raw sensitive inputs appear in standard logs.
 
 ## 14. Rollout proposal
 
-Prefer an additive, measurable rollout unless product explicitly chooses a clean break:
+v2 is a new REST API version served alongside v1; rollout is measured:
 
 1. Define representative traffic corpus and current baselines.
 2. Freeze canonical schema rules and compatibility test matrix.
@@ -451,24 +434,24 @@ Prefer an additive, measurable rollout unless product explicitly chooses a clean
 
 ## 15. Decisions required before implementation
 
-1. Is vNext a clean breaking protocol or an additive negotiated protocol?
+1. MessagePack or CBOR (§5.0)?
 2. Which canonical schema language/tool owns numeric IDs and code generation?
 3. Are envelopes positional arrays, integer-key maps, or a hybrid?
-4. Is protocol version stored in headers, body, or both?
+4. Is the v2 marker in the media type only (`application/vnd.vibe.v2+…`), in the path, or both, given that `{version}` in the v1.8 path is the definition version?
 5. What exact compatibility guarantees apply across SDK and server versions?
-6. Which operations qualify for asynchronous execution and SSE?
-7. What are event replay, operation expiration, and result retention durations?
+6. Which resources qualify for asynchronous jobs and SSE?
+7. What are event replay, job expiration, and result retention durations?
 8. Which SSE authentication strategy is valid for each supported runtime?
 9. What payload distributions and current production baselines define success?
 10. What byte/token budgets apply to the generated AI Markdown?
 11. Is batching part of the first release or a measured follow-up?
-12. What is the fallback behavior when MessagePack/SSE is unavailable?
+12. Does a v2 resource also accept JSON (content negotiation) when the binary codec is unavailable, or is v2 binary-only?
 
 ## 16. Suggested first design spike
 
 Use two representative operations:
 
-- **Fast:** small request and response, to measure MessagePack overhead and compatibility behavior.
+- **Fast:** small request and response, to measure binary-encoding overhead and compatibility behavior.
 - **Long-running:** accepted operation with real progress, reconnect, cancellation, and binary final result.
 
 Deliverables of the spike:
