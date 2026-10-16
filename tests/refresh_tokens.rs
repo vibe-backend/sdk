@@ -939,3 +939,73 @@ async fn family_lookup_error_fails_closed_and_keeps_the_token() {
     let (s, body, _) = a.refresh(&r0).await;
     assert_eq!(s, StatusCode::OK, "{body}");
 }
+
+/// Cleanup of finished families against a real database, run as a
+/// non-superuser table owner (FORCE RLS applies).
+#[tokio::test]
+async fn postgres_cleanup_removes_finished_families_in_batches() {
+    let Ok(admin_url) = std::env::var("VIBE_TEST_PG_ADMIN_URL") else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "VIBE_TEST_PG_ADMIN_URL must be set in CI"
+        );
+        return;
+    };
+    let (admin, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let s = uuid::Uuid::new_v4().simple().to_string()[..10].to_string();
+    let tenant = format!("tc{s}");
+    let schema = format!("t_{tenant}");
+    let owner = format!("refresh_owner_{s}");
+    admin
+        .batch_execute(&format!("CREATE ROLE {owner} LOGIN PASSWORD 'pw'"))
+        .await
+        .unwrap();
+    for stmt in vibe::runtime::refresh::table_statements(&schema).unwrap() {
+        admin.batch_execute(&stmt).await.unwrap();
+    }
+    let t = format!("{schema}._platform_refresh_tokens");
+    admin
+        .batch_execute(&format!(
+            "ALTER SCHEMA {schema} OWNER TO {owner}; ALTER TABLE {t} OWNER TO {owner};"
+        ))
+        .await
+        .unwrap();
+    // 2.5 batches of finished families, one family inside the retention
+    // window and one live family.
+    let finished = vibe::runtime::refresh::CLEANUP_BATCH * 5 / 2;
+    admin
+        .batch_execute(&format!(
+            "INSERT INTO {t} (id, tenant_id, family_id, user_id, token_hash, created_at, family_expires_at, idle_expires_at) \
+             SELECT gen_random_uuid(), '{tenant}', gen_random_uuid(), 'u1', 'old' || g, now() - interval '40 days', \
+                    now() - interval '2 days', now() - interval '9 days' FROM generate_series(1, {finished}) g; \
+             INSERT INTO {t} (id, tenant_id, family_id, user_id, token_hash, created_at, family_expires_at, idle_expires_at) VALUES \
+             (gen_random_uuid(), '{tenant}', gen_random_uuid(), 'u1', 'recent', now() - interval '30 days', now() - interval '1 hour', now() - interval '1 hour'), \
+             (gen_random_uuid(), '{tenant}', gen_random_uuid(), 'u1', 'live', now(), now() + interval '30 days', now() + interval '7 days');"
+        ))
+        .await
+        .unwrap();
+    let mut url = url::Url::parse(&admin_url).unwrap();
+    url.set_username(&owner).unwrap();
+    url.set_password(Some("pw")).unwrap();
+    let (as_owner, conn) = tokio_postgres::connect(url.as_str(), tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    for stmt in vibe::runtime::refresh::cleanup_statements(&schema).unwrap() {
+        as_owner.batch_execute(&stmt).await.unwrap();
+    }
+    let left: Vec<String> = admin
+        .query(
+            &format!("SELECT token_hash FROM {t} ORDER BY token_hash"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(left, vec!["live".to_string(), "recent".to_string()]);
+}
