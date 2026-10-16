@@ -470,7 +470,7 @@ async fn cmd_serve(
     let always: Vec<String> = manifest
         .routes
         .iter()
-        .filter(|r| r.public && r.challenge_type != "none" && r.challenge_when == "always")
+        .filter(|r| r.challenge_type != "none" && r.challenge_when == "always")
         .map(|r| r.feature_id.clone())
         .collect();
     vibe::runtime::challenge::production_gate(run_env, challenge.is_some(), &always)?;
@@ -502,6 +502,7 @@ async fn cmd_serve(
         trusted_proxies: trusted_proxies_from_env()?,
         dev_hints: memory,
         challenge,
+        failures: Default::default(),
     });
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr)

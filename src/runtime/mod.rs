@@ -1,6 +1,7 @@
 pub mod challenge;
 mod crud;
 mod exec;
+pub mod failures;
 mod http;
 pub mod jwks;
 mod limiter;

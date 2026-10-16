@@ -126,12 +126,20 @@ fn development_needs_an_explicit_replay_store() {
 /// Minimal source + lock with `when: after-failures` so `cmd_serve` hits the
 /// #199 unverified gate via the real CLI startup path.
 fn project_with_after_failures_lock() -> std::path::PathBuf {
+    project_with_lock(
+        "true",
+        "{ type: captcha, when: after-failures, after-failures: 3 }",
+    )
+}
+
+/// Minimal source + lock with the given `public` and `challenge` bullets.
+fn project_with_lock(public: &str, challenge: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("vibe-serve-af-{}", uuid::Uuid::new_v4()));
     let feature = dir.join("api/auth/v1/login");
     std::fs::create_dir_all(&feature).unwrap();
     std::fs::write(
         feature.join("login.md"),
-        "# login\n\n## Route\n\n- method: POST\n- path: /auth/v1/{slug}/login\n\n## Access\n\n- public: true\n- challenge: { type: captcha, when: after-failures, after-failures: 3 }\n",
+        format!("# login\n\n## Route\n\n- method: POST\n- path: /auth/v1/{{slug}}/login\n\n## Access\n\n- public: {public}\n- challenge: {challenge}\n"),
     )
     .unwrap();
     std::fs::write(
@@ -158,9 +166,11 @@ signature: (none)
 ---
 
 ## Access
-- public: true
-- challenge: { type: captcha, when: after-failures, after-failures: 3 }
-"#,
+- public: PUBLIC
+- challenge: CHALLENGE
+"#
+        .replace("PUBLIC", public)
+        .replace("CHALLENGE", challenge),
     )
     .unwrap();
     dir
@@ -229,5 +239,37 @@ fn development_allows_after_failures_challenge_lock() {
         !err.contains("after-failures") && !err.contains("not verified yet"),
         "{err}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const VERIFIER: [(&str, &str); 3] = [
+    ("VIBE_ENV", "production"),
+    ("VIBE_TURNSTILE_SECRET", "0x4AAAAAAAtestsecret"),
+    ("VIBE_CHALLENGE_HOSTNAMES", "app.example.com"),
+];
+
+/// #201: `after-failures` stays refused in production even with a verifier,
+/// because its failure count is per process.
+#[test]
+fn production_refuses_after_failures_even_with_a_verifier() {
+    let dir = project_with_after_failures_lock();
+    let (ok, err) = serve_project(&dir, &VERIFIER, false);
+    assert!(!ok, "{err}");
+    assert!(
+        err.contains("temporarily unsupported in production"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #201: an authenticated opt-in challenge (`when: always`) is enforced at
+/// runtime, so the #199 gate no longer refuses it.
+#[test]
+fn production_no_longer_refuses_authenticated_opt_in_challenge() {
+    let dir = project_with_lock("false", "{ type: captcha, when: always }");
+    let (ok, err) = serve_project(&dir, &VERIFIER, false);
+    // Startup stops later (no database / manifest), not at the challenge gate.
+    assert!(!ok, "{err}");
+    assert!(!err.contains("temporarily unsupported"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }

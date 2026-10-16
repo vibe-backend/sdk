@@ -638,21 +638,26 @@ pub fn production_gate(env: RunEnv, configured: bool, routes: &[String]) -> Resu
     ))
 }
 
-/// Whether a declared challenge is never verified at runtime: only public
-/// routes with `when: always` are checked, so `after-failures` routes and
-/// non-public (authenticated) routes that declare a challenge are not (#199).
+/// Whether a declared challenge is still refused in production (#199, #201).
+/// `when: always` is verified on public and authenticated routes alike.
+/// `when: after-failures` is enforced at runtime, but its failure count is
+/// per process (not shared between instances), so production keeps refusing
+/// it until a shared failure store is decided. Unknown `when` values are
+/// refused too, and so is a non-`captcha` type on an authenticated route (it
+/// cannot be verified; public `pow` routes are left to #202).
 pub fn challenge_unverified(public: bool, ty: &str, when: &str) -> bool {
-    ty != "none" && !(public && when == "always")
+    ty != "none" && (when != "always" || (!public && ty != "captcha"))
 }
 
-/// Error when production would serve routes whose declared challenge is not
-/// verified at runtime (#199). `routes` are the offending lock or route ids.
+/// Error when production would serve routes whose declared challenge is
+/// still refused there (see [`challenge_unverified`]). `routes` are the
+/// offending lock or route ids.
 pub fn unverified_gate(env: RunEnv, routes: &[String]) -> Result<(), String> {
     if env != RunEnv::Production || routes.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "challenge with `when: after-failures` or on an authenticated route is temporarily unsupported in production until verified challenges on these routes are implemented (#201); only public routes with `when: always` are verified (use `type: none` or make the route public with `when: always`); affected: {}",
+        "challenge with `when: after-failures` is temporarily unsupported in production: its failure count is kept per process and is not shared between instances yet (#201); use `when: always` instead; affected: {}",
         routes.join(", ")
     ))
 }
@@ -821,14 +826,16 @@ mod tests {
     }
 
     #[test]
-    fn only_public_always_challenges_count_as_verified() {
+    fn only_captcha_always_challenges_count_as_verified() {
         assert!(!challenge_unverified(true, "captcha", "always"));
         assert!(!challenge_unverified(false, "none", "always"));
         assert!(!challenge_unverified(true, "none", "after-failures"));
         assert!(challenge_unverified(true, "captcha", "after-failures"));
         assert!(challenge_unverified(false, "captcha", "after-failures"));
-        assert!(challenge_unverified(false, "captcha", "always"));
+        // #201: authenticated opt-in `when: always` is verified at runtime.
+        assert!(!challenge_unverified(false, "captcha", "always"));
         assert!(challenge_unverified(false, "pow", "always"));
+        assert!(challenge_unverified(true, "captcha", "sometimes"));
     }
 
     #[test]
