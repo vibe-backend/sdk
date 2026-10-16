@@ -26,12 +26,15 @@ updates:
         versions: [">=0.11"]
       - dependency-name: hmac
         versions: [">=0.13"]
+      - dependency-name: digest
+        versions: [">=0.11"]
     groups:
       rustcrypto:
         patterns:
           - "sha2"
           - "hmac"
           - "digest"
+        update-types: ["minor", "patch"]
       cargo:
         patterns: ["*"]
         update-types: ["minor", "patch"]
