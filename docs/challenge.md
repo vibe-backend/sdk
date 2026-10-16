@@ -152,6 +152,9 @@ The server checks the nonce in a fixed order and stops at the first failure:
 4. Decision 134 capacity caps (store full, per-prefix cap): 429
    `CHALLENGE_RATE_LIMITED` with `Retry-After`. This response is identical to
    every other decision 134 429, apart from the `Retry-After` value.
+   `Retry-After` is the remaining lifetime of the tenant's own oldest record
+   (store full) or of the tenant's oldest record in that prefix (per-prefix
+   cap), at most 360 seconds, and 60 seconds if it can't be computed.
 
 Every verification failure, including a reused nonce, is 403, never 429. On 429,
 wait `Retry-After` seconds, then retry with a new nonce and a new challenge.

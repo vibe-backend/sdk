@@ -1603,7 +1603,7 @@ Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動�
 - **計數**：每個 request 剛好佔**一個** nonce 紀錄（key `(tenant_id, nonce)`），另加決定 132 原有嘅 token 紀錄。Nonce 紀錄計入決定 134 嘅每租戶容量同每個網段（IPv4 /24、IPv6 /48）上限；因為佢喺驗證之前預留，亦計入決定 137 嘅未驗證預留上限（每 client IP 16、每租戶 1,000）。冇另外、冇上限嘅空間。
 - **超過上限**（已確認（產品經理 2026-10-16 12:19 HKT））：
   - Nonce 紀錄會令決定 137 未驗證預留上限超過 → 403 `CHALLENGE_FAILED`。
-  - Nonce 紀錄會令決定 134 容量上限（每租戶 store 滿、每網段上限）超過 → 429 `CHALLENGE_RATE_LIMITED` 加 `Retry-After`，規則同決定 134 完全一樣（`Retry-After` = 相關最舊紀錄剩餘有效時間，上限 360s，計唔到就 60）。呢個 429 回應除咗 `Retry-After` 嘅值之外，同其他所有決定 134 嘅 429 完全一樣，唔透露內部原因係 nonce；reason 只入 metric 同內部 log。
+  - Nonce 紀錄會令決定 134 容量上限（每租戶 store 滿、每網段上限）超過 → 429 `CHALLENGE_RATE_LIMITED` 加 `Retry-After`，規則同決定 134 完全一樣（`Retry-After`：store 滿就用該 tenant 自己最舊紀錄嘅剩餘有效時間；網段超額就用該 tenant 喺嗰個網段最舊紀錄嘅剩餘有效時間；上限 360 秒，計唔到就用 60 秒）。呢個 429 回應除咗 `Retry-After` 嘅值之外，同其他所有決定 134 嘅 429 完全一樣，唔透露內部原因係 nonce；reason 只入 metric 同內部 log。
   - 所有驗證失敗（包括 nonce 格式錯、同一個 nonce 重用）一律 403，永遠唔係 429。
 - **檢查次序**（固定、deterministic）：① nonce 格式同 canonical 檢查（403）→ ② 重用檢查（403）→ ③ 決定 137 未驗證預留上限（403）→ ④ 決定 134 容量上限（429）。遇到第一個唔通過就停。原因：無效輸入同安全相關嘅 403 優先；容量 429 只會畀本身合法嘅 request。
 
@@ -1902,6 +1902,8 @@ b6366f0d634afe549d3039313154f8e78529a9fd92396fc35a8e52cb6e9bcf09
 - **部署相容性**：會改 body、path 或者 query encoding 嘅 proxy／CDN（壓縮、prefix rewrite、`%20` 改 `+`）會令所有綁定 request 被拒（fail closed），要喺部署文件講明。
 - **Provider 依賴**：`cdata` 由 Turnstile 原樣回傳；如果 provider 改變 `cdata` 行為，比對會失敗（fail closed），唔會放行。
 - **Replay store 容量**：每個 request 多一個 nonce 紀錄，同 token 共用決定 134 同 137 上限，高流量時會早啲到上限（決定 137 → 403，決定 134 → 429，都係 fail closed）。
+- **網段上限較早觸發**（已確認（產品經理 2026-10-16 12:31 HKT））：每個 request 佔兩個紀錄（token 同 nonce），所以每個 IP 或者網段大約只可以同時有 8 個 request（決定 134 網段上限 16、決定 137 每 IP 16）；共用 carrier NAT 嘅用戶會較早撞到 429。GA 前用 `vibe_challenge_rejected_total{reason="replay_prefix_cap"}` 檢視實際數字再決定要唔要調整，追蹤 #256。
+- **拒絕回應時間**（已確認（產品經理 2026-10-16 12:31 HKT））：v1 唔會拉平 nonce 相關拒絕回應嘅時間，接受為剩餘風險；vNext 評估見 #255。
 - **Nonce 喺邊度睇得到**：Operator 自己嘅 reverse proxy 或者 CDN 如果負責 TLS termination，睇得到 nonce 同 body；challenge script 喺我哋自己嘅頁面執行，原則上讀得到頁面內容（包括表格同 nonce）。Nonce 係單次使用、唔含任何 secret，睇到 nonce 唔可以用嚟偽造 request；呢度嘅保護範圍只係令 `cdata` 本身唔可以還原內容。
 - **用戶體驗**（已接受，產品經理 2026-10-16）：用戶做完 challenge 之後再改表格，要重新做 challenge。前端文件教開發者喺表格填好之後、送出之前先做 challenge（[`challenge.md`](challenge.md)）。
 
