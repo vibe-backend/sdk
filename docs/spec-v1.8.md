@@ -33,6 +33,7 @@
 - 補 v1.7 reviewer 提出嘅缺口：11.4 create-user lock 補返 `user.invite` step；新增 `user.register`、`user.invite` 編譯 lock 範例；11.3／11.4 rate-limit 補 `key`；admin `EMAIL_TAKEN` 處理；create-user 改為可以重試（idempotent）並新增 re-invite endpoint（決定 84–88）。
 
 - Challenge provider（issue #160，已確認（產品經理 2026-10-16））：決定 131–138，v1 用 Cloudflare Turnstile（server 端 siteverify、production 共用 Postgres replay store（#177）、`type: pow` build error、fail closed、錯誤碼、secret 處理、同限流組合、固定數值、已認證 endpoint opt-in、provider 抽象），見 0.12、7.2a。
+- Refresh cookie 補充（issue #78，已確認（產品經理 2026-10-16））：決定 141–148（cookie 模式 login、對外錯誤一致、`Max-Age`、CSRF 次序、cookie logout、access token 預設 TTL、錯誤碼、向後相容），喺決定 6、45、60、61、65、72、101 之上補充，見 0.11、4A.1b；實作狀態見 4A.1b。
 
 ### v1.7（定稿）
 
@@ -238,6 +239,21 @@
 | 129 | 租戶 role 細節（補充決定 97，SDK #147）：(1) Runtime role 係 `tenant_<id>_rw`、`tenant_<id>_public_reader`、`tenant_<id>_public_writer`；`<id>` 係系統產生、只有 `[a-z0-9_]` 嘅不透明 id，永遠唔用用戶提供嘅名；role 名超過 63 bytes 即拒絕，永遠唔截斷。(2) 連線池每個（租戶、role）5 條，每個租戶最多 15 條；另有全 process 上限，預設 200，可以設定（設定名 `VIBE_DB_POOL_MAX_TOTAL`（已確認（產品經理 2026-10-16）））。三個上限（每個（租戶、role）5 條、每個租戶 15 條、全 process）任何一個滿咗，都即刻回 503 `DB_POOL_EXHAUSTED` 加 `Retry-After`（值 `1`（已確認（產品經理 2026-10-16））），並發 metric（名 `vibe_db_pool_exhausted_total{scope="role"\|"tenant"\|"process"}`（已確認（產品經理 2026-10-16）））；永遠唔排隊等 timeout，包括每個（租戶、role）同每個租戶上限。(3) `VIBE_TENANT_DB_SECRETS` JSON 檔只限開發同測試，權限一定 0600，永遠唔 commit、唔寫 log；production 憑證來源係 secret manager，經每個租戶 role 嘅環境變數參照注入（同 #147 實作一致），process 只讀參照、唔落地成檔；production 見到呢個檔就拒絕啟動（fail closed）。Owner role（`tenant_<id>_owner`）憑證：平台只喺每次 migrate 開始時由 secret manager 發一次性密碼，migrate 完成即作廢並將 role 設返 `NOLOGIN`；即係每次 migrate 都輪換，runtime 永遠攞唔到。(4) 閒置連線池 5 分鐘後關閉（v1 固定，冇環境變數設定）；呢點阻 GA，唔阻 v1 preview。(5) Migration role 係 `tenant_<id>_owner`，擁有該租戶 schema 同表，只畀 migrate 用。決定 27 嘅例外（已確認（產品經理 2026-10-16））：PostgreSQL owner 天生可以 TRUNCATE／DROP 同重新授權，冇辦法靠收權限禁止，所以 owner 係決定 27 嘅受控例外，條件見 2B「Owner role 條件」：migration parser 用正面白名單、migrate 單一 transaction、finally 由獨立平台 admin 連線收回登入、定期檢查、runtime 連線池永遠唔以 owner 登入；runtime role 唔係 owner，每張表都要 `FORCE ROW LEVEL SECURITY`；migrate 兩樣都檢查，缺任何一樣就失敗。(6) 編譯器輸出每個租戶常數 policy（`TO tenant_<id>_rw`），唔用 `current_setting('app.tenant_id')`；部署時比較編譯出嚟嘅 policy 同 DB 實際安裝嘅 policy，唔一致即 fail closed。 實作狀態（對照 #147 @8066b69）：#147 已包括三層連線池上限即時 503、`VIBE_DB_POOL_MAX_TOTAL`、`vibe_db_pool_exhausted_total{scope}`、production 拒絕 `VIBE_TENANT_DB_SECRETS`、一次性 owner 密碼、`pg_policies` 比對、migrate 拆做主 transaction 加 commit 後 concurrent index 步驟、finally 由獨立 admin 連線將 owner 設返 `NOLOGIN`、定期 owner 檢查（`vibe check-owners`）、連線池拒絕 owner role、parser 白名單（2B.3，#206）、INVALID index 只 drop 平台紀錄嘅（#207）、閒置連線池固定 5 分鐘關閉（v1 冇環境變數設定，#165）。受控 membership 例外（已確認（產品經理 2026-10-16））：每個租戶剛好一行 membership `tenant_<id>_rw` ← `tenant_<id>_owner`，`ADMIN FALSE`、`INHERIT FALSE`、`SET TRUE`（PostgreSQL 16+），反方向同其他任何 membership 令啟動失敗；owner migrate 以外 `NOLOGIN` 加定期偏差檢查；必須測試跨租戶、INHERIT、ADMIN OPTION 三種失敗情況——未實作，#246（#147 啟動檢查要調整）。另外嘅 lock 驗證器加固由 #147 進行中。未完成：backfill 同 replay 清理按租戶設定 RLS context、參數化同分批——未實作，#233。 | 已確認（產品經理 2026-10-16） | 7.1、7.1a、9C |
 | 130 | IP 限流計數鍵同驅逐（SDK #132，v1 blocker；修訂 #73 嘅限流設計）：(1) 網段 slot 上限（跟 #73）：上限係每個網段可以開嘅**新計數器 slot** 數目，唔係 request 次數。計數前 IPv4-mapped IPv6（`::ffff:a.b.c.d`）一律先轉做 IPv4（同 #182 一致）。IPv4 每個（`tenant_id`、/24）最多 10 個新 slot；IPv6 每個（`tenant_id`、/48）最多 10 個，另加每個（`tenant_id`、/32）最多 50 個。Request 次數限流照舊用 4.3 嘅滑動窗口同數字。(2) 平台層：另有一個跨租戶網段 slot 計數器，鍵係 /24 同 /48，預設上限係租戶 slot 上限 ×5（單位同樣係新計數器 slot），倍數用 `VIBE_RATE_PLATFORM_FACTOR` 設定（預設 5，最大 100（已確認（產品經理 2026-10-16）））；兩層都通過先放行；平台層亦保證每個租戶 64 slot 保底。拒絕回 429 加 `Retry-After`，回應永遠唔講係邊一層觸發。(3) 驅逐：固定窗口長度 60 秒，只用喺本決定嘅網段 slot 計數同佢嘅 LRU 驅逐（4.3 request 限流仍然係滑動窗口）；LRU 有上限，先驅逐已過期嘅項目；每個租戶有自己嘅計數器 slot 上限；slot 滿而冇過期項目就 fail closed，回 429 並記 metric；永遠唔驅逐仲喺窗口內嘅計數器。Metric：拒絕記 metric（名 `vibe_rate_limit_slot_refused_total{layer="tenant"\|"platform", reason="network_cap"\|"table_full"\|"tenant_budget_exhausted"\|"prefix_cap_exceeded"}`（已確認（產品經理 2026-10-16））；`layer` 只喺內部 metric 出現，回應唔講）。Slot 表（同 #182 新設計（已確認（產品經理 2026-10-16）））：租戶表：每個租戶有自己一個 4,096 slot 嘅表，滿咗只拒絕嗰個租戶；全部租戶總預算 = `VIBE_RATE_EXPECTED_TENANTS`（預設 256，範圍 1–4096）× 4,096；用緊少過 64 個 slot 嘅租戶一定放行。平台表：IPv4 按 /24、IPv6 按 /32 分開嘅表，每個最多 4,096 項。平台表保證每個租戶嘅 64 slot 保底：平台總量 = 租戶總預算 + 租戶數 × 64，預設 1,064,960（256 × 4,096 + 256 × 64），所以就算好多租戶填滿平台表，新租戶都唔會冇 slot 可用。多 instance 部署一定要用共用儲存（#157）。#73 嘅 shard 內 owner／reserve 上限（每個網段 100 個 bucket、較闊網段 1,000 個、最後 1,000 個保留 slot）照舊保留，喺本決定之外再疊加（已確認（產品經理 2026-10-16））。Test IP 覆寫由環境變數 `VIBE_HONOR_TEST_IP=true` 開啟，只喺 debug build 生效；release build 唔理 `x-vibe-test-ip` header，而且設定咗 `VIBE_HONOR_TEST_IP=true` 時 `vibe serve`／router 拒絕啟動（fail closed）。剩餘風險：(a) 固定窗口邊界前後，網段新 slot 數目最多可以去到上限 ×2（已接受）；(b) 平台層令一個租戶嘅流量可以用埋同一 /24 或者 /48 其他租戶嘅額度（已接受）；(c) 平台總量只有保底以上嘅部分係跨租戶共用；共用部分喺一個窗口內用晒嘅話，保底以上嘅新 slot 會被拒絕，保底照樣保證（已確認（產品經理 2026-10-16））；(d) 同時滿咗嘅租戶多過 `VIBE_RATE_EXPECTED_TENANTS`，就只有用緊少過 64 個 slot 嘅租戶可以開新 slot（已確認（產品經理 2026-10-16））；呢個情況一定記 metric reason `tenant_budget_exhausted`（已確認（產品經理 2026-10-16））並發 WARN 告警（每分鐘最多一次），唔可以靜默拒絕；(e) 最差情況每個表大約 300 MB 記憶體（估計，未實測）（已確認（產品經理 2026-10-16））；唔可以靠呢個估計：v1 一定要有硬記憶體上限 `VIBE_RATE_TABLE_MEMORY_MAX_BYTES`（預設 268435456，即 256 MiB，限 limiter 全部 slot 表合計；名同預設已確認（產品經理 2026-10-16）；預設刻意細過單一表最差估計（大約 300 MB），滿載時 limiter 會先到 `table_full`（fail closed），#195 實測後再調整預設），超過即以 reason `table_full` fail closed。記憶體上限預先保留保底份額：租戶數 × 64 × 3 KiB（每個保底 slot 一個租戶計數器、一個平台計數器同一個 bucket），256 個租戶即 48 MiB，最多佔上限一半。保底以內嘅增長對照完整上限檢查；其他增長對照「上限減保留」檢查，超過即 `table_full`。#195 實測：每個 slot 大約 481 B，上限按每個 slot 1 KiB 估算；**GA blocker：記憶體實測（#195）**；(f) 活躍租戶多過 `VIBE_RATE_EXPECTED_TENANTS` 時，就算喺保底以內嘅請求都可能撞到硬記憶體上限，以 `table_full` fail closed（已接受（產品經理 2026-10-16））；接受條件：活躍租戶超過 `VIBE_RATE_EXPECTED_TENANTS` 嘅 80% 就發告警 `rate_limit_active_tenants_high`；保底以內嘅 `table_full` 拒絕要喺 `vibe_rate_limit_slot_refused_total{reason="table_full"}` 用 `within_floor` label 分辨（或者只寫入內部 log），永遠唔出現喺任何回應；#195 實測要一併驗證呢個風險同保底記憶體預留嘅大小；營運調整見 4.3；(g) 一個 IPv6 /32 入面活躍 /48 太多、超過該 /32 嘅平台表上限時，嗰個 /32 自己嘅用戶會 fail closed（已確認（產品經理 2026-10-16））；呢個情況一定記 metric reason `prefix_cap_exceeded`（reason 名已確認（產品經理 2026-10-16））並發 WARN 告警（每分鐘最多一次），唔可以靜默拒絕。 實作狀態（對照 #182 @679e128（2026-10-16 核對））：#182 實作每租戶 4,096 slot 表、`VIBE_RATE_EXPECTED_TENANTS`、64 slot 保底（平台表同記憶體保留，保底以內增長對照完整上限）、平台 /24、/32 表（預設總量 1,064,960）、`VIBE_RATE_PLATFORM_FACTOR`、IPv4-mapped 轉 IPv4、四個 reason、每分鐘最多一次嘅 WARN 告警、`VIBE_RATE_TABLE_MEMORY_MAX_BYTES` 硬上限（#210、#211），同埋 release build 唔理 test IP header。未完成：告警 `rate_limit_active_tenants_high`——#182 未實作，#234；`within_floor` 分辨——#182 未實作，#235；release build 設定 `VIBE_HONOR_TEST_IP=true` 時拒絕啟動——#182 已實作（自 @c12736c 由環境變數讀取，有測試），#230 喺 #182 merge 之後由 maintainer 關閉。記憶體實測見 #195（GA blocker）。 | 已確認（產品經理 2026-10-16） | 4.3、4A.3、7.2 |
 | 139 | `sign-jwt` 簽名算法政策（issue #198）：v1 只支援 ES256 同 RS256，預設 ES256；RS256 用嚟同第三方／JWKS 互通。RS256 key 最少 2048 bit，喺 `vibe validate --deploy`／部署同 `vibe serve` 啟動時檢查，唔夠就 fail closed（拒絕啟動，永遠唔會降級或者改用其他 alg）。驗證端只接受設定好嘅一個 alg；`alg` header 係其他值一律拒絕，包括 `none`、HS*，同埋 ES256／RS256 之中另一個（唔准混用）。EdDSA 留到 vNext。實作狀態：部分未實作，見 4.1a。 | 已確認（產品經理 2026-10-16） | 4.1、4.1a、12.6 |
+
+### 0.11 v1.8 refresh cookie 補充（決定 141 起，issue #78，已確認（產品經理 2026-10-16））
+
+決定 6、45、60、61、65、72 同 101 已經定咗 refresh 輪換、重用偵測、寬限期、pipeline 參數、限流、cookie 名同屬性、兩個模式同 CSRF／CORS 原則；以下只補返 issue #78 仲未寫清楚嘅部分。產品經理已確認（2026-10-16）。實作狀態見 4A.1b。
+
+| # | 決定 | 狀態 | 位置 |
+| --- | --- | --- | --- |
+| 141 | Cookie 模式下 login 都用 cookie：`transport: cookie` 時，login（`sign-jwt` `issue-refresh: new-family`）同 refresh（決定 101）一樣，新 refresh token **只**喺 `Set-Cookie` 出現，response body 唔包含 `refresh_token`；body 只有 `access_token` 同 `expires_in`（login 而家已經用 `access_token` 欄位名）。`transport: body` 照舊（決定 6、45）。 | 已確認（產品經理 2026-10-16） | 4A.1b |
+| 142 | 對外錯誤一致：輪換、重用撤銷家族同清 cookie 跟決定 6、61、101，唔重複定義。重用、過期、已撤銷、搵唔到，對外一律回同一個 401 錯誤碼同 body（決定 147），唔分開透露狀態；分別只寫入審計（`revoke_reason: reuse-detected` 等）。 | 已確認（產品經理 2026-10-16） | 4A.1、4A.1b |
+| 143 | Cookie `Max-Age` = `min(家族剩餘絕對壽命, 閒置剩餘時間)`，每次輪換重新計（收緊決定 101「唔超過家族剩餘絕對壽命」；決定 143 只可以收緊決定 101，永遠唔可以放寬佢任何 cookie 屬性或者上限）；一定有 `Max-Age`（唔用 session cookie），唔用 `Expires`。`Path=/`、冇 `Domain` 照決定 101；決定 60 嘅 slug Path 只適用 `transport: body`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
+| 144 | Refresh／logout 檢查次序（全部喺讀 cookie 之前做，補充決定 101）：1. method 一定 `POST`（其他回 405）；2. `Origin` 一定存在而且完全等於 `allowed-origins` 其中一個；3. `cross-site` 模式一定有 `X-Vibe-CSRF: 1`（cookie logout 喺任何模式都一定要，決定 145）；2 或 3 失敗對外一律回 403 `CSRF_REJECTED`，詳細原因只寫 server log 同審計；呢類 403 唔清 cookie，cookie 只喺通過檢查之後先會被清；4. cookie 模式只由 cookie 讀 token，忽略 body 入面嘅 `refresh_token`。唔接受 `Referer` 代替 `Origin`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
+| 145 | Cookie 模式 logout 唔要求 access token：瀏覽器 reload 之後記憶體冇 access token，所以 `token-revoke` 喺 `token-source: cookie` 而且 `scope: family` 時，以 cookie 搵家族並撤銷，唔需要 `auth`（決定 65「一定要 `auth`」嘅例外，只限呢個組合）。條件（產品經理 2026-10-16 確認；架構師 2026-10-16 釐清）：(1) 三項檢查，依次：(a) `Origin` 一定存在而且完全等於嗰個 slug 嘅決定 101 `allowed-origins` 其中一個（同 refresh 用同一份設定，冇另外嘅 logout 清單）；(b) 一定帶 `X-Vibe-CSRF: 1`，`same-site` 模式都要；(c) token 只由 `__Host-vibe_rt_{slug}` cookie 讀，永遠唔由 body 或者其他 cookie 名讀。(a) 或 (b) 失敗即 fail closed：403 `CSRF_REJECTED`，唔讀 cookie、唔撤銷、唔清 cookie。(2) (a)、(b) 通過之後，有效 cookie 就撤銷佢對應嘅家族；冇 cookie、cookie 無效、過期或者已撤銷就乜都唔撤銷；兩種情況回應完全一樣：204 加清除 cookie，唔透露有冇 token 或者 token 係咪有效。(3) 只撤銷嗰個 cookie 對應嘅家族，而且家族一定要屬於 URL slug 嗰個租戶（RLS 照舊；租戶唔啱當無效 cookie 處理）；唔影響同一用戶其他家族。(4) 重複 logout 係 idempotent。(5) 同 refresh 一樣套用決定 72 嘅限流同最低回應耗時（300ms），令有效同無效 cookie 喺時間上分唔出。(6) 點解 `same-site` 都要 `X-Vibe-CSRF`：logout 冇 access token（本決定），所以除咗 `Origin` 檢查，CSRF header 係佢唯一嘅來源證明；無條件要求亦令兩個模式用同一條規則。(7) 必要測試見 4A.1b。`scope: all`（全部裝置登出）照舊一定要 `auth`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
+| 146 | Access token 預設 TTL 15 分鐘（上限 1 小時照決定 6）；refresh 家族、`idle-ttl`、`reuse-grace` 嘅預設同上限照決定 6、45、61，唔改。Cookie 模式建議前端喺 access token 到期前 60 秒內 refresh。 | 已確認（產品經理 2026-10-16） | 4A.1、4A.1b |
+| 147 | Refresh／logout 錯誤碼（固定、平台提供，lock 唔使宣告；cookie 同 body transport 一律用同一套，`INVALID_REFRESH_TOKEN` 冇任何別名）：401 `INVALID_REFRESH_TOKEN`（冇 token／冇 cookie、無效、過期、已撤銷、重用；同時清 cookie）；403 `CSRF_REJECTED`（決定 144；唔清 cookie）；405 `METHOD_NOT_ALLOWED`；429 `RATE_LIMITED`（決定 72 限流，帶 `Retry-After`）；503 `TX_CONFLICT`／504 `TX_TIMEOUT`（決定 100）。錯誤 body 唔包含任何 token、hash 或者家族 id。 | 已確認（產品經理 2026-10-16） | 4A.1b、8 |
+| 148 | 向後相容：`transport` 預設照舊 `body`，現有 lock 唔使改；改做 `cookie` 係 opt-in，要重新 build。每個 endpoint version 只接受一種 transport，永遠唔會同時收 body 同 cookie；要遷移就喺新 `{version}` 開 cookie endpoint，舊版 body endpoint 照舊運作直到 deprecate。已發出嘅 body refresh token 唔會自動轉做 cookie，用戶喺新版重新登入。SDK client 預設照舊。 | 已確認（產品經理 2026-10-16） | 4A.1b |
 
 ### 0.12 Challenge provider：Turnstile（決定 131 起，issue #160，已確認（產品經理 2026-10-16））
 
@@ -1123,7 +1139,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 瀏覽器 client：access token 只放記憶體（唔放 cookie、唔放 localStorage），refresh token 放 cookie；重新載入頁面時 call refresh endpoint 攞新 access token。
 
 - **Endpoint**：`POST /{definition}/{version}/{slug}/refresh`（`token-refresh`，`transport: cookie`）同 `POST /{definition}/{version}/{slug}/logout`（`token-revoke`）。Refresh 回 body `{ "access_token", "expires_in" }`，新 refresh token 只喺 `Set-Cookie`。
-- **Cookie 屬性**：`__Host-vibe_rt_{slug}=<token>; HttpOnly; Secure; SameSite=<模式>; Path=/`，冇 `Domain`，`Max-Age` 唔超過家族剩餘絕對壽命。
+- **Cookie 屬性**：`__Host-vibe_rt_{slug}=<token>; HttpOnly; Secure; SameSite=<模式>; Path=/`，冇 `Domain`，`Max-Age` 唔超過家族剩餘絕對壽命（決定 143 收緊做同時唔超過閒置剩餘時間）。
   - `__Host-` 前綴保證 cookie 只屬於呢個 host、一定 Secure，防止 subdomain 寫入或者覆蓋 cookie；但瀏覽器規定 `__Host-` cookie 一定要 `Path=/`，所以唔可以再限定 `Path` 去 refresh endpoint。我哋揀 `__Host-`：`Path` 唔係安全邊界，而 `HttpOnly` 已經令 JS 讀唔到；server 只喺 refresh 同 logout 讀呢個 cookie，其他 endpoint 一律忽略。Cookie 名包括 slug，同一個 host 多個租戶唔會撞。產品經理已確認：防止 subdomain 覆蓋 cookie 比限定 Path 重要（2026-10-14）。
 - **兩個模式**（`token-refresh` 參數 `cookie-mode`）：
   - **`same-site`（預設）**：`SameSite=Strict`。前端同 API 一定要同 site（例如 `app.example.com` 同 `api.example.com`）。
@@ -1131,7 +1147,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
     1. 嚴格 `Origin` 白名單（完全相等，唔准 `*` 或者 wildcard，最少一個 origin）；同埋
     2. 自訂 header CSRF 檢查：refresh 同 logout 一定要帶 `X-Vibe-CSRF: 1`，冇就回 403。自訂 header 令瀏覽器一定先做 CORS preflight，跨 site 表單或者簡單請求帶唔到。
   - 開咗 `cross-site` 但缺少任何一樣，驗證器報 error，`vibe build` 同部署一律失敗。
-  - `same-site` 模式都會檢查 `Origin` 白名單；`X-Vibe-CSRF` 可選。
+  - `same-site` 模式都會檢查 `Origin` 白名單；refresh 嘅 `X-Vibe-CSRF` 可選，cookie logout 一定要（決定 145）。
 - **輪換同重用偵測**：跟 4A.1，每次 refresh 輪換；偵測到重用已失效 token（寬限期外）撤銷成個家族，同時回 `Set-Cookie` 清除 cookie。
 - **CSRF**：refresh 同 logout 一定要有 `Origin` header，而且喺租戶設定嘅前端 origin 白名單入面（完全相等，唔准 wildcard）；冇 `Origin` 或者唔喺白名單回 403，唔讀 cookie。`same-site` 模式再加 `SameSite=Strict`；`cross-site` 模式再加 `X-Vibe-CSRF` header 檢查。只接受 `POST`。
 - **CORS**：只對白名單 origin 回 `Access-Control-Allow-Origin: <origin>`（唔准 `*`）、`Access-Control-Allow-Credentials: true`、`Vary: Origin`；`cross-site` 模式 preflight 回 `Access-Control-Allow-Headers` 包括 `X-Vibe-CSRF`。Credentials **只限** refresh 同 logout endpoint，其他 endpoint 一律唔回 `Access-Control-Allow-Credentials`。
@@ -1163,10 +1179,10 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 | 參數 | 類型 | 預設 | 說明 |
 | --- | --- | --- | --- |
 | `scope` | `family` \| `all` | `family` | `family`：撤銷當前 refresh token 所屬家族（登出）；`all`：撤銷該用戶所有家族（全部裝置登出） |
-| `token-source` | `body` \| `cookie` | 同 `token-refresh` 嘅 `transport` | `scope: family` 時用嚟搵家族；`scope: all` 唔需要 |
+| `token-source` | `body` \| `cookie` | 同 `token-refresh` 嘅 `transport` | `scope: family` 時用嚟搵家族；`scope: all` 唔需要。`cookie` 時冇自己嘅 `allowed-origins`：一律用同一個 slug `token-refresh` 嘅決定 101 `allowed-origins`（決定 145） |
 | `clear-cookie` | boolean | `true`（cookie 時） | 回應帶 `Max-Age=0` 清除 refresh cookie，`Path` 同 `token-refresh` 一樣 |
 
-- 一定要 `auth`；只可以撤銷 `sub` 自己嘅家族；`revoke_reason` 分別寫 `logout`／`logout-all`。
+- 一定要 `auth`，只可以撤銷 `sub` 自己嘅家族。例外：`token-source: cookie` 加 `scope: family`（決定 145）唔使 `auth`，只撤銷嗰個 cookie 對應、屬於 URL slug 租戶嘅家族，並套用決定 72 限流同最低回應耗時；`revoke_reason` 分別寫 `logout`／`logout-all`。
 - 搵唔到 token 或者已撤銷都回 204（idempotent，唔洩漏狀態）。
 
 #### Refresh token 儲存
@@ -1192,6 +1208,114 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 
 - Revoke：一律 UPDATE `revoked_at` 同 `revoke_reason`（家族一次過），唔用 DELETE；過期紀錄唔刪除，冇個人資料（只有 hash 同 id），12.10 刪除時一併 revoke。
 - 只有平台專用 `refresh_store` role 可以讀寫呢張表（見 7.1）。
+
+### 4A.1b Refresh cookie 補充細節（決定 141–148，issue #78，已確認（產品經理 2026-10-16））
+
+> 本節已確認（產品經理 2026-10-16）。只描述防禦設計。
+
+#### 流程
+
+1. Login（`transport: cookie`）：回 body `{ "access_token", "expires_in" }`，同 `Set-Cookie: __Host-vibe_rt_{slug}=…; HttpOnly; Secure; SameSite=<模式>; Path=/; Max-Age=<秒>`；body 冇 `refresh_token`（決定 141）。
+2. 頁面載入／access token 就到期：前端 `POST /{definition}/{version}/{slug}/refresh`，`credentials: "include"`，`cross-site` 模式加 `X-Vibe-CSRF: 1`。
+3. 平台按決定 144 次序檢查，之後先讀 cookie，跟 4A.1 輪換；成功回 200、新 access token 同新 cookie（`Max-Age` 跟決定 143）。
+4. 重用或者無效：回 401 `INVALID_REFRESH_TOKEN` 加清除 cookie；重用時撤銷成個家族（決定 142、101）。
+5. Logout：`POST …/logout`，cookie 模式唔使 access token。先檢查 `Origin`（同 refresh 同一份決定 101 白名單）同 `X-Vibe-CSRF: 1`（`same-site` 都要），任何一項失敗回 403 `CSRF_REJECTED`；之後 token 只由 `__Host-` cookie 讀。通過之後一律 204 加清除 cookie：有效 cookie 撤銷佢嘅家族，冇 cookie 或者無效就乜都唔撤銷，回應一樣；套用決定 72 限流同最低回應耗時（決定 145）。
+
+#### Auth pipeline markdown 寫法
+
+Source（`api/auth/refresh.md`）用自然語言寫，frontmatter 宣告高風險欄位（決定 112）：
+
+```markdown
+---
+kind: api
+public: true
+auth: refresh-cookie
+---
+
+# Refresh token
+
+呢個係 refresh token endpoint，用 httpOnly cookie，前端同 API 同 site。
+簽 token 用 user.sign-access-token。
+```
+
+編譯後 lock（節錄）：
+
+```markdown
+## Route
+
+- method: POST
+- path: /{definition}/{version}/{slug}/refresh
+- public: true
+
+## Pipelines
+
+- -auth
+- token-refresh:
+    sign-method: user.sign-access-token
+    transport: cookie
+    cookie-mode: same-site
+    allowed-origins: [https://app.example.com]
+    refresh-ttl: 30d
+    idle-ttl: 7d
+    reuse-grace: 10s
+```
+
+`cross-site` 例子只改 `cookie-mode: cross-site`，`allowed-origins` 一定最少一個完全相等嘅 origin；平台自動要求 `X-Vibe-CSRF`，唔使喺 lock 再寫。
+
+Logout（節錄）：
+
+```markdown
+## Route
+
+- method: POST
+- path: /{definition}/{version}/{slug}/logout
+- public: true
+
+## Pipelines
+
+- -auth
+- token-revoke:
+    scope: family
+    token-source: cookie
+    clear-cookie: true
+```
+
+驗證器 error：`transport: cookie` 冇 `allowed-origins`；`token-revoke` 自己宣告 `allowed-origins`（cookie logout 一律繼承同一個 slug `token-refresh` 嘅設定，決定 145）；`allowed-origins` 有 `*`、wildcard、path 或者唔係 `https`（dev build 除外）；`cross-site` 但冇 `allowed-origins`；`token-revoke` `scope: all` 但係 `public: true`；`token-revoke` `token-source: cookie` 但同一個 definition 嘅 `token-refresh` 唔係 `transport: cookie`。
+
+#### 錯誤碼（決定 147）
+
+| 狀態 | 錯誤碼 | 幾時 | 清 cookie |
+| --- | --- | --- | --- |
+| 401 | `INVALID_REFRESH_TOKEN` | 冇 cookie、無效、過期、已撤銷、重用 | 係 |
+| 403 | `CSRF_REJECTED` | 冇 `Origin`、唔喺白名單；refresh 喺 `cross-site` 冇 `X-Vibe-CSRF: 1`；cookie logout 喺任何模式（包括 `same-site`）冇 `X-Vibe-CSRF: 1`（決定 145）。冇 cookie 唔係 403（logout 回 204，refresh 回 401）。詳細原因只入 server log 同審計 | 否（只有通過檢查嘅請求先會清 cookie） |
+| 405 | `METHOD_NOT_ALLOWED` | 唔係 `POST` | 否 |
+| 429 | `RATE_LIMITED` | 決定 72 限流 | 否 |
+| 503／504 | `TX_CONFLICT`／`TX_TIMEOUT` | 決定 100 | 否 |
+
+所有回應帶 `Cache-Control: no-store`；body 同 log 永遠唔記錄 token 明文。
+
+#### 向後相容（決定 148）
+
+- `transport: body` 照舊係預設，現有 lock、SDK client 同 login 回應唔變。
+- Cookie 係 opt-in，經新 `{version}` 遷移；每個 endpoint version 只接受一種 transport。
+- Login 同 refresh 嘅 body 都用 `access_token`（現有 login 已經係咁）。
+- 決定 60（slug Path）只喺 body 模式冇作用；cookie 模式跟決定 101 `Path=/`。
+
+#### Cookie logout 必要測試（決定 145）
+
+三項檢查各自單獨失敗（其餘兩項正確，有一個有效 cookie）各一個測試：
+
+1. `Origin` 唔喺 `allowed-origins`（或者冇 `Origin`）：403 `CSRF_REJECTED`，家族冇被撤銷，回應冇 `Set-Cookie`。
+2. 冇 `X-Vibe-CSRF: 1`（`same-site` 同 `cross-site` 各測一次）：403 `CSRF_REJECTED`，家族冇被撤銷，回應冇 `Set-Cookie`。
+3. Token 唔係由 `__Host-vibe_rt_{slug}` cookie 嚟（只喺 body，或者用其他 cookie 名）：204 加清除 cookie，同無效 cookie 回應完全一樣，body／其他 cookie 嘅家族冇被撤銷。
+
+另外：冇 cookie、無效、過期、已撤銷同有效 cookie 嘅 204 回應（status、header、body）完全一樣，同樣受最低回應耗時限制；重複 logout 兩次回應一樣；只有嗰個 cookie 嘅家族被撤銷；其他租戶嘅家族（slug 唔啱）唔會被撤銷；超過決定 72 限流回 429。
+
+#### 實作狀態（對照 main，2026-10-16）
+
+- **main 已實作**：`sign-jwt` 簽 access token，login body 回 `access_token`（`src/runtime/ops.rs`）；sqlguard 拒絕 app SQL 觸及 `_platform_refresh_tokens`（`src/sqlguard.rs`）。
+- **main 未實作**：`token-refresh`／`token-revoke` pipeline、`_platform_refresh_tokens` 儲存同輪換；`sign-jwt issue-refresh` 除 `none` 以外一律 build／runtime error（`src/validate.rs`、`src/runtime/ops.rs`）；`rate-limit key: family` 被拒絕（`src/manifest.rs`）。Cookie transport（決定 101、141–148）全部未實作。
+- **進行中**：PR #95（Refs #26）實作 body transport 嘅 refresh、輪換、重用偵測同 revoke；cookie transport 明確唔包括。#95 用 `INVALID_REFRESH_TOKEN`，同決定 147 一致（產品經理 2026-10-16 確認兩種 transport 都用呢個名，冇別名）。
 
 ### 4A.2 密碼政策（決定 7）
 
