@@ -244,7 +244,7 @@
 | 133 | 邊啲 endpoint 要 challenge：跟決定 38、49：有 INSERT 嘅 public endpoint `{ type: captcha, when: always }`；login 類 `{ type: captcha, when: after-failures, after-failures: 3 }`；其他冇 INSERT 嘅 public 寫入可以 `type: none`。已認證 endpoint 預設**唔要**，但可以經 source frontmatter `challenge: captcha` opt-in（lock 寫 `{ type: captcha, when: always }`）；refresh endpoint（決定 72）唔要求。 | 已確認（產品經理 2026-10-16） | 7.2、7.2a |
 | 134 | 失敗、超時同 fail closed：503 `CHALLENGE_UNAVAILABLE` **只限** provider 或者網絡失敗（provider 唔可達、超時、回應唔啱，同 replay store 暫時連唔到），永遠唔會當通過、冇 fallback；token 無效一律係 403，唔會變 503。設定問題喺啟動時擋：production（`VIBE_ENV`）有任何 challenge route 而冇設定 verifier 或者共用 replay store，`vibe serve` 拒絕啟動、`vibe validate --deploy` 失敗。Dev（`vibe dev`）用假 verifier（一律通過，terminal 標示，決定 74），production 永遠唔准用。 | 已確認（產品經理 2026-10-16） | 7.2a、2C.4 |
 | 135 | 錯誤碼：400 `CHALLENGE_REQUIRED`（冇 proof）；403 `CHALLENGE_FAILED`（偽造、重用、過期、時間錯、hostname／action 唔啱、每 IP／每租戶未驗證預留上限，即係所有 token 無效情況）；503 `CHALLENGE_UNAVAILABLE`（只限 provider／網絡失敗，固定帶 `Retry-After: 5`）。限流同配額係另一回事，回 429 `RATE_LIMITED`（帶 `Retry-After`），唔會用 503。錯誤 body 唔包含 token、provider 原始錯誤碼或者 secret；詳細原因只入 server log 同審計。 | 已確認（產品經理 2026-10-16） | 7.2a、8 |
-| 136 | Secret 處理：`VIBE_TURNSTILE_SECRET` 只可以由環境變數或者 secret manager（例如 CI environment secret）注入；唔准寫入 source、lock、manifest、`.env` commit 或者 log；錯誤訊息同 debug 輸出只顯示「已設定／未設定」。驗證器見到 lock 或者 source 有疑似 secret 值即報 error。設定：`VIBE_CHALLENGE_PROVIDER`（預設 `turnstile`）、`VIBE_TURNSTILE_SECRET`、`VIBE_CHALLENGE_HOSTNAMES`（有 secret 就一定要有）。 | 已確認（產品經理 2026-10-16） | 7.2a、2A.8.5 |
+| 136 | Secret 處理：`VIBE_TURNSTILE_SECRET` 只可以由環境變數或者 secret manager（例如 CI environment secret）注入；唔准寫入 source、lock、manifest、`.env` commit 或者 log；錯誤訊息同 debug 輸出只顯示「已設定／未設定」。驗證器見到 lock 或者 source 有疑似 secret 值即報 error。設定：`VIBE_CHALLENGE_PROVIDER`（預設 `turnstile`）、`VIBE_TURNSTILE_SECRET`、`VIBE_CHALLENGE_HOSTNAMES`（有 secret 就一定要有）、`VIBE_CHALLENGE_REPLAY_STORE`（production 一定 `postgres`，#177）；預設同 production 規則見 7.2a。 | 已確認（產品經理 2026-10-16） | 7.2a、2A.8.5 |
 | 137 | 同限流組合：route 限流（決定 25、39）同 public 寫入每日配額喺 challenge 之前檢查，超過回 **429**（同 challenge 嘅 503 分開），被限流嘅 request 唔會去到 replay store 或者 provider；challenge 唔取代限流同配額。v1 用固定平台數值：token 壽命 300s、每 client IP 最多 16、每租戶最多 1,000 個未驗證預留（超過回 403 `CHALLENGE_FAILED`，唔 call provider）；**冇租戶 override**。將來如果加 override，只可以調低，唔可以調高。 | 已確認（產品經理 2026-10-16） | 7.2a、4.3 |
 | 138 | Provider 抽象：runtime 經 `ChallengeVerifier` trait 驗證（輸入 token、client IP、預期 action；輸出 通過／失敗／不可用 三種，provider 細節唔外露；「失敗」對應 403，「不可用」對應 503）。之後加 hCaptcha 等 provider 只係新 implementation 同 `VIBE_CHALLENGE_PROVIDER` 新值，lock 語法、replay store 同錯誤碼唔變；未實作嘅值（例如 `hcaptcha`）啟動時拒絕。 | 已確認（產品經理 2026-10-16） | 7.2a |
 
@@ -1350,11 +1350,16 @@ Source 用自然語言寫「要 captcha」，frontmatter 一樣要宣告 public 
 
 #### 設定（決定 136）
 
-| 變數 | 意思 |
-| --- | --- |
-| `VIBE_CHALLENGE_PROVIDER` | `turnstile`（預設）；其他值未實作就拒絕啟動 |
-| `VIBE_TURNSTILE_SECRET` | 只由環境變數／secret manager 注入；永遠唔 log、唔入 lock 或者 manifest |
-| `VIBE_CHALLENGE_HOSTNAMES` | 逗號分隔 widget hostname；有 secret 就一定要有 |
+v1 challenge provider 係 **Cloudflare Turnstile**（決定 131），由 server 端 siteverify 驗證（決定 132）。設定只經環境變數：
+
+| 變數 | 預設 | 意思 | Production 規則 |
+| --- | --- | --- | --- |
+| `VIBE_CHALLENGE_PROVIDER` | `turnstile` | v1 只接受 `turnstile`；其他值（例如 `hcaptcha`）未實作，啟動時拒絕 | 同 dev 一樣 |
+| `VIBE_TURNSTILE_SECRET` | 冇（未設定 = verifier 未設定） | Turnstile secret key；只由環境變數／secret manager 注入，永遠唔 log、唔入 source、lock、manifest 或者 commit 嘅 `.env` | 有任何 challenge route 就一定要有，否則 `vibe serve` 拒絕啟動、`vibe validate --deploy` 失敗 |
+| `VIBE_CHALLENGE_HOSTNAMES` | 冇 | 逗號分隔 widget hostname；siteverify 回應嘅 `hostname` 一定要喺入面 | 有 secret 就一定要有 |
+| `VIBE_CHALLENGE_REPLAY_STORE` | Production：`postgres`；其他環境冇預設，一定要明確設定 | `postgres`（每租戶一份、所有 instance 共用，用 `VIBE_DATABASE_URL`）或者 `memory`（per process，只限 dev／CI） | 一定係 `postgres`；設 `memory` 或者冇 PostgreSQL 即拒絕啟動 |
+
+`VIBE_ENV` 決定係咪 production（同 2C.4 一致）。固定數值（token 壽命 300s、每 IP 16、每租戶 1,000、503 `Retry-After: 5`）係平台常數，冇環境變數或者租戶 override（決定 137）。`type: pow` 喺 build 時已經係 error（決定 131）。
 
 Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動；Turnstile 本身嘅單次使用檢查（`timeout-or-duplicate`）只係額外一層。
 
