@@ -14,11 +14,13 @@ pub mod hashutil;
 pub mod llm;
 pub mod lock;
 pub mod manifest;
+pub mod netguard;
 pub mod runtime;
 pub mod scan;
 pub mod secret;
 pub mod security;
 pub mod sign;
+pub mod sqlguard;
 pub mod sqlpolicy;
 pub mod validate;
 

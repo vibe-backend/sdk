@@ -72,6 +72,8 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         env_name: "test".into(),
         jwks: None,
         roles_claim: "roles".into(),
+        signing_keys: Default::default(),
+        route_jwks: Default::default(),
     };
     let loaded = vibe::runtime::load_project_slugs(&root, true).unwrap();
     assert!(loaded.slugs.contains_key("acme"));
@@ -112,6 +114,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         honor_test_ip: true,
         trusted_proxies: Vec::new(),
         dev_hints: true,
+        challenge: None,
     });
     let app = router(state);
 
@@ -709,6 +712,7 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
         min_override_ms: Some(0),
         honor_test_ip: true,
         dev_hints: true,
+        challenge: None,
     }));
     let customer = bearer(&token("customer-1", &["customer"], "tenant0001"));
     let admin = bearer(&token("admin-user", &["admin"], "tenant0001"));
@@ -1463,4 +1467,170 @@ async fn auth_roles_merge_every_parent_auth_block() {
     };
     assert!(text.contains("auth role customer widens"), "{text}");
     assert!(!text.contains("auth role staff widens"), "{text}");
+}
+
+/// Lock `### auth` iss/aud/jwks-uri flow through validate, the manifest and
+/// the HTTP router: only the route issuer's tokens are accepted there.
+#[tokio::test]
+async fn route_jwt_overrides_end_to_end() {
+    struct Keys;
+    #[async_trait::async_trait]
+    impl vibe::runtime::jwks::JwksSource for Keys {
+        async fn fetch(&self) -> Result<Value, String> {
+            Ok(json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "r1",
+                "x": "0mqNqll14aIJEhYqCiRLWJX63Ty6Q0UxBzbmJ2wI9FM",
+                "y": "FSS8OFxIbiCRaiHQPz-m-qM0jRsjlGSuzoyHxiraTWM"}]}))
+        }
+    }
+    const IDP: &str = "https://idp.example.com/t1";
+    const URI: &str = "https://idp.example.com/t1/keys";
+    let build = |jwks: &'static str| async move {
+        let root = copy_shop();
+        // v1.8: locks must match a recompile, so the override lives in the source.
+        let source = root.join("api/catalog/v1/create-product/create-product.md");
+        let text = fs::read_to_string(&source).unwrap();
+        fs::write(
+            &source,
+            text.replacen(
+                "## Pipelines\n\n(none)",
+                &format!(
+                    "## Pipelines\n\n### auth\n\n- mode: jwt\n- iss: {IDP}\n- aud: catalog-api\n- jwks-uri: {jwks}\n- roles: [staff]"
+                ),
+                1,
+            ),
+        )
+        .unwrap();
+        let compiled = compile_project(&CompileOptions {
+            root: &root,
+            llm: None,
+            llm_config: None,
+            check: false,
+        })
+        .await;
+        if let Err(err) = compiled {
+            return (root, Err(err.to_string()));
+        }
+        let report = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+            root: &root,
+            deploy: false,
+        });
+        (
+            root,
+            report.map(|r| r.to_string()).map_err(|r| r.to_string()),
+        )
+    };
+    // A private JWKS host is a validate error.
+    let (_, bad) = build("https://169.254.169.254/keys").await;
+    let err = bad.unwrap_err();
+    assert!(err.contains("host must be public"), "{err}");
+
+    let (root, ok) = build(URI).await;
+    ok.unwrap_or_else(|err| panic!("{err}"));
+    // v1.8: no approve step.
+    let key = sign::generate_key();
+    let manifest = manifest_from_project(&root, &key).unwrap_or_else(|err| panic!("{err}"));
+    let route = manifest
+        .routes
+        .iter()
+        .find(|r| r.path == "/catalog/v1/products" && r.method == "POST")
+        .unwrap();
+    assert_eq!(
+        (
+            route.jwt_iss.as_str(),
+            route.jwt_aud.as_str(),
+            route.jwks_uri.as_str()
+        ),
+        (IDP, "catalog-api", URI)
+    );
+    let mut auth = AuthConfig::anonymous();
+    auth.public_pem = PUBLIC_PEM.into();
+    auth.alg = Algorithm::ES256;
+    auth.route_jwks.insert(
+        URI.into(),
+        Arc::new(vibe::runtime::jwks::JwksCache::new(Arc::new(Keys))),
+    );
+    let app = router(Arc::new(AppState {
+        manifest,
+        exec: Arc::new(MemoryExec::new()),
+        auth,
+        slugs: std::collections::HashMap::new(),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
+        trusted_proxies: Vec::new(),
+        disabled: std::collections::HashSet::new(),
+        min_override_ms: Some(0),
+        honor_test_ip: true,
+        dev_hints: true,
+        challenge: None,
+    }));
+    let now = chrono::Utc::now().timestamp();
+    let mint = |patch: Value, alg: Algorithm| {
+        let mut claims = json!({
+            "sub": "staff-1", "exp": now + 600, "iat": now, "nbf": now,
+            "iss": IDP, "aud": "catalog-api", "tenant_id": "tenant0001", "roles": ["staff"]
+        });
+        for (k, v) in patch.as_object().unwrap() {
+            claims[k] = v.clone();
+        }
+        let mut header = Header::new(alg);
+        header.kid = Some("r1".into());
+        let key = if alg == Algorithm::HS256 {
+            EncodingKey::from_secret(b"guess")
+        } else {
+            EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap()
+        };
+        bearer(&encode(&header, &claims, &key).unwrap())
+    };
+    let post = |auth: String, sku: &'static str| {
+        let app = app.clone();
+        async move {
+            send(
+                &app,
+                "POST",
+                "/catalog/v1/products",
+                Some(auth),
+                Some(product(sku, "Widget", 100)),
+            )
+            .await
+        }
+    };
+    let created = post(mint(json!({}), Algorithm::ES256), "SKU-1").await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.json);
+    // The default issuer's token is refused on this route.
+    let env = post(bearer(&token("staff-1", &["staff"], "tenant0001")), "SKU-2").await;
+    assert_eq!(env.status, StatusCode::UNAUTHORIZED);
+    for (label, patch, alg) in [
+        ("wrong aud", json!({"aud": "shop"}), Algorithm::ES256),
+        (
+            "wrong iss",
+            json!({"iss": "https://auth.localhost/shop"}),
+            Algorithm::ES256,
+        ),
+        (
+            "expired",
+            json!({"exp": now - 120, "iat": now - 600, "nbf": now - 600}),
+            Algorithm::ES256,
+        ),
+        (
+            "not yet valid",
+            json!({"nbf": now + 600, "exp": now + 900}),
+            Algorithm::ES256,
+        ),
+        (
+            "bad tenant",
+            json!({"tenant_id": "x, t_other"}),
+            Algorithm::ES256,
+        ),
+        ("alg mismatch", json!({}), Algorithm::HS256),
+    ] {
+        let r = post(mint(patch, alg), "SKU-3").await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{label}");
+    }
+    // Roles still apply on override routes.
+    let r = post(
+        mint(json!({"roles": ["customer"]}), Algorithm::ES256),
+        "SKU-4",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
 }

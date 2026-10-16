@@ -9,7 +9,7 @@ use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 
 type HttpResponse = Response<Body>;
 use axum::Router;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -20,7 +20,9 @@ use crate::manifest::{Manifest, RouteSpec};
 
 use super::crud::{self, MethodFail};
 use super::exec::QueryExec;
-use super::limiter::{ip_bucket, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision};
+use super::limiter::{
+    ip_bucket, owner_of, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -56,9 +58,57 @@ pub struct AuthConfig {
     /// Default claim holding the caller's roles (`VIBE_JWT_ROLES_CLAIM`,
     /// default `roles`); a route's `roles-claim` overrides it.
     pub roles_claim: String,
+    /// Private keys for `sign-jwt` steps, by `key-ref` (loaded at startup).
+    pub signing_keys: HashMap<String, SigningKey>,
+    /// JWKS caches for routes with their own `jwks-uri` (or an `iss` whose
+    /// default `{iss}/.well-known/jwks.json` differs), keyed by URI. Built at
+    /// startup; a route whose URI is missing here fails closed.
+    pub route_jwks: HashMap<String, Arc<super::jwks::JwksCache>>,
+}
+
+/// A JWT signing key named by a lock `key-ref`.
+#[derive(Clone)]
+pub struct SigningKey {
+    pub alg: Algorithm,
+    pub kid: String,
+    pub key: jsonwebtoken::EncodingKey,
+}
+
+/// The JWKS URI a route authenticates against when it overrides the issuer:
+/// its `jwks-uri`, else spec §4.1's `{iss}/.well-known/jwks.json`. `None`
+/// means the route uses the process-wide key source.
+pub fn route_jwks_uri(route: &RouteSpec) -> Option<String> {
+    if !route.jwks_uri.is_empty() {
+        Some(route.jwks_uri.clone())
+    } else if !route.jwt_iss.is_empty() {
+        Some(format!(
+            "{}/.well-known/jwks.json",
+            route.jwt_iss.trim_end_matches('/')
+        ))
+    } else {
+        None
+    }
 }
 
 impl AuthConfig {
+    /// Creates one HTTPS JWKS cache per distinct route URI (cache rules apply
+    /// per URI).
+    pub fn add_route_jwks(&mut self, routes: &[RouteSpec]) -> Result<(), String> {
+        for route in routes {
+            if let Some(uri) = route_jwks_uri(route) {
+                if self.route_jwks.contains_key(&uri) {
+                    continue;
+                }
+                // Route URIs come from locks: public hosts only, no dev exception.
+                let source = super::jwks::HttpsJwks::new(&uri)
+                    .map_err(|err| format!("{} {}: {err}", route.method, route.path))?;
+                self.route_jwks
+                    .insert(uri, Arc::new(super::jwks::JwksCache::new(Arc::new(source))));
+            }
+        }
+        Ok(())
+    }
+
     pub fn anonymous() -> Self {
         Self {
             public_pem: String::new(),
@@ -72,6 +122,8 @@ impl AuthConfig {
             env_name: "test".into(),
             jwks: None,
             roles_claim: "roles".into(),
+            signing_keys: HashMap::new(),
+            route_jwks: HashMap::new(),
         }
     }
 }
@@ -96,9 +148,12 @@ pub struct AppState {
     pub trusted_proxies: Vec<ProxyNet>,
     /// When set, an unknown public slug explains how to register it.
     pub dev_hints: bool,
+    /// Verifies `x-challenge-proof` (#118). `None`: challenge routes fail closed.
+    pub challenge: Option<Arc<dyn super::challenge::ChallengeVerifier>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    super::ops::warm_up();
     Router::new().fallback(handle).with_state(state)
 }
 
@@ -594,27 +649,23 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
     }
+    // The challenge runs after the rate limit and the public write quota, so
+    // limited requests never reach the replay cache or siteverify.
     if found.route.public
         && found.route.challenge_type != "none"
         && found.route.challenge_when == "always"
-        && headers
-            .get("x-challenge-proof")
-            .map(|v| v.is_empty())
-            .unwrap_or(true)
     {
-        return finish(
+        if let Some(fail) = check_challenge(
+            state.challenge.as_ref(),
             found.route,
-            &state,
-            started,
-            error_response(
-                StatusCode::BAD_REQUEST,
-                "CHALLENGE_REQUIRED",
-                "A challenge proof is required",
-                &request_id,
-                &[],
-            ),
+            headers.get("x-challenge-proof"),
+            &ip,
+            &principal.tenant_id,
         )
-        .await;
+        .await
+        {
+            return finish(found.route, &state, started, fail(&request_id)).await;
+        }
     }
     let mut query_values = BTreeMap::new();
     for field in &found.route.request {
@@ -635,6 +686,18 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     let req_value = crud::req_var(body, query_values, found.params.clone(), header_values);
     let mut vars = Map::new();
     vars.insert("req".into(), req_value);
+    vars.insert(
+        "ctx".into(),
+        crud::ctx_var(&crud::CallCtx {
+            auth: &state.auth,
+            tenant_id: &principal.tenant_id,
+            role: "",
+            caller: crud::Caller {
+                subject: &principal.subject,
+                roles: &principal.roles,
+            },
+        }),
+    );
     let input = match crud::eval_expr(&found.route.transform_in, &vars) {
         Ok(value) => value,
         Err(err) => {
@@ -693,6 +756,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     &step.target,
                     &args,
                     crud::CallCtx {
+                        auth: &state.auth,
                         tenant_id: &principal.tenant_id,
                         role,
                         caller: crud::Caller {
@@ -817,7 +881,13 @@ async fn finish(
     response: HttpResponse,
 ) -> HttpResponse {
     let min_ms = state.min_override_ms.unwrap_or(if route.public {
-        route.min_response_ms
+        // Login-class endpoints (a verify-password step) pad to 500 ms so
+        // timing does not reveal whether the account exists.
+        if crud::route_verifies_password(&state.manifest, route) {
+            route.min_response_ms.max(500)
+        } else {
+            route.min_response_ms
+        }
     } else {
         0
     });
@@ -1133,7 +1203,19 @@ async fn authenticate(
         .kid
         .clone()
         .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
-    let (alg, key) = if let Some(jwks) = &auth.jwks {
+    let route_uri = route_jwks_uri(route);
+    let (alg, key) = if let Some(uri) = &route_uri {
+        // Route-level issuer: only its own keys, never the env key source.
+        let jwks = auth
+            .route_jwks
+            .get(uri)
+            .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+        let found = jwks
+            .key(&kid)
+            .await
+            .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
+        (found.alg, found.key)
+    } else if let Some(jwks) = &auth.jwks {
         let found = jwks
             .key(&kid)
             .await
@@ -1154,19 +1236,30 @@ async fn authenticate(
     if jwt_header.alg != alg {
         return Err(AuthError::unauthorized("Bearer"));
     }
-    verify_jwt(auth, token, alg, &key, roles_claim)
+    let iss = if route.jwt_iss.is_empty() {
+        auth.iss.as_str()
+    } else {
+        route.jwt_iss.as_str()
+    };
+    let aud = if route.jwt_aud.is_empty() {
+        auth.aud.as_str()
+    } else {
+        route.jwt_aud.as_str()
+    };
+    verify_jwt(token, alg, &key, iss, aud, roles_claim)
 }
 
 fn verify_jwt(
-    auth: &AuthConfig,
     token: &str,
     alg: Algorithm,
     key: &DecodingKey,
+    iss: &str,
+    aud: &str,
     roles_claim: &str,
 ) -> Result<Principal, AuthError> {
     let mut validation = Validation::new(alg);
-    validation.set_issuer(&[&auth.iss]);
-    validation.set_audience(&[&auth.aud]);
+    validation.set_issuer(&[iss]);
+    validation.set_audience(&[aud]);
     validation.leeway = 60;
     validation.validate_nbf = true;
     let data = jsonwebtoken::decode::<Claims>(token, key, &validation)
@@ -1404,16 +1497,18 @@ fn rate_limited(
     let checks: Vec<(String, String, u32)> = route
         .rates
         .iter()
-        .map(|rate| {
+        .enumerate()
+        .map(|(index, rate)| {
             let (shard, key) =
                 rate_bucket(&rate.key, route, ip, principal, body, &state.auth.pepper);
-            (shard, key, rate.per_minute)
+            // Each block is its own limit, even when two share a key.
+            (format!("{shard}#{index}"), key, rate.per_minute)
         })
         .collect();
     let Ok(mut rates) = state.rates.lock() else {
         return Some("1".into());
     };
-    match rates.check(&checks, Instant::now()) {
+    match rates.check(&checks, &owner_of(ip), Instant::now()) {
         RateDecision::Allow => None,
         RateDecision::Limited(wait) => Some(wait.to_string()),
     }
@@ -1611,7 +1706,72 @@ fn platform_status(code: &str) -> StatusCode {
         "FORBIDDEN" => StatusCode::FORBIDDEN,
         "UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
         "BAD_REQUEST" => StatusCode::BAD_REQUEST,
+        "SERVICE_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+type FailFn = Box<dyn FnOnce(&str) -> HttpResponse + Send>;
+
+/// Verifies the challenge proof of a `when: always` route. Fails closed: no
+/// proof is 400, no verifier, a `pow` route or an unreachable provider is 503,
+/// a rejected proof is 403.
+async fn check_challenge(
+    verifier: Option<&Arc<dyn super::challenge::ChallengeVerifier>>,
+    route: &crate::manifest::RouteSpec,
+    proof: Option<&String>,
+    ip: impl std::fmt::Display,
+    tenant: &str,
+) -> Option<FailFn> {
+    fn fail(status: StatusCode, code: &'static str, message: &'static str) -> Option<FailFn> {
+        Some(Box::new(move |request_id: &str| {
+            error_response(status, code, message, request_id, &[])
+        }))
+    }
+    let token = match proof.map(|v| v.trim()) {
+        Some(token) if !token.is_empty() => token,
+        _ => {
+            return fail(
+                StatusCode::BAD_REQUEST,
+                "CHALLENGE_REQUIRED",
+                "A challenge proof is required",
+            )
+        }
+    };
+    let verifier = match (verifier, route.challenge_type.as_str()) {
+        (Some(verifier), "captcha") => verifier,
+        _ => {
+            tracing::warn!(route = %route.feature_id, kind = %route.challenge_type, "no challenge verifier configured; refusing");
+            return fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CHALLENGE_UNAVAILABLE",
+                "Challenge verification is unavailable",
+            );
+        }
+    };
+    let ctx = super::challenge::ChallengeContext {
+        action: super::challenge::challenge_action(&route.feature_id),
+        remote_ip: Some(ip.to_string()),
+        tenant: Some(tenant.to_string()).filter(|t| !t.is_empty()),
+    };
+    match verifier.verify(token, &ctx).await {
+        Ok(()) => None,
+        Err(super::challenge::ChallengeError::Rejected(why)) => {
+            tracing::info!(route = %route.feature_id, %why, "challenge rejected");
+            fail(
+                StatusCode::FORBIDDEN,
+                "CHALLENGE_FAILED",
+                "The challenge proof is invalid",
+            )
+        }
+        Err(super::challenge::ChallengeError::Unavailable(why)) => {
+            tracing::warn!(route = %route.feature_id, %why, "challenge provider unavailable");
+            fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CHALLENGE_UNAVAILABLE",
+                "Challenge verification is unavailable",
+            )
+        }
     }
 }
 
@@ -1671,6 +1831,7 @@ fn empty_response(
 #[cfg(test)]
 mod rate_tests {
     use super::*;
+    use crate::runtime::challenge::{ChallengeContext, ChallengeError, ChallengeVerifier};
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -1764,6 +1925,70 @@ mod rate_tests {
         );
         assert_eq!(a, b);
         assert_eq!(a, c, "missing and empty share the same bucket");
+    }
+
+    struct FakeVerifier(Result<(), ChallengeError>);
+
+    #[async_trait::async_trait]
+    impl ChallengeVerifier for FakeVerifier {
+        fn provider(&self) -> &'static str {
+            "fake"
+        }
+        async fn verify(&self, token: &str, ctx: &ChallengeContext) -> Result<(), ChallengeError> {
+            assert_eq!(token, "tok");
+            assert_eq!(ctx.action, "register");
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn challenge_gate_fails_closed() {
+        let mut route = test_route();
+        route.feature_id = "shop/v1/register".into();
+        route.challenge_type = "captcha".into();
+        route.challenge_when = "always".into();
+        let status = |f: Option<FailFn>| f.map(|f| f("rid").status());
+        let ok: Arc<dyn ChallengeVerifier> = Arc::new(FakeVerifier(Ok(())));
+        let tok = "tok".to_string();
+        let blank = "  ".to_string();
+        // Missing or blank proof.
+        assert_eq!(
+            status(check_challenge(Some(&ok), &route, None, "1.2.3.4", "tenant0001").await),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            status(check_challenge(Some(&ok), &route, Some(&blank), "1.2.3.4", "tenant0001").await),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        // No verifier configured: an arbitrary proof no longer passes.
+        assert_eq!(
+            status(check_challenge(None, &route, Some(&tok), "1.2.3.4", "tenant0001").await),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        // Verified.
+        assert_eq!(
+            status(check_challenge(Some(&ok), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
+            None
+        );
+        // Rejected and unavailable.
+        let bad: Arc<dyn ChallengeVerifier> =
+            Arc::new(FakeVerifier(Err(ChallengeError::Rejected("x".into()))));
+        assert_eq!(
+            status(check_challenge(Some(&bad), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
+            Some(StatusCode::FORBIDDEN)
+        );
+        let down: Arc<dyn ChallengeVerifier> =
+            Arc::new(FakeVerifier(Err(ChallengeError::Unavailable("x".into()))));
+        assert_eq!(
+            status(check_challenge(Some(&down), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        // `pow` has no verifier in v1: fail closed.
+        route.challenge_type = "pow".into();
+        assert_eq!(
+            status(check_challenge(Some(&ok), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
     }
 
     fn test_route() -> RouteSpec {
@@ -2093,6 +2318,73 @@ RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
         assert!(route_scopes_allow(&["catalog:*".into()], &need));
     }
 
+    struct Down;
+    #[async_trait::async_trait]
+    impl super::super::jwks::JwksSource for Down {
+        async fn fetch(&self) -> Result<Value, String> {
+            Err("connection refused".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn route_iss_aud_and_jwks_uri_override_env_defaults() {
+        const IDP: &str = "https://idp.example.com/t1";
+        const URI: &str = "https://idp.example.com/t1/keys";
+        let keys = json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "r1", "x": X, "y": Y}]});
+        // Env JWKS has the same key under kid k1; the route must not use it.
+        let mut auth = jwks_auth();
+        auth.route_jwks.insert(
+            URI.into(),
+            Arc::new(super::super::jwks::JwksCache::new(Arc::new(Doc(keys)))),
+        );
+        let r = route(json!({"jwt_iss": IDP, "jwt_aud": "tenant-api", "jwks_uri": URI}));
+        let good = token("r1", json!({"iss": IDP, "aud": "tenant-api"}));
+        assert!(authenticate(&auth, &r, &bearer(&good)).await.is_ok());
+        // Default issuer/audience tokens are refused on the overridden route.
+        let env_tok = token("k1", json!({}));
+        assert!(authenticate(&auth, &r, &bearer(&env_tok)).await.is_err());
+        let wrong_aud = token("r1", json!({"iss": IDP, "aud": "shop"}));
+        assert!(authenticate(&auth, &r, &bearer(&wrong_aud)).await.is_err());
+        // And the route issuer's tokens are refused on default routes.
+        assert!(authenticate(&auth, &route(json!({})), &bearer(&good))
+            .await
+            .is_err());
+        // aud-only override keeps the env key source and issuer.
+        let r_aud = route(json!({"jwt_aud": "tenant-api"}));
+        let t = token("k1", json!({"aud": "tenant-api"}));
+        assert!(authenticate(&auth, &r_aud, &bearer(&t)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn route_jwks_unreachable_or_missing_fails_closed() {
+        const IDP: &str = "https://idp.example.com/t2";
+        let mut auth = jwks_auth();
+        let r = route(json!({"jwt_iss": IDP}));
+        let t = token("k1", json!({"iss": IDP}));
+        // Not registered at startup: 401, no fallback to the env JWKS.
+        assert!(authenticate(&auth, &r, &bearer(&t)).await.is_err());
+        // Registered (derived {iss}/.well-known/jwks.json) but unreachable: 401.
+        assert_eq!(
+            route_jwks_uri(&r).unwrap(),
+            "https://idp.example.com/t2/.well-known/jwks.json"
+        );
+        auth.route_jwks.insert(
+            route_jwks_uri(&r).unwrap(),
+            Arc::new(super::super::jwks::JwksCache::new(Arc::new(Down))),
+        );
+        assert!(authenticate(&auth, &r, &bearer(&t)).await.is_err());
+    }
+
+    #[test]
+    fn add_route_jwks_requires_https() {
+        let mut auth = AuthConfig::anonymous();
+        let ok = route(json!({"jwt_iss": "https://idp.example.com"}));
+        auth.add_route_jwks(&[ok.clone(), ok]).unwrap();
+        assert_eq!(auth.route_jwks.len(), 1, "one cache per URI");
+        let bad = route(json!({"jwt_iss": "https://idp.example.com", "jwks_uri": "http://x/k"}));
+        assert!(auth.add_route_jwks(&[bad]).is_err());
+    }
+
     #[test]
     fn api_keys_file_with_bad_tenant_id_is_rejected() {
         use std::os::unix::fs::PermissionsExt;
@@ -2334,5 +2626,20 @@ mod request_validation_tests {
             assert!(check_type(&f, &good).is_ok(), "{ty} good");
             assert!(check_type(&f, &bad).is_err(), "{ty} bad");
         }
+    }
+}
+
+#[cfg(test)]
+mod crypto_kats {
+    use super::hmac_hex;
+
+    #[test]
+    fn hmac_sha256_known_answer() {
+        // RFC 4231 test case 1
+        let mac = hmac_hex(&[0x0b; 20], "Hi There");
+        assert_eq!(
+            mac,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
     }
 }
