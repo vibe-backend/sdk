@@ -273,7 +273,7 @@ pub fn cleanup_statements(schema: &str) -> Result<Vec<String>, String> {
         "DO $$ DECLARE n bigint; i int := 0; BEGIN \
          PERFORM set_config('app.tenant_id', {t}, true); LOOP \
          DELETE FROM {qualified} WHERE id IN (SELECT id FROM {qualified} \
-         WHERE family_expires_at <= now() - make_interval(secs => {CLEANUP_RETENTION_SECS}) \
+         WHERE family_expires_at <= clock_timestamp() - make_interval(secs => {CLEANUP_RETENTION_SECS}) \
          LIMIT {CLEANUP_BATCH}); \
          GET DIAGNOSTICS n = ROW_COUNT; i := i + 1; \
          EXIT WHEN n < {CLEANUP_BATCH} OR i >= {CLEANUP_MAX_BATCHES}; END LOOP; END $$",
@@ -750,7 +750,7 @@ mod tests {
         let sql = cleanup_statements("t_tenant0001").unwrap().join("\n");
         assert!(sql.contains(&format!("LIMIT {CLEANUP_BATCH}")));
         assert!(sql.contains(&format!("i >= {CLEANUP_MAX_BATCHES}")));
-        assert!(sql.contains("family_expires_at <= now()"));
+        assert!(sql.contains("family_expires_at <= clock_timestamp()"));
         assert!(cleanup_statements("public").is_err());
     }
 

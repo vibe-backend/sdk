@@ -17,6 +17,12 @@ pub enum ExecError {
     Message(String),
 }
 
+/// Issuance work performed only after refresh validation, while rotation is locked.
+#[async_trait]
+pub trait RefreshIssuer: Send + Sync {
+    async fn issue(&self, user_id: &str) -> Result<Value, ExecError>;
+}
+
 #[async_trait]
 pub trait QueryExec: Send + Sync {
     async fn execute(&self, tenant_id: &str, role: &str, stmt: Stmt)
@@ -60,7 +66,24 @@ pub trait QueryExec: Send + Sync {
         token_hash: &str,
         new_hash: &str,
         policy: RefreshPolicy,
-    ) -> Result<Rotated, ExecError>;
+    ) -> Result<Rotated, ExecError> {
+        self.refresh_rotate_authorized(tenant_id, token_hash, new_hash, policy, None)
+            .await
+            .map(|(rotated, _)| rotated)
+    }
+
+    /// Validate and detect reuse before invoking issuance. Issuance failure
+    /// leaves rotation uncommitted; reuse revocation commits without issuance.
+    async fn refresh_rotate_authorized(
+        &self,
+        _tenant_id: &str,
+        _token_hash: &str,
+        _new_hash: &str,
+        _policy: RefreshPolicy,
+        _issuer: Option<&dyn RefreshIssuer>,
+    ) -> Result<(Rotated, Option<Value>), ExecError> {
+        Err(ExecError::Message("authorized rotation unavailable".into()))
+    }
 
     async fn refresh_revoke(
         &self,
@@ -148,6 +171,7 @@ const REFRESH_TABLE: &str = "_platform_refresh_tokens";
 #[derive(Default)]
 pub struct MemoryExec {
     tables: Mutex<BTreeMap<String, Vec<Row>>>,
+    refresh_gate: tokio::sync::Mutex<()>,
     /// Test stub for `query` steps (the memory executor runs no SQL).
     query_stub: Mutex<Option<String>>,
 }
@@ -253,6 +277,7 @@ impl QueryExec for MemoryExec {
         token_hash: &str,
         policy: RefreshPolicy,
     ) -> Result<String, ExecError> {
+        let _gate = self.refresh_gate.lock().await;
         let mut tables = self
             .tables
             .lock()
@@ -266,26 +291,46 @@ impl QueryExec for MemoryExec {
         ))
     }
 
-    async fn refresh_rotate(
+    async fn refresh_rotate_authorized(
         &self,
         tenant_id: &str,
         token_hash: &str,
         new_hash: &str,
         policy: RefreshPolicy,
-    ) -> Result<Rotated, ExecError> {
-        let mut tables = self
-            .tables
+        issuer: Option<&dyn RefreshIssuer>,
+    ) -> Result<(Rotated, Option<Value>), ExecError> {
+        let _gate = self.refresh_gate.lock().await;
+        let (rows, rotated) = {
+            let mut tables = self
+                .tables
+                .lock()
+                .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+            let stored = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+            let mut rows = stored.clone();
+            let rotated = super::refresh::memory_rotate(
+                &mut rows,
+                tenant_id,
+                token_hash,
+                new_hash,
+                policy,
+                chrono::Utc::now().timestamp(),
+            );
+            if !matches!(rotated, Rotated::Ok { .. }) {
+                *stored = rows;
+                return Ok((rotated, None));
+            }
+            (rows, rotated)
+        };
+        let value = if let (Some(issuer), Rotated::Ok { user_id, .. }) = (issuer, &rotated) {
+            Some(issuer.issue(user_id).await?)
+        } else {
+            None
+        };
+        self.tables
             .lock()
-            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
-        let rows = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
-        Ok(super::refresh::memory_rotate(
-            rows,
-            tenant_id,
-            token_hash,
-            new_hash,
-            policy,
-            chrono::Utc::now().timestamp(),
-        ))
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?
+            .insert(key(tenant_id, REFRESH_TABLE), rows);
+        Ok((rotated, value))
     }
 
     async fn refresh_revoke(
@@ -293,6 +338,7 @@ impl QueryExec for MemoryExec {
         tenant_id: &str,
         target: RevokeTarget<'_>,
     ) -> Result<u64, ExecError> {
+        let _gate = self.refresh_gate.lock().await;
         let mut tables = self
             .tables
             .lock()
@@ -1125,13 +1171,14 @@ impl QueryExec for PgExec {
         Ok(family)
     }
 
-    async fn refresh_rotate(
+    async fn refresh_rotate_authorized(
         &self,
         tenant_id: &str,
         token_hash: &str,
         new_hash: &str,
         policy: RefreshPolicy,
-    ) -> Result<Rotated, ExecError> {
+        issuer: Option<&dyn RefreshIssuer>,
+    ) -> Result<(Rotated, Option<Value>), ExecError> {
         if !super::slugs::valid_tenant(tenant_id) {
             return Err(ExecError::Message("invalid tenant id".into()));
         }
@@ -1139,8 +1186,13 @@ impl QueryExec for PgExec {
         let tx = client.transaction().await.map_err(map_pg)?;
         let schema = format!("\"t_{tenant_id}\"");
         tx.query(
-            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true)",
-            &[&tenant_id, &schema],
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), \
+             set_config('statement_timeout', $3, true), set_config('lock_timeout', $3, true)",
+            &[
+                &tenant_id,
+                &schema,
+                &self.options.statement_timeout_ms.to_string(),
+            ],
         )
         .await
         .map_err(map_pg)?;
@@ -1156,7 +1208,7 @@ impl QueryExec for PgExec {
             .await
             .map_err(map_pg)?;
         let Some(family_of) = family_of else {
-            return Ok(Rotated::Invalid);
+            return Ok((Rotated::Invalid, None));
         };
         let family_of: String = family_of.get(0);
         tx.execute(
@@ -1187,7 +1239,7 @@ impl QueryExec for PgExec {
             .await
             .map_err(map_pg)?;
         let Some(row) = row else {
-            return Ok(Rotated::Invalid);
+            return Ok((Rotated::Invalid, None));
         };
         let id: String = row.get(0);
         let family: String = row.get(1);
@@ -1208,9 +1260,9 @@ impl QueryExec for PgExec {
                     .await
                     .map_err(map_pg)?;
                 tx.commit().await.map_err(map_pg)?;
-                return Ok(Rotated::Reuse { family_id: family });
+                return Ok((Rotated::Reuse { family_id: family }, None));
             }
-            return Ok(Rotated::Invalid);
+            return Ok((Rotated::Invalid, None));
         }
         // Spent before expired: a late replay still revokes the family. A
         // grace reissue is allowed only while the earlier child is unused.
@@ -1219,11 +1271,15 @@ impl QueryExec for PgExec {
                 .await
                 .map_err(map_pg)?;
             tx.commit().await.map_err(map_pg)?;
-            return Ok(Rotated::Reuse { family_id: family });
+            return Ok((Rotated::Reuse { family_id: family }, None));
         }
         if expired {
-            return Ok(Rotated::Invalid);
+            return Ok((Rotated::Invalid, None));
         }
+        let value = match issuer {
+            Some(issuer) => Some(issuer.issue(&user).await?),
+            None => None,
+        };
         let child = uuid::Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO _platform_refresh_tokens (id, tenant_id, family_id, user_id, token_hash, parent_id, created_at, family_expires_at, idle_expires_at) \
@@ -1258,11 +1314,14 @@ impl QueryExec for PgExec {
             .map_err(map_pg)?;
         }
         tx.commit().await.map_err(map_pg)?;
-        Ok(Rotated::Ok {
-            user_id: user,
-            family_id: family,
-            expires_in: policy.idle_ttl.min(family_left),
-        })
+        Ok((
+            Rotated::Ok {
+                user_id: user,
+                family_id: family,
+                expires_in: policy.idle_ttl.min(family_left),
+            },
+            value,
+        ))
     }
 
     async fn refresh_revoke(

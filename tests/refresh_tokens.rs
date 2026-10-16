@@ -1077,6 +1077,7 @@ struct FamilyLookupFails {
     lookup_delay_ms: u64,
     rotate_delay_ms: u64,
     signer_delay_ms: u64,
+    signer_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -1099,6 +1100,18 @@ impl vibe::runtime::QueryExec for FamilyLookupFails {
         params: Vec<Option<String>>,
     ) -> Result<Vec<vibe::runtime::Row>, vibe::runtime::ExecError> {
         tokio::time::sleep(std::time::Duration::from_millis(self.signer_delay_ms)).await;
+        if self.signer_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(vibe::runtime::ExecError::Message(
+                "issuance unavailable".into(),
+            ));
+        }
+        if writes {
+            self.inner.seed(
+                tenant_id,
+                "issuance_audit",
+                json!({"id": "issued"}).as_object().unwrap().clone(),
+            );
+        }
         self.inner.raw(tenant_id, role, writes, sql, params).await
     }
 
@@ -1132,6 +1145,20 @@ impl vibe::runtime::QueryExec for FamilyLookupFails {
         tokio::time::sleep(std::time::Duration::from_millis(self.rotate_delay_ms)).await;
         self.inner
             .refresh_rotate(tenant_id, token_hash, new_hash, policy)
+            .await
+    }
+
+    async fn refresh_rotate_authorized(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: vibe::runtime::refresh::RefreshPolicy,
+        issuer: Option<&dyn vibe::runtime::RefreshIssuer>,
+    ) -> Result<(vibe::runtime::refresh::Rotated, Option<Value>), vibe::runtime::ExecError> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.rotate_delay_ms)).await;
+        self.inner
+            .refresh_rotate_authorized(tenant_id, token_hash, new_hash, policy, issuer)
             .await
     }
 
@@ -1175,6 +1202,7 @@ async fn family_lookup_error_fails_closed_and_keeps_the_token() {
             lookup_delay_ms: 0,
             rotate_delay_ms: 0,
             signer_delay_ms: 0,
+            signer_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     });
     let r0 = tok(&a.login().await, "refresh_token");
@@ -1203,6 +1231,7 @@ async fn refresh_waits_complete_and_new_tokens_remain_usable() {
                 lookup_delay_ms,
                 rotate_delay_ms,
                 signer_delay_ms,
+                signer_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             })
         });
         let token = tok(&a.login().await, "refresh_token");
@@ -1440,4 +1469,281 @@ async fn postgres_refresh_table_grants_and_guard() {
     }
     // A tenant without the table also fails.
     assert!(check_store(&rt, &[format!("tz{s}")]).await.is_err());
+}
+
+fn app_with_issuance_control(
+    grace: i64,
+    writes: bool,
+) -> (App, Arc<std::sync::atomic::AtomicBool>) {
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = down.clone();
+    let mut m = manifest(grace);
+    if writes {
+        let method = m
+            .methods
+            .iter_mut()
+            .find(|m| m.target == "auth.sign")
+            .unwrap();
+        method.writes = true;
+        method.steps.insert(
+            0,
+            serde_json::from_value(step(
+                "query",
+                "audit",
+                json!({
+                    "table": "issuance_audit", "sql": "insert into issuance_audit (id) values ($1)",
+                    "params": ["input.user_id"], "writes": true
+                }),
+            ))
+            .unwrap(),
+        );
+    }
+    let a = app_wrapped(m, move |inner| {
+        Arc::new(FamilyLookupFails {
+            inner,
+            down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lookup_delay_ms: 0,
+            rotate_delay_ms: 0,
+            signer_delay_ms: 0,
+            signer_down: flag,
+        })
+    });
+    (a, down)
+}
+
+#[tokio::test]
+async fn reuse_revokes_the_family_when_issuance_is_unavailable() {
+    for grace in [0, 10] {
+        let (a, down) = app_with_issuance_control(grace, false);
+        let parent = tok(&a.login().await, "refresh_token");
+        let (status, first, _) = a.refresh(&parent).await;
+        assert_eq!(status, StatusCode::OK);
+        let (presented, current) = if grace == 0 {
+            (parent, tok(&first, "refresh_token"))
+        } else {
+            let (status, retry, _) = a.refresh(&parent).await;
+            assert_eq!(status, StatusCode::OK);
+            (tok(&first, "refresh_token"), tok(&retry, "refresh_token"))
+        };
+        down.store(true, std::sync::atomic::Ordering::SeqCst);
+        // A current token reaches issuance and remains available on failure.
+        assert_eq!(a.refresh(&current).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(a.refresh(&presented).await.0, StatusCode::UNAUTHORIZED);
+        down.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(a.refresh(&current).await.0, StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+async fn rejected_tokens_do_not_run_sign_method_writes() {
+    use vibe::runtime::{Col, QueryExec, Stmt};
+    for state in ["invalid", "revoked", "expired", "reused"] {
+        let (a, _) = app_with_issuance_control(0, true);
+        let login = a.login().await;
+        let token = tok(&login, "refresh_token");
+        let presented = match state {
+            "invalid" => "unknown".to_string(),
+            "revoked" => {
+                a.post(
+                    "/v1/logout",
+                    Some(&tok(&login, "access_token")),
+                    json!({"refresh_token": token}),
+                )
+                .await;
+                token
+            }
+            "expired" => {
+                use hmac::{Hmac, KeyInit, Mac};
+                use sha2::Sha256;
+                let mut mac = Hmac::<Sha256>::new_from_slice(&a.state.auth.pepper).unwrap();
+                mac.update(b"expired-token");
+                let hash = hex::encode(mac.finalize().into_bytes());
+                a.exec
+                    .refresh_issue(
+                        TENANT,
+                        "u1",
+                        &hash,
+                        vibe::runtime::refresh::RefreshPolicy {
+                            family_ttl: -1,
+                            idle_ttl: -1,
+                            grace: 0,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                "expired-token".to_string()
+            }
+            _ => {
+                assert_eq!(a.refresh(&token).await.0, StatusCode::OK);
+                token
+            }
+        };
+        let audit_rows = || {
+            a.exec.execute(
+                TENANT,
+                "public_reader",
+                Stmt::Select {
+                    table: "issuance_audit".into(),
+                    columns: vec![Col {
+                        name: "id".into(),
+                        ty: "text".into(),
+                    }],
+                    id: None,
+                    filters: vec![],
+                    sort: None,
+                    limit: 100,
+                    offset: 0,
+                },
+            )
+        };
+        let before = audit_rows().await.unwrap();
+        assert_eq!(
+            a.refresh(&presented).await.0,
+            StatusCode::UNAUTHORIZED,
+            "{state}"
+        );
+        assert_eq!(audit_rows().await.unwrap(), before, "{state}");
+        if state == "reused" {
+            assert_eq!(before.len(), 1, "a current token runs the write step");
+        } else {
+            assert!(before.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn postgres_rotation_lock_wait_is_bounded() {
+    use vibe::runtime::{PgExec, PgOptions, QueryExec};
+    let Ok(admin_url) = std::env::var("VIBE_TEST_PG_ADMIN_URL") else {
+        return;
+    };
+    let (mut admin, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let suffix = uuid::Uuid::new_v4().simple().to_string()[..10].to_string();
+    let tenant = format!("tl{suffix}");
+    let schema = format!("t_{tenant}");
+    let role = format!("refresh_lock_{suffix}");
+    admin
+        .batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'pw'"))
+        .await
+        .unwrap();
+    for stmt in vibe::runtime::refresh::table_statements(&schema).unwrap() {
+        admin.batch_execute(&stmt).await.unwrap();
+    }
+    for stmt in vibe::runtime::refresh::runtime_grant_statements(&schema, &role).unwrap() {
+        admin.batch_execute(&stmt).await.unwrap();
+    }
+    let mut url = url::Url::parse(&admin_url).unwrap();
+    url.set_username(&role).unwrap();
+    url.set_password(Some("pw")).unwrap();
+    let exec = PgExec::connect_with(
+        url.as_str(),
+        PgOptions {
+            statement_timeout_ms: 150,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let policy = vibe::runtime::refresh::RefreshPolicy::default();
+    let family = exec
+        .refresh_issue(&tenant, "u1", "locked", policy)
+        .await
+        .unwrap();
+    for advisory in [true, false] {
+        let tx = admin.transaction().await.unwrap();
+        if advisory {
+            tx.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('vibe-refresh:' || $1))",
+                &[&family],
+            )
+            .await
+            .unwrap();
+        } else {
+            tx.query_one(&format!("SELECT id FROM {schema}._platform_refresh_tokens WHERE token_hash = 'locked' FOR UPDATE"), &[]).await.unwrap();
+        }
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            exec.refresh_rotate(&tenant, "locked", "next", policy),
+        )
+        .await;
+        assert!(result.is_ok(), "rotation exceeded the timeout bound");
+        assert!(
+            result.unwrap().is_err(),
+            "rotation must fail while the lock is held"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        tx.rollback().await.unwrap();
+    }
+    assert!(matches!(
+        exec.refresh_rotate(&tenant, "locked", "next", policy)
+            .await
+            .unwrap(),
+        vibe::runtime::refresh::Rotated::Ok { .. }
+    ));
+    drop(exec);
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE; DROP ROLE {role}"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn internal_metrics_endpoint_exports_counters_for_local_collectors() {
+    let a = app(0);
+    a.refresh("unknown").await;
+    for (peer, expected) in [
+        ("127.0.0.1:9000", StatusCode::OK),
+        ("192.0.2.1:9000", StatusCode::NOT_FOUND),
+    ] {
+        let request = Request::builder()
+            .uri("/internal/metrics")
+            .header("x-forwarded-for", "127.0.0.1")
+            .extension(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let response = a.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::OK {
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/plain; version=0.0.4; charset=utf-8"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(body.contains("vibe_refresh_rejections_total"));
+            assert!(body.contains("vibe_rate_limit_saturation_refusals_total"));
+        }
+    }
+}
+
+#[test]
+fn refresh_cleanup_uses_wall_clock_time() {
+    let sql = vibe::runtime::refresh::cleanup_statements("t_tenant0001")
+        .unwrap()
+        .join("\n");
+    assert!(sql.contains("family_expires_at <= clock_timestamp()"));
+    assert!(!sql.contains("now()"));
+}
+
+#[tokio::test]
+async fn issuance_failure_keeps_the_current_token_available() {
+    let (a, down) = app_with_issuance_control(0, false);
+    let token = tok(&a.login().await, "refresh_token");
+    down.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(a.refresh(&token).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    down.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (status, body, _) = a.refresh(&token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        a.refresh(&tok(&body, "refresh_token")).await.0,
+        StatusCode::OK
+    );
 }

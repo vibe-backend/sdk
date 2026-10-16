@@ -379,6 +379,30 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     let request_id = uuid::Uuid::new_v4().to_string();
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
+    if path == "/internal/metrics" {
+        // Use the transport peer, independent of forwarded request headers.
+        let local = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|ConnectInfo(peer)| peer.ip().is_loopback());
+        if method == "GET" && local {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )
+                .body(Body::from(super::internal_metrics()))
+                .expect("fixed metrics response");
+        }
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "Not found",
+            &request_id,
+            &[],
+        );
+    }
     if path == "/health" {
         return json_response(StatusCode::OK, json!({"status": "ok"}), &request_id, &[]);
     }
@@ -1702,8 +1726,7 @@ fn rate_limited_response(request_id: &str, retry: &str) -> HttpResponse {
     )
 }
 
-/// `token-refresh`: prepare the access token, then rotate the refresh token
-/// with the route's `sign-method`.
+/// `token-refresh`: validate, prepare issuance, and commit rotation.
 async fn refresh_response(
     state: &AppState,
     route: &RouteSpec,
@@ -1764,53 +1787,68 @@ async fn refresh_response(
     }
     let (new_token, new_hash) = super::ops::new_refresh_token(&state.auth.pepper);
     let policy = super::ops::policy_of(spec);
-    let user_id = match state.exec.refresh_subject(tenant, &hash).await {
-        Ok(Some(user_id)) => user_id,
-        Ok(None) => return invalid_refresh(request_id, "invalid"),
-        Err(_) => return refresh_unavailable(request_id),
+    let issuer = HttpRefreshIssuer {
+        state,
+        spec,
+        tenant,
+        new_token: &new_token,
     };
-    let input = serde_json::json!({ "user_id": user_id });
-    let result = crud::run_method(
-        &state.manifest,
-        state.exec.as_ref(),
-        &spec.sign_method,
-        &input,
-        crud::CallCtx {
-            auth: &state.auth,
-            tenant_id: tenant,
-            role: "public_reader",
-            caller: crud::Caller {
-                subject: &user_id,
-                roles: &[],
-            },
-            refresh_token: Some(&new_token),
-        },
-        1,
-    )
-    .await;
-    let mut value = match result {
-        Ok(result) if result.value.get("access_token").is_some() => result.value,
-        _ => return refresh_unavailable(request_id),
-    };
-    // No fallible signing work remains after the rotation commits.
     match state
         .exec
-        .refresh_rotate(tenant, &hash, &new_hash, policy)
+        .refresh_rotate_authorized(tenant, &hash, &new_hash, policy, Some(&issuer))
         .await
     {
-        Ok(Rotated::Ok { expires_in, .. }) => {
+        Ok((Rotated::Ok { expires_in, .. }, Some(mut value))) => {
             value["refresh_token"] = Value::String(new_token);
             value["refresh_expires_in"] = Value::from(expires_in);
             json_response(StatusCode::OK, value, request_id, &[])
         }
-        Ok(Rotated::Reuse { family_id }) => {
+        Ok((Rotated::Reuse { family_id }, _)) => {
             tracing::warn!(tenant_hash = %log_id_hash(tenant), family_hash = %log_id_hash(&family_id), "refresh token reuse detected; family revoked");
             invalid_refresh(request_id, "invalid")
         }
-        Ok(Rotated::Invalid) => invalid_refresh(request_id, "invalid"),
+        Ok(_) => invalid_refresh(request_id, "invalid"),
         Err(err) => {
             tracing::error!(%request_id, error = ?err, "refresh rotation failed");
-            invalid_refresh(request_id, "invalid")
+            refresh_unavailable(request_id)
+        }
+    }
+}
+
+struct HttpRefreshIssuer<'a> {
+    state: &'a AppState,
+    spec: &'a crate::manifest::RefreshSpec,
+    tenant: &'a str,
+    new_token: &'a str,
+}
+
+#[async_trait::async_trait]
+impl super::exec::RefreshIssuer for HttpRefreshIssuer<'_> {
+    async fn issue(&self, user_id: &str) -> Result<Value, super::exec::ExecError> {
+        let input = json!({ "user_id": user_id });
+        let result = crud::run_method(
+            &self.state.manifest,
+            self.state.exec.as_ref(),
+            &self.spec.sign_method,
+            &input,
+            crud::CallCtx {
+                auth: &self.state.auth,
+                tenant_id: self.tenant,
+                role: "public_reader",
+                caller: crud::Caller {
+                    subject: user_id,
+                    roles: &[],
+                },
+                refresh_token: Some(self.new_token),
+            },
+            1,
+        )
+        .await;
+        match result {
+            Ok(result) if result.value.get("access_token").is_some() => Ok(result.value),
+            _ => Err(super::exec::ExecError::Message(
+                "refresh issuance failed".into(),
+            )),
         }
     }
 }
