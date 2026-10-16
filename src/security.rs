@@ -148,13 +148,23 @@ pub fn method_doc_writes(docs: &std::collections::HashMap<String, LockDoc>, targ
         return target_looks_like_write(target);
     };
     if let Some(sig) = find_section(&doc.sections, "Signature") {
-        if sig.get("writes") == Some("true") {
+        // Anything other than an explicit `false` counts as a write, so a
+        // malformed value never lowers the risk (validation rejects it).
+        if sig
+            .bullets
+            .iter()
+            .any(|b| b.key == "writes" && b.value.trim() != "false")
+        {
             return true;
         }
     }
     if let Some(steps) = find_section(&doc.sections, "Steps") {
         for block in &steps.blocks {
-            if block_value(block, "writes") == "true" || sql_writes(&block_value(block, "sql")) {
+            let marked = block
+                .bullets
+                .iter()
+                .any(|b| b.key == "writes" && b.value.trim() != "false");
+            if marked || sql_writes(&block_value(block, "sql")) {
                 return true;
             }
         }

@@ -383,11 +383,31 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
     if let Some(steps) = find_section(&doc.sections, "Steps") {
         for block in &steps.blocks {
             let sql = block_val(block, "sql");
-            if crate::security::sql_writes(sql.trim_matches('`'))
-                && block_val(block, "writes") != "true"
-            {
-                report.push(
+            let sql_writes = crate::security::sql_writes(sql.trim_matches('`'));
+            match crate::manifest::parse_writes(&block.bullets) {
+                Err(err) => report.push(
+                    Diag::error(file, err)
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                ),
+                Ok(Some(true)) if !sql_writes => report.push(
+                    Diag::error(
+                        file,
+                        "step is marked `writes: true` but its SQL does not write",
+                    )
+                    .at_step(&block.heading)
+                    .at_section("Steps"),
+                ),
+                Ok(marked) if sql_writes && marked != Some(true) => report.push(
                     Diag::error(file, "step SQL writes but is not marked `writes: true`")
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                ),
+                _ => {}
+            }
+            if let Err(err) = crate::manifest::parse_status(&block.bullets) {
+                report.push(
+                    Diag::error(file, err)
                         .at_step(&block.heading)
                         .at_section("Steps"),
                 );
@@ -408,8 +428,16 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
     let caps = find_section(&doc.sections, "Signature")
         .and_then(|section| section.get("capabilities"))
         .unwrap_or("");
-    let writes = find_section(&doc.sections, "Signature").and_then(|section| section.get("writes"))
-        == Some("true");
+    let writes = match find_section(&doc.sections, "Signature") {
+        Some(sig) => match crate::manifest::parse_writes(&sig.bullets) {
+            Ok(w) => w.unwrap_or(false),
+            Err(err) => {
+                report.push(Diag::error(file, err).at_section("Signature"));
+                return;
+            }
+        },
+        None => false,
+    };
     let Some(steps) = find_section(&doc.sections, "Steps") else {
         report.push(Diag::error(file, "method is missing steps").at_section("Steps"));
         return;
@@ -475,9 +503,6 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                 }
             }
         }
-        if block_val(block, "writes") == "true" {
-            saw_write = true;
-        }
         if op == "query" {
             let sql = block_val(block, "sql").trim_matches('`').to_string();
             saw_write |= crate::security::sql_writes(&sql);
@@ -504,20 +529,8 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
             .push(Diag::error(file, "writes: false but a step writes SQL").at_section("Signature"));
     }
     if writes && !saw_write {
-        // Also count explicit writes: true steps without detectable SQL verbs.
-        let marked = steps
-            .blocks
-            .iter()
-            .any(|b| block_val(b, "writes") == "true");
-        if !marked {
-            report.push(
-                Diag::error(
-                    file,
-                    "writes: true but no step writes SQL or sets writes: true",
-                )
-                .at_section("Signature"),
-            );
-        }
+        report
+            .push(Diag::error(file, "writes: true but no step writes SQL").at_section("Signature"));
     }
 }
 
@@ -1533,6 +1546,68 @@ mod tests {
         assert!(msgs.iter().any(|m| m.contains("nope.get")), "{msgs:?}");
         assert!(msgs.iter().any(|m| m.contains("product.ghost")), "{msgs:?}");
         assert!(!msgs.iter().any(|m| m.contains("example.com")), "{msgs:?}");
+    }
+
+    fn method_errors(body: &str) -> Vec<String> {
+        let d = doc(Kind::Method, None, "models/product/methods/x", body);
+        let mut report = Report::new();
+        check_method(&d, "x.lock.md", &mut report);
+        report.errors().map(|d| d.message.clone()).collect()
+    }
+
+    #[test]
+    fn writes_must_match_what_the_steps_do() {
+        let select = "### s1 query\n- op: query\n- sql: `select id from t where id = $1`\n- params: [input.id]\n";
+        let insert = "### s1 query\n- op: query\n- sql: `insert into t (a) values ($1)`\n- params: [input.a]\n";
+        // A read step marked as writing.
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: true\n## Steps\n{select}- writes: true\n"
+        ));
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("marked `writes: true` but its SQL does not write")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m == "writes: true but no step writes SQL"),
+            "{msgs:?}"
+        );
+        // A write step without the marker, and a Signature without writes.
+        let msgs = method_errors(&format!("## Signature\n- errors: []\n## Steps\n{insert}"));
+        assert!(
+            msgs.iter().any(|m| m.contains("not marked `writes: true`")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("writes: false but a step writes SQL")),
+            "{msgs:?}"
+        );
+        // Malformed or duplicate values.
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: yes\n## Steps\n{insert}- writes: true\n"
+        ));
+        assert!(
+            msgs.iter().any(|m| m.contains("invalid writes `yes`")),
+            "{msgs:?}"
+        );
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: true\n## Steps\n{insert}- writes: true\n- writes: false\n"
+        ));
+        assert!(
+            msgs.iter().any(|m| m.contains("duplicate `writes`")),
+            "{msgs:?}"
+        );
+        // Consistent locks pass.
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: true\n## Steps\n{insert}- writes: true\n- scope: pk\n"
+        ));
+        assert!(!msgs.iter().any(|m| m.contains("writes")), "{msgs:?}");
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: false\n## Steps\n{select}- writes: false\n"
+        ));
+        assert!(!msgs.iter().any(|m| m.contains("writes")), "{msgs:?}");
     }
 
     #[test]
