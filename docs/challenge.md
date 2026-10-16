@@ -70,8 +70,25 @@ Which store is used, when a verifier is configured:
   nonce; settling it inserts a `verified`, `rejected` or `released` row for
   that nonce. A `released` row only cancels its own `pending` row, so a
   verified token stays used for its whole TTL. Reads ignore expired rows;
-  expired rows are deleted only by the owner role when `vibe migrate` runs.
+  expired rows are deleted only by the owner role, when `vibe migrate` runs
+  and periodically with `vibe replay-cleanup` (below).
   Checks are serialized per tenant with a transaction-level advisory lock.
+- **Cleanup (#193).** `vibe replay-cleanup --tenant <id> [--tenant <id> ...]`
+  deletes each tenant's rows whose `expires_at` has passed, in one
+  transaction per tenant, and appends one row to the owner-only audit table
+  `t_<tenant>.vibe_challenge_replay_cleanup` (`ran_at`, `run_by`, `trigger`
+  = `scheduled` or `migrate`, `deleted`). It connects with the owner
+  connection `vibe migrate` uses (`VIBE_MIGRATE_DATABASE_URL`) and refuses to
+  run as `VIBE_RUNTIME_DB_ROLE` or a member of it; the runtime role has no
+  DELETE (decision 27) and no access to the audit table. Run it from a
+  scheduler (cron, Kubernetes CronJob), for example every 15 minutes, inside
+  the same owner login window as `vibe migrate` (decision 129: owner login
+  enabled for the run, returned to `NOLOGIN` afterwards).
+- Verification never depends on cleanup. Expired rows are already ignored by
+  reads, and a verified row is kept for `TOKEN_LIFETIME + 60s` while the token
+  itself is refused once its `challenge_ts` is older than `TOKEN_LIFETIME`, so
+  by the time a verified row can be deleted its token is already rejected as
+  expired. Tests pin `VERIFIED_RETENTION > TOKEN_LIFETIME`.
 - Client IPs are stored as HMAC-SHA256 under a per-tenant key derived from
   `VIBE_API_KEY_PEPPER`; tokens as SHA-256 of the token.
 - `memory` is an explicit opt-in for a single development or CI process. It

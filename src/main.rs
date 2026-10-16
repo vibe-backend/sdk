@@ -83,6 +83,14 @@ enum Command {
         #[arg(long)]
         tenant: String,
     },
+    /// Delete expired challenge replay rows for tenants, as the tenant owner
+    /// role (`VIBE_MIGRATE_DATABASE_URL`), and audit each run. Meant to run
+    /// periodically (cron, Kubernetes CronJob); never with the runtime role.
+    ReplayCleanup {
+        /// Tenant id; repeat for several tenants.
+        #[arg(long = "tenant", required = true)]
+        tenants: Vec<String>,
+    },
     /// Register a public slug for a tenant.
     Slug {
         #[command(subcommand)]
@@ -170,6 +178,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             project,
             tenant,
         } => cmd_migrate(&manifest, &project, &tenant).await,
+        Command::ReplayCleanup { tenants } => cmd_replay_cleanup(&tenants).await,
         Command::Slug { action } => match action {
             SlugAction::Add {
                 slug,
@@ -517,6 +526,42 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
         println!("{line}");
     }
     Ok(())
+}
+
+async fn cmd_replay_cleanup(tenants: &[String]) -> Result<(), String> {
+    for tenant in tenants {
+        if !vibe::runtime::valid_tenant(tenant) {
+            return Err(format!(
+                "tenant id {tenant:?} must match ^[a-z0-9]{{8,32}}$"
+            ));
+        }
+    }
+    // Same owner connection as `vibe migrate`; `vibe serve` never has it.
+    let url = std::env::var("VIBE_MIGRATE_DATABASE_URL").map_err(|_| {
+        "VIBE_MIGRATE_DATABASE_URL is required (the tenant owner role; the runtime role has no DELETE)".to_string()
+    })?;
+    let runtime_role = std::env::var("VIBE_RUNTIME_DB_ROLE").map_err(|_| {
+        "VIBE_RUNTIME_DB_ROLE is required (cleanup refuses to run as that role)".to_string()
+    })?;
+    let exec = PgExec::connect(&url).await?;
+    let mut failed = Vec::new();
+    for tenant in tenants {
+        match vibe::runtime::replay::cleanup_expired(&exec, tenant, &runtime_role).await {
+            Ok(n) => {
+                tracing::info!(%tenant, deleted = n, "challenge replay cleanup");
+                println!("{tenant}: deleted {n} expired challenge replay rows");
+            }
+            Err(err) => {
+                eprintln!("{tenant}: challenge replay cleanup failed: {err}");
+                failed.push(tenant.as_str());
+            }
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("replay cleanup failed for {}", failed.join(", ")))
+    }
 }
 
 fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
