@@ -13,6 +13,8 @@ added only when the corresponding PR is merged to `main`.
 
 ### Fixed
 
+- **Lock checks:** `vibe validate` no longer reports "UPDATE needs a WHERE clause" for an INSERT into a table with an `updated_at` column or for an upsert's `ON CONFLICT DO UPDATE`. `vibe compile` records the same security items as `vibe validate`, including writes done by custom-named methods a feature calls.
+
 - **Postgres TLS (#174):** `TlsMode::Require` (`sslmode=require`) previously did not enable TLS for database connections. It now requires TLS and fails to connect if the server does not offer it. `sslrootcert` is honored, and an unreadable or empty `sslrootcert` file is reported as an error.
 
 ### Breaking
