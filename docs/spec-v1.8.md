@@ -245,8 +245,8 @@
 | 141 | Cookie 模式下 login 都用 cookie：`transport: cookie` 時，login（`sign-jwt` `issue-refresh: new-family`）同 refresh（決定 101）一樣，新 refresh token **只**喺 `Set-Cookie` 出現，response body 唔包含 `refresh_token`；body 只有 `access_token` 同 `expires_in`（login 而家已經用 `access_token` 欄位名）。`transport: body` 照舊（決定 6、45）。 | 已確認（產品經理 2026-10-16） | 4A.1b |
 | 142 | 對外錯誤一致：輪換、重用撤銷家族同清 cookie 跟決定 6、61、101，唔重複定義。重用、過期、已撤銷、搵唔到，對外一律回同一個 401 錯誤碼同 body（決定 147），唔分開透露狀態；分別只寫入審計（`revoke_reason: reuse-detected` 等）。 | 已確認（產品經理 2026-10-16） | 4A.1、4A.1b |
 | 143 | Cookie `Max-Age` = `min(家族剩餘絕對壽命, 閒置剩餘時間)`，每次輪換重新計（收緊決定 101「唔超過家族剩餘絕對壽命」；決定 143 只可以收緊決定 101，永遠唔可以放寬佢任何 cookie 屬性或者上限）；一定有 `Max-Age`（唔用 session cookie），唔用 `Expires`。`Path=/`、冇 `Domain` 照決定 101；決定 60 嘅 slug Path 只適用 `transport: body`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
-| 144 | Refresh／logout 檢查次序（全部喺讀 cookie 之前做，補充決定 101）：1. method 一定 `POST`（其他回 405）；2. `Origin` 一定存在而且完全等於 `allowed-origins` 其中一個；3. `cross-site` 模式一定有 `X-Vibe-CSRF: 1`；2 或 3 失敗對外一律回 403 `CSRF_REJECTED`，詳細原因只寫 server log 同審計；呢類 403 唔清 cookie，cookie 只喺通過檢查之後先會被清；4. cookie 模式只由 cookie 讀 token，忽略 body 入面嘅 `refresh_token`。唔接受 `Referer` 代替 `Origin`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
-| 145 | Cookie 模式 logout 唔要求 access token：瀏覽器 reload 之後記憶體冇 access token，所以 `token-revoke` 喺 `token-source: cookie` 而且 `scope: family` 時，以 cookie 搵家族並撤銷，唔需要 `auth`（決定 65「一定要 `auth`」嘅例外，只限呢個組合）。條件（產品經理 2026-10-16 確認）：(1) 一定要通過全部三項檢查：`Origin` 完全等於 `allowed-origins` 其中一個、帶 `X-Vibe-CSRF: 1`（呢個 logout 喺 `same-site` 模式都一定要）、token 只由 `__Host-vibe_rt_{slug}` cookie 讀；任何一項失敗即 fail closed，唔讀 cookie、唔撤銷、唔清 cookie（403 `CSRF_REJECTED`，決定 144、147）。(2) 只撤銷嗰個 cookie 對應嘅 refresh token 家族，唔影響同一用戶其他家族。(3) 重複 logout 係 idempotent。(4) 通過檢查之後，結果一律 204 加清除 cookie，token 有效、無效、過期、已撤銷或者冇 cookie 嘅回應完全一樣，唔透露 token 係咪有效。(5) 必要測試：三項檢查各自單獨失敗各一個測試（見 4A.1b）。`scope: all`（全部裝置登出）照舊一定要 `auth`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
+| 144 | Refresh／logout 檢查次序（全部喺讀 cookie 之前做，補充決定 101）：1. method 一定 `POST`（其他回 405）；2. `Origin` 一定存在而且完全等於 `allowed-origins` 其中一個；3. `cross-site` 模式一定有 `X-Vibe-CSRF: 1`（cookie logout 喺任何模式都一定要，決定 145）；2 或 3 失敗對外一律回 403 `CSRF_REJECTED`，詳細原因只寫 server log 同審計；呢類 403 唔清 cookie，cookie 只喺通過檢查之後先會被清；4. cookie 模式只由 cookie 讀 token，忽略 body 入面嘅 `refresh_token`。唔接受 `Referer` 代替 `Origin`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
+| 145 | Cookie 模式 logout 唔要求 access token：瀏覽器 reload 之後記憶體冇 access token，所以 `token-revoke` 喺 `token-source: cookie` 而且 `scope: family` 時，以 cookie 搵家族並撤銷，唔需要 `auth`（決定 65「一定要 `auth`」嘅例外，只限呢個組合）。條件（產品經理 2026-10-16 確認；架構師 2026-10-16 釐清）：(1) 三項檢查，依次：(a) `Origin` 一定存在而且完全等於嗰個 slug 嘅決定 101 `allowed-origins` 其中一個（同 refresh 用同一份設定，冇另外嘅 logout 清單）；(b) 一定帶 `X-Vibe-CSRF: 1`，`same-site` 模式都要；(c) token 只由 `__Host-vibe_rt_{slug}` cookie 讀，永遠唔由 body 或者其他 cookie 名讀。(a) 或 (b) 失敗即 fail closed：403 `CSRF_REJECTED`，唔讀 cookie、唔撤銷、唔清 cookie。(2) (a)、(b) 通過之後，有效 cookie 就撤銷佢對應嘅家族；冇 cookie、cookie 無效、過期或者已撤銷就乜都唔撤銷；兩種情況回應完全一樣：204 加清除 cookie，唔透露有冇 token 或者 token 係咪有效。(3) 只撤銷嗰個 cookie 對應嘅家族，而且家族一定要屬於 URL slug 嗰個租戶（RLS 照舊；租戶唔啱當無效 cookie 處理）；唔影響同一用戶其他家族。(4) 重複 logout 係 idempotent。(5) 同 refresh 一樣套用決定 72 嘅限流同最低回應耗時（300ms），令有效同無效 cookie 喺時間上分唔出。(6) 點解 `same-site` 都要 `X-Vibe-CSRF`：logout 冇 access token（本決定），所以除咗 `Origin` 檢查，CSRF header 係佢唯一嘅來源證明；無條件要求亦令兩個模式用同一條規則。(7) 必要測試見 4A.1b。`scope: all`（全部裝置登出）照舊一定要 `auth`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
 | 146 | Access token 預設 TTL 15 分鐘（上限 1 小時照決定 6）；refresh 家族、`idle-ttl`、`reuse-grace` 嘅預設同上限照決定 6、45、61，唔改。Cookie 模式建議前端喺 access token 到期前 60 秒內 refresh。 | 已確認（產品經理 2026-10-16） | 4A.1、4A.1b |
 | 147 | Refresh／logout 錯誤碼（固定、平台提供，lock 唔使宣告；cookie 同 body transport 一律用同一套，`INVALID_REFRESH_TOKEN` 冇任何別名）：401 `INVALID_REFRESH_TOKEN`（冇 token／冇 cookie、無效、過期、已撤銷、重用；同時清 cookie）；403 `CSRF_REJECTED`（決定 144；唔清 cookie）；405 `METHOD_NOT_ALLOWED`；429 `RATE_LIMITED`（決定 72 限流，帶 `Retry-After`）；503 `TX_CONFLICT`／504 `TX_TIMEOUT`（決定 100）。錯誤 body 唔包含任何 token、hash 或者家族 id。 | 已確認（產品經理 2026-10-16） | 4A.1b、8 |
 | 148 | 向後相容：`transport` 預設照舊 `body`，現有 lock 唔使改；改做 `cookie` 係 opt-in，要重新 build。每個 endpoint version 只接受一種 transport，永遠唔會同時收 body 同 cookie；要遷移就喺新 `{version}` 開 cookie endpoint，舊版 body endpoint 照舊運作直到 deprecate。已發出嘅 body refresh token 唔會自動轉做 cookie，用戶喺新版重新登入。SDK client 預設照舊。 | 已確認（產品經理 2026-10-16） | 4A.1b |
@@ -1119,7 +1119,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
     1. 嚴格 `Origin` 白名單（完全相等，唔准 `*` 或者 wildcard，最少一個 origin）；同埋
     2. 自訂 header CSRF 檢查：refresh 同 logout 一定要帶 `X-Vibe-CSRF: 1`，冇就回 403。自訂 header 令瀏覽器一定先做 CORS preflight，跨 site 表單或者簡單請求帶唔到。
   - 開咗 `cross-site` 但缺少任何一樣，驗證器報 error，`vibe build` 同部署一律失敗。
-  - `same-site` 模式都會檢查 `Origin` 白名單；`X-Vibe-CSRF` 可選。
+  - `same-site` 模式都會檢查 `Origin` 白名單；refresh 嘅 `X-Vibe-CSRF` 可選，cookie logout 一定要（決定 145）。
 - **輪換同重用偵測**：跟 4A.1，每次 refresh 輪換；偵測到重用已失效 token（寬限期外）撤銷成個家族，同時回 `Set-Cookie` 清除 cookie。
 - **CSRF**：refresh 同 logout 一定要有 `Origin` header，而且喺租戶設定嘅前端 origin 白名單入面（完全相等，唔准 wildcard）；冇 `Origin` 或者唔喺白名單回 403，唔讀 cookie。`same-site` 模式再加 `SameSite=Strict`；`cross-site` 模式再加 `X-Vibe-CSRF` header 檢查。只接受 `POST`。
 - **CORS**：只對白名單 origin 回 `Access-Control-Allow-Origin: <origin>`（唔准 `*`）、`Access-Control-Allow-Credentials: true`、`Vary: Origin`；`cross-site` 模式 preflight 回 `Access-Control-Allow-Headers` 包括 `X-Vibe-CSRF`。Credentials **只限** refresh 同 logout endpoint，其他 endpoint 一律唔回 `Access-Control-Allow-Credentials`。
@@ -1151,10 +1151,10 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 | 參數 | 類型 | 預設 | 說明 |
 | --- | --- | --- | --- |
 | `scope` | `family` \| `all` | `family` | `family`：撤銷當前 refresh token 所屬家族（登出）；`all`：撤銷該用戶所有家族（全部裝置登出） |
-| `token-source` | `body` \| `cookie` | 同 `token-refresh` 嘅 `transport` | `scope: family` 時用嚟搵家族；`scope: all` 唔需要 |
+| `token-source` | `body` \| `cookie` | 同 `token-refresh` 嘅 `transport` | `scope: family` 時用嚟搵家族；`scope: all` 唔需要。`cookie` 時冇自己嘅 `allowed-origins`：一律用同一個 slug `token-refresh` 嘅決定 101 `allowed-origins`（決定 145） |
 | `clear-cookie` | boolean | `true`（cookie 時） | 回應帶 `Max-Age=0` 清除 refresh cookie，`Path` 同 `token-refresh` 一樣 |
 
-- 一定要 `auth`（例外：`token-source: cookie` 加 `scope: family`，見決定 145）；只可以撤銷 `sub` 自己嘅家族；`revoke_reason` 分別寫 `logout`／`logout-all`。
+- 一定要 `auth`，只可以撤銷 `sub` 自己嘅家族。例外：`token-source: cookie` 加 `scope: family`（決定 145）唔使 `auth`，只撤銷嗰個 cookie 對應、屬於 URL slug 租戶嘅家族，並套用決定 72 限流同最低回應耗時；`revoke_reason` 分別寫 `logout`／`logout-all`。
 - 搵唔到 token 或者已撤銷都回 204（idempotent，唔洩漏狀態）。
 
 #### Refresh token 儲存
@@ -1181,7 +1181,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 - Revoke：一律 UPDATE `revoked_at` 同 `revoke_reason`（家族一次過），唔用 DELETE；過期紀錄唔刪除，冇個人資料（只有 hash 同 id），12.10 刪除時一併 revoke。
 - 只有平台專用 `refresh_store` role 可以讀寫呢張表（見 7.1）。
 
-### 4A.1b Refresh cookie 補充細節（決定 141–128，issue #78，已確認（產品經理 2026-10-16））
+### 4A.1b Refresh cookie 補充細節（決定 141–148，issue #78，已確認（產品經理 2026-10-16））
 
 > 本節已確認（產品經理 2026-10-16）。只描述防禦設計。
 
@@ -1191,7 +1191,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 2. 頁面載入／access token 就到期：前端 `POST /{definition}/{version}/{slug}/refresh`，`credentials: "include"`，`cross-site` 模式加 `X-Vibe-CSRF: 1`。
 3. 平台按決定 144 次序檢查，之後先讀 cookie，跟 4A.1 輪換；成功回 200、新 access token 同新 cookie（`Max-Age` 跟決定 143）。
 4. 重用或者無效：回 401 `INVALID_REFRESH_TOKEN` 加清除 cookie；重用時撤銷成個家族（決定 142、101）。
-5. Logout：`POST …/logout`，cookie 模式唔使 access token，但一定要通過決定 145 嘅三項檢查（`Origin` 白名單、`X-Vibe-CSRF: 1`、`__Host-` cookie），任何一項失敗 fail closed；只撤銷嗰個 cookie 嘅家族；通過檢查後一律 204 加清除 cookie，唔透露 token 係咪有效；重複 logout 結果一樣。
+5. Logout：`POST …/logout`，cookie 模式唔使 access token。先檢查 `Origin`（同 refresh 同一份決定 101 白名單）同 `X-Vibe-CSRF: 1`（`same-site` 都要），任何一項失敗回 403 `CSRF_REJECTED`；之後 token 只由 `__Host-` cookie 讀。通過之後一律 204 加清除 cookie：有效 cookie 撤銷佢嘅家族，冇 cookie 或者無效就乜都唔撤銷，回應一樣；套用決定 72 限流同最低回應耗時（決定 145）。
 
 #### Auth pipeline markdown 寫法
 
@@ -1252,14 +1252,14 @@ Logout（節錄）：
     clear-cookie: true
 ```
 
-驗證器 error：`transport: cookie` 冇 `allowed-origins`；`allowed-origins` 有 `*`、wildcard、path 或者唔係 `https`（dev build 除外）；`cross-site` 但冇 `allowed-origins`；`token-revoke` `scope: all` 但係 `public: true`；`token-revoke` `token-source: cookie` 但同一個 definition 嘅 `token-refresh` 唔係 `transport: cookie`。
+驗證器 error：`transport: cookie` 冇 `allowed-origins`；`token-revoke` 自己宣告 `allowed-origins`（cookie logout 一律繼承同一個 slug `token-refresh` 嘅設定，決定 145）；`allowed-origins` 有 `*`、wildcard、path 或者唔係 `https`（dev build 除外）；`cross-site` 但冇 `allowed-origins`；`token-revoke` `scope: all` 但係 `public: true`；`token-revoke` `token-source: cookie` 但同一個 definition 嘅 `token-refresh` 唔係 `transport: cookie`。
 
 #### 錯誤碼（決定 147）
 
 | 狀態 | 錯誤碼 | 幾時 | 清 cookie |
 | --- | --- | --- | --- |
 | 401 | `INVALID_REFRESH_TOKEN` | 冇 cookie、無效、過期、已撤銷、重用 | 係 |
-| 403 | `CSRF_REJECTED` | 冇 `Origin`、唔喺白名單，或者 `cross-site` 冇 `X-Vibe-CSRF: 1`（詳細原因只入 server log 同審計） | 否（只有通過檢查嘅請求先會清 cookie） |
+| 403 | `CSRF_REJECTED` | 冇 `Origin`、唔喺白名單；refresh 喺 `cross-site` 冇 `X-Vibe-CSRF: 1`；cookie logout 喺任何模式（包括 `same-site`）冇 `X-Vibe-CSRF: 1`（決定 145）。冇 cookie 唔係 403（logout 回 204，refresh 回 401）。詳細原因只入 server log 同審計 | 否（只有通過檢查嘅請求先會清 cookie） |
 | 405 | `METHOD_NOT_ALLOWED` | 唔係 `POST` | 否 |
 | 429 | `RATE_LIMITED` | 決定 72 限流 | 否 |
 | 503／504 | `TX_CONFLICT`／`TX_TIMEOUT` | 決定 100 | 否 |
@@ -1275,13 +1275,13 @@ Logout（節錄）：
 
 #### Cookie logout 必要測試（決定 145）
 
-每項檢查單獨失敗（其餘兩項正確）各一個測試，全部預期 403 `CSRF_REJECTED`、家族冇被撤銷、回應冇 `Set-Cookie`：
+三項檢查各自單獨失敗（其餘兩項正確，有一個有效 cookie）各一個測試：
 
-1. `Origin` 唔喺 `allowed-origins`（或者冇 `Origin`）。
-2. 冇 `X-Vibe-CSRF: 1`。
-3. Token 唔係由 `__Host-vibe_rt_{slug}` cookie 嚟（例如只喺 body 或者用其他 cookie 名）。
+1. `Origin` 唔喺 `allowed-origins`（或者冇 `Origin`）：403 `CSRF_REJECTED`，家族冇被撤銷，回應冇 `Set-Cookie`。
+2. 冇 `X-Vibe-CSRF: 1`（`same-site` 同 `cross-site` 各測一次）：403 `CSRF_REJECTED`，家族冇被撤銷，回應冇 `Set-Cookie`。
+3. Token 唔係由 `__Host-vibe_rt_{slug}` cookie 嚟（只喺 body，或者用其他 cookie 名）：204 加清除 cookie，同無效 cookie 回應完全一樣，body／其他 cookie 嘅家族冇被撤銷。
 
-另外：重複 logout 兩次回應完全一樣；有效同無效 cookie 嘅 204 回應完全一樣；只有嗰個 cookie 嘅家族被撤銷。
+另外：冇 cookie、無效、過期、已撤銷同有效 cookie 嘅 204 回應（status、header、body）完全一樣，同樣受最低回應耗時限制；重複 logout 兩次回應一樣；只有嗰個 cookie 嘅家族被撤銷；其他租戶嘅家族（slug 唔啱）唔會被撤銷；超過決定 72 限流回 429。
 
 #### 實作狀態（對照 main，2026-10-16）
 
