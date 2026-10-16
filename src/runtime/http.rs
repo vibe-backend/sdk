@@ -9,7 +9,7 @@ use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 
 type HttpResponse = Response<Body>;
 use axum::Router;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -20,7 +20,9 @@ use crate::manifest::{Manifest, RouteSpec};
 
 use super::crud::{self, MethodFail};
 use super::exec::QueryExec;
-use super::limiter::{ip_bucket, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision};
+use super::limiter::{
+    ip_bucket, owner_of, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -149,6 +151,8 @@ pub struct AppState {
     pub trusted_proxies: Vec<ProxyNet>,
     /// When set, an unknown public slug explains how to register it.
     pub dev_hints: bool,
+    /// Verifies `x-challenge-proof` (#118). `None`: challenge routes fail closed.
+    pub challenge: Option<Arc<dyn super::challenge::ChallengeVerifier>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -648,27 +652,23 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
     }
+    // The challenge runs after the rate limit and the public write quota, so
+    // limited requests never reach the replay cache or siteverify.
     if found.route.public
         && found.route.challenge_type != "none"
         && found.route.challenge_when == "always"
-        && headers
-            .get("x-challenge-proof")
-            .map(|v| v.is_empty())
-            .unwrap_or(true)
     {
-        return finish(
+        if let Some(fail) = check_challenge(
+            state.challenge.as_ref(),
             found.route,
-            &state,
-            started,
-            error_response(
-                StatusCode::BAD_REQUEST,
-                "CHALLENGE_REQUIRED",
-                "A challenge proof is required",
-                &request_id,
-                &[],
-            ),
+            headers.get("x-challenge-proof"),
+            &ip,
+            &principal.tenant_id,
         )
-        .await;
+        .await
+        {
+            return finish(found.route, &state, started, fail(&request_id)).await;
+        }
     }
     let mut query_values = BTreeMap::new();
     for field in &found.route.request {
@@ -1511,7 +1511,7 @@ fn rate_limited(
     let Ok(mut rates) = state.rates.lock() else {
         return Some("1".into());
     };
-    match rates.check(&checks, Instant::now()) {
+    match rates.check(&checks, &owner_of(ip), Instant::now()) {
         RateDecision::Allow => None,
         RateDecision::Limited(wait) => Some(wait.to_string()),
     }
@@ -1716,6 +1716,70 @@ fn platform_status(code: &str) -> StatusCode {
     }
 }
 
+type FailFn = Box<dyn FnOnce(&str) -> HttpResponse + Send>;
+
+/// Verifies the challenge proof of a `when: always` route. Fails closed: no
+/// proof is 400, no verifier, a `pow` route or an unreachable provider is 503,
+/// a rejected proof is 403.
+async fn check_challenge(
+    verifier: Option<&Arc<dyn super::challenge::ChallengeVerifier>>,
+    route: &crate::manifest::RouteSpec,
+    proof: Option<&String>,
+    ip: impl std::fmt::Display,
+    tenant: &str,
+) -> Option<FailFn> {
+    fn fail(status: StatusCode, code: &'static str, message: &'static str) -> Option<FailFn> {
+        Some(Box::new(move |request_id: &str| {
+            error_response(status, code, message, request_id, &[])
+        }))
+    }
+    let token = match proof.map(|v| v.trim()) {
+        Some(token) if !token.is_empty() => token,
+        _ => {
+            return fail(
+                StatusCode::BAD_REQUEST,
+                "CHALLENGE_REQUIRED",
+                "A challenge proof is required",
+            )
+        }
+    };
+    let verifier = match (verifier, route.challenge_type.as_str()) {
+        (Some(verifier), "captcha") => verifier,
+        _ => {
+            tracing::warn!(route = %route.feature_id, kind = %route.challenge_type, "no challenge verifier configured; refusing");
+            return fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CHALLENGE_UNAVAILABLE",
+                "Challenge verification is unavailable",
+            );
+        }
+    };
+    let ctx = super::challenge::ChallengeContext {
+        action: super::challenge::challenge_action(&route.feature_id),
+        remote_ip: Some(ip.to_string()),
+        tenant: Some(tenant.to_string()).filter(|t| !t.is_empty()),
+    };
+    match verifier.verify(token, &ctx).await {
+        Ok(()) => None,
+        Err(super::challenge::ChallengeError::Rejected(why)) => {
+            tracing::info!(route = %route.feature_id, %why, "challenge rejected");
+            fail(
+                StatusCode::FORBIDDEN,
+                "CHALLENGE_FAILED",
+                "The challenge proof is invalid",
+            )
+        }
+        Err(super::challenge::ChallengeError::Unavailable(why)) => {
+            tracing::warn!(route = %route.feature_id, %why, "challenge provider unavailable");
+            fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CHALLENGE_UNAVAILABLE",
+                "Challenge verification is unavailable",
+            )
+        }
+    }
+}
+
 fn error_response(
     status: StatusCode,
     code: &str,
@@ -1772,6 +1836,7 @@ fn empty_response(
 #[cfg(test)]
 mod rate_tests {
     use super::*;
+    use crate::runtime::challenge::{ChallengeContext, ChallengeError, ChallengeVerifier};
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -1865,6 +1930,70 @@ mod rate_tests {
         );
         assert_eq!(a, b);
         assert_eq!(a, c, "missing and empty share the same bucket");
+    }
+
+    struct FakeVerifier(Result<(), ChallengeError>);
+
+    #[async_trait::async_trait]
+    impl ChallengeVerifier for FakeVerifier {
+        fn provider(&self) -> &'static str {
+            "fake"
+        }
+        async fn verify(&self, token: &str, ctx: &ChallengeContext) -> Result<(), ChallengeError> {
+            assert_eq!(token, "tok");
+            assert_eq!(ctx.action, "register");
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn challenge_gate_fails_closed() {
+        let mut route = test_route();
+        route.feature_id = "shop/v1/register".into();
+        route.challenge_type = "captcha".into();
+        route.challenge_when = "always".into();
+        let status = |f: Option<FailFn>| f.map(|f| f("rid").status());
+        let ok: Arc<dyn ChallengeVerifier> = Arc::new(FakeVerifier(Ok(())));
+        let tok = "tok".to_string();
+        let blank = "  ".to_string();
+        // Missing or blank proof.
+        assert_eq!(
+            status(check_challenge(Some(&ok), &route, None, "1.2.3.4", "tenant0001").await),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            status(check_challenge(Some(&ok), &route, Some(&blank), "1.2.3.4", "tenant0001").await),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        // No verifier configured: an arbitrary proof no longer passes.
+        assert_eq!(
+            status(check_challenge(None, &route, Some(&tok), "1.2.3.4", "tenant0001").await),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        // Verified.
+        assert_eq!(
+            status(check_challenge(Some(&ok), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
+            None
+        );
+        // Rejected and unavailable.
+        let bad: Arc<dyn ChallengeVerifier> =
+            Arc::new(FakeVerifier(Err(ChallengeError::Rejected("x".into()))));
+        assert_eq!(
+            status(check_challenge(Some(&bad), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
+            Some(StatusCode::FORBIDDEN)
+        );
+        let down: Arc<dyn ChallengeVerifier> =
+            Arc::new(FakeVerifier(Err(ChallengeError::Unavailable("x".into()))));
+        assert_eq!(
+            status(check_challenge(Some(&down), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        // `pow` has no verifier in v1: fail closed.
+        route.challenge_type = "pow".into();
+        assert_eq!(
+            status(check_challenge(Some(&ok), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
     }
 
     fn test_route() -> RouteSpec {
@@ -2502,5 +2631,20 @@ mod request_validation_tests {
             assert!(check_type(&f, &good).is_ok(), "{ty} good");
             assert!(check_type(&f, &bad).is_err(), "{ty} bad");
         }
+    }
+}
+
+#[cfg(test)]
+mod crypto_kats {
+    use super::hmac_hex;
+
+    #[test]
+    fn hmac_sha256_known_answer() {
+        // RFC 4231 test case 1
+        let mac = hmac_hex(&[0x0b; 20], "Hi There");
+        assert_eq!(
+            mac,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
     }
 }

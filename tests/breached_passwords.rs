@@ -305,7 +305,7 @@ async fn handler(
 async fn server(mode: &'static str, redirect_to: &str) -> (String, Requests) {
     let seen = Requests::default();
     let app = axum::Router::new()
-        .route("/range/:prefix", get(handler))
+        .route("/range/{prefix}", get(handler))
         .with_state(Mock {
             seen: seen.clone(),
             mode,

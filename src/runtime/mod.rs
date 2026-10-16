@@ -1,4 +1,5 @@
 pub mod breached;
+pub mod challenge;
 mod crud;
 mod exec;
 mod http;
@@ -9,6 +10,7 @@ mod ops;
 mod slugs;
 mod sql;
 
+pub use challenge::{ChallengeContext, ChallengeError, ChallengeVerifier, TurnstileVerifier};
 pub use crud::{
     check_expr, check_when, parse_ownership, run_method, when_problem, CallCtx, CallResult, Caller,
     MethodFail, Ownership,
@@ -28,7 +30,7 @@ pub use sql::Stmt;
 pub fn hash_password_for_tests(plain: &str) -> String {
     crud::hash_password(plain).expect("hash")
 }
-pub use limiter::{ProxyNet, QuotaBuckets, RateBuckets};
+pub use limiter::{saturation_refusals, ProxyNet, QuotaBuckets, RateBuckets};
 pub use migrate::migrate_tenant;
 pub use slugs::{add_slug, load_project_slugs, SlugLoad};
 pub use sql::{

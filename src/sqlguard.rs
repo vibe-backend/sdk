@@ -7,7 +7,8 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, ObjectName, Query, SetExpr, Statement, TableFactor, Visit, Visitor,
+    ArrayElemTypeDef, BinaryOperator, DataType, Expr, Ident, ObjectName, Query, SelectItem,
+    SetExpr, Statement, TableFactor, TimezoneInfo, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -100,6 +101,16 @@ impl Visitor for Guard {
             if select.into.is_some() {
                 return self.fail("SELECT ... INTO is not allowed".into());
             }
+            for item in &select.projection {
+                if let SelectItem::ExprWithAlias { expr, alias } = item {
+                    // `typename 'literal'` — sqlparser uses a single-quoted alias.
+                    if alias.quote_style == Some('\'') {
+                        if let Some(problem) = typed_literal_alias_problem(expr) {
+                            return self.fail(problem);
+                        }
+                    }
+                }
+            }
         }
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
@@ -146,22 +157,27 @@ impl Visitor for Guard {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-        let cast_type = match expr {
-            Expr::Cast { data_type, .. } | Expr::TypedString { data_type, .. } => {
-                Some(data_type.to_string())
-            }
-            _ => None,
-        };
-        if let Some(ty) = cast_type {
-            // Object-identifier types (regclass, regproc, …) turn strings into
-            // catalog references.
-            let ty = ty.to_ascii_lowercase();
-            let base = ty.rsplit('.').next().unwrap_or(&ty);
-            if base.starts_with("reg") || base == "oid" || base == "name" {
-                return self.fail(format!("cast to {ty} is not allowed in lock SQL"));
-            }
-        }
         match expr {
+            Expr::Cast {
+                kind, data_type, ..
+            } => {
+                use sqlparser::ast::CastKind;
+                // Only PostgreSQL CAST / :: forms; reject TRY_CAST / SAFE_CAST.
+                if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) {
+                    return self.fail(format!("cast form {expr} is not allowed in lock SQL"));
+                }
+                if let Some(problem) = cast_type_problem(data_type) {
+                    return self.fail(problem);
+                }
+            }
+            Expr::TypedString { data_type, .. } => {
+                if let Some(problem) = cast_type_problem(data_type) {
+                    return self.fail(problem);
+                }
+            }
+            Expr::Convert { .. } => {
+                return self.fail("CONVERT is not allowed in lock SQL".into());
+            }
             Expr::Collate { collation, .. } if collation.0.len() != 1 => {
                 return self.fail(format!(
                     "collation {collation} must not be schema-qualified"
@@ -184,6 +200,136 @@ impl Visitor for Guard {
             }
         }
         ControlFlow::Continue(())
+    }
+}
+
+/// Cast and typed-literal target types lock SQL may use (builtin scalars and
+/// common aliases only). Anything else is rejected.
+pub const ALLOWED_CAST_TYPES: &[&str] = &[
+    "text",
+    "varchar",
+    "character varying",
+    "char",
+    "character",
+    "bpchar",
+    "int2",
+    "smallint",
+    "int4",
+    "int",
+    "integer",
+    "int8",
+    "bigint",
+    "numeric",
+    "decimal",
+    "float4",
+    "real",
+    "float8",
+    "float",
+    "double",
+    "double precision",
+    "bool",
+    "boolean",
+    "date",
+    "time",
+    "timetz",
+    "timestamp",
+    "timestamptz",
+    "interval",
+    "uuid",
+    "json",
+    "jsonb",
+    "bytea",
+];
+
+/// Fold an identifier the way PostgreSQL does for type names: unquoted names
+/// are lowercased; quoted names keep their exact spelling (so `"TEXT"` is not
+/// `text`). Backslashes are left as-is — only `U&"..."` would decode them, and
+/// sqlparser does not parse that form as an identifier.
+fn type_ident_name(ident: &Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_ascii_lowercase()
+    }
+}
+
+/// Returns the allowlist key for a (possibly schema-qualified) type name, or
+/// `None` when the schema is not exactly `pg_catalog` under PostgreSQL folding
+/// rules.
+fn normalize_type_name_parts(idents: &[Ident]) -> Option<String> {
+    match idents {
+        [base] => Some(type_ident_name(base)),
+        [schema, base] if type_ident_name(schema) == "pg_catalog" => Some(type_ident_name(base)),
+        _ => None,
+    }
+}
+
+fn normalized_data_type_name(data_type: &DataType) -> Option<String> {
+    let mut ty = data_type;
+    while let DataType::Array(
+        ArrayElemTypeDef::AngleBracket(inner)
+        | ArrayElemTypeDef::SquareBracket(inner, _)
+        | ArrayElemTypeDef::Parenthesis(inner),
+    ) = ty
+    {
+        ty = inner;
+    }
+    match ty {
+        DataType::Text | DataType::String(_) => Some("text".into()),
+        DataType::Varchar(_) | DataType::CharacterVarying(_) | DataType::CharVarying(_) => {
+            Some("varchar".into())
+        }
+        DataType::Char(_) | DataType::Character(_) => Some("char".into()),
+        DataType::Int2(_) | DataType::SmallInt(_) => Some("int2".into()),
+        DataType::Int4(_) | DataType::Int(_) | DataType::Integer(_) => Some("int4".into()),
+        DataType::Int8(_) | DataType::BigInt(_) => Some("int8".into()),
+        DataType::Numeric(_) | DataType::Decimal(_) | DataType::Dec(_) => Some("numeric".into()),
+        DataType::Float4 | DataType::Real => Some("float4".into()),
+        DataType::Float8 | DataType::Double | DataType::DoublePrecision | DataType::Float(_) => {
+            Some("float8".into())
+        }
+        DataType::Bool | DataType::Boolean => Some("bool".into()),
+        DataType::Date => Some("date".into()),
+        DataType::Time(_, tz) => match tz {
+            TimezoneInfo::WithTimeZone | TimezoneInfo::Tz => Some("timetz".into()),
+            _ => Some("time".into()),
+        },
+        DataType::Timestamp(_, tz) => match tz {
+            TimezoneInfo::WithTimeZone | TimezoneInfo::Tz => Some("timestamptz".into()),
+            _ => Some("timestamp".into()),
+        },
+        DataType::Interval => Some("interval".into()),
+        DataType::Uuid => Some("uuid".into()),
+        DataType::JSON => Some("json".into()),
+        DataType::JSONB => Some("jsonb".into()),
+        DataType::Bytea => Some("bytea".into()),
+        DataType::Custom(name, _) => normalize_type_name_parts(&name.0),
+        // Explicitly not allowlisted (regclass and other builtins).
+        _ => None,
+    }
+}
+
+/// Rejects casts whose target is not in [`ALLOWED_CAST_TYPES`].
+fn cast_type_problem(data_type: &DataType) -> Option<String> {
+    match normalized_data_type_name(data_type) {
+        Some(name) if ALLOWED_CAST_TYPES.contains(&name.as_str()) => None,
+        _ => Some(format!("cast to {data_type} is not allowed in lock SQL")),
+    }
+}
+
+/// Schema-qualified typed literals (`pg_catalog.regclass 'x'`) and some
+/// unqualified ones (`oid 'x'`) are parsed as `ExprWithAlias` with a
+/// single-quoted alias rather than `TypedString`. Treat them like casts.
+fn typed_literal_alias_problem(expr: &Expr) -> Option<String> {
+    let name = match expr {
+        Expr::Identifier(ident) => normalize_type_name_parts(std::slice::from_ref(ident)),
+        Expr::CompoundIdentifier(idents) => normalize_type_name_parts(idents),
+        // e.g. U&"..." misparsed as BitwiseAnd — not an allowlisted type form
+        _ => None,
+    };
+    match name {
+        Some(n) if ALLOWED_CAST_TYPES.contains(&n.as_str()) => None,
+        _ => Some(format!("cast to {expr} is not allowed in lock SQL")),
     }
 }
 
@@ -351,35 +497,155 @@ mod tests {
     }
 
     #[test]
-    fn session_role_setting_and_dynamic_sql_are_rejected() {
+    fn disallowed_sql_is_rejected() {
         for sql in [
-            "select set_config('role', 'none', true)",
-            "select set_config('app.tenant_id', 'b', true), query_to_xml('select 1', true, false, '')",
-            "select email from users where set_config('app.tenant_id','b',true) is not null",
-            "select current_setting('app.tenant_id')",
-            "select * from query_to_xml('select 1', true, false, '')",
+            "select forbidden_fn(1)",
+            "select * from forbidden_fn(1)",
+            "select id from users where forbidden_fn(1) is not null",
             "select pg_catalog.lower('x')",
-            "set role vibe_app",
-            "set session authorization vibe_app",
-            "reset role",
+            "set some_setting = 1",
+            "reset some_setting",
             "select 1; select 2",
-            "select email from t_b.users",
-            "select * from pg_catalog.pg_roles",
-            "select * from _platform_refresh_tokens",
-            "select * from U&\"\\005fplatform_refresh_tokens\"",
+            "select id from other_schema.users",
+            "select * from _platform_example",
             "with d as (update users set name = 'x' returning id) select * from d",
             "with d as (delete from users returning id) select * from d",
             "do $$ begin end $$",
             "copy users to stdout",
             "select * into tmp_copy from users",
-            "select 'x'::regclass",
-            "select cast('x' as regproc)",
-            "select count(*) from users where tableoid = '_platform_refresh_tokens'::regclass",
-            "select regclass 'users'",
-            "select name from users where name = 'a' collate pg_catalog.\"C\"",
-            "select 1 operator(pg_catalog.+) 1",
+            "select name from users where name = 'a' collate other_schema.\"C\"",
+            "select 1 operator(other_schema.+) 1",
         ] {
             assert!(query_problem(sql).is_some(), "accepted: {sql}");
+        }
+    }
+
+    #[test]
+    fn quoted_type_idents_keep_exact_spelling() {
+        let text = sqlparser::ast::Ident::new("TEXT");
+        assert_eq!(super::type_ident_name(&text), "text");
+        let quoted = sqlparser::ast::Ident::with_quote('"', "TEXT");
+        assert_eq!(super::type_ident_name(&quoted), "TEXT");
+        assert_eq!(
+            super::normalize_type_name_parts(&[sqlparser::ast::Ident::with_quote('"', "TEXT")]),
+            Some("TEXT".into())
+        );
+        assert_eq!(
+            super::normalize_type_name_parts(&[sqlparser::ast::Ident::with_quote(
+                '"',
+                "\\0074ext"
+            )]),
+            Some("\\0074ext".into())
+        );
+        assert_eq!(
+            super::normalize_type_name_parts(&[
+                sqlparser::ast::Ident::with_quote('"', "PG_CATALOG"),
+                sqlparser::ast::Ident::with_quote('"', "text"),
+            ]),
+            None
+        );
+        assert_eq!(
+            super::normalize_type_name_parts(&[
+                sqlparser::ast::Ident::new("PG_CATALOG"),
+                sqlparser::ast::Ident::new("text"),
+            ]),
+            Some("text".into())
+        );
+    }
+
+    #[test]
+    fn identifier_type_casts_are_rejected() {
+        for sql in [
+            "select 'x'::regclass",
+            "select cast('x' as regproc)",
+            "select regclass 'x'",
+            "select 'x'::oid",
+            "select 'x'::name",
+            "select 'x'::\"regclass\"",
+            "select 'x'::\"REGCLASS\"",
+            "select 'x'::pg_catalog.regclass",
+            "select 'x'::pg_catalog.\"regclass\"",
+            "select 'x'::\"pg_catalog\".\"regtype\"",
+            "select 'x'::\"oid\"",
+            "select cast('x' as \"regproc\")",
+            "select 'x'::regclass[]",
+            "select 'x'::\"regclass\"[]",
+            // Unicode-escaped identifiers and pg_catalog prefix
+            "select 'x'::U&\"\\0072egclass\"",
+            "select 'x'::U&\"pg_catalog\".U&\"\\0072egclass\"",
+            // Internal array type names
+            "select 'x'::_regclass",
+            "select 'x'::\"_regclass\"",
+            "select 'x'::_oid",
+            "select 'x'::_regproc",
+            // Schema-qualified typed literals
+            "select pg_catalog.regclass 'x'",
+            "select pg_catalog.\"regclass\" 'x'",
+            // Unqualified names outside the allowlist
+            "select 'x'::dom_rc",
+            "select oid 'x'",
+            "select 'x'::xid8",
+            "select 'x'::xid",
+            "select 'x'::cid",
+            "select 'x'::tid",
+            "select 'x'::public.text",
+            // Quoted names keep exact spelling (not folded like unquoted)
+            "select 'x'::\"TEXT\"",
+            "select \"TEXT\" 'x'",
+            "select 'x'::\"PG_CATALOG\".\"text\"",
+            "select 'x'::\"pg_catalog\".\"TEXT\"",
+            // Backslash is literal in quoted idents, not a unicode escape
+            "select 'x'::\"\\0074ext\"",
+            // Non-PostgreSQL cast forms
+            "select convert('x', text)",
+            "select try_cast('x' as text)",
+            "select safe_cast('x' as text)",
+        ] {
+            assert!(query_problem(sql).is_some(), "accepted: {sql}");
+        }
+    }
+
+    #[test]
+    fn ordinary_casts_pass() {
+        for sql in [
+            "select $1::uuid",
+            "select '1'::int",
+            "select '1'::int2",
+            "select '1'::int4",
+            "select '1'::int8",
+            "select '1'::smallint",
+            "select '1'::bigint",
+            "select '1'::integer",
+            "select 'x'::text",
+            "select 'x'::\"text\"",
+            "select 'x'::varchar",
+            "select 'x'::char",
+            "select 'x'::bpchar",
+            "select '1'::numeric",
+            "select '1'::decimal",
+            "select '1'::float4",
+            "select '1'::float8",
+            "select '1'::real",
+            "select '1'::double precision",
+            "select 'true'::bool",
+            "select 'true'::boolean",
+            "select '2020-01-01'::date",
+            "select '12:00'::time",
+            "select '2020-01-01'::timestamp",
+            "select '2020-01-01'::timestamptz",
+            "select '1 day'::interval",
+            "select '{}'::json",
+            "select '{}'::jsonb",
+            "select '\\x'::bytea",
+            "select 'x'::pg_catalog.text",
+            "select 'x'::pg_catalog.\"text\"",
+            "select text 'x'",
+            "select pg_catalog.text 'x'",
+            "select \"text\" 'hello'",
+            "select uuid '00000000-0000-0000-0000-000000000001'",
+            "select 'x'::text[]",
+        ] {
+            assert_eq!(query_problem(sql), None, "{sql}");
         }
     }
 

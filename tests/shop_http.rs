@@ -127,6 +127,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         honor_test_ip: true,
         trusted_proxies: Vec::new(),
         dev_hints: true,
+        challenge: None,
     });
     let app = router(state);
 
@@ -777,6 +778,7 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
         min_override_ms: Some(0),
         honor_test_ip: true,
         dev_hints: true,
+        challenge: None,
     }));
     let customer = bearer(&token("customer-1", &["customer"], "tenant0001"));
     let admin = bearer(&token("admin-user", &["admin"], "tenant0001"));
@@ -1063,6 +1065,7 @@ async fn route_jwt_overrides_end_to_end() {
         min_override_ms: Some(0),
         honor_test_ip: true,
         dev_hints: true,
+        challenge: None,
     }));
     let now = chrono::Utc::now().timestamp();
     let mint = |patch: Value, alg: Algorithm| {
