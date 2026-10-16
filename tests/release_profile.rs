@@ -76,7 +76,7 @@ fn serve_memory(root: &Path, envs: &[(&str, &str)]) -> (bool, String) {
             "--expect-version",
             "1.8.0",
             "--expect-commit",
-            "abc123",
+            "0123456789abcdef0123456789abcdef01234567",
         ],
         envs,
     )

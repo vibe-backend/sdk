@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -42,8 +43,6 @@ pub struct Provenance {
     pub locks: Vec<LockProvenance>,
     /// Every security item of every lock, sorted.
     pub security_items: Vec<ItemProvenance>,
-    /// Release approval reference given for high-risk items (decision 90).
-    pub release_approval: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -74,10 +73,9 @@ impl Provenance {
 /// How a manifest is built.
 #[derive(Clone, Debug, Default)]
 pub struct BuildInfo {
-    /// Release build. High-risk items fail closed until release-environment
-    /// approval verification (#80) lands (decision 90/118).
+    /// Release build: unsigned here (signed keyless by the release job);
+    /// needs a release version and the full commit SHA.
     pub release: bool,
-    pub release_approval: Option<String>,
     /// Release version without a leading `v`. Required for release builds.
     pub version: String,
     pub commit: String,
@@ -233,6 +231,10 @@ pub struct StepSpec {
     pub when_expr: String,
     pub writes: bool,
     pub table: String,
+    /// Every bullet of the step, raw (op-specific settings such as `hash`,
+    /// `plain`, `bytes`, `claims`, `ttl`, `key-ref`).
+    #[serde(default)]
+    pub opts: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -396,43 +398,25 @@ fn build_unsigned(
             "release build needs a version (`--version` or the tag name without v)".into(),
         ));
     }
+    if info.release {
+        crate::attest::check_release_version(&version).map_err(single)?;
+        crate::attest::check_release_commit(&info.commit).map_err(single)?;
+    }
     manifest.provenance = Provenance {
         build_mode: if info.release { "release" } else { "dev" }.into(),
         version,
         commit: info.commit.clone(),
         locks,
         security_items: items,
-        release_approval: info
-            .release_approval
-            .clone()
-            .filter(|r| !r.trim().is_empty()),
     };
-    // Decision 90/118: the approval is the `release` environment approval,
-    // verified against the platform (#80). Until that verification exists,
-    // a release build with high-risk items fails closed; no
-    // `--release-approval` value counts as approval.
-    if info.release {
-        let high: Vec<String> = manifest
-            .provenance
-            .high_risk()
-            .iter()
-            .map(|item| format!("{} ({})", item.lock, item.item))
-            .collect();
-        if !high.is_empty() {
-            return Err(single(format!(
-                "release build has high-risk items: {}; release-environment approval verification (#80) is not implemented yet, so high-risk release builds fail closed (--release-approval is not accepted as approval)",
-                high.join(", ")
-            )));
-        }
-    }
     manifest.signature = String::new();
     Ok(manifest)
 }
 
-/// Outside development only release manifests run (decisions 79, 90, 91):
+/// Outside development only release manifests run (decisions 79, 91):
 /// built with `vibe manifest --release` (compiled in memory in the release
-/// environment) and, if they have high-risk items, carrying a release
-/// approval.
+/// environment). High-risk items are listed in the deploy report; the human
+/// gate is the `release` environment approval (decision 90 withdrawn).
 pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), String> {
     if development {
         return Ok(());
@@ -445,11 +429,6 @@ pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), St
     }
     if provenance.locks.is_empty() {
         return Err("manifest has no lock provenance".into());
-    }
-    // Fail closed until release-environment approval verification (#80):
-    // a recorded approval string is not proof of approval.
-    if !provenance.high_risk().is_empty() {
-        return Err("manifest has high-risk items without a verified release approval".into());
     }
     Ok(())
 }
@@ -534,10 +513,12 @@ pub fn read_release_manifest(
             manifest.provenance.commit, identity.commit
         )));
     }
-    if identity.version != expected.version {
+    // `identity.version` is read from the certificate tag; `expected` comes
+    // from the deployer (CLI or environment), never from the bundle.
+    if identity.version != expected.version || manifest_version != identity.version {
         return Err(single(format!(
-            "attested version {} is not the expected {}",
-            identity.version, expected.version
+            "attested version {} does not match the expected {} and the manifest version {}",
+            identity.version, expected.version, manifest.provenance.version
         )));
     }
     Ok((manifest, identity))
@@ -1018,6 +999,11 @@ fn steps_from(section: Option<&crate::lock::Section>, file: &str) -> Result<Vec<
             when_expr: get("when"),
             writes: get("writes") == "true",
             table: get("table"),
+            opts: block
+                .bullets
+                .iter()
+                .map(|b| (b.key.clone(), b.value.clone()))
+                .collect(),
         });
     }
     Ok(steps)

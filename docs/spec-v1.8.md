@@ -23,11 +23,14 @@
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
 - 新增產品經理六條基線做決定 89–94（release 簽名只限 `v*` tag 加 required-reviewer environment（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118）、高風險 fail closed（決定 90 已於 2026-10-16 撤回：高風險項目只列入部署報告）、production 拒絕 in-memory、冇 release 簽名就失敗（決定 119 改用 Sigstore keyless）、決定 29／37 恢復、`/latest/` 永遠唔係草稿），同決定 95（create-user 邀請失敗處理）。
 - Lock 係 build 輸出，唔再 commit（`.gitignore`），由 CI／CD 喺部署時由 source build（決定 117，取代決定 80）。
+- `sign-jwt` 簽名算法政策（決定 139，issue #198）：只支援 ES256、RS256，預設 ES256；RS256 key 最少 2048 bit，唔夠 fail closed；驗證端只接受設定嘅一個 alg；EdDSA 留到 vNext（見 4.1a）。
 - Email 正規化（決定 120）：唔合併 plus addressing、保留點；local part NFC→trim→lowercase；domain IDNA UTS #46 punycode→lowercase；只儲存正規化值；遷移遇到衝突 fail closed，人手處理。
 - 撤回 `--release-approval`（產品經理 2026-10-16）：唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（2C.3a、9C）。
 - CLI `--project` 預設係目前目錄；README 簡化做兩行（決定 81、82，見 2C.1）。
 - 新增 9C「冇人手 review 嘅安全模型」：寫明未經人手 review 嘅 LLM 輸出而家可以直接部署、剩餘風險同仍然有效嘅防線；另附 PR review 指引草稿（[`pr-review-guide.md`](pr-review-guide.md)，決定 83）。
 - 補 v1.7 reviewer 提出嘅缺口：11.4 create-user lock 補返 `user.invite` step；新增 `user.register`、`user.invite` 編譯 lock 範例；11.3／11.4 rate-limit 補 `key`；admin `EMAIL_TAKEN` 處理；create-user 改為可以重試（idempotent）並新增 re-invite endpoint（決定 84–88）。
+
+- Challenge provider（issue #160，已確認（產品經理 2026-10-16））：決定 131–138，v1 用 Cloudflare Turnstile（server 端 siteverify、production 共用 Postgres replay store（#177）、`type: pow` build error、fail closed、錯誤碼、secret 處理、同限流組合、固定數值、已認證 endpoint opt-in、provider 抽象），見 0.12、7.2a。
 
 ### v1.7（定稿）
 
@@ -116,7 +119,7 @@
 | 46 | `hash-password`：argon2id，memory 64 MiB、iterations 3、parallelism 1、salt 16 byte（CSPRNG）、輸出 32 byte，用 PHC 字串格式儲存；登入成功時如果參數同而家唔同，平台自動 rehash。 | 4A.2 |
 | 47 | Public 註冊：password 欄位只可以經 `hash-password` op 嘅輸出寫入，method 要標 `capabilities: [set-password]`，api lock `## Access` 要寫 `password-write: allow`（高風險安全項目）；黑名單照樣禁止 request 直接寫 password 欄位。 | 7.2、12.6 |
 | 48 | 樂觀鎖用 HTTP `ETag`／`If-Match`：update 一定要帶 `If-Match`，缺少回 428，唔對應回 412；method input 欄位叫 `if_match`，只可以由 `req.header.if-match` 映射。 | 8、12.9 |
-| 49 | challenge 語法統一：`challenge: { type: none \| captcha \| pow, when: always \| after-failures, after-failures: <n> }`；有 INSERT 嘅 public endpoint 一定要 `when: always`。 | 7.2、10.7 |
+| 49 | challenge 語法統一：`challenge: { type: none \| captcha \| pow, when: always \| after-failures, after-failures: <n> }`；有 INSERT 嘅 public endpoint 一定要 `when: always`。Challenge token 單次使用狀態存喺每個租戶自己 schema（決定 97），runtime role 只有 SELECT／INSERT（決定 27）。 | 7.2、10.7 |
 | 50 | 私隱刪除流程已經喺 12.10 定義（決定 42），後續版本改為「資料主體自助提交入口」，唔再列「正式流程」。 | 14 |
 | 51 | 新增 `kind: migration`：source `migrations/{provider}/{seq}-{name}.md`，lock `.lock.md`；DDL 只准喺呢度；用臨時 migration role；一律標高風險安全項目（v1.8 決定 78：資訊性，唔再要人手確認，已確認（產品經理 2026-10-14））；平台自動加 `tenant_id`、RLS、FORCE；DROP 租戶資料要行「棄用 30 日」流程。 | 2B |
 
@@ -230,6 +233,22 @@
 | 118 | Build once, promote：release job 只喺 `v*` tag build 一次，同一個 artifact 原封不動 promote 去各環境，唔重新 build；部署器用 `gh attestation verify --source-ref refs/tags/v<version>` 驗證。PR CI build 只係非權威預覽，結果唔可以部署。LLM key：release 用 `release` environment secret `VIBE_LLM_API_KEY`，PR 預覽用 `VIBE_LLM_API_KEY_PREVIEW`，兩條分開。Artifact 入面要有審計戳記（tag、commit SHA、workflow run id、compiler-hash、build 時間），唔包含任何 key。閘門：臨時方案 (i) 下任何有寫權限嘅人都可以開 `v*` tag，所以 tag 唔係真正閘門；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（`--release-approval` 已撤回）。將來目標係方案 (iii)：專用 release App 係唯一可以開 `v*` tag 嘅 actor，並開啟 `prevent_self_review`。兩條 LLM secret 由 Jack 本人建立。 | 已確認（產品經理 2026-10-14） | 2A.8、2C.3b |
 | 119 | Manifest 簽名改用 Sigstore keyless（Jack 決定，取代 KMS）：release manifest 由 release workflow 喺 `release` environment 用 GitHub OIDC 身份經 Sigstore（Fulcio 證書）簽，簽名一定要記錄喺 Rekor transparency log。驗證時證書身份一定要完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`（只接受完全相等，唔可以寬鬆配對 `refs/tags/v*`；如果工具一定要用 regex，只可以用完全錨定、正確轉義、寫死部署版本嘅式，例如 `^https://github\.com/vibe-backend/sdk/\.github/workflows/release\.yml@refs/tags/v1\.8\.0$`），commit SHA 同 GitHub-hosted runner 都要對，同決定 113 attestation 一致；issuer pin 死 `https://token.actions.githubusercontent.com`；冇 Rekor inclusion 證明即拒絕。驗證離線做：Rekor inclusion proof／SET 隨 Sigstore bundle 一齊交付；trust root（`trusted_root.json`：Fulcio CA、Rekor 公鑰、CT log key）由 Sigstore TUF repository 取得，release 時 pin 一份入 runtime binary，見 2C.3b。Keyless 身份只證明邊個 workflow 同 tag 產生呢個 build，唔證明邊個批准；佢唔會加多一個人，因為任何 `j113203` agent 都可以開 tag 再自己批准。冇任何長期簽名 key 或者 KMS，冇自管簽名 key 輪換（Sigstore trust root 輪換見 2C.3b）。Environment secret（例如簽名 secret）只可以用喺 dev／test，永遠唔用嚟簽 release。剩餘風險：臨時方案 (i) 下 tag 身份唔係閘門，唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；trust root 更新都係經同一個 `release` environment 出，同一個帳戶可以自己批准，冇額外嘅人把關。 | 已確認（產品經理 2026-10-14） | 2C.2、2C.3、2C.3b、9B、9C |
 | 120 | Email 正規化（issue #106）：v1 唔合併 plus addressing，`a+x@` 同 `a@` 係兩個唔同地址；local part 入面嘅點（`.`）照樣保留，`a.b@` 同 `ab@` 係兩個唔同地址。Local part：先做 Unicode NFC（唔係 NFKC），再 trim，再 lowercase。Domain：用 IDNA UTS #46 轉做 punycode，再 lowercase；IDNA 轉換失敗回 422 `VALIDATION_FAILED`。唯一 index、查找同發送全部用正規化後嘅值；login、註冊、邀請、驗證、重發同 rate-limit 全部先正規化再儲存同查找（12.11）。v1 只儲存正規化後嘅值，唔另外保留原本地址做顯示。現有資料遷移：migration 先偵測正規化後衝突（只差大小寫或者 Unicode 形式嘅重複地址）；有任何衝突就 fail closed 停止，唔自動合併；衝突報告只列 user id，任何公開 log 都唔出現完整 email；由人手按 12.11 嘅處理程序解決之後先重新跑。 | 已確認（產品經理 2026-10-16） | 4.3、9、12.11 |
+| 139 | `sign-jwt` 簽名算法政策（issue #198）：v1 只支援 ES256 同 RS256，預設 ES256；RS256 用嚟同第三方／JWKS 互通。RS256 key 最少 2048 bit，喺 `vibe validate --deploy`／部署同 `vibe serve` 啟動時檢查，唔夠就 fail closed（拒絕啟動，永遠唔會降級或者改用其他 alg）。驗證端只接受設定好嘅一個 alg；`alg` header 係其他值一律拒絕，包括 `none`、HS*，同埋 ES256／RS256 之中另一個（唔准混用）。EdDSA 留到 vNext。實作狀態：部分未實作，見 4.1a。 | 已確認（產品經理 2026-10-16） | 4.1、4.1a、12.6 |
+
+### 0.12 Challenge provider：Turnstile（決定 131 起，issue #160，已確認（產品經理 2026-10-16））
+
+跟進 #139（#118）嘅實作（[`challenge.md`](challenge.md)）同 #177（共用 replay store）。產品經理已確認（2026-10-16）。只描述防禦設計。
+
+| # | 決定 | 狀態 | 位置 |
+| --- | --- | --- | --- |
+| 131 | v1 challenge provider 係 Cloudflare Turnstile：`type: captcha` 一律由 server 端 siteverify 驗證，只有 header 存在唔算通過。`type: pow` v1 唔支援（修訂決定 49：v1 有 INSERT 嘅 public endpoint 一定要 `type: captcha`）；`type: pow` 係 **build 時驗證器 error**，`vibe build`、`vibe validate` 同部署一律失敗，唔會去到 runtime。 | 已確認（產品經理 2026-10-16） | 7.2a、10.7 |
+| 132 | Server 端 siteverify：每個 request 帶 `x-challenge-proof` header；server 先拒絕空或者超過 2048 字元嘅 token，再喺 replay store 預留 token（只存 SHA-256），然後 call Turnstile siteverify（5s timeout、唔跟 redirect、只准公網地址），送 secret、token 同 client IP。一定要 `success: true`、`hostname` 喺 `VIBE_CHALLENGE_HOSTNAMES`、`action` 等於 endpoint 名、`challenge_ts` 存在而且唔超過 300s 前、唔超過 60s 後。每個 token 最多用一次。**Replay store（#177）**：production 一律用共用 Postgres replay store（所有 instance 共用），冇設定或者連唔到就拒絕啟動；per-process cache 只限 dev／test。Turnstile 本身嘅單次使用檢查（`timeout-or-duplicate`）只係額外一層，唔係主要防線。 | 已確認（產品經理 2026-10-16） | 7.2a |
+| 133 | 邊啲 endpoint 要 challenge：跟決定 38、49：有 INSERT 嘅 public endpoint `{ type: captcha, when: always }`；login 類 `{ type: captcha, when: after-failures, after-failures: 3 }`；其他冇 INSERT 嘅 public 寫入可以 `type: none`。已認證 endpoint 預設**唔要**，但可以經 source frontmatter `challenge: captcha` opt-in（lock 寫 `{ type: captcha, when: always }`）；refresh endpoint（決定 72）唔要求。 | 已確認（產品經理 2026-10-16） | 7.2、7.2a |
+| 134 | 失敗、超時同 fail closed：503 `CHALLENGE_UNAVAILABLE` **只限** provider 或者網絡失敗（provider 唔可達、超時、回應唔啱，同 replay store 暫時連唔到），永遠唔會當通過、冇 fallback；token 無效一律係 403，唔會變 503。**Replay store 滿**（已確認（產品經理 2026-10-16））：係流量造成嘅容量限制，唔係 provider 失敗，所以回 **429** `CHALLENGE_RATE_LIMITED`加 `Retry-After`，唔回 503；照樣 fail closed：未成功記錄 replay 就永遠唔准放行。`Retry-After` = store 入面最舊紀錄嘅剩餘有效時間，上限 360s；計唔到就固定 60。同時發 metric `vibe_challenge_rejected_total{reason="replay_store_full"}`並觸發告警 `challenge_replay_store_full`（store 滿時觸發；metric reason `replay_store_full`）；名稱已確認（產品經理 2026-10-16）。**每個網段上限**（已確認（產品經理 2026-10-16））：每個租戶嘅 replay store 入面，每個網段（IPv4 /24、IPv6 /48）可以持有嘅記錄有上限，預設 16（同決定 137 每個 IP 16 個未驗證預留一致）；超過回 429 `CHALLENGE_RATE_LIMITED`（內部 reason `replay_prefix_cap`），`Retry-After` = 該租戶該網段最舊紀錄嘅剩餘有效時間，上限 360s，計唔到就 60，同 store 滿規則一樣（網段 `Retry-After` 已確認（產品經理 2026-10-16））。**429 回應一致**（已確認（產品經理 2026-10-16））：網段超過上限同 store 滿都用同一個錯誤碼 `CHALLENGE_RATE_LIMITED`；reason（`replay_store_full`、`replay_prefix_cap` 等）只寫入 metric 同內部 log，永遠唔出現喺 HTTP 回應（body、header、error detail 都冇）；所有呢類 429 回應除咗 `Retry-After` 之外完全一樣。Replay store 使用率超過 80% 觸發告警 `challenge_replay_store_high_usage`（已確認（產品經理 2026-10-16））。設定問題喺啟動時擋：production（`VIBE_ENV`）有任何 challenge route 而冇設定 verifier 或者共用 replay store，`vibe serve` 拒絕啟動、`vibe validate --deploy` 失敗。Dev（`vibe dev`）用假 verifier（一律通過，terminal 標示，決定 74），production 永遠唔准用。 | 已確認（產品經理 2026-10-16） | 7.2a、2C.4 |
+| 135 | 錯誤碼：400 `CHALLENGE_REQUIRED`（冇 proof）；403 `CHALLENGE_FAILED`（偽造、重用、過期、時間錯、hostname／action 唔啱、每 IP／每租戶未驗證預留上限，即係所有 token 無效情況）；503 `CHALLENGE_UNAVAILABLE`（只限 provider／網絡失敗，固定帶 `Retry-After: 5`）；429 `CHALLENGE_RATE_LIMITED`（replay store 滿或者網段超過上限，決定 134；帶 `Retry-After`：store 滿按 store 最舊紀錄、網段超過上限按該租戶該網段最舊紀錄嘅剩餘有效時間，上限 360s，計唔到用 60（網段 `Retry-After` 已確認（產品經理 2026-10-16））；回應唔包含 reason）。限流同配額係另一回事，回 429 `RATE_LIMITED`（帶 `Retry-After`），唔會用 503。錯誤 body 唔包含 token、provider 原始錯誤碼或者 secret；詳細原因只入 server log 同審計。 | 已確認（產品經理 2026-10-16） | 7.2a、8 |
+| 136 | Secret 處理：`VIBE_TURNSTILE_SECRET` 只可以由環境變數或者 secret manager（例如 CI environment secret）注入；唔准寫入 source、lock、manifest、`.env` commit 或者 log；錯誤訊息同 debug 輸出只顯示「已設定／未設定」。驗證器見到 lock 或者 source 有疑似 secret 值即報 error。設定：`VIBE_CHALLENGE_PROVIDER`（預設 `turnstile`）、`VIBE_TURNSTILE_SECRET`、`VIBE_CHALLENGE_HOSTNAMES`（有 secret 就一定要有）、`VIBE_CHALLENGE_REPLAY_STORE`（production 一定 `postgres`，#177）；預設同 production 規則見 7.2a。 | 已確認（產品經理 2026-10-16） | 7.2a、2A.8.5 |
+| 137 | 同限流組合：route 限流（決定 25、39）同 public 寫入每日配額喺 challenge 之前檢查，超過回 **429**（同 challenge 嘅 503 分開），被限流嘅 request 唔會去到 replay store 或者 provider；challenge 唔取代限流同配額。v1 用固定平台數值：token 壽命 300s、每 client IP 最多 16、每租戶最多 1,000 個未驗證預留（超過回 403 `CHALLENGE_FAILED`，唔 call provider）；**冇租戶 override**。將來如果加 override，只可以調低，唔可以調高。 | 已確認（產品經理 2026-10-16） | 7.2a、4.3 |
+| 138 | Provider 抽象：runtime 經 `ChallengeVerifier` trait 驗證（輸入 token、client IP、預期 action；輸出 通過／失敗／不可用 三種，provider 細節唔外露；「失敗」對應 403，「不可用」對應 503）。之後加 hCaptcha 等 provider 只係新 implementation 同 `VIBE_CHALLENGE_PROVIDER` 新值，lock 語法、replay store 同錯誤碼唔變；未實作嘅值（例如 `hcaptcha`）啟動時拒絕。 | 已確認（產品經理 2026-10-16） | 7.2a |
 
 ## 1. 目錄同命名
 
@@ -981,11 +1000,34 @@ security-items:
 | `jwks-uri` | 預設 `{iss}/.well-known/jwks.json`；一定要 https |
 | JWKS cache | 10 分鐘；遇到未知 `kid` 即刻重拉，但同一 issuer 最少相隔 60 秒；拉唔到時最多沿用舊 cache 1 小時，之後所有 token 回 401 |
 | clock skew | `exp`、`nbf`、`iat` 容許 60 秒 |
-| alg 白名單 | ES256、RS256（RSA key 最少 2048 bit）；禁止 `none`、HS*，亦唔准混用；header 一定要有 `kid` |
+| alg 白名單 | ES256、RS256（RSA key 最少 2048 bit），預設 ES256；每個部署只設定一個 alg，驗證只接受呢個 alg；禁止 `none`、HS*，亦唔准混用；header 一定要有 `kid`（決定 139，見 4.1a） |
 | `roles-claim` | 預設 `roles` |
 
 - 要驗 `iss`、`aud`、`exp`、`nbf`；`exp` 距離 `iat` 超過 1 小時（access token 上限）一律拒絕。
 - 改 `iss`、`aud`、`jwks-uri`（例如接外部 IdP）屬高風險安全項目。
+
+### 4.1a 簽名算法政策（決定 139，已確認（產品經理 2026-10-16），issue #198）
+
+呢節係 `sign-jwt`（簽發）同 JWT 驗證（auth pipeline）共用嘅 alg 規則，優先於其他地方較簡略嘅寫法。
+
+| 項目 | 規則 |
+| --- | --- |
+| 支援 alg | 只有 ES256（P-256）同 RS256；預設 ES256。RS256 只建議用嚟同第三方／JWKS 互通。 |
+| RS256 key 長度 | 最少 2048 bit（按 modulus 實際長度計）。簽名私鑰、靜態驗證公鑰同 JWKS 入面嘅 RSA key 都適用。 |
+| 唔符合 key 長度 | 簽名私鑰或者靜態驗證公鑰唔夠長：`vibe validate --deploy`、部署同 `vibe serve` 啟動 fail closed，拒絕啟動；唔會降級、唔會改用其他 alg、唔會只出 warning。JWKS 入面唔夠長嘅 key 當冇呢個 `kid`，用佢簽嘅 token 回 401。 |
+| 驗證 alg | 每個部署（或者每個 issuer）只設定一個 alg。token header 嘅 `alg` 一定要等於設定值；`none`、HS*、ES256／RS256 之中另一個同任何未知值一律回 401。alg 由設定決定，唔由 token header 或者 key 類型推斷。 |
+| key 同 alg 一致 | 設定 alg 同 key 類型唔夾（例如設定 ES256 但 key 係 RSA）：啟動 fail closed。JWKS key 嘅 `kty`／`alg` 同設定 alg 唔夾，嗰個 key 唔用。 |
+| EdDSA | v1 唔支援，留到 vNext（見 14）。 |
+
+錯誤訊息只講邊個設定唔啱同要求（例如「RS256 key 最少 2048 bit」），唔會印出 key 內容。
+
+實作狀態（main，2026-10-16 檢查）：
+
+- 已實作：`vibe validate` 拒絕 ES256／RS256 以外嘅 `sign-jwt` alg；`sign-jwt` 執行時 alg 要同已載入 key 一致；`VIBE_JWT_ALG` 只接受 ES256、RS256；驗證時 header `alg` 要等於 key 嘅 alg（`none`、HS* 會被拒）；JWKS 只載入 P-256 同 ≥ 2048 bit 嘅 RSA key。
+- RS256 簽名私鑰最少 2048 bit 嘅啟動檢查：Implementation status: not yet implemented, follow-up #222.
+- 靜態驗證公鑰（`VIBE_JWT_PUBLIC_KEY_PEM`）RSA 最少 2048 bit 同設定 alg／key 類型一致嘅啟動檢查：Implementation status: not yet implemented, follow-up #224.
+- 用 JWKS 驗證時只接受一個設定 alg（而家每個 key 用自己嘅 alg，JWKS 同時有 EC 同 RSA key 嘅話兩種都收）：Implementation status: not yet implemented, follow-up #225.
+- `sign-jwt` 冇寫 `alg` 時預設 ES256（而家驗證器當錯誤）：Implementation status: not yet implemented, follow-up #226.
 
 ### 4.2 API key 模式（決定 43）
 
@@ -1256,9 +1298,10 @@ migration 放喺 ./migrations/main/。
   - **配額**：每租戶每日 public 寫入配額強制，預設 1,000 次，另每 IP 每日 50 次；租戶 admin 可以調低，調高最多到 10,000 要經平台申請（決定 39）；用完之後只封鎖 public 寫入（回 429 同 `Retry-After`），已認證請求同 public 讀取照常（決定 21）。
   - **限流**：IP 加租戶兩層限流強制；lock 標 `cost: high` 嘅昂貴 step（例如 `verify-password`、`hash-password`、大範圍 query）自動用更嚴嘅限流，即係 endpoint 上限嘅一半（決定 25、39）。
   - **防機器人**（決定 49）：lock `## Access` 用統一語法 `challenge: { type: none | captcha | pow, when: always | after-failures, after-failures: <n> }`。
-    - 建立資料（有 INSERT）嘅 public endpoint：一定要 `type: captcha` 或者 `pow`，`when: always`。
+    - 建立資料（有 INSERT）嘅 public endpoint：一定要 `type: captcha` 或者 `pow`，`when: always`（v1 只支援 `captcha`，`pow` 係 build error，見 7.2a 決定 131）。
     - login 類 endpoint：一定要 `{ type: captcha, when: after-failures, after-failures: 3 }`（跟 4A.3）。
     - 其他冇 INSERT 嘅 public 寫入：可以 `type: none`。
+    - Challenge token 單次使用狀態（#157，產品決定）：production 有設定 verifier 時一律用 PostgreSQL replay store；表喺每個租戶自己 schema（`t_<tenant>.vibe_challenge_replay`，有 `tenant_id`、ENABLE + FORCE RLS，owner role 擁有，由該租戶嘅 `vibe migrate` 建立），冇跨租戶共用表（決定 97）。runtime role 只有 SELECT、INSERT，冇 DELETE／UPDATE（決定 27）：預留同結果都係追加記錄，讀取忽略過期記錄，過期記錄只由 owner role 喺 `vibe migrate` 刪除。Fail closed 唔依賴清理：清理冇做或者延遲，只會令 store 較早滿，滿咗按決定 134 回 429，永遠唔會放行未記錄 replay 嘅 request（見 #193）。容量上限同 quota 按租戶計；client IP 用每租戶 key 嘅 HMAC 儲存。表唔存在、用唔到或者 runtime role 權限多過 SELECT／INSERT 就拒絕啟動；production 設 `VIBE_CHALLENGE_REPLAY_STORE=memory` 亦拒絕啟動。dev／CI 一定要明確揀 `memory` 或者 `postgres`，冇預設值。v1 captcha provider 係 Cloudflare Turnstile。
   - **註冊（password 寫入）**（決定 47）：public 路徑寫 password 類型欄位只准一種方式：
     - method 標 `capabilities: [set-password]`（高風險安全項目），而且寫入 password 欄位嘅值一定係同一 method 內 `hash-password` op 嘅輸出；直接用 request 值寫 password 欄位一律 error。
     - api lock `## Access` 寫 `password-write: allow`，`writable-columns` 明確列出 password 欄位。
@@ -1269,6 +1312,110 @@ migration 放喺 ./migrations/main/。
   - **Untrusted 內容**：public 寫入嘅欄位喺 model 標記 `untrusted: true`；所有輸出（包括已認證 endpoint 讀返出嚟）都按 Content-Type 做 output encoding；每個欄位要有長度上限，陣列要有數量上限，冇上限就 error（決定 24）。
   - **對外 call**：public 路徑（public endpoint 直接或者經 method 間接）預設禁止 `call`；要開要逐個 endpoint 喺 lock 寫 `external-calls: allow`，屬高風險安全項目。
   - 部署報告列出所有 public 寫入 endpoint 同佢哋嘅可寫欄位，並出 warning。
+
+### 7.2a Challenge 驗證：Turnstile（決定 131–138，issue #160，已確認（產品經理 2026-10-16））
+
+> 本節已確認（產品經理 2026-10-16），包括 replay store 滿回 429 同每個網段上限（決定 134，2026-10-16 補充）。實作細節見 [`challenge.md`](challenge.md)；共用 replay store 見 #177。
+
+#### 宣告語法
+
+Lock `## Access`（決定 49 語法，v1 `type` 只可以 `none` 或者 `captcha`；`pow` 係 build error）：
+
+```markdown
+## Access
+
+- public: true
+- challenge: { type: captcha, when: always }
+```
+
+Login 類：
+
+```markdown
+- challenge: { type: captcha, when: after-failures, after-failures: 3 }
+```
+
+已認證 endpoint opt-in（預設冇）：source frontmatter 加 `challenge: captcha`，lock 會有：
+
+```markdown
+## Access
+
+- auth: required
+- challenge: { type: captcha, when: always }
+```
+
+Source 用自然語言寫「要 captcha」，frontmatter 一樣要宣告 public 同寫入（決定 112）。前端 widget 嘅 `data-action` 一定等於 endpoint 名（feature id 最後一段，最多 32 個 `[A-Za-z0-9_-]` 字元）。
+
+#### 處理次序
+
+1. 限流同 public 寫入配額（決定 137）；超過即 **429** `RATE_LIMITED`（同 challenge 嘅 503 分開）。
+2. 冇 `x-challenge-proof` → 400 `CHALLENGE_REQUIRED`。
+3. Token 格式、共用 replay store 預留、每 IP／租戶預留上限 → 無效即 403 `CHALLENGE_FAILED`；replay store 連唔到或者出錯 → **503** `CHALLENGE_UNAVAILABLE` 加 `Retry-After: 5`（唔係 403）；網段超過上限 → 429 `CHALLENGE_RATE_LIMITED` 加 `Retry-After`（該租戶該網段最舊紀錄剩餘有效時間，上限 360s，計唔到就 60）（網段 `Retry-After` 已確認（產品經理 2026-10-16））；store 滿 → 429 `CHALLENGE_RATE_LIMITED`加 `Retry-After`，唔記錄 replay 就唔放行（決定 134）。
+4. Siteverify（決定 132）→ token 無效 403；provider／網絡失敗（包括 replay store 暫時連唔到）503 加 `Retry-After: 5`（fail closed，決定 134）。
+5. 通過之後先執行 lock steps。
+
+#### 錯誤碼（決定 135）
+
+| 狀態 | 錯誤碼 | 幾時 |
+| --- | --- | --- |
+| 400 | `CHALLENGE_REQUIRED` | 冇 proof |
+| 403 | `CHALLENGE_FAILED` | token 無效：偽造、重用、過期、時間錯、hostname／action 唔啱、預留上限 |
+| 429 | `RATE_LIMITED` | 限流或者配額（唔關 challenge 事），帶 `Retry-After` |
+| 429 | `CHALLENGE_RATE_LIMITED` | Replay store 滿或者網段超過上限（決定 134）；回應除咗 `Retry-After` 之外完全一樣，唔包含 reason；`Retry-After` = 最舊紀錄剩餘有效時間（store 滿：store 入面最舊；網段：該租戶該網段最舊），上限 360s，計唔到就 60（網段 `Retry-After` 已確認（產品經理 2026-10-16））；fail closed；metric `vibe_challenge_rejected_total{reason="replay_store_full"}`、告警 `challenge_replay_store_full` |
+| 503 | `CHALLENGE_UNAVAILABLE` | 只限 provider 或者網絡失敗：唔可達、超時、回應唔啱、replay store 暫時連唔到；固定 `Retry-After: 5` |
+
+設定錯誤（冇 verifier、冇共用 replay store、`type: pow`、未實作 provider）喺 build 或者啟動時已經擋咗，production 唔會以 503 出現。
+
+#### 固定數值（決定 137）
+
+| 項目 | v1 值 | Override |
+| --- | --- | --- |
+| Token 壽命 | 300s | 冇；將來只可以調低 |
+| 每 client IP 未驗證預留 | 16 | 冇；將來只可以調低 |
+| 每租戶未驗證預留 | 1,000 | 冇；將來只可以調低 |
+| 503 `Retry-After` | 5s | 固定 |
+
+#### 設定（決定 136）
+
+v1 challenge provider 係 **Cloudflare Turnstile**（決定 131），由 server 端 siteverify 驗證（決定 132）。設定只經環境變數：
+
+| 變數 | 預設 | 意思 | Production 規則 |
+| --- | --- | --- | --- |
+| `VIBE_CHALLENGE_PROVIDER` | `turnstile` | v1 只接受 `turnstile`；其他值（例如 `hcaptcha`）未實作，啟動時拒絕 | 同 dev 一樣 |
+| `VIBE_TURNSTILE_SECRET` | 冇（未設定 = verifier 未設定） | Turnstile secret key；只由環境變數／secret manager 注入，永遠唔 log、唔入 source、lock、manifest 或者 commit 嘅 `.env` | 有任何 challenge route 就一定要有，否則 `vibe serve` 拒絕啟動、`vibe validate --deploy` 失敗 |
+| `VIBE_CHALLENGE_HOSTNAMES` | 冇 | 逗號分隔 widget hostname；siteverify 回應嘅 `hostname` 一定要喺入面 | 有 secret 就一定要有 |
+| `VIBE_CHALLENGE_REPLAY_STORE` | Production：`postgres`；其他環境冇預設，一定要明確設定 | `postgres`（每租戶一份、所有 instance 共用，用 `VIBE_DATABASE_URL`）或者 `memory`（per process，只限 dev／CI） | 一定係 `postgres`；設 `memory` 或者冇 PostgreSQL 即拒絕啟動 |
+
+`VIBE_ENV` 決定係咪 production（同 2C.4 一致）。固定數值（token 壽命 300s、每 IP 16、每租戶 1,000、503 `Retry-After: 5`）係平台常數，冇環境變數或者租戶 override（決定 137）。`type: pow` 喺 build 時已經係 error（決定 131）。
+
+Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動；Turnstile 本身嘅單次使用檢查（`timeout-or-duplicate`）只係額外一層。
+
+#### Replay store 數值（同 main 嘅 code 一致）
+
+| 項目 | 值 |
+| --- | --- |
+| 已驗證 token 保留時間（replay TTL） | 360s（token 壽命 300s + 60s clock skew 邊際） |
+| 被拒 token 保留時間（rejected hold） | 10s |
+| 未有答覆嘅預留（provider 唔可用，正常 settle） | 即時釋放 |
+| Request 中斷、未 settle 嘅 pending 預留（pending hold） | 30s |
+| Token 長度上限 | 2048 字元 |
+| Siteverify timeout | 5s |
+| 每個網段（IPv4 /24、IPv6 /48）每租戶持有上限 | 16（同決定 137 每個 IP 16 個未驗證預留一致）；超過回 429 `CHALLENGE_RATE_LIMITED`（內部 reason `replay_prefix_cap`，只入 metric／log）；`Retry-After` = 該租戶該網段最舊紀錄剩餘有效時間，上限 360s，計唔到就 60（網段 `Retry-After` 已確認（產品經理 2026-10-16）） |
+| 告警 | 使用率超過 80%：`challenge_replay_store_high_usage`；store 滿：`challenge_replay_store_full`（metric reason `replay_store_full`） |
+| Metric | `vibe_challenge_rejected_total{reason}`（例如 `reason="replay_store_full"`、`"replay_prefix_cap"`）；reason 只入 metric 同內部 log，永遠唔出現喺 HTTP 回應 |
+| 容量上限 | Postgres store：每租戶 10,000；memory store（只限 dev／CI）：每 process 100,000；滿咗回 429（決定 134） |
+
+#### 實作狀態（對比 `main` 4b85de5）
+
+以下決定係產品經理已確認嘅 spec 目標，**唔會因為 code 未做而放寬**；未做嘅部分標明，跟進 issue 見下表（#200–#205）。
+
+| 決定 | 狀態 | 差異 |
+| --- | --- | --- |
+| 134 啟動閘門 | **Implementation status: not yet implemented**（部分） | `src/main.rs` 同 `src/runtime/challenge.rs` `production_gate` 只檢查 `public` 而且 `when: always` 嘅 route；`after-failures` 同決定 133 已認證 opt-in route 冇 verifier 時唔會擋啟動。follow-up issue #200。 |
+| 133 Runtime 執行範圍 | **Implementation status: not yet implemented**（部分） | `src/runtime/http.rs` 只對 `public` 而且 `when: always` 嘅 route 做 challenge；`after-failures`（login）同已認證 opt-in route 而家唔會驗證 challenge。follow-up issue #201。 |
+| 135 `Retry-After: 5` | **Implementation status: not yet implemented** | `src/runtime/http.rs` `check_challenge` 回 503 `CHALLENGE_UNAVAILABLE` 時冇 `Retry-After` header。follow-up issue #202。 |
+| 131 `type: pow` build error | **Implementation status: not yet implemented** | `src/validate.rs` 冇呢個檢查；而家係 runtime 回 503。follow-up issue #203。 |
+| 134 503 範圍 | **Implementation status: not yet implemented**（部分） | Production 冇 verifier 嘅 `when: always` public route 已經喺啟動擋；但 runtime 對「冇 verifier」同 `type: pow` 仍然回 503（應該喺 build／啟動擋）。Replay store 容量滿而家回 503，決定 134（已確認（產品經理 2026-10-16））要求 429 加 `Retry-After`、metric 同告警；每個網段持有上限（IPv4 /24、IPv6 /48，預設 16，429 reason `replay_prefix_cap`）、metric `vibe_challenge_rejected_total{reason}`、告警 `challenge_replay_store_high_usage`（超過 80%）同 `challenge_replay_store_full`（滿）亦未做；所有呢類 429 一律 `CHALLENGE_RATE_LIMITED`、回應除 `Retry-After` 外一致、唔包含 reason，亦未做：not yet implemented，follow-up issue #204。 |
+| 136 Turnstile secret 掃描 | **Implementation status: not yet implemented** | `src/secret.rs` 只比對已設定嘅 LLM key 同 `sk-`／`AKIA` 格式；冇比對 `VIBE_TURNSTILE_SECRET` 嘅值，亦冇 Turnstile secret 格式規則，所以而家捉唔到。follow-up issue #205。 |
 
 ### 7.3 schema 升級去 database（離線遷移，CLI `tenant migrate`）
 
@@ -1456,6 +1603,7 @@ migration 放喺 ./migrations/main/。
 - public 寫入用咗 `INSERT`／`UPDATE` 以外嘅操作；寫咗 `writable-columns` 以外嘅欄位；寫咗黑名單欄位。
 - public 寫入嘅 `UPDATE` 冇 `WHERE`，或者唔係用主鍵／RLS 限定。
 - public 寫入 endpoint 嘅 `## Request` 宣告咗 `tenant_id`、`id` 或者 `created_by`。
+- `challenge` 用咗 `type: pow`（v1 唔支援，決定 131）。
 - `challenge` 唔合統一語法；有 INSERT 嘅 public endpoint 唔係 `{ type: captcha | pow, when: always }`；login 類 endpoint 冇 `when: after-failures, after-failures: 3`。
 - public 路徑寫 password 欄位但缺少以下任何一項：api 嘅 `password-write: allow`、method 嘅 `capabilities: [set-password]`、寫入值係同一 method 內 `hash-password` 輸出。
 - 有 public INSERT 嘅 endpoint 冇 `challenge: { type: captcha | pow, when: always }`（冇 INSERT 嘅 password 或者驗證寫入唔要求 captcha，唔報 error）。
@@ -2407,7 +2555,7 @@ api source 寫「用 user.login 驗證帳戶密碼」，編譯成：
   - claim 白名單：method 只可以傳 `sub` 同平台允許嘅自訂 claim（例如 `sid`）；`roles` 由平台喺簽發時從 DB 讀（用 `sub` 喺當前租戶搵用戶）；`tenant_id` 只有一個來源：平台由 slug（public）或者已驗證 token（auth）解析出嚟嘅 `ctx.tenant_id`，唔由 client、method 或者 `users` 表提供（決定 62）。method 唔可以傳入或者覆蓋任何一個。
   - 平台自動加 `iss`、`aud`、`exp`、`nbf`、`iat`、`jti`；method 唔可以覆蓋。
   - `ttl` 有上限（access token 最多 1h）。
-  - 只可以簽 JWT，alg 只准 RS256 或者 ES256；私鑰喺平台 secret，lock 只寫 `key-ref`。
+  - 只可以簽 JWT，alg 只准 ES256（預設）或者 RS256，RS256 key 最少 2048 bit，唔夠就啟動 fail closed（決定 139，見 4.1a）；私鑰喺平台 secret，lock 只寫 `key-ref`。
   - 其他 method（例如 `user.login`）同 pipeline 要簽 token，就用 `method` op 呼叫 `user.sign-token`。
   - refresh token 由 `sign-jwt` 嘅 `issue-refresh` 處理（見 4A.1）。
 - `capabilities: [set-password]`：只有標咗呢個 capability 嘅 model method 可以喺 public 路徑寫 password 欄位，值一定要係 `hash-password` 輸出（見 7.2）；已認證路徑嘅改密碼 method 同樣建議標呢個 capability，方便 review。
@@ -3492,5 +3640,6 @@ security-items:
 - public 寫入內容審核 hook（spam／不當內容），處理 captcha 被破解同低質內容嘅剩餘風險。
 - 私隱刪除嘅資料主體自助提交入口（12.10 流程已經定義，呢度只係加自助入口）。
 - Kill switch 自動觸發（例如錯誤率或者寫入量異常時自動停用）。
+- `sign-jwt` 支援 EdDSA（Ed25519）（決定 139 留到 vNext）。
 - 編譯用 LLM provider 加入 `azure-openai`（要處理 deployment 名同 api-version 等設定）。
 - `openai` adapter 支援 OpenAI Responses API（reasoning model 建議用），v1 只用 Chat Completions。

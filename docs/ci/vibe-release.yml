@@ -42,6 +42,15 @@ jobs:
     outputs:
       sha256: ${{ steps.sum.outputs.sha256 }}
     steps:
+      - name: Require VIBE_SDK_REV to be a full SHA on sdk main
+        # Fails closed on a pin that is not reachable from main (for example
+        # a feature-branch commit), so no unreleased verifier is installed.
+        run: |
+          [[ "$VIBE_SDK_REV" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::VIBE_SDK_REV must be a full commit SHA"; exit 1; }
+          git init -q sdk && cd sdk
+          git fetch -q --filter=blob:none https://github.com/vibe-backend/sdk "+refs/heads/main:refs/sdk/main" "$VIBE_SDK_REV"
+          git merge-base --is-ancestor "$VIBE_SDK_REV" refs/sdk/main \
+            || { echo "::error::VIBE_SDK_REV $VIBE_SDK_REV is not on vibe-backend/sdk main"; exit 1; }
       - name: Install pinned vibe
         run: cargo install --locked --git https://github.com/vibe-backend/sdk --rev "$VIBE_SDK_REV" vibe --root "$RUNNER_TEMP/vibe"
       - id: sum

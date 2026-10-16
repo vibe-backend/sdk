@@ -13,16 +13,17 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait = "0.1"
-base64 = "0.22"
 argon2 = { version = "0.6", features = ["password-hash", "getrandom"] }
 axum = "0.8"
+base64 = "0.22"
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "3"
 hex = "0.4"
 hmac = "0.13"
 jsonwebtoken = "9"
-rand = "0.8"
+rand = "0.10"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,7 +32,6 @@ sha2 = "0.11"
 sigstore-trust-root = { version = "0.15", default-features = false }
 sigstore-types = "0.15"
 sigstore-verify = { version = "0.15", default-features = true }
-sqlparser = "0.52"
 subtle = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "net"] }
 deadpool-postgres = "0.14"
@@ -44,6 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
+sqlparser = { version = "0.52", features = ["visitor"] }
 
 [dev-dependencies]
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }

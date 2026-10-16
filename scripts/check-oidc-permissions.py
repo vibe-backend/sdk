@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Fail if a workflow job can mint an OIDC token or write attestations
+outside the `release` environment.
+
+A job may have `id-token: write` or `attestations: write` only when it runs
+with `environment: release`. Workflow-level grants of either are refused.
+A job that may attest must download every artifact by exact `name` (no
+`pattern`, no `merge-multiple`) and must list its attestation subjects by
+exact path (no wildcards, no `subject-digest`/`subject-checksums`).
+Checks .github/workflows/*.yml and docs/ci/*.yml (or the paths given).
+"""
+import glob
+import sys
+
+import yaml
+
+GUARDED = ("id-token", "attestations")
+
+
+def grants(perms):
+    if perms in ("write-all",):
+        return list(GUARDED)
+    if isinstance(perms, dict):
+        return [k for k in GUARDED if perms.get(k) == "write"]
+    return []
+
+
+def env_name(env):
+    if isinstance(env, dict):
+        return env.get("name")
+    return env
+
+
+def check(path):
+    with open(path, encoding="utf-8") as f:
+        doc = yaml.safe_load(f) or {}
+    problems = []
+    for key in grants(doc.get("permissions")):
+        problems.append(f"{path}: workflow-level permissions grant {key}: write")
+    for name, job in (doc.get("jobs") or {}).items():
+        job = job or {}
+        granted = grants(job.get("permissions"))
+        if granted and env_name(job.get("environment")) != "release":
+            for key in granted:
+                problems.append(
+                    f"{path}: job `{name}` has {key}: write without environment: release"
+                )
+        if "attestations" in granted:
+            problems += attest_inputs(path, name, job)
+    return problems
+
+
+GLOB_CHARS = set("*?[]{}")
+
+
+def attest_inputs(path, name, job):
+    problems = []
+    for step in job.get("steps") or []:
+        uses = str((step or {}).get("uses") or "")
+        args = (step or {}).get("with") or {}
+        if uses.startswith("actions/download-artifact@"):
+            if "pattern" in args or args.get("merge-multiple"):
+                problems.append(f"{path}: job `{name}` downloads artifacts by pattern/merge-multiple")
+            if not args.get("name") or GLOB_CHARS & set(str(args.get("name"))):
+                problems.append(f"{path}: job `{name}` downloads an artifact without an exact name")
+        if uses.startswith("actions/attest-build-provenance@"):
+            for key in ("subject-digest", "subject-checksums"):
+                if key in args:
+                    problems.append(f"{path}: job `{name}` attests via {key}; list subject-path entries")
+            subjects = str(args.get("subject-path") or "")
+            entries = [e.strip() for e in subjects.replace(",", "\n").splitlines() if e.strip()]
+            if not entries or any(GLOB_CHARS & set(e) for e in entries):
+                problems.append(f"{path}: job `{name}` attests subject-path with a wildcard or no path")
+    return problems
+
+
+def main(argv):
+    paths = argv or sorted(
+        glob.glob(".github/workflows/*.yml")
+        + glob.glob(".github/workflows/*.yaml")
+        + glob.glob("docs/ci/*.yml")
+    )
+    problems = [p for path in paths for p in check(path)]
+    for p in problems:
+        print(f"::error::{p}")
+    print(f"{len(paths)} workflow files checked, {len(problems)} problems")
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
