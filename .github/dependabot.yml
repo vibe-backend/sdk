@@ -20,6 +20,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: "sqlparser"
+        versions: [">=0.53"]
     groups:
       rustcrypto:
         patterns:
