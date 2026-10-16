@@ -34,9 +34,9 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install --require-hashes --no-deps -r scripts/requirements-ci.txt
       - name: Policy checks for jobs that can mint OIDC tokens / write attestations
-        run: "$RUNNER_TEMP/venv/bin/python" scripts/check-oidc-permissions.py
+        run: '"$RUNNER_TEMP/venv/bin/python" scripts/check-oidc-permissions.py'
       - name: Policy checker tests
-        run: "$RUNNER_TEMP/venv/bin/python" tests/oidc_policy.py -v
+        run: '"$RUNNER_TEMP/venv/bin/python" tests/oidc_policy.py -v'
       - name: Install script tests
         run: python3 tests/install_manager.py
       - name: Shellcheck install script
