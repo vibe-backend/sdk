@@ -310,7 +310,7 @@ fn normalized_data_type_name(data_type: &DataType) -> Option<String> {
 }
 
 /// Rejects casts whose target is not in [`ALLOWED_CAST_TYPES`].
-fn cast_type_problem(data_type: &DataType) -> Option<String> {
+pub fn cast_type_problem(data_type: &DataType) -> Option<String> {
     match normalized_data_type_name(data_type) {
         Some(name) if ALLOWED_CAST_TYPES.contains(&name.as_str()) => None,
         _ => Some(format!("cast to {data_type} is not allowed in lock SQL")),
@@ -340,6 +340,16 @@ pub struct SqlInfo {
     pub writes: bool,
     /// UPDATE or DELETE (needs a row scope).
     pub targets_rows: bool,
+}
+
+/// Runs the lock SQL expression checks (allowlisted functions and cast
+/// types, plain unqualified relation names, no table functions, no
+/// data-modifying WITH) over any parsed node. Used for migration
+/// expressions too.
+pub fn node_problem<V: Visit>(node: &V) -> Option<String> {
+    let mut guard = Guard(None);
+    let _ = node.visit(&mut guard);
+    guard.0
 }
 
 /// Checks `sql` against the allowlist and describes it.

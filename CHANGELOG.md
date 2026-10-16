@@ -43,9 +43,14 @@ Pending — add each entry only when its PR merges:
   (default 200) return 503 `DB_POOL_EXHAUSTED` with `Retry-After: 1`
   (`vibe_db_pool_exhausted_total{scope}`). The owner role is NOLOGIN outside migrate: migrate uses
   `VIBE_MIGRATE_ADMIN_DATABASE_URL` to open a one-time owner login window and always closes it;
-  `vibe check-owners` alerts on owners that can log in. Migration statements use an allowlist;
+  `vibe check-owners` alerts on owners that can log in. Migration statements are parsed and only
+  CREATE TABLE, ALTER TABLE ADD COLUMN / ADD constraint / ALTER COLUMN SET|DROP NOT NULL|DEFAULT,
+  named CREATE [UNIQUE] INDEX, DROP INDEX and backfill UPDATE ... WHERE are accepted (CREATE
+  FUNCTION/PROCEDURE/TRIGGER/TYPE/SEQUENCE, INSERT and COMMENT are no longer accepted);
   UNIQUE indexes are built in the main transaction, other indexes concurrently after commit, and
-  INVALID indexes are rebuilt on the next migrate. Locks must be
+  only INVALID indexes recorded by the concurrent index step (`public.vibe_concurrent_indexes`) are
+  rebuilt on the next migrate. Tenant pools close after 5 minutes unused
+  (`vibe_db_pool_idle_closed_total`) and reopen on the next request. Locks must be
   recompiled: the `policy:` line is now the per-tenant policy that migrate installs, and serve refuses
   to start if the installed policies differ.
   `vibe migrate` refuses to run without them and refuses a migration login that can own or use another

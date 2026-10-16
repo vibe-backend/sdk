@@ -847,17 +847,22 @@ async fn migration_without_tenant_id_or_with_a_view_fails() {
         (
             "CREATE FUNCTION steal() RETURNS bigint LANGUAGE sql SECURITY DEFINER \
              AS 'SELECT count(*) FROM notes'",
-            "SECURITY DEFINER",
+            "not allowed in migrations",
         ),
         (
             "CREATE FUNCTION steal_trg() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
              AS 'BEGIN PERFORM set_config(''app.tenant_id'', ''other'', true); RETURN NEW; END'",
-            "SECURITY DEFINER",
+            "not allowed in migrations",
         ),
         (
             "CREATE PROCEDURE steal_proc() LANGUAGE sql SECURITY DEFINER              AS 'SELECT count(*) FROM notes'",
-            "SECURITY DEFINER",
+            "not allowed in migrations",
         ),
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+            "CREATE FUNCTION",
+        ),
+        ("CREATE TABLE t2 (tenant_id text); COMMIT", "more than one command"),
     ] {
         let mut m = manifest();
         m.migrations[0].statements = vec![stmt.to_string()];
@@ -1836,11 +1841,21 @@ async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
     )
     .await
     .unwrap();
+    migrate_tenant(&exec, &manifest(), &tenant).await.unwrap();
+    // Another session holds a lock on the table, so the next migration
+    // waits inside its transaction.
+    let locker = connect(&s.admin_url).await;
+    locker
+        .batch_execute(&format!(
+            "BEGIN; LOCK TABLE t_{tenant}.audit_notes IN ACCESS EXCLUSIVE MODE"
+        ))
+        .await
+        .unwrap();
     let mut m = manifest();
     m.migrations[0]
         .statements
-        .push("INSERT INTO audit_notes SELECT 'x', pg_sleep(5)::text".into());
-    // Cancel the migration while it sleeps inside its transaction, after
+        .push("ALTER TABLE audit_notes ADD COLUMN waited text".into());
+    // Cancel the migration while it waits inside its transaction, after
     // reading the pid of the backend running it from pg_stat_activity.
     let find_pid = async {
         loop {
@@ -1848,7 +1863,7 @@ async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
                 .admin
                 .query(
                     "SELECT pid FROM pg_stat_activity WHERE usename = $1 \
-                     AND state = 'active' AND query LIKE 'INSERT INTO audit_notes SELECT%'",
+                     AND state = 'active' AND wait_event_type = 'Lock'",
                     &[&owner],
                 )
                 .await
@@ -1862,7 +1877,7 @@ async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
     let migration = migrate_tenant(&exec, &m, &tenant);
     let sleeping_pid = tokio::select! {
         pid = tokio::time::timeout(std::time::Duration::from_secs(4), find_pid) => {
-            pid.expect("the migration's pg_sleep never showed up in pg_stat_activity")
+            pid.expect("the waiting migration never showed up in pg_stat_activity")
         }
         done = migration => panic!("the migration should still be running: {done:?}"),
     };
@@ -1898,16 +1913,18 @@ async fn cancelled_migration_does_not_return_its_connection_mid_transaction() {
         "the old backend went back to the pool as idle"
     );
     // The pool's only connection was discarded, not reused mid-transaction:
-    // a fresh session sees no open transaction and the schema never existed.
+    // a fresh session sees no open transaction and the column was not added.
     let got = exec
         .query_texts(
             "SELECT coalesce(txid_current_if_assigned()::text, 'none') || '|' || \
-             (SELECT count(*) FROM pg_namespace WHERE nspname = $1)::text",
+             (SELECT count(*) FROM information_schema.columns WHERE table_schema = $1 \
+              AND table_name = 'audit_notes' AND column_name = 'waited')::text",
             &format!("t_{tenant}"),
         )
         .await
         .unwrap();
     assert_eq!(got, vec!["none|0".to_string()]);
+    locker.batch_execute("ROLLBACK").await.unwrap();
 }
 
 // ---- D129 owner login window, allowlist and index placement ----
@@ -2143,8 +2160,34 @@ async fn unique_indexes_are_transactional_and_others_concurrent_after_commit() {
     );
 }
 
+/// Indexes in `schema` that the platform recorded as built by its
+/// concurrent index step.
+async fn recorded_indexes(admin: &Client, tenant: &str) -> Vec<String> {
+    admin
+        .query(
+            "SELECT index_name FROM public.vibe_concurrent_indexes WHERE tenant = $1 ORDER BY 1",
+            &[&tenant],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+async fn mark_invalid(admin: &Client, schema: &str, names: &[&str]) {
+    for name in names {
+        admin
+            .batch_execute(&format!(
+                "UPDATE pg_index SET indisvalid = false WHERE indexrelid = '{schema}.{name}'::regclass"
+            ))
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test]
-async fn invalid_indexes_are_dropped_and_rebuilt_with_an_audit_entry() {
+async fn platform_recorded_invalid_index_is_dropped_and_rebuilt_with_an_audit_entry() {
     let s = require_pg!(setup().await);
     let tenant = format!("tr{}", suffix());
     let schema = format!("t_{tenant}");
@@ -2158,25 +2201,20 @@ async fn invalid_indexes_are_dropped_and_rebuilt_with_an_audit_entry() {
     vibe::runtime::migrate_with_owner_window(&s.admin_url, &m, &tenant)
         .await
         .unwrap();
-    // Simulate failed concurrent builds: both indexes left INVALID.
-    s.admin
-        .batch_execute(&format!(
-            "UPDATE pg_index SET indisvalid = false WHERE indexrelid IN \
-             ('{schema}.audit_note_u'::regclass, '{schema}.audit_note_p'::regclass)"
-        ))
-        .await
-        .unwrap();
-    assert!(indexes(&s.admin, &schema).await.iter().any(|i| !i.2));
+    // Only the concurrent index step's index is recorded.
+    assert_eq!(
+        recorded_indexes(&s.admin, &tenant).await,
+        vec!["audit_note_p"]
+    );
+    // Simulate a failed concurrent build.
+    mark_invalid(&s.admin, &schema, &["audit_note_p"]).await;
     let log = vibe::runtime::migrate_with_owner_window(&s.admin_url, &m, &tenant)
         .await
         .unwrap();
-    for (name, when) in [
-        ("audit_note_u", "in the migration transaction"),
-        ("audit_note_p", "concurrently after commit"),
-    ] {
-        let line = format!("audit: dropped invalid index {schema}.{name}; rebuilding {when}");
-        assert!(log.contains(&line), "{line} not in {log:?}");
-    }
+    let line = format!(
+        "audit: dropped invalid index {schema}.audit_note_p; rebuilding concurrently after commit"
+    );
+    assert!(log.contains(&line), "{line} not in {log:?}");
     let got = indexes(&s.admin, &schema).await;
     assert!(
         got.contains(&("audit_note_u".into(), true, true)),
@@ -2193,6 +2231,90 @@ async fn invalid_indexes_are_dropped_and_rebuilt_with_an_audit_entry() {
             .any(|e| e.starts_with("dropped invalid index") && e.contains("audit_note_p")),
         "{events:?}"
     );
+}
+
+#[tokio::test]
+async fn invalid_index_not_recorded_by_the_platform_is_left_untouched() {
+    let s = require_pg!(setup().await);
+    let tenant = format!("tn{}", suffix());
+    let schema = format!("t_{tenant}");
+    let mut m = manifest();
+    m.migrations[0].statements.push(
+        "CREATE UNIQUE INDEX IF NOT EXISTS audit_note_u ON audit_notes (tenant_id, note)"
+            .to_string(),
+    );
+    ensure_nologin_owner(&s.admin_url, &tenant).await;
+    vibe::runtime::migrate_with_owner_window(&s.admin_url, &m, &tenant)
+        .await
+        .unwrap();
+    // An index made outside the concurrent index step, plus the migration's
+    // UNIQUE index (built in the transaction, never recorded): both INVALID.
+    s.admin
+        .batch_execute(&format!(
+            "CREATE INDEX outside_idx ON {schema}.audit_notes (note)"
+        ))
+        .await
+        .unwrap();
+    mark_invalid(&s.admin, &schema, &["outside_idx", "audit_note_u"]).await;
+    assert!(recorded_indexes(&s.admin, &tenant).await.is_empty());
+    let oids_before = s
+        .admin
+        .query(
+            &format!(
+                "SELECT '{schema}.outside_idx'::regclass::oid, '{schema}.audit_note_u'::regclass::oid"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let log = vibe::runtime::migrate_with_owner_window(&s.admin_url, &m, &tenant)
+        .await
+        .unwrap();
+    assert!(
+        !log.iter().any(|l| l.contains("dropped invalid index")),
+        "{log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|l| l.contains("outside_idx") && l.contains("left in place")),
+        "{log:?}"
+    );
+    let got = indexes(&s.admin, &schema).await;
+    assert!(
+        got.contains(&("outside_idx".into(), false, false)),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("audit_note_u".into(), true, false)),
+        "{got:?}"
+    );
+    let oids_after = s
+        .admin
+        .query(
+            &format!(
+                "SELECT '{schema}.outside_idx'::regclass::oid, '{schema}.audit_note_u'::regclass::oid"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let pair = |rows: &[tokio_postgres::Row]| -> (u32, u32) { (rows[0].get(0), rows[0].get(1)) };
+    assert_eq!(pair(&oids_before), pair(&oids_after));
+    // A record for another tenant does not count for this one.
+    s.admin
+        .execute(
+            "INSERT INTO public.vibe_concurrent_indexes (tenant, index_name) VALUES ($1, 'outside_idx') \
+             ON CONFLICT DO NOTHING",
+            &[&format!("{tenant}x")],
+        )
+        .await
+        .unwrap();
+    vibe::runtime::migrate_with_owner_window(&s.admin_url, &m, &tenant)
+        .await
+        .unwrap();
+    assert!(indexes(&s.admin, &schema)
+        .await
+        .contains(&("outside_idx".into(), false, false)));
 }
 
 #[tokio::test]
@@ -2467,4 +2589,83 @@ async fn replay_store_fails_closed_when_unusable() {
     assert!(is_unavailable(
         store.reserve(&token_key("x"), None, None).await
     ));
+}
+
+// D129 (4): idle tenant pools close and reopen on the next request.
+
+fn select_notes() -> Stmt {
+    Stmt::Select {
+        table: "notes".into(),
+        columns: vec![],
+        id: None,
+        filters: vec![],
+        sort: None,
+        limit: 1,
+        offset: 0,
+    }
+}
+
+#[tokio::test]
+async fn idle_tenant_pools_close_and_reopen_on_the_next_request() {
+    let s = require_pg!(setup().await);
+    assert_eq!(
+        vibe::runtime::POOL_IDLE_TIMEOUT,
+        std::time::Duration::from_secs(300)
+    );
+    let pools = pools_for(&s.admin_url, &[&s.tenant])
+        .with_idle_timeout(std::time::Duration::from_millis(200));
+    pools
+        .execute(&s.tenant, "app_rw", select_notes())
+        .await
+        .unwrap();
+    assert_eq!(pools.open_pools().await, 1);
+    // Used recently: stays open.
+    assert_eq!(pools.close_idle().await, 0);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Unused but a request holds its slot: stays open.
+    let held = pools.acquire(&s.tenant, "app_rw").unwrap();
+    let conn = pools.pool(&s.tenant, "app_rw").await.unwrap().pool();
+    let checked_out = conn.get().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(pools.close_idle().await, 0);
+    drop(checked_out);
+    drop(held);
+    let before = vibe::runtime::pool_idle_closed_total();
+    assert_eq!(pools.close_idle().await, 1);
+    assert_eq!(pools.open_pools().await, 0);
+    assert!(vibe::runtime::pool_idle_closed_total() > before);
+    assert!(conn.is_closed());
+    // The next request opens it again.
+    pools
+        .execute(&s.tenant, "app_rw", select_notes())
+        .await
+        .unwrap();
+    assert_eq!(pools.open_pools().await, 1);
+}
+
+#[tokio::test]
+async fn idle_closer_task_closes_unused_pools() {
+    let s = require_pg!(setup().await);
+    let pools = std::sync::Arc::new(
+        pools_for(&s.admin_url, &[&s.tenant])
+            .with_idle_timeout(std::time::Duration::from_millis(100)),
+    );
+    let task = vibe::runtime::TenantPools::spawn_idle_closer(&pools);
+    pools
+        .execute(&s.tenant, "app_rw", select_notes())
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pools.open_pools().await > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "idle pool was never closed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    drop(pools);
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("the closer stops once the pools are dropped")
+        .unwrap();
 }

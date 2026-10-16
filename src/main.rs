@@ -432,6 +432,8 @@ async fn cmd_serve(
             pools.max_connections()
         );
         let pools = Arc::new(pools);
+        // D129 (4): a tenant's pools close after 5 minutes unused.
+        vibe::runtime::TenantPools::spawn_idle_closer(&pools);
         pg_pools = Some(pools.clone());
         pools
     };

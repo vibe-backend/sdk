@@ -315,7 +315,26 @@ pub struct TenantPools {
     /// Connections in use per (tenant, role) and per tenant.
     role_slots: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     tenant_slots: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
-    pools: tokio::sync::Mutex<HashMap<String, Arc<PgExec>>>,
+    pools: tokio::sync::Mutex<HashMap<String, OpenPool>>,
+    /// A pool unused for this long is closed (D129 (4)); reopened lazily.
+    idle_timeout: std::time::Duration,
+}
+
+/// An open (tenant, role) pool and when a request last used it.
+struct OpenPool {
+    exec: Arc<PgExec>,
+    last_used: std::time::Instant,
+}
+
+/// Tenant pools are closed after this long without use (spec D129 (4)).
+pub const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+static POOLS_IDLE_CLOSED: AtomicU64 = AtomicU64::new(0);
+
+/// Metric `vibe_db_pool_idle_closed_total`: tenant pools closed after
+/// [`POOL_IDLE_TIMEOUT`] without use, since process start.
+pub fn pool_idle_closed_total() -> u64 {
+    POOLS_IDLE_CLOSED.load(Ordering::Relaxed)
 }
 
 impl TenantPools {
@@ -364,6 +383,67 @@ impl TenantPools {
             role_slots: std::sync::Mutex::default(),
             tenant_slots: std::sync::Mutex::default(),
             pools: tokio::sync::Mutex::default(),
+            idle_timeout: POOL_IDLE_TIMEOUT,
+        })
+    }
+
+    /// Changes how long a pool may stay unused before it is closed
+    /// (default [`POOL_IDLE_TIMEOUT`]; tests use a shorter one).
+    pub fn with_idle_timeout(mut self, idle_timeout: std::time::Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// Number of (tenant, role) pools currently open.
+    pub async fn open_pools(&self) -> usize {
+        self.pools.lock().await.len()
+    }
+
+    /// Closes every pool that has not been used for the idle timeout and has
+    /// no connection checked out. Returns how many were closed. The next
+    /// request for that tenant and role opens its pool again.
+    pub async fn close_idle(&self) -> usize {
+        let now = std::time::Instant::now();
+        let mut pools = self.pools.lock().await;
+        let idle: Vec<String> = pools
+            .iter()
+            .filter(|(_, open)| {
+                let status = open.exec.pool().status();
+                now.duration_since(open.last_used) >= self.idle_timeout
+                    && status.size == status.available
+                    && status.waiting == 0
+            })
+            .map(|(role, _)| role.clone())
+            .collect();
+        for role in &idle {
+            if let Some(open) = pools.remove(role) {
+                open.exec.pool().close();
+                let total = POOLS_IDLE_CLOSED.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::info!(
+                    role = role.as_str(),
+                    vibe_db_pool_idle_closed_total = total,
+                    "closed idle tenant pool"
+                );
+            }
+        }
+        idle.len()
+    }
+
+    /// Runs [`Self::close_idle`] periodically until `pools` is dropped.
+    pub fn spawn_idle_closer(pools: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let weak = Arc::downgrade(pools);
+        let every = (pools.idle_timeout / 5).clamp(
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(60),
+        );
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(pools) = weak.upgrade() else { return };
+                pools.close_idle().await;
+            }
         })
     }
 
@@ -458,14 +538,21 @@ impl TenantPools {
     pub async fn pool(&self, tenant: &str, class: &str) -> Result<Arc<PgExec>, String> {
         let role = tenant_role(tenant, class)?;
         let mut pools = self.pools.lock().await;
-        if let Some(pool) = pools.get(&role) {
-            return Ok(pool.clone());
+        if let Some(open) = pools.get_mut(&role) {
+            open.last_used = std::time::Instant::now();
+            return Ok(open.exec.clone());
         }
         // Connection errors from PgExec never include the URL (password).
         let pool = PgExec::connect_with(&self.url_for(&role)?, self.options.clone()).await?;
         pool.check_tenant_role(tenant, class).await?;
         let pool = Arc::new(pool);
-        pools.insert(role, pool.clone());
+        pools.insert(
+            role,
+            OpenPool {
+                exec: pool.clone(),
+                last_used: std::time::Instant::now(),
+            },
+        );
         Ok(pool)
     }
 

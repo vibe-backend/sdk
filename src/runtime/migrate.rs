@@ -1,6 +1,6 @@
 use crate::manifest::Manifest;
 
-use super::allowlist::{classify, rebuild_placement, Placement};
+use super::allowlist::{classify, rebuild_placement, ConcurrentIndex, Placement};
 use super::exec::{PgExec, PgSession};
 use super::grants::{parse_grants, pg_grant_statements};
 use super::slugs::valid_tenant;
@@ -68,6 +68,22 @@ pub async fn migrate_tenant(
     exec: &PgExec,
     manifest: &Manifest,
     tenant: &str,
+) -> Result<Vec<String>, String> {
+    migrate_tenant_recorded(exec, manifest, tenant, &[], &mut Vec::new()).await
+}
+
+/// [`migrate_tenant`] with the platform's index records (spec §2B.3 item
+/// 5): `recorded` lists the indexes the concurrent index step built earlier
+/// in this tenant's schema (the only INVALID indexes migrate drops and
+/// rebuilds); `built` receives the name of every index this run's
+/// concurrent index step started, whether or not it succeeded, for the
+/// caller to record.
+pub async fn migrate_tenant_recorded(
+    exec: &PgExec,
+    manifest: &Manifest,
+    tenant: &str,
+    recorded: &[String],
+    built: &mut Vec<String>,
 ) -> Result<Vec<String>, String> {
     if !valid_tenant(tenant) {
         return Err(super::slugs::TENANT_ID_RULE.into());
@@ -165,7 +181,8 @@ pub async fn migrate_tenant(
         session
             .batch(&[format!("SET LOCAL vibe.migrate_tx = '{marker}'")])
             .await?;
-        let (mut log, deferred) = migrate_in_tx(&session, manifest, &placed, tenant).await?;
+        let (mut log, deferred) =
+            migrate_in_tx(&session, manifest, &placed, tenant, recorded).await?;
         log.extend(verify_tenant(&session, tenant).await?);
         still_in_transaction(&session, &marker).await?;
         Ok::<_, String>((log, deferred))
@@ -175,7 +192,7 @@ pub async fn migrate_tenant(
         Ok((mut log, deferred)) => {
             session.batch(&["COMMIT".to_string()]).await?;
             session.in_transaction(false);
-            log.extend(build_indexes_after_commit(&session, tenant, &deferred).await?);
+            log.extend(build_indexes_after_commit(&session, tenant, &deferred, built).await?);
             Ok(log)
         }
         Err(err) => {
@@ -308,8 +325,8 @@ fn strip_leading_comments(mut sql: &str) -> &str {
 }
 
 /// A non-unique index built `CONCURRENTLY` after the main transaction
-/// commits: (migration id or `rebuild`, SQL).
-type Deferred = Vec<(String, String)>;
+/// commits: (migration id or `rebuild`, index).
+type Deferred = Vec<(String, ConcurrentIndex)>;
 
 /// Prefix of log lines that `vibe migrate` also writes to the audit table.
 pub const AUDIT_PREFIX: &str = "audit: ";
@@ -319,6 +336,7 @@ async fn migrate_in_tx(
     manifest: &Manifest,
     placed: &[(String, Vec<Placement>)],
     tenant: &str,
+    recorded: &[String],
 ) -> Result<(Vec<String>, Deferred), String> {
     let mut deferred: Deferred = Vec::new();
     let mut log = Vec::new();
@@ -352,7 +370,7 @@ async fn migrate_in_tx(
     }
     // An index left INVALID by a failed concurrent build is dropped and
     // rebuilt (spec §2B), with an audit entry.
-    log.extend(drop_invalid_indexes(exec, &schema, &mut deferred).await?);
+    log.extend(drop_invalid_indexes(exec, &schema, recorded, &mut deferred).await?);
     // Migration DDL names tables unqualified; resolve them in the tenant
     // schema; each batch sets it for the migration statements that follow.
     for (id, steps) in placed {
@@ -366,7 +384,7 @@ async fn migrate_in_tx(
                     .execute_one(sql)
                     .await
                     .map_err(|err| format!("{id}: {err}"))?,
-                Placement::AfterCommit(sql) => deferred.push((id.clone(), sql.clone())),
+                Placement::AfterCommit(index) => deferred.push((id.clone(), index.clone())),
             }
         }
         exec.batch(&["RESET search_path".to_string()]).await?;
@@ -428,36 +446,59 @@ async fn migrate_in_tx(
     Ok((log, deferred))
 }
 
-/// Indexes in `schema` that are INVALID (a failed `CREATE INDEX
-/// CONCURRENTLY`): each is dropped in the main transaction and rebuilt,
-/// UNIQUE ones right away in the transaction, others after commit.
+/// INVALID indexes left by a failed concurrent index step (spec §2B.3 item
+/// 5). Only an index that is (i) recorded in `recorded` (the platform's own
+/// concurrent index step records), (ii) in `schema` and (iii) marked
+/// `pg_index.indisvalid = false` is dropped and rebuilt, UNIQUE ones right
+/// away in the transaction, others after commit. The name used is the
+/// recorded one. Any other INVALID index is left in place and reported.
 async fn drop_invalid_indexes(
     exec: &PgSession,
     schema: &str,
+    recorded: &[String],
     deferred: &mut Deferred,
 ) -> Result<Vec<String>, String> {
+    let recorded: Vec<String> = recorded.to_vec();
     let rows = (**exec)
         .query(
-            "SELECT c.relname::text, pg_get_indexdef(c.oid) FROM pg_index i \
+            "SELECT c.relname::text, pg_get_indexdef(c.oid), c.relname = ANY($2::text[]) \
+             FROM pg_index i \
              JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = $1 AND NOT i.indisvalid ORDER BY 1",
-            &[&schema],
+            &[&schema, &recorded],
         )
         .await
         .map_err(super::exec::pg_error)?;
     let mut log = Vec::new();
     for row in rows {
-        let (name, def): (String, String) = (row.get(0), row.get(1));
-        exec.batch(&[format!("DROP INDEX {}.{}", quote(schema)?, quote(&name)?)])
+        let (found, def, is_recorded): (String, String, bool) =
+            (row.get(0), row.get(1), row.get(2));
+        let Some(name) = recorded
+            .iter()
+            .find(|r| **r == found)
+            .filter(|_| is_recorded)
+        else {
+            tracing::error!(
+                schema,
+                index = found.as_str(),
+                "ALERT: INVALID index not built by the platform's concurrent index step; left in place"
+            );
+            log.push(format!(
+                "{AUDIT_PREFIX}invalid index {schema}.{} was not built by the platform's concurrent index step; left in place (use the 2B deprecation flow)",
+                quote(&found).unwrap_or_else(|_| "?".into())
+            ));
+            continue;
+        };
+        exec.batch(&[format!("DROP INDEX {}.{}", quote(schema)?, quote(name)?)])
             .await?;
-        let placement = rebuild_placement(&def);
+        let placement = rebuild_placement(&def)?;
         let when = match &placement {
             Placement::InTransaction(sql) => {
                 exec.execute_one(sql).await?;
                 "in the migration transaction"
             }
-            Placement::AfterCommit(sql) => {
-                deferred.push(("rebuild".into(), sql.clone()));
+            Placement::AfterCommit(index) => {
+                deferred.push(("rebuild".into(), index.clone()));
                 "concurrently after commit"
             }
         };
@@ -469,13 +510,15 @@ async fn drop_invalid_indexes(
 }
 
 /// Builds the deferred non-unique indexes, one audited step each, after the
-/// main transaction committed (still inside the owner login window). A
-/// failure is reported; the index it leaves INVALID is dropped and rebuilt
-/// on the next migrate.
+/// main transaction committed (still inside the owner login window). Each
+/// index this step creates is added to `built` before it runs (an index
+/// that already existed is not). A failure is reported; the index it
+/// leaves INVALID is dropped and rebuilt on the next migrate.
 async fn build_indexes_after_commit(
     exec: &PgSession,
     tenant: &str,
     deferred: &Deferred,
+    built: &mut Vec<String>,
 ) -> Result<Vec<String>, String> {
     let schema = format!("t_{tenant}");
     let mut log = Vec::new();
@@ -484,8 +527,19 @@ async fn build_indexes_after_commit(
     }
     exec.batch(&[format!("SET search_path TO {}", quote(&schema)?)])
         .await?;
-    for (id, sql) in deferred {
-        if let Err(err) = exec.execute_one(sql).await {
+    for (id, index) in deferred {
+        let exists = (**exec)
+            .query(
+                "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[&schema, &index.name],
+            )
+            .await
+            .map_err(super::exec::pg_error)?;
+        if exists.is_empty() {
+            built.push(index.name.clone());
+        }
+        if let Err(err) = exec.execute_one(&index.sql).await {
             let _ = exec.batch(&["RESET search_path".to_string()]).await;
             return Err(format!(
                 "{id}: the main migration transaction for {schema} committed, but the concurrent index step failed: {err}; an INVALID index it left is dropped and rebuilt on the next migrate"
@@ -814,6 +868,19 @@ pub async fn migrate_with_owner_window(
             "refusing to migrate t_{tenant}: {owner} can already log in outside a migrate window; set it NOLOGIN and investigate (see the owner login check)"
         ));
     }
+    // The platform's own records of indexes its concurrent index step built.
+    lock.batch(&[INDEX_RECORD_TABLE_SQL.to_string()]).await?;
+    let recorded: Vec<String> = (*lock)
+        .query(
+            "SELECT index_name FROM public.vibe_concurrent_indexes WHERE tenant = $1 ORDER BY 1",
+            &[&tenant],
+        )
+        .await
+        .map_err(super::exec::pg_error)?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let mut built = Vec::new();
     let password = one_time_password();
     let verifier = postgres_protocol::password::scram_sha_256(password.as_bytes());
     let opened = lock
@@ -828,14 +895,14 @@ pub async fn migrate_with_owner_window(
             async {
                 let owner_url = url_with_login(admin_url, &owner, &password)?;
                 let exec = PgExec::connect(&owner_url).await?;
-                migrate_tenant(&exec, manifest, tenant).await
+                migrate_tenant_recorded(&exec, manifest, tenant, &recorded, &mut built).await
             }
             .await
         }
     };
     drop(password);
     // finally: always, on a separate admin connection.
-    let closed = close_owner_window(admin_url, &owner, tenant, &result).await;
+    let closed = close_owner_window(admin_url, &owner, tenant, &result, &built).await;
     let _ = lock
         .batch(&["SELECT pg_advisory_unlock_all()".to_string()])
         .await;
@@ -853,6 +920,7 @@ async fn close_owner_window(
     owner: &str,
     tenant: &str,
     result: &Result<Vec<String>, String>,
+    built: &[String],
 ) -> Result<(), String> {
     let mut last = String::new();
     for _ in 0..3 {
@@ -873,7 +941,17 @@ async fn close_owner_window(
             events.push(format!(
                 "owner login window closed: {owner} NOLOGIN, password removed"
             ));
-            session.batch(&[AUDIT_TABLE_SQL.to_string()]).await?;
+            session.batch(&[AUDIT_TABLE_SQL.to_string(), INDEX_RECORD_TABLE_SQL.to_string()]).await?;
+            for name in built {
+                (*session)
+                    .execute(
+                        "INSERT INTO public.vibe_concurrent_indexes (tenant, index_name) VALUES ($1, $2) \
+                         ON CONFLICT DO NOTHING",
+                        &[&tenant, name],
+                    )
+                    .await
+                    .map_err(super::exec::pg_error)?;
+            }
             for event in events {
                 (*session)
                     .execute(
@@ -904,6 +982,14 @@ async fn close_owner_window(
 pub const AUDIT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS public.vibe_migrate_audit (\
  at timestamptz NOT NULL DEFAULT now(), tenant text NOT NULL, event text NOT NULL); \
  REVOKE ALL ON public.vibe_migrate_audit FROM PUBLIC";
+
+/// Platform record of indexes built by the concurrent index step (spec
+/// §2B.3 item 5), written by the platform-admin connection only.
+pub const INDEX_RECORD_TABLE_SQL: &str =
+    "CREATE TABLE IF NOT EXISTS public.vibe_concurrent_indexes (\
+ tenant text NOT NULL, index_name text NOT NULL, at timestamptz NOT NULL DEFAULT now(), \
+ PRIMARY KEY (tenant, index_name)); \
+ REVOKE ALL ON public.vibe_concurrent_indexes FROM PUBLIC";
 
 /// Owner login alerts raised since process start (`vibe check-owners`).
 static OWNER_LOGIN_ALERTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

@@ -880,11 +880,23 @@ fn check_migration_sql(doc: &LockDoc, file: &str, report: &mut Report) {
                     .at_section("Up"),
             );
         }
-        let lower = sql.to_ascii_lowercase();
-        if lower.contains("create index") && !lower.contains("concurrently") {
+        if let Err(problem) = crate::runtime::allowlist::classify(&sql) {
             report.push(
-                Diag::error(file, "CREATE INDEX must be CONCURRENTLY").at_step(&block.heading),
+                Diag::error(file, problem)
+                    .at_step(&block.heading)
+                    .at_section("Up"),
             );
+        }
+        // Spec 10.1: from the parsed index, not the text.
+        match crate::runtime::allowlist::index_kind(&sql) {
+            Some((false, false)) => report.push(
+                Diag::error(file, "CREATE INDEX must be CONCURRENTLY").at_step(&block.heading),
+            ),
+            Some((true, true)) => report.push(
+                Diag::error(file, "CREATE UNIQUE INDEX must not be CONCURRENTLY")
+                    .at_step(&block.heading),
+            ),
+            _ => {}
         }
     }
 }

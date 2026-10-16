@@ -35,13 +35,15 @@ pub fn hash_password_for_tests(plain: &str) -> String {
 pub use limiter::{saturation_refusals, ProxyNet, QuotaBuckets, RateBuckets};
 pub use memory::{MemoryExec, MEMORY_UNSUPPORTED_SQL};
 pub use migrate::{
-    check_owner_logins, migrate_tenant, migrate_with_owner_window, owner_login_alerts_total,
+    check_owner_logins, migrate_tenant, migrate_tenant_recorded, migrate_with_owner_window,
+    owner_login_alerts_total,
 };
 pub use pools::{
     parse_pool_max_total, parse_tenant_role, pool_exhausted_count, pool_exhausted_metrics,
-    pool_exhausted_total, secret_source, secret_source_from_env, EnvSecrets, FileSecrets,
-    PoolScope, TenantPools, TenantSecretSource, DEFAULT_MAX_CONNECTIONS, DEV_SECRETS_FILE,
-    MAX_TENANT_CONNECTIONS, MAX_TENANT_POOL_SIZE, POOL_MAX_TOTAL_ENV,
+    pool_exhausted_total, pool_idle_closed_total, secret_source, secret_source_from_env,
+    EnvSecrets, FileSecrets, PoolScope, TenantPools, TenantSecretSource, DEFAULT_MAX_CONNECTIONS,
+    DEV_SECRETS_FILE, MAX_TENANT_CONNECTIONS, MAX_TENANT_POOL_SIZE, POOL_IDLE_TIMEOUT,
+    POOL_MAX_TOTAL_ENV,
 };
 pub use slugs::{add_slug, load_project_slugs, valid_tenant, SlugLoad, TENANT_ID_RULE};
 pub use sql::{
