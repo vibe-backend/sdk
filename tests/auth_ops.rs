@@ -59,9 +59,12 @@ fn jsonwebtoken_rejects_off_curve_key_without_startup_checks() {
         "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
         STANDARD.encode(&der)
     );
-    if let Ok(key) = DecodingKey::from_ec_pem(pem.as_bytes()) {
-        assert!(decode::<Value>(&token, &key, &validation).is_err());
-    }
+    assert_eq!(
+        vibe::runtime::eckey::p256_public(&pem),
+        Err(vibe::runtime::eckey::EcProblem::BadPoint)
+    );
+    let key = DecodingKey::from_ec_pem(pem.as_bytes()).expect("off-curve PEM loads");
+    assert!(decode::<Value>(&token, &key, &validation).is_err());
 }
 
 fn fixture() -> Manifest {
@@ -1237,8 +1240,27 @@ fn sign_jwt_without_alg_defaults_to_es256() {
 #[test]
 fn es256_signing_key_must_be_p256() {
     // Decision 139: other curves refuse to start.
+    let pem = include_str!("../src/runtime/testdata/ec-p384-k.pem");
+    for alg in [Some("ES256"), None] {
+        let err = vibe::runtime::load_signing_keys(
+            &fixture_with_alg(alg),
+            &|name| (name == "JWT_SIGNING_KEY").then(|| pem.to_string()),
+            "local",
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("P-256"), "{err}");
+        assert!(
+            !err.contains("MI"),
+            "key material must not be printed: {err}"
+        );
+    }
+}
+
+#[test]
+fn sec1_signing_keys_are_rejected() {
     for pem in [
-        include_str!("../src/runtime/testdata/ec-p384-k.pem"),
+        include_str!("../src/runtime/testdata/ec-p256-sec1.pem"),
         include_str!("../src/runtime/testdata/ec-p384-sec1.pem"),
     ] {
         for alg in [Some("ES256"), None] {
@@ -1249,10 +1271,9 @@ fn es256_signing_key_must_be_p256() {
             )
             .err()
             .unwrap();
-            assert!(err.contains("P-256"), "{err}");
-            assert!(
-                !err.contains("MI"),
-                "key material must not be printed: {err}"
+            assert_eq!(
+                err,
+                "JWT_SIGNING_KEY: SEC1 EC PRIVATE KEY is not supported; use PKCS#8 PRIVATE KEY"
             );
         }
     }

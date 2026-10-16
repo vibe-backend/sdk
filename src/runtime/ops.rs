@@ -464,7 +464,13 @@ pub fn load_signing_keys(
                 "ES256" | "" => {
                     // Defense-in-depth only: report P-256 curve/point errors at startup.
                     // jsonwebtoken (aws_lc_rs) performs authoritative parsing and
-                    // verification; JWKS keys bypass these hand-written checks.
+                    // verification.
+                    if pem
+                        .lines()
+                        .any(|line| line.trim() == "-----BEGIN EC PRIVATE KEY-----")
+                    {
+                        return Err(format!("{key_ref}: SEC1 EC PRIVATE KEY is not supported; use PKCS#8 PRIVATE KEY"));
+                    }
                     super::eckey::p256_private(&pem)
                         .map_err(|problem| super::http::ec_problem_message(&key_ref, problem))?;
                     (

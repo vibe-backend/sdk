@@ -230,7 +230,7 @@ pub fn parse_jwks(doc: &Value, alg: Algorithm) -> HashMap<String, JwkKey> {
         let parsed = match (alg, s("kty"), s("alg")) {
             (Algorithm::ES256, Some("EC"), None | Some("ES256")) if s("crv") == Some("P-256") => {
                 match (s("x"), s("y")) {
-                    (Some(x), Some(y)) => DecodingKey::from_ec_components(x, y).ok(),
+                    (Some(x), Some(y)) => validated_ec_key(x, y),
                     _ => None,
                 }
             }
@@ -250,6 +250,33 @@ pub fn parse_jwks(doc: &Value, alg: Algorithm) -> HashMap<String, JwkKey> {
         }
     }
     out
+}
+
+/// Validate the uncompressed point as SPKI before keeping an EC JWK.
+fn validated_ec_key(x: &str, y: &str) -> Option<DecodingKey> {
+    use base64::{
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+        Engine,
+    };
+
+    let x_bytes = URL_SAFE_NO_PAD.decode(x).ok()?;
+    let y_bytes = URL_SAFE_NO_PAD.decode(y).ok()?;
+    if x_bytes.len() != 32 || y_bytes.len() != 32 {
+        return None;
+    }
+    // SubjectPublicKeyInfo: id-ecPublicKey, prime256v1, uncompressed point.
+    let mut der = vec![
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
+    ];
+    der.extend_from_slice(&x_bytes);
+    der.extend_from_slice(&y_bytes);
+    let pem = format!(
+        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+        STANDARD.encode(der)
+    );
+    super::eckey::p256_public(&pem).ok()?;
+    DecodingKey::from_ec_components(x, y).ok()
 }
 
 /// Modulus size in bits: `n` decoded (base64url), leading zero bytes and
@@ -366,6 +393,24 @@ mod tests {
             .key_at("a", t0 + Duration::from_secs(3601))
             .await
             .is_none());
+    }
+
+    #[test]
+    fn jwks_ec_keys_are_validated() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let mut y = URL_SAFE_NO_PAD.decode(Y).unwrap();
+        y[31] ^= 1;
+        let keys = parse_jwks(
+            &json!({"keys": [
+                ec("valid"),
+                {"kty": "EC", "crv": "P-256", "kid": "off-curve", "x": X, "y": URL_SAFE_NO_PAD.encode(y)},
+                {"kty": "EC", "crv": "P-256", "kid": "short", "x": "AA", "y": Y},
+                {"kty": "EC", "crv": "P-256", "kid": "malformed", "x": "!", "y": Y}
+            ]}),
+            Algorithm::ES256,
+        );
+        assert_eq!(keys.keys().collect::<Vec<_>>(), vec!["valid"]);
     }
 
     #[test]
