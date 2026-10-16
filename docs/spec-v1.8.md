@@ -1412,7 +1412,8 @@ Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動�
 
 | 決定 | 狀態 | 差異 |
 | --- | --- | --- |
-| 134 啟動閘門 | **Implementation status: not yet implemented**（部分） | `src/main.rs` 同 `src/runtime/challenge.rs` `production_gate` 只檢查 `public` 而且 `when: always` 嘅 route；`after-failures` 同決定 133 已認證 opt-in route 冇 verifier 時唔會擋啟動。follow-up issue #200。 |
+| 134 啟動閘門 | **Implementation status: not yet implemented**（部分） | `production_gate` 仍然只檢查 `public` 而且 `when: always` 嘅 verifier 設定；未驗證嘅 `after-failures`／已認證 opt-in 改由 #199 `unverified_gate` 喺 production 拒絕（見下一列）。follow-up issue #200（verifier 覆蓋範圍）。 |
+| 133／#199 未驗證 challenge | **Implemented**（production 拒絕；runtime 未驗證） | Runtime 而家只驗證 public route 嘅 `when: always` challenge。`when: after-failures`（login 類）同非 public（已認證）route 宣告嘅 challenge 未驗證，所以 production 下 `vibe serve` 同 `vibe validate --deploy` 會拒絕（就算已設定 verifier）；dev／CI 照樣接受。Runtime 驗證呢啲 mode 見 #201。 |
 | 133 Runtime 執行範圍 | **Implementation status: not yet implemented**（部分） | `src/runtime/http.rs` 只對 `public` 而且 `when: always` 嘅 route 做 challenge；`after-failures`（login）同已認證 opt-in route 而家唔會驗證 challenge。follow-up issue #201。 |
 | 135 `Retry-After: 5` | **Implementation status: not yet implemented** | `src/runtime/http.rs` `check_challenge` 回 503 `CHALLENGE_UNAVAILABLE` 時冇 `Retry-After` header。follow-up issue #202。 |
 | 131 `type: pow` build error | **Implementation status: not yet implemented** | `src/validate.rs` 冇呢個檢查；而家係 runtime 回 503。follow-up issue #203。 |
