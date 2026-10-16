@@ -544,19 +544,12 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
     let mut auth = AuthConfig::anonymous();
     if let Ok(pem) = std::env::var("VIBE_JWT_PUBLIC_KEY_PEM") {
         auth.public_pem = pem.replace("\\n", "\n");
-        auth.alg = vibe::runtime::detect_jwt_alg(&auth.public_pem)?;
     }
-    if let Ok(alg) = std::env::var("VIBE_JWT_ALG") {
-        auth.alg = match alg.trim().to_ascii_uppercase().as_str() {
-            "ES256" => jsonwebtoken::Algorithm::ES256,
-            "RS256" => jsonwebtoken::Algorithm::RS256,
-            other => {
-                return Err(format!(
-                    "VIBE_JWT_ALG `{other}`: only ES256 and RS256 are supported"
-                ));
-            }
-        };
-    }
+    let alg_env = std::env::var("VIBE_JWT_ALG").ok();
+    auth.alg = vibe::runtime::static_jwt_alg(
+        (!auth.public_pem.is_empty()).then_some(auth.public_pem.as_str()),
+        alg_env.as_deref(),
+    )?;
     if let Ok(iss) = std::env::var("VIBE_JWT_ISS") {
         auth.iss = iss;
     }
@@ -603,9 +596,9 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
             return Err("VIBE_JWT_ALLOW_PRIVATE_HOST is only allowed in development".into());
         }
         let source = vibe::runtime::jwks::HttpsJwks::with_policy(&uri, allow_private)?;
-        auth.jwks = Some(std::sync::Arc::new(vibe::runtime::jwks::JwksCache::new(
-            std::sync::Arc::new(source),
-        )));
+        auth.jwks = Some(std::sync::Arc::new(
+            vibe::runtime::jwks::JwksCache::with_alg(std::sync::Arc::new(source), auth.alg),
+        ));
     }
     if let Ok(path) = std::env::var("VIBE_API_KEYS_FILE") {
         auth.api_keys_file = Some(std::sync::Arc::new(vibe::runtime::ApiKeyFile::open(
