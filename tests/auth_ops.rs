@@ -154,6 +154,33 @@ async fn random_token_is_always_32_bytes() {
 }
 
 #[tokio::test]
+async fn random_token_uses_unpadded_base64url_alphabet() {
+    // Fixed vector for the engine random-token uses (RFC 4648 §5, no padding).
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    assert_eq!(engine.encode([0xfb, 0xff, 0xbf]), "-_-_");
+    assert_eq!(engine.encode([0u8; 32]), "A".repeat(43));
+    assert_eq!(engine.encode(b"vibe"), "dmliZQ");
+
+    let m = method_manifest(
+        &[],
+        json!([step("random-token", "vt", json!({})), respond("vt")]),
+    );
+    for _ in 0..16 {
+        let out = run(&m, &MemoryExec::new(), json!({})).await.unwrap();
+        let value = out["value"].as_str().unwrap();
+        assert_eq!(value.len(), 43, "{value}");
+        assert!(
+            value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "{value}"
+        );
+        assert_eq!(engine.decode(value).unwrap().len(), 32);
+    }
+}
+
+#[tokio::test]
 async fn hash_and_verify_password_with_dummy_hash_for_missing_users() {
     let m = method_manifest(
         &[],
