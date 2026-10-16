@@ -21,6 +21,10 @@ added only when the corresponding PR is merged to `main`.
 - **Rate limits (#54):** `VIBE_TRUSTED_PROXIES` accepts proxy IPs, CIDR blocks (v4/v6), hops with ports and IPv4-mapped IPv6; `X-Forwarded-For` is used only when the peer is trusted, taking the rightmost untrusted hop. IPv6 clients are bucketed per /64. `Retry-After` is the real time until the oldest hit leaves the window (quota: seconds until UTC midnight). Buckets are held in bounded, per-route/key-type LRU shards (10k each); at-limit buckets are never evicted, and a flood of one key type cannot block other clients.
 - **Request handling (#57):** Authentication, role/scope checks and rate limiting now run before request validation, so unauthenticated callers get 401/403 instead of 422 details. Expression failures return a generic `422 Invalid request` (details go to the server log). Required headers are enforced case-insensitively; body, query and path values are type-checked. Early 400, 413 (payload too large) and 415 (unsupported media type) responses respect the route's `min_response_ms`.
 
+### Security
+
+- **Lock and manifest signatures (#167):** Lock and manifest signature verification now uses `verify_strict`; weak keys and non-canonical signatures are rejected (#151).
+
 <!--
 Pending — add each entry only when its PR merges:
 - #51: migrate requires VIBE_MIGRATE_DATABASE_URL and VIBE_RUNTIME_DB_ROLE; no longer reads VIBE_DATABASE_URL.
