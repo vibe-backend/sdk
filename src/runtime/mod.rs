@@ -6,6 +6,7 @@ pub mod jwks;
 mod limiter;
 mod migrate;
 mod ops;
+pub mod replay;
 mod slugs;
 mod sql;
 
