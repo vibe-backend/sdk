@@ -1340,3 +1340,26 @@ async fn replay_store_fails_closed_when_unusable() {
         store.reserve(&token_key("x"), None, None).await
     ));
 }
+
+#[tokio::test]
+async fn sslmode_require_fails_against_server_without_tls() {
+    let Some(admin) = admin_url() else {
+        if std::env::var_os("CI").is_some() {
+            panic!("VIBE_TEST_PG_ADMIN_URL is not set in CI");
+        }
+        eprintln!("SKIPPED: VIBE_TEST_PG_ADMIN_URL not set");
+        return;
+    };
+    // The CI service container has TLS turned off.
+    let mut url = url::Url::parse(&admin).unwrap();
+    url.query_pairs_mut().append_pair("sslmode", "require");
+    if let Ok(exec) = PgExec::connect(url.as_str()).await {
+        let ssl = exec
+            .query_texts(
+                "SELECT ssl::text || $1 FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                "",
+            )
+            .await;
+        panic!("sslmode=require must not connect to a server without TLS (ssl: {ssl:?})");
+    }
+}
