@@ -1573,6 +1573,16 @@ fn invalid_refresh(request_id: &str) -> HttpResponse {
     )
 }
 
+fn refresh_unavailable(request_id: &str) -> HttpResponse {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "SERVICE_UNAVAILABLE",
+        "Token refresh is temporarily unavailable; try again later",
+        request_id,
+        &[("retry-after", "1")],
+    )
+}
+
 fn rate_limited_response(request_id: &str, retry: &str) -> HttpResponse {
     error_response(
         StatusCode::TOO_MANY_REQUESTS,
@@ -1611,7 +1621,17 @@ async fn refresh_response(
         return invalid_refresh(request_id);
     };
     let hash = super::ops::refresh_hash(&state.auth.pepper, token);
-    if let Ok(Some(family)) = state.exec.refresh_family(tenant, &hash).await {
+    // The family lookup must succeed before rotating: a store error fails
+    // closed with a retryable 503 instead of skipping the family limit. The
+    // presented token is not consumed, so the client can retry it.
+    let family = match state.exec.refresh_family(tenant, &hash).await {
+        Ok(family) => family,
+        Err(err) => {
+            tracing::error!(%request_id, %tenant, error = ?err, "refresh family lookup failed; failing closed");
+            return refresh_unavailable(request_id);
+        }
+    };
+    if let Some(family) = family {
         let per_minute = route
             .rates
             .iter()
