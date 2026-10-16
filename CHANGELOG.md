@@ -36,6 +36,7 @@ added only when the corresponding PR is merged to `main`.
 - LLM dump writes refuse symbolic links, use private permissions and redact known keys, tokens and authorization headers.
 - `LLM_FORMAT_RETRIES` accepts only ASCII digits within its supported range and rejects invalid values.
 - Public LLM requests without an explicit budget receive a default bound.
+- **EC signing keys checked at load (#257):** ES256 private keys (PEM and DER) are now checked when they are loaded: PKCS#8 and SEC1 PEMs (PKCS#8 for DER) must name P-256, included public points must lie on the curve, the encoding must cover the input exactly (no trailing data) and the private scalar must be in `1..n-1`. Such keys are refused at startup instead of being accepted or failing at the first signature.
 - **Postgres TLS (#174):** `TlsMode::Require` (`sslmode=require`) previously did not enable TLS for database connections. It now requires TLS and fails to connect if the server does not offer it. `sslrootcert` is honored, and an unreadable or empty `sslrootcert` file is reported as an error.
 
 ### Breaking

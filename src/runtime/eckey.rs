@@ -6,8 +6,8 @@
 //! performed by jsonwebtoken (aws_lc_rs backend). JWKS public keys are also checked
 //! when loaded.
 //!
-//! Reads SubjectPublicKeyInfo (`PUBLIC KEY`), PKCS#8 (`PRIVATE KEY`) and
-//! SEC1 (`EC PRIVATE KEY`) PEMs. Public points must be uncompressed and lie
+//! Reads SubjectPublicKeyInfo (`PUBLIC KEY`) and PKCS#8 (`PRIVATE KEY`)
+//! PEMs. Public points must be uncompressed and lie
 //! on the curve.
 
 use super::rsakey::{algorithm_identifier, pem_der, tlv, whole};
@@ -21,6 +21,9 @@ const P256_OID: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 #[derive(Debug, PartialEq, Eq)]
 pub enum EcProblem {
     NotEc,
+    /// Bare SEC1 private keys are unsupported, regardless of PEM label.
+    Sec1,
+    InvalidPem,
     OtherCurve,
     BadPoint,
     /// Private scalar d is not in `1..n-1`.
@@ -31,7 +34,7 @@ pub enum EcProblem {
 
 /// `Ok` when `pem` is a P-256 public key with a valid point.
 pub fn p256_public(pem: &str) -> Result<(), EcProblem> {
-    let (label, der) = pem_der(pem).ok_or(EcProblem::NotEc)?;
+    let (label, der) = pem_der(pem).ok_or(EcProblem::InvalidPem)?;
     if label != "PUBLIC KEY" {
         return Err(EcProblem::NotEc);
     }
@@ -46,31 +49,62 @@ pub fn p256_public(pem: &str) -> Result<(), EcProblem> {
     }
 }
 
-/// `Ok` when `pem` is a P-256 private key (PKCS#8 or SEC1).
-pub fn p256_private(pem: &str) -> Result<(), EcProblem> {
-    let (label, der) = pem_der(pem).ok_or(EcProblem::NotEc)?;
+/// Validates a PKCS#8 PEM and returns its DER for the signing backend.
+pub fn p256_private(pem: &str) -> Result<Vec<u8>, EcProblem> {
+    let (label, der) = pem_der(pem).ok_or(EcProblem::InvalidPem)?;
     match label.as_str() {
         "PRIVATE KEY" => {
-            // SEQUENCE { INTEGER version, AlgorithmIdentifier, OCTET STRING, ... }
-            let seq = whole(&der, 0x30).ok_or(EcProblem::NotEc)?;
-            let (_ver, rest) = tlv(seq, 0x02).ok_or(EcProblem::NotEc)?;
-            let (alg, rest) = tlv(rest, 0x30).ok_or(EcProblem::NotEc)?;
-            curve_of_alg(alg)?;
-            let (key, mut rest) = tlv(rest, 0x04).ok_or(EcProblem::NotEc)?;
-            // Optional [0] attributes and [1] publicKey (PKCS#8 v2), nothing else.
-            for tag in [0xa0, 0xa1] {
-                if let Some((_, more)) = tlv(rest, tag) {
-                    rest = more;
-                }
-            }
-            if !rest.is_empty() {
-                return Err(EcProblem::TrailingData);
-            }
-            sec1_private(key, true)
+            p256_private_der(&der)?;
+            Ok(der)
         }
-        "EC PRIVATE KEY" => sec1_private(&der, false),
+        "EC PRIVATE KEY" => Err(EcProblem::Sec1),
         _ => Err(EcProblem::NotEc),
     }
+}
+
+#[cfg(test)]
+fn der_element(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    if body.len() < 128 {
+        out.push(body.len() as u8);
+    } else {
+        let len = (body.len() as u32).to_be_bytes();
+        let first = len.iter().position(|b| *b != 0).unwrap();
+        out.push(0x80 | (4 - first) as u8);
+        out.extend_from_slice(&len[first..]);
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+/// Checks a PKCS#8 DER private key, sharing all checks with the PEM path.
+pub fn p256_private_der(der: &[u8]) -> Result<(), EcProblem> {
+    // SEQUENCE { INTEGER version, AlgorithmIdentifier, OCTET STRING, ... }
+    let seq = whole(der, 0x30).ok_or(EcProblem::NotEc)?;
+    let (ver, rest) = tlv(seq, 0x02).ok_or(EcProblem::NotEc)?;
+    // SEC1 has version 1 followed by the private scalar OCTET STRING;
+    // PKCS#8 has an AlgorithmIdentifier SEQUENCE in this position.
+    if ver == [1] && tlv(rest, 0x04).is_some() {
+        return Err(EcProblem::Sec1);
+    }
+    let (alg, rest) = tlv(rest, 0x30).ok_or(EcProblem::NotEc)?;
+    curve_of_alg(alg)?;
+    let (key, mut rest) = tlv(rest, 0x04).ok_or(EcProblem::NotEc)?;
+    // Optional attributes and a public point (implicit [1] in RFC 5958).
+    if let Some((_, more)) = tlv(rest, 0xa0) {
+        rest = more;
+    }
+    if let Some((bits, more)) = tlv(rest, 0x81) {
+        check_public_bits(bits)?;
+        rest = more;
+    } else if let Some((public, more)) = tlv(rest, 0xa1) {
+        check_public_bits(whole(public, 0x03).ok_or(EcProblem::NotEc)?)?;
+        rest = more;
+    }
+    if !rest.is_empty() {
+        return Err(EcProblem::TrailingData);
+    }
+    sec1_private(key, true)
 }
 
 /// AlgorithmIdentifier must be id-ecPublicKey with the P-256 named curve.
@@ -90,7 +124,10 @@ fn curve_of_alg(alg: &[u8]) -> Result<(), EcProblem> {
 /// surrounding PKCS#8 already named it.
 fn sec1_private(der: &[u8], curve_known: bool) -> Result<(), EcProblem> {
     let seq = whole(der, 0x30).ok_or(EcProblem::NotEc)?;
-    let (_ver, rest) = tlv(seq, 0x02).ok_or(EcProblem::NotEc)?;
+    let (version, rest) = tlv(seq, 0x02).ok_or(EcProblem::NotEc)?;
+    if version != [1] {
+        return Err(EcProblem::NotEc);
+    }
     let (d, mut rest) = tlv(rest, 0x04).ok_or(EcProblem::NotEc)?;
     if d.len() != 32 {
         return Err(EcProblem::OtherCurve);
@@ -123,6 +160,13 @@ fn sec1_private(der: &[u8], curve_known: bool) -> Result<(), EcProblem> {
         return Err(EcProblem::TrailingData);
     }
     Ok(())
+}
+
+fn check_public_bits(bits: &[u8]) -> Result<(), EcProblem> {
+    match bits.split_first() {
+        Some((0, point)) => check_point(point),
+        _ => Err(EcProblem::BadPoint),
+    }
 }
 
 // --- P-256 point validation -------------------------------------------------
@@ -272,19 +316,20 @@ mod tests {
     #[test]
     fn p256_keys_are_accepted() {
         assert_eq!(p256_public(P256_PUB), Ok(()));
-        assert_eq!(p256_private(P256_SEC1), Ok(()));
+        assert_eq!(p256_private(P256_PKCS8).map(|_| ()), Ok(()));
+        assert_eq!(p256_private(P256_SEC1), Err(EcProblem::Sec1));
     }
 
     #[test]
     fn other_curves_are_refused() {
         assert_eq!(p256_public(P384_PUB), Err(EcProblem::OtherCurve));
         assert_eq!(p256_private(P384_PKCS8), Err(EcProblem::OtherCurve));
-        assert_eq!(p256_private(P384_SEC1), Err(EcProblem::OtherCurve));
+        assert_eq!(p256_private(P384_SEC1), Err(EcProblem::Sec1));
         assert_eq!(
             p256_public(include_str!("testdata/rsa-p2048.pem")),
             Err(EcProblem::NotEc)
         );
-        assert_eq!(p256_public("garbage"), Err(EcProblem::NotEc));
+        assert_eq!(p256_public("garbage"), Err(EcProblem::InvalidPem));
     }
 
     #[test]
@@ -325,6 +370,15 @@ RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
         pem(&label, &der)
     }
 
+    fn validate_private(pem: &str) -> Result<(), EcProblem> {
+        let (label, der) = pem_der(pem).unwrap();
+        if label == "EC PRIVATE KEY" {
+            sec1_private(&der, false)
+        } else {
+            p256_private_der(&der)
+        }
+    }
+
     fn scalars() -> Vec<(&'static str, [u8; 32], bool)> {
         let mut above = ORDER;
         above[31] += 1;
@@ -344,10 +398,10 @@ RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
 
     #[test]
     fn private_scalar_must_be_in_range() {
-        assert_eq!(p256_private(P256_PKCS8), Ok(()));
+        assert_eq!(p256_private(P256_PKCS8).map(|_| ()), Ok(()));
         for src in [P256_PKCS8, P256_SEC1] {
             for (name, d, ok) in scalars() {
-                let res = p256_private(&with_d(src, &d));
+                let res = validate_private(&with_d(src, &d));
                 if ok {
                     assert_eq!(res, Ok(()), "{name}");
                 } else {
@@ -364,7 +418,10 @@ RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
             // After the outer structure.
             let mut outer = der.clone();
             outer.extend_from_slice(&[0x05, 0x00]);
-            assert_eq!(p256_private(&pem(&label, &outer)), Err(EcProblem::NotEc));
+            assert_eq!(
+                validate_private(&pem(&label, &outer)),
+                Err(EcProblem::NotEc)
+            );
             // Inside the outer SEQUENCE (lengths fixed up).
             let mut inner = der.clone();
             let len_at = if der[1] == 0x81 { 2 } else { 1 };
@@ -372,10 +429,41 @@ RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
             inner[len_at] += 2;
             inner.extend_from_slice(&[0x05, 0x00]);
             assert_eq!(
-                p256_private(&pem(&label, &inner)),
+                validate_private(&pem(&label, &inner)),
                 Err(EcProblem::TrailingData),
                 "{label}"
             );
+        }
+    }
+
+    #[test]
+    fn private_public_points_are_checked_in_all_containers() {
+        for src in [P256_PKCS8, P256_SEC1] {
+            let (label, mut der) = pem_der(src).unwrap();
+            *der.last_mut().unwrap() ^= 1;
+            assert_eq!(
+                validate_private(&pem(&label, &der)),
+                Err(EcProblem::BadPoint)
+            );
+        }
+        // RFC 5958 outer publicKey, implicit [1], must also be on P-256.
+        let (_, der) = pem_der(P256_PKCS8).unwrap();
+        let mut body = whole(&der, 0x30).unwrap().to_vec();
+        let mut bits = vec![0, 4];
+        bits.extend([0; 64]);
+        body.extend(der_element(0x81, &bits));
+        assert_eq!(
+            p256_private_der(&der_element(0x30, &body)),
+            Err(EcProblem::BadPoint)
+        );
+    }
+
+    #[test]
+    fn invalid_pem_encoding_has_a_fixed_problem() {
+        for body in ["ABCD!EFG", "ABCDéEFG", "MIGHAgE"] {
+            let pem = format!("-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----");
+            assert_eq!(p256_private(&pem), Err(EcProblem::InvalidPem));
+            assert_eq!(p256_public(&pem), Err(EcProblem::InvalidPem));
         }
     }
 
