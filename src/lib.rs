@@ -20,6 +20,7 @@ pub mod scan;
 pub mod secret;
 pub mod security;
 pub mod sign;
+pub mod sigstore;
 pub mod sqlpolicy;
 pub mod validate;
 

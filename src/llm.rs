@@ -22,6 +22,8 @@ pub struct LlmConfig {
     pub seed: u64,
     pub endpoint_host: String,
     pub endpoint_private: bool,
+    /// When false (`LLM_SEND_SAMPLING=0`), omit temperature/seed/top_* (#35).
+    pub send_sampling: bool,
     /// OpenAI API style: `chat` (default) or `responses` (`LLM_API_STYLE`, #40).
     pub api_style: String,
 }
@@ -79,40 +81,22 @@ impl SentParams {
     }
 }
 
-/// Capability table shipped with this SDK version (spec 2A.8.6, decision 58).
-///
-/// Gemini accepts temperature, topP, topK, and seed for every model. OpenAI
-/// sends sampling parameters only for models that also accept
-/// `reasoning_effort: none` (GPT-5.1 and GPT-5.2). Everything else, including
-/// Anthropic and local OpenAI-compatible tags, gets no sampling parameters.
-pub fn model_capabilities(provider: &str, model: &str, seed: u64) -> SentParams {
-    let model = model.to_ascii_lowercase();
-    if provider == GEMINI {
-        return SentParams {
-            temperature: Some("0".into()),
-            top_p: Some("1".into()),
-            top_k: Some("1".into()),
-            seed: Some(seed.to_string()),
-            reasoning_effort: None,
-        };
-    }
-    if provider == OPENAI && (model.contains("gpt-5.1") || model.contains("gpt-5.2")) {
-        return SentParams {
-            temperature: Some("0".into()),
-            top_p: Some("1".into()),
-            top_k: None,
-            seed: Some(seed.to_string()),
-            reasoning_effort: Some("none".into()),
-        };
-    }
-    SentParams::default()
+/// Which sampling parameters a registered model family accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SamplingCaps {
+    temperature: bool,
+    top_p: bool,
+    top_k: bool,
+    seed: bool,
+    reasoning_none: bool,
 }
 
 /// Sampling parameters for one config and model, by API style. This is the
 /// single map both the request body and the lock's `sent-params` stamp use.
 /// The Responses API has no `seed`, so it is dropped for `responses`.
 pub fn sent_params(config: &LlmConfig, model: &str) -> SentParams {
-    let mut params = model_capabilities(&config.provider, model, config.seed);
+    let mut params =
+        model_capabilities_with(&config.provider, model, config.seed, config.send_sampling);
     if config.provider == OPENAI && config.api_style == "responses" {
         params.seed = None;
     }
@@ -129,8 +113,180 @@ pub fn lock_provider(config: &LlmConfig) -> String {
     }
 }
 
+const GEMINI_2: SamplingCaps = SamplingCaps {
+    temperature: true,
+    top_p: true,
+    top_k: true,
+    seed: true,
+    reasoning_none: false,
+};
+const GPT_5_NONE: SamplingCaps = SamplingCaps {
+    temperature: true,
+    top_p: true,
+    top_k: false,
+    seed: true,
+    reasoning_none: true,
+};
+const GPT_4: SamplingCaps = SamplingCaps {
+    temperature: true,
+    top_p: true,
+    top_k: false,
+    seed: true,
+    reasoning_none: false,
+};
+const CLAUDE_TEMP: SamplingCaps = SamplingCaps {
+    temperature: true,
+    top_p: false,
+    top_k: false,
+    seed: false,
+    reasoning_none: false,
+};
+
+/// Variants that share a registered prefix but reject sampling parameters
+/// (or `reasoning_effort: none`).
+const OPENAI_EXCLUDED: &[&str] = &[
+    "-pro",
+    "-codex",
+    "-chat",
+    "-search",
+    "-audio",
+    "-realtime",
+    "-transcribe",
+    "-tts",
+];
+
+/// Gemini variants that share a registered family but are not text models
+/// (speech, image generation, Live API) and must not get sampling parameters.
+const GEMINI_EXCLUDED: &[&str] = &["-tts", "-image", "-live", "-audio"];
+
+/// What may follow a registered id.
+#[derive(Clone, Copy)]
+enum Suffix {
+    /// Nothing, or `-` and any variant (`gemini-2.5-flash-lite`,
+    /// `gpt-4o-mini-2024-07-18`), minus the excluded substrings.
+    Variant,
+    /// Nothing, `-YYYYMMDD`, `-YYYY-MM-DD` or `-latest` only
+    /// (`claude-opus-4-20250514`, `claude-3-5-sonnet-latest`).
+    Dated,
+}
+
+use Suffix::{Dated, Variant};
+
+/// Explicit capability registry: `(provider, model id, allowed suffix,
+/// excluded substrings, caps)`, shipped with this SDK version (spec 2A.8.6,
+/// decision 58, #35). A model gets sampling parameters only when its
+/// lower-cased name is a listed id, optionally followed by an allowed suffix
+/// (there is always a `-` or the end of the name right after the id, so
+/// `gpt-4.10`, `gpt-4oops` and `claude-opus-4-10` do not match), and contains
+/// none of the excluded substrings. Unknown models and providers get none.
+///
+/// - Gemini 1.5 / 2.0 / 2.5 text models (not tts, image, live or audio
+///   variants): temperature 0, topP 1, topK 1, seed. Gemini 3 and later are
+///   not listed: Google recommends the default temperature 1.0 (lower values
+///   can loop) and newer models deprecate sampling knobs, so they get none.
+/// - OpenAI gpt-5.1 / gpt-5.2 (not -pro, -codex, -chat): temperature 0,
+///   top_p 1, seed, `reasoning_effort: none`. gpt-4.1 / gpt-4o (not search,
+///   audio, realtime, transcribe, tts): temperature 0, top_p 1, seed.
+/// - Anthropic: `temperature: 0` only (never with top_p) for exactly these
+///   models: Claude Opus 4, 4.1, 4.5, 4.6; Sonnet 4, 4.5, 4.6; Haiku 4.5;
+///   Claude 3.7 Sonnet, 3.5 Sonnet, 3.5 Haiku, 3 Opus and 3 Haiku. Every
+///   other Claude model (Opus 4.7 and later, Sonnet 5 and later, any newer
+///   Haiku, Claude 2.x) is not listed and gets none.
+const SAMPLING_REGISTRY: &[(&str, &str, Suffix, &[&str], SamplingCaps)] = &[
+    (GEMINI, "gemini-1.5", Variant, GEMINI_EXCLUDED, GEMINI_2),
+    (GEMINI, "gemini-2.0", Variant, GEMINI_EXCLUDED, GEMINI_2),
+    (GEMINI, "gemini-2.5", Variant, GEMINI_EXCLUDED, GEMINI_2),
+    (OPENAI, "gpt-5.1", Variant, OPENAI_EXCLUDED, GPT_5_NONE),
+    (OPENAI, "gpt-5.2", Variant, OPENAI_EXCLUDED, GPT_5_NONE),
+    (OPENAI, "gpt-4.1", Variant, OPENAI_EXCLUDED, GPT_4),
+    (OPENAI, "gpt-4o", Variant, OPENAI_EXCLUDED, GPT_4),
+    (ANTHROPIC, "claude-opus-4-6", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-opus-4-5", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-opus-4-1", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-opus-4-0", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-opus-4", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-sonnet-4-6", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-sonnet-4-5", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-sonnet-4-0", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-sonnet-4", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-haiku-4-5", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-7-sonnet", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-5-sonnet", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-5-haiku", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-opus", Dated, &[], CLAUDE_TEMP),
+    (ANTHROPIC, "claude-3-haiku", Dated, &[], CLAUDE_TEMP),
+];
+
+/// `-YYYYMMDD`, `-YYYY-MM-DD` or `-latest`.
+fn is_date_or_latest(rest: &str) -> bool {
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    if rest == "latest" {
+        return true;
+    }
+    let b = rest.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    match b.len() {
+        8 => digits(0..8),
+        10 => digits(0..4) && b[4] == b'-' && digits(5..7) && b[7] == b'-' && digits(8..10),
+        _ => false,
+    }
+}
+
+fn id_matches(model: &str, id: &str, suffix: Suffix) -> bool {
+    let Some(rest) = model.strip_prefix(id) else {
+        return false;
+    };
+    match suffix {
+        Variant => rest.is_empty() || rest.starts_with('-'),
+        Dated => rest.is_empty() || is_date_or_latest(rest),
+    }
+}
+
+fn registered_caps(provider: &str, model: &str) -> Option<SamplingCaps> {
+    let model = model.to_ascii_lowercase();
+    SAMPLING_REGISTRY
+        .iter()
+        .find(|(p, id, suffix, excluded, _)| {
+            *p == provider
+                && id_matches(&model, id, *suffix)
+                && !excluded.iter().any(|x| model.contains(x))
+        })
+        .map(|(_, _, _, _, caps)| *caps)
+}
+
+/// Sampling parameters for a model with sampling enabled (the default).
+pub fn model_capabilities(provider: &str, model: &str, seed: u64) -> SentParams {
+    model_capabilities_with(provider, model, seed, true)
+}
+
+/// Sampling parameters to send. `send_sampling = false` (`LLM_SEND_SAMPLING=0`)
+/// sends none even for registered models.
+pub fn model_capabilities_with(
+    provider: &str,
+    model: &str,
+    seed: u64,
+    send_sampling: bool,
+) -> SentParams {
+    if !send_sampling {
+        return SentParams::default();
+    }
+    let Some(caps) = registered_caps(provider, model) else {
+        return SentParams::default();
+    };
+    SentParams {
+        temperature: caps.temperature.then(|| "0".into()),
+        top_p: caps.top_p.then(|| "1".into()),
+        top_k: caps.top_k.then(|| "1".into()),
+        seed: caps.seed.then(|| seed.to_string()),
+        reasoning_effort: caps.reasoning_none.then(|| "none".into()),
+    }
+}
+
+/// True when the model is in the capability registry.
 pub fn sampling_registered(provider: &str, model: &str) -> bool {
-    !model_capabilities(provider, model, 0).is_empty()
+    registered_caps(provider, model).is_some()
 }
 
 #[derive(Clone, Debug)]
@@ -231,6 +387,12 @@ pub fn load_llm_config(
         report.push(Diag::error("env", "LLM_MODEL is missing"));
     }
     if let Some(model) = &model {
+        if !model.is_empty() && !model_id_is_valid(&provider, model) {
+            report.push(Diag::error(
+                "env",
+                "LLM_MODEL contains characters that are not allowed for this provider",
+            ));
+        }
         if !model_is_pinned(model) {
             report.push(Diag::error(
                 "env",
@@ -272,6 +434,13 @@ pub fn load_llm_config(
     if report.has_errors() {
         return Err(report);
     }
+    // Default on: pin temperature/seed for deterministic NL compiles (#35).
+    let send_sampling = !matches!(
+        env.get("LLM_SEND_SAMPLING")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    );
     let api_style = env
         .get("LLM_API_STYLE")
         .map(|v| v.trim().to_ascii_lowercase())
@@ -301,6 +470,7 @@ pub fn load_llm_config(
         seed,
         endpoint_host: host,
         endpoint_private: private,
+        send_sampling,
         api_style,
     })
 }
@@ -348,6 +518,23 @@ fn pick(
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }
+}
+
+/// Only a conservative character set is accepted for model ids. Gemini
+/// places the id in the request URL path, so ':' and '/' are rejected there;
+/// other providers send it in the JSON body and may use them (for example
+/// `qwen2.5-coder:32b` or `org/model`).
+pub fn model_id_is_valid(provider: &str, model: &str) -> bool {
+    let path_safe = provider == GEMINI;
+    !model.is_empty()
+        && model.len() <= 256
+        && !model.starts_with('.')
+        && !model.contains("..")
+        && model.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'.' | b'_' | b'-')
+                || (!path_safe && matches!(b, b':' | b'/'))
+        })
 }
 
 pub fn model_is_pinned(model: &str) -> bool {
@@ -820,14 +1007,31 @@ fn gemini_call(
     config: &LlmConfig,
     request: &LlmRequest,
 ) -> (String, Value, Vec<(&'static str, String)>) {
-    let url = join_url(
-        &config.base_url,
-        &format!("models/{}:generateContent", request.model),
-    );
+    let model = encode_path_segment(&request.model);
+    let url = join_url(&config.base_url, &format!("models/{model}:generateContent"));
     let params = sent_params(config, &request.model);
     let body = gemini_body(request, &params);
     let headers = vec![("x-goog-api-key", config.api_key.clone())];
     (url, body, headers)
+}
+
+/// Percent-encode a single URL path segment (RFC 3986 unreserved left as-is).
+fn encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 fn join_url(base: &str, path: &str) -> String {
@@ -1002,6 +1206,110 @@ mod tests {
     }
 
     #[test]
+    fn model_id_charset() {
+        for ok in ["gpt-4o-2024-08-06", "gemini-2.5-pro-001", "a_b.c-1"] {
+            assert!(model_id_is_valid(GEMINI, ok), "{ok}");
+            assert!(model_id_is_valid(OPENAI, ok), "{ok}");
+        }
+        for bad in [
+            "", "../x", "a/b", "a:b", "a?b", "a%2Fb", "a b", ".x", "a..b", "a#b",
+        ] {
+            assert!(!model_id_is_valid(GEMINI, bad), "{bad}");
+        }
+        // #131 negative cases: backslash, controls, non-ASCII, '@', over 256 bytes
+        for bad in [
+            "a\\b",
+            "a\nb",
+            "a\0b",
+            "a\tb",
+            "caf\u{e9}",
+            "\u{4e2d}",
+            "a@b",
+        ] {
+            assert!(!model_id_is_valid(GEMINI, bad), "{bad:?}");
+            assert!(!model_id_is_valid(OPENAI, bad), "{bad:?}");
+        }
+        let over_256 = "a".repeat(257);
+        assert!(!model_id_is_valid(GEMINI, &over_256));
+        assert!(!model_id_is_valid(OPENAI, &over_256));
+        assert!(model_id_is_valid(GEMINI, &"a".repeat(256)));
+        assert!(model_id_is_valid(OPENAI, "qwen2.5-coder:32b-instruct-q8_0"));
+        assert!(!model_id_is_valid(OPENAI, "a?b"));
+        let report = load_llm_config(
+            &env(&[
+                ("LLM_PROVIDER", "gemini"),
+                ("LLM_API_KEY", "test-value"),
+                ("LLM_MODEL", "gemini-2.5-pro-001:x"),
+            ]),
+            false,
+        );
+        assert!(report.is_err());
+    }
+
+    #[test]
+    fn gemini_model_is_percent_encoded_in_path() {
+        let config = LlmConfig {
+            provider: GEMINI.into(),
+            base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+            api_key: "test-value".into(),
+            model: "unused".into(),
+            timeout: Duration::from_secs(5),
+            max_retries: 0,
+            seed: 0,
+            endpoint_host: "generativelanguage.googleapis.com".into(),
+            endpoint_private: false,
+            send_sampling: true,
+            api_style: "chat".into(),
+        };
+        for (model, encoded) in [
+            ("a/b", "a%2Fb"),
+            ("a?b", "a%3Fb"),
+            ("a#b", "a%23b"),
+            ("a%b", "a%25b"),
+            ("../x", "..%2Fx"),
+            ("a..b", "a..b"),
+            ("a b", "a%20b"),
+        ] {
+            let request = LlmRequest {
+                system: "s".into(),
+                input: "i".into(),
+                model: model.into(),
+                seed: 0,
+                timeout: Duration::from_secs(5),
+            };
+            let (url, _, _) = gemini_call(&config, &request);
+            let expected = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{encoded}:generateContent"
+            );
+            assert_eq!(url, expected, "{model}");
+            let parsed = url::Url::parse(&url).unwrap();
+            assert!(parsed.query().is_none(), "{model} must not inject a query");
+            assert!(
+                parsed.fragment().is_none(),
+                "{model} must not inject a fragment"
+            );
+            let segs: Vec<_> = parsed.path_segments().unwrap().collect();
+            assert_eq!(
+                segs,
+                ["v1beta", "models", &format!("{encoded}:generateContent")],
+                "{model}"
+            );
+        }
+        let request = LlmRequest {
+            system: "s".into(),
+            input: "i".into(),
+            model: "gemini-2.5-pro-001".into(),
+            seed: 0,
+            timeout: Duration::from_secs(5),
+        };
+        let (url, _, _) = gemini_call(&config, &request);
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-001:generateContent"
+        );
+    }
+
+    #[test]
     fn openai_alias_and_loopback() {
         let cfg = load_llm_config(
             &env(&[
@@ -1054,28 +1362,135 @@ mod tests {
             timeout: Duration::from_secs(1),
         };
         let unknown = model_capabilities(OPENAI, &request.model, 0);
-        assert!(unknown.is_empty());
+        assert!(
+            unknown.is_empty(),
+            "unregistered models get no sampling params"
+        );
         let openai = openai_body(&request, &unknown);
         assert!(openai.get("temperature").is_none());
         assert!(openai.get("seed").is_none());
         assert!(openai.get("tools").is_none());
         assert!(openai.get("functions").is_none());
         assert!(openai.get("tool_choice").is_none());
+        let off = model_capabilities_with(OPENAI, &request.model, 0, false);
+        assert!(off.is_empty());
         let pinned = model_capabilities(OPENAI, "gpt-5.1", 0);
         let openai_pinned = openai_body(&request, &pinned);
         assert_eq!(openai_pinned["temperature"], 0);
         assert_eq!(openai_pinned["top_p"], 1);
         assert_eq!(openai_pinned["seed"], 0);
         assert_eq!(openai_pinned["reasoning_effort"], "none");
-        let anthropic = anthropic_body(&request, &SentParams::default());
-        assert!(anthropic.get("temperature").is_none());
+        let anthropic = anthropic_body(
+            &request,
+            &model_capabilities(ANTHROPIC, "claude-sonnet-4-6", 0),
+        );
+        assert_eq!(anthropic["temperature"], 0);
+        assert!(anthropic.get("top_p").is_none(), "anthropic: not both");
         assert!(anthropic.get("tools").is_none());
-        assert!(anthropic.get("top_p").is_none());
-        let gemini = gemini_body(&request, &model_capabilities(GEMINI, &request.model, 0));
+        let gemini = gemini_body(&request, &model_capabilities(GEMINI, "gemini-2.5-pro", 0));
         assert_eq!(gemini["generationConfig"]["temperature"], 0);
         assert_eq!(gemini["generationConfig"]["topK"], 1);
         assert!(gemini.get("tools").is_none());
         assert!(gemini.get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn only_registered_models_get_sampling() {
+        for (provider, model) in [
+            (OPENAI, "gpt-5.5-2026-09-01"),
+            (OPENAI, "gpt-5-2025-08-07"),
+            (OPENAI, "o3-2025-04-16"),
+            (OPENAI, "qwen2.5-coder:32b"),
+            (GEMINI, "vendor-model"),
+            (GEMINI, "gemini-3-pro-preview"),
+            (GEMINI, "gemini-3.5-flash"),
+            ("mystery", "gpt-4o-2024-08-06"),
+            (OPENAI, "gpt-5.2-pro-2025-12-11"),
+            (OPENAI, "gpt-5.1-codex"),
+            (OPENAI, "gpt-5.1-codex-mini"),
+            (OPENAI, "gpt-5.1-chat-latest"),
+            (OPENAI, "gpt-4o-search-preview-2025-03-11"),
+            (OPENAI, "gpt-4o-mini-search-preview"),
+            (OPENAI, "gpt-4o-audio-preview"),
+            (OPENAI, "gpt-4o-realtime-preview"),
+            (ANTHROPIC, "claude-opus-4-7"),
+            (ANTHROPIC, "claude-opus-4-7-20260416"),
+            (ANTHROPIC, "claude-opus-4-8"),
+            (ANTHROPIC, "claude-opus-5"),
+            (ANTHROPIC, "claude-opus-5-5"),
+            (ANTHROPIC, "claude-sonnet-5"),
+            (ANTHROPIC, "claude-sonnet-5-5"),
+            (ANTHROPIC, "claude-haiku-5-5"),
+            (ANTHROPIC, "claude-fable-5-1"),
+            // No version boundary after the registered id.
+            (OPENAI, "gpt-5.10"),
+            (OPENAI, "gpt-5.10-2026-01-01"),
+            (OPENAI, "gpt-4.10"),
+            (OPENAI, "gpt-4oops"),
+            (OPENAI, "gpt-5.25"),
+            (ANTHROPIC, "claude-opus-4-10"),
+            (ANTHROPIC, "claude-opus-4-10-20270101"),
+            (ANTHROPIC, "claude-sonnet-4-50"),
+            (ANTHROPIC, "claude-haiku-4-55"),
+            (ANTHROPIC, "claude-opus-4-7-latest"),
+            (ANTHROPIC, "claude-opus-4-20250514-extra"),
+            (ANTHROPIC, "claude-opus-4-2025051"),
+            (ANTHROPIC, "claude-2.1"),
+            (ANTHROPIC, "claude-2-1"),
+            (GEMINI, "gemini-2.50-pro"),
+            // Gemini speech, image and Live variants.
+            (GEMINI, "gemini-2.5-flash-preview-tts"),
+            (GEMINI, "gemini-2.5-pro-preview-tts"),
+            (GEMINI, "gemini-2.5-flash-image"),
+            (GEMINI, "gemini-2.5-flash-image-preview"),
+            (GEMINI, "gemini-2.0-flash-preview-image-generation"),
+            (GEMINI, "gemini-2.0-flash-exp-image-generation"),
+            (GEMINI, "gemini-2.0-flash-live-001"),
+            (GEMINI, "gemini-live-2.5-flash-preview"),
+            (GEMINI, "gemini-2.5-flash-live-preview"),
+            (GEMINI, "gemini-2.5-flash-native-audio-preview-09-2025"),
+        ] {
+            assert!(
+                model_capabilities(provider, model, 1).is_empty(),
+                "{provider} {model}"
+            );
+            assert!(!sampling_registered(provider, model), "{provider} {model}");
+        }
+        for (provider, model) in [
+            (OPENAI, "gpt-5.1-2025-11-13"),
+            (OPENAI, "GPT-4o-2024-08-06"),
+            (ANTHROPIC, "claude-opus-4-6"),
+            (ANTHROPIC, "claude-sonnet-4-5-20250929"),
+            (ANTHROPIC, "claude-haiku-4-5-20251001"),
+            (OPENAI, "gpt-4.1-mini-2025-04-14"),
+            (OPENAI, "gpt-5.2-2025-12-11"),
+            (GEMINI, "gemini-2.5-pro"),
+            (GEMINI, "gemini-2.5-flash-lite"),
+            (GEMINI, "gemini-2.0-flash-001"),
+            (GEMINI, "gemini-1.5-pro-002"),
+            (OPENAI, "gpt-5.1"),
+            (OPENAI, "gpt-4o"),
+            (OPENAI, "gpt-4o-mini"),
+            (OPENAI, "gpt-4.1"),
+            (ANTHROPIC, "claude-opus-4-1"),
+            (ANTHROPIC, "claude-opus-4-1-20250805"),
+            (ANTHROPIC, "claude-opus-4-20250514"),
+            (ANTHROPIC, "claude-sonnet-4-20250514"),
+            (ANTHROPIC, "claude-sonnet-4-5-2025-09-29"),
+            (ANTHROPIC, "claude-sonnet-4-0"),
+            (ANTHROPIC, "claude-3-5-sonnet-latest"),
+            (ANTHROPIC, "claude-3-7-sonnet-20250219"),
+            (ANTHROPIC, "claude-3-opus-20240229"),
+            (ANTHROPIC, "claude-3-haiku-20240307"),
+            (ANTHROPIC, "claude-3-5-haiku-latest"),
+        ] {
+            assert!(sampling_registered(provider, model), "{provider} {model}");
+            let p = model_capabilities(provider, model, 1);
+            assert_eq!(p.temperature.as_deref(), Some("0"), "{provider} {model}");
+            assert!(model_capabilities_with(provider, model, 1, false).is_empty());
+        }
+        let claude = model_capabilities(ANTHROPIC, "claude-opus-4-6", 1);
+        assert!(claude.top_p.is_none() && claude.seed.is_none());
     }
 
     #[test]
@@ -1266,6 +1681,7 @@ mod responses_tests {
             endpoint_host: "api.openai.com".into(),
             endpoint_private: false,
             api_style: "responses".into(),
+            send_sampling: true,
         }
     }
 

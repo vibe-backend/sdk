@@ -10,35 +10,47 @@ Locks are build output. They are not committed (`*.lock.md` is in
    compiles in memory and runs the deterministic policy, then writes the
    result to the job summary. It is informational and never deployed. It uses
    `VIBE_LLM_API_KEY_PREVIEW`.
-2. **Build once.** After the merge to protected `main`, `release-build` runs in
-   the `release` environment: `vibe manifest --release` compiles every source
-   in memory, validates the in-memory locks (policy, dependency hashes, SQL
-   allowlist, inherited auth), records per-lock hashes and the commit in the
-   signed manifest, and fails closed on high-risk items without
-   `--release-approval`. Lock files on disk are not read. The manifest is
-   attested with `actions/attest-build-provenance`.
+2. **Build once.** A `v*` tag runs the `release` job in the `release`
+   environment (Jack approves it): `vibe manifest --release` compiles every
+   source in memory, validates the in-memory locks (policy, dependency hashes,
+   SQL allowlist, inherited auth) and writes an unsigned manifest recording
+   per-lock hashes, the version and the commit. High-risk security items are
+   listed in the deploy report; they do not block (decision 90 is withdrawn).
+   Lock files on disk are not read. The job then signs the manifest with
+   Sigstore keyless (`cosign sign-blob`, GitHub OIDC identity, Fulcio
+   certificate, Rekor entry) into `manifest.json.sigstore.json`, and attests
+   it with `actions/attest-build-provenance`. There is no signing key and no
+   fallback: if OIDC, Fulcio or Rekor is unavailable the job fails. Only this
+   job has `id-token: write`.
 3. **Promote only.** `deploy` checks the digest, runs
-   `gh attestation verify --repo --signer-workflow --source-ref refs/heads/main`
-   (fail closed), and deploys the same file to staging and then production.
-4. **Run.** Outside development, `vibe serve` / `vibe migrate` verify the
-   manifest with the pinned release public key only: a key compiled into the
-   binary with `VIBE_RELEASE_PUBKEY` (the runtime `VIBE_MANIFEST_PUBKEY`
-   cannot override it; a differing value is refused), otherwise
-   `VIBE_MANIFEST_PUBKEY`. They run only
-   `build_mode: release` manifests. `.vibe/signing.pub` is ignored there.
+   `gh attestation verify --signer-workflow vibe-backend/sdk/.github/workflows/release.yml
+   --source-ref refs/tags/v<version> --source-digest <commit> --deny-self-hosted-runners`
+   and `cosign verify-blob` with the exact identity
+   `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<version>`,
+   issuer `https://token.actions.githubusercontent.com` and the commit
+   (fail closed), then deploys the same files to staging and then production.
+4. **Run.** Outside development, `vibe serve` / `vibe migrate` accept only
+   `build_mode: release` manifests with a Sigstore bundle
+   (`<manifest>.sigstore.json`, or `VIBE_MANIFEST_BUNDLE`) for the deployed
+   version `VIBE_RELEASE_VERSION`. They check that the certificate identity
+   equals exactly the identity above, the issuer, the manifest's commit, this
+   repository and ref, a GitHub-hosted runner (Fulcio runner-environment
+   extension) and a Rekor inclusion proof, then run `cosign verify-blob
+   --offline` against the Sigstore `trusted_root.json` compiled into the
+   binary (`assets/sigstore/trusted_root.json`; there is no runtime override).
+   `cosign` must be on `PATH`. `.vibe/signing.pub` and dev manifests are
+   never trusted there.
 
 ## Setup (done by a repo admin, not by the SDK)
 
-- `release` environment: required reviewers, deployment branch `main` only.
-- Secrets in the `release` environment (not repo level):
-  `VIBE_LLM_API_KEY`, `VIBE_RELEASE_SIGNING_KEY` (hex ed25519 seed).
+- `release` environment: required reviewers, deployment tags `v*` only.
+- Secret in the `release` environment (not repo level): `VIBE_LLM_API_KEY`.
+  No signing secret exists.
 - Repo or PR-scoped secret `VIBE_LLM_API_KEY_PREVIEW` (low quota, cannot reach
   release secrets).
-- Optional environment variable `VIBE_RELEASE_APPROVAL` (reference recorded
-  for high-risk items).
 - `staging` and `production` environments for the deploy job.
-- Runtime configuration: `VIBE_MANIFEST_PUBKEY` = hex public key matching
-  `VIBE_RELEASE_SIGNING_KEY`.
+- Runtime configuration: `VIBE_RELEASE_VERSION` = deployed version (e.g.
+  `1.8.0`), and `cosign` installed.
 - Make `preview` a required status check on `main`.
 
 ## Local development

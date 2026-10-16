@@ -37,8 +37,10 @@ pub struct Provenance {
     pub locks: Vec<LockProvenance>,
     /// Every security item of every lock, sorted.
     pub security_items: Vec<ItemProvenance>,
-    /// Release approval reference given for high-risk items (decision 90).
-    pub release_approval: Option<String>,
+    /// Release version without the leading `v` (release builds only). The
+    /// Sigstore certificate identity is bound to `refs/tags/v<version>`.
+    #[serde(default)]
+    pub version: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -69,10 +71,11 @@ impl Provenance {
 /// How a manifest is built.
 #[derive(Clone, Debug, Default)]
 pub struct BuildInfo {
-    /// Release build. High-risk items fail closed until release-environment
-    /// approval verification (#80) lands (decision 90/118).
+    /// Release build: left unsigned here and signed by the release workflow
+    /// with Sigstore keyless (decision 119). High-risk items are only listed.
     pub release: bool,
-    pub release_approval: Option<String>,
+    /// Release version (without `v`); required for a release build.
+    pub version: String,
     pub commit: String,
 }
 
@@ -312,18 +315,43 @@ pub fn manifest_from_loaded(
     loaded: &validate::LoadedProject,
     signing_key: &SigningKey,
 ) -> Result<Manifest, Report> {
-    build_signed(root, loaded, signing_key, &BuildInfo::default())
+    build_signed(root, loaded, Some(signing_key), &BuildInfo::default())
 }
 
 /// Validates (deploy rules) and builds the manifest from exactly the loaded
-/// lock texts; nothing is re-read. Records provenance and, for a release
-/// build, fails closed on high-risk items without a release approval.
+/// lock texts; nothing is re-read. Records provenance. A dev build is signed
+/// with the development key; a release build takes no key and is left
+/// unsigned for the release workflow's Sigstore keyless signature (decisions
+/// 92, 119). High-risk items are listed in the provenance, never blocking
+/// (decision 90 withdrawn).
 pub fn build_signed(
     root: &Path,
     loaded: &validate::LoadedProject,
-    signing_key: &SigningKey,
+    signing_key: Option<&SigningKey>,
     info: &BuildInfo,
 ) -> Result<Manifest, Report> {
+    match (info.release, signing_key) {
+        (true, Some(_)) => {
+            return Err(single(
+                "release manifests are signed with Sigstore keyless only, never with a key".into(),
+            ))
+        }
+        (false, None) => return Err(single("a dev manifest needs the development key".into())),
+        _ => {}
+    }
+    if info.release {
+        crate::sigstore::check_version(&info.version).map_err(single)?;
+        let commit = &info.commit;
+        if commit.len() != 40
+            || !commit
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(single(format!(
+                "release builds need the full 40-character source commit, got `{commit}`"
+            )));
+        }
+    }
     let (result, docs) = validate::validate_loaded(&ValidateOptions { root, deploy: true }, loaded);
     result?;
     let mut manifest = build_manifest(&docs)?;
@@ -355,40 +383,25 @@ pub fn build_signed(
         commit: info.commit.clone(),
         locks,
         security_items: items,
-        release_approval: info
-            .release_approval
-            .clone()
-            .filter(|r| !r.trim().is_empty()),
+        version: if info.release {
+            info.version.clone()
+        } else {
+            String::new()
+        },
     };
-    // Decision 90/118: the approval is the `release` environment approval,
-    // verified against the platform (#80). Until that verification exists,
-    // a release build with high-risk items fails closed; no
-    // `--release-approval` value counts as approval.
-    if info.release {
-        let high: Vec<String> = manifest
-            .provenance
-            .high_risk()
-            .iter()
-            .map(|item| format!("{} ({})", item.lock, item.item))
-            .collect();
-        if !high.is_empty() {
-            return Err(single(format!(
-                "release build has high-risk items: {}; release-environment approval verification (#80) is not implemented yet, so high-risk release builds fail closed (--release-approval is not accepted as approval)",
-                high.join(", ")
-            )));
-        }
-    }
     manifest.signature = String::new();
     let bytes =
         serde_json::to_vec(&manifest).map_err(|err| single(format!("manifest json: {err}")))?;
-    manifest.signature = sign::sign_bytes(&bytes, signing_key);
+    if let Some(key) = signing_key {
+        manifest.signature = sign::sign_bytes(&bytes, key);
+    }
     Ok(manifest)
 }
 
-/// Outside development only release manifests run (decisions 79, 90, 91):
-/// built with `vibe manifest --release` (compiled in memory in the release
-/// environment) and, if they have high-risk items, carrying a release
-/// approval.
+/// Outside development only release manifests run (decisions 75, 79, 91):
+/// built with `vibe manifest --release` and verified with Sigstore keyless
+/// ([`read_release_manifest`]). High-risk items are reported, not blocking
+/// (decision 90 withdrawn).
 pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), String> {
     if development {
         return Ok(());
@@ -402,12 +415,49 @@ pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), St
     if provenance.locks.is_empty() {
         return Err("manifest has no lock provenance".into());
     }
-    // Fail closed until release-environment approval verification (#80):
-    // a recorded approval string is not proof of approval.
-    if !provenance.high_risk().is_empty() {
-        return Err("manifest has high-risk items without a verified release approval".into());
+    if provenance.version.is_empty() {
+        return Err("release manifest has no version".into());
     }
     Ok(())
+}
+
+/// Reads a release manifest and verifies its Sigstore keyless signature
+/// (decision 119): the bundle certificate must name exactly
+/// `release.yml@refs/tags/v<version>` with the GitHub Actions issuer, the
+/// manifest's commit and a GitHub-hosted runner, with Rekor inclusion,
+/// verified offline against the compiled-in trust root.
+pub fn read_release_manifest(
+    path: &Path,
+    bundle: &Path,
+    version: &str,
+) -> Result<Manifest, Report> {
+    crate::sigstore::check_version(version).map_err(single)?;
+    let bytes = fs::read(path).map_err(|err| single(format!("cannot read manifest: {err}")))?;
+    let manifest: Manifest =
+        serde_json::from_slice(&bytes).map_err(|err| single(format!("manifest json: {err}")))?;
+    let provenance = &manifest.provenance;
+    if provenance.build_mode != "release" {
+        return Err(single(
+            "only release manifests (`vibe manifest --release`) can run outside development".into(),
+        ));
+    }
+    if !manifest.signature.is_empty() {
+        return Err(single(
+            "release manifests carry no key signature; they are verified with Sigstore only".into(),
+        ));
+    }
+    if provenance.version != version {
+        return Err(single(format!(
+            "manifest version `{}` is not the deployed version `{version}`",
+            provenance.version
+        )));
+    }
+    let expected = crate::sigstore::Expected {
+        version: version.to_string(),
+        commit: provenance.commit.clone(),
+    };
+    crate::sigstore::verify_release_manifest(path, bundle, &expected).map_err(single)?;
+    Ok(manifest)
 }
 
 pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), Report> {
@@ -440,7 +490,10 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
     for doc in ids {
         match doc.meta.kind {
             Kind::Model => models.push(model_from(doc)),
-            Kind::Method => methods.push(method_from(doc)),
+            Kind::Method => match method_from(doc) {
+                Ok(method) => methods.push(method),
+                Err(diag) => report.push(diag),
+            },
             Kind::Migration => migrations.push(migration_from(doc)),
             Kind::Api if doc.meta.scope == Some(Scope::Feature) => match route_from(doc, docs) {
                 Ok(route) => routes.push(route),
@@ -585,33 +638,38 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
     }
 }
 
-fn method_from(doc: &LockDoc) -> MethodSpec {
+fn method_from(doc: &LockDoc) -> Result<MethodSpec, Diag> {
     let target = doc
         .meta
         .id
         .split_once("/methods/")
         .map(|(object, method)| format!("{object}.{method}"))
         .unwrap_or_else(|| doc.meta.id.clone());
-    let writes =
-        find_section(&doc.sections, "Signature").and_then(|s| s.get("writes")) == Some("true");
-    let errors = find_section(&doc.sections, "Signature")
-        .and_then(|s| s.get("errors"))
-        .and_then(|raw| crate::lock::parse_string_list(raw).ok())
-        .unwrap_or_default();
-    let capabilities = find_section(&doc.sections, "Signature")
-        .and_then(|s| s.get("capabilities"))
-        .and_then(|raw| crate::lock::parse_string_list(raw).ok())
-        .unwrap_or_default();
-    MethodSpec {
+    let signature = find_section(&doc.sections, "Signature");
+    let writes = signature.and_then(|s| s.get("writes")) == Some("true");
+    let mut errors = Vec::new();
+    if let Some(raw) = signature.and_then(|s| s.get("errors")) {
+        errors = crate::lock::parse_string_list(raw).map_err(|err| {
+            Diag::error(&doc.meta.id, format!("invalid errors: {err}")).at_section("Signature")
+        })?;
+    }
+    let mut capabilities = Vec::new();
+    if let Some(raw) = signature.and_then(|s| s.get("capabilities")) {
+        capabilities = crate::lock::parse_string_list(raw).map_err(|err| {
+            Diag::error(&doc.meta.id, format!("invalid capabilities: {err}"))
+                .at_section("Signature")
+        })?;
+    }
+    Ok(MethodSpec {
         target,
         writes,
         input: Vec::new(),
         errors,
         capabilities,
-        steps: steps_from(find_section(&doc.sections, "Steps")),
+        steps: steps_from(find_section(&doc.sections, "Steps"), &doc.meta.id)?,
         crud_model: String::new(),
         crud_action: String::new(),
-    }
+    })
 }
 
 fn migration_from(doc: &LockDoc) -> MigrationSpec {
@@ -779,7 +837,7 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
             .and_then(|s| s.get("out"))
             .unwrap_or("result")
             .to_string(),
-        steps: steps_from(find_section(&doc.sections, "Steps")),
+        steps: steps_from(find_section(&doc.sections, "Steps"), &doc.meta.id)?,
         errors: error_rows(find_section(&doc.sections, "Errors")),
         min_response_ms,
         public_writes: access.and_then(|s| s.get("public-writes")) == Some("true"),
@@ -853,51 +911,55 @@ fn error_rows(section: Option<&crate::lock::Section>) -> Vec<ErrMap> {
         .collect()
 }
 
-fn steps_from(section: Option<&crate::lock::Section>) -> Vec<StepSpec> {
+fn steps_from(section: Option<&crate::lock::Section>, file: &str) -> Result<Vec<StepSpec>, Diag> {
     let Some(section) = section else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    section
-        .blocks
-        .iter()
-        .map(|block| {
-            let get = |key: &str| {
-                block
-                    .bullets
-                    .iter()
-                    .find(|b| b.key == key)
-                    .map(|b| b.value.clone())
-                    .unwrap_or_default()
-            };
-            let op = get("op");
-            let id = block
-                .heading
-                .split_whitespace()
-                .next()
-                .unwrap_or("s")
-                .to_string();
-            StepSpec {
-                id,
-                op: op.clone(),
-                target: get("target"),
-                args: get("args"),
-                value: get("value"),
-                status: get("status")
-                    .parse()
-                    .unwrap_or(if op == "respond" { 200 } else { 0 }),
-                sql: get("sql").trim_matches('`').trim().to_string(),
-                params: crate::lock::parse_string_list(&get("params")).unwrap_or_default(),
-                out: get("out"),
-                fail: get("fail"),
-                when_expr: get("when"),
-                writes: get("writes") == "true",
-                table: get("table"),
-            }
-        })
-        .collect()
+    let mut steps = Vec::new();
+    for block in &section.blocks {
+        let get = |key: &str| {
+            block
+                .bullets
+                .iter()
+                .find(|b| b.key == key)
+                .map(|b| b.value.clone())
+                .unwrap_or_default()
+        };
+        let op = get("op");
+        let id = block
+            .heading
+            .split_whitespace()
+            .next()
+            .unwrap_or("s")
+            .to_string();
+        let mut params = Vec::new();
+        if let Some(raw) = block.bullets.iter().find(|b| b.key == "params") {
+            params = crate::lock::parse_string_list(&raw.value).map_err(|err| {
+                Diag::error(file, format!("invalid params: {err}")).at_section("Steps")
+            })?;
+        }
+        steps.push(StepSpec {
+            id,
+            op: op.clone(),
+            target: get("target"),
+            args: get("args"),
+            value: get("value"),
+            status: get("status")
+                .parse()
+                .unwrap_or(if op == "respond" { 200 } else { 0 }),
+            sql: get("sql").trim_matches('`').trim().to_string(),
+            params,
+            out: get("out"),
+            fail: get("fail"),
+            when_expr: get("when"),
+            writes: get("writes") == "true",
+            table: get("table"),
+        });
+    }
+    Ok(steps)
 }
 
-fn parse_challenge(raw: &str) -> (String, String) {
+pub(crate) fn parse_challenge(raw: &str) -> (String, String) {
     let map = crate::lock::parse_inline_map(raw).unwrap_or_default();
     let ty = map
         .iter()
@@ -1202,6 +1264,65 @@ mod roles_list_tests {
             crate::lock::parse_string_list("[staff]").unwrap(),
             vec!["staff"]
         );
+    }
+}
+
+#[cfg(test)]
+mod malformed_list_tests {
+    use super::{method_from, steps_from};
+    use crate::diag::Level;
+    use crate::lock::{parse_sections, Kind, LockDoc, Meta};
+
+    fn method_doc(body: &str) -> LockDoc {
+        LockDoc {
+            meta: Meta::pending(
+                Kind::Method,
+                None,
+                "shop/methods/bad",
+                "shop/methods/bad.md",
+            ),
+            sections: parse_sections(body).expect("sections"),
+        }
+    }
+
+    #[test]
+    fn malformed_signature_errors_is_a_build_error() {
+        let doc = method_doc("## Signature\n\n- errors: NOT_FOUND\n- capabilities: []\n");
+        let err = method_from(&doc).unwrap_err();
+        assert_eq!(err.level, Level::Error);
+        assert!(err.message.contains("invalid errors"), "{err:?}");
+    }
+
+    #[test]
+    fn malformed_signature_capabilities_is_a_build_error() {
+        let doc = method_doc("## Signature\n\n- errors: []\n- capabilities: sign-jwt\n");
+        let err = method_from(&doc).unwrap_err();
+        assert!(err.message.contains("invalid capabilities"), "{err:?}");
+    }
+
+    #[test]
+    fn malformed_step_params_is_a_build_error() {
+        let doc = method_doc(
+            "## Signature\n\n- errors: []\n\n## Steps\n\n### s1\n\n- op: respond\n- params: a, b\n- status: 200\n",
+        );
+        let err = method_from(&doc).unwrap_err();
+        assert!(err.message.contains("invalid params"), "{err:?}");
+    }
+
+    #[test]
+    fn absent_lists_stay_empty() {
+        let doc = LockDoc {
+            meta: Meta::pending(Kind::Method, None, "shop/methods/ok", "shop/methods/ok.md"),
+            sections: parse_sections(
+                "## Signature\n\n- writes: false\n\n## Steps\n\n### s1\n\n- op: respond\n- status: 200\n",
+            )
+            .unwrap(),
+        };
+        let method = method_from(&doc).unwrap();
+        assert!(method.errors.is_empty());
+        assert!(method.capabilities.is_empty());
+        assert!(method.steps[0].params.is_empty());
+        assert!(steps_from(None, "x").unwrap().is_empty());
     }
 }
 

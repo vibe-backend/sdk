@@ -1,6 +1,6 @@
 # PR review 指引（草稿，配合 spec v1.8 決定 29、37、83、89、96）
 
-v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9C）。人手 review 改由 Git 平台負責；以下係建議設定（以 GitHub rulesets 為例；`vibe build --release-approval` 只認 ruleset，唔認舊式 branch protection）。標「計劃中」嘅指令係 v1.8 設計，未實作。
+v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9C）。人手 review 改由 Git 平台負責；以下係建議設定（以 GitHub rulesets 為例）；SDK 唔檢查呢啲設定。`vibe build --release-approval` 已撤回（產品經理 2026-10-16）。標「計劃中」嘅指令係 v1.8 設計，未實作。
 
 ## 1. Ruleset（`main`）
 
@@ -10,24 +10,20 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - 開 **Dismiss stale pull request approvals when new commits are pushed**（取代 v1.7 嘅「確認綁定 commit hash」）。
 - 開 **Require approval of the most recent reviewable push**，最後 push 嘅人唔可以自己批准。
 - 開 **Require review from Code Owners**。
-- **Bypass list**：`main` ruleset 可以保留 OrganizationAdmin bypass（日常 `--admin` merge 唔變；spec 決定 96 修訂，已確認（產品經理 2026-10-14））。SDK 唔會檢查 `main` 嘅 bypass；`--release-approval` 實作之後，高風險 release 先會獨立驗證 PR review 同 tree 相等，令 admin bypass merge 出唔到高風險 release（`--release-approval` 未實作，實作之前唔成立，今日冇保護）。
+- **Bypass list**：`main` ruleset 保留 OrganizationAdmin bypass（日常 `--admin` merge 唔變；spec 決定 96）。剩餘風險（Jack 已接受）：admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass）；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；同一個帳戶（`j113203`）可以自己批准；`release` environment admin bypass 保持開啟。
 - 以上 required review 同 up-to-date 設定照樣一定要開。
 
 ## 1A. Release tag ruleset（`v*`，spec 決定 96）
 
 - 專用 **tag ruleset**（target：Tag，enforcement：Active），target `refs/tags/v*`（UI 入面 include pattern `v*`）。
 - 只開 **Restrict updates**、**Restrict deletions**、**Block force pushes**；**唔開 Restrict creations**（產品經理代 Jack 決定採用 (i)）。任何有 write 權限嘅人都可以開 `v*` tag，開咗就改唔到、刪唔到。
-- **Bypass list 一定要留空**，admin 都唔例外；唔設白名單。高風險 release build 會讀呢個 ruleset，讀唔到、唔係空、唔係 Active、缺少上面三條規則、或者冇 target 到今次嘅 tag 就失敗。
+- **Bypass list 一定要留空**，admin 都唔例外；唔設白名單。呢個 ruleset 係營運設定，SDK 唔讀、唔檢查；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（spec 決定 96、2C.3a）。
 - Release 只可以由 `v*` tag 出，tag 一定要指向 `main` 上嘅 commit。
-- 把關：開 tag 唔會自動發佈；發佈 job 要經 `release` environment 批准（live reviewer：`j113203`，`prevent_self_review: false`）。`--release-approval` 係計劃中、**未實作**，今日唔提供任何保護。
+- 把關：開 tag 唔會自動發佈；發佈 job 要經 `release` environment 批准（live reviewer：`j113203`，`prevent_self_review: false`）。`--release-approval` 已撤回（產品經理 2026-10-16），冇額外保護。
 - **剩餘風險（Jack 已接受）**：所有 agent 都用 `j113203` push，任何 `j113203` agent 都可以開 `v*` tag **再自己批准 release**。
 - 以上係**臨時方案 (i)**。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一開 `v*` tag 嘅 actor，同時開返 Prevent self-review。
-- `release` environment `can_admins_bypass: true` 保持開啟（Jack 決定保留，已接受風險：admin 可以跳過 `release` environment 嘅批准，即係跳過真正閘門）。
-- 讀 ruleset 嘅專用 GitHub App：只裝喺呢個 repo，喺 `release` environment job 入面 mint installation token：
-  - 權限只畀 repository **Administration: read** 同 **Metadata: read**；**唔畀 Administration: write**。
-  - GitHub 只會將 `bypass_actors` 回畀對 ruleset 有寫權限嘅 caller；如果 read 睇唔到，高風險 release build 會失敗，要另外搵產品經理批准，唔好自己加權限。
-  - App private key 放 `release` environment secret；mint token 時收窄到呢個 repo；token 唔好印出嚟。
-  - 冇呢個 App 嘅話，高風險 release build 會失敗；普通 build 只記錄。
+- `release` environment `can_admins_bypass: true` 保持開啟（Jack 決定保留，已接受風險：admin 可以跳過 `release` environment 嘅批准，即係跳過真正人手批准閘門）。
+- 唔需要讀 ruleset 嘅 GitHub App：`--release-approval` 已撤回，SDK 唔讀 tag ruleset 或者 `bypass_actors`，冇 App 或者讀唔到都唔影響任何 build；ruleset 只係營運設定，唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（spec 決定 96、2C.3a）。
 
 ## 2. CODEOWNERS（必須，spec 決定 29、37）
 
@@ -52,13 +48,13 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 - 而家已經有：`vibe secret-scan --fail-on-find`。
 - `vibe compile --check`：喺 CI 由 source build 一次，驗證結果同決定 114 policy（唔同 commit 咗嘅 lock 比較，因為 lock 唔 commit；spec 決定 117）。
 - 而家已經有：`vibe validate`。
-- `main` 一定要用 **ruleset**（唔好用舊式 branch protection）開 pull request rule 嘅 **Require approval of the most recent reviewable push**：`vibe build --release-approval` 會用 `GET /repos/{owner}/{repo}/rules/branches/main` 確認，冇就失敗。舊式 branch protection 要 admin 權限先讀到，所以唔接受（spec 2C.3a）。
-- 唔好用 merge queue：高風險 release build 唔支援（spec 2C.3a）。
-- 一定要喺 ruleset 嘅 **Require status checks to pass** 入面開 **Require branches to be up to date before merging**（`strict_required_status_checks_policy`，最少要有一個 required status check 先生效）：`vibe build --release-approval` 會比較 build commit 同 PR head 嘅 tree，冇開呢個設定就可能唔一樣，release build 會失敗（spec 2C.3a）。
+- `main` 建議用 **ruleset**（唔好用舊式 branch protection）開 pull request rule 嘅 **Require approval of the most recent reviewable push**。
+- Merge queue：SDK 冇限制（原本 `--release-approval` 嘅限制已撤回）。
+- 建議喺 ruleset 嘅 **Require status checks to pass** 入面開 **Require branches to be up to date before merging**（`strict_required_status_checks_policy`，最少要有一個 required status check 先生效）。
 
 ## 4. 高風險 label 要兩個 approval（可選，source PR 合併層面）
 
-呢個係 Git 平台層面嘅可選 PR 設定，同 `--release-approval` 無關；release 嘅真正批准係 `release` environment（spec 決定 118）。
+呢個係 Git 平台層面嘅可選 PR 設定，同 release 無關；release 嘅真正批准係 `release` environment（spec 決定 118）。
 
 GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自訂 required status check：
 
@@ -77,12 +73,12 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
 ## 6. Release environment 同 Sigstore 簽名（spec 決定 89、92、119）
 
 - 開一個 `release` environment，設 **Required reviewers**；**Deployment branches and tags** 揀 Selected branches and tags，只加 tag 規則 `v*`（唔加任何 branch），即係只准受 release ruleset 保護嘅 `v*` tag 部署。
-- `release` environment **Required reviewers** 係 `j113203`（Jack）；**Prevent self-review 關閉**（spec 決定 96）。所有 agent 都用 `j113203` push，所以 agent 觸發嘅 release 可以由同一個帳戶自己批准；呢個風險 Jack 已經接受。`--release-approval` 未實作；實作後佢唔數 reviewer，只驗證前置條件同 `release` environment 批准存在（spec 決定 90、118）。
+- `release` environment **Required reviewers** 係 `j113203`（Jack）；**Prevent self-review 關閉**（spec 決定 96）。所有 agent 都用 `j113203` push，所以 agent 觸發嘅 release 可以由同一個帳戶自己批准；呢個風險 Jack 已經接受。`--release-approval` 已撤回；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（spec 決定 118）。
 - `release` environment 嘅 **Allow administrators to bypass configured protection rules** 保持開啟（Jack 決定）。剩餘風險：admin 可以跳過 required reviewers；Jack 已接受。
 - 改 CODEOWNERS（`.github/`、root、`docs/` 任何一個）一律當高風險；release 時真正批准係 `release` environment（Jack）。
 - CODEOWNERS 用 team（`@org/team`）嘅話，release workflow 要用 GitHub App installation token（organization Members: read，其他只讀），`GITHUB_TOKEN` 查唔到 team 成員；冇就失敗。
 - Machine user（普通帳戶做自動化）SDK 分唔到係唔係真人，唔好畀佢哋 write 權限或者 CODEOWNERS 身份。
-- 高風險 release 要用 `vibe build --release-approval env:<run_id>`（可以加 `pr:<number>`，計劃中）。Build 唔數 PR review 或者批准人數目；只驗證：build commit 屬於唯一一個 merged PR 而且 tree 同 PR head 一樣、build commit 喺 `main`、ruleset 同 CODEOWNERS 設定、attestation 輸入一致，同埋呢個 run 有 `release` environment（Jack）嘅批准（spec 決定 90、118）。
+- `vibe build --release-approval` 已撤回（產品經理 2026-10-16，spec 2C.3a）；高風險 release 冇額外 SDK 檢查。
 - Release workflow 嘅 token 權限：
 
   ```yaml
@@ -94,7 +90,7 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
   ```
 
 - 任何 API 錯誤、404 或者 rate limit，release build 都會失敗（fail closed），唔好加 retry 去繞過。
-- Release manifest 用 Sigstore keyless 簽（spec 決定 119）：release workflow 喺 `release` environment 用 GitHub OIDC 身份簽，寫入 Rekor；冇長期 key。驗證時 pin issuer `https://token.actions.githubusercontent.com`，證書身份完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`（或者完全錨定 regex），加 commit SHA；離線驗證，trust root embed 入 binary（spec 2C.3b）。Keyless 身份只證明邊個 workflow 同 tag 產生 build，唔證明邊個批准。
+- Release manifest 用 Sigstore keyless 簽（spec 決定 119）：release workflow 喺 `release` environment 用 GitHub OIDC 身份簽，寫入 Rekor；冇長期 key。驗證時 pin issuer `https://token.actions.githubusercontent.com`，證書身份完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`（只接受完全相等；如果工具一定要 regex，只可以用完全錨定、正確轉義嘅式，例如 `^https://github\.com/vibe-backend/sdk/\.github/workflows/release\.yml@refs/tags/v1\.8\.0$`），加 commit SHA；離線驗證，trust root embed 入 binary（spec 2C.3b）。Keyless 身份只證明邊個 workflow 同 tag 產生 build，唔證明邊個批准。
 - Environment secret（例如簽名 secret）只可以用喺 dev／test，永遠唔簽 release。
 - Sigstore 簽名失敗就失敗，唔可以 fallback 去 dev key。
 - 詳細加固步驟見 issue #28。
