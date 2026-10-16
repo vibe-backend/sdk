@@ -26,7 +26,10 @@ pub use http::{
     static_jwt_alg, ApiKeyFile, AppState, AuthConfig, RunEnv, SigningKey, Slug, StoredKey,
     REQUEST_TYPES,
 };
-pub use ops::{custom_claim_problem, load_signing_keys, sub_source_problem};
+pub use ops::{
+    custom_claim_problem, ec_signing_key_from_der, ec_signing_key_from_pem, load_signing_keys,
+    sub_source_problem,
+};
 pub use sql::Stmt;
 
 /// argon2id hash with the platform floor (for seeding test data).

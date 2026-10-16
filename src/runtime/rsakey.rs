@@ -12,26 +12,23 @@ pub const MIN_RSA_BITS: usize = 2048;
 /// rsaEncryption (1.2.840.113549.1.1.1) as a DER OBJECT IDENTIFIER body.
 const RSA_ENCRYPTION_OID: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
 
-/// The first PEM block: (label, DER bytes). Escaped `\\n` newlines (as in
+/// A single PEM block: (label, DER bytes), with only whitespace around it. Escaped `\\n` newlines (as in
 /// env values) are accepted.
 pub(crate) fn pem_der(pem: &str) -> Option<(String, Vec<u8>)> {
     let pem = pem.replace("\\n", "\n");
-    let mut label = None;
-    let mut body = String::new();
-    for line in pem.lines().map(str::trim) {
-        if let Some(rest) = line.strip_prefix("-----BEGIN ") {
-            label = Some(rest.trim_end_matches('-').to_string());
-            body.clear();
-        } else if line.starts_with("-----END ") {
-            break;
-        } else if label.is_some() {
-            body.push_str(line);
-        }
+    let text = pem.trim();
+    let rest = text.strip_prefix("-----BEGIN ")?;
+    let (label, rest) = rest.split_once("-----")?;
+    if label.is_empty() || !label.bytes().all(|b| b.is_ascii_uppercase() || b == b' ') {
+        return None;
     }
+    let end = format!("-----END {label}-----");
+    let body = rest.strip_suffix(&end)?;
+    let body: String = body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     let der = base64::engine::general_purpose::STANDARD
-        .decode(body.as_bytes())
+        .decode(body)
         .ok()?;
-    Some((label?, der))
+    Some((label.to_string(), der))
 }
 
 /// The single top-level DER element with `tag`; trailing bytes after it
