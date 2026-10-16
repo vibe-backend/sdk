@@ -45,7 +45,8 @@ For each request the server:
    than 32 characters or contains a character outside `[A-Za-z0-9_-]`
    (replaced by `-`), the action is the first 23 sanitized characters, `-`,
    and the first 8 hex digits of SHA-256 of the feature id. `vibe serve`
-   refuses to start if two challenge routes would still share an action.
+   refuses to start, and `vibe validate --deploy` fails, if two challenge
+   routes would still share an action.
 
 ## Replay store
 

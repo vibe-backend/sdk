@@ -716,6 +716,34 @@ pub fn always_challenge_locks(root: &Path) -> Vec<String> {
     out
 }
 
+/// Feature ids of every lock that declares a challenge (any `when`), for
+/// the widget action collision check in `vibe validate --deploy`.
+pub fn challenge_feature_ids(root: &Path) -> Vec<String> {
+    let Ok(sources) = crate::discover::discover(root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for source in sources {
+        let Ok(text) = std::fs::read_to_string(root.join(source.lock_rel())) else {
+            continue;
+        };
+        let Ok(doc) = crate::lock::parse_lock(&text) else {
+            continue;
+        };
+        let raw = doc
+            .sections
+            .iter()
+            .find(|s| s.name == "Access")
+            .and_then(|s| s.get("challenge"))
+            .unwrap_or("");
+        let (ty, _) = crate::manifest::parse_challenge(raw);
+        if ty != "none" && !ty.is_empty() {
+            out.push(doc.meta.id.clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn action_is_the_endpoint_name() {
+    fn action_is_derived_from_the_feature_id() {
         assert_eq!(challenge_action("shop/v1/register"), "shop_v1_register");
         assert_ne!(
             challenge_action("shop/v1/register"),

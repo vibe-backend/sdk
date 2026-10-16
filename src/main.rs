@@ -304,6 +304,11 @@ fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
     let always = vibe::runtime::challenge::always_challenge_locks(project);
     let configured = vibe::runtime::challenge::configured_in_env()?;
     vibe::runtime::challenge::production_gate(run_env, configured, &always)?;
+    // #159: same widget action check as `vibe serve`, before deploying.
+    if deploy {
+        let ids = vibe::runtime::challenge::challenge_feature_ids(project);
+        vibe::runtime::challenge::action_collisions(ids.iter().map(String::as_str))?;
+    }
     // #157: the replay store choice (the table itself is checked by `vibe serve`).
     let replay_kind =
         vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?;
