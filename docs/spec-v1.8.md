@@ -231,6 +231,7 @@
 | 119 | Manifest 簽名改用 Sigstore keyless（Jack 決定，取代 KMS）：release manifest 由 release workflow 喺 `release` environment 用 GitHub OIDC 身份經 Sigstore（Fulcio 證書）簽，簽名一定要記錄喺 Rekor transparency log。驗證時證書身份一定要完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`（只接受完全相等，唔可以寬鬆配對 `refs/tags/v*`；如果工具一定要用 regex，只可以用完全錨定、正確轉義、寫死部署版本嘅式，例如 `^https://github\.com/vibe-backend/sdk/\.github/workflows/release\.yml@refs/tags/v1\.8\.0$`），commit SHA 同 GitHub-hosted runner 都要對，同決定 113 attestation 一致；issuer pin 死 `https://token.actions.githubusercontent.com`；冇 Rekor inclusion 證明即拒絕。驗證離線做：Rekor inclusion proof／SET 隨 Sigstore bundle 一齊交付；trust root（`trusted_root.json`：Fulcio CA、Rekor 公鑰、CT log key）由 Sigstore TUF repository 取得，release 時 pin 一份入 runtime binary，見 2C.3b。Keyless 身份只證明邊個 workflow 同 tag 產生呢個 build，唔證明邊個批准；佢唔會加多一個人，因為任何 `j113203` agent 都可以開 tag 再自己批准。冇任何長期簽名 key 或者 KMS，冇自管簽名 key 輪換（Sigstore trust root 輪換見 2C.3b）。Environment secret（例如簽名 secret）只可以用喺 dev／test，永遠唔用嚟簽 release。剩餘風險：臨時方案 (i) 下 tag 身份唔係閘門，真正閘門係 `release` environment 批准（決定 118）；trust root 更新都係經同一個 `release` environment 出，同一個帳戶可以自己批准，冇額外嘅人把關。 | 已確認（產品經理 2026-10-14） | 2C.2、2C.3、2C.3b、9B、9C |
 | 120 | Email 正規化（issue #106）：v1 唔合併 plus addressing，`a+x@` 同 `a@` 係兩個唔同地址；local part 入面嘅點（`.`）照樣保留，`a.b@` 同 `ab@` 係兩個唔同地址。Local part：先做 Unicode NFC（唔係 NFKC），再 trim，再 lowercase。Domain：用 IDNA UTS #46 轉做 punycode，再 lowercase；IDNA 轉換失敗回 422 `VALIDATION_FAILED`。唯一 index、查找同發送全部用正規化後嘅值；login、註冊、邀請、驗證、重發同 rate-limit 全部先正規化再儲存同查找（12.11）。v1 只儲存正規化後嘅值，唔另外保留原本地址做顯示。現有資料遷移：migration 先偵測正規化後衝突（只差大小寫或者 Unicode 形式嘅重複地址）；有任何衝突就 fail closed 停止，唔自動合併；衝突報告只列 user id，任何公開 log 都唔出現完整 email；由人手按 12.11 嘅處理程序解決之後先重新跑。 | 已確認（產品經理 2026-10-16） | 4.3、9、12.11 |
 | 129 | 租戶 role 細節（補充決定 97，SDK #147）：(1) Runtime role 係 `tenant_<id>_rw`、`tenant_<id>_public_reader`、`tenant_<id>_public_writer`；`<id>` 係系統產生、只有 `[a-z0-9_]` 嘅不透明 id，永遠唔用用戶提供嘅名；role 名超過 63 bytes 即拒絕，永遠唔截斷。(2) 連線池每個（租戶、role）5 條，每個租戶最多 15 條；另有全 process 上限，預設 200，可以設定。超過任何上限即刻回 503 `DB_POOL_EXHAUSTED` 加 `Retry-After` 並發 metric，唔排隊等 timeout。(3) `VIBE_TENANT_DB_SECRETS` JSON 檔只限開發同測試，權限一定 0600，永遠唔 commit、唔寫 log；production 用 secret manager 參照，production 見到呢個檔就拒絕啟動（fail closed）。(4) 閒置連線池 5 分鐘後關閉；呢點阻 GA，唔阻 v1 preview。(5) Migration role 係 `tenant_<id>_owner`，擁有該租戶 schema，只畀 migrate 用；runtime role 唔係 owner，每張表都要 `FORCE ROW LEVEL SECURITY`；migrate 兩樣都檢查，缺任何一樣就失敗。(6) 編譯器輸出每個租戶常數 policy（`TO tenant_<id>_rw`），唔用 `current_setting('app.tenant_id')`；部署時比較編譯出嚟嘅 policy 同 DB 實際安裝嘅 policy，唔一致即 fail closed。 | 已確認（產品經理 2026-10-16） | 7.1、7.1a、9C |
+| 130 | IP 限流計數鍵同驅逐（SDK #132，v1 blocker；修訂 #73 嘅限流設計）：(1) 計數鍵：IPv4 用（`tenant_id`、/24），上限 10；IPv6 用（`tenant_id`、/48），上限 10，另加（`tenant_id`、/32），上限 50；其他數字同時間窗跟 #73。(2) 平台層：另有一個跨租戶網段計數器，鍵係 /24 同 /48，預設上限係租戶上限 ×5，可以設定；兩層都通過先放行；v1 冇每租戶預留。拒絕回 429 加 `Retry-After`，回應永遠唔講係邊一層觸發。(3) 驅逐：固定窗口加有上限嘅 LRU，先驅逐已過期嘅項目；每個租戶有自己嘅計數器 slot 上限；slot 滿而冇過期項目就 fail closed，回 429 並記 metric；永遠唔驅逐仲喺窗口內嘅計數器。多 instance 部署一定要用共用儲存（#157）。 | 已確認（產品經理 2026-10-16） | 4.3、4A.3、7.2 |
 
 ## 1. 目錄同命名
 
@@ -1014,7 +1015,10 @@ security-items:
 | `burst` | 正整數 | 否 | 預設等於窗口上限，唔可以大過佢 |
 | `fail` | 錯誤碼 | 否 | 預設 `RATE_LIMITED`（429，帶 `Retry-After`） |
 
-- 計數用滑動窗口，按 `tenant_id` 分開儲存；`key: ip` 嘅 IP 由平台按受信任 proxy 設定解析，唔讀 client 自報 header。
+- 計數用固定窗口，按 `tenant_id` 分開儲存；`key: ip` 嘅 IP 由平台按受信任 proxy 設定解析，唔讀 client 自報 header。
+- `key: ip` 計數鍵（決定 130）：IPv4 用（`tenant_id`、/24），上限 10；IPv6 用（`tenant_id`、/48），上限 10，另加（`tenant_id`、/32），上限 50；其他數字同時間窗照舊。
+- 平台層（決定 130）：另有跨租戶網段計數器（鍵係 /24 同 /48），預設上限係租戶上限 ×5，可以設定；兩層都通過先放行，v1 冇每租戶預留。拒絕一律回 429 加 `Retry-After`，回應唔講係邊一層觸發。
+- 驅逐（決定 130）：有上限嘅 LRU，先驅逐已過期項目；每個租戶有自己嘅計數器 slot 上限；slot 滿而冇過期項目就 fail closed（429 加 metric）；永遠唔驅逐仲喺窗口內嘅計數器。多 instance 部署一定要用共用儲存（#157）。
 - 同一 endpoint 可以有多個 `rate-limit` step；任何一個超過就拒絕。
 
 ### 4.4 `## Order` 准用值（決定 65）
@@ -1144,7 +1148,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 - 同一帳戶或者同一 IP 15 分鐘內失敗 3 次之後，之後嘅登入一定要 captcha（防止被人用嚟惡意鎖死帳戶）。
 - 鎖定期間，用戶可以經 email 重設密碼連結即時解鎖；鎖定同解鎖都寫審計記錄並通知用戶。
 - 鎖定期間回應同密碼錯完全一樣（401 `INVALID_CREDENTIALS`），耗時都補到 500ms，唔洩露帳戶狀態。
-- 另加 IP 限流：每個 IP 每分鐘 10 次登入（見 11.2 `login-guard`）。
+- 另加 IP 限流：每分鐘 10 次登入（見 11.2 `login-guard`）；IP 計數鍵按決定 130（IPv4 /24、IPv6 /48 加 /32），另加平台層跨租戶網段限流。
 
 ## 5. 資料庫提供者 `providers/{name}.md`
 
@@ -1255,7 +1259,7 @@ migration 放喺 ./migrations/main/。
   - **UPDATE**：一定要有 `WHERE`，用主鍵或者 RLS 限定，而且 RLS 生效。
   - **租戶**：`tenant_id` 由平台按 slug 解析後注入；request body 入面有 `tenant_id`、`id`、`created_by` 一律 422 拒絕（決定 23）。
   - **配額**：每租戶每日 public 寫入配額強制，預設 1,000 次，另每 IP 每日 50 次；租戶 admin 可以調低，調高最多到 10,000 要經平台申請（決定 39）；用完之後只封鎖 public 寫入（回 429 同 `Retry-After`），已認證請求同 public 讀取照常（決定 21）。
-  - **限流**：IP 加租戶兩層限流強制；lock 標 `cost: high` 嘅昂貴 step（例如 `verify-password`、`hash-password`、大範圍 query）自動用更嚴嘅限流，即係 endpoint 上限嘅一半（決定 25、39）。
+  - **限流**：IP 加租戶兩層限流強制（IP 計數鍵、平台層同驅逐規則見決定 130、4.3）；lock 標 `cost: high` 嘅昂貴 step（例如 `verify-password`、`hash-password`、大範圍 query）自動用更嚴嘅限流，即係 endpoint 上限嘅一半（決定 25、39）。
   - **防機器人**（決定 49）：lock `## Access` 用統一語法 `challenge: { type: none | captcha | pow, when: always | after-failures, after-failures: <n> }`。
     - 建立資料（有 INSERT）嘅 public endpoint：一定要 `type: captcha` 或者 `pow`，`when: always`。
     - login 類 endpoint：一定要 `{ type: captcha, when: after-failures, after-failures: 3 }`（跟 4A.3）。
