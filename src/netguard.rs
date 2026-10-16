@@ -176,6 +176,8 @@ fn non_public_v6(ip: Ipv6Addr) -> bool {
         || (s[0] == 0x2001 && s[1] == 2 && s[2] == 0) // 2001:2::/48 benchmarking
         || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x10) // 2001:10::/28 ORCHID
         || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x20) // 2001:20::/28 ORCHIDv2
+        || (s[0] == 0x3fff && (s[1] & 0xf000) == 0) // 3fff::/20 documentation
+        || s[0] == 0x5f00 // 5f00::/16 SRv6 SIDs
         || s[0] == 0x2002 // 2002::/16 6to4
         || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
         || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
@@ -264,6 +266,10 @@ mod tests {
             "2001:1f::1",
             "2001:20::1",
             "2001:2f:ffff::1",
+            "3fff::",
+            "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "5f00::",
+            "5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
             "192.0.2.1",
             "192.0.2.255",
             "192.88.99.1",
@@ -281,6 +287,10 @@ mod tests {
             "2001:2:1::1",
             "2001:30::1",
             "2001:f::1",
+            "3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "3fff:1000::",
+            "5eff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "5f01::",
             "192.0.3.1",
             "192.88.98.1",
             "192.88.100.1",
