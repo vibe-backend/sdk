@@ -397,6 +397,15 @@ async fn cmd_serve(
     let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
+    for route in &manifest.routes {
+        if let Some(problem) = route
+            .refresh
+            .as_ref()
+            .and_then(|spec| vibe::manifest::refresh_spec_problem(&route.feature_id, spec))
+        {
+            return Err(problem);
+        }
+    }
     // `sign-jwt` key-refs name environment variables holding private PEMs.
     auth.signing_keys =
         vibe::runtime::load_signing_keys(&manifest, &|name| std::env::var(name).ok(), &auth.kid)?;

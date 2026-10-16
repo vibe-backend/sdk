@@ -30,8 +30,10 @@ Per-IP rate limits and public-write quotas use the TCP peer address. Set `VIBE_T
 | `sign-method` | required | — | Method with a `sign-jwt` step that signs the new access token (`capabilities: [sign-token]`). |
 | `refresh-ttl` | 30d | ≤ 30d | Family lifetime, counted from login. No token of the family works after it. |
 | `idle-ttl` | 7d | ≤ 7d | An unused token expires this long after it was issued. |
-| `reuse-grace` | 10s | ≤ 60s | Window for one retry of the previous token (see below). |
+| `reuse-grace` | 10s | 1s–10s | Window for one retry of the previous token (see below). |
 | `transport` | `body` | `body` | Where the token travels. |
+
+Values outside these limits (for example `reuse-grace: 11s` or `0s`) fail `vibe validate` and the build, and `vibe serve` refuses to start with a manifest that carries one (spec §4A.1).
 
 `refresh_expires_in` is the smaller of `idle-ttl` and what is left of the family lifetime. Rate limits: 30 requests per minute per IP (429) and 10 per minute per family; a `rate-limit` with `key: family` can only lower the family limit. Only live tokens count toward the family limit, and reaching it returns the same 401 as any other failure.
 

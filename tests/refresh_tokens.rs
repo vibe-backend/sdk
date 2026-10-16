@@ -479,6 +479,18 @@ fn pipeline_blocks_parse_and_check() {
     );
     assert!(parse_refresh_block(&b(&[("sign-method", "m"), ("refresh-ttl", "31d")])).is_err());
     assert!(parse_refresh_block(&b(&[("sign-method", "m"), ("idle-ttl", "8d")])).is_err());
+    // reuse-grace: default and maximum 10s (spec §4A.1); 0 is not a valid
+    // window (the setting is 1s..=10s).
+    let grace = |v: &str| {
+        parse_refresh_block(&b(&[("sign-method", "m"), ("reuse-grace", v)]))
+            .map(|s| s.reuse_grace_s)
+    };
+    assert_eq!(grace("10s").unwrap(), 10);
+    assert_eq!(grace("1s").unwrap(), 1);
+    for bad in ["11s", "60s", "1m", "0s", "0"] {
+        let err = grace(bad).unwrap_err();
+        assert!(err.contains("between 1s and 10s"), "{bad}: {err}");
+    }
     assert!(parse_refresh_block(&b(&[("sign-method", "m"), ("transport", "cookie")])).is_err());
     assert!(parse_refresh_block(&b(&[("sign-method", "m"), ("bogus", "1")])).is_err());
     assert!(parse_revoke_block(&b(&[("scope", "everyone")])).is_err());
@@ -996,4 +1008,24 @@ async fn postgres_cleanup_removes_finished_families_in_batches() {
         .map(|r| r.get(0))
         .collect();
     assert_eq!(left, vec!["live".to_string(), "recent".to_string()]);
+}
+
+#[test]
+fn startup_rejects_reuse_grace_outside_the_spec_limits() {
+    use vibe::manifest::{refresh_spec_problem, RefreshSpec};
+    let spec = |grace: i64| RefreshSpec {
+        sign_method: "auth.sign".into(),
+        refresh_ttl_s: 2_592_000,
+        idle_ttl_s: 604_800,
+        reuse_grace_s: grace,
+    };
+    assert_eq!(refresh_spec_problem("auth.refresh", &spec(10)), None);
+    assert_eq!(refresh_spec_problem("auth.refresh", &spec(1)), None);
+    for bad in [11, 60, 0, -1] {
+        let err = refresh_spec_problem("auth.refresh", &spec(bad)).unwrap();
+        assert!(
+            err.contains("reuse-grace") && err.contains("between 1s and 10s"),
+            "{err}"
+        );
+    }
 }
