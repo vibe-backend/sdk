@@ -170,17 +170,26 @@ Every bound request must carry a fresh nonce in the `X-Vibe-Request-Nonce` heade
   nonce record, which counts toward the replay store caps (decisions 134 and
   137).
 
-The server checks the nonce in a fixed order and stops at the first failure:
+The server checks in a fixed order and stops at the first failure (PM-approved
+2026-10-16 12:44 HKT, #258):
 
-1. Format and canonical form: 403 `CHALLENGE_FAILED`.
-2. Reuse of the same nonce: 403 `CHALLENGE_FAILED`.
-3. Decision 137 unverified-reservation cap: 403 `CHALLENGE_FAILED`.
-4. Decision 134 capacity caps (store full, per-prefix cap): 429
+1. Format and canonical form of the nonce, the token and the request: 403
+   `CHALLENGE_FAILED`. These checks don't need the replay store.
+2. Replay store unavailable: 503 `CHALLENGE_UNAVAILABLE` with `Retry-After: 5`.
+   The request is never let through.
+3. Reuse of the same nonce, then of the same token: 403 `CHALLENGE_FAILED`.
+4. Decision 137 unverified-reservation cap: 403 `CHALLENGE_FAILED`.
+5. Decision 134 capacity caps (store full, per-prefix cap): 429
    `CHALLENGE_RATE_LIMITED` with `Retry-After`. This response is identical to
-   every other decision 134 429, apart from the `Retry-After` value.
+   every other decision 134 429, apart from the `Retry-After` value, whether the
+   nonce record or the token record went over the cap.
    `Retry-After` is the remaining lifetime of the tenant's own oldest record
    (store full) or of the tenant's oldest record in that prefix (per-prefix
    cap), at most 360 seconds, and 60 seconds if it can't be computed.
+
+The nonce record and the token record are reserved in one transaction, nonce
+first. If either fails, nothing is written. Each request takes 2 records, and
+both count toward the caps. Cap values are reviewed in #256.
 
 Every verification failure, including a reused nonce, is 403, never 429. On 429,
 wait `Retry-After` seconds, then retry with a new nonce and a new challenge.
