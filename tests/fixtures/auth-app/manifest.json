@@ -1,0 +1,52 @@
+{
+  "manifest_version": 1,
+  "signature": "",
+  "migrations": [],
+  "models": [],
+  "routes": [
+    {
+      "method": "POST", "path": "/auth/v1/{slug}/login", "feature_id": "auth/v1/login",
+      "public": true, "auth_removed": true, "auth_mode": "jwt", "roles": [], "scopes": [],
+      "rates": [], "body_limit": 4096,
+      "request": [
+        {"location": "body", "name": "email", "ty": "string", "required": true, "min": null, "max": null, "format": ""},
+        {"location": "body", "name": "password", "ty": "string", "required": true, "min": null, "max": null, "format": ""}
+      ],
+      "transform_in": "{email: req.body.email, password: req.body.password}",
+      "transform_out": "result",
+      "steps": [
+        {"id": "s1", "op": "method", "target": "user.login", "args": "transform.in", "value": "",
+         "status": 0, "sql": "", "params": [], "out": "result", "fail": "", "when_expr": "",
+         "writes": false, "table": ""},
+        {"id": "s2", "op": "respond", "target": "", "args": "", "value": "transform.out",
+         "status": 200, "sql": "", "params": [], "out": "", "fail": "", "when_expr": "",
+         "writes": false, "table": ""}
+      ],
+      "errors": [{"status": 401, "code": "INVALID_CREDENTIALS", "from": "user.login"}],
+      "min_response_ms": 300, "public_writes": false, "challenge_type": "none",
+      "challenge_when": "always", "deprecated": false, "sunset": ""
+    }
+  ],
+  "methods": [
+    {
+      "target": "user.login", "writes": false, "input": [], "errors": ["INVALID_CREDENTIALS"],
+      "capabilities": ["sign-token"], "crud_model": "", "crud_action": "",
+      "steps": [
+        {"id": "s1", "op": "query", "target": "", "args": "", "value": "", "status": 0,
+         "sql": "select id::text as id, roles, password from users where email = $1 and deleted_at is null and email_verified_at is not null",
+         "params": ["input.email"], "out": "u", "fail": "", "when_expr": "", "writes": false, "table": "users"},
+        {"id": "s2", "op": "verify-password", "target": "", "args": "", "value": "", "status": 0,
+         "sql": "", "params": [], "out": "ok", "fail": "", "when_expr": "", "writes": false, "table": "",
+         "opts": {"hash": "u.password", "plain": "input.password", "missing-user": "dummy-hash"}},
+        {"id": "s3", "op": "validate", "target": "", "args": "", "value": "", "status": 0,
+         "sql": "", "params": [], "out": "", "fail": "INVALID_CREDENTIALS", "when_expr": "`ok != true`",
+         "writes": false, "table": ""},
+        {"id": "s4", "op": "sign-jwt", "target": "", "args": "", "value": "", "status": 0,
+         "sql": "", "params": [], "out": "tok", "fail": "", "when_expr": "", "writes": false, "table": "",
+         "opts": {"alg": "ES256", "key-ref": "JWT_SIGNING_KEY", "claims": "{ sub: u.id }", "ttl": "15m"}},
+        {"id": "s5", "op": "respond", "target": "", "args": "", "value": "tok", "status": 200,
+         "sql": "", "params": [], "out": "", "fail": "", "when_expr": "", "writes": false, "table": ""}
+      ]
+    }
+  ]
+}

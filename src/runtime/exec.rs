@@ -20,6 +20,83 @@ pub enum ExecError {
 pub trait QueryExec: Send + Sync {
     async fn execute(&self, tenant_id: &str, role: &str, stmt: Stmt)
         -> Result<Vec<Row>, ExecError>;
+
+    /// Runs a lock `query` step: validated, parameterised SQL in the tenant
+    /// schema under row level security. Params are sent as text and parsed
+    /// by PostgreSQL for whatever type the statement needs. Only PostgreSQL
+    /// implements this.
+    ///
+    /// `role` is `public_reader` or `public_writer` (spec §12.8): the statement
+    /// runs under `SET LOCAL ROLE`, and in a READ ONLY transaction unless
+    /// `writes`.
+    async fn raw(
+        &self,
+        _tenant_id: &str,
+        _role: &str,
+        _writes: bool,
+        _sql: &str,
+        _params: Vec<Option<String>>,
+    ) -> Result<Vec<Row>, ExecError> {
+        Err(ExecError::Message(
+            "query steps need PostgreSQL; the --memory executor does not run them".into(),
+        ))
+    }
+
+    /// Platform lookup for `sign-jwt`: `users.roles` of the user whose `id`
+    /// is `user_id`; `None` when there is no such user.
+    async fn user_roles(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, ExecError>;
+}
+
+/// Database roles a `query` step may run as.
+pub const QUERY_ROLES: [&str; 2] = ["public_reader", "public_writer"];
+
+fn roles_from(value: Option<&Value>) -> Result<Vec<String>, ExecError> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| ExecError::Message("users.roles must be text[]".into()))
+            })
+            .collect(),
+        Some(_) => Err(ExecError::Message("users.roles must be text[]".into())),
+    }
+}
+
+/// A query parameter sent in text format so PostgreSQL infers its type.
+#[derive(Debug)]
+struct TextParam(Option<String>);
+
+impl tokio_postgres::types::ToSql for TextParam {
+    fn to_sql(
+        &self,
+        _ty: &tokio_postgres::types::Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match &self.0 {
+            Some(text) => {
+                out.extend_from_slice(text.as_bytes());
+                Ok(tokio_postgres::types::IsNull::No)
+            }
+            None => Ok(tokio_postgres::types::IsNull::Yes),
+        }
+    }
+
+    fn accepts(_ty: &tokio_postgres::types::Type) -> bool {
+        true
+    }
+
+    fn encode_format(&self, _ty: &tokio_postgres::types::Type) -> tokio_postgres::types::Format {
+        tokio_postgres::types::Format::Text
+    }
+
+    tokio_postgres::types::to_sql_checked!();
 }
 
 #[derive(Default)]
@@ -31,10 +108,35 @@ impl MemoryExec {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Adds a row to a tenant table directly (dev data and tests).
+    pub fn seed(&self, tenant_id: &str, table: &str, row: Row) {
+        if let Ok(mut tables) = self.tables.lock() {
+            tables.entry(key(tenant_id, table)).or_default().push(row);
+        }
+    }
 }
 
 #[async_trait]
 impl QueryExec for MemoryExec {
+    async fn user_roles(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, ExecError> {
+        let tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        let Some(row) = tables.get(&key(tenant_id, "users")).and_then(|rows| {
+            rows.iter()
+                .find(|r| r.get("id").and_then(Value::as_str) == Some(user_id))
+        }) else {
+            return Ok(None);
+        };
+        roles_from(row.get("roles")).map(Some)
+    }
+
     async fn execute(
         &self,
         tenant_id: &str,
@@ -701,6 +803,119 @@ impl QueryExec for PgExec {
             out.push(mapped);
         }
         Ok(out)
+    }
+
+    async fn raw(
+        &self,
+        tenant_id: &str,
+        role: &str,
+        writes: bool,
+        sql: &str,
+        params: Vec<Option<String>>,
+    ) -> Result<Vec<Row>, ExecError> {
+        if !QUERY_ROLES.contains(&role) {
+            return Err(ExecError::Message(format!("query cannot run as {role}")));
+        }
+        self.run_tx(tenant_id, Some(role), writes, sql, params)
+            .await
+    }
+
+    async fn user_roles(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, ExecError> {
+        let rows = self
+            .run_tx(
+                tenant_id,
+                None,
+                false,
+                "SELECT roles FROM users WHERE id::text = $1",
+                vec![Some(user_id.to_string())],
+            )
+            .await?;
+        match rows.first() {
+            None => Ok(None),
+            Some(row) => roles_from(row.get("roles")).map(Some),
+        }
+    }
+}
+
+impl PgExec {
+    /// One transaction in the tenant schema; `role` switches to a query role
+    /// with `SET LOCAL ROLE`; without `writes` it is READ ONLY.
+    async fn run_tx(
+        &self,
+        tenant_id: &str,
+        role: Option<&str>,
+        writes: bool,
+        sql: &str,
+        params: Vec<Option<String>>,
+    ) -> Result<Vec<Row>, ExecError> {
+        if !super::slugs::valid_tenant(tenant_id) {
+            return Err(ExecError::Message("invalid tenant id".into()));
+        }
+        let mut client = self.client().await.map_err(ExecError::Message)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|err| ExecError::Message(err.to_string()))?;
+        if !writes {
+            tx.batch_execute("SET TRANSACTION READ ONLY")
+                .await
+                .map_err(|err| ExecError::Message(err.to_string()))?;
+        }
+        let schema = format!("\"t_{tenant_id}\"");
+        tx.query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true)",
+            &[
+                &tenant_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &schema as &(dyn tokio_postgres::types::ToSql + Sync),
+            ],
+        )
+        .await
+        .map_err(|err| ExecError::Message(err.to_string()))?;
+        if let Some(role) = role {
+            // `role` is one of QUERY_ROLES (checked by the caller).
+            tx.batch_execute(&format!("SET LOCAL ROLE {role}"))
+                .await
+                .map_err(|err| ExecError::Message(format!("SET ROLE {role}: {err}")))?;
+        }
+        let params: Vec<TextParam> = params.into_iter().map(TextParam).collect();
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p as _).collect();
+        let body = sql.trim().trim_end_matches(';');
+        let rows = if crate::sqlguard::returns_rows(body) {
+            // Every column comes back as JSON, whatever its type.
+            let wrapped = crate::sqlguard::wrap_for_rows(body);
+            if role.is_some() {
+                // Query steps: check the text that is actually executed.
+                if let Some(problem) = crate::sqlguard::wrapped_problem(&wrapped) {
+                    return Err(ExecError::Message(problem));
+                }
+            }
+            tx.query(&wrapped, &refs).await.map_err(map_pg)?
+        } else {
+            if role.is_some() {
+                if let Some(problem) = crate::sqlguard::query_problem(body) {
+                    return Err(ExecError::Message(problem));
+                }
+            }
+            tx.execute(body, &refs).await.map_err(map_pg)?;
+            Vec::new()
+        };
+        tx.commit()
+            .await
+            .map_err(|err| ExecError::Message(err.to_string()))?;
+        rows.iter()
+            .map(|row| {
+                let text: String = row.get(0);
+                match serde_json::from_str(&text) {
+                    Ok(Value::Object(map)) => Ok(map),
+                    _ => Err(ExecError::Message("query row is not an object".into())),
+                }
+            })
+            .collect()
     }
 }
 
