@@ -883,7 +883,7 @@ async fn duplicate_insert_is_conflict_not_internal() {
     let err = run_method(&m, &exec, "t.run", &input, ctx(&auth, &tenant), 0)
         .await
         .unwrap_err();
-    assert_eq!(err.code, "CONFLICT", "{err:?}");
+    assert_eq!(err.code, "UNIQUE_VIOLATION", "{err:?}");
 }
 
 #[tokio::test]

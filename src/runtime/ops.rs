@@ -133,7 +133,9 @@ pub async fn query(
         .map_err(|err| match err {
             ExecError::Message(msg) if msg.contains("--memory") => internal(msg),
             // SQLSTATE 23505 (unique violation), mapped in exec.
-            ExecError::Conflict => MethodFail::code("CONFLICT", "already exists"),
+            ExecError::Conflict => {
+                MethodFail::code("UNIQUE_VIOLATION", "a unique constraint was violated")
+            }
             other => {
                 tracing::warn!(error = ?other, "query step failed");
                 internal("query failed")
