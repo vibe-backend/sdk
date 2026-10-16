@@ -1460,17 +1460,30 @@ fn effective_rate_limit(per_minute: u32, high_cost: bool) -> u32 {
     }
 }
 
+/// Password ops (`verify-password`, `hash-password`) are high cost by default;
+/// any other step opts in with `cost: high`.
 fn step_has_high_cost(step: &StepSpec) -> bool {
-    step.opts.get("cost").is_some_and(|cost| cost == "high")
+    matches!(step.op.as_str(), "verify-password" | "hash-password")
+        || step.opts.get("cost").is_some_and(|cost| cost == "high")
 }
 
+/// True when the route, or any method it reaches through `method` steps
+/// (followed transitively), has a high-cost step. A visited set keeps
+/// recursive method graphs finite.
 fn route_has_high_cost(manifest: &Manifest, route: &RouteSpec) -> bool {
-    route.steps.iter().any(|step| {
-        step_has_high_cost(step)
-            || (step.op == "method"
-                && crate::manifest::method(manifest, &step.target)
-                    .is_some_and(|method| method.steps.iter().any(step_has_high_cost)))
-    })
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut pending: Vec<&StepSpec> = route.steps.iter().collect();
+    while let Some(step) = pending.pop() {
+        if step_has_high_cost(step) {
+            return true;
+        }
+        if step.op == "method" && visited.insert(step.target.as_str()) {
+            if let Some(method) = crate::manifest::method(manifest, &step.target) {
+                pending.extend(method.steps.iter());
+            }
+        }
+    }
+    false
 }
 
 fn rate_bucket(
@@ -1881,6 +1894,110 @@ mod rate_tests {
     fn xff_ignored_without_trusted_proxy() {
         let got = client_ip(&xff("1.2.3.4"), Some(ip("9.9.9.9")), &[], false);
         assert_eq!(got, "9.9.9.9");
+    }
+
+    fn cost_fixture() -> Manifest {
+        serde_json::from_str(include_str!("../../tests/fixtures/auth-app/manifest.json"))
+            .expect("fixture manifest")
+    }
+
+    fn cost_step(op: &str, target: &str, cost: Option<&str>) -> StepSpec {
+        let mut step = cost_fixture().routes[0].steps[0].clone();
+        step.op = op.to_string();
+        step.target = target.to_string();
+        step.opts.clear();
+        if let Some(c) = cost {
+            step.opts.insert("cost".into(), c.into());
+        }
+        step
+    }
+
+    fn cost_manifest(methods: Vec<(&str, Vec<StepSpec>)>) -> Manifest {
+        let mut m = cost_fixture();
+        let template = m.methods[0].clone();
+        m.methods = methods
+            .into_iter()
+            .map(|(target, steps)| {
+                let mut method = template.clone();
+                method.target = target.to_string();
+                method.steps = steps;
+                method
+            })
+            .collect();
+        m
+    }
+
+    fn cost_route(steps: Vec<StepSpec>) -> RouteSpec {
+        let mut r = cost_fixture().routes[0].clone();
+        r.steps = steps;
+        r
+    }
+
+    #[test]
+    fn password_ops_are_high_cost_by_default() {
+        assert!(step_has_high_cost(&cost_step("verify-password", "", None)));
+        assert!(step_has_high_cost(&cost_step("hash-password", "", None)));
+        assert!(step_has_high_cost(&cost_step(
+            "verify-password",
+            "",
+            Some("low")
+        )));
+        assert!(step_has_high_cost(&cost_step("query", "", Some("high"))));
+        assert!(!step_has_high_cost(&cost_step("query", "", None)));
+    }
+
+    #[test]
+    fn route_cost_includes_transitively_called_methods() {
+        let m = cost_manifest(vec![
+            ("a", vec![cost_step("method", "b", None)]),
+            ("b", vec![cost_step("method", "c", None)]),
+            ("c", vec![cost_step("verify-password", "", None)]),
+            ("plain", vec![cost_step("query", "", None)]),
+        ]);
+        assert!(route_has_high_cost(
+            &m,
+            &cost_route(vec![cost_step("method", "a", None)])
+        ));
+        assert!(!route_has_high_cost(
+            &m,
+            &cost_route(vec![cost_step("method", "plain", None)])
+        ));
+        assert!(route_has_high_cost(
+            &m,
+            &cost_route(vec![cost_step("hash-password", "", None)])
+        ));
+    }
+
+    #[test]
+    fn route_cost_terminates_on_recursive_methods() {
+        let m = cost_manifest(vec![
+            ("x", vec![cost_step("method", "y", None)]),
+            (
+                "y",
+                vec![
+                    cost_step("method", "x", None),
+                    cost_step("method", "y", None),
+                ],
+            ),
+        ]);
+        assert!(!route_has_high_cost(
+            &m,
+            &cost_route(vec![cost_step("method", "x", None)])
+        ));
+        let m = cost_manifest(vec![
+            ("x", vec![cost_step("method", "y", None)]),
+            (
+                "y",
+                vec![
+                    cost_step("method", "x", None),
+                    cost_step("hash-password", "", None),
+                ],
+            ),
+        ]);
+        assert!(route_has_high_cost(
+            &m,
+            &cost_route(vec![cost_step("method", "x", None)])
+        ));
     }
 
     #[test]
