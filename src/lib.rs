@@ -34,3 +34,5 @@ pub use diag::{Diag, Level, Report};
 pub use llm::{load_llm_config, FakeAdapter, HttpAdapter, LlmAdapter, LlmConfig};
 pub use manifest::{manifest_from_project, read_manifest, write_manifest, Manifest};
 pub use validate::{validate_project, ValidateOptions};
+
+pub mod interactive;

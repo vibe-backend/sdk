@@ -8,8 +8,8 @@ added only when the corresponding PR is merged to `main`.
 - **Undefined variable roots (#284):** Validate rejects undefined expression roots, naming the root, location and sorted allowed roots.
 - **Compile validation (#288):** Each LLM lock is validated after normalization and repaired with exact validate feedback within the existing shared retry bound. Prompts clarify API steps, expressions and routes. Compilation validates the whole project before writing locks or a build record, and fails without writing either if invalid.
 
-- **Hello world scaffold:** `vibe new <definition>/<version>/<feature>` creates minimal explicit sources without overwriting existing files.
-- **Missing API sources:** Compile errors show the missing `_definition.md` / `_version.md` path, minimal content, and a `vibe new` hint.
+- **Interactive CLI:** `vibe` sets up LLM settings and generates feature sources from natural language, with confirmation and no overwrites.
+- **Missing API sources:** Compile errors show the missing `_definition.md` / `_version.md` path, minimal content, and a hint to run `vibe` (interactive).
 - **Memory development slugs:** `serve --memory` in development defaults to slug `dev` (tenant `devtenant`) even when other slugs are configured and reloads changed slug files without restart. Other serving modes are unchanged.
 
 - **API expressions:** Support JSON string/number literals, reserved true/false/null words and quoted object keys (no arrays). API `respond value` evaluates expressions; empty or `transform.out` evaluates Transform out, with failures returning 500 INTERNAL without fallback. Missing or `(none)` Transform defaults to in = {} and out = result, including `- in: (none)` / `- out: (none)`. Validation and manifest building reject statically failing expressions and empty Transform bullets.

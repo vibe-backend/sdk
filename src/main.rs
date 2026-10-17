@@ -3,7 +3,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use std::io::IsTerminal;
 use vibe::compile::{compile_project, CompileOptions};
 use vibe::discover;
 use vibe::llm::{self, HttpAdapter, LlmAdapter};
@@ -18,17 +19,11 @@ use vibe::validate::{validate_project, ValidateOptions};
 #[command(name = "vibe", about = "Compile and serve a markdown-driven backend")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Scaffold a public hello world feature without overwriting sources.
-    New {
-        path: String,
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
     /// Compile source markdown into lock files.
     Compile {
         #[arg(long, default_value = ".")]
@@ -168,13 +163,19 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), String> {
-    match cli.command {
-        Command::New { path, project } => {
-            for message in vibe::scaffold::create(&project, &path)? {
-                println!("{message}");
-            }
-            Ok(())
-        },
+    let Some(command) = cli.command else {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() || ci_or_prod() {
+            Cli::command().print_help().map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        let project = Path::new(".");
+        load_dotenv(project);
+        let mut io = TerminalIo;
+        let config = vibe::interactive::setup(project, &mut io, llm::env_map_from_process())?;
+        let adapter = HttpAdapter::new(config.clone())?;
+        return vibe::interactive::run(project, &mut io, &config, &adapter).await;
+    };
+    match command {
         Command::Compile { project, check } => cmd_compile(&project, check).await,
         Command::Approve { .. } => Err("`vibe approve` has been removed in spec v1.8 (decision 77): review happens on the source pull request. Use `vibe validate --deploy --dev` and `vibe manifest --dev` locally (the equivalent of `vibe build --dev` until `vibe build` is available).".into()),
         Command::Validate { project, deploy, dev } => cmd_validate(&project, deploy, dev),
@@ -848,5 +849,90 @@ fn ci_or_prod() -> bool {
 fn print_report(report: &vibe::Report) {
     for diag in &report.diags {
         eprintln!("{diag}");
+    }
+}
+
+struct TerminalIo;
+impl vibe::interactive::Io for TerminalIo {
+    fn read_line(&mut self, prompt: &str) -> Option<String> {
+        use std::io::Write;
+        print!("{prompt}");
+        std::io::stdout().flush().ok()?;
+        let mut line = String::new();
+        (std::io::stdin().read_line(&mut line).ok()? > 0).then(|| line.trim_end().to_string())
+    }
+    fn read_secret(&mut self, prompt: &str) -> Option<String> {
+        read_password(prompt)
+    }
+    fn write(&mut self, text: &str) {
+        println!("{text}");
+    }
+}
+
+fn read_password(prompt: &str) -> Option<String> {
+    use std::io::Write;
+    print!("{prompt}");
+    std::io::stdout().flush().ok()?;
+    let _guard = EchoGuard::disable()?;
+    let mut line = String::new();
+    let n = std::io::stdin().read_line(&mut line).ok()?;
+    println!();
+    (n > 0).then(|| line.trim_end_matches(['\r', '\n']).to_string())
+}
+#[cfg(unix)]
+struct EchoGuard(libc::termios);
+#[cfg(unix)]
+impl EchoGuard {
+    fn disable() -> Option<Self> {
+        unsafe {
+            let mut old = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut old) != 0 {
+                return None;
+            }
+            let mut new = old;
+            new.c_lflag &= !libc::ECHO;
+            if libc::tcsetattr(0, libc::TCSANOW, &new) != 0 {
+                return None;
+            }
+            Some(Self(old))
+        }
+    }
+}
+#[cfg(unix)]
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &self.0);
+        }
+    }
+}
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+    fn GetConsoleMode(handle: *mut std::ffi::c_void, mode: *mut u32) -> i32;
+    fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
+}
+#[cfg(windows)]
+struct EchoGuard(*mut std::ffi::c_void, u32);
+#[cfg(windows)]
+impl EchoGuard {
+    fn disable() -> Option<Self> {
+        unsafe {
+            let handle = GetStdHandle(-10i32 as u32);
+            let mut mode = 0;
+            if GetConsoleMode(handle, &mut mode) == 0 || SetConsoleMode(handle, mode & !4) == 0 {
+                return None;
+            }
+            Some(Self(handle, mode))
+        }
+    }
+}
+#[cfg(windows)]
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        unsafe {
+            SetConsoleMode(self.0, self.1);
+        }
     }
 }

@@ -1892,6 +1892,6 @@ async fn missing_definition_suggests_scaffold() {
     .unwrap()
     .to_string();
     assert!(error.contains("api/shop/_definition.md"), "{error}");
-    assert!(error.contains("vibe new"), "{error}");
+    assert!(error.contains("Run `vibe` (interactive)"), "{error}");
     fs::remove_dir_all(root).unwrap();
 }

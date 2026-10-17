@@ -35,14 +35,14 @@ Do not use guessed release tags or `releases/download` URLs; they are not a supp
 ## Hello world
 
 ```bash
-vibe new hello/v1/hello
+vibe            # first run asks for LLM settings, then: 幫我開一個 hello world
 vibe compile
 vibe manifest --dev
 vibe serve --memory
 curl http://127.0.0.1:8080/hello/v1/dev/hello
 ```
 
-`vibe new` never overwrites existing files. Natural-language sources need the LLM variables from `.env.example` for `vibe compile`. In development, `serve --memory` always serves slug `dev`, even when other slugs are configured, and picks up `vibe slug add` without restart. `vibe manifest --dev` runs the same deploy checks as `vibe validate --deploy --dev`.
+First run writes LLM settings to `.env` (gitignored; the key is entered masked and never printed). The CLI shows the files and asks before writing, never overwrites, and non-interactive `vibe` prints help. In development, `serve --memory` always serves slug `dev`, even when other slugs are configured, and picks up `vibe slug add` without restart. `vibe manifest --dev` runs the same deploy checks as `vibe validate --deploy --dev`.
 
 ## Run a project
 
