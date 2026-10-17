@@ -34,7 +34,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install vibe
-        run: cargo install --locked --git https://github.com/vibe-backend/sdk vibe
+        run: cargo install --locked --git https://github.com/vibe-backend/sdk --bin vibe vibe
       - name: Build preview and policy report (informational)
         run: |
           set -o pipefail
@@ -61,7 +61,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install vibe
-        run: cargo install --locked --git https://github.com/vibe-backend/sdk vibe
+        run: cargo install --locked --git https://github.com/vibe-backend/sdk --bin vibe vibe
       - uses: sigstore/cosign-installer@v3
       - name: Release build (compile in memory, policy, unsigned manifest)
         env:

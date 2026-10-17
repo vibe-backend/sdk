@@ -4,19 +4,40 @@
 
 `scripts/vibe-install.sh` 從 `vibe-backend/sdk` GitHub Releases 安裝 binary，支援 Linux（x86_64/aarch64）與 macOS（x86_64/arm64）。Windows 請直接下載 release zip；此 POSIX shell 管理器不支援 Windows。
 
+預設 **vibe-sdk** 安裝做 `vibe`，用嚟互動開發、build、`vibe run` 同輔助指令。
+**vibe-runtime** 安裝做 `vibe-runtime`，部署時只跑 artifact，冇 LLM client、build
+同互動 code。`vibe-runtime run --artifact <dir>` 或者冇 subcommand 都接受同一組 flags；
+artifact 預設 `.`，支援 `--addr`、`--db`／`VIBE_DB` 同 `--allow-test-build`（只限開發）。
+
+Archive 係 `vibe-sdk-<target>.tar.gz`／`.zip` 同 `vibe-runtime-<target>.tar.gz`／`.zip`，
+SHA256SUMS 同 attestation 覆蓋兩者。`--sdk`／`--runtime` 優先過
+`VIBE_INSTALL_BINARY=sdk|runtime`（預設 sdk）。兩者可以並存：SDK 用 `.vibe-managed`
+同 `.vibe-install.lock`；runtime 用 `.vibe-runtime-managed` 同 `.vibe-runtime-install.lock`。
+Remove 只影響揀咗嗰個 binary；archive 只准包含對應嘅單一普通檔案。
+rc.2 之前只有舊名 `vibe-<target>.tar.gz`，SDK 喺 SHA256SUMS 冇新名時可以 fallback；
+runtime 冇 fallback。兩者 checksum 同固定身份 attestation 驗證一樣嚴格。
+
 ## 使用方式
 
 ```sh
-./scripts/vibe-install.sh install --version v1.2.3 --non-interactive
-./scripts/vibe-install.sh install --version v1.3.0-rc.1 --non-interactive
-./scripts/vibe-install.sh upgrade --version v1.3.0 --non-interactive
-./scripts/vibe-install.sh upgrade --non-interactive # 解析 latest stable
-./scripts/vibe-install.sh remove --non-interactive
+./scripts/vibe-install.sh install --version v1.0.0-rc.2
+./scripts/vibe-install.sh install --version v1.0.0-rc.2 --runtime
+VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.2
+./scripts/vibe-install.sh upgrade --non-interactive
+./scripts/vibe-install.sh remove --runtime
+./scripts/vibe-install.sh remove
 ```
 
 `install --version` 與 `upgrade --version` 接受 `vX.Y.Z` 或 `vX.Y.Z-rc.N`。每個數字必須為零或不帶前置零的正整數；不接受其他預發佈標籤或 build metadata。
 
 預設安裝至 `$HOME/.local/bin/vibe`；可用 `--install-dir /absolute/path` 改寫。若目錄不在 PATH，腳本只提示，不修改 shell profile。完整選項請執行 `--help`。
+
+## 從 source build
+
+```sh
+cargo build --release --bin vibe
+cargo build --release --no-default-features --bin vibe-runtime
+```
 
 ## 安全模型
 
@@ -35,8 +56,8 @@
    ```
 
    commit SHA 由 tag 經 `gh api repos/vibe-backend/sdk/commits/refs/tags/v<version>` 解析。穩定版與預發佈版本使用完全相同的 attestation 身份：`vibe-backend/sdk` 的 workflow `.github/workflows/release.yml`、source ref `refs/tags/v<version>`（包含任何 `-rc.N` 後綴），以及 issuer `https://token.actions.githubusercontent.com`（`gh` 預設值）。此身份寫死於腳本，`VIBE_INSTALL_REPOSITORY`／`VIBE_INSTALL_DOWNLOAD_URL` 無法改變；任一驗證失敗都不替換既有版本。
-5. archive 只能包含頂層唯一、非 symlink 的 `vibe`。每個已驗證版本存於不可變版本目錄；對外 `vibe` symlink 以單次 rename 原子切換。操作鎖避免 install、upgrade、remove 競爭。
-6. 腳本不覆寫未管理的 `vibe`。remove 僅接受指向 `.vibe-managed/versions/.../vibe` 的管理 symlink，只刪除管理根目錄與該 symlink，不刪除安裝目錄或其他檔案。
+5. archive 只能包含頂層唯一、非 symlink 的所選 binary（`vibe` 或 `vibe-runtime`）。每個已驗證版本存於不可變版本目錄；對外 binary symlink 以單次 rename 原子切換。操作鎖避免 install、upgrade、remove 競爭。
+6. 腳本不覆寫未管理的所選 binary。remove 僅接受指向所選 managed root 的管理 symlink，只刪除管理根目錄與該 symlink，不刪除安裝目錄或其他檔案。
 7. 重複安裝相同且內容一致的版本為 no-op。
 
 ### 信任邊界與限制

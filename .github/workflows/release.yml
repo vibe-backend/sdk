@@ -17,6 +17,8 @@ on:
       - "tests/install_manager.py"
       - "scripts/ci/release-assets.sh"
       - "tests/release_assets.sh"
+      - "scripts/ci/check-*.sh"
+      - "tests/tag_version.sh"
 
 permissions:
   contents: read
@@ -39,6 +41,8 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      - name: Tag matches Cargo.toml version
+        run: scripts/ci/check-tag-version.sh "$GITHUB_REF_NAME"
       - name: Require the tagged commit to be reachable from main
         run: |
           git fetch --no-tags origin main
@@ -60,7 +64,9 @@ jobs:
       - name: Install script tests
         run: python3 tests/install_manager.py
       - name: Shellcheck install script
-        run: shellcheck scripts/vibe-install.sh
+        run: shellcheck scripts/vibe-install.sh scripts/ci/check-runtime-binary.sh scripts/ci/check-runtime-features.sh scripts/ci/check-tag-version.sh tests/tag_version.sh
+      - name: Tag version tests
+        run: tests/tag_version.sh
       - name: Release asset binding tests
         run: |
           shellcheck scripts/ci/release-assets.sh tests/release_assets.sh
@@ -80,19 +86,24 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            asset: vibe-x86_64-unknown-linux-gnu.tar.gz
+            sdk_asset: vibe-sdk-x86_64-unknown-linux-gnu.tar.gz
+            runtime_asset: vibe-runtime-x86_64-unknown-linux-gnu.tar.gz
           - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
-            asset: vibe-aarch64-unknown-linux-gnu.tar.gz
+            sdk_asset: vibe-sdk-aarch64-unknown-linux-gnu.tar.gz
+            runtime_asset: vibe-runtime-aarch64-unknown-linux-gnu.tar.gz
           - os: macos-14
             target: x86_64-apple-darwin
-            asset: vibe-x86_64-apple-darwin.tar.gz
+            sdk_asset: vibe-sdk-x86_64-apple-darwin.tar.gz
+            runtime_asset: vibe-runtime-x86_64-apple-darwin.tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
-            asset: vibe-aarch64-apple-darwin.tar.gz
+            sdk_asset: vibe-sdk-aarch64-apple-darwin.tar.gz
+            runtime_asset: vibe-runtime-aarch64-apple-darwin.tar.gz
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-            asset: vibe-x86_64-pc-windows-msvc.zip
+            sdk_asset: vibe-sdk-x86_64-pc-windows-msvc.zip
+            runtime_asset: vibe-runtime-x86_64-pc-windows-msvc.zip
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -114,26 +125,42 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} --bin vibe
+          cargo build --release --locked --target ${{ matrix.target }} --no-default-features --bin vibe-runtime
+      - name: Check runtime binary separation
+        if: runner.os != 'Windows'
+        shell: bash
+        run: scripts/ci/check-runtime-binary.sh "target/${{ matrix.target }}/release/vibe-runtime" "target/${{ matrix.target }}/release/vibe"
       - name: Package tar.gz
-        if: endsWith(matrix.asset, '.tar.gz')
+        if: endsWith(matrix.sdk_asset, '.tar.gz')
         shell: bash
         run: |
           mkdir -p staging
           cp "target/${{ matrix.target }}/release/vibe" staging/vibe
           chmod +x staging/vibe
-          tar -C staging -czf "${{ matrix.asset }}" vibe
+          tar -C staging -czf "${{ matrix.sdk_asset }}" vibe
+          cp "target/${{ matrix.target }}/release/vibe-runtime" staging/vibe-runtime
+          chmod +x staging/vibe-runtime
+          tar -C staging -czf "${{ matrix.runtime_asset }}" vibe-runtime
       - name: Package zip
-        if: endsWith(matrix.asset, '.zip')
+        if: endsWith(matrix.sdk_asset, '.zip')
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/vibe.exe" staging/vibe.exe
-          Compress-Archive -Path staging/vibe.exe -DestinationPath "${{ matrix.asset }}"
+          Compress-Archive -Path staging/vibe.exe -DestinationPath "${{ matrix.sdk_asset }}"
+          Copy-Item "target/${{ matrix.target }}/release/vibe-runtime.exe" staging/vibe-runtime.exe
+          Compress-Archive -Path staging/vibe-runtime.exe -DestinationPath "${{ matrix.runtime_asset }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          name: ${{ matrix.sdk_asset }}
+          path: ${{ matrix.sdk_asset }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.runtime_asset }}
+          path: ${{ matrix.runtime_asset }}
           if-no-files-found: error
 
   # Tag-only: build provenance for each archive (id-token lives only here).

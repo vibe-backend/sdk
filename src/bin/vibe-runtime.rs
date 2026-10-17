@@ -3,10 +3,16 @@ use std::path::PathBuf;
 use vibe::run::{DbChoice, RunOptions, RunSource};
 
 #[derive(Parser)]
-#[command(version, about = "Run a signed vibe build artifact")]
+#[command(
+    version,
+    about = "Run a signed vibe build artifact",
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    #[command(flatten)]
+    run: RunArgs,
 }
 
 #[derive(Subcommand)]
@@ -33,15 +39,10 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let args = match Cli::parse().command {
+    let cli = Cli::parse();
+    let args = match cli.command {
         Some(Command::Run(args)) => args,
-        None => RunArgs {
-            artifact: ".".into(),
-            project: None,
-            addr: "127.0.0.1:8080".into(),
-            db: None,
-            allow_test_build: false,
-        },
+        None => cli.run,
     };
     if let Err(message) = run(args).await {
         eprintln!("{message}");
@@ -49,17 +50,22 @@ async fn main() {
     }
 }
 
+fn artifact_project(artifact: &std::path::Path) -> PathBuf {
+    if artifact.is_dir() {
+        artifact.into()
+    } else {
+        artifact
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."))
+            .into()
+    }
+}
+
 async fn run(args: RunArgs) -> Result<(), String> {
-    let project = args.project.unwrap_or_else(|| {
-        if args.artifact.is_dir() {
-            args.artifact.clone()
-        } else {
-            args.artifact
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .into()
-        }
-    });
+    let project = args
+        .project
+        .unwrap_or_else(|| artifact_project(&args.artifact));
     vibe::run::run(RunOptions {
         project,
         source: RunSource::Artifact(args.artifact),
@@ -68,4 +74,45 @@ async fn run(args: RunArgs) -> Result<(), String> {
         allow_test_build: args.allow_test_build,
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_manifest_uses_current_directory() {
+        assert_eq!(
+            artifact_project(std::path::Path::new("manifest.json")),
+            PathBuf::from(".")
+        );
+        assert_eq!(
+            artifact_project(std::path::Path::new("/app/manifest.json")),
+            PathBuf::from("/app")
+        );
+    }
+
+    #[test]
+    fn bare_and_explicit_run_accept_the_same_flags() {
+        for prefix in [vec!["vibe-runtime"], vec!["vibe-runtime", "run"]] {
+            let cli = Cli::try_parse_from(prefix.into_iter().chain([
+                "--artifact",
+                "manifest.json",
+                "--addr",
+                "0.0.0.0:8080",
+                "--db",
+                "memory",
+                "--allow-test-build",
+            ]))
+            .unwrap();
+            let args = match cli.command {
+                Some(Command::Run(args)) => args,
+                None => cli.run,
+            };
+            assert_eq!(args.artifact, PathBuf::from("manifest.json"));
+            assert_eq!(args.addr, "0.0.0.0:8080");
+            assert!(args.allow_test_build);
+        }
+        assert!(Cli::try_parse_from(["vibe-runtime", "--artifact", ".", "run"]).is_err());
+    }
 }

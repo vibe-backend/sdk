@@ -4,19 +4,44 @@
 
 `scripts/vibe-install.sh` installs the binary from `vibe-backend/sdk` GitHub Releases on Linux (x86_64/aarch64) and macOS (x86_64/arm64). On Windows, download the release zip directly; this POSIX shell manager does not support Windows.
 
+The default **vibe-sdk** installs `vibe` for interactive development, builds,
+`vibe run` and auxiliary commands. **vibe-runtime** installs `vibe-runtime` for
+deployment: it runs artifacts only, with no LLM client, build or interactive code.
+`vibe-runtime run --artifact <dir>` and bare `vibe-runtime` accept the same flags;
+artifact defaults to `.`, with `--addr`, `--db` / `VIBE_DB`, and
+`--allow-test-build` (development only).
+
+Archives are `vibe-sdk-<target>.tar.gz` / `.zip` and
+`vibe-runtime-<target>.tar.gz` / `.zip`. SHA256SUMS and attestations cover both.
+Flags `--sdk` / `--runtime` override `VIBE_INSTALL_BINARY=sdk|runtime` (default sdk).
+Both can coexist: SDK uses `.vibe-managed` and `.vibe-install.lock`; runtime uses
+`.vibe-runtime-managed` and `.vibe-runtime-install.lock`. Removal affects only the
+chosen binary. Each archive contains exactly its selected regular binary file.
+SDK alone supports legacy `vibe-<target>.tar.gz` assets from before rc.2 when the
+new SDK name is absent from SHA256SUMS. Runtime has no legacy fallback.
+Checksum and pinned attestation verification are identical for both binaries.
+
 ## Usage
 
 ```sh
-./scripts/vibe-install.sh install --version v1.2.3 --non-interactive
-./scripts/vibe-install.sh install --version v1.3.0-rc.1 --non-interactive
-./scripts/vibe-install.sh upgrade --version v1.3.0 --non-interactive
-./scripts/vibe-install.sh upgrade --non-interactive # resolves the latest stable release
-./scripts/vibe-install.sh remove --non-interactive
+./scripts/vibe-install.sh install --version v1.0.0-rc.2
+./scripts/vibe-install.sh install --version v1.0.0-rc.2 --runtime
+VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.2
+./scripts/vibe-install.sh upgrade --non-interactive
+./scripts/vibe-install.sh remove --runtime
+./scripts/vibe-install.sh remove
 ```
 
 `install --version` and `upgrade --version` accept `vX.Y.Z` or `vX.Y.Z-rc.N`. Every number must be zero or a positive integer without leading zeros; other pre-release labels and build metadata are rejected.
 
 The default destination is `$HOME/.local/bin/vibe`; override it with `--install-dir /absolute/path`. If the directory is not on `PATH`, the script prints a hint and never edits shell profiles. Run `--help` for all options.
+
+## Build from source
+
+```sh
+cargo build --release --bin vibe
+cargo build --release --no-default-features --bin vibe-runtime
+```
 
 ## Security model
 
@@ -35,8 +60,8 @@ The default destination is `$HOME/.local/bin/vibe`; override it with `--install-
    ```
 
    The commit SHA is resolved from the tag with `gh api repos/vibe-backend/sdk/commits/refs/tags/v<version>`. Stable releases and pre-releases use the identical attestation identity: workflow `.github/workflows/release.yml` of `vibe-backend/sdk`, source ref `refs/tags/v<version>` (including any `-rc.N` suffix), and issuer `https://token.actions.githubusercontent.com` (the `gh` default). This identity is hard-coded in the script; `VIBE_INSTALL_REPOSITORY` and `VIBE_INSTALL_DOWNLOAD_URL` cannot change it. If any check fails, the existing version is left in place.
-5. The archive may contain only a single top-level, non-symlink `vibe`. Each verified version lives in an immutable version directory, and the public `vibe` symlink is switched atomically with a single rename. An operation lock prevents install, upgrade and remove from racing.
-6. The script never overwrites an unmanaged `vibe`. `remove` only accepts a managed symlink pointing at `.vibe-managed/versions/.../vibe`, and deletes only the managed root and that symlink, never the install directory or other files.
+5. The archive may contain only a single top-level, non-symlink selected binary (`vibe` or `vibe-runtime`). Each verified version lives in an immutable version directory, and the public binary symlink is switched atomically with a single rename. An operation lock prevents install, upgrade and remove from racing.
+6. The script never overwrites an unmanaged selected binary. `remove` only accepts a managed symlink pointing into the selected managed root, and deletes only the managed root and that symlink, never the install directory or other files.
 7. Re-installing the same version with identical content is a no-op.
 
 ### Trust boundaries and limits

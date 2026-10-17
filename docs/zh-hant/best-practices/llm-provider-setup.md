@@ -57,7 +57,7 @@ Fork PR 沒有 secrets，因此只執行 validator，不重新編譯（§2A.8.5�
 決定 174：provider、endpoint host、model、seed 同 sent parameters 記喺 build record 同 manifest provenance 嘅 `compilers` map。Lock 只記 `vibe-version`：正式版（包括 0.x）用 major.minor，pre-release 用完整版本，必須完全一致（決定 176）。
 
 ````markdown
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 ````
 
 `model-snapshot` 是 **provider 回報**的 model id（`modelReported`），而非用戶輸入；若與 `LLM_MODEL` 不同（例如 provider 解析了別名）屬錯誤。`sent-params` 是 adapter 實際送出的參數集（Decision 58、§2A.8.6）。
