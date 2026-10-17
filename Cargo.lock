@@ -3000,6 +3000,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hmac 0.13.0",
+ "jiff",
  "jsonwebtoken",
  "p256",
  "rand",

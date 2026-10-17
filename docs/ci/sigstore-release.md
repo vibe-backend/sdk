@@ -68,3 +68,8 @@ check:
    require a verified Sigstore bundle, whatever `VIBE_ENV` or `--memory` say.
 4. Ship `manifest.json.sigstore.json` next to `manifest.json` (or set
    `VIBE_MANIFEST_BUNDLE`).
+
+## Trust root rotation
+
+Alerts (`manifest_trust_root_rejected`, `manifest_trust_root_rotation_pending`)
+and the update runbook are in [sigstore-trust-root.md](sigstore-trust-root.md).

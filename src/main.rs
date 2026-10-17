@@ -657,6 +657,7 @@ fn load_manifest(
             rekor_log_index = %identity.rekor_log_index,
             "release manifest attestation verified"
         );
+        vibe::attest::warn_on_pending_rotation();
         return Ok(manifest);
     }
     #[cfg(debug_assertions)]
