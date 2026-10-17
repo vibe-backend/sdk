@@ -1,6 +1,6 @@
 # ADR 0001: Best-practice pattern library
 
-- **Status:** Proposed (draft, not yet reviewed). The PM hard rules below were set by the PM on 2026-10-17 09:59 HKT; the §9 points were approved by the PM on 2026-10-17 10:08 HKT (decisions 158–163). This ADR feeds the v1.1 spec and does not block any v1 blocker.
+- **Status:** Proposed (draft, not yet reviewed). The PM hard rules below were set by the PM on 2026-10-17 09:59 HKT; the §9 points were approved by the PM on 2026-10-17 10:08 HKT (decisions 158–163, [record](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228340971)); P8–P10 on 10:21 HKT ([record](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228450139)); D166 and D167 are drafts pending PM confirmation. This ADR feeds the v1.1 spec and does not block any v1 blocker.
 - **Date:** 2026-10-17
 - **Spec:** [`../spec-pattern-library-v1.1.md`](../spec-pattern-library-v1.1.md) (decisions 150–168)
 - **Related:** decisions 79, 113, 117, 118, 119 (provenance, lock as build output, Sigstore keyless), 149 (read-only sign-method); PRs #147, #95.
@@ -32,10 +32,10 @@ The compiler turns natural-language Markdown into a lock and then into an execut
 4. The signer identity MUST be pinned to an exact repo and workflow (issuer + SAN). Offline verification (bundle + cached trust root) MUST be supported so deploys still work when Sigstore/Rekor is down. Verification failure MUST fail closed. A `vibe serve` cold start MUST NOT download anything.
 5. The v1 internal refactor onto the same interface MUST wait until #147, #95 and the D149 implementation have merged, MUST be additive with no behaviour change, and MUST be scheduled at the end of the GA plan.
 
-## Architect decisions (2026-10-17)
+## Draft decisions pending PM confirmation (P11, P12)
 
-- Pattern IR rules (D166): the core MUST enforce RLS and `owner-key` on every pattern IR, a pattern MUST NOT choose or switch DB roles (the executor decides), and a secret MUST only be sent to a host declared in `egress:`. Violations are compile errors.
-- `use:` (D167) is a structured endpoint frontmatter field, consistent with #92.
+- Pattern IR rules (D166, P11): the core MUST enforce RLS and `owner-key` on every pattern IR, a pattern MUST NOT choose or switch DB roles (the executor decides), and a secret MUST only be sent to a host declared in `egress:`. Violations are compile errors.
+- `use:` (D167, P12) is a structured endpoint frontmatter field, consistent with #92.
 
 ## PM decisions (2026-10-17 10:21 HKT)
 

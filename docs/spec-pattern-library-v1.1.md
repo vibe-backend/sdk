@@ -18,17 +18,17 @@
 | 155 | 來源驗證：signer 身份固定到一個 repo 同 workflow（issuer + SAN）；支援離線驗證（bundle + cache 嘅 trust root），Sigstore／Rekor 用唔到都可以部署；驗證失敗 fail closed；`vibe serve` cold start 唔可以下載任何嘢。 | 已確認（產品經理 2026-10-17） | 6 |
 | 156 | Lock 新欄位：core SDK 版本同 hash、compiler 版本、IR schema 版本、`patterns[]`、每個 endpoint 嘅 capability → pattern `id@version`。v1 一律 `source: builtin`，digest 係內嵌內容嘅 hash。 | 草稿 | 7 |
 | 157 | v1 內部改用同一介面：要等 #147、#95 同決定 149 實作 merge 之後先做；只可以加，唔可以改行為；放喺 GA 計劃最後。 | 已確認（產品經理 2026-10-17） | 8 |
-| 158 | Registry 發布者同 signer 身份（P1、P2）：v1.1 registry 只接受一個官方 repo 加一個 release workflow 簽嘅 package；SAN 只接受 `refs/tags/v*` release tag，唔接受 branch ref；第三方 pattern 留 vNext。 | 已確認（產品經理 2026-10-17） | 6、9 |
-| 159 | Cache trust root 更新（P3）：同決定 119 一樣，跟 core release 更新，唔另設更新渠道。 | 已確認（產品經理 2026-10-17） | 6、9 |
-| 160 | 冇網絡嘅 compile（P4）：用預先填好嘅本地 cache／mirror，入面每個 package 照樣做決定 155 嘅完整驗證，同埋一定要通過決定 161 嘅撤回清單檢查。 | 已確認（產品經理 2026-10-17） | 6、9 |
-| 161 | Pattern 版本撤回清單（P5）：用同決定 158 一樣嘅 pinned signer 身份簽；有版本號同到期時間；比 cache 版本舊嘅清單一律拒絕（防回滾）；到期之後警告，但照用本地最新一份已驗證嘅清單，唔會因為離線就全部失敗。 | 已確認（產品經理 2026-10-17） | 6.1、9 |
-| 162 | IR schema 相容（P6）：core 只接受同一 major 嘅 IR schema；唔同 major 即 compile error。 | 已確認（產品經理 2026-10-17） | 4、9 |
-| 163 | Builtin 同 registry 並存（P7）：business pattern 拆出之後，builtin 版本保留一個 minor release 再移除；同時存在時一樣要用 `use:` 明確揀（決定 154）。 | 已確認（產品經理 2026-10-17） | 5、9 |
-| 164 | 項目層 pin 宣告（P8）：因為 lock 唔 commit（決定 117），pin 唔可以只放 lock。會 commit 嘅 `patterns.md` frontmatter `patterns:` 一定要記錄每個 registry pattern 嘅 `id@確實版本` 同 `sha256`；build 只解析呢度宣告嘅版本，lock 照記錄，build 檢查兩者一致，唔一致即 fail closed。`use:` 只可以揀 `patterns.md` 已宣告嘅版本，否則 compile error。 | 已確認（產品經理 2026-10-17） | 5.1、9 |
-| 165 | Endpoint `egress:`（允許 host）同 `secrets:`（名）frontmatter 欄位（P9）：v1.1 加入，v1 一律當空。Pattern 要求嘅 egress／secrets 一定要係 endpoint 宣告嘅子集（同決定 153）；`egress:` 只接受明確 host，唔准 `*` wildcard（validate error）。 | 已確認（產品經理 2026-10-17） | 3.1、9 |
-| 166 | Business pattern IR 嘅 core 強制規則：core 對所有 pattern IR 一律強制 RLS 同 `owner-key`（決定 70、114）；pattern 唔可以揀或者切換 DB role（由 executor 決定）；secret 只可以送去 `egress:` 宣告嘅 host；違反即 compile error。 | 已確認（架構師決定 2026-10-17） | 4.1 |
-| 167 | `use:` 放 endpoint frontmatter（結構化，同 #92 frontmatter 優先一致），唔寫喺 prose；唔計入安全關鍵字檢查。 | 已確認（架構師決定 2026-10-17） | 5 |
-| 168 | 冇本地已驗證撤回清單（P10）：一定要用 core release 內嵌嘅已簽撤回清單做初始值；只有冇內嵌清單時先 fail closed。 | 已確認（產品經理 2026-10-17） | 6.1、9 |
+| 158 | Registry 發布者同 signer 身份（P1、P2）：v1.1 registry 只接受一個官方 repo 加一個 release workflow 簽嘅 package；SAN 只接受 `refs/tags/v*` release tag，唔接受 branch ref；第三方 pattern 留 vNext。 | 已確認（產品經理 2026-10-17 10:08 HKT，[記錄](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228340971)） | 6、9 |
+| 159 | Cache trust root 更新（P3）：同決定 119 一樣，跟 core release 更新，唔另設更新渠道。 | 已確認（產品經理 2026-10-17 10:08 HKT，[記錄](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228340971)） | 6、9 |
+| 160 | 冇網絡嘅 compile（P4）：用預先填好嘅本地 cache／mirror，入面每個 package 照樣做決定 155 嘅完整驗證，同埋一定要通過決定 161 嘅撤回清單檢查。 | 已確認（產品經理 2026-10-17 10:08 HKT，[記錄](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228340971)） | 6、9 |
+| 161 | Pattern 版本撤回清單（P5）：用同決定 158 一樣嘅 pinned signer 身份簽；有版本號同到期時間；比 cache 版本舊嘅清單一律拒絕（防回滾）；到期之後警告，但照用本地最新一份已驗證嘅清單，唔會因為離線就全部失敗。 | 已確認（產品經理 2026-10-17 10:08 HKT，[記錄](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228340971)） | 6.1、9 |
+| 162 | IR schema 相容（P6）：core 只接受同一 major 嘅 IR schema；唔同 major 即 compile error。 | 已確認（產品經理 2026-10-17 10:08 HKT，[記錄](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228340971)） | 4、9 |
+| 163 | Builtin 同 registry 並存（P7）：business pattern 拆出之後，builtin 版本保留一個 minor release 再移除；同時存在時一樣要用 `use:` 明確揀（決定 154）。 | 已確認（產品經理 2026-10-17 10:08 HKT，[記錄](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228340971)） | 5、9 |
+| 164 | 項目層 pin 宣告（P8）：因為 lock 唔 commit（決定 117），pin 唔可以只放 lock。會 commit 嘅 `patterns.md` frontmatter `patterns:` 一定要記錄每個 registry pattern 嘅 `id@確實版本` 同 `sha256`；build 只解析呢度宣告嘅版本，lock 照記錄，build 檢查兩者一致，唔一致即 fail closed。`use:` 只可以揀 `patterns.md` 已宣告嘅版本，否則 compile error。 | 已確認（產品經理 2026-10-17 10:21 HKT，[記錄](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228450139)） | 5.1、9 |
+| 165 | Endpoint `egress:`（允許 host）同 `secrets:`（名）frontmatter 欄位（P9）：v1.1 加入，v1 一律當空。Pattern 要求嘅 egress／secrets 一定要係 endpoint 宣告嘅子集（同決定 153）；`egress:` 只接受明確 host，唔准 `*` wildcard（validate error）。 | 已確認（產品經理 2026-10-17 10:21 HKT，[記錄](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228450139)） | 3.1、9 |
+| 166 | Business pattern IR 嘅 core 強制規則：core 對所有 pattern IR 一律強制 RLS 同 `owner-key`（決定 70、114）；pattern 唔可以揀或者切換 DB role（由 executor 決定）；secret 只可以送去 `egress:` 宣告嘅 host；違反即 compile error。 | 草稿，待產品經理確認（P11） | 4.1 |
+| 167 | `use:` 放 endpoint frontmatter（結構化，同 #92 frontmatter 優先一致），唔寫喺 prose；唔計入安全關鍵字檢查。 | 草稿，待產品經理確認（P12） | 5 |
+| 168 | 冇本地已驗證撤回清單（P10）：一定要用 core release 內嵌嘅已簽撤回清單做初始值；只有冇內嵌清單時先 fail closed。 | 已確認（產品經理 2026-10-17 10:21 HKT，[記錄](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228450139)） | 6.1、9 |
 
 ## 1. 背景
 
@@ -65,7 +65,7 @@
 | --- | --- | --- |
 | `requires.db` | v1.8 現有：source frontmatter `writes`、`public`、`public-writes`、`auth`、`provider`（決定 112、#92）；lock `## Access`（`public`、`public-writes`、`tenant`）、`## Limits` 嘅 `provider`；method lock `## Signature` 嘅 `writes`；model lock `## Policies` 嘅 `grants` 同 `owner-key`（決定 70、114）。Pattern 要 `INSERT`／`UPDATE` 而 endpoint 冇 `writes: true`，或者要嘅 table／欄位唔喺 model grants，即 compile error | v1.8 已有 |
 | `requires.network` | 新加 endpoint frontmatter `egress: [host, …]`（只接受明確 host、完全相等；`*` 或者任何 wildcard 係 validate error；預設冇）；同現有 `external-calls`（7.1）一致：`egress` 非空就一定要 `external-calls: allow` | 已確認（決定 165） |
-| `requires.secrets` | 新加 endpoint frontmatter `secrets: [NAME, …]`（只寫名）；一定要等於呢個 endpoint 經 method 用到嘅 `key-ref` 同 method frontmatter `secrets`（#92）嘅聯集 | 已確認（決定 165） |
+| `requires.secrets` | 新加 endpoint frontmatter `secrets: [NAME, …]`（只寫名）；一定要等於呢個 endpoint 經 method 用到嘅 `key-ref`（v1.8 已有）嘅聯集；method frontmatter `secrets` 依賴未 merge 嘅 #92，#92 merge 之後先一併核對 | 已確認（決定 165） |
 | `requires.pipelines` | lock `## Pipelines` | v1.8 已有 |
 
 - 子集（MUST）：pattern `requires.network` 嘅每個 host 一定喺 endpoint `egress:`，`requires.secrets` 嘅每個名一定喺 endpoint `secrets:`；超出即 compile error。
@@ -90,7 +90,7 @@ pub trait Pattern {
 - Core 驗證每個 IR fragment：只准已知 op；SQL 照舊經 sqlguard 同 policy 檢查（決定 98、114）；權限唔可以超出 `requires`。
 - Registry package 只係 data（manifest 加 IR template），由 core 內置嘅 interpreter 執行 `plan`；唔載入外來 Rust code。
 
-### 4.1 Core 強制規則（決定 166）
+### 4.1 Core 強制規則（決定 166，草稿，待產品經理確認）
 
 CRUD、upload、email 照舊屬 business pattern，但 core 對所有 pattern IR 一律：
 
@@ -106,7 +106,7 @@ CRUD、upload、email 照舊屬 business pattern，但 core 對所有 pattern IR
 2. AST → 需要嘅 capability。
 3. 搵出 `provides` 覆蓋嗰啲 capability 嘅候選 pattern。
 4. Security pattern 一定套用（例如有 `auth` 就一定用內置 auth），唔可以由 business pattern 取代或者略過。
-5. 每個 capability：冇候選 → compile error；一個 → 用佢；多過一個 business 候選 → compile error（MUST），一定要喺 source 用 `use: <id>@<range>` 明確揀。冇隱含評分、冇「最新優先」。
+5. 每個 capability：冇候選 → compile error；一個 → 用佢；多過一個 business 候選 → compile error（MUST），一定要喺 endpoint frontmatter 用 `use: <id>@<range>` 明確揀。冇隱含評分、冇「最新優先」。
 6. 版本解析跟 5.1：build 只用 `patterns.md` pin 咗嘅確實版本，唔喺 build 時解析 range。
    - `use:`（決定 167）係 endpoint frontmatter 嘅結構化欄位，例如 `use: [crud-offset-pagination@^1.2]`；prose 入面寫 `use:` 唔生效（出 warning）；`use:` 唔計入安全關鍵字檢查，亦唔受 prose 否定規則影響。`use:` 嘅 range 一定要包含 `patterns.md` pin 嘅版本，否則 compile error。
 7. Builtin 同 registry 並存（決定 163，MUST）：拆出之後 builtin 保留一個 minor release 再移除；並存時照第 5 步要 `use:`。
@@ -114,7 +114,7 @@ CRUD、upload、email 照舊屬 business pattern，但 core 對所有 pattern IR
 
 ### 5.1 項目層 pin（決定 164，已確認（產品經理 2026-10-17））
 
-- 項目根目錄 `patterns.md`（會 commit）用 frontmatter 記錄：
+- 項目根目錄 `patterns.md`（會 commit）用 frontmatter 記錄（compile 唔會將佢當 source，同 README 等根目錄 markdown 一樣排除；frontmatter 跟 #92 規則：key 唯一、細楷，重複或者衝突即錯誤）：
 
 ```yaml
 patterns:
@@ -138,7 +138,7 @@ patterns:
 - `vibe serve`（MUST）：cold start 唔下載任何嘢；只執行 artifact 入面已經 compile 好嘅 IR。Pattern 只喺 `vibe compile` 階段取得。
 - Artifact sha256 一定等於 lock 記錄；唔等即 fail closed。
 
-### 6.1 撤回清單（決定 161）
+### 6.1 撤回清單（決定 161、168（P10））
 
 - 簽名（MUST）：撤回清單用同決定 158 一樣嘅 pinned signer 身份（issuer + SAN）簽，用 Sigstore bundle 離線驗證；驗證失敗即拒絕呢份清單。
 - 內容：`version`（單調遞增整數）、`expires-at`、撤回咗嘅 `id@version` 列表同原因。
@@ -184,6 +184,13 @@ patterns:
 | P9 | Endpoint `egress:`／`secrets:` | v1.1 加入、v1 當空；pattern 要求一定係子集；`egress:` 唔准 wildcard（決定 165） |
 | P10 | 冇本地已驗證撤回清單 | 用 core 內嵌已簽清單；冇內嵌先 fail closed（決定 168） |
 
+### 9.2 待產品經理確認
+
+| # | 問題 | 選項 | 建議 |
+| --- | --- | --- | --- |
+| P11 | Business pattern IR 嘅 core 強制規則（決定 166） | A：照 4.1，CRUD／upload／email 留 business，core 強制 RLS／`owner-key`、executor 揀 role、secret 只去 `egress:`；B：碰租戶隔離、secret 或者對外網絡嘅 pattern 一律當 security，留 core | A |
+| P12 | `use:` 位置（決定 167） | A：endpoint frontmatter 結構化欄位（同 #92），唔計入安全關鍵字檢查；B：prose 加專用語法 | A |
+
 ## 10. 主要風險同緩解
 
 | 風險 | 緩解 |
@@ -201,7 +208,7 @@ patterns:
 ```markdown
 ---
 public: false
-auth: jwt
+auth: required
 writes: false
 use: [crud-offset-pagination@^1.2]
 ---
