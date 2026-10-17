@@ -277,7 +277,11 @@ async fn structured_limits_pins_and_slug_normalization() {
         let body = API_GOOD.replace("- provider: main", "- provider: main\n- timeout: 5s\n- body: 4KB")
             .replace("## Request\n(none)", "## Request\n| field | type | rules | required |\n| --- | --- | --- | --- |\n| path.slug | uuid | - | no |\n| path.slug | string | - | no |")
             .replace("/catalog/v1/hello", if slug { "/catalog/v1/{slug}/hello" } else { "/catalog/v1/hello" });
-        fs::write(&source_path, &body).unwrap();
+        fs::write(
+            &source_path,
+            body.replace("- provider: main", "- provider: other"),
+        )
+        .unwrap();
         let opts = CompileOptions {
             root: &root,
             llm: None,
@@ -285,10 +289,21 @@ async fn structured_limits_pins_and_slug_normalization() {
             check: false,
         };
         let error = compile_project(&opts).await.err().unwrap().to_string();
-        assert!(
-            error.contains("pin it in frontmatter (`timeout: 5s`)"),
-            "{error}"
-        );
+        for (key, value, resolved) in [
+            ("provider", "other", "main"),
+            ("timeout", "5s", "10s"),
+            ("body", "4KB", "1MB"),
+        ] {
+            assert!(error.contains(&format!("`## Limits` {key}: source value `{value}` differs from the resolved value `{resolved}`")), "{error}");
+            assert!(
+                error.contains(&format!("pin it in frontmatter (`{key}: {value}`)")),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("delete the `{key}` line from `## Limits`")),
+                "{error}"
+            );
+        }
         assert!(!root.join("api/catalog/v1/hello/hello.lock.md").exists());
         fs::write(
             &source_path,

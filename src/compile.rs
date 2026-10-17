@@ -1716,7 +1716,7 @@ fn normalize_feature(
         if !natural {
             if let Some(value) = find_section(&doc.sections, "Limits").and_then(|s| s.get(key)) {
                 if value != resolved {
-                    diags.push(Diag::error(&source.rel, format!("`## Limits` {key}: {value} in the source is not used; pin it in frontmatter (`{key}: {value}`) or remove it")));
+                    diags.push(Diag::error(&source.rel, format!("`## Limits` {key}: source value `{value}` differs from the resolved value `{resolved}`; pin it in frontmatter (`{key}: {value}`) or delete the `{key}` line from `## Limits`")));
                 }
             }
         }

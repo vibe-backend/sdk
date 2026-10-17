@@ -18,7 +18,7 @@
 
 ### v1.8（草稿，2026-10-14）
 
-- 補編決定 150–162（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
+- 補編決定 150–163（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 compiler-hash 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。
 - 新增 `vibe build`：一個指令做晒編譯、驗證同 manifest（類似 `nest build`），冇 reviewer 步驟（審核由 Git 平台設定負責，決定 76，見 2C.3）。
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
@@ -284,7 +284,7 @@
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
-### 0.14 v1.8 2026-10-17 決定（決定 150–162，產品經理已批准 2026-10-17）
+### 0.14 v1.8 2026-10-17 決定（決定 150–163，產品經理已批准 2026-10-17）
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
@@ -295,12 +295,13 @@
 | 154 | （#97）移除 `vibe approve` 同 lock 簽名；lock 冇 `status`／`approval-*`／`approved-*`／`signature`，舊欄位出一次 warning 後忽略。`vibe manifest` 冇 `--dev` 就 build release manifest（同 `--release`）；release workflow 用 Sigstore keyless 簽名，非開發環境 `vibe serve` 只接受經 Sigstore 驗證嘅 release manifest。 | 已批准（產品經理 2026-10-17） | 2A.1、2A.5、2C.2、2C.3、2C.3b |
 | 155 | （#290／#291）開發環境 `vibe serve --memory` 一定有 slug `dev`（tenant `devtenant`），即使 slug 檔設定咗其他 slug；檔案改動唔使重啟。非 memory 同非開發環境不變。 | 已批准（產品經理 2026-10-17） | 2C.1 |
 | 156 | （#291）validate 按位置檢查 expression 變數根：Transform in 准 `req`、`ctx`；api step 同 Transform out 准 `input`、`req`、`ctx` 同之前 method step 嘅 out；method 准 `input`、`ctx` 同之前 step 嘅 out。錯誤報根名、位置同准用根。compile 每個 LLM lock 正規化後跑 validate，失敗經現有 repair loop 回饋 model，共用 `LLM_FORMAT_RETRIES` 上限；最後失敗就停止，成個 project 通過先寫 lock 同 build record。 | 已批准（產品經理 2026-10-17） | 2A.2、2A.8 |
-| 157 | （#292）互動 `vibe` 取代 `vibe new`；首次問 LLM 設定，寫 project `.env`（0600），只補缺少嘅行，已有值優先；`.gitignore` 只加一次 `.env`。Endpoint 解析到 private／本地地址先問用戶再加 `LLM_ALLOW_PRIVATE_HOST=true`。產生 source 要簡單小寫 kebab-case 名，hello world 預設 `hello/v1/hello`。實作狀態：setup 會再 append 全部今次輸入嘅設定，唔會略過已有 key；讀取時環境變數優先，否則以 `.env` 入面先出現嘅值為準。 | 已批准（產品經理 2026-10-17） | 2C.1 |
+| 157 | （#292）互動 `vibe` 取代 `vibe new`；首次問 LLM 設定，寫 project `.env`（0600），只補缺少嘅行，已有值優先；`.gitignore` 只加一次 `.env`。Endpoint 解析到 private／本地地址先問用戶再加 `LLM_ALLOW_PRIVATE_HOST=true`。產生 source 要簡單小寫 kebab-case 名，hello world 預設 `hello/v1/hello`。 | 已批准（產品經理 2026-10-17） | 2C.1 |
 | 158 | （#293）移除冇 key 嘅 api step op `transform`（pre-1.0，冇 deprecation period）；validate 拒絕並提示刪除 step、改用 `## Transform`，見 2A.4 註。 | 已批准（產品經理 2026-10-17） | 2A.4 |
 | 159 | （#293）api feature lock 嘅 `## Limits` 同 `## Request` `path.slug` row 由 code 按固定規則正規化，唔由 model 揀，同一 source 編譯出 byte-identical lock。 | 已批准（產品經理 2026-10-17） | 2A.2 |
 | 160 | Frontmatter 可以 pin `timeout`、`body` 同 `provider`；timeout／body 按 pin → `_version` Defaults → `_definition` Defaults → `10s`／`1MB`；provider 按 pin → `_definition` Providers default → `main`。validate 檢查 pin 格式；Limits 只嚟自 frontmatter 同繼承預設，prose limits 唔會用，warning 留到 vNext。compile 同互動 prompt 都叫 model 同用戶將 limits 寫喺 frontmatter。 | 已批准（產品經理 2026-10-17） | 2.2、2A.2 |
 | 161 | Structured source 用同一套 `path.slug` 同 Limits 規則；structured `## Limits` 有值同解析結果唔同就 compile error，要移去 frontmatter 或刪除。 | 已批准（產品經理 2026-10-17） | 2A.2 |
 | 162 | 每次改 compile prompt（system prompt、guide、examples）一定要 bump `PROMPT_VERSION`，佢計入 compiler-hash 同 LLM cache key。 | 已批准（產品經理 2026-10-17） | 2A.6 |
+| 163 | Structured source `## Limits` 有值同解析結果唔同就 compile error，錯誤講明欄位（provider／timeout／body）、source 寫嘅值、解析出嚟嘅值同修正方法（喺 frontmatter pin 或者刪除嗰行）。 | 已批准（產品經理 2026-10-17） | 2A.2 |
 
 ## 1. 目錄同命名
 
@@ -526,7 +527,7 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 
 ### 2A.2 通用 section 規則
 
-決定 159、160、161：自然語言同 structured api feature 嘅以下 optional 部分由 code 用固定決定性規則正規化，永遠唔由 model 揀；忽略 model 喺呢啲部分嘅輸出，確保同一 source 編譯出 byte-identical lock。Structured source 用同一套規則；來源 `## Limits` 缺省、`(none)` 或者同解析值相同都接受；有值唔同就 compile error：`## Limits <key>: <value> in the source is not used; pin it in frontmatter (<key>: <value>) or remove it`。自然語言 model 輸出仍然靜默忽略。
+決定 159、160、161、163：自然語言同 structured api feature 嘅以下 optional 部分由 code 用固定決定性規則正規化，永遠唔由 model 揀；忽略 model 喺呢啲部分嘅輸出，確保同一 source 編譯出 byte-identical lock。Structured source 用同一套規則；來源 `## Limits` 缺省、`(none)` 或者同解析值相同都接受；有值唔同就 compile error：`` `## Limits` <key>: source value `<value>` differs from the resolved value `<resolved>`; pin it in frontmatter (`<key>: <value>`) or delete the `<key>` line from `## Limits` ``。自然語言 model 輸出仍然靜默忽略。
 
 - `## Limits` 一律丟棄 model 原有內容，固定依次寫三個 bullet：`provider` 用 source frontmatter 指定值，否則用 `_definition` 嘅 `## Providers default`，再否則 `main`；`timeout` 同 `body` 依次用 source frontmatter pin、`_version` 嘅 `## Defaults`、`_definition` 嘅 `## Defaults`，再否則分別用 `10s` 同 `1MB`。
 - 決定 160：compile、validate 同互動生成一律檢查 pin；validate 亦檢查 lock Limits。`timeout` 要嚴格 duration（例如 `500ms`、`10s`），大過 0 而唔超過 30s；`body` 要嚴格 size（例如 `64kb`、`4KB`、`1MB`），大過 0 而唔超過 1MB；`provider` 要小寫 kebab-case。錯誤講明 key、壞值同有效例子。
