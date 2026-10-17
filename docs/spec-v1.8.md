@@ -1379,7 +1379,7 @@ error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-re
 - 欄位層 UPDATE grant 列表（runtime role）加 `last_used_at`；其他欄位唔變。
 - 同 #95 已批准嘅單向 guard trigger 一致：`last_used_at` 只可以向前（新值唔可以係 null 或者早過舊值）；行一旦 `revoked_at` 有值，`last_used_at` 都唔可以再改（撤銷係最終狀態）；identity 欄位照舊唔可以改。`vibe serve` 啟動檢查 grant 列表同 trigger 時一併檢查呢條規則。
 
-**範例：唯讀 sign-method 加獨立寫入 method**
+**範例：唯讀 sign-method 加獨立寫入 method：**
 
 `sign-method` 用 12.8 嘅 `user.sign-token`（`writes: false`，只有 `sign-jwt` 同 `respond`），refresh endpoint 照 4A.1 嘅 `token-refresh: { sign-method: user.sign-token }`。之前喺 sign-method 入面做嘅業務寫入，搬去一個普通寫入 method，由 client 喺 refresh 成功之後用新 access token 另外呼叫：
 
