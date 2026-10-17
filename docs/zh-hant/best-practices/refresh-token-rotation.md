@@ -4,6 +4,8 @@
 
 讓 access token 保持短效（≤ 1 小時），同時讓用戶端維持登入狀態，方法是使用帶重用偵測的**輪換 refresh token**（Decision 6、§4A.1）。Refresh 由內置 `token-refresh` pipeline 處理（Decision 45）；登出由內置 `token-revoke` pipeline 處理（Decision 65）。第一個 refresh token 在登入時簽發：`sign-jwt` 配 `issue-refresh: new-family`（§4A.1、F10；見 [user-login.md](user-login.md)）。
 
+Spec Decision 149（待產品經理確認，§4A.1c）要求 `sign-method` 嘅寫入同輪換一齊生效；建議做法係 `sign-method` 唯讀（`writes: false`），所以 sign method 唔好加寫入 step。
+
 ## 自然語言 source 範例
 
 `api/auth/v1/refresh/refresh.md`（路由 `POST /auth/v1/{slug}/refresh`）

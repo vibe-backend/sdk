@@ -4,6 +4,8 @@
 
 Keep access tokens short-lived (≤ 1h) while letting clients stay signed in, using **rotating refresh tokens** with reuse detection (Decision 6, §4A.1). Refresh is handled by the built-in `token-refresh` pipeline (Decision 45); logout by the built-in `token-revoke` pipeline (Decision 65). The first refresh token is issued at login: `sign-jwt` with `issue-refresh: new-family` (§4A.1, F10; see [user-login.md](user-login.md)).
 
+Spec decision 149 (pending PM confirmation, §4A.1c) requires the `sign-method` writes and the rotation to take effect together. The recommended option is that the `sign-method` is read-only (`writes: false`), so keep sign methods free of write steps.
+
 ## Natural-language source example
 
 `api/auth/v1/refresh/refresh.md` (route `POST /auth/v1/{slug}/refresh`)
