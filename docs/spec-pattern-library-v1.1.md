@@ -105,7 +105,7 @@ CRUD、upload、email 照舊屬 business pattern，但 core 對所有 pattern IR
 4. Security pattern 一定套用（例如有 `auth` 就一定用內置 auth），唔可以由 business pattern 取代或者略過。
 5. 每個 capability：冇候選 → compile error；一個 → 用佢；多過一個 business 候選 → compile error（MUST），一定要喺 source 用 `use: <id>@<range>` 明確揀。冇隱含評分、冇「最新優先」。
 6. 版本解析跟 5.1：build 只用 `patterns.md` pin 咗嘅確實版本，唔喺 build 時解析 range。
-- `use:`（決定 167）係 endpoint frontmatter 嘅結構化欄位，例如 `use: [crud-offset-pagination@^1.2]`；prose 入面寫 `use:` 唔生效（出 warning）；`use:` 唔計入安全關鍵字檢查，亦唔受 prose 否定規則影響。`use:` 嘅 range 一定要包含 `patterns.md` pin 嘅版本，否則 compile error。
+   - `use:`（決定 167）係 endpoint frontmatter 嘅結構化欄位，例如 `use: [crud-offset-pagination@^1.2]`；prose 入面寫 `use:` 唔生效（出 warning）；`use:` 唔計入安全關鍵字檢查，亦唔受 prose 否定規則影響。`use:` 嘅 range 一定要包含 `patterns.md` pin 嘅版本，否則 compile error。
 7. Builtin 同 registry 並存（決定 163，MUST）：拆出之後 builtin 保留一個 minor release 再移除；並存時照第 5 步要 `use:`。
 8. 錯誤訊息一定要列出 capability、所有候選 `id@version`，同修正方法（加 `use:`）。
 
