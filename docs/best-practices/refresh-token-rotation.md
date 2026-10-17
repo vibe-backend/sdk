@@ -4,7 +4,7 @@
 
 Keep access tokens short-lived (≤ 1h) while letting clients stay signed in, using **rotating refresh tokens** with reuse detection (Decision 6, §4A.1). Refresh is handled by the built-in `token-refresh` pipeline (Decision 45); logout by the built-in `token-revoke` pipeline (Decision 65). The first refresh token is issued at login: `sign-jwt` with `issue-refresh: new-family` (§4A.1, F10; see [user-login.md](user-login.md)).
 
-Spec decision 149 (PM-approved 2026-10-17, §4A.1c): the `sign-method` must be read-only (`writes: false`), including methods it calls through `op: method`. `vibe validate`, the build and `vibe serve` reject it otherwise (`REFRESH_SIGN_METHOD_WRITES`). The platform records the last refresh time itself (`last_used_at`); put any other write in a separate write method that the client calls after the refresh succeeds.
+Spec decision 149 (PM-approved 2026-10-17, §4A.1c): the `sign-method` must be read-only (`writes: false`), including methods it calls through `op: method`. `vibe validate`, the build and `vibe serve` reject it otherwise (`REFRESH_SIGN_METHOD_WRITES`). The platform records the last refresh time per family itself (`_platform_refresh_families.last_refreshed_at`); after upgrading, run `vibe migrate` before `vibe serve`; put any other write in a separate write method that the client calls after the refresh succeeds.
 
 ## Natural-language source example
 
