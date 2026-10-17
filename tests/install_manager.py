@@ -42,4 +42,48 @@ name=${url##*/};rest=${url#*/download/};version=${rest%%/*};cp "$MOCK_SERVER/$ve
  def test_multiline_version_rejected(self):r=self.runit("install","--version","x\nv1.0.0\ny",env=self.env|{"MOCK_NETWORK_FAIL":"1"});self.assertNotEqual(r.returncode,0);self.assertIn("invalid stable release version",r.stderr);self.assertFalse((self.t/"gh.log").exists())
  def test_curl_https_only(self):
   t=SCRIPT.read_text();self.assertEqual(t.count("curl -f"),t.count("--proto '=https' --tlsv1.2"))
+ def two(self):return subprocess.check_output([self.dest/"vibe"],text=True).strip()
+ def test_below_minimum_fails(self):
+  self.release("v0.0.9","old");r=self.runit("install","--version","v0.0.9",env=self.env|{"VIBE_INSTALL_MIN_VERSION":"v0.0.1"});self.assertNotEqual(r.returncode,0);self.assertIn("below the minimum supported version",r.stderr);self.assertFalse((self.dest/"vibe").exists());self.assertFalse((self.t/"gh.log").exists())
+ def test_overridden_latest_older_tag_fails(self):
+  self.release("v0.0.5","old");r=self.runit("upgrade",env=self.env|{"MOCK_LATEST":"v0.0.5"});self.assertNotEqual(r.returncode,0);self.assertIn("below the minimum supported version",r.stderr);self.assertFalse((self.dest/"vibe").exists())
+ def test_latest_older_than_installed_refused(self):
+  self.release("v1.5.0","mid");r=self.runit("install","--version","v1.5.0");self.assertEqual(r.returncode,0,r.stderr);r=self.runit("upgrade",env=self.env|{"MOCK_LATEST":"v1.0.0"});self.assertNotEqual(r.returncode,0);self.assertIn("refusing downgrade",r.stderr);self.assertEqual(self.two(),"mid")
+ def test_downgrade_refused_without_flag(self):
+  self.assertEqual(self.runit("install","--version","v2.0.0").returncode,0);r=self.runit("install","--version","v1.0.0");self.assertNotEqual(r.returncode,0);self.assertIn("--allow-downgrade",r.stderr);self.assertEqual(self.two(),"two")
+  r=self.runit("install","--version","v1.0.0","--allow-downgrade");self.assertEqual(r.returncode,0,r.stderr);self.assertEqual(self.two(),"one")
+ def test_allow_downgrade_never_below_minimum(self):
+  self.release("v0.0.9","old");self.install1();r=self.runit("install","--version","v0.0.9","--allow-downgrade");self.assertNotEqual(r.returncode,0);self.assertIn("below the minimum",r.stderr);self.assertEqual(self.two(),"one")
+ def test_nonsemver_installed_refused(self):
+  self.install1();man=next((self.dest/".vibe-managed"/"versions").glob("*/manifest"));man.write_text(man.read_text().replace("version=v1.0.0","version=1"))
+  r=self.runit("install","--version","v2.0.0");self.assertNotEqual(r.returncode,0);self.assertIn("non-semver",r.stderr);self.assertEqual(self.two(),"one")
+  r=self.runit("install","--version","v2.0.0","--allow-downgrade");self.assertEqual(r.returncode,0,r.stderr);self.assertEqual(self.two(),"two")
+  self.release("v0.0.9","old");man=next((self.dest/".vibe-managed"/"versions").glob("*/manifest"));man.write_text(man.read_text().replace("version=v2.0.0","version=1"))
+  r=self.runit("install","--version","v0.0.9","--allow-downgrade");self.assertNotEqual(r.returncode,0);self.assertIn("below the minimum",r.stderr);self.assertEqual(self.two(),"two")
+ def test_missing_manifest_version_refused(self):
+  self.install1();man=next((self.dest/".vibe-managed"/"versions").glob("*/manifest"))
+  # empty value
+  man.write_text(man.read_text().replace("version=v1.0.0","version="))
+  r=self.runit("install","--version","v2.0.0");self.assertNotEqual(r.returncode,0);self.assertIn("missing or empty version",r.stderr);self.assertEqual(self.two(),"one")
+  r=self.runit("install","--version","v2.0.0","--allow-downgrade");self.assertEqual(r.returncode,0,r.stderr);self.assertEqual(self.two(),"two")
+  # key absent
+  man=next((self.dest/".vibe-managed"/"versions").glob("*/manifest"));man.write_text("\n".join(l for l in man.read_text().splitlines() if not l.startswith("version="))+"\n")
+  r=self.runit("install","--version","v1.0.0");self.assertNotEqual(r.returncode,0);self.assertIn("missing or empty version",r.stderr);self.assertEqual(self.two(),"two")
+  self.release("v0.0.9","old");r=self.runit("install","--version","v0.0.9","--allow-downgrade");self.assertNotEqual(r.returncode,0);self.assertIn("below the minimum",r.stderr);self.assertEqual(self.two(),"two")
+ def test_missing_manifest_file_refused(self):
+  self.install1();man=next((self.dest/".vibe-managed"/"versions").glob("*/manifest"));man.unlink()
+  r=self.runit("install","--version","v2.0.0");self.assertNotEqual(r.returncode,0);self.assertIn("missing manifest",r.stderr);self.assertEqual(self.two(),"one")
+  r=self.runit("install","--version","v2.0.0","--allow-downgrade");self.assertEqual(r.returncode,0,r.stderr);self.assertEqual(self.two(),"two")
+  man=next((self.dest/".vibe-managed"/"versions").glob("*/manifest"));man.unlink()
+  self.release("v0.0.9","old");r=self.runit("install","--version","v0.0.9","--allow-downgrade");self.assertNotEqual(r.returncode,0);self.assertIn("below the minimum",r.stderr);self.assertEqual(self.two(),"two")
+ def test_sha256_match_and_mismatch(self):
+  h=hashlib.sha256((self.server/"v1.0.0"/ASSET).read_bytes()).hexdigest()
+  r=self.runit("install","--version","v1.0.0","--sha256","f"*64);self.assertNotEqual(r.returncode,0);self.assertIn("does not match --sha256",r.stderr);self.assertFalse((self.dest/"vibe").exists())
+  self.assertNotEqual(self.runit("install","--version","v1.0.0","--sha256","xyz").returncode,0)
+  r=self.runit("install","--version","v1.0.0","--sha256",h.upper());self.assertEqual(r.returncode,0,r.stderr)
+ def test_semver_compare(self):
+  for a,b,want in [("1.10.0","1.9.0","1"),("v1.9.0","v1.10.0","-1"),("1.0.0-alpha","1.0.0","-1"),("1.0.0","1.0.0-rc.1","1"),("1.0.0-alpha","1.0.0-alpha.1","-1"),("1.0.0-alpha.1","1.0.0-alpha.beta","-1"),("1.0.0-beta.2","1.0.0-beta.11","-1"),("1.0.0-rc.1","1.0.0-beta.11","1"),("v2.0.0","v2.0.0","0"),("0.10.0","0.9.99","1")]:
+   r=self.runit("__compare-versions",a,b);self.assertEqual(r.stdout.strip(),want,(a,b))
+ def test_minimum_is_hardcoded(self):
+  t=SCRIPT.read_text();self.assertRegex(t,r"\nMIN_VERSION=v[0-9]+\.[0-9]+\.[0-9]+\n");self.assertNotIn("MIN_VERSION:-",t);self.assertNotIn("--min-version",t)
 if __name__=='__main__':unittest.main(verbosity=2)

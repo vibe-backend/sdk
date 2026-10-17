@@ -41,6 +41,11 @@ WARN vibe::rate_limit_saturation: rate-limit shard saturated; refusing new keys 
 
 `reason` is `owner_cap`, `network_cap`, `reserve` or `pinned`. Before release, add a log-based alert on that target (for example, any `reason="reserve"` or `reason="pinned"` line, or `refused` above a few dozen per minute), since those mean new clients are being turned away rather than one heavy network being capped.
 
+## Release checklist: installer minimum version (#169)
+
+- [ ] Whenever a release ships a security fix, bump `MIN_VERSION` in `scripts/vibe-install.sh` to that release in the same release cycle, and update `docs/install.md`.
+- [ ] The first official release must include the v1-blocker security fixes (at least #116 release verification and #197 TLS). `MIN_VERSION` is currently `v0.1.0`, the planned first release (`Cargo.toml`); if the first tag differs, update it before tagging.
+
 ## Residual risks
 
 - `release` environment admin bypass is enabled (`can_admins_bypass: true`). An admin can deploy without Jack's environment approval. Jack accepted this risk.

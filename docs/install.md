@@ -19,6 +19,9 @@ The default destination is `$HOME/.local/bin/vibe`; override it with `--install-
 
 1. Platforms are allowlisted; unsupported platforms fail closed.
 2. `install` requires an explicit stable `vX.Y.Z`. When `upgrade` has no version, it only accepts a GitHub `releases/latest` redirect within the same repository.
+   - A minimum version (`MIN_VERSION`, currently `v0.1.0`) is hard-coded in the script and cannot be changed by environment variables (including `VIBE_INSTALL_*`) or arguments. Any version below it, whether given with `--version` or resolved as `latest` (including from an overridden download source), is refused before download (#169).
+   - Versions are compared numerically per segment following SemVer precedence. Installing a version older than the managed one is refused unless `--allow-downgrade` is passed, and even then never below the minimum.
+   - `--sha256 <digest>` optionally pins the exact archive digest; a mismatch fails closed. Without it, the script relies on `SHA256SUMS` plus attestation verification.
 3. All downloads use HTTPS only (`--proto '=https'`) with TLS 1.2 or later (`--tlsv1.2`); any download failure stops the run.
 4. The asset must first match the same release's `SHA256SUMS`, then pass `gh attestation verify` with an authenticated GitHub CLI (decision 118, spec 2C.3b/9C):
 
@@ -46,4 +49,4 @@ The checksum detects transport corruption; the GitHub build attestation binds th
 python3 tests/install_manager.py
 ```
 
-The tests use local mock release, curl and attestation commands and never contact GitHub. They cover fresh install, upgrade to latest, repeated runs, remove, preserving the existing version on network/checksum/attestation failure, the pinned attestation identity and flags, unsupported platforms, invalid destinations, the operation lock, and never overwriting or removing unmanaged files.
+The tests use local mock release, curl and attestation commands and never contact GitHub. They cover fresh install, upgrade to latest, repeated runs, remove, preserving the existing version on network/checksum/attestation failure, the pinned attestation identity and flags, unsupported platforms, invalid destinations, the operation lock, the minimum-version and downgrade policy, `--sha256` pinning, SemVer comparison, and never overwriting or removing unmanaged files.
