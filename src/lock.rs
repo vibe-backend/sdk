@@ -8,7 +8,7 @@ pub const COMPILER_NAME: &str = "md-logic";
 pub const COMPILER_VERSION: &str = "0.1.0";
 // Every compile prompt text change (system, guide, examples) must bump PROMPT_VERSION:
 // it feeds compiler-hash and the LLM cache key.
-pub const PROMPT_VERSION: &str = "prompt-5";
+pub const PROMPT_VERSION: &str = "prompt-6";
 pub const LOCK_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,7 +159,8 @@ impl CompilerStamp {
 /// provider/model and the hash of the translated text are stamped; the
 /// translated text itself goes into the release audit artifact, never into
 /// the lock. Not part of `source-hash` or `compiler-hash`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct TranslationStamp {
     pub prompt_version: String,
     pub llm_provider: String,
@@ -186,11 +187,11 @@ pub struct Meta {
     pub dependencies: Vec<Dependency>,
     pub compiler: CompilerStamp,
     pub compiler_hash: String,
-    /// Present only for translated sources.
+    /// In-memory audit stamp only; never rendered into locks (decision 165).
     pub translation: Option<TranslationStamp>,
     pub security_items: Vec<SecurityItem>,
     /// Pre-v1.8 frontmatter keys (`status`, `approval-*`, `approved-*`,
-    /// `signature`, item `approved-by`) found while parsing. They are ignored
+    /// `signature`, item `approved-by`) and pre-165 `translation` found while parsing. They are ignored
     /// and never rendered; the validator reports them as warnings.
     pub legacy_fields: Vec<String>,
 }
@@ -413,12 +414,6 @@ fn render_meta(meta: &Meta) -> String {
         render_sent_params(&meta.compiler.sent_params)
     ));
     push_line(&mut out, "compiler-hash", &meta.compiler_hash);
-    if let Some(t) = &meta.translation {
-        out.push_str(&format!(
-            "translation: {{ prompt-version: {}, llm-provider: {}, model-snapshot: {}, hash: {} }}\n",
-            t.prompt_version, t.llm_provider, t.model_snapshot, t.hash
-        ));
-    }
     if meta.security_items.is_empty() {
         push_line(&mut out, "security-items", "[]");
     } else {
@@ -740,7 +735,11 @@ fn parse_meta(front: &str) -> Result<Meta, String> {
     }
     let compiler = parse_compiler(&get("compiler")?)?;
     let translation = match fields.iter().find(|(k, _)| k == "translation") {
-        Some((_, raw)) => Some(parse_translation(raw)?),
+        Some((_, raw)) => {
+            parse_translation(raw)?;
+            legacy_fields.push("translation".into());
+            None
+        }
         None => None,
     };
     Ok(Meta {
@@ -1015,7 +1014,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn translation_stamp_roundtrips_and_has_no_text_field() {
+    fn translation_stamp_is_not_rendered_and_legacy_stamp_is_ignored() {
         let mut meta = Meta::pending(Kind::Model, None, "product", "models/product/product.md");
         meta.source_hash = "sha256:abc".into();
         meta.compiler_hash = compiler_hash(&meta.compiler);
@@ -1032,15 +1031,12 @@ mod tests {
             sections: Vec::new(),
         };
         let text = render_lock(&doc);
-        assert!(text.contains(
-            "translation: { prompt-version: translate-1, llm-provider: openai, model-snapshot: gpt-test-2026-01-01, hash: sha256:0123 }\n"
-        ));
-        let parsed = parse_lock(&text).expect("parse");
-        assert_eq!(parsed.meta.translation, doc.meta.translation);
+        assert!(!text.contains("translation:"));
+        let old = text.replacen("security-items:", "translation: { prompt-version: translate-1, llm-provider: openai, model-snapshot: gpt-test-2026-01-01, hash: sha256:0123 }\nsecurity-items:", 1);
+        let parsed = parse_lock(&old).expect("parse legacy translation");
+        assert!(parsed.meta.translation.is_none());
+        assert!(parsed.meta.legacy_fields.contains(&"translation".into()));
         assert_eq!(render_lock(&parsed), text);
-        // A `text` key (or any other) is rejected: the text never goes in the lock.
-        let bad = text.replace("hash: sha256:0123 }", "hash: sha256:0123, text: hi }");
-        assert!(parse_lock(&bad).is_err());
     }
 
     #[test]

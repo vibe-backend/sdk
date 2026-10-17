@@ -25,17 +25,29 @@ pub struct BuildRecord {
     pub version: u32,
     /// Lock path (relative to the project) -> `sha256:<hex>` of its text.
     pub locks: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub translations: BTreeMap<String, crate::lock::TranslationStamp>,
 }
 
 pub fn lock_hash(text: &str) -> String {
     sha256_prefixed(text.as_bytes())
 }
 
-/// Writes the record atomically (temp file, fsync, rename, fsync dir).
+/// Writes a record for sources without translation stamps.
 pub fn write(root: &Path, locks: BTreeMap<String, String>) -> Result<(), String> {
+    write_with_translations(root, locks, BTreeMap::new())
+}
+
+/// Writes the record atomically (temp file, fsync, rename, fsync dir).
+pub fn write_with_translations(
+    root: &Path,
+    locks: BTreeMap<String, String>,
+    translations: BTreeMap<String, crate::lock::TranslationStamp>,
+) -> Result<(), String> {
     let record = BuildRecord {
         version: VERSION,
         locks,
+        translations,
     };
     let json = serde_json::to_vec_pretty(&record).map_err(|err| err.to_string())?;
     crate::fsutil::write_atomic(&root.join(PATH), &json).map_err(|err| err.to_string())
@@ -73,5 +85,20 @@ pub fn check(loaded: &LoadedProject, report: &mut Report) {
                 "lock is not in the build record; run `vibe compile`",
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn old_records_and_provenance_keep_their_serialization() {
+        let old = r#"{"version":1,"locks":{}}"#;
+        let record: super::BuildRecord = serde_json::from_str(old).unwrap();
+        assert!(record.translations.is_empty());
+        assert_eq!(serde_json::to_string(&record).unwrap(), old);
+        let old = r#"{"commit":"abc","locks":[],"security_items":[],"version":""}"#;
+        let provenance: crate::manifest::Provenance = serde_json::from_str(old).unwrap();
+        assert!(provenance.translations.is_empty());
+        assert_eq!(serde_json::to_string(&provenance).unwrap(), old);
     }
 }

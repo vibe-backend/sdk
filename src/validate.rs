@@ -9,8 +9,8 @@ use crate::diag::{Diag, Report};
 use crate::discover::{self, SourceFile};
 use crate::hashutil::source_hash;
 use crate::lock::{
-    compiler_hash, find_section, parse_lock, section_order, Kind, LockDoc, Scope, Section,
-    SourceType, LOCK_VERSION,
+    compiler_hash, find_section, parse_lock, section_order, Kind, LockDoc, Scope, SourceType,
+    LOCK_VERSION,
 };
 use crate::scan;
 use crate::security::{self, pipeline_name};
@@ -302,11 +302,25 @@ pub(crate) fn check_lock(
     }
     check_sections(doc, &file, report);
     check_variable_roots(doc, &file, report);
-    if !doc.meta.legacy_fields.is_empty() {
+    if doc
+        .meta
+        .legacy_fields
+        .iter()
+        .any(|field| field == "translation")
+    {
+        report.push(Diag::warning(&file, "lock contains a `translation` field, which is no longer written (decision 165); run `vibe compile` to refresh it"));
+    }
+    if doc
+        .meta
+        .legacy_fields
+        .iter()
+        .any(|field| field != "translation")
+    {
         let fields: Vec<String> = doc
             .meta
             .legacy_fields
             .iter()
+            .filter(|field| field.as_str() != "translation")
             .map(|field| format!("`{field}`"))
             .collect();
         report.push(Diag::warning(
@@ -1253,9 +1267,6 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
                 }
             }
         }
-    }
-    if find_section(&doc.sections, "Errors").is_some_and(Section::is_empty) {
-        report.push(Diag::warning(file, "feature has no Errors section").at_section("Errors"));
     }
 }
 

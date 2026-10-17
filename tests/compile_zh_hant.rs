@@ -230,13 +230,18 @@ async fn zh_hant_sample_shop_compiles_and_validates() {
             .count(),
         4
     );
-    // D109: the lock stamps only prompt version, provider/model and the hash
-    // of the translation; the text itself is never in the lock.
+    // D109/165: the build record stamps prompt version, provider/model and
+    // translation hash; neither stamp nor text is in the lock.
     let text = translation("商品目錄");
     let raw = fs::read_to_string(root.join("models/product/product.lock.md")).unwrap();
     assert!(!raw.contains(text), "translated text leaked into the lock");
     assert!(!raw.contains("Product catalog"), "{raw}");
-    let stamp = product.meta.translation.clone().expect("translation stamp");
+    assert!(product.meta.translation.is_none());
+    assert!(!raw.contains("translation:"));
+    let record: vibe::buildrecord::BuildRecord =
+        serde_json::from_str(&fs::read_to_string(root.join(vibe::buildrecord::PATH)).unwrap())
+            .unwrap();
+    let stamp = &record.translations["models/product/product.lock.md"];
     assert_eq!(
         stamp.prompt_version,
         vibe::compile::TRANSLATE_PROMPT_VERSION

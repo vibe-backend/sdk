@@ -5,6 +5,10 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Lock-format change (decision 165):** Bumped PROMPT_VERSION to prompt-6. Locks no longer write run-varying translation stamps; per-lock stamps live in the backward-compatible build record and optional manifest provenance, preserving D109 audit links. Old locks parse and discard `translation:` and validate warns once per lock to recompile.
+- **Empty Errors:** Missing, empty, header-only and `(none)` feature Errors sections normalize identically for structured and natural-language sources. No warning for no custom errors.
+- **Security wording:** Structured declarations confirm ambiguous negation without a warning; explicit prose conflicts still fail. Cantonese auth removal phrases include 唔需要驗證, 唔使驗證 and 唔使登入.
+- **Sampling diagnostics:** Unsupported-model and disabled-sampling warnings appear at most once per compile invocation (one per CLI run).
 - **Spec decision 164:** `vibe manifest` is the official build command (release by default, `--dev` for development); `vibe build` is deferred to vNext. Removed stand-in wording.
 - **Empty LLM settings:** Interactive setup and the `.env` loader treat empty or whitespace-only LLM/OpenAI values as unset. Later non-empty lines win, and empty process variables do not block `.env` values; existing file content is preserved.
 - **CLI help:** Describes interactive `vibe`; removed `vibe new` points to `vibe`. Manifest help describes unsigned release output, workflow Sigstore signing and the local dev key.

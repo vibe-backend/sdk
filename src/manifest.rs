@@ -39,6 +39,8 @@ pub struct Manifest {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Provenance {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub translations: BTreeMap<String, crate::lock::TranslationStamp>,
     /// Source commit (`GITHUB_SHA`, `--commit`, or `git rev-parse HEAD`).
     pub commit: String,
     /// One entry per lock, sorted by id.
@@ -618,6 +620,12 @@ pub fn build_signed(
     locks.sort_by(|a, b| a.id.cmp(&b.id));
     items.sort_by(|a, b| (&a.lock, &a.item).cmp(&(&b.lock, &b.item)));
     manifest.provenance = Provenance {
+        translations: loaded
+            .build_record
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<crate::buildrecord::BuildRecord>(raw).ok())
+            .map(|record| record.translations)
+            .unwrap_or_default(),
         commit: info.commit.clone(),
         locks,
         security_items: items,
