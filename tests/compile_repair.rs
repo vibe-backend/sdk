@@ -268,3 +268,44 @@ async fn cached_lock_failing_validate_is_recompiled() {
         .contains("op: transform"));
     fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn structured_limits_pins_and_slug_normalization() {
+    for slug in [true, false] {
+        let root = api_project();
+        let source_path = root.join("api/catalog/v1/hello/hello.md");
+        let body = API_GOOD.replace("- provider: main", "- provider: main\n- timeout: 5s\n- body: 4KB")
+            .replace("## Request\n(none)", "## Request\n| field | type | rules | required |\n| --- | --- | --- | --- |\n| path.slug | uuid | - | no |\n| path.slug | string | - | no |")
+            .replace("/catalog/v1/hello", if slug { "/catalog/v1/{slug}/hello" } else { "/catalog/v1/hello" });
+        fs::write(&source_path, &body).unwrap();
+        let opts = CompileOptions {
+            root: &root,
+            llm: None,
+            llm_config: None,
+            check: false,
+        };
+        let error = compile_project(&opts).await.err().unwrap().to_string();
+        assert!(
+            error.contains("pin it in frontmatter (`timeout: 5s`)"),
+            "{error}"
+        );
+        assert!(!root.join("api/catalog/v1/hello/hello.lock.md").exists());
+        fs::write(
+            &source_path,
+            format!("---\ntimeout: 5s\nbody: 4KB\n---\n{body}"),
+        )
+        .unwrap();
+        compile_project(&opts)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let lock = fs::read_to_string(root.join("api/catalog/v1/hello/hello.lock.md")).unwrap();
+        assert!(lock.contains("- provider: main\n- timeout: 5s\n- body: 4KB"));
+        assert_eq!(lock.matches("| path.slug |").count(), usize::from(slug));
+        if slug {
+            assert!(lock.contains("| path.slug | string | - | yes |"));
+        } else {
+            assert!(lock.contains("## Request\n(none)"));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}

@@ -1,3 +1,6 @@
+---
+body: 4KB
+---
 # session (writes users.last_device through user.record-session)
 
 ## Route

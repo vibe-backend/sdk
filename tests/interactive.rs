@@ -318,3 +318,42 @@ async fn repairs_are_bounded() {
     assert_eq!(fs::read_dir(&p).unwrap().count(), 0);
     fs::remove_dir_all(p).unwrap();
 }
+
+#[tokio::test]
+async fn kebab_names_are_repaired_or_write_nothing() {
+    for repair in [true, false] {
+        let p = root();
+        let calls = AtomicUsize::new(0);
+        let bad = answer().replace("\"feature\":\"hello\"", "\"feature\":\"HelloWorld\"");
+        let fake = FakeAdapter {
+            responder: |r: &llm::LlmRequest| {
+                if calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    assert!(r.input.contains("kebab-case"));
+                    if repair {
+                        return Ok(answer());
+                    }
+                }
+                Ok(bad.clone())
+            },
+        };
+        let result = interactive::run(
+            &p,
+            &mut Script::new(&["hello world", "y"]),
+            &config(),
+            &fake,
+        )
+        .await;
+        if repair {
+            result.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                fs::read_to_string(p.join("api/hello/v1/hello/hello.md")).unwrap(),
+                source()
+            );
+        } else {
+            assert!(result.unwrap_err().contains("kebab-case"));
+            assert_eq!(fs::read_dir(&p).unwrap().count(), 0);
+        }
+        fs::remove_dir_all(p).unwrap();
+    }
+}

@@ -18,6 +18,7 @@
 
 ### v1.8（草稿，2026-10-14）
 
+- 補編決定 150–162（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 compiler-hash 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。
 - 新增 `vibe build`：一個指令做晒編譯、驗證同 manifest（類似 `nest build`），冇 reviewer 步驟（審核由 Git 平台設定負責，決定 76，見 2C.3）。
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
@@ -283,6 +284,24 @@
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
+### 0.14 v1.8 2026-10-17 決定（決定 150–162，產品經理已批准 2026-10-17）
+
+| # | 決定 | 狀態 | 位置 |
+| --- | --- | --- | --- |
+| 150 | （#285）Expression 支援 JSON 字串／數字、`true`／`false`／`null` 字面值同加引號嘅 object key（未支援 array）；三個字係保留字。api `respond value` 會 evaluate，runtime 失敗回 500 `INTERNAL`，唔 fallback；validate／manifest 拒絕靜態可確定失敗嘅 expression。`## Transform` 可省略，等同 `(none)`（in = `{}`、out = `result`），`- in: (none)`／`- out: (none)` 都接受。 | 已批准（產品經理 2026-10-17） | 2.3、2A.2、2A.3 |
+| 151 | （#287）LLM 連線錯誤顯示底層原因（地址／範圍被拒、DNS、TLS）同遮咗嘅 URL，永遠唔包含 key、request header 或 response body。`vibe validate --deploy --dev` 同 `vibe manifest --dev` 接受本地開發 private endpoint lock，CI／production 拒絕。開發環境 `vibe serve` 啟動 runtime 前警告並移除 `LLM_*`／`OPENAI_*`（包括 `.env` 值），其他環境照舊拒絕。 | 已批准（產品經理 2026-10-17） | 2A.8.4、2A.8.5、2C.3、10 |
+| 152 | （#92）api source frontmatter `auth: none`（同 `removed`／`false`／`off`）一律編譯成 `-auth`，取代繼承或 model auth。固定清單嘅中英文移除 auth 句子當直接否定，唔出歧義 warning；login 要求照樣衝突，雙重否定保留嚴格檢查。 | 已批准（產品經理 2026-10-17） | 2.2、2.1a |
+| 153 | （#289）LLM 錯誤只顯示寫死 allowlist 嘅值（已知 model 名、provider 錯誤碼、Responses API incomplete reason），其餘顯示 `unknown`；provider 訊息文字同 response body 永遠唔顯示。 | 已批准（產品經理 2026-10-17） | 2A.8.5 |
+| 154 | （#97）移除 `vibe approve` 同 lock 簽名；lock 冇 `status`／`approval-*`／`approved-*`／`signature`，舊欄位出一次 warning 後忽略。`vibe manifest` 冇 `--dev` 就 build release manifest（同 `--release`）；release workflow 用 Sigstore keyless 簽名，非開發環境 `vibe serve` 只接受經 Sigstore 驗證嘅 release manifest。 | 已批准（產品經理 2026-10-17） | 2A.1、2A.5、2C.2、2C.3、2C.3b |
+| 155 | （#290／#291）開發環境 `vibe serve --memory` 一定有 slug `dev`（tenant `devtenant`），即使 slug 檔設定咗其他 slug；檔案改動唔使重啟。非 memory 同非開發環境不變。 | 已批准（產品經理 2026-10-17） | 2C.1 |
+| 156 | （#291）validate 按位置檢查 expression 變數根：Transform in 准 `req`、`ctx`；api step 同 Transform out 准 `input`、`req`、`ctx` 同之前 method step 嘅 out；method 准 `input`、`ctx` 同之前 step 嘅 out。錯誤報根名、位置同准用根。compile 每個 LLM lock 正規化後跑 validate，失敗經現有 repair loop 回饋 model，共用 `LLM_FORMAT_RETRIES` 上限；最後失敗就停止，成個 project 通過先寫 lock 同 build record。 | 已批准（產品經理 2026-10-17） | 2A.2、2A.8 |
+| 157 | （#292）互動 `vibe` 取代 `vibe new`；首次問 LLM 設定，寫 project `.env`（0600），只補缺少嘅行，已有值優先；`.gitignore` 只加一次 `.env`。Endpoint 解析到 private／本地地址先問用戶再加 `LLM_ALLOW_PRIVATE_HOST=true`。產生 source 要簡單小寫 kebab-case 名，hello world 預設 `hello/v1/hello`。實作狀態：setup 會再 append 全部今次輸入嘅設定，唔會略過已有 key；讀取時環境變數優先，否則以 `.env` 入面先出現嘅值為準。 | 已批准（產品經理 2026-10-17） | 2C.1 |
+| 158 | （#293）移除冇 key 嘅 api step op `transform`（pre-1.0，冇 deprecation period）；validate 拒絕並提示刪除 step、改用 `## Transform`，見 2A.4 註。 | 已批准（產品經理 2026-10-17） | 2A.4 |
+| 159 | （#293）api feature lock 嘅 `## Limits` 同 `## Request` `path.slug` row 由 code 按固定規則正規化，唔由 model 揀，同一 source 編譯出 byte-identical lock。 | 已批准（產品經理 2026-10-17） | 2A.2 |
+| 160 | Frontmatter 可以 pin `timeout`、`body` 同 `provider`；timeout／body 按 pin → `_version` Defaults → `_definition` Defaults → `10s`／`1MB`；provider 按 pin → `_definition` Providers default → `main`。validate 檢查 pin 格式；Limits 只嚟自 frontmatter 同繼承預設，prose limits 唔會用，warning 留到 vNext。compile 同互動 prompt 都叫 model 同用戶將 limits 寫喺 frontmatter。 | 已批准（產品經理 2026-10-17） | 2.2、2A.2 |
+| 161 | Structured source 用同一套 `path.slug` 同 Limits 規則；structured `## Limits` 有值同解析結果唔同就 compile error，要移去 frontmatter 或刪除。 | 已批准（產品經理 2026-10-17） | 2A.2 |
+| 162 | 每次改 compile prompt（system prompt、guide、examples）一定要 bump `PROMPT_VERSION`，佢計入 compiler-hash 同 LLM cache key。 | 已批准（產品經理 2026-10-17） | 2A.6 |
+
 ## 1. 目錄同命名
 
 ```text
@@ -359,7 +378,8 @@ project/
 
 - 每個 source 用 `#` 標題寫名，之後用段落或者列點描述。
 - 建議用以下小標題幫編譯器理解（唔強制）：`## 用途`、`## 輸入`、`## 輸出`、`## 做法`、`## 錯誤`、`## 權限`。
-- 安全相關嘅設定（公開、剔走 auth、寫入、改 provider、放寬限流、簽 token）可以用自然語言寫（決定 16）；但**高風險欄位一定要喺 frontmatter 宣告**（決定 112）：`writes`、`public`（同 `public-writes`）、`auth`、用到嘅 secret（`secrets`）。冇宣告而 lock 或者譯文顯示有呢啲行為，編譯失敗，錯誤講明要加邊個宣告。建議用獨立一句清楚寫出，唔好埋喺長段落入面；無論寫喺邊，驗證器都會由 lock 抽出安全項目，PR 逐項高亮（見 2A.5）。
+- 安全相關嘅設定（公開、剔走 auth、寫入、改 provider、放寬限流、簽 token）可以用自然語言寫（決定 16），但 `## Limits` 嘅 `timeout`、`body`、`provider` 只用 frontmatter pin 同繼承預設，prose limits 唔會用（決定 160；rate-limit pipeline 唔受影響）；但**高風險欄位一定要喺 frontmatter 宣告**（決定 112）：`writes`、`public`（同 `public-writes`）、`auth`、用到嘅 secret（`secrets`）。冇宣告而 lock 或者譯文顯示有呢啲行為，編譯失敗，錯誤講明要加邊個宣告。建議用獨立一句清楚寫出，唔好埋喺長段落入面；無論寫喺邊，驗證器都會由 lock 抽出安全項目，PR 逐項高亮（見 2A.5）。
+- 決定 160：api feature 可以喺 frontmatter pin `timeout`、`body`、`provider`；`## Limits` 只用呢啲 pin 同繼承預設，prose 入面嘅 limits 唔會用（warning 留到 vNext），rate-limit pipeline 唔受影響。Compile 同互動 prompt 都要求 limits 寫喺 frontmatter；互動完成亦會提醒用戶。
 - source 入面嘅文字只會被當做描述，入面任何「指示編譯器」或者「略過檢查」嘅句子都唔會生效，lock 層規則照樣強制檢查；呢類似指令嘅句子會被 deterministic 規則偵測，出 warning 並喺 PR 高亮（見 2A.7）。
 
 ### 2.3 api feature source 涵蓋內容
@@ -506,9 +526,10 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 
 ### 2A.2 通用 section 規則
 
-產品經理決定（2026-10-17）：自然語言 api feature 嘅以下 optional 部分由 code 用固定決定性規則正規化，永遠唔由 model 揀；忽略 model 喺呢啲部分嘅輸出，確保同一 source 編譯出 byte-identical lock。結構化 source 保留現有行為。
+決定 159、160、161：自然語言同 structured api feature 嘅以下 optional 部分由 code 用固定決定性規則正規化，永遠唔由 model 揀；忽略 model 喺呢啲部分嘅輸出，確保同一 source 編譯出 byte-identical lock。Structured source 用同一套規則；來源 `## Limits` 缺省、`(none)` 或者同解析值相同都接受；有值唔同就 compile error：`## Limits <key>: <value> in the source is not used; pin it in frontmatter (<key>: <value>) or remove it`。自然語言 model 輸出仍然靜默忽略。
 
-- `## Limits` 一律丟棄 model 原有內容，固定依次寫三個 bullet：`provider` 用 source frontmatter 指定值，否則用 `_definition` 嘅 `## Providers default`，再否則 `main`；`timeout` 同 `body` 依次用 `_version` 嘅 `## Defaults`、`_definition` 嘅 `## Defaults`，再否則分別用 `10s` 同 `1MB`。
+- `## Limits` 一律丟棄 model 原有內容，固定依次寫三個 bullet：`provider` 用 source frontmatter 指定值，否則用 `_definition` 嘅 `## Providers default`，再否則 `main`；`timeout` 同 `body` 依次用 source frontmatter pin、`_version` 嘅 `## Defaults`、`_definition` 嘅 `## Defaults`，再否則分別用 `10s` 同 `1MB`。
+- 決定 160：compile、validate 同互動生成一律檢查 pin；validate 亦檢查 lock Limits。`timeout` 要嚴格 duration（例如 `500ms`、`10s`），大過 0 而唔超過 30s；`body` 要嚴格 size（例如 `64kb`、`4KB`、`1MB`），大過 0 而唔超過 1MB；`provider` 要小寫 kebab-case。錯誤講明 key、壞值同有效例子。
 - 正規化後嘅 Route path 有 `{slug}` segment，就先移除 Request 所有 model 寫嘅 `path.slug` row，再喺第一個 data row 加且只加 `| path.slug | string | - | yes |`；其他 row 保留次序。Request 係 `(none)` 或冇 table 時，建立 header `| field | type | rules | required |` 嘅 table。Route 冇 `{slug}` segment 就移除所有 `path.slug` row；移除後冇 row 就寫 `(none)`。
 
 - section 用 `##` 標題，名稱同次序按 kind 固定（見 2A.3）；唔准有額外 section，缺 section 用 `(none)` 表示；api feature 可以省略 `## Transform`，等同 `(none)`，compile 會喺 lock 嘅固定位置補返。
@@ -539,7 +560,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 
 ### 2A.4 op 白名單
 
-產品經理決定（2026-10-17）：冇 key 嘅 `transform` step op 已移除；而家仲係 pre-1.0，唔設 deprecation period。validate 會拒絕佢，提示刪除呢個 step，改用 `## Transform`（`- in:`／`- out:`）寫 request／response 映射。
+決定 158：冇 key 嘅 `transform` step op 已移除；而家仲係 pre-1.0，唔設 deprecation period。validate 會拒絕佢，提示刪除呢個 step，改用 `## Transform`（`- in:`／`- out:`）寫 request／response 映射。
 
 | 層 | 准用 op |
 | --- | --- |
@@ -586,6 +607,8 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - Lock 過時（source 或者依賴 hash 唔一致）或者驗證唔通過，就唔可以 build release manifest。
 
 ### 2A.6 重新編譯規則
+
+- 決定 162：每次改 compile prompt 文字（system prompt、prompt guide、examples）一定要 bump `PROMPT_VERSION`；佢計入 compiler-hash 同 LLM cache key。今次係 `prompt-5`，舊 lock 要重新編譯；hash 測試記錄版本同所有 kind／scope 嘅 prompt SHA-256，改 prompt 後要一齊更新。
 
 - 只有 `source-hash` 或者任何 `dependencies` hash 變咗先會重新編譯；source 改咗但正規化 hash 唔變就唔會重新編譯。
 - 編譯用嘅 model 一定 pin 死 snapshot（唔准用會浮動嘅別名）；`compiler-hash` 按 2A.1 標準定義計，寫入每個 lock（決定 18、64）。
@@ -1558,6 +1581,9 @@ error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-re
 `api/auth/v1/refresh/refresh.md`（`token-refresh` route，sign-method 係上面唯讀嘅 `user.sign-token`）
 
 ```markdown
+---
+body: 4KB
+---
 # refresh
 
 ## Route
@@ -1622,6 +1648,9 @@ error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-re
 `api/auth/v1/session/session.md`（要 JWT；呼叫 `user.record-session`。標題要提到寫入：compile 嘅 semantic check 要求有 `write-sql` 嘅 source 提到 write／update 等字）
 
 ```markdown
+---
+body: 4KB
+---
 # session (writes users.last_device through user.record-session)
 
 ## Route
@@ -3023,6 +3052,9 @@ security-items:
 ### 11.4b Re-invite：`api/users/v2/re-invite/re-invite.md`（路由 `POST /users/v2/{id}/invite`，決定 86，已確認（產品經理 2026-10-14））
 
 ```markdown
+---
+body: 1KB
+---
 # 重新寄邀請
 POST，路徑 /users/v2/{id}/invite。只有 admin 可以用，每個 admin 每分鐘最多 10 次。
 用 user.invite 重新寄邀請，舊邀請即時失效。邀請入 outbox 之後回 202，body `{ invite_status: "invite_pending" }`（決定 95）；亦可以用嚟重寄 `delivery_failed` 嘅邀請。
@@ -3223,7 +3255,7 @@ query 要有 region（2 個字元）。
 ## Request
 | field | type | rules | required |
 |---|---|---|---|
-| path.slug | string | | yes |
+| path.slug | string | - | yes |
 | query.region | string | length: 2 | yes |
 
 ## Response
@@ -3265,6 +3297,9 @@ query 要有 region（2 個字元）。
 ### 11.7 Public 建立資料：`api/catalog/v1/submit-review/submit-review.md`（路由 `POST /catalog/v1/{slug}/reviews`）
 
 ```markdown
+---
+body: 16KB
+---
 # 提交評論
 POST，路徑 /catalog/v1/{slug}/reviews，公開，唔使 auth，租戶由 slug 決定。
 訪客可以留評論，所以會寫入資料，要 captcha。
@@ -3314,7 +3349,7 @@ body：item_id（uuid）、rating（1 至 5）、comment（1 至 500 字）。
 ## Request
 | field | type | rules | required |
 |---|---|---|---|
-| path.slug | string | | yes |
+| path.slug | string | - | yes |
 | body.item_id | uuid | | yes |
 | body.rating | integer | min: 1, max: 5 | yes |
 | body.comment | string | min: 1, max: 500, untrusted | yes |
@@ -3801,7 +3836,7 @@ security-items:
 ## Request
 | field | type | rules | required |
 |---|---|---|---|
-| path.slug | string | | yes |
+| path.slug | string | - | yes |
 | body.email | string | format: email | yes |
 | body.password | string | min: 1, max: 256 | yes |
 
@@ -4270,6 +4305,9 @@ security-items:
 #### 12.11.6 api：`api/auth/v1/register/register.md`（路由 `POST /auth/v1/{slug}/register`）
 
 ```markdown
+---
+body: 4KB
+---
 # 註冊
 POST，路徑 /auth/v1/{slug}/register。
 公開，唔使 auth，租戶由 slug 決定。
@@ -4343,7 +4381,7 @@ security-items:
 ## Request
 | field | type | rules | required |
 | --- | --- | --- | --- |
-| path.slug | string | | yes |
+| path.slug | string | - | yes |
 | body.email | string | format: email, max: 254, untrusted | yes |
 | body.name | string | min: 1, max: 50, untrusted | yes |
 
@@ -4385,6 +4423,9 @@ security-items:
 #### 12.11.7 api：`api/auth/v1/verify-email/verify-email.md`（路由 `POST /auth/v1/{slug}/verify-email`）
 
 ```markdown
+---
+body: 2KB
+---
 # 驗證 email 同設定密碼
 POST，路徑 /auth/v1/{slug}/verify-email。
 公開，唔使 auth，租戶由 slug 決定。
@@ -4463,7 +4504,7 @@ security-items:
 ## Request
 | field | type | rules | required |
 | --- | --- | --- | --- |
-| path.slug | string | | yes |
+| path.slug | string | - | yes |
 | body.token | string | length: 43, pattern: base64url | yes |
 | body.password | string | min: 1, max: 256 | yes |
 

@@ -1137,14 +1137,14 @@ pub fn system_prompt(kind: Kind, scope: Option<Scope>) -> String {
     // Examples follow lock::section_order exactly; every step has source-lines.
     let example = match (kind, scope) {
         (Kind::Method, _) => "\n\nEXAMPLE METHOD LOCK BODY:\n## Signature\n- target: product.create\n- writes: true\n- errors: [NOT_FOUND]\n- capabilities: []\n## Calls\n- methods: []\n## Steps\n### s1 query\n- op: query\n- writes: true\n- sql: `INSERT INTO products (id, tenant_id, name) VALUES ($1, $2, $3)`\n- params: [input.id, ctx.user.tenant, input.name]\n- scope: rls\n- out: row\n- source-lines: 3-4\n### s2 respond\n- op: respond\n- value: row\n- source-lines: 5\n",
-        (Kind::Api, Some(Scope::Feature)) => "\n\nEXAMPLE API FEATURE LOCK BODY:\n## Route\n- method: GET\n- path: /catalog/v1/products/{id}\n## Access\n- public: false\n## Pipelines\n### auth\n- mode: jwt\n### rate-limit\n- per-minute: 600\n- key: user\n## Limits\n- provider: main\n- timeout: 5s\n- body: 64kb\n## Request\n| field | type | rules | required |\n| --- | --- | --- | --- |\n| path.id | uuid | - | yes |\n## Response\n- status: 200\n## Transform\n## Steps\n### s1 method\n- op: method\n- target: product.get\n- args: { id: req.path.id }\n- out: row\n- source-lines: 3\n### s2 respond\n- op: respond\n- value: row\n- source-lines: 4\n## Errors\n| status | code | from |\n| --- | --- | --- |\n| 404 | NOT_FOUND | product.get |\n",
+        (Kind::Api, Some(Scope::Feature)) => "\n\nEXAMPLE API FEATURE LOCK BODY:\n## Route\n- method: GET\n- path: /catalog/v1/products/{id}\n## Access\n- public: false\n## Pipelines\n### auth\n- mode: jwt\n### rate-limit\n- per-minute: 600\n- key: user\n## Limits\n- provider: main\n- timeout: 10s\n- body: 1MB\n## Request\n| field | type | rules | required |\n| --- | --- | --- | --- |\n| path.id | uuid | - | yes |\n## Response\n- status: 200\n## Transform\n## Steps\n### s1 method\n- op: method\n- target: product.get\n- args: { id: req.path.id }\n- out: row\n- source-lines: 3\n### s2 respond\n- op: respond\n- value: row\n- source-lines: 4\n## Errors\n| status | code | from |\n| --- | --- | --- |\n| 404 | NOT_FOUND | product.get |\n",
         _ => "\n\nPrefer existing method targets from DEPENDENCIES (object.action).\n",
     };
     format!(
         "You are {COMPILER_NAME} {COMPILER_VERSION} prompt {PROMPT_VERSION}. \
 Compile the source into lock markdown sections only. \
 No frontmatter, no prose, no code fences. \
-Required sections in order: {sections}. \
+API feature ## Limits is computed by the compiler from frontmatter pins (timeout, body, provider) and inherited defaults; never derive limits from prose. Required sections in order: {sections}. \
 Use `- key: value` bullets, `### sN op` steps, and markdown tables where the section needs them. \
 Allowed method ops: query, validate, call, method, respond, verify-password, hash-password, random-token, hash-token, sign-jwt. \
 Allowed api ops: method, validate, respond; there is no transform step, so do not emit a transform step. API step keys exactly: method {{target, args, out}}, validate {{when, fail}}, respond {{value, status}}, plus op and source-lines. Request/response mapping belongs in ## Transform as - in: expr and - out: expr. Transform in roots: req, ctx only; API steps and Transform out: input, req, ctx and earlier method step outs. Method roots: input, ctx and earlier step outs. Literals: JSON strings, numbers, true/false/null; object keys may be quoted; no arrays. A constant response uses one respond step with - value: {{ message: \"hello world\" }} and ## Transform (none). Route path must use /{{definition}}/{{version}}/... from the source; public slug routes use /{{definition}}/{{version}}/{{slug}}/... and tenant: path.slug. \
@@ -1654,9 +1654,8 @@ fn normalize_feature(
         }
     }
     let natural = doc.meta.source_type == SourceType::Natural;
-    if natural {
-        // Optional model output must not affect the canonical lock.
-        doc.sections.retain(|section| section.name != "Limits");
+    {
+        // Route-derived request rows are canonical for all feature sources.
         let slug = find_section(&doc.sections, "Route")
             .and_then(|section| section.get("path"))
             .is_some_and(|path| path.split('/').any(|segment| segment == "{slug}"));
@@ -1691,50 +1690,54 @@ fn normalize_feature(
             *request = Section::none("Request");
         }
     }
-    let timeout = inherited_default(def, ver, "timeout").unwrap_or_else(|| "10s".into());
-    let body = inherited_default(def, ver, "body").unwrap_or_else(|| "1MB".into());
-    if let Some(limits) = find_section_mut(&mut doc.sections, "Limits") {
-        if limits.get("timeout").is_none() {
-            upsert_bullet(limits, "timeout", &timeout);
-        }
-        if limits.get("body").is_none() {
-            upsert_bullet(limits, "body", &body);
+    let front = parse_source_frontmatter(&source.text)
+        .map_err(|error| vec![Diag::error(&source.rel, error)])?;
+    for (key, value) in &front {
+        if let Err(error) = crate::validate::check_limit_value(key, value) {
+            diags.push(Diag::error(&source.rel, error));
         }
     }
+    let mut bullets = Vec::new();
+    for (key, fallback) in [("provider", "main"), ("timeout", "10s"), ("body", "1MB")] {
+        let resolved = front
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .or_else(|| {
+                if key == "provider" {
+                    def.and_then(|d| find_section(&d.sections, "Providers"))
+                        .and_then(|s| s.get("default"))
+                        .map(str::to_string)
+                } else {
+                    inherited_default(def, ver, key)
+                }
+            })
+            .unwrap_or_else(|| fallback.into());
+        if !natural {
+            if let Some(value) = find_section(&doc.sections, "Limits").and_then(|s| s.get(key)) {
+                if value != resolved {
+                    diags.push(Diag::error(&source.rel, format!("`## Limits` {key}: {value} in the source is not used; pin it in frontmatter (`{key}: {value}`) or remove it")));
+                }
+            }
+        }
+        bullets.push(Bullet {
+            key: key.into(),
+            value: resolved,
+        });
+    }
+    if !diags.is_empty() {
+        return Err(diags);
+    }
+    doc.sections.retain(|s| s.name != "Limits");
+    doc.sections.push(Section {
+        name: "Limits".into(),
+        bullets,
+        table: None,
+        blocks: Vec::new(),
+        none: false,
+    });
     if find_section(&doc.sections, "Errors").is_none() {
         doc.sections.push(Section::none("Errors"));
-    }
-    if find_section(&doc.sections, "Limits").is_none() {
-        let front = source_frontmatter(&source.text);
-        let provider = front
-            .iter()
-            .find(|(key, _)| natural && key == "provider")
-            .map(|(_, value)| value.as_str())
-            .or_else(|| {
-                def.and_then(|doc| find_section(&doc.sections, "Providers"))
-                    .and_then(|section| section.get("default"))
-            })
-            .unwrap_or("main");
-        doc.sections.push(Section {
-            name: "Limits".into(),
-            bullets: vec![
-                Bullet {
-                    key: "provider".into(),
-                    value: provider.into(),
-                },
-                Bullet {
-                    key: "timeout".into(),
-                    value: timeout,
-                },
-                Bullet {
-                    key: "body".into(),
-                    value: body,
-                },
-            ],
-            table: None,
-            blocks: Vec::new(),
-            none: false,
-        });
     }
     ensure_transform(doc);
     let order = crate::lock::section_order(Kind::Api, Some(Scope::Feature));
@@ -2555,6 +2558,8 @@ const PINNED_KEYS: &[&str] = &[
     "public-writes",
     "auth",
     "provider",
+    "timeout",
+    "body",
     "writes",
     "capabilities",
     "ownership",
@@ -2661,7 +2666,7 @@ fn frontmatter_security_check(doc: &LockDoc, source: &SourceFile) -> Vec<Diag> {
             } else {
                 auth_mode.clone().unwrap_or_else(|| "inherited".into())
             }),
-            (Kind::Api, "provider") => section_get("Limits", "provider"),
+            (Kind::Api, key @ ("provider" | "timeout" | "body")) => section_get("Limits", key),
             (Kind::Model, "provider") => section_get("Table", "provider"),
             (Kind::Model, "ownership") => {
                 Some(section_get("Table", "ownership").unwrap_or("(none)".into()))
@@ -2866,6 +2871,40 @@ mod prompt_tests {
     use std::collections::HashMap;
 
     #[test]
+    fn compile_prompt_version_and_hash() {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        for kind in [
+            Kind::Provider,
+            Kind::Pipeline,
+            Kind::Model,
+            Kind::Method,
+            Kind::Migration,
+            Kind::Api,
+        ] {
+            for scope in [
+                None,
+                Some(Scope::Definition),
+                Some(Scope::Version),
+                Some(Scope::Feature),
+            ] {
+                let prompt = system_prompt(kind, scope);
+                hash.update((prompt.len() as u64).to_be_bytes());
+                hash.update(prompt.as_bytes());
+            }
+        }
+        let actual = hex::encode(hash.finalize());
+        assert_eq!(
+            (crate::lock::PROMPT_VERSION, actual.as_str()),
+            (
+                "prompt-5",
+                "d2adc5cd17ddefeaa4d6dfec31a8ac7e2abd7b2ef9f515a2b337d54620c10517"
+            ),
+            "compile prompt changed: bump PROMPT_VERSION and update the recorded hash"
+        );
+    }
+
+    #[test]
     fn examples_follow_section_order_and_have_source_lines() {
         for (kind, scope) in [(Kind::Method, None), (Kind::Api, Some(Scope::Feature))] {
             let prompt = system_prompt(kind, scope);
@@ -2927,6 +2966,58 @@ mod prompt_tests {
             id: "shop/v1/new-thing".into(),
             text: text.into(),
             schema: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn limits_resolve_each_pin_then_version_definition_and_builtin() {
+        use crate::lock::{find_section, find_section_mut, SourceType};
+        let mut docs = shop_docs().await;
+        let mut template = docs.get("catalog/v1/get-product").unwrap().clone();
+        template.meta.source_type = SourceType::Structured;
+        let mut source = feature("");
+        source.id = "catalog/v1/new-thing".into();
+        for (front, version, definition, expected) in [
+            (
+                "provider: pinned\ntimeout: 500ms\nbody: 64kb",
+                true,
+                true,
+                ["pinned", "500ms", "64kb"],
+            ),
+            ("", true, true, ["secondary", "3s", "4KB"]),
+            ("", false, true, ["secondary", "5s", "8KB"]),
+            ("", false, false, ["main", "10s", "1MB"]),
+        ] {
+            source.text = format!("---\n{front}\n---\n# Feature\n");
+            let def = docs.get_mut("catalog/_definition").unwrap();
+            def.sections
+                .retain(|s| s.name != "Defaults" && s.name != "Providers");
+            if definition {
+                def.sections.extend(crate::lock::parse_sections("## Defaults\n- timeout: 5s\n- body: 8KB\n## Providers\n- default: secondary\n").unwrap());
+            }
+            let ver = docs.get_mut("catalog/v1/_version").unwrap();
+            ver.sections.retain(|s| s.name != "Defaults");
+            if version {
+                ver.sections.extend(
+                    crate::lock::parse_sections("## Defaults\n- timeout: 3s\n- body: 4KB\n")
+                        .unwrap(),
+                );
+            }
+            let mut doc = template.clone();
+            doc.sections.retain(|s| s.name != "Limits");
+            super::normalize_feature(&mut doc, &source, &docs).unwrap();
+            let limits = find_section(&doc.sections, "Limits").unwrap();
+            for (key, value) in ["provider", "timeout", "body"].into_iter().zip(expected) {
+                assert_eq!(limits.get(key), Some(value));
+            }
+            // A pin cannot be replaced by a different lock value.
+            if !front.is_empty() {
+                find_section_mut(&mut doc.sections, "Limits")
+                    .unwrap()
+                    .bullets[1]
+                    .value = "1s".into();
+                assert!(!super::frontmatter_security_check(&doc, &source).is_empty());
+            }
         }
     }
 

@@ -5,6 +5,12 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Limits pins:** API feature frontmatter supports timeout, body and provider. Timeout/body resolve pins → version defaults → definition defaults → built-ins; provider resolves pin → definition provider default → main. Compile, validate and interactive generation check values; prose limits are ignored and prompts explain frontmatter pins. Body sizes accept case-insensitive b/kb/mb units everywhere; previously a lowercase value such as `64kb` built a manifest with a zero body limit.
+- **Breaking: structured Limits:** Structured API features now use the same canonical Limits and path.slug rules. Conflicting source Limits fail compile; move those values into frontmatter or remove them.
+- **Compile prompt version:** Bumped to prompt-5 (locks recompile). Every compile prompt, guide or example change must bump PROMPT_VERSION; a recorded SHA-256 test guards the rule.
+- **Spec decisions:** Assigned decision numbers 150–162 in spec section 0.14.
+- **Interactive naming:** Prompts request simple lowercase kebab-case names and default hello world to hello/v1/hello.
+
 - **Breaking: api step op `transform` removed:** Validate rejects `op: transform` in api feature `## Steps`, telling you to delete the step and use `## Transform` (`- in:` / `- out:`). Pre-1.0, no deprecation period; the compile prompt no longer offers it.
 - **Deterministic api feature locks:** Natural-language sources ignore model output for Limits and Request `path.slug` rows. Limits always writes provider, timeout and body from source pins/inherited defaults; slug routes get one canonical first `path.slug` row, and other routes drop it.
 
