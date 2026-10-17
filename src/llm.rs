@@ -36,6 +36,9 @@ pub struct LlmRequest {
     pub model: String,
     pub seed: u64,
     pub timeout: Duration,
+    /// Shared per-source / per-run cap on attempts and time (#83).
+    /// `None` shares the process-wide environment-configured bound, including retries.
+    pub budget: Option<std::sync::Arc<crate::llm_budget::CallBudget>>,
 }
 
 #[derive(Clone, Debug)]
@@ -301,6 +304,42 @@ pub trait LlmAdapter: Send + Sync {
     fn provider(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
     async fn compile(&self, request: &LlmRequest) -> Result<LlmResponse, String>;
+    /// True when `compile` reserves from `request.budget` per HTTP attempt
+    /// itself. Other adapters are charged one call by `call_budgeted`.
+    fn enforces_budget(&self) -> bool {
+        false
+    }
+}
+
+/// Calls without an explicit run budget share one process-wide budget.
+fn default_budget() -> Result<std::sync::Arc<crate::llm_budget::CallBudget>, String> {
+    static BUDGET: std::sync::OnceLock<
+        Result<std::sync::Arc<crate::llm_budget::CallBudget>, String>,
+    > = std::sync::OnceLock::new();
+    BUDGET
+        .get_or_init(|| crate::llm_budget::CallBudget::from_env().map(std::sync::Arc::new))
+        .clone()
+}
+
+/// Every LLM call goes through here so the budget holds for any adapter.
+pub async fn call_budgeted(
+    adapter: &dyn LlmAdapter,
+    request: &LlmRequest,
+) -> Result<LlmResponse, String> {
+    let mut bounded = request.clone();
+    if bounded.budget.is_none() {
+        bounded.budget = Some(default_budget()?);
+    }
+    let request = &bounded;
+    if !adapter.enforces_budget() {
+        if let Some(budget) = &request.budget {
+            budget.reserve()?;
+        }
+    }
+    let left = request.budget.as_ref().expect("default budget").remaining();
+    tokio::time::timeout(left, adapter.compile(request))
+        .await
+        .map_err(|_| "LLM time budget spent".to_string())?
 }
 
 pub struct FakeAdapter<F>
@@ -688,13 +727,366 @@ pub fn parse_duration_ms(raw: &str) -> Option<u64> {
 }
 
 pub fn redact(text: &str, secrets: &[&str]) -> String {
-    let mut out = text.to_string();
-    for secret in secrets {
-        if secret.len() >= 8 && *secret != "replace-me" {
-            out = out.replace(secret, "[redacted]");
+    let mut known: Vec<String> = std::env::vars()
+        .filter(|(name, _)| {
+            !matches!(name.as_str(), "PWD" | "OLDPWD")
+                && [
+                    "KEY",
+                    "TOKEN",
+                    "SECRET",
+                    "PASSWORD",
+                    "PASSWD",
+                    "PWD",
+                    "DATABASE_URL",
+                ]
+                .iter()
+                .any(|part| name.to_ascii_uppercase().contains(part))
+        })
+        .map(|(_, value)| value)
+        .filter(|v| !v.is_empty())
+        .collect();
+    known.extend(secrets.iter().map(|v| v.to_string()));
+    let mut text = text.to_string();
+    let mut ranges = Vec::new();
+    static KEYS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)(?:\b(?:[a-z0-9]+[_-])*(?:password|passwd|pwd|secret|token|api[ _-]?key|database_url|private_key|credentials?|passphrase|authorization|auth|set-cookie|cookie|session)(?:[_-][a-z0-9]+)*\b|密碼|密码|口令|憑證)[ 	"']*[:=][ 	]*|\bbearer[ 	]+"#).expect("redaction keys")
+    });
+    static TOKENS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"[a-zA-Z][a-zA-Z0-9+.-]*://[^\r\n"'<>]*@[^\s"'<>]*|\b(?:sk-|xai-|github_pat_|gh[pousr]_)[A-Za-z0-9_-]+|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bxox[abprs]-[A-Za-z0-9-]+|\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"#).expect("redaction tokens")
+    });
+    static URL_VALUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\r\n"'<>]*:[^\r\n"'<>]*"#)
+            .expect("URL credentials")
+    });
+    static PEM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----").expect("private key marker")
+    });
+    let mut view = text.as_bytes().to_vec();
+    let mut spans: Vec<_> = (0..view.len()).map(|i| (i, i + 1)).collect();
+    for secret in &known {
+        if !secret.is_empty() {
+            ranges.extend(
+                text.match_indices(secret)
+                    .map(|(at, value)| (at, at + value.len())),
+            );
         }
     }
-    out
+    for iteration in 0..=16 {
+        let (readable, mapped) = readable_redaction_view(&view, &spans);
+        for secret in &known {
+            if !secret.is_empty() {
+                for (start, value) in readable.match_indices(secret) {
+                    ranges.push((mapped[start].0, mapped[start + value.len() - 1].1));
+                }
+            }
+        }
+        let mut cursor = 0;
+        while let Some(found) = KEYS.find_at(&readable, cursor) {
+            let key = readable[found.start()..found.end()]
+                .trim_end_matches([' ', '\t', ':', '=', '\'', '"']);
+            let value_text = readable[found.end()..].trim_start();
+            let auth_setting = key.eq_ignore_ascii_case("auth")
+                && [
+                    "required", "optional", "enabled", "disabled", "true", "false",
+                ]
+                .iter()
+                .any(|setting| {
+                    value_text.strip_prefix(setting).is_some_and(|rest| {
+                        rest.is_empty()
+                            || rest.starts_with(|c: char| {
+                                c.is_whitespace() || matches!(c, ';' | ',' | '}' | ']')
+                            })
+                    })
+                });
+            if matches!(key, "PWD" | "OLDPWD") || auth_setting {
+                cursor = found.end();
+                continue;
+            }
+            let start = mapped[found.start()].0;
+            let value = mapped[found.end() - 1].1;
+            let header =
+                key.eq_ignore_ascii_case("cookie") || key.eq_ignore_ascii_case("set-cookie");
+            let end = redaction_end(&text, start, value, header);
+            ranges.push((start, end));
+            cursor = found.end();
+            while cursor < mapped.len() && mapped[cursor].0 < end {
+                cursor += 1;
+            }
+        }
+        for found in TOKENS.find_iter(&readable) {
+            ranges.push((mapped[found.start()].0, mapped[found.end() - 1].1));
+        }
+        for found in URL_VALUE.find_iter(&readable) {
+            if !readable[found.start()..found.end()].contains('@') {
+                ranges.push((mapped[found.start()].0, mapped[found.end() - 1].1));
+            }
+        }
+        let mut cursor = 0;
+        while let Some(capture) = PEM.captures_at(&readable, cursor) {
+            let found = capture.get(0).expect("marker");
+            let closing = format!("-----END {}-----", &capture[1]);
+            let end = readable[found.end()..]
+                .find(&closing)
+                .map_or(readable.len(), |at| found.end() + at + closing.len());
+            ranges.push((mapped[found.start()].0, mapped[end - 1].1));
+            cursor = end;
+        }
+        let (next, next_spans) = decode_redaction_view(readable.as_bytes(), &mapped);
+        if next == view {
+            break;
+        }
+        if iteration == 16 {
+            ranges.push((0, text.len()));
+            break;
+        }
+        view = next;
+        spans = next_spans;
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    for (start, end) in merged.into_iter().rev() {
+        text.replace_range(start..end, "[redacted]");
+    }
+    text
+}
+
+// Original offsets keep encoded delimiters from shortening a redaction.
+fn redaction_end(text: &str, start: usize, value: usize, header: bool) -> usize {
+    let line_end = text[value..].find('\n').map_or(text.len(), |n| value + n);
+    let tail = &text[value..];
+    if header {
+        return line_end;
+    }
+    let first_line = text[value..line_end]
+        .split_once('#')
+        .map_or(&text[value..line_end], |(value, _)| value)
+        .trim();
+    {
+        let line_start = text[..start].rfind('\n').map_or(0, |n| n + 1);
+        let indent = text[line_start..]
+            .chars()
+            .take_while(|c| matches!(c, ' ' | '\t'))
+            .count();
+        let mut end = line_end;
+        while end < text.len() {
+            let next = end + 1;
+            let next_end = text[next..].find('\n').map_or(text.len(), |n| next + n);
+            let line = &text[next..next_end];
+            if !line.trim().is_empty()
+                && line.chars().take_while(|c| matches!(c, ' ' | '\t')).count() <= indent
+            {
+                break;
+            }
+            end = next_end;
+        }
+        if end > line_end || first_line.is_empty() || first_line.starts_with(['|', '>']) {
+            return end;
+        }
+    }
+    if tail.starts_with(['\\', '%', '&']) {
+        return text.len();
+    }
+    let mut quote = None;
+    let mut escaped = false;
+    let mut entity_end = 0;
+    for (index, ch) in tail.char_indices() {
+        if index < entity_end {
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+        } else if let Some(open) = quote {
+            if ch == open {
+                // Repeated decoding can change which quote closes a value.
+                if tail[..index].contains('\\') {
+                    return text.len();
+                }
+                return value + index + ch.len_utf8();
+            }
+        } else if index == 0 && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if ch == '&' && html_entity_len(&tail[index..]).is_some() {
+            entity_end = index + html_entity_len(&tail[index..]).expect("entity length");
+        } else if ch == '\n' || matches!(ch, ';' | ',' | '}' | ']' | '&') {
+            return value + index;
+        }
+    }
+    text.len()
+}
+
+fn html_entity_len(text: &str) -> Option<usize> {
+    let end = text.find(';')?;
+    let entity = text.get(1..end)?;
+    let valid = if let Some(number) = entity
+        .strip_prefix("#x")
+        .or_else(|| entity.strip_prefix("#X"))
+    {
+        !number.is_empty() && number.bytes().all(|b| b.is_ascii_hexdigit())
+    } else if let Some(number) = entity.strip_prefix('#') {
+        !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+    } else {
+        entity.starts_with(|c: char| c.is_ascii_alphabetic())
+            && entity.bytes().all(|b| b.is_ascii_alphanumeric())
+    };
+    valid.then_some(end + 1)
+}
+
+fn readable_redaction_view(
+    bytes: &[u8],
+    spans: &[(usize, usize)],
+) -> (String, Vec<(usize, usize)>) {
+    use unicode_normalization::UnicodeNormalization;
+    let mut readable = String::new();
+    let mut mapped = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let width = match bytes[cursor] {
+            0..=0x7f => 1,
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => 1,
+        };
+        let width = width.min(bytes.len() - cursor);
+        let length = if std::str::from_utf8(&bytes[cursor..cursor + width]).is_ok() {
+            width
+        } else {
+            1
+        };
+        let decoded = String::from_utf8_lossy(&bytes[cursor..cursor + length]);
+        let normalized: String = decoded.nfkc().collect();
+        mapped.extend(std::iter::repeat_n(
+            (spans[cursor].0, spans[cursor + length - 1].1),
+            normalized.len(),
+        ));
+        readable.push_str(&normalized);
+        cursor += length;
+    }
+    let normalized: String = readable.nfkc().collect();
+    if normalized != readable {
+        // Composition across characters uses a conservative original span.
+        let span = (spans[0].0, spans[spans.len() - 1].1);
+        mapped = vec![span; normalized.len()];
+        readable = normalized;
+    }
+    (readable, mapped)
+}
+
+fn decode_redaction_view(bytes: &[u8], spans: &[(usize, usize)]) -> (Vec<u8>, Vec<(usize, usize)>) {
+    let mut next = Vec::new();
+    let mut mapped = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut replacement = None;
+        if bytes[i] == b'&' {
+            if let Some(end) = bytes[i..]
+                .iter()
+                .take(33)
+                .position(|b| *b == b';')
+                .filter(|end| *end <= 32)
+            {
+                let entity = std::str::from_utf8(&bytes[i + 1..i + end]).unwrap_or("");
+                let ch = match entity {
+                    "equals" => Some('='),
+                    "colon" => Some(':'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "Tab" => Some('\t'),
+                    "NewLine" => Some('\n'),
+                    "nbsp" => Some(' '),
+                    "lowbar" => Some('_'),
+                    "sol" => Some('/'),
+                    "bsol" => Some('\\'),
+                    "semi" => Some(';'),
+                    "percnt" => Some('%'),
+                    "commat" => Some('@'),
+                    "period" => Some('.'),
+                    "num" => Some('#'),
+                    "hyphen" => Some('-'),
+                    _ => entity
+                        .strip_prefix("#x")
+                        .or_else(|| entity.strip_prefix("#X"))
+                        .and_then(|n| u32::from_str_radix(n, 16).ok())
+                        .or_else(|| entity.strip_prefix('#').and_then(|n| n.parse().ok()))
+                        .and_then(char::from_u32),
+                };
+                replacement = ch.map(|ch| (ch.to_string().into_bytes(), end + 1));
+            }
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(a), Some(b)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                replacement = Some((vec![(a * 16 + b) as u8], 3));
+            }
+        } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'x' && i + 3 < bytes.len() {
+                if let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 4]) {
+                    replacement = u8::from_str_radix(hex, 16).ok().map(|ch| (vec![ch], 4));
+                }
+            } else if bytes[i + 1] == b'u' && i + 5 < bytes.len() {
+                if let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 6]) {
+                    if let Ok(code) = u32::from_str_radix(hex, 16) {
+                        let mut scalar = code;
+                        let mut consumed = 6;
+                        if (0xd800..=0xdbff).contains(&code)
+                            && bytes.get(i + 6..i + 8) == Some(b"\\u")
+                        {
+                            if let Some(low) = bytes
+                                .get(i + 8..i + 12)
+                                .and_then(|hex| std::str::from_utf8(hex).ok())
+                                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                                .filter(|low| (0xdc00..=0xdfff).contains(low))
+                            {
+                                scalar = 0x10000 + ((code - 0xd800) << 10) + low - 0xdc00;
+                                consumed = 12;
+                            }
+                        }
+                        if let Some(ch) = char::from_u32(scalar) {
+                            replacement = Some((ch.to_string().into_bytes(), consumed));
+                        }
+                    }
+                }
+            } else {
+                let ch = match bytes[i + 1] {
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'b' => 8,
+                    b'f' => 12,
+                    other => other,
+                };
+                replacement = Some((vec![ch], 2));
+            }
+        }
+        if let Some((decoded, consumed)) = replacement {
+            mapped.extend(std::iter::repeat_n(
+                (spans[i].0, spans[i + consumed - 1].1),
+                decoded.len(),
+            ));
+            next.extend(decoded);
+            i += consumed;
+        } else {
+            next.push(bytes[i]);
+            mapped.push(spans[i]);
+            i += 1;
+        }
+    }
+    (next, mapped)
 }
 
 pub struct HttpAdapter {
@@ -712,7 +1104,7 @@ pub fn mask_secrets(text: &str, api_key: &str) -> String {
     // Query, fragment, and `;`-separated params: key / api_key / token / …
     static KEY_PARAM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-            r"(?i)([?&#;](?:key|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|token|secret|password|auth)=)[^&\s#;]*",
+            r"(?i)([?&#;](?:key|api[ _-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|token|secret|password|auth)=)[^&\s#;]*",
         )
         .expect("regex")
     });
@@ -799,6 +1191,10 @@ impl HttpAdapter {
 
 #[async_trait]
 impl LlmAdapter for HttpAdapter {
+    fn enforces_budget(&self) -> bool {
+        true
+    }
+
     fn provider(&self) -> &'static str {
         match self.config.provider.as_str() {
             ANTHROPIC => "anthropic",
@@ -816,12 +1212,66 @@ impl LlmAdapter for HttpAdapter {
     }
 
     async fn compile(&self, request: &LlmRequest) -> Result<LlmResponse, String> {
+        let mut bounded = request.clone();
+        if bounded.budget.is_none() {
+            bounded.budget = Some(default_budget()?);
+        }
+        let request = &bounded;
         let mut attempt = 0u32;
         let max = self.config.max_retries;
+        let started = std::time::Instant::now();
+        let deadline = retry_deadline();
         loop {
-            match self.compile_once(request).await {
+            // Every attempt reserves from the shared budget and may not run
+            // past the retry deadline or the budget's time left.
+            let mut window = deadline.saturating_sub(started.elapsed());
+            if let Some(budget) = &request.budget {
+                match budget.reserve() {
+                    Ok(left) => window = window.min(left),
+                    Err(why) => return Err(why),
+                }
+            }
+            if window.is_zero() {
+                return Err(format!(
+                    "LLM retry deadline {}s reached",
+                    deadline.as_secs()
+                ));
+            }
+            let attempt_result =
+                match tokio::time::timeout(window, self.compile_once(request)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(CallError {
+                        message: format!(
+                            "LLM call stopped after {}ms: deadline or budget reached",
+                            window.as_millis()
+                        ),
+                        retryable: false,
+                        retry_after: None,
+                    }),
+                };
+            match attempt_result {
                 Ok(response) => return Ok(response),
                 Err(err) if err.retryable && attempt < max => {
+                    // 408/429/5xx/network/timeouts: honor Retry-After, else
+                    // exponential backoff with jitter (#83); never past the
+                    // overall deadline or the budget.
+                    let delay = err.retry_after.unwrap_or_else(|| retry_delay(attempt));
+                    let budget_left = request
+                        .budget
+                        .as_ref()
+                        .map(|b| b.remaining())
+                        .unwrap_or(Duration::MAX);
+                    if started.elapsed() + delay >= deadline || delay >= budget_left {
+                        return Err(redact(
+                            &format!(
+                                "{} (gave up: retry deadline {}s or LLM budget reached)",
+                                err.message,
+                                deadline.as_secs()
+                            ),
+                            &[&self.config.api_key],
+                        ));
+                    }
+                    tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
                 Err(err) => {
@@ -832,9 +1282,35 @@ impl LlmAdapter for HttpAdapter {
     }
 }
 
+/// Delay before retry `attempt` (0-based): 1s, 2s, 4s, ... capped at 16s,
+/// plus up to 25% jitter so parallel runs do not retry in lockstep.
+pub fn retry_delay(attempt: u32) -> std::time::Duration {
+    let base_ms = 1_000u64.saturating_mul(1 << attempt.min(4));
+    let jitter = (uuid::Uuid::new_v4().as_u128() % (base_ms as u128 / 4 + 1)) as u64;
+    std::time::Duration::from_millis(base_ms + jitter)
+}
+
 struct CallError {
     message: String,
     retryable: bool,
+    retry_after: Option<std::time::Duration>,
+}
+
+/// Total time one LLM call may spend retrying (`LLM_RETRY_DEADLINE`
+/// seconds, default 120, max 600).
+pub fn retry_deadline() -> std::time::Duration {
+    let secs = std::env::var("LLM_RETRY_DEADLINE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|n| n.min(600))
+        .unwrap_or(120);
+    std::time::Duration::from_secs(secs)
+}
+
+/// `Retry-After` in delta-seconds (HTTP-dates are ignored), capped at 60s.
+pub fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    let secs: u64 = value.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(secs.min(60)))
 }
 
 impl HttpAdapter {
@@ -860,8 +1336,14 @@ impl HttpAdapter {
                 &self.config.api_key,
             ),
             retryable: true,
+            retry_after: None,
         })?;
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after);
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -877,6 +1359,7 @@ impl HttpAdapter {
                 &self.config.api_key,
             ),
             retryable: true,
+            retry_after: None,
         })?;
         if !status.is_success() {
             return Err(CallError {
@@ -887,7 +1370,8 @@ impl HttpAdapter {
                     &bytes,
                     &self.config.api_key,
                 ),
-                retryable: status.is_server_error() || status.as_u16() == 429,
+                retryable: status.is_server_error() || matches!(status.as_u16(), 408 | 429),
+                retry_after,
             });
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| CallError {
@@ -899,6 +1383,7 @@ impl HttpAdapter {
                 &self.config.api_key,
             ),
             retryable: false,
+            retry_after: None,
         })?;
         let parsed = match self.config.provider.as_str() {
             ANTHROPIC => parse_anthropic(&value),
@@ -911,12 +1396,14 @@ impl HttpAdapter {
         .map_err(|message| CallError {
             message: mask_secrets(&message, &self.config.api_key),
             retryable: false,
+            retry_after: None,
         })?;
         if let Some(reported) = &parsed.model_reported {
             if reported != &request.model && !reported.is_empty() {
                 return Err(CallError {
                     message: "provider reported an unexpected model".into(),
                     retryable: false,
+                    retry_after: None,
                 });
             }
         }
@@ -1199,6 +1686,368 @@ pub fn runtime_llm_env_present() -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn multiline_value_after_comment_only_line() {
+        for first in ["", "# comment", "first", "\"first\""] {
+            let input = format!("  password: {first}\n    second\n    third\n  message: retained");
+            assert_eq!(redact(&input, &[]), "  [redacted]\n  message: retained");
+        }
+    }
+
+    #[test]
+    fn html_entity_inside_value() {
+        for entity in ["&amp;", "&#61;", "&#x3d;", "&copy;", "&semi;"] {
+            let input = format!("password=abc{entity}def&message=retained");
+            assert_eq!(redact(&input, &[]), "[redacted]&message=retained");
+        }
+        assert_eq!(
+            redact("password=abc&message=retained", &[]),
+            "[redacted]&message=retained"
+        );
+    }
+
+    #[test]
+    fn key_word_boundaries() {
+        for input in [
+            "author: name",
+            "max_tokens: 100",
+            "auth: required",
+            "auth: optional",
+            "tokenizer: value",
+        ] {
+            assert_eq!(redact(input, &[]), input);
+        }
+        for key in [
+            "auth_token",
+            "x-auth",
+            "api_key",
+            "APP_DATABASE_URL",
+            "password",
+            "authorization",
+        ] {
+            assert_eq!(redact(&format!("{key}: value"), &[]), "[redacted]");
+        }
+    }
+
+    #[test]
+    fn redact_fullwidth_colon() {
+        assert_eq!(redact("password：value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_fullwidth_equals() {
+        assert_eq!(redact("password＝value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_html_separator() {
+        assert_eq!(redact("password&#61;value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_hex_separator() {
+        assert_eq!(redact("password\\x3dvalue", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_yaml_block_scalar() {
+        assert_eq!(redact("password: |-\n  first\n  second", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_multiline_quote() {
+        assert_eq!(redact("password: \"first\nsecond\"", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_encoded_known_secret() {
+        assert_eq!(redact("value%2Dhidden", &["value-hidden"]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_url_userinfo_variant() {
+        assert_eq!(redact("https://user:pa ss@host", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_pem_private_key() {
+        assert_eq!(
+            redact(
+                "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----",
+                &[]
+            ),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_cookie_header() {
+        assert_eq!(redact("Cookie: a=value; b=other", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_json_auth() {
+        assert_eq!(redact("{\"auth\":\"value\"}", &[]), "{\"[redacted]}");
+    }
+
+    #[test]
+    fn redact_credentials_setting() {
+        assert_eq!(redact("credentials=value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_chinese_password() {
+        assert_eq!(redact("密碼：value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_aws_access_key() {
+        assert_eq!(redact("AKIA1234567890ABCDEF", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_github_pat() {
+        assert_eq!(redact("github_pat_abcdef123456", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_slack_token() {
+        assert_eq!(redact("xoxb-123456-abcdef", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_compact_token_format() {
+        assert_eq!(
+            redact("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature", &[]),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_pwd_path() {
+        assert_eq!(
+            redact("PWD=/tmp/project\nOLDPWD=/tmp/other", &[]),
+            "PWD=/tmp/project\nOLDPWD=/tmp/other"
+        );
+    }
+
+    #[test]
+    fn redact_line_after_multiline_value() {
+        assert_eq!(
+            redact("password: >\n  first\n  second\nmessage: retained", &[]),
+            "[redacted]\nmessage: retained"
+        );
+    }
+
+    #[test]
+    fn redact_json_escaped_opening_quote() {
+        assert_eq!(
+            redact(r#"{"password": \"a\"b tail\"}"#, &[]),
+            r#"{"[redacted]"#
+        );
+    }
+
+    #[test]
+    fn redact_nested_json_escaped_opening_quote() {
+        let original = r#"{"password": \"a\"b tail\"}"#;
+        let nested = serde_json::to_string(original).unwrap();
+        let output = redact(&nested, &[]);
+        assert!(output.ends_with("[redacted]"), "{output}");
+        assert!(
+            !output.contains("tail") && !output.contains("b"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn redact_invalid_percent_byte_with_encoded_separator() {
+        assert_eq!(redact("%FF password%3Dsecret", &[]), "%FF [redacted]");
+    }
+
+    #[test]
+    fn redact_many_percent_encoding_layers() {
+        assert_eq!(redact("password%252525253Dsecret", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_nested_json_password() {
+        assert_eq!(
+            redact(r#"{"outer":{"password":"secret"}}"#, &[]),
+            r#"{"outer":{"[redacted]}}"#
+        );
+    }
+
+    #[test]
+    fn redact_percent_encoding_iteration_limit() {
+        let encoded = format!("password%{}3Dsecret; remainder", "25".repeat(20));
+        assert_eq!(redact(&encoded, &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_preserves_other_lines() {
+        assert_eq!(
+            redact("plain text\npassword=secret\nmore text", &[]),
+            "plain text\n[redacted]\nmore text"
+        );
+    }
+
+    #[test]
+    fn redact_multilevel_escaped_quoted_values_including_tail() {
+        for raw in [
+            r"password='a\\'b tail'",
+            r"password='a\\\\'b tail'",
+            r"database_url='a\\'b tail'",
+            r#"password="a\\"b tail""#,
+        ] {
+            assert_eq!(redact(raw, &[]), "[redacted]", "{raw}");
+        }
+    }
+
+    #[test]
+    fn redact_iteratively_percent_encoded_settings_in_original_text() {
+        for raw in [
+            "password%3Dsecret",
+            "pwd%3Dsecret%26x%3D1",
+            "password%253Dsecret",
+            "p%2561ssword%253Dsecret",
+            "password%25253Dsecret",
+        ] {
+            assert_eq!(
+                redact(&format!("before {raw}; after"), &[]),
+                "before [redacted]; after",
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_password_with_escaped_single_quote() {
+        assert_eq!(redact(r"password='a\'b'", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_password_with_escaped_double_quote_and_space() {
+        assert_eq!(redact(r#"password="a\"b c""#, &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_password_with_escaped_space() {
+        assert_eq!(redact(r"password=a\ b", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_dsn_with_percent_encoded_password() {
+        assert_eq!(
+            redact("postgres://user:a%40b%3Ac@host/db", &[]),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_fully_url_encoded_connection_string() {
+        assert_eq!(
+            redact("postgres%3A%2F%2Fuser%3Apass%40host", &[]),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_dsn_with_escaped_space() {
+        assert_eq!(redact(r"postgres://user:a\ b@host/db", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_connection_strings_and_settings() {
+        for scheme in [
+            "postgres",
+            "postgresql",
+            "mysql",
+            "mongodb+srv",
+            "redis",
+            "amqp",
+        ] {
+            let raw = format!("before {scheme}://user:credential@host/db after");
+            let text = redact(&raw, &[]);
+            assert!(!text.contains("credential"), "{scheme}: {text}");
+            assert!(text.contains("before") && text.contains("after"));
+        }
+        for raw in [
+            "Server=host;Password=ado-value;Database=db;",
+            "Server=host;Pwd=ado-value;Database=db;",
+            "Password=\"ado;value\";",
+            "DATABASE_URL=private-connection",
+            r#"{"DATABASE_URL": "private-connection"}"#,
+            "APP_DATABASE_URL='private-connection'",
+        ] {
+            let text = redact(raw, &[]);
+            assert!(!text.contains("ado-value"), "{text}");
+            assert!(!text.contains("ado;value"), "{text}");
+            assert!(!text.contains("private-connection"), "{text}");
+            assert!(text.contains("[redacted]"), "{text}");
+        }
+        assert_eq!(redact("short abc", &["abc"]), "short [redacted]");
+    }
+
+    #[tokio::test]
+    async fn default_budget_is_shared_and_configured() {
+        if std::env::var_os("VIBE_TEST_DEFAULT_BUDGET").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "llm::tests::default_budget_is_shared_and_configured",
+                ])
+                .env("VIBE_TEST_DEFAULT_BUDGET", "1")
+                .env("LLM_MAX_CALLS_PER_SOURCE", "2")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let adapter = FakeAdapter {
+            responder: |_: &LlmRequest| Ok("done".into()),
+        };
+        let request = LlmRequest {
+            system: String::new(),
+            input: String::new(),
+            model: "test".into(),
+            seed: 0,
+            timeout: Duration::from_secs(1),
+            budget: None,
+        };
+        assert!(call_budgeted(&adapter, &request).await.is_ok());
+        assert!(call_budgeted(&adapter, &request).await.is_ok());
+        assert!(call_budgeted(&adapter, &request)
+            .await
+            .unwrap_err()
+            .contains("2 calls"));
+    }
+
+    #[tokio::test]
+    async fn explicit_budget_is_enforced() {
+        let adapter = FakeAdapter {
+            responder: |request: &LlmRequest| {
+                let budget = request.budget.as_ref().expect("default bound");
+                let mut available = 0;
+                while budget.reserve().is_ok() {
+                    available += 1;
+                }
+                assert!(available < crate::llm_budget::Limits::default().source_calls);
+                Ok("done".into())
+            },
+        };
+        let request = LlmRequest {
+            system: String::new(),
+            input: String::new(),
+            model: "test".into(),
+            seed: 0,
+            timeout: Duration::from_secs(1),
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
+        };
+        assert!(call_budgeted(&adapter, &request).await.is_ok());
+    }
+
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()
@@ -1296,6 +2145,9 @@ mod tests {
                 model: model.into(),
                 seed: 0,
                 timeout: Duration::from_secs(5),
+                budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                    crate::llm_budget::Limits::default(),
+                ))),
             };
             let (url, _, _) = gemini_call(&config, &request);
             let expected = format!(
@@ -1321,6 +2173,9 @@ mod tests {
             model: "gemini-2.5-pro-001".into(),
             seed: 0,
             timeout: Duration::from_secs(5),
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         let (url, _, _) = gemini_call(&config, &request);
         assert_eq!(
@@ -1380,6 +2235,9 @@ mod tests {
             model: "vendor-model-2026-09-01".into(),
             seed: 0,
             timeout: Duration::from_secs(1),
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         let unknown = model_capabilities(OPENAI, &request.model, 0);
         assert!(
@@ -1685,6 +2543,9 @@ mod responses_tests {
                 model: model.into(),
                 seed: 7,
                 timeout: Duration::from_secs(5),
+                budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                    crate::llm_budget::Limits::default(),
+                ))),
             };
             let err = adapter.compile(&request).await.unwrap_err();
             assert!(err.contains(&status.to_string()), "{status}: {err}");
@@ -1728,6 +2589,7 @@ mod responses_tests {
                     model: "test-model".into(),
                     seed: 0,
                     timeout: Duration::from_secs(2),
+                    budget: None,
                 };
                 let err = adapter.compile(&request).await.unwrap_err();
                 for secret in [key, &format!("Bearer {key}"), marker] {
@@ -1770,6 +2632,9 @@ mod responses_tests {
                 model: model.into(),
                 seed: config.seed,
                 timeout: config.timeout,
+                budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                    crate::llm_budget::Limits::default(),
+                ))),
             };
             let (_, body, _) = openai_responses_call(&config, &request);
             let stamp = params.to_map();
@@ -1865,6 +2730,9 @@ mod responses_tests {
             model: model.into(),
             seed: 7,
             timeout: Duration::from_secs(5),
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         *reply.lock().unwrap() =
             json!({"status": "completed", "model": model, "output_text": "## A"});
@@ -1894,6 +2762,9 @@ mod responses_tests {
             model: "gpt-5.1-2026-01-01".into(),
             seed: 0,
             timeout: Duration::from_secs(1),
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         let body = openai_responses_body(&request, &model_capabilities(OPENAI, "gpt-5.1", 0));
         assert_eq!(body["instructions"], "sys");
