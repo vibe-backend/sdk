@@ -849,7 +849,22 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                             result_value.clone()
                         }
                         Ok(value) => value,
-                        Err(_) => result_value.clone(),
+                        Err(err) => {
+                            tracing::error!(%request_id, error = %err, "respond value failed");
+                            return finish(
+                                found.route,
+                                &state,
+                                started,
+                                error_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "INTERNAL",
+                                    "Internal error",
+                                    &request_id,
+                                    &[],
+                                ),
+                            )
+                            .await;
+                        }
                     }
                 } else {
                     match crud::eval_expr(&step.value, &vars) {

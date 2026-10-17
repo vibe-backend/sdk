@@ -784,6 +784,7 @@ fn normalize_feature(
             none: false,
         });
     }
+    ensure_transform(doc);
     let order = crate::lock::section_order(Kind::Api, Some(Scope::Feature));
     for name in order {
         if find_section(&doc.sections, name).is_none() {
@@ -873,7 +874,23 @@ fn ensure_order(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Diag>>
     reorder(doc, source)
 }
 
+fn ensure_transform(doc: &mut LockDoc) {
+    if doc.meta.kind == Kind::Api
+        && doc.meta.scope == Some(Scope::Feature)
+        && find_section(&doc.sections, "Transform").is_none()
+    {
+        doc.sections.push(Section {
+            name: "Transform".into(),
+            bullets: Vec::new(),
+            table: None,
+            blocks: Vec::new(),
+            none: true,
+        });
+    }
+}
+
 fn reorder(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Diag>> {
+    ensure_transform(doc);
     let order = crate::lock::section_order(source.kind, source.scope);
     for name in order {
         if find_section(&doc.sections, name).is_none() {
@@ -1354,7 +1371,12 @@ mod prompt_tests {
         // shop already serves; move the example to its own path.
         let api = dir.join("api/catalog/v1/example-list/example-list.md");
         let text = std::fs::read_to_string(&api).unwrap();
-        std::fs::write(&api, text.replace("/products\n", "/example-products\n")).unwrap();
+        std::fs::write(
+            &api,
+            text.replace("/products\n", "/example-products\n")
+                .replace("## Transform\n", ""),
+        )
+        .unwrap();
         let opts = super::CompileOptions {
             root: &dir,
             llm: None,
@@ -1364,6 +1386,22 @@ mod prompt_tests {
         if let Err(report) = super::compile_project(&opts).await {
             panic!("compile: {:?}", report.diags);
         }
+        let lock_path = api.with_extension("lock.md");
+        let lock_text = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(lock_text.contains("## Transform\n(none)"), "{lock_text}");
+        let mut lock = parse_lock(&lock_text).unwrap();
+        crate::manifest::build_manifest(&std::collections::HashMap::from([(
+            lock.meta.id.clone(),
+            lock.clone(),
+        )]))
+        .unwrap();
+        lock.sections.retain(|s| s.name != "Transform");
+        crate::manifest::build_manifest(&std::collections::HashMap::from([(
+            lock.meta.id.clone(),
+            lock.clone(),
+        )]))
+        .unwrap();
+        std::fs::write(&lock_path, crate::lock::render_lock(&lock)).unwrap();
         let vopts = crate::validate::ValidateOptions {
             root: &dir,
             deploy: false,

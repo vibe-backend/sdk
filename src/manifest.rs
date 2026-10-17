@@ -909,6 +909,20 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         .map(validate::parse_bytes)
         .unwrap_or(1_048_576);
     let transform = find_section(&doc.sections, "Transform");
+    let transform_expr = |key: &str, default: &str| -> Result<String, Diag> {
+        let expr = transform.and_then(|s| s.get(key)).unwrap_or(default);
+        let expr = if expr.trim() == "(none)" {
+            default
+        } else {
+            expr
+        };
+        crate::runtime::check_expr(expr).map_err(|err| {
+            Diag::error(&doc.meta.id, format!("transform {key}: {err}")).at_section("Transform")
+        })?;
+        Ok(expr.to_string())
+    };
+    let transform_in = transform_expr("in", "{}")?;
+    let transform_out = transform_expr("out", "result")?;
     let (challenge_type, challenge_when) =
         parse_challenge(access.and_then(|s| s.get("challenge")).unwrap_or(""));
     let min_response_ms = access
@@ -932,15 +946,8 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         rates,
         body_limit,
         request: request_fields(find_section(&doc.sections, "Request")),
-        transform_in: transform
-            .and_then(|s| s.get("in"))
-            .filter(|expr| !matches!(expr.trim(), "" | "(none)"))
-            .unwrap_or("{}")
-            .to_string(),
-        transform_out: transform
-            .and_then(|s| s.get("out"))
-            .unwrap_or("result")
-            .to_string(),
+        transform_in,
+        transform_out,
         steps: steps_from(find_section(&doc.sections, "Steps"), &doc.meta.id)?,
         errors: error_rows(find_section(&doc.sections, "Errors")),
         min_response_ms,
@@ -1032,6 +1039,26 @@ fn steps_from(section: Option<&crate::lock::Section>, file: &str) -> Result<Vec<
                 .unwrap_or_default()
         };
         let op = get("op");
+        let expression_key = match op.as_str() {
+            "method" if !get("args").is_empty() => Some("args"),
+            "respond" if !get("value").is_empty() => Some("value"),
+            _ => None,
+        };
+        if let Some(key) = expression_key {
+            crate::runtime::check_expr(&get(key)).map_err(|err| {
+                Diag::error(file, format!("{key}: {err}"))
+                    .at_step(&block.heading)
+                    .at_section("Steps")
+            })?;
+        }
+        if let Some(problem) = validate::op_expression_problems(block, &op)
+            .into_iter()
+            .next()
+        {
+            return Err(Diag::error(file, problem)
+                .at_step(&block.heading)
+                .at_section("Steps"));
+        }
         let id = block
             .heading
             .split_whitespace()
@@ -1621,6 +1648,26 @@ mod constant_response_tests {
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
 
+    #[test]
+    fn malformed_transform_bullets_cannot_build() {
+        for key in ["in", "out"] {
+            for expr in ["", "{a: }"] {
+                let doc = LockDoc {
+                    meta: crate::lock::Meta::pending(Kind::Api, Some(Scope::Feature), "hello", "hello.md"),
+                    sections: crate::lock::parse_sections(&format!("## Route\n- method: GET\n- path: /hello\n## Access\n- public: true\n## Pipelines\n### -auth\n## Transform\n- {key}: {expr}\n")).unwrap(),
+                };
+                let err = route_from(&doc, &HashMap::new()).unwrap_err();
+                assert!(
+                    err.message.contains(&format!("transform {key}:")),
+                    "{err:?}"
+                );
+                if expr.is_empty() {
+                    assert!(err.message.contains("empty expression"));
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn public_constant_response_without_transform() {
         for transform in [
@@ -1631,6 +1678,7 @@ mod constant_response_tests {
 
 (none)
 ",
+            "## Transform\n- in: (none)\n- out: (none)\n",
         ] {
             for (value, expected, status) in [
                 (
@@ -1671,7 +1719,25 @@ mod constant_response_tests {
                     ),
                     sections: crate::lock::parse_sections(&body).unwrap(),
                 };
-                let route = route_from(&doc, &HashMap::new()).unwrap();
+                let mut build_doc = doc.clone();
+                if status == StatusCode::INTERNAL_SERVER_ERROR {
+                    assert!(route_from(&doc, &HashMap::new()).is_err());
+                    build_doc
+                        .sections
+                        .iter_mut()
+                        .find(|s| s.name == "Steps")
+                        .unwrap()
+                        .blocks[0]
+                        .bullets
+                        .iter_mut()
+                        .find(|b| b.key == "value")
+                        .unwrap()
+                        .value = "transform.out".into();
+                }
+                let mut route = route_from(&build_doc, &HashMap::new()).unwrap();
+                if status == StatusCode::INTERNAL_SERVER_ERROR {
+                    route.transform_out = "{message: }".into();
+                }
                 assert_eq!(route.transform_in, "{}");
                 let manifest = Manifest {
                     manifest_version: MANIFEST_VERSION,
