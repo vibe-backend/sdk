@@ -17,8 +17,17 @@ use crate::validate::{self, ValidateOptions};
 pub const MANIFEST_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildMode {
+    Dev,
+    Release,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
     pub manifest_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_mode: Option<BuildMode>,
     pub routes: Vec<RouteSpec>,
     pub models: Vec<ModelSpec>,
     pub methods: Vec<MethodSpec>,
@@ -452,14 +461,23 @@ pub struct MigrationSpec {
 }
 
 pub fn manifest_from_project(root: &Path, signing_key: &SigningKey) -> Result<Manifest, Report> {
+    manifest_from_project_with_mode(root, signing_key, false)
+}
+
+pub fn manifest_from_project_with_mode(
+    root: &Path,
+    signing_key: &SigningKey,
+    dev: bool,
+) -> Result<Manifest, Report> {
     let verify = signing_key.verifying_key();
     validate::validate_project(&ValidateOptions {
+        dev,
         root,
         deploy: true,
         verify_key: Some(&verify),
     })?;
     let docs = load_docs(root)?;
-    let mut manifest = build_manifest(&docs)?;
+    let mut manifest = build_manifest_with_mode(&docs, dev)?;
     manifest.signature = String::new();
     let bytes =
         serde_json::to_vec(&manifest).map_err(|err| single(format!("manifest json: {err}")))?;
@@ -490,6 +508,18 @@ pub fn read_manifest(path: &Path, key: &VerifyingKey) -> Result<Manifest, Report
 }
 
 pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Report> {
+    build_manifest_with_mode(docs, false)
+}
+
+pub fn build_manifest_with_mode(
+    docs: &HashMap<String, LockDoc>,
+    dev: bool,
+) -> Result<Manifest, Report> {
+    if !dev && docs.values().any(|doc| doc.meta.compiler.endpoint_private) {
+        return Err(single(
+            "locks compiled against a private endpoint cannot be deployed".into(),
+        ));
+    }
     let mut report = Report::new();
     let mut models = Vec::new();
     let mut methods = Vec::new();
@@ -546,6 +576,7 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
     }
     Ok(Manifest {
         manifest_version: MANIFEST_VERSION,
+        build_mode: dev.then_some(BuildMode::Dev),
         routes,
         models,
         methods,
@@ -1740,6 +1771,7 @@ mod constant_response_tests {
                 }
                 assert_eq!(route.transform_in, "{}");
                 let manifest = Manifest {
+                    build_mode: None,
                     manifest_version: MANIFEST_VERSION,
                     routes: vec![route],
                     models: vec![],

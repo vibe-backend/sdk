@@ -68,6 +68,52 @@ pub fn is_non_public_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Human-readable category for an address refused by the outbound guard.
+pub fn non_public_ip_category(ip: IpAddr) -> &'static str {
+    match ip {
+        IpAddr::V4(ip) => {
+            let o = ip.octets();
+            if ip.is_loopback() {
+                "loopback 127.0.0.0/8"
+            } else if o[0] == 10 {
+                "private 10.0.0.0/8"
+            } else if o[0] == 172 && (16..=31).contains(&o[1]) {
+                "private 172.16.0.0/12"
+            } else if o[0] == 192 && o[1] == 168 {
+                "private 192.168.0.0/16"
+            } else if o[0] == 198 && (o[1] & 0xfe) == 18 {
+                "198.18.0.0/15 benchmarking range"
+            } else if o[0] == 100 && (o[1] & 0xc0) == 64 {
+                "CGNAT 100.64.0.0/10"
+            } else if ip.is_link_local() {
+                "link-local 169.254.0.0/16"
+            } else if o[0] == 0 {
+                "unspecified or current-network 0.0.0.0/8"
+            } else if o[0] >= 224 {
+                "multicast or reserved 224.0.0.0/3"
+            } else {
+                "special-purpose IPv4 range"
+            }
+        }
+        IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return non_public_ip_category(IpAddr::V4(v4));
+            }
+            if ip.is_loopback() {
+                "loopback ::1"
+            } else if ip.is_unspecified() {
+                "unspecified ::"
+            } else if ip.segments()[0] & 0xfe00 == 0xfc00 {
+                "private unique-local fc00::/7"
+            } else if ip.segments()[0] & 0xffc0 == 0xfe80 {
+                "link-local fe80::/10"
+            } else {
+                "special-purpose IPv6 range"
+            }
+        }
+    }
+}
+
 type LookupFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
 type Lookup = dyn Fn(String) -> LookupFuture + Send + Sync;
@@ -110,8 +156,9 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
             }
             if let Some(bad) = addrs.iter().find(|a| is_non_public_ip(a.ip())) {
                 return Err(format!(
-                    "{name} resolves to non-public address {}; refusing to connect",
-                    bad.ip()
+                    "{name} resolves to non-public address {} ({}); refusing to connect",
+                    bad.ip(),
+                    non_public_ip_category(bad.ip())
                 )
                 .into());
             }
@@ -304,6 +351,22 @@ mod tests {
         PublicOnlyResolver::with_lookup(move |_name| {
             Box::pin(async move { Ok(vec![SocketAddr::new(ip, 0)]) })
         })
+    }
+
+    #[tokio::test]
+    async fn benchmarking_dns_refusal_explains_range() {
+        use reqwest::dns::Resolve;
+        let name = "proxy.example.com".parse().unwrap();
+        let error = fake_dns("198.18.0.5".parse().unwrap())
+            .resolve(name)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("198.18.0.5"));
+        assert!(error.contains("198.18.0.0/15 benchmarking range"));
+        assert!(!error.contains("LLM_ALLOW_PRIVATE_HOST"));
+        assert!(error.ends_with("; refusing to connect"));
     }
 
     #[tokio::test]

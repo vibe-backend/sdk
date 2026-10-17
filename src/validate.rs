@@ -26,6 +26,7 @@ static PARAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$([1-9][0-9]*)").
 pub struct ValidateOptions<'a> {
     pub root: &'a Path,
     pub deploy: bool,
+    pub dev: bool,
     pub verify_key: Option<&'a ed25519_dalek::VerifyingKey>,
 }
 
@@ -125,7 +126,7 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
     {
         report.push(Diag::error(&file, "model snapshot is a floating alias"));
     }
-    if opts.deploy && doc.meta.compiler.endpoint_private {
+    if opts.deploy && !opts.dev && doc.meta.compiler.endpoint_private {
         report.push(Diag::error(
             &file,
             "locks compiled against a private endpoint cannot be deployed",
