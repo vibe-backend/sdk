@@ -478,6 +478,43 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     )
     .await;
     assert_eq!(dropped.status, StatusCode::NO_CONTENT);
+
+    // Route rate limit: list-products allows 600 requests per minute per IP.
+    // The 601st from the same IP gets 429 with Retry-After; another IP is
+    // unaffected.
+    let limited_ip = "X-Vibe-Test-Ip: 198.51.100.7".to_string();
+    for n in 0..600 {
+        let ok = send(
+            &app,
+            "GET",
+            "/catalog/v1/shopslug1/products",
+            Some(limited_ip.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(ok.status, StatusCode::OK, "request {n} within the limit");
+    }
+    let limited = send(
+        &app,
+        "GET",
+        "/catalog/v1/shopslug1/products",
+        Some(limited_ip.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(limited.json["error"]["code"], "RATE_LIMITED");
+    let retry: u64 = limited.headers["retry-after"].parse().unwrap();
+    assert!((1..=60).contains(&retry), "retry-after {retry}");
+    let other_ip = send(
+        &app,
+        "GET",
+        "/catalog/v1/shopslug1/products",
+        Some("X-Vibe-Test-Ip: 198.51.100.8".into()),
+        None,
+    )
+    .await;
+    assert_eq!(other_ip.status, StatusCode::OK);
 }
 
 #[tokio::test]
