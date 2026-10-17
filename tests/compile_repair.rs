@@ -128,7 +128,6 @@ async fn model_prompt_example_passes_the_validator() {
         dev: false,
         root: &root,
         deploy: false,
-        verify_key: None,
     })
     .unwrap_or_else(|err| panic!("{err}"));
     assert!(!report.has_errors());

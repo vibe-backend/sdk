@@ -708,6 +708,27 @@ const FLOATING_ALIASES: &[&str] = &[
     "o4-mini",
 ];
 
+/// LLM hosts a release build may send a key to. The default endpoint
+/// (api.openai.com when LLM_BASE_URL is unset) is on the list.
+pub const RELEASE_LLM_HOSTS: &[&str] = &[
+    "api.openai.com",
+    "api.anthropic.com",
+    "generativelanguage.googleapis.com",
+];
+
+/// Release builds only talk to allowlisted hosts, over https.
+pub fn check_release_endpoint(config: &LlmConfig) -> Result<(), String> {
+    let host = config.endpoint_host.to_ascii_lowercase();
+    if config.endpoint_private || !RELEASE_LLM_HOSTS.contains(&host.as_str()) {
+        return Err(format!(
+            "release builds only send the LLM key to an allowlisted host ({}); LLM_BASE_URL points at {}",
+            RELEASE_LLM_HOSTS.join(", "),
+            if host.is_empty() { "(none)" } else { &host }
+        ));
+    }
+    Ok(())
+}
+
 fn default_base_url(provider: &str) -> &'static str {
     match provider {
         ANTHROPIC => "https://api.anthropic.com",

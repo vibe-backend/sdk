@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::Path;
 
 use crate::diag::{Diag, Report};
@@ -18,7 +19,7 @@ pub struct CompileOptions<'a> {
     pub root: &'a Path,
     pub llm: Option<&'a dyn LlmAdapter>,
     pub llm_config: Option<&'a LlmConfig>,
-    /// Compare with locks already on disk and do not write.
+    /// Build in memory and apply deploy policy without writing locks.
     pub check: bool,
 }
 
@@ -29,6 +30,102 @@ pub struct CompileOutput {
 
 pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, Report> {
     let sources = discover::discover(opts.root)?;
+    let (docs, ordered, mut report) = compile_docs(
+        &sources,
+        CompileOptions {
+            root: opts.root,
+            llm: opts.llm,
+            llm_config: opts.llm_config,
+            check: opts.check,
+        },
+        &HashMap::new(),
+    )
+    .await?;
+    write_or_check(opts, &sources, &docs, &ordered, &mut report)
+}
+
+/// Compiles every source in memory and returns the result as a
+/// [`crate::validate::LoadedProject`] (rendered lock texts plus their build
+/// record). Nothing is read from or written to the lock files on disk, so a
+/// release build never trusts committed locks and an edit to a lock file
+/// during the build cannot reach its output (decisions 113, 118).
+pub async fn compile_in_memory(
+    root: &Path,
+    llm: Option<&dyn LlmAdapter>,
+    llm_config: Option<&LlmConfig>,
+) -> Result<(crate::validate::LoadedProject, Report), Report> {
+    let sources = discover::discover(root)?;
+    let opts = CompileOptions {
+        root,
+        llm,
+        llm_config,
+        check: true,
+    };
+    let (docs, ordered, report) = compile_docs(&sources, opts, &HashMap::new()).await?;
+    let mut texts: HashMap<String, String> = HashMap::new();
+    let mut record = std::collections::BTreeMap::new();
+    for id in &ordered {
+        let doc = &docs[id];
+        let rel = lock_rel(&doc.meta.source);
+        let text = render_lock(doc);
+        record.insert(rel.clone(), crate::buildrecord::lock_hash(&text));
+        texts.insert(rel, text);
+    }
+    let loaded = crate::validate::LoadedProject {
+        lock_texts: sources
+            .iter()
+            .map(|source| texts.get(&lock_rel(&source.rel)).cloned())
+            .collect(),
+        sources,
+        build_record: serde_json::to_string(&crate::buildrecord::BuildRecord {
+            version: 1,
+            locks: record,
+        })
+        .ok(),
+    };
+    Ok((loaded, report))
+}
+
+/// Recompiles structured sources in memory, without an LLM and without
+/// touching the disk. Natural-language sources cannot be recompiled offline,
+/// so their parsed locks are passed in `natural` and used as-is (they still
+/// feed dependency hashes). CI runs `vibe compile --check` with the LLM for
+/// those.
+pub fn recompile_offline(
+    root: &Path,
+    sources: &[SourceFile],
+    natural: &HashMap<String, LockDoc>,
+) -> Result<HashMap<String, LockDoc>, Report> {
+    let opts = CompileOptions {
+        root,
+        llm: None,
+        llm_config: None,
+        check: true,
+    };
+    let mut fut = std::pin::pin!(compile_docs(sources, opts, natural));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match fut.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(result) => result.map(|(docs, _, _)| docs),
+        // Without an adapter nothing awaits I/O, so this cannot happen.
+        std::task::Poll::Pending => {
+            let mut report = Report::new();
+            report.push(Diag::error(
+                "",
+                "offline recompile unexpectedly needed an LLM",
+            ));
+            Err(report)
+        }
+    }
+}
+
+type Compiled = (HashMap<String, LockDoc>, Vec<String>, Report);
+
+async fn compile_docs(
+    sources: &[SourceFile],
+    opts: CompileOptions<'_>,
+    natural: &HashMap<String, LockDoc>,
+) -> Result<Compiled, Report> {
+    let opts = &opts;
     let mut report = Report::new();
     let mut docs: HashMap<String, LockDoc> = HashMap::new();
     let mut ordered: Vec<String> = Vec::new();
@@ -59,7 +156,7 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         return Err(report);
     }
 
-    let mut ranked = sources.clone();
+    let mut ranked = sources.to_vec();
     ranked.sort_by_key(|source| (rank(source), source.rel.clone()));
 
     for source in &ranked {
@@ -78,6 +175,13 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
             continue;
         }
         let structured = is_structured_source(&source.combined_text());
+        if !structured {
+            if let Some(doc) = natural.get(&source.id) {
+                ordered.push(source.id.clone());
+                docs.insert(source.id.clone(), doc.clone());
+                continue;
+            }
+        }
         let stamp = stamp_from(if structured { None } else { opts.llm_config });
         if !structured && opts.llm.is_none() {
             report.push(Diag::error(
@@ -163,7 +267,6 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                 item: "prompt-injection".into(),
                 risk: crate::lock::Risk::Medium,
                 reason: String::new(),
-                approved_by: Vec::new(),
             });
         }
         if !structured && needs_translation(&source.combined_text()) {
@@ -217,6 +320,15 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         // a feature that calls a writing method gets write-sql too.
         let mut items = security::extract_items(&docs[id]);
         security::enrich_feature_writes(&docs[id], &docs, &mut items);
+        let mut probe = docs[id].clone();
+        probe.meta.dependencies = deps.clone();
+        if security::auth_mode_changed(&probe, &docs) {
+            items.push(crate::lock::SecurityItem {
+                item: "auth-mode-change".into(),
+                risk: crate::lock::Risk::High,
+                reason: String::new(),
+            });
+        }
         let doc = docs.get_mut(id).expect("doc inserted");
         doc.meta.dependencies = deps;
         if doc
@@ -229,7 +341,6 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                 item: "prompt-injection".into(),
                 risk: crate::lock::Risk::Medium,
                 reason: String::new(),
-                approved_by: Vec::new(),
             });
         }
         items.sort_by(|a, b| a.item.cmp(&b.item));
@@ -261,52 +372,70 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
         ));
         return Err(report);
     }
+    Ok((docs, ordered, report))
+}
+
+fn write_or_check(
+    opts: &CompileOptions<'_>,
+    sources: &[SourceFile],
+    docs: &HashMap<String, LockDoc>,
+    ordered: &[String],
+    report: &mut Report,
+) -> Result<CompileOutput, Report> {
     let mut files = Vec::new();
-    let mut writes: Vec<(std::path::PathBuf, String)> = Vec::new();
-    for id in &ordered {
+    let mut texts: HashMap<String, String> = HashMap::new();
+    let mut record = std::collections::BTreeMap::new();
+    for id in ordered {
         let doc = &docs[id];
         let rel = lock_rel(&doc.meta.source);
-        let path = opts.root.join(&rel);
         let text = render_lock(doc);
-        if opts.check {
-            match fs::read_to_string(&path) {
-                Ok(existing) => {
-                    if let Ok(parsed) = crate::lock::parse_lock(&existing) {
-                        let same_items = security::same_items(
-                            &parsed.meta.security_items,
-                            &doc.meta.security_items,
-                        );
-                        if content_hash(&parsed) != content_hash(doc)
-                            || parsed.meta.compiler_hash != doc.meta.compiler_hash
-                            || parsed.meta.source_hash != doc.meta.source_hash
-                            || !same_items
-                        {
-                            report.push(Diag::error(
-                                &rel,
-                                "recompile does not match the lock on disk",
-                            ));
-                        }
-                    } else {
-                        report.push(Diag::error(&rel, "existing lock cannot be parsed"));
-                    }
-                }
-                Err(_) => report.push(Diag::error(&rel, "lock is missing for determinism check")),
-            }
-        } else {
-            writes.push((path, text));
-        }
+        record.insert(rel.clone(), crate::buildrecord::lock_hash(&text));
+        texts.insert(rel.clone(), text);
         files.push(rel);
     }
-    if report.has_errors() {
-        return Err(report);
-    }
-    if let Err(err) = crate::lockcommit::commit_journaled(opts.root, &writes) {
-        let message = if err.committed {
-            format!("locks were written, but cleanup failed: {err}; the next run finishes it")
-        } else {
-            format!("cannot write locks (none changed): {err}")
+    if opts.check {
+        // Verify the build result and the deploy policy in memory; the locks
+        // on disk (if any) are not consulted and nothing is written.
+        let loaded = crate::validate::LoadedProject {
+            sources: sources.to_vec(),
+            lock_texts: sources
+                .iter()
+                .map(|source| texts.get(&lock_rel(&source.rel)).cloned())
+                .collect(),
+            build_record: serde_json::to_string(&crate::buildrecord::BuildRecord {
+                version: 1,
+                locks: record,
+            })
+            .ok(),
         };
-        report.push(Diag::error("compile", message));
+        let (result, _) = crate::validate::validate_loaded(
+            &crate::validate::ValidateOptions {
+                dev: false,
+                root: opts.root,
+                deploy: true,
+            },
+            &loaded,
+        );
+        match result {
+            Ok(found) => report.diags.extend(found.diags),
+            Err(found) => report.diags.extend(found.diags),
+        }
+    } else {
+        let writes: Vec<_> = files
+            .iter()
+            .map(|rel| (opts.root.join(rel), texts[rel].clone()))
+            .collect();
+        if let Err(err) = crate::lockcommit::commit_journaled(opts.root, &writes) {
+            report.push(Diag::error("compile", format!("cannot write locks: {err}")));
+        } else if let Err(err) = crate::buildrecord::write(opts.root, record) {
+            report.push(Diag::error(
+                crate::buildrecord::PATH,
+                format!("cannot write build record: {err}"),
+            ));
+        }
+    }
+    let report = std::mem::take(report);
+    if report.has_errors() {
         return Err(report);
     }
     Ok(CompileOutput { files, report })
@@ -2746,7 +2875,11 @@ mod prompt_tests {
             // to its own path.
             std::fs::write(
                 &path,
-                body.replace("/products/{id}", "/example-products/{id}"),
+                body.replace("/products/{id}", "/example-products/{id}")
+                    .replace(
+                        "### auth\n- mode: jwt",
+                        "### auth\n- mode: jwt\n- roles: [staff]",
+                    ),
             )
             .unwrap();
         }
@@ -2782,7 +2915,6 @@ mod prompt_tests {
             dev: false,
             root: &dir,
             deploy: false,
-            verify_key: None,
         }) {
             Ok(r) | Err(r) => r,
         };

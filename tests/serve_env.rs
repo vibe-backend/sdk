@@ -34,6 +34,11 @@ fn serve(envs: &[(&str, &str)], memory: bool) -> (bool, String) {
         cmd.env_remove(key);
     }
     cmd.current_dir(&dir);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("LLM_") || key.starts_with("OPENAI_") || key == "VIBE_LLM_API_KEY" {
+            cmd.env_remove(key);
+        }
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -226,6 +231,11 @@ fn serve_project(project: &std::path::Path, envs: &[(&str, &str)], memory: bool)
         cmd.env_remove(key);
     }
     cmd.current_dir(project);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("LLM_") || key.starts_with("OPENAI_") || key == "VIBE_LLM_API_KEY" {
+            cmd.env_remove(key);
+        }
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -295,6 +305,17 @@ fn signed_dev_manifest_starts_with_memory_in_development() {
     use std::process::Stdio;
     let root = std::env::temp_dir().join(format!("vibe-dev-serve-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
+    let compiled = Command::new(env!("CARGO_BIN_EXE_vibe"))
+        .env_clear()
+        .args(["compile", "--project"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
     let key = vibe::sign::load_or_create(&root).unwrap();
     let manifest = vibe::manifest::manifest_from_project_with_mode(&root, &key, true).unwrap();
     let path = root.join("dev.json");

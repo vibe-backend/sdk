@@ -50,7 +50,6 @@ async fn problems(claims: &str, custom: &str) -> String {
         dev: false,
         root: &root,
         deploy: false,
-        verify_key: None,
     }) {
         Ok(_) => String::new(),
         Err(report) => report.to_string(),

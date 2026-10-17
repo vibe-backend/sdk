@@ -123,7 +123,6 @@ async fn any_failure_leaves_official_locks_untouched_and_caches_successes() {
         dev: false,
         root: &root,
         deploy: false,
-        verify_key: None,
     })
     .unwrap_or_else(|err| panic!("{err}"));
 }

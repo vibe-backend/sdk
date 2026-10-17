@@ -221,7 +221,6 @@ async fn zh_hant_sample_shop_compiles_and_validates() {
         dev: false,
         root: &root,
         deploy: false,
-        verify_key: None,
     })
     .unwrap_or_else(|err| panic!("{err}"));
     // Every Chinese natural source was translated once and cached.
@@ -362,7 +361,6 @@ async fn chinese_left_in_translation_is_not_an_error() {
         dev: false,
         root: &root,
         deploy: false,
-        verify_key: None,
     })
     .unwrap_or_else(|err| panic!("{err}"));
 }

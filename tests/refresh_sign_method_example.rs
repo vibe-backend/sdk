@@ -6,7 +6,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use vibe::approve::{approve_project, ApproveOptions};
 use vibe::compile::{compile_project, CompileOptions};
 use vibe::manifest::manifest_from_project;
 use vibe::sign;
@@ -51,7 +50,6 @@ fn validate(root: &Path) -> Result<(), String> {
         dev: false,
         root,
         deploy: false,
-        verify_key: None,
     })
     .map(|_| ())
     .map_err(|err| err.to_string())
@@ -69,17 +67,13 @@ async fn refresh_session_example_passes_validate_and_build() {
     validate(&root).unwrap_or_else(|err| panic!("{err}"));
 
     let key = sign::load_or_create(&root).unwrap();
-    approve_project(&ApproveOptions {
+    // Local flow: validate --deploy --dev, then manifest --dev (no approval).
+    validate_project(&ValidateOptions {
         root: &root,
-        reviewers: &["ada@example.com".into(), "grace@example.com".into()],
-        reason: "spec 4A.1c example",
-        approval_ref: "local",
-        commit: "local",
-        now: "2026-10-17T00:00:00Z",
-        signing_key: &key,
+        deploy: true,
+        dev: true,
     })
     .unwrap_or_else(|err| panic!("{err}"));
-    // `vibe manifest` (build): validate --deploy, then the signed manifest.
     let manifest = manifest_from_project(&root, &key).unwrap_or_else(|err| panic!("{err}"));
 
     let sign_token = manifest

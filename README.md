@@ -40,11 +40,9 @@ The shop demo is moving to [vibe-backend/sample-shop](https://github.com/vibe-ba
 
 ```bash
 vibe compile --project tests/fixtures/shop
-vibe approve --project tests/fixtures/shop \
-  --reviewer ada@example.com --reviewer grace@example.com \
-  --reason "sample shop locks"
-vibe validate --project tests/fixtures/shop --deploy
-vibe manifest --project tests/fixtures/shop -o manifest.json
+vibe validate --project tests/fixtures/shop
+vibe validate --deploy --dev --project tests/fixtures/shop
+vibe manifest --dev --project tests/fixtures/shop -o manifest.json
 vibe serve --manifest manifest.json --project tests/fixtures/shop --memory
 ```
 
@@ -52,7 +50,7 @@ vibe serve --manifest manifest.json --project tests/fixtures/shop --memory
 
 Runtime configuration (PostgreSQL roles and TLS, connection pool, LLM variables, `VIBE_ENV`, JWT/JWKS and API keys, rate limits and trusted proxies) is in [docs/runtime-config.md](docs/runtime-config.md).
 
-`vibe approve` needs `--reason` and one `--reviewer` per reviewer (repeat the flag, e.g. `--reviewer a@x --reviewer b@x`). High-risk locks (public endpoints, providers, and migrations) need two reviewers. A failed approve writes nothing.
+Locks are build output: they are not committed (`*.lock.md` is gitignored) and carry no approval or signature (spec v1.8). Deployments use only the manifest built and attested in the protected `release` environment (`vibe manifest --release`); see [docs/ci/README.md](docs/ci/README.md). Review happens in pull requests; see [docs/pr-review-guide.md](docs/pr-review-guide.md). `security-items` in a lock are informational. The manifest is still signed.
 
 ```bash
 cargo fmt --all -- --check

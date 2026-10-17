@@ -109,14 +109,18 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
         provider.meta.compiler,
         vibe::lock::CompilerStamp::deterministic()
     );
-    compile_project(&CompileOptions {
+    let check = compile_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),
         check: true,
     })
     .await
-    .unwrap_or_else(|e| panic!("{e}"));
+    .err()
+    .expect("compile --check applies the release deploy policy");
+    assert!(check
+        .to_string()
+        .contains("private endpoint cannot be deployed"));
     let text = fs::read_to_string(root.join("models/product/product.lock.md")).unwrap();
     let doc = parse_lock(&text).unwrap();
     assert_eq!(doc.meta.source_type, SourceType::Natural);
@@ -132,9 +136,166 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
         dev: false,
         root: &root,
         deploy: false,
-        verify_key: None,
     })
     .unwrap_or_else(|err| panic!("{err}"));
+
+    // Private-endpoint natural-language output supports the complete local
+    // deploy/manifest path without any lock approval or pre-existing key.
+    validate_project(&ValidateOptions {
+        root: &root,
+        deploy: true,
+        dev: true,
+    })
+    .unwrap_or_else(|err| panic!("{err}"));
+    let key = vibe::sign::load_or_create(&root).unwrap();
+    let manifest = vibe::manifest::manifest_from_project_with_mode(&root, &key, true)
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(manifest.build_mode, Some(vibe::manifest::BuildMode::Dev));
+    let path = root.join("dev.json");
+    vibe::manifest::write_manifest(&path, &manifest).unwrap();
+    let public = vibe::sign::load_dev_public(&root).unwrap();
+    assert_eq!(
+        vibe::manifest::read_manifest(&path, &public).unwrap(),
+        manifest
+    );
+
+    // A hand edit of a natural-language lock (cannot be recompiled offline)
+    // must not pass deploy validation or reach a manifest.
+    let deploy = || {
+        validate_project(&ValidateOptions {
+            dev: false,
+            root: &root,
+            deploy: true,
+        })
+    };
+    let before = deploy();
+    if let Err(err) = &before {
+        assert!(!err.to_string().contains("hand-edited"), "{err}");
+    }
+    let lock = root.join("models/product/product.lock.md");
+    let edited =
+        text.replacen("max: 40", "max: 100000", 1)
+            .replacen("required, unique,", "required,", 1);
+    assert_ne!(edited, text);
+    fs::write(&lock, edited).unwrap();
+    let err = deploy().unwrap_err().to_string();
+    assert!(err.contains("models/product/product.lock.md"), "{err}");
+    assert!(err.contains("hand-edited"), "{err}");
+    fs::create_dir_all(root.join(".vibe")).unwrap();
+    let key = vibe::sign::generate_key();
+    let err = vibe::manifest::manifest_from_project(&root, &key)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("hand-edited"), "{err}");
+}
+
+const METHOD: &str = r#"## Signature
+
+- input: {id: uuid}
+- output: {id: uuid}
+- writes: true
+
+## Calls
+
+(none)
+
+## Steps
+
+### s1
+
+- op: query
+- sql: UPDATE products SET sku = 'x' WHERE id = $1
+- params: [input.id]
+- scope: pk
+"#;
+
+#[tokio::test]
+async fn natural_language_lock_with_tautological_where_cannot_deploy() {
+    let root = std::env::temp_dir().join(format!("vibe-llm-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(root.join("models/product/methods")).unwrap();
+    fs::create_dir_all(root.join("providers")).unwrap();
+    fs::write(
+        root.join("providers/main.md"),
+        include_str!("fixtures/shop/providers/main.md"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("models/product/product.md"),
+        "# product\n\nStaff can create a product from a sku.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("models/product/methods/rename.md"),
+        "---\nwrites: true\n---\n# rename\n\nRename one product by id (update its sku).\n",
+    )
+    .unwrap();
+    let config = LlmConfig {
+        provider: "openai".into(),
+        base_url: "https://api.openai.com/v1".into(),
+        api_key: "sk-test-value".into(),
+        model: "gpt-test-2026-01-01".into(),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        seed: 0,
+        endpoint_host: "api.openai.com".into(),
+        endpoint_private: false,
+        api_style: "chat".into(),
+        send_sampling: true,
+    };
+    let adapter = FakeAdapter {
+        responder: |request: &LlmRequest| {
+            let body = if request.input.contains("Rename one product") {
+                METHOD
+            } else {
+                SECTIONS
+            };
+            Ok(format!("```markdown\n{body}\n```"))
+        },
+    };
+    let compiled = compile_project(&CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&config),
+        check: false,
+    })
+    .await;
+    let lock = root.join("models/product/methods/rename.lock.md");
+    compiled.unwrap_or_else(|err| panic!("{err}"));
+    let text = fs::read_to_string(&lock).unwrap();
+    assert_eq!(
+        parse_lock(&text).unwrap().meta.source_type,
+        SourceType::Natural
+    );
+    // Hand-edit the natural-language lock and forge the build record, so only
+    // the deterministic policy stands between the edit and a deploy.
+    let edited = text.replacen("WHERE id = $1", "WHERE true OR id = $1", 1);
+    assert_ne!(edited, text);
+    fs::write(&lock, &edited).unwrap();
+    let loaded = vibe::validate::load_project(&root).unwrap();
+    let mut locks = std::collections::BTreeMap::new();
+    for (source, text) in loaded.sources.iter().zip(&loaded.lock_texts) {
+        if let Some(text) = text {
+            let rel = source.rel.trim_end_matches(".md").to_string() + ".lock.md";
+            locks.insert(rel, vibe::buildrecord::lock_hash(text));
+        }
+    }
+    vibe::buildrecord::write(&root, locks).unwrap();
+    for deploy in [false, true] {
+        let err = validate_project(&ValidateOptions {
+            dev: false,
+            root: &root,
+            deploy,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("rename.lock.md"), "{err}");
+        assert!(err.contains("WHERE is always true"), "{err}");
+    }
+    let key = vibe::sign::generate_key();
+    let err = vibe::manifest::manifest_from_project(&root, &key)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("WHERE is always true"), "{err}");
 }
 
 #[tokio::test]
@@ -179,7 +340,6 @@ async fn structured_locks_ignore_llm_config_and_check_consistently() {
         root: &root,
         deploy: false,
         dev: false,
-        verify_key: None,
     })
     .unwrap_or_else(|e| panic!("{e}"));
 }
@@ -336,7 +496,6 @@ async fn auth_none_overrides_every_model_auth_form_and_recognizes_removal_prose(
                         root: &root,
                         dev: false,
                         deploy: false,
-                        verify_key: None,
                     })
                     .unwrap_or_else(|err| panic!("{prose} / {emitted}: {err}"));
                     fs::remove_dir_all(root).unwrap();

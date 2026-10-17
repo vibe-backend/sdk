@@ -4,9 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use vibe::approve::{approve_project, ApproveOptions};
 use vibe::compile::{compile_project, CompileOptions};
-use vibe::sign;
 
 fn copy_dir(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
@@ -78,18 +76,6 @@ async fn validate_deploy_refuses_after_failures_fixture_lock() {
         check: true,
     })
     .await
-    .unwrap_or_else(|err| panic!("{err}"));
-
-    let key = sign::load_or_create(&root).unwrap();
-    approve_project(&ApproveOptions {
-        root: &root,
-        reviewers: &["ada@example.com".into(), "grace@example.com".into()],
-        reason: "fixture for unverified challenge gate",
-        approval_ref: "local",
-        commit: "local",
-        now: "2026-10-16T00:00:00Z",
-        signing_key: &key,
-    })
     .unwrap_or_else(|err| panic!("{err}"));
 
     let lock =

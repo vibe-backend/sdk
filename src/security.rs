@@ -397,7 +397,6 @@ fn push(items: &mut Vec<SecurityItem>, item: &str, risk: Risk) {
         item: item.into(),
         risk,
         reason: String::new(),
-        approved_by: Vec::new(),
     });
 }
 
@@ -413,6 +412,51 @@ pub fn same_items(expected: &[SecurityItem], actual: &[SecurityItem]) -> bool {
     a.sort();
     b.sort();
     a == b
+}
+
+/// Normalized auth mode: trimmed, lower case, and `jwt` when missing.
+pub fn auth_mode(raw: &str) -> String {
+    let mode = raw.trim().to_ascii_lowercase();
+    if mode.is_empty() {
+        "jwt".into()
+    } else {
+        mode
+    }
+}
+
+fn auth_block_modes(doc: &LockDoc) -> Vec<String> {
+    find_section(&doc.sections, "Pipelines")
+        .map(|section| {
+            section
+                .blocks
+                .iter()
+                .filter(|block| pipeline_name(&block.heading) == "auth")
+                .map(|block| {
+                    auth_mode(
+                        block
+                            .bullets
+                            .iter()
+                            .find(|b| b.key == "mode")
+                            .map(|b| b.value.as_str())
+                            .unwrap_or(""),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True when an API feature's auth mode differs from any auth mode its
+/// definition/version dependencies declare (decision: high-risk).
+pub fn auth_mode_changed(doc: &LockDoc, docs: &std::collections::HashMap<String, LockDoc>) -> bool {
+    let Some(own) = auth_block_modes(doc).into_iter().next() else {
+        return false;
+    };
+    doc.meta.dependencies.iter().any(|dep| {
+        docs.get(&dep.id)
+            .filter(|parent| parent.meta.kind == crate::lock::Kind::Api)
+            .is_some_and(|parent| auth_block_modes(parent).iter().any(|mode| *mode != own))
+    })
 }
 
 #[cfg(test)]

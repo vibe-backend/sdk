@@ -155,7 +155,7 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 - **Sandbox**：compiler 的對外網絡只限 endpoint host；沒有 tools、function calling 或 streaming；除 `LLM_API_KEY` 外沒有其他 secret（§2A.7、§2A.8.6）。
 - CI 和 production 編譯必須用公開 host 的 `https://`；在 CI 使用 loopback、私有 host 或 `LLM_ALLOW_PRIVATE_HOST=true` 屬錯誤（§2A.8.4）。
 - `LLM_ALLOW_PRIVATE_HOST=true` 亦適用於解析至非公開地址的網域名稱，例如 fake-IP DNS 代理；只限本地開發。即使名稱看似公開，編譯結果亦會記錄 `endpoint-private: true`。 公開網域名稱仍須使用 HTTPS；CI 和 production 拒絕此旗標。
-- 本地測試私有 endpoint 編譯的 lock，可用 `vibe validate --deploy --dev` 和 `vibe manifest --dev`。審批、簽署和其他檢查維持不變；CI 和 production 拒絕這些旗標。 Dev manifest 的簽署內容包含 `build_mode: "dev"`，`vibe serve` 只在開發環境接受 （可配合 `--memory`）；release manifest 不接受私有 endpoint lock。
+- 本地測試私有 endpoint 編譯的 lock，可用 `vibe validate --deploy --dev` 和 `vibe manifest --dev`。Manifest 簽署和其他驗證檢查維持不變；CI 和 production 拒絕這些旗標。 Dev manifest 的簽署內容包含 `build_mode: "dev"`，`vibe serve` 只在開發環境接受 （可配合 `--memory`）；release manifest 不接受私有 endpoint lock。
 - 更換 provider、endpoint host 或 model 屬 **major** 變更：所有 lock 重新編譯，涉及自然語言／安全的 lock 需要重新審批。只改 base URL 的 path 不屬 major，但 CI 確定性檢查仍須通過（§2A.8.7）。
 
 ## 規格缺口

@@ -41,9 +41,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1"
+x509-cert = "0.2"
+der = "0.7"
 sqlparser = { version = "0.52", features = ["visitor"] }
 
 [dev-dependencies]
+rcgen = "0.13"
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(unix)'.dependencies]

@@ -1411,7 +1411,7 @@ error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-re
 
 **範例：唯讀 sign-method 加獨立寫入 method：**
 
-完整、可以照抄嘅版本就係 repo 入面嘅 fixture `tests/fixtures/refresh-session`，由 `tests/refresh_sign_method_example.rs` 嘅 `refresh_session_example_passes_validate_and_build` 測試（`vibe compile` → `vibe validate` → `vibe approve` → `vibe manifest`）。以下檔案全部係 structured source（`source-type: structured`），`vibe compile` 唔使 LLM 就會產生對應嘅 `.lock.md`（lock 嘅 frontmatter，例如 `source-hash`，係由 compile 計出嚟，唔好手寫）。之前喺 sign-method 入面做嘅業務寫入，搬去一個普通寫入 method，由 client 喺 refresh 成功之後用新 access token 另外呼叫。
+完整、可以照抄嘅版本就係 repo 入面嘅 fixture `tests/fixtures/refresh-session`，由 `tests/refresh_sign_method_example.rs` 嘅 `refresh_session_example_passes_validate_and_build` 測試（`vibe compile` → `vibe validate` → `vibe validate --deploy --dev` → `vibe manifest --dev`）。以下檔案全部係 structured source（`source-type: structured`），`vibe compile` 唔使 LLM 就會產生對應嘅 `.lock.md`（lock 嘅 frontmatter，例如 `source-hash`，係由 compile 計出嚟，唔好手寫）。之前喺 sign-method 入面做嘅業務寫入，搬去一個普通寫入 method，由 client 喺 refresh 成功之後用新 access token 另外呼叫。
 
 `models/user/user.md`（model 要有 `last_device`；`id`、`tenant_id`、`created_at` 等 system 欄位由 compile 自動加）
 
@@ -1671,7 +1671,7 @@ error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-re
 | 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ```
 
-Fixture 仲有 `providers/main.md`、`api/auth/_definition.md`（`auth` pipeline `mode: jwt`）、`api/auth/v1/_version.md` 同 `slugs.example.json`，同 `tests/fixtures/shop` 嘅寫法一樣。`vibe compile` 會為上面每個檔案產生 `.lock.md`（包括 `api/auth/v1/session/session.lock.md`），`vibe approve` 簽核之後 `vibe manifest` 先可以 build。
+Fixture 仲有 `providers/main.md`、`api/auth/_definition.md`（`auth` pipeline `mode: jwt`）、`api/auth/v1/_version.md` 同 `slugs.example.json`，同 `tests/fixtures/shop` 嘅寫法一樣。`vibe compile` 會為上面每個檔案產生 `.lock.md`（包括 `api/auth/v1/session/session.lock.md`），本地開發用 `vibe validate --deploy --dev` 驗證之後，再用 `vibe manifest --dev` build。
 
 Client 流程：`POST …/refresh` 成功攞到新 access token 之後，再 `POST /auth/v1/session`。兩個 request 唔係 atomic：session 寫入失敗唔影響已經完成嘅輪換，client 可以重試；呢個寫入同 refresh token 狀態無關。
 
