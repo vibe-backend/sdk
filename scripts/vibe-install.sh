@@ -13,11 +13,12 @@ usage() {
  cat <<'USAGE'
 Manage the vibe binary installed from verified GitHub Releases.
 Usage:
-  vibe-install.sh install --version vX.Y.Z [options]
-  vibe-install.sh upgrade [--version vX.Y.Z] [options]
+  vibe-install.sh install --version VERSION [options]
+  vibe-install.sh upgrade [--version VERSION] [options]
   vibe-install.sh remove [options]
 Options:
-  --version VERSION   Exact stable tag; required for install. Upgrade resolves latest if omitted.
+  --version VERSION   Exact vX.Y.Z or vX.Y.Z-rc.N tag; required for install.
+                      Upgrade resolves latest if omitted.
   --install-dir DIR   Destination (default: $HOME/.local/bin).
   --non-interactive   Never prompt (operations are non-interactive by default).
   -h, --help          Show help.
@@ -47,10 +48,10 @@ if [ "$ACTION" = remove ]; then
  rm -rf -- "$ROOT" || { mv -- "$LOCK/removed-link" "$BIN"; die "failed to remove managed files"; }
  rm -f -- "$LOCK/removed-link"; printf 'Removed script-managed vibe from %s\n' "$INSTALL_DIR"; exit 0
 fi
-[ "$ACTION" != install ] || [ -n "$VERSION" ] || die "install requires --version vX.Y.Z"
+[ "$ACTION" != install ] || [ -n "$VERSION" ] || die "install requires --version vX.Y.Z or vX.Y.Z-rc.N"
 need curl; need tar; need awk; need gh
 if [ -z "$VERSION" ]; then latest=$(curl -fsSIL --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' "$DOWNLOAD_URL/$REPOSITORY/releases/latest") || die "failed to resolve latest release"; prefix="$DOWNLOAD_URL/$REPOSITORY/releases/tag/"; case $latest in "$prefix"*) VERSION=${latest#"$prefix"};; *) die "latest release redirected outside expected repository";; esac; fi
-if [ "$(printf '%s\n' "$VERSION" | wc -l)" -eq 1 ] && printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then :; else die "invalid stable release version: $VERSION"; fi
+if [ "$(printf '%s\n' "$VERSION" | wc -l)" -eq 1 ] && printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'; then :; else die "invalid release version: $VERSION"; fi
 os=$(uname -s) || die "cannot detect OS"; arch=$(uname -m) || die "cannot detect architecture"
 case "$os:$arch" in Linux:x86_64|Linux:amd64) target=x86_64-unknown-linux-gnu;; Linux:aarch64|Linux:arm64) target=aarch64-unknown-linux-gnu;; Darwin:x86_64|Darwin:amd64) target=x86_64-apple-darwin;; Darwin:arm64|Darwin:aarch64) target=aarch64-apple-darwin;; *) die "unsupported platform: $os/$arch";; esac
 asset="$PROGRAM-$target.tar.gz"; base="$DOWNLOAD_URL/$REPOSITORY/releases/download/$VERSION"; tmp=$(mktemp -d "$INSTALL_DIR/.vibe-install.XXXXXX") || die "cannot create temporary directory"

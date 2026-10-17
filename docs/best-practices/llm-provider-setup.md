@@ -22,7 +22,7 @@ There is no source `.md` for this: the endpoint is configuration, not a definiti
 | `LLM_RUN_DEADLINE` | no | seconds one run may spend in LLM calls, default 1800, max 3600 |
 | `LLM_MAX_RETRIES` | no | retries for network errors, timeouts, 408, 429 and 5xx with exponential backoff (1s, 2s, 4s, … capped at 16s, plus jitter), default 2, max 5; a `Retry-After` header (seconds, capped at 60) replaces the backoff; 400/401/403/404 are never retried |
 | `LLM_FORMAT_RETRIES` | no | re-prompts with the validator errors when the LLM output is not valid lock markdown, default 2, max 5; each re-prompt counts against `LLM_MAX_CALLS_PER_SOURCE` |
-| `LLM_SEED` | no | sent only if the model supports seed; default `0`; counted in `compiler-hash` either way |
+| `LLM_SEED` | no | sent only if the model supports seed; default `0`; recorded in build-record `compilers`, never in `compiler-hash` (decision 174) |
 | `LLM_ALLOW_PRIVATE_HOST` | no | default `false`; local development only |
 
 `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` are **aliases** accepted only with `LLM_PROVIDER=openai`. `LLM_*` takes precedence; if both are set with different values it is an error. Setting any `OPENAI_*` with another provider is an error (§2A.8.3).
@@ -60,10 +60,10 @@ Fork PRs get no secrets, so they only run the validator, not the recompile (§2A
 
 ## Compiled lock md example
 
-The provider, endpoint host and model are recorded in the lock's `compiler` frontmatter and counted in `compiler-hash` (host only, never the key or path) (§2A.1, §2A.8.7):
+Decision 174: provider, endpoint host, model, seed and sent parameters are recorded in the build record and manifest provenance `compilers` map. Locks contain only compiler name and version; compiler-hash uses only compiler version and prompt version.
 
 ````markdown
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: <model id reported by the provider>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: { temperature: 0, top_p: 1, seed: 0 } }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 ````
 

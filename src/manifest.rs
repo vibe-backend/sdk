@@ -40,6 +40,8 @@ pub struct Manifest {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Provenance {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub compilers: BTreeMap<String, crate::lock::LlmStamp>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub translations: BTreeMap<String, crate::lock::TranslationStamp>,
     /// Source commit (`GITHUB_SHA`, `--commit`, or `git rev-parse HEAD`).
     pub commit: String,
@@ -592,7 +594,11 @@ pub fn build_signed(
         loaded,
     );
     result?;
-    let mut manifest = build_manifest_with_mode(&docs, !info.release)?;
+    let record = loaded
+        .build_record
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<crate::buildrecord::BuildRecord>(raw).ok());
+    let mut manifest = build_manifest_with_record(&docs, !info.release, record.as_ref())?;
     manifest.build_mode = Some(if info.release {
         BuildMode::Release
     } else {
@@ -622,6 +628,7 @@ pub fn build_signed(
     locks.sort_by(|a, b| a.id.cmp(&b.id));
     items.sort_by(|a, b| (&a.lock, &a.item).cmp(&(&b.lock, &b.item)));
     manifest.provenance = Provenance {
+        compilers: record.map(|record| record.compilers).unwrap_or_default(),
         translations: loaded
             .build_record
             .as_deref()
@@ -735,7 +742,22 @@ pub fn build_manifest_with_mode(
     docs: &HashMap<String, LockDoc>,
     dev: bool,
 ) -> Result<Manifest, Report> {
-    if !dev && docs.values().any(|doc| doc.meta.compiler.endpoint_private) {
+    build_manifest_with_record(docs, dev, None)
+}
+
+pub fn build_manifest_with_record(
+    docs: &HashMap<String, LockDoc>,
+    dev: bool,
+    record: Option<&crate::buildrecord::BuildRecord>,
+) -> Result<Manifest, Report> {
+    if !dev
+        && record.is_some_and(|record| {
+            record
+                .compilers
+                .values()
+                .any(|stamp| stamp.endpoint_private)
+        })
+    {
         return Err(single(
             "locks compiled against a private endpoint cannot be deployed".into(),
         ));

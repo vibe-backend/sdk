@@ -180,7 +180,7 @@ source: api/auth/v1/login/login.md
 source-hash: sha256:00
 source-type: structured
 dependencies: []
-compiler: { name: md-logic, version: 0.1.0, model-snapshot: none, llm-provider: none, endpoint-host: none, endpoint-private: false, llm-seed: 0, sent-params: {} }
+compiler: { name: md-logic, version: 0.1.0 }
 compiler-hash: sha256:00
 status: pending
 approval-mode: manual

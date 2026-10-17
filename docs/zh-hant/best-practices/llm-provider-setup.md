@@ -16,7 +16,7 @@ compiler 使用 LLM 把自然語言 source `.md` 轉為 lock md（§2.1、§2A.6
 | `LLM_MODEL` | 是 | provider 文件列為**非浮動**的 model id／snapshot id（Decision 58） |
 | `LLM_TIMEOUT` | 否 | 預設 60s，上限 300s |
 | `LLM_MAX_RETRIES` | 否 | 網絡重試次數，預設 2，上限 5 |
-| `LLM_SEED` | 否 | 只在 model 支援 seed 時傳送；預設 `0`；無論如何都計入 `compiler-hash` |
+| `LLM_SEED` | 否 | 只在 model 支援 seed 時傳送；預設 `0`；記喺 build-record `compilers`，唔計入 `compiler-hash`（決定 174） |
 | `LLM_ALLOW_PRIVATE_HOST` | 否 | 預設 `false`；只限本地開發 |
 
 `OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL` 是只在 `LLM_PROVIDER=openai` 時接受的**別名**。`LLM_*` 優先；兩者都設定而值不同屬錯誤。配合其他 provider 設定任何 `OPENAI_*` 也屬錯誤（§2A.8.3）。
@@ -54,10 +54,10 @@ Fork PR 沒有 secrets，因此只執行 validator，不重新編譯（§2A.8.5�
 
 ## 編譯後的 lock md 範例
 
-provider、endpoint host 和 model 記錄在 lock 的 `compiler` frontmatter，並計入 `compiler-hash`（只計 host，絕不計 key 或 path）（§2A.1、§2A.8.7）：
+決定 174：provider、endpoint host、model、seed 同 sent parameters 記喺 build record 同 manifest provenance 嘅 `compilers` map。Lock compiler 只留 name 同 version；compiler-hash 只計 compiler version 同 prompt version。
 
 ````markdown
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: <model id reported by the provider>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: { temperature: 0, top_p: 1, seed: 0 } }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 ````
 

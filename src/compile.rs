@@ -78,31 +78,14 @@ pub async fn compile_in_memory(
         check: true,
     };
     let (docs, ordered, report) = compile_docs(&sources, opts, &HashMap::new()).await?;
-    let mut texts: HashMap<String, String> = HashMap::new();
-    let mut record = std::collections::BTreeMap::new();
-    let mut translations = std::collections::BTreeMap::new();
-    for id in &ordered {
-        let doc = &docs[id];
-        let rel = lock_rel(&doc.meta.source);
-        let text = render_lock(doc);
-        if let Some(stamp) = &doc.meta.translation {
-            translations.insert(rel.clone(), stamp.clone());
-        }
-        record.insert(rel.clone(), crate::buildrecord::lock_hash(&text));
-        texts.insert(rel, text);
-    }
+    let (texts, record) = collect_build_record(root, &docs, &ordered);
     let loaded = crate::validate::LoadedProject {
         lock_texts: sources
             .iter()
             .map(|source| texts.get(&lock_rel(&source.rel)).cloned())
             .collect(),
         sources,
-        build_record: serde_json::to_string(&crate::buildrecord::BuildRecord {
-            version: 1,
-            locks: record,
-            translations,
-        })
-        .ok(),
+        build_record: serde_json::to_string(&record).ok(),
     };
     Ok((loaded, report))
 }
@@ -395,16 +378,17 @@ async fn compile_docs(
     Ok((docs, ordered, report))
 }
 
-fn write_or_check(
-    opts: &CompileOptions<'_>,
-    sources: &[SourceFile],
+fn collect_build_record(
+    root: &Path,
     docs: &HashMap<String, LockDoc>,
     ordered: &[String],
-    report: &mut Report,
-) -> Result<CompileOutput, Report> {
-    let mut files = Vec::new();
+) -> (HashMap<String, String>, crate::buildrecord::BuildRecord) {
     let mut texts: HashMap<String, String> = HashMap::new();
     let mut record = std::collections::BTreeMap::new();
+    let previous = fs::read_to_string(root.join(crate::buildrecord::PATH))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<crate::buildrecord::BuildRecord>(&raw).ok());
+    let mut compilers = std::collections::BTreeMap::new();
     let mut translations = std::collections::BTreeMap::new();
     for id in ordered {
         let doc = &docs[id];
@@ -413,10 +397,53 @@ fn write_or_check(
         if let Some(stamp) = &doc.meta.translation {
             translations.insert(rel.clone(), stamp.clone());
         }
+        if doc.meta.source_type == SourceType::Natural {
+            if let Some(stamp) = doc.meta.compiler.llm_stamp().or_else(|| {
+                let record = previous.as_ref()?;
+                (record.locks.get(&rel)? == &crate::buildrecord::lock_hash(&text))
+                    .then(|| record.compilers.get(&rel).cloned())
+                    .flatten()
+            }) {
+                compilers.insert(rel.clone(), stamp);
+            }
+            if doc.meta.compiler.llm_stamp().is_none() && !translations.contains_key(&rel) {
+                if let Some(stamp) = previous
+                    .as_ref()
+                    .filter(|record| {
+                        record.locks.get(&rel) == Some(&crate::buildrecord::lock_hash(&text))
+                    })
+                    .and_then(|record| record.translations.get(&rel))
+                {
+                    translations.insert(rel.clone(), stamp.clone());
+                }
+            }
+        }
         record.insert(rel.clone(), crate::buildrecord::lock_hash(&text));
-        texts.insert(rel.clone(), text);
-        files.push(rel);
+        texts.insert(rel, text);
     }
+    (
+        texts,
+        crate::buildrecord::BuildRecord {
+            version: 1,
+            locks: record,
+            translations,
+            compilers,
+        },
+    )
+}
+
+fn write_or_check(
+    opts: &CompileOptions<'_>,
+    sources: &[SourceFile],
+    docs: &HashMap<String, LockDoc>,
+    ordered: &[String],
+    report: &mut Report,
+) -> Result<CompileOutput, Report> {
+    let (texts, record) = collect_build_record(opts.root, docs, ordered);
+    let files: Vec<_> = ordered
+        .iter()
+        .map(|id| lock_rel(&docs[id].meta.source))
+        .collect();
     if opts.check {
         // Verify the build result and the deploy policy in memory; the locks
         // on disk (if any) are not consulted and nothing is written.
@@ -426,12 +453,7 @@ fn write_or_check(
                 .iter()
                 .map(|source| texts.get(&lock_rel(&source.rel)).cloned())
                 .collect(),
-            build_record: serde_json::to_string(&crate::buildrecord::BuildRecord {
-                version: 1,
-                locks: record,
-                translations,
-            })
-            .ok(),
+            build_record: serde_json::to_string(&record).ok(),
         };
         let (result, _) = crate::validate::validate_loaded(
             &crate::validate::ValidateOptions {
@@ -474,9 +496,12 @@ fn write_or_check(
             .collect();
         if let Err(err) = crate::lockcommit::commit_journaled(opts.root, &writes) {
             report.push(Diag::error("compile", format!("cannot write locks: {err}")));
-        } else if let Err(err) =
-            crate::buildrecord::write_with_translations(opts.root, record, translations)
-        {
+        } else if let Err(err) = crate::buildrecord::write_with_compilers(
+            opts.root,
+            record.locks,
+            record.translations,
+            record.compilers,
+        ) {
             report.push(Diag::error(
                 crate::buildrecord::PATH,
                 format!("cannot write build record: {err}"),
@@ -510,7 +535,7 @@ fn cache_key(
         "system": system_prompt(source.kind, source.scope),
         "input": llm_input(source, docs),
         "model": config.model,
-        "provider": config.provider,
+        "provider": stamp.llm_provider,
         "host": config.endpoint_host,
         "seed": config.seed,
         "sent": stamp.sent_params,
@@ -1111,7 +1136,7 @@ async fn translate_source(
     let key = crate::hashutil::sha256_hex(
         serde_json::json!({
             "source": source_hash(&body),
-            "provider": config.provider,
+            "provider": stamp.llm_provider,
             "model": config.model,
             "prompt": TRANSLATE_PROMPT_VERSION,
             "sent": stamp.sent_params,
@@ -3090,8 +3115,8 @@ mod prompt_tests {
         assert_eq!(
             (crate::lock::PROMPT_VERSION, actual.as_str()),
             (
-                "prompt-9",
-                "47af3b4c401cfa2fe58ddf3acb4d7c4366f420949a8e86e9af35e15451b1006d"
+                "prompt-10",
+                "9132299dbe723ad8b4b54ec21a6f8d143cbe8fc6752fb6b96dfc8d607b3c9975"
             ),
             "compile prompt changed: bump PROMPT_VERSION and update the recorded hash"
         );
@@ -3118,6 +3143,65 @@ mod prompt_tests {
             let steps = body.matches("\n### s").count();
             assert_eq!(body.matches("- source-lines:").count(), steps);
         }
+    }
+
+    #[tokio::test]
+    async fn reused_locks_keep_build_record_provenance() {
+        let root = std::env::temp_dir().join(format!("vibe-reuse-{}", uuid::Uuid::new_v4()));
+        copy_dir(&shop_fixture(), &root);
+        let opts = super::CompileOptions {
+            root: &root,
+            llm: None,
+            llm_config: None,
+            check: false,
+        };
+        super::compile_project(&opts).await.unwrap();
+        let sources = crate::discover::discover(&root).unwrap();
+        let mut docs: HashMap<_, _> = sources
+            .iter()
+            .map(|source| {
+                let text =
+                    std::fs::read_to_string(root.join(super::lock_rel(&source.rel))).unwrap();
+                (source.id.clone(), parse_lock(&text).unwrap())
+            })
+            .collect();
+        let doc = docs.get_mut("product").unwrap();
+        doc.meta.source_type = crate::lock::SourceType::Natural;
+        doc.meta.compiler.llm_provider = "openai".into();
+        doc.meta.compiler.model_snapshot = "recorded-model".into();
+        doc.meta.compiler.endpoint_host = "recorded.example.test".into();
+        doc.meta.translation = Some(crate::lock::TranslationStamp {
+            prompt_version: "translate-1".into(),
+            llm_provider: "openai".into(),
+            model_snapshot: "recorded-model".into(),
+            hash: "sha256:abc".into(),
+        });
+        let ordered: Vec<_> = sources.iter().map(|source| source.id.clone()).collect();
+        super::write_or_check(
+            &opts,
+            &sources,
+            &docs,
+            &ordered,
+            &mut crate::diag::Report::new(),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(root.join(crate::buildrecord::PATH)).unwrap();
+        for doc in docs.values_mut() {
+            *doc = parse_lock(&crate::lock::render_lock(doc)).unwrap();
+        }
+        super::write_or_check(
+            &opts,
+            &sources,
+            &docs,
+            &ordered,
+            &mut crate::diag::Report::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            before,
+            std::fs::read_to_string(root.join(crate::buildrecord::PATH)).unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The shop test project.

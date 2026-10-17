@@ -8,17 +8,20 @@
 
 ```sh
 ./scripts/vibe-install.sh install --version v1.2.3 --non-interactive
+./scripts/vibe-install.sh install --version v1.3.0-rc.1 --non-interactive
 ./scripts/vibe-install.sh upgrade --version v1.3.0 --non-interactive
 ./scripts/vibe-install.sh upgrade --non-interactive # resolves the latest stable release
 ./scripts/vibe-install.sh remove --non-interactive
 ```
+
+`install --version` and `upgrade --version` accept `vX.Y.Z` or `vX.Y.Z-rc.N`. Every number must be zero or a positive integer without leading zeros; other pre-release labels and build metadata are rejected.
 
 The default destination is `$HOME/.local/bin/vibe`; override it with `--install-dir /absolute/path`. If the directory is not on `PATH`, the script prints a hint and never edits shell profiles. Run `--help` for all options.
 
 ## Security model
 
 1. Platforms are allowlisted; unsupported platforms fail closed.
-2. `install` requires an explicit stable `vX.Y.Z`. When `upgrade` has no version, it only accepts a GitHub `releases/latest` redirect within the same repository.
+2. `install` requires an explicit `vX.Y.Z` or `vX.Y.Z-rc.N` tag. When `upgrade` has no version, it only accepts a GitHub `releases/latest` redirect within the same repository.
 3. All downloads use HTTPS only (`--proto '=https'`) with TLS 1.2 or later (`--tlsv1.2`); any download failure stops the run.
 4. The asset must first match the same release's `SHA256SUMS`, then pass `gh attestation verify` with an authenticated GitHub CLI (decision 118, spec 2C.3b/9C):
 
@@ -31,7 +34,7 @@ The default destination is `$HOME/.local/bin/vibe`; override it with `--install-
      --deny-self-hosted-runners
    ```
 
-   The commit SHA is resolved from the tag with `gh api repos/vibe-backend/sdk/commits/refs/tags/v<version>`. The attestation identity is hard-coded in the script; `VIBE_INSTALL_REPOSITORY` and `VIBE_INSTALL_DOWNLOAD_URL` cannot change it. If any check fails, the existing version is left in place.
+   The commit SHA is resolved from the tag with `gh api repos/vibe-backend/sdk/commits/refs/tags/v<version>`. Stable releases and pre-releases use the identical attestation identity: workflow `.github/workflows/release.yml` of `vibe-backend/sdk`, source ref `refs/tags/v<version>` (including any `-rc.N` suffix), and issuer `https://token.actions.githubusercontent.com` (the `gh` default). This identity is hard-coded in the script; `VIBE_INSTALL_REPOSITORY` and `VIBE_INSTALL_DOWNLOAD_URL` cannot change it. If any check fails, the existing version is left in place.
 5. The archive may contain only a single top-level, non-symlink `vibe`. Each verified version lives in an immutable version directory, and the public `vibe` symlink is switched atomically with a single rename. An operation lock prevents install, upgrade and remove from racing.
 6. The script never overwrites an unmanaged `vibe`. `remove` only accepts a managed symlink pointing at `.vibe-managed/versions/.../vibe`, and deletes only the managed root and that symlink, never the install directory or other files.
 7. Re-installing the same version with identical content is a no-op.
@@ -46,4 +49,4 @@ The checksum detects transport corruption; the GitHub build attestation binds th
 python3 tests/install_manager.py
 ```
 
-The tests use local mock release, curl and attestation commands and never contact GitHub. They cover fresh install, upgrade to latest, repeated runs, remove, preserving the existing version on network/checksum/attestation failure, the pinned attestation identity and flags, unsupported platforms, invalid destinations, the operation lock, and never overwriting or removing unmanaged files.
+The tests use local mock release, curl and attestation commands and never contact GitHub. They cover installing `vX.Y.Z` or `vX.Y.Z-rc.N`, upgrades from stable to rc and rc to stable, rejection of invalid and multi-line versions before network calls, upgrade to latest, repeated runs, remove, preserving the existing version on network/checksum/attestation failure (including rc verification failures), the pinned attestation identity and flags, unsupported platforms, invalid destinations, the operation lock, and never overwriting or removing unmanaged files.

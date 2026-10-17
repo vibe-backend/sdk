@@ -1772,7 +1772,7 @@ async fn route_jwt_overrides_end_to_end() {
 
 #[tokio::test]
 async fn private_endpoint_deployment_requires_signed_dev_mode() {
-    use vibe::lock::{compiler_hash, parse_lock, render_lock};
+    use vibe::lock::parse_lock;
     use vibe::manifest::{
         manifest_from_project_with_mode, read_manifest, write_manifest, BuildMode,
     };
@@ -1791,14 +1791,26 @@ async fn private_endpoint_deployment_requires_signed_dev_mode() {
     let mut lock = parse_lock(&fs::read_to_string(&lock_path).unwrap()).unwrap();
     lock.meta.compiler.endpoint_private = true;
     lock.meta.compiler.endpoint_host = "localhost".into();
-    lock.meta.compiler_hash = compiler_hash(&lock.meta.compiler);
+    lock.meta.compiler.llm_provider = "openai".into();
     let docs = std::collections::HashMap::from([(lock.meta.id.clone(), lock.clone())]);
-    assert!(vibe::manifest::build_manifest(&docs)
-        .unwrap_err()
-        .to_string()
-        .contains("private endpoint cannot be deployed"));
-    fs::write(&lock_path, render_lock(&lock)).unwrap();
-    rerecord(&root);
+    let mut record: vibe::buildrecord::BuildRecord =
+        serde_json::from_str(&fs::read_to_string(root.join(vibe::buildrecord::PATH)).unwrap())
+            .unwrap();
+    record.compilers.insert(
+        "api/catalog/v1/get-product/get-product.lock.md".into(),
+        lock.meta.compiler.llm_stamp().unwrap(),
+    );
+    assert!(
+        vibe::manifest::build_manifest_with_record(&docs, false, Some(&record))
+            .unwrap_err()
+            .to_string()
+            .contains("private endpoint cannot be deployed")
+    );
+    fs::write(
+        root.join(vibe::buildrecord::PATH),
+        serde_json::to_string(&record).unwrap(),
+    )
+    .unwrap();
     let key = sign::load_or_create(&root).unwrap();
     let verify = key.verifying_key();
     for dev in [false, true] {

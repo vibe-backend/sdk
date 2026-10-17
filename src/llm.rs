@@ -107,7 +107,7 @@ pub fn sent_params(config: &LlmConfig, model: &str) -> SentParams {
     params
 }
 
-/// Provider name recorded in the lock: `openai-responses` when the OpenAI
+/// Provider name recorded in build provenance: `openai-responses` when the OpenAI
 /// Responses API is used (#40), otherwise the provider itself.
 pub fn lock_provider(config: &LlmConfig) -> String {
     if config.provider == OPENAI && config.api_style == "responses" {

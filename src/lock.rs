@@ -2,13 +2,13 @@ use std::collections::BTreeMap;
 
 use crate::hashutil::sha256_prefixed;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 
 pub const COMPILER_NAME: &str = "md-logic";
 pub const COMPILER_VERSION: &str = "0.1.0";
 // Every compile prompt text change (system, guide, examples) must bump PROMPT_VERSION:
 // it feeds compiler-hash and the LLM cache key.
-pub const PROMPT_VERSION: &str = "prompt-9";
+pub const PROMPT_VERSION: &str = "prompt-10";
 pub const LOCK_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +131,7 @@ pub struct Dependency {
 pub struct CompilerStamp {
     pub name: String,
     pub version: String,
+    /// In-memory LLM settings are copied to build provenance, never rendered or hashed.
     pub model_snapshot: String,
     pub llm_provider: String,
     pub endpoint_host: String,
@@ -138,6 +139,30 @@ pub struct CompilerStamp {
     pub seed: u64,
     /// Deterministic parameters the adapter actually sent. Empty when none were sent.
     pub sent_params: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LlmStamp {
+    pub llm_provider: String,
+    pub model_snapshot: String,
+    pub endpoint_host: String,
+    pub endpoint_private: bool,
+    pub llm_seed: u64,
+    pub sent_params: BTreeMap<String, String>,
+}
+
+impl CompilerStamp {
+    pub fn llm_stamp(&self) -> Option<LlmStamp> {
+        (self.llm_provider != "none").then(|| LlmStamp {
+            llm_provider: self.llm_provider.clone(),
+            model_snapshot: self.model_snapshot.clone(),
+            endpoint_host: self.endpoint_host.clone(),
+            endpoint_private: self.endpoint_private,
+            llm_seed: self.seed,
+            sent_params: self.sent_params.clone(),
+        })
+    }
 }
 
 impl CompilerStamp {
@@ -312,38 +337,9 @@ pub fn section_order(kind: Kind, scope: Option<Scope>) -> &'static [&'static str
 pub fn compiler_hash(stamp: &CompilerStamp) -> String {
     let mut root = BTreeMap::new();
     root.insert("compiler.version".to_string(), json!(stamp.version));
-    root.insert("endpoint-host".to_string(), json!(stamp.endpoint_host));
-    root.insert(
-        "endpoint-private".to_string(),
-        json!(stamp.endpoint_private),
-    );
-    root.insert("llm-provider".to_string(), json!(stamp.llm_provider));
-    root.insert("llm-seed".to_string(), json!(stamp.seed));
-    root.insert("model-snapshot".to_string(), json!(stamp.model_snapshot));
     root.insert("prompt-version".to_string(), json!(PROMPT_VERSION));
-    root.insert(
-        "sent-params".to_string(),
-        sent_params_json(&stamp.sent_params),
-    );
     let raw = serde_json::to_string(&root).expect("compiler hash json");
     sha256_prefixed(raw.as_bytes())
-}
-
-fn sent_params_json(params: &BTreeMap<String, String>) -> Value {
-    let mut out = serde_json::Map::new();
-    for (key, value) in params {
-        let parsed = if key == "reasoning_effort" {
-            Value::String(value.clone())
-        } else if let Ok(number) = value.parse::<i64>() {
-            json!(number)
-        } else if let Ok(number) = value.parse::<f64>() {
-            json!(number)
-        } else {
-            Value::String(value.clone())
-        };
-        out.insert(key.clone(), parsed);
-    }
-    Value::Object(out)
 }
 
 /// Hash of the definition a dependent should pin.
@@ -403,15 +399,8 @@ fn render_meta(meta: &Meta) -> String {
         }
     }
     out.push_str(&format!(
-        "compiler: {{ name: {}, version: {}, model-snapshot: {}, llm-provider: {}, endpoint-host: {}, endpoint-private: {}, llm-seed: {}, sent-params: {} }}\n",
-        meta.compiler.name,
-        meta.compiler.version,
-        meta.compiler.model_snapshot,
-        meta.compiler.llm_provider,
-        meta.compiler.endpoint_host,
-        meta.compiler.endpoint_private,
-        meta.compiler.seed,
-        render_sent_params(&meta.compiler.sent_params)
+        "compiler: {{ name: {}, version: {} }}\n",
+        meta.compiler.name, meta.compiler.version,
     ));
     push_line(&mut out, "compiler-hash", &meta.compiler_hash);
     if meta.security_items.is_empty() {
@@ -744,7 +733,22 @@ fn parse_meta(front: &str) -> Result<Meta, String> {
     if item_approvals {
         legacy_fields.push("security-items approved-by".into());
     }
-    let compiler = parse_compiler(&get("compiler")?)?;
+    let raw_compiler = get("compiler")?;
+    for (key, _) in parse_inline_map(&raw_compiler)? {
+        if matches!(
+            key.as_str(),
+            "model-snapshot"
+                | "llm-provider"
+                | "endpoint-host"
+                | "endpoint-private"
+                | "llm-seed"
+                | "seed"
+                | "sent-params"
+        ) {
+            legacy_fields.push(format!("compiler.{key}"));
+        }
+    }
+    let compiler = parse_compiler(&raw_compiler)?;
     let translation = match fields.iter().find(|(k, _)| k == "translation") {
         Some((_, raw)) => {
             parse_translation(raw)?;
@@ -826,39 +830,12 @@ fn parse_security(raw: &str) -> Result<(Vec<SecurityItem>, bool), String> {
     Ok((items, legacy))
 }
 
-fn render_sent_params(params: &BTreeMap<String, String>) -> String {
-    if params.is_empty() {
-        return "{}".into();
-    }
-    let body = params
-        .iter()
-        .map(|(key, value)| format!("{key}: {value}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{{ {body} }}")
-}
-
 fn parse_compiler(raw: &str) -> Result<CompilerStamp, String> {
     let map = parse_inline_map(raw)?;
-    let seed = map
-        .iter()
-        .find(|(key, _)| key == "llm-seed" || key == "seed")
-        .map(|(_, value)| value.as_str())
-        .ok_or("missing llm-seed")?;
-    let sent_raw = map
-        .iter()
-        .find(|(key, _)| key == "sent-params")
-        .map(|(_, value)| value.as_str())
-        .unwrap_or("{}");
     Ok(CompilerStamp {
         name: map_get(&map, "name")?.to_string(),
         version: map_get(&map, "version")?.to_string(),
-        model_snapshot: map_get(&map, "model-snapshot")?.to_string(),
-        llm_provider: map_get(&map, "llm-provider")?.to_string(),
-        endpoint_host: map_get(&map, "endpoint-host")?.to_string(),
-        endpoint_private: map_get(&map, "endpoint-private")? == "true",
-        seed: seed.parse().map_err(|_| "bad seed".to_string())?,
-        sent_params: parse_sent_params(sent_raw)?,
+        ..CompilerStamp::deterministic()
     })
 }
 
@@ -882,11 +859,6 @@ fn parse_translation(raw: &str) -> Result<TranslationStamp, String> {
         model_snapshot: map_get(&map, "model-snapshot")?.to_string(),
         hash,
     })
-}
-
-fn parse_sent_params(raw: &str) -> Result<BTreeMap<String, String>, String> {
-    let map = parse_inline_map(raw)?;
-    Ok(map.into_iter().collect())
 }
 
 fn map_get<'a>(map: &'a [(String, String)], key: &str) -> Result<&'a str, String> {
@@ -1034,6 +1006,54 @@ pub fn signing_payload(rendered_with_none: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiler_environment_is_ignored_and_not_hashed_or_rendered() {
+        let mut meta = Meta::pending(Kind::Model, None, "product", "models/product/product.md");
+        let hash = compiler_hash(&meta.compiler);
+        assert_eq!(
+            hash,
+            sha256_prefixed(
+                format!(
+                    "{{\"compiler.version\":\"{}\",\"prompt-version\":\"{}\"}}",
+                    COMPILER_VERSION, PROMPT_VERSION
+                )
+                .as_bytes()
+            )
+        );
+        meta.compiler.model_snapshot = "probe-model".into();
+        meta.compiler.llm_provider = "probe-provider".into();
+        meta.compiler.endpoint_host = "probe-host".into();
+        meta.compiler.endpoint_private = true;
+        meta.compiler.seed = 913;
+        meta.compiler
+            .sent_params
+            .insert("temperature".into(), "0".into());
+        assert_eq!(hash, compiler_hash(&meta.compiler));
+        meta.compiler_hash = hash;
+        meta.source_hash = "sha256:abc".into();
+        let doc = LockDoc {
+            meta,
+            sections: Vec::new(),
+        };
+        let text = render_lock(&doc);
+        for key in [
+            "model-snapshot",
+            "llm-provider",
+            "endpoint-host",
+            "endpoint-private",
+            "llm-seed",
+            "sent-params",
+            "probe-",
+        ] {
+            assert!(!text.contains(key));
+        }
+        let old = text.replace("version: 0.1.0 }", "version: 0.1.0, model-snapshot: old, llm-provider: old, endpoint-host: old, endpoint-private: true, llm-seed: 913, seed: invalid, sent-params: { temperature: 0 } }");
+        let parsed = parse_lock(&old).unwrap();
+        assert_eq!(parsed.meta.legacy_fields.len(), 7);
+        assert_eq!(parsed.meta.compiler, CompilerStamp::deterministic());
+        assert_eq!(render_lock(&parsed), text);
+    }
 
     #[test]
     fn translation_stamp_is_not_rendered_and_legacy_stamp_is_ignored() {

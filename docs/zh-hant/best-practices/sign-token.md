@@ -31,7 +31,7 @@ source-hash: sha256:3b90...d4
 source-type: natural
 dependencies:
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 status: approved
 approval-mode: manual
