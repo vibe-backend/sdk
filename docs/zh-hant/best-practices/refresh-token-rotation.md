@@ -127,3 +127,5 @@ Return 204.
 - 由 pipeline 產生回應時，feature lock 的 `## Transform`／`## Steps` 應包含甚麼**未有規定**。
 - Decision 72 說固定的 refresh 限流會「用 §4.3 的 schema 寫入 lock」，但沒有展示是以明確的 `rate-limit` step 出現（如本頁所示），還是由 `token-refresh` 隱含。
 - 寬限期內可選的用戶端指紋比對（§4A.1 第 5 點）沒有對應參數。
+
+輪換進行中的 reservation 回傳可重試的 503 `TX_CONFLICT`，不含 `Set-Cookie`。先檢查重用：超過寬限期的已使用 token 即使仍有 reservation 也撤銷家族。完成後在寬限期內重試依決定 61 重發，超過寬限期則視為重用。簽發錯誤清除 reservation；取消請求、簽發逾時、完成交易失敗或 reservation 過期同樣清除 reservation，原 token 維持有效，可以重試；只有已提交的子 token 才會消耗原 token。資料庫／連線池逾時回傳 504 `TX_TIMEOUT`。升級後先執行 `vibe migrate`，再執行 `vibe serve`；reservation 欄位由 migration 按租戶新增。

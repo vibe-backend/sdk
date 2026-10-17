@@ -172,7 +172,7 @@
 | 58 | Adapter 按 model capability 送決定性參數：model 唔支援嘅參數（例如 `temperature`、`top_p`、`seed`）就唔送，唔可以強送；決定性只靠 CI 重編比對保證。Model pin 用 provider 回報嘅 model id／snapshot id，唔再要求 id 帶日期後綴。 | 已確認 | 2A.6、2A.8.2、2A.8.3、2A.8.6 |
 | 59 | 三個 provider 嘅 request path 同 header 固定寫入 adapter：OpenAI `POST {base}/chat/completions`＋`Authorization: Bearer`；Anthropic `POST {base}/v1/messages`＋`x-api-key`＋`anthropic-version: 2023-06-01`；Gemini `POST {base}/models/{model}:generateContent`＋`x-goog-api-key`。 | 已確認 | 2A.8.2 |
 | 60 | Refresh cookie 嘅 `Path` 一定包含 `{slug}`：`/{definition}/{version}/{slug}/refresh`（同 10.7 一致）。 | 已確認 | 4A.1 |
-| 61 | Refresh 寬限期精確定義：DB 只存 hash；寬限期內用返舊 token，平台用 `used_at` 判斷，撤銷上一次發出嘅子 token，再喺同一家族發一組新 token；唔儲存、唔重發明文。每個舊 token 最多重發一次（`used_at` 加 `grace_reissued_at`）；寬限期內第二次再用即當重用，撤銷成個家族。 | 已確認 | 4A.1 |
+| 61 | Refresh 寬限期精確定義：DB 只存 hash；寬限期內用返舊 token，平台用 `used_at` 判斷，撤銷上一次發出嘅子 token，再喺同一家族發一組新 token；唔儲存、唔重發明文。並行請求喺第一個請求處理中出示同一 token，會收到可重試嘅 503 TX_CONFLICT（retryable: true，唔清 cookie）。第一個請求完成之後，喺寬限期（10 秒）內再出示，按寬限期規則處理；超過寬限期先當重用，撤銷整個 family。每個舊 token 最多重發一次（`used_at` 加 `grace_reissued_at`）；寬限期內第二次再用即當重用，撤銷成個家族。 | 已確認（產品經理 2026-10-17） | 4A.1 |
 | 62 | `sign-token` 嘅 `tenant_id` 只有一個來源：平台由 slug（public）或者已驗證 token（auth）解析出嚟嘅 `ctx.tenant_id`；永遠唔由 client 或者 method 傳入，亦唔由 `users` 表讀。 | 已確認 | 12.6、12.8 |
 | 63 | `mail_worker` 加入 7.1 平台專用 role 表。 | 已確認 | 7.1 |
 | 64 | `compiler-hash` 只有一個標準定義（2A.1），包括 seed 同實際送出嘅決定性參數。 | 已確認 | 2A.1、2A.6、10.1 |
@@ -212,7 +212,7 @@
 | 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；CODEOWNERS required 係 source PR 合併條件（決定 115），SDK / `vibe build` 唔檢查 CODEOWNERS（2C.3a）。 | 已確認（產品經理 2026-10-14）：CODEOWNERS required 係 source PR 合併條件 | 2A.7、9B |
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，`site/build.mjs` 揀 latest 時跳過有呢個標記嘅版本。 | 已確認（產品經理 2026-10-14） | 文件標頭、網站 |
 | 95 | create-user 邀請（v1.8 修訂）：邀請信寫入 transactional outbox（同其他寫入同一個 transaction）之後，create-user 同 re-invite 回 **202**，body 帶 `user_id` 同 `invite_status: invite_pending`。Mail worker 喺背景寄同重試；超過重試上限標 `delivery_failed`。邀請狀態（`invite_pending`／`sent`／`delivery_failed`）可以查詢，亦可以經 re-invite 重寄。只有 transaction 失敗（outbox 冇寫入，成個 request rollback，決定 99）先回 503 `INVITE_NOT_QUEUED`（帶 `Retry-After`）。`INVITE_DELIVERY_FAILED` 唔再係 503 錯誤碼，改為狀態值 `delivery_failed`。同 issue #26 相關。 | 已確認（產品經理 2026-10-14） | 11.4、11.4a、11.4b |
-| 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i) 做**臨時方案**）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。人手批准把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；自動閘門仍然係決定 113／114／118；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。`--release-approval` 已撤回（產品經理 2026-10-16），冇額外把關。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，同時開返 Prevent self-review。另外 live `release` environment `can_admins_bypass: true` 由 Jack 直接決定保持開啟，係已接受嘅風險（admin 可以跳過 environment 批准）。上面 ruleset 設定照舊要求，但 SDK 唔讀（原本嘅 ruleset 檢查屬 `--release-approval`，已撤回）。`main` ruleset 保留 OrganizationAdmin bypass。剩餘風險（Jack 已接受）：admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass）；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；同一個帳戶（`j113203`）可以自己批准；`release` environment admin bypass 保持開啟。 | 已確認（產品經理 2026-10-14） | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
+| 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i) 做**臨時方案**）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。人手批准把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；自動閘門仍然係決定 113／114／118；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。`--release-approval` 已撤回（產品經理 2026-10-16），冇額外把關。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，同時開返 Prevent self-review。另外 live `release` environment `can_admins_bypass: true` 由 Jack 直接決定保持開啟，係已接受嘅風險（admin 可以跳過 environment 批准）。上面 ruleset 設定照舊要求，但 SDK 唔讀（原本嘅 ruleset 檢查屬 `--release-approval`，已撤回）。`main` ruleset 保留 OrganizationAdmin bypass。**已接受例外（Jack 決定 2026-10-16，issue #70；人手／文件層面）**：`main` ruleset `bypass_actors` 唔係空（例如 `[OrganizationAdmin, always]`）**唔會**阻 release。而家**冇**任何自動化檢查讀 ruleset 或者 `bypass_actors`（決定 90／#127：SDK 同 release workflow 唔讀 ruleset）；呢條例外係人手／文件層面接受。原因係而家得一個維護者、冇第二個 reviewer，冇 bypass 就冇嘢 merge 到。有第二個 reviewer 之後要重新檢討。如果將來 `release.yml` 加呢類步驟，只可以係唯讀、資訊性、永遠唔會擋 release（同決定 90、第 2C.3a 對齊）。呢條例外唔改 ruleset 設定，亦唔適用於 `v*` tag ruleset（嗰個 `bypass_actors` 照舊要求係空）。剩餘風險（Jack 已接受）：admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass）；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；同一個帳戶（`j113203`）可以自己批准；`release` environment admin bypass 保持開啟。 | 已確認（產品經理 2026-10-14；Jack 2026-10-16, #70） | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
 | 97 | 租戶隔離身份（v1 blocker）：runtime 為每個（租戶、role 類別）開獨立連線池，直接以 `LOGIN` 租戶 role 登入再執行 lock SQL；runtime 連線 role 同租戶 role 之間冇任何 membership，租戶連線入面冇辦法切返其他身份（唔用 `SET LOCAL ROLE`；除非之後證明 PostgreSQL 17 嘅 `SET LOCAL ROLE` 不可逆）。租戶 role `NOINHERIT`、只有自己 schema 嘅權限、唔係其他 role 嘅成員；憑證只存 runtime secret store。平台表（refresh token、idempotency、outbox）只喺租戶自己 schema，租戶 role 讀唔到任何跨租戶共用表。`app.tenant_id` 之類 GUC 只可以輔助（例如 log），永遠唔係身份來源。安全細節經私人 security advisory 處理。Role 命名、連線池上限、憑證、閒置關閉、owner role 同 policy 比對見決定 129。 | 已確認（產品經理 2026-10-14） | 7.1、7.1a、9C |
 | 98 | Lock SQL parser 白名單：用 PostgreSQL 解析器（例如 `pg_query`）解析，只准單一 DML statement；禁止 transaction 控制、身份切換語句、會話設定修改同 schema-qualified 名稱；function 同 type 只准白名單；解析失敗即 fail closed。Conformance 要有跨租戶負面測試。 補充（已確認（產品經理 2026-10-14），Code Reviewer）：function 白名單係正面清單，冇列就禁止（動態 SQL／XML 查詢函數、introspection、取檔／外連函數、large object 全部唔喺入面）；lock SQL 唔可以有任何會話設定修改；唔可以引用平台表；migration 同樣用 parser 檢查（禁止提權 function、非白名單語言嘅 function／trigger、role 同權限操作、會話設定修改）；全部 fail closed，並有對應負面測試。 | 已確認（產品經理 2026-10-14） | 2A.4、7.1a、10.1 |
 | 99 | 跨 model transaction：一個 request = 一個 runtime 管理嘅 transaction（`READ COMMITTED`）；用戶 SQL 控制唔到 transaction 邊界；庫存扣減用條件 UPDATE（`WHERE stock >= qty`）再檢查 affected rows，唔夠就 409 同 rollback；冇跨 request、跨 DB 或者分散式 transaction；寫入按固定次序、喺租戶 role 之下執行。取代 7.1「每個 query 獨立 transaction」。 | 已確認（產品經理 2026-10-14） | 7.1、7.4、12.6 |
@@ -253,7 +253,7 @@
 | 144 | Refresh／logout 檢查次序（全部喺讀 cookie 之前做，補充決定 101）：1. method 一定 `POST`（其他回 405）；2. `Origin` 一定存在而且完全等於 `allowed-origins` 其中一個；3. `cross-site` 模式一定有 `X-Vibe-CSRF: 1`（cookie logout 喺任何模式都一定要，決定 145）；2 或 3 失敗對外一律回 403 `CSRF_REJECTED`，詳細原因只寫 server log 同審計；呢類 403 唔清 cookie，cookie 只喺通過檢查之後先會被清；4. cookie 模式只由 cookie 讀 token，忽略 body 入面嘅 `refresh_token`。唔接受 `Referer` 代替 `Origin`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
 | 145 | Cookie 模式 logout 唔要求 access token：瀏覽器 reload 之後記憶體冇 access token，所以 `token-revoke` 喺 `token-source: cookie` 而且 `scope: family` 時，以 cookie 搵家族並撤銷，唔需要 `auth`（決定 65「一定要 `auth`」嘅例外，只限呢個組合）。條件（產品經理 2026-10-16 確認；架構師 2026-10-16 釐清）：(1) 三項檢查，依次：(a) `Origin` 一定存在而且完全等於嗰個 slug 嘅決定 101 `allowed-origins` 其中一個（同 refresh 用同一份設定，冇另外嘅 logout 清單）；(b) 一定帶 `X-Vibe-CSRF: 1`，`same-site` 模式都要；(c) token 只由 `__Host-vibe_rt_{slug}` cookie 讀，永遠唔由 body 或者其他 cookie 名讀。(a) 或 (b) 失敗即 fail closed：403 `CSRF_REJECTED`，唔讀 cookie、唔撤銷、唔清 cookie。(2) (a)、(b) 通過之後，有效 cookie 就撤銷佢對應嘅家族；冇 cookie、cookie 無效、過期或者已撤銷就乜都唔撤銷；兩種情況回應完全一樣：204 加清除 cookie，唔透露有冇 token 或者 token 係咪有效。(3) 只撤銷嗰個 cookie 對應嘅家族，而且家族一定要屬於 URL slug 嗰個租戶（RLS 照舊；租戶唔啱當無效 cookie 處理）；唔影響同一用戶其他家族。(4) 重複 logout 係 idempotent。(5) 同 refresh 一樣套用決定 72 嘅限流同最低回應耗時（300ms），令有效同無效 cookie 喺時間上分唔出。限流 key（issue #253，產品經理 2026-10-16 批准）：cookie logout 只用決定 72 嘅 IP 限流（每分鐘 30 次），計法同 refresh 一樣；**唔用**決定 72 嘅家族限流（每分鐘 10 次）。呢個係決定 72 嘅例外，只適用於 cookie logout，refresh 照舊用家族限流。有效、無效同冇 cookie 嘅 429 同回應耗時一定完全一樣；最低回應耗時 300ms 不變。見 4A.1b「Cookie logout 限流 key」。(6) 點解 `same-site` 都要 `X-Vibe-CSRF`：logout 冇 access token（本決定），所以除咗 `Origin` 檢查，CSRF header 係佢唯一嘅來源證明；無條件要求亦令兩個模式用同一條規則。(7) 必要測試見 4A.1b。`scope: all`（全部裝置登出）照舊一定要 `auth`。 | 已確認（產品經理 2026-10-16） | 4A.1a、4A.1b |
 | 146 | Access token 預設 TTL 15 分鐘（上限 1 小時照決定 6）；refresh 家族、`idle-ttl`、`reuse-grace` 嘅預設同上限照決定 6、45、61，唔改。Cookie 模式建議前端喺 access token 到期前 60 秒內 refresh。 | 已確認（產品經理 2026-10-16） | 4A.1、4A.1b |
-| 147 | Refresh／logout 錯誤碼（固定、平台提供，lock 唔使宣告；cookie 同 body transport 一律用同一套，`INVALID_REFRESH_TOKEN` 冇任何別名）：401 `INVALID_REFRESH_TOKEN`（只適用於 refresh：冇 token／冇 cookie、無效、過期、已撤銷、重用；同時清 cookie。Cookie logout 喺同樣情況唔回 401，按決定 145 回 204 加清 cookie；issue #253 釐清）；403 `CSRF_REJECTED`（決定 144；唔清 cookie）；405 `METHOD_NOT_ALLOWED`；429 `RATE_LIMITED`（決定 72 限流，帶 `Retry-After`）；503 `TX_CONFLICT`／504 `TX_TIMEOUT`（決定 100）。錯誤 body 唔包含任何 token、hash 或者家族 id。 | 已確認（產品經理 2026-10-16） | 4A.1b、8 |
+| 147 | Refresh／logout 錯誤碼（固定、平台提供，lock 唔使宣告；cookie 同 body transport 一律用同一套，`INVALID_REFRESH_TOKEN` 冇任何別名）：401 `INVALID_REFRESH_TOKEN`（只適用於 refresh：冇 token／冇 cookie、無效、過期、已撤銷、重用；同時清 cookie。Cookie logout 喺同樣情況唔回 401，按決定 145 回 204 加清 cookie；issue #253 釐清）；403 `CSRF_REJECTED`（決定 144；唔清 cookie）；405 `METHOD_NOT_ALLOWED`；429 `RATE_LIMITED`（只適用於決定 72 嘅 IP 限流，帶 `Retry-After`）；每個 refresh 家族嘅限流（決定 72）：超過上限時回 401 `INVALID_REFRESH_TOKEN`，同無效 token 嘅回應逐 byte 完全一樣（status、body 同所有 header，包括清除 refresh cookie 嘅同一個 `Set-Cookie`），唔帶 `Retry-After`，同樣套用最低回應耗時 300ms，唔撤銷家族。呢個事件只可以記錄喺營運人員／租戶可見嘅 server log，而且只可以用租戶 ID 同家族 ID 嘅 hash，永遠唔記錄 token 明文或者家族 ID 原文；除咗本規則之外，回應、API 錯誤訊息同公開文件都唔透露呢個事件；503 `TX_CONFLICT`／504 `TX_TIMEOUT`（決定 100）。錯誤 body 唔包含任何 token、hash 或者家族 id。 | 已確認（產品經理 2026-10-16） | 4A.1b、8 |
 | 148 | 向後相容：`transport` 預設照舊 `body`，現有 lock 唔使改；改做 `cookie` 係 opt-in，要重新 build。每個 endpoint version 只接受一種 transport，永遠唔會同時收 body 同 cookie；要遷移就喺新 `{version}` 開 cookie endpoint，舊版 body endpoint 照舊運作直到 deprecate。已發出嘅 body refresh token 唔會自動轉做 cookie，用戶喺新版重新登入。SDK client 預設照舊。 | 已確認（產品經理 2026-10-16） | 4A.1b |
 
 ### 0.12 Challenge provider：Turnstile（決定 131 起，issue #160，已確認（產品經理 2026-10-16））
@@ -798,8 +798,9 @@ jobs:
 ### 2C.3a `--release-approval`（已撤回，產品經理 2026-10-16）
 
 - 產品經理撤回 `--release-approval`（原決定 90），唔會實作。SDK 唔驗證 PR review、tree 相等、CODEOWNERS 設定、`main` 或者 tag ruleset，亦唔讀 environment 批准紀錄；高風險 `security-items` 只列入部署報告，唔阻 release。
+- **SDK 同 release workflow 都唔讀 ruleset／`bypass_actors`**（決定 90／#127；決定 96）：`.github/workflows/release.yml` 而家冇任何 ruleset／`bypass_actors` 檢查。如果將來 `release.yml` 加呢類步驟，只可以係唯讀、資訊性、永遠唔會擋 release（決定 96 已接受例外；`main` ruleset `bypass_actors` 唔係空唔阻 release）。
 - 唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118。
-- `main` 同 `v*` tag ruleset 照舊按 [`pr-review-guide.md`](pr-review-guide.md) 設定，但 SDK 唔檢查。
+- `main` 同 `v*` tag ruleset 照舊按 [`pr-review-guide.md`](pr-review-guide.md) 設定，但 SDK 同 release workflow 都唔檢查。
 - **剩餘風險（Jack 已接受）**：
   - Admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass 保持開啟）。
   - 唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118。
@@ -1066,10 +1067,10 @@ security-items:
 實作狀態（main，2026-10-16 檢查）：
 
 - 已實作：`vibe validate` 拒絕 ES256／RS256 以外嘅 `sign-jwt` alg；`sign-jwt` 執行時 alg 要同已載入 key 一致；`VIBE_JWT_ALG` 只接受 ES256、RS256；驗證時 header `alg` 要等於 key 嘅 alg（`none`、HS* 會被拒）；JWKS 只載入 P-256 同 ≥ 2048 bit 嘅 RSA key。
-- RS256 簽名私鑰最少 2048 bit 嘅啟動檢查：Implementation status: not yet implemented, follow-up #222.
-- 靜態驗證公鑰（`VIBE_JWT_PUBLIC_KEY_PEM`）RSA 最少 2048 bit 同設定 alg／key 類型一致嘅啟動檢查：Implementation status: not yet implemented, follow-up #224.
-- 用 JWKS 驗證時只接受一個設定 alg（而家每個 key 用自己嘅 alg，JWKS 同時有 EC 同 RSA key 嘅話兩種都收）：Implementation status: not yet implemented, follow-up #225.
-- `sign-jwt` 冇寫 `alg` 時預設 ES256（而家驗證器當錯誤）：Implementation status: not yet implemented, follow-up #226.
+- RS256 簽名私鑰最少 2048 bit；ES256 簽名私鑰一定要係 P-256，私鑰純量 d 要喺 `1..n-1` 範圍內，編碼入面唔可以有多餘資料：`vibe serve` 啟動時檢查，唔符合就拒絕啟動（#222）。`vibe validate --deploy` 讀唔到執行環境嘅私鑰，所以唔檢查 key 大細或者曲線；呢個檢查只喺 `vibe serve` 啟動時做。
+- 靜態驗證公鑰（`VIBE_JWT_PUBLIC_KEY_PEM`）：啟動時檢查 key 類型同設定 alg 一致，RSA 最少 2048 bit，ES256 一定要係 P-256 同有效點（P-384 等其他曲線拒絕啟動）（#224）。
+- JWKS 驗證只用設定 alg（`VIBE_JWT_ALG`，預設 ES256）嘅 key：解析 JWKS 時就按 kty／crv／alg 篩走其他 key；同一個 kid 喺文件出現多過一次就成個 kid 都唔用（記錄警告）；結果同 key 次序無關。route 層 issuer 嘅 JWKS 暫時用同一個部署設定 alg（#225）。
+- `sign-jwt` 冇寫 `alg` 時預設 ES256（#226）。
 
 ### 4.2 API key 模式（決定 43）
 
@@ -1122,17 +1123,19 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 
 ### 4A.1 Access token 同 refresh token（決定 6）
 
+- For the per-refresh-family limit, when the limit is exceeded the response is 401, consistent with an invalid token. IP limits remain 429 `RATE_LIMITED` with `Retry-After`.
 - Access token：JWT，ttl 上限 1 小時。
 - Refresh token：不透明隨機值（最少 256 bit），DB 只存 hash；ttl 上限 30 日（由家族第一次簽發計，絕對壽命），閒置 7 日冇用就失效。
 - 每次用 refresh token 都輪換：發新 refresh token 同新 access token，舊 refresh token 即時失效。
 - 同一次登入產生嘅 refresh token 屬同一個家族（`family_id`）；偵測到重用已失效嘅 refresh token，即時撤銷成個家族，並寫審計記錄、通知用戶。
 - 寬限期（決定 61）：為咗容忍網絡重試，輪換後 `reuse-grace`（預設同上限 10 秒）內再用同一個舊 token，唔當重用。DB 只存 hash，平台冇可能回返上一次嘅明文，所以做法係：
   1. 用 `HMAC-SHA-256(pepper, token)` 搵到嗰列；佢 `used_at` 唔係 null、`now() - used_at <= reuse-grace`、`grace_reissued_at` 係 null、家族未撤銷。
-  2. 喺同一個 transaction 撤銷佢嘅 `replaced_by` 子 token（`revoke_reason: grace-reissue`），再由同一個舊 token 發一個新子 token（同一個 `family_id`，`parent_id` 指舊 token），更新舊 token 嘅 `replaced_by`，設 `grace_reissued_at = now()`；`used_at` 唔改（寬限期唔會延長）。用 `update ... where grace_reissued_at is null` 做條件更新，兩個並發請求只有一個成功，另一個當重用。
+  2. 喺同一個 transaction 撤銷佢嘅 `replaced_by` 子 token（`revoke_reason: grace-reissue`），再由同一個舊 token 發一個新子 token（同一個 `family_id`，`parent_id` 指舊 token），更新舊 token 嘅 `replaced_by`，設 `grace_reissued_at = now()`；`used_at` 唔改（寬限期唔會延長）。用 `update ... where grace_reissued_at is null` 做條件更新，並行請求喺第一個請求處理中出示同一 token，會收到可重試嘅 503 TX_CONFLICT（retryable: true，唔清 cookie）。第一個請求完成之後，喺寬限期（10 秒）內再出示，按寬限期規則處理；超過寬限期先當重用，撤銷整個 family。
   3. 回新 access token 同新 refresh token。家族唔變，絕對壽命唔變。
   4. 每個舊 token 最多重發一次。超過寬限期、或者 `grace_reissued_at` 已經有值（寬限期內第二次再用）、或者家族已撤銷、或者子 token 已經再被輪換過，一律當重用：撤銷成個家族。
   5. 可選：平台可以額外比對 client 指紋（例如 User-Agent hash）先准重發；v1 唔要求。
 - 登出：revoke 當前家族；「全部裝置登出」revoke 該用戶所有家族。
+- 清理（#95）：revoke 一律用 UPDATE；成個家族絕對壽命完咗超過 1 日之後，`vibe migrate`（table owner）會分批 DELETE 嗰個家族嘅所有列（每批 1000 列，每次最多 100 批）。生效中嘅家族永遠唔會被清理，所以重用偵測唔受影響。
 - refresh 流程由平台內置 `token-refresh` pipeline 實現，用 `method` op 呼叫標咗 `capabilities: [sign-token]` 嘅 model method 簽新 access token。
 - 簽發：`sign-jwt` op 嘅 `issue-refresh` 參數決定係咪同時發 refresh token：`new-family`（登入）、`rotate`（refresh，由 `token-refresh` pipeline 注入）、`none`；由平台按呼叫來源決定，method 唔可以自己揀 `rotate`。
 
@@ -1174,6 +1177,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
   - `public: true`（因為冇 access token），租戶由 slug 決定。
   - 唔屬 public 寫入：用戶 lock 冇寫入 step，只有平台 `refresh_store` 寫平台表，所以唔計 7.2 嘅 public 寫入每日配額，亦唔需要 captcha。
   - 平台固定限流：IP 每分鐘 30 次、同一家族每分鐘 10 次；用 4.3 嘅 schema 寫入 lock。
+    超過家族上限嘅回應按決定 147。
   - 最低回應耗時 300ms（同一般 public endpoint）。
 
 #### `token-revoke` pipeline 參數（決定 65）
@@ -1288,10 +1292,10 @@ Logout（節錄）：
 
 | 狀態 | 錯誤碼 | 幾時 | 清 cookie |
 | --- | --- | --- | --- |
-| 401 | `INVALID_REFRESH_TOKEN` | 只適用於 refresh：冇 cookie、無效、過期、已撤銷、重用。Cookie logout 喺同樣情況唔回 401，一律 204 加清 cookie（決定 145） | 係 |
+| 401 | `INVALID_REFRESH_TOKEN` | 只適用於 refresh：冇 cookie、無效、過期、已撤銷、重用、超過每個 refresh 家族嘅限流（回應同無效 token 逐 byte 完全一樣，唔帶 `Retry-After`，最低回應耗時 300ms，唔撤銷家族；決定 147）。Cookie logout 喺同樣情況唔回 401，一律 204 加清 cookie（決定 145） | 係 |
 | 403 | `CSRF_REJECTED` | 冇 `Origin`、唔喺白名單；refresh 喺 `cross-site` 冇 `X-Vibe-CSRF: 1`；cookie logout 喺任何模式（包括 `same-site`）冇 `X-Vibe-CSRF: 1`（決定 145）。冇 cookie 唔係 403（logout 回 204，refresh 回 401）。詳細原因只入 server log 同審計 | 否（只有通過檢查嘅請求先會清 cookie） |
 | 405 | `METHOD_NOT_ALLOWED` | 唔係 `POST` | 否 |
-| 429 | `RATE_LIMITED` | 決定 72 限流 | 否 |
+| 429 | `RATE_LIMITED` | 只適用於 IP 限流（決定 72），帶 `Retry-After` | 否 |
 | 503／504 | `TX_CONFLICT`／`TX_TIMEOUT` | 決定 100 | 否 |
 
 所有回應帶 `Cache-Control: no-store`；body 同 log 永遠唔記錄 token 明文。
@@ -2067,7 +2071,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 - Runtime 限制：只載入簽咗名嘅 manifest、唔解析 md、冇 `LLM_*`、對外 call 白名單、kill switch（9A）、固定最低回應耗時、配額同限流。
 - Manifest 簽名（決定 79、89、92、96）：release 只由有專用 release ruleset（bypass 一定要空）嘅 `v*` tag 出（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118）；release 簽名只喺 `v*` tag 加有 required reviewers（Jack）嘅 `release` environment，用 release workflow 嘅 GitHub OIDC 身份做 Sigstore keyless 簽名（Rekor inclusion 必須，決定 119）；簽唔到就失敗，唔 fallback；production 只信 pin 死嘅 Sigstore 身份（issuer `https://token.actions.githubusercontent.com`，certificate identity 完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`，加 commit SHA；離線驗證，trust root embed 入 binary，見 2C.3b），dev key 永遠唔信任。剩餘風險：臨時方案 (i) 下 tag 身份唔係閘門，唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；keyless 身份只證明邊個 workflow 同 tag 產生 build，唔證明邊個批准，唔會加多一個人（任何 `j113203` agent 都可以開 tag 再自己批准）。
 - 高風險 fail closed（決定 90）已撤回（產品經理 2026-10-16）：高風險安全項目只列入部署報告；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（見 2C.3a）。
-- `main` ruleset 保留 admin bypass（決定 96 修訂）。剩餘風險（Jack 已接受）：admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass）；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；同一個帳戶（`j113203`）可以自己批准；`release` environment admin bypass 保持開啟。
+- `main` ruleset 保留 admin bypass（決定 96 修訂）；`bypass_actors` 唔係空係人手／文件層面已接受例外（Jack 2026-10-16，issue #70）：而家 SDK 同 release workflow 都唔讀 ruleset／`bypass_actors`（決定 90／#127）；如果將來 `release.yml` 加檢查，只可以係唯讀、資訊性、永遠唔會擋 release（同決定 90、第 2C.3a 對齊）。剩餘風險（Jack 已接受）：admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass）；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；同一個帳戶（`j113203`）可以自己批准；`release` environment admin bypass 保持開啟。
 - CODEOWNERS 必須（決定 29、37、93、115）：source PR 合併條件；SDK / release build 唔檢查（2C.3a）。
 - Production 一律拒絕 in-memory，冇 override（決定 91）。
 - `/latest/` 永遠唔係草稿（決定 94）。

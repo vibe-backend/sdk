@@ -115,7 +115,7 @@ pub fn add_slug(
     fs::write(path, text + "\n").map_err(|err| err.to_string())
 }
 
-fn valid_slug(slug: &str) -> bool {
+pub(super) fn valid_slug(slug: &str) -> bool {
     let bytes = slug.as_bytes();
     (1..=63).contains(&bytes.len())
         && bytes

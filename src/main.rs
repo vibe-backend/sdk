@@ -397,6 +397,15 @@ async fn cmd_serve(
     let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
+    for route in &manifest.routes {
+        if let Some(problem) = route
+            .refresh
+            .as_ref()
+            .and_then(|spec| vibe::manifest::refresh_spec_problem(&route.feature_id, spec))
+        {
+            return Err(problem);
+        }
+    }
     // `sign-jwt` key-refs name environment variables holding private PEMs.
     auth.signing_keys =
         vibe::runtime::load_signing_keys(&manifest, &|name| std::env::var(name).ok(), &auth.kid)?;
@@ -431,6 +440,19 @@ async fn cmd_serve(
         Arc::new(pg)
     };
     let loaded = vibe::runtime::load_project_slugs(project, memory)?;
+    if let (Some(pool), true) = (
+        &pg_pool,
+        manifest.routes.iter().any(|r| r.refresh.is_some()),
+    ) {
+        let mut tenants: Vec<String> = loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
+        tenants.sort();
+        tenants.dedup();
+        let client = pool
+            .get()
+            .await
+            .map_err(|err| format!("refresh token store check: {err}"))?;
+        vibe::runtime::refresh::check_store(&client, &tenants).await?;
+    }
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
@@ -537,6 +559,23 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
     for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant, &runtime_role).await? {
         println!("{line}");
     }
+    // Last: the revoke is table-level (on `_platform_refresh_tokens` only).
+    // `GRANT ... ON ALL TABLES IN SCHEMA` in a migration expands to per-table
+    // grants when it runs, so revoking afterwards removes those as well.
+    exec.check_role_separation_for(Some(&runtime_role)).await?;
+    if manifest.routes.iter().any(|r| r.refresh.is_some()) {
+        let schema = format!("t_{tenant}");
+        exec.batch(&vibe::runtime::refresh::table_statements(&schema)?)
+            .await?;
+        exec.batch(&vibe::runtime::refresh::runtime_grant_statements(
+            &schema,
+            &runtime_role,
+        )?)
+        .await?;
+        exec.batch(&vibe::runtime::refresh::cleanup_statements(&schema)?)
+            .await?;
+        println!("bootstrapped {schema}._platform_refresh_tokens (finished families cleaned up)");
+    }
     Ok(())
 }
 
@@ -544,19 +583,12 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
     let mut auth = AuthConfig::anonymous();
     if let Ok(pem) = std::env::var("VIBE_JWT_PUBLIC_KEY_PEM") {
         auth.public_pem = pem.replace("\\n", "\n");
-        auth.alg = vibe::runtime::detect_jwt_alg(&auth.public_pem)?;
     }
-    if let Ok(alg) = std::env::var("VIBE_JWT_ALG") {
-        auth.alg = match alg.trim().to_ascii_uppercase().as_str() {
-            "ES256" => jsonwebtoken::Algorithm::ES256,
-            "RS256" => jsonwebtoken::Algorithm::RS256,
-            other => {
-                return Err(format!(
-                    "VIBE_JWT_ALG `{other}`: only ES256 and RS256 are supported"
-                ));
-            }
-        };
-    }
+    let alg_env = std::env::var("VIBE_JWT_ALG").ok();
+    auth.alg = vibe::runtime::static_jwt_alg(
+        (!auth.public_pem.is_empty()).then_some(auth.public_pem.as_str()),
+        alg_env.as_deref(),
+    )?;
     if let Ok(iss) = std::env::var("VIBE_JWT_ISS") {
         auth.iss = iss;
     }
@@ -603,9 +635,9 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
             return Err("VIBE_JWT_ALLOW_PRIVATE_HOST is only allowed in development".into());
         }
         let source = vibe::runtime::jwks::HttpsJwks::with_policy(&uri, allow_private)?;
-        auth.jwks = Some(std::sync::Arc::new(vibe::runtime::jwks::JwksCache::new(
-            std::sync::Arc::new(source),
-        )));
+        auth.jwks = Some(std::sync::Arc::new(
+            vibe::runtime::jwks::JwksCache::with_alg(std::sync::Arc::new(source), auth.alg),
+        ));
     }
     if let Ok(path) = std::env::var("VIBE_API_KEYS_FILE") {
         auth.api_keys_file = Some(std::sync::Arc::new(vibe::runtime::ApiKeyFile::open(

@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
+use super::refresh::{RefreshPolicy, RevokeTarget, Rotated};
 use super::sql::{self, Col, Stmt};
 
 pub type Row = Map<String, Value>;
@@ -13,7 +14,15 @@ pub enum ExecError {
     NotFound,
     Conflict,
     Precondition,
+    Timeout,
+    IssuanceFailed,
     Message(String),
+}
+
+/// Issuance work performed only after refresh validation, without holding a rotation connection.
+#[async_trait]
+pub trait RefreshIssuer: Send + Sync {
+    async fn issue(&self, user_id: &str) -> Result<Value, ExecError>;
 }
 
 #[async_trait]
@@ -41,6 +50,66 @@ pub trait QueryExec: Send + Sync {
             "query steps need PostgreSQL; the --memory executor does not run them".into(),
         ))
     }
+
+    /// Stores a new refresh family; returns the family id.
+    async fn refresh_issue(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        token_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<String, ExecError>;
+
+    /// Presents a refresh token (by hash) and atomically rotates it to
+    /// `new_hash` (see [`super::refresh`]).
+    async fn refresh_rotate(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<Rotated, ExecError> {
+        self.refresh_rotate_authorized(tenant_id, token_hash, new_hash, policy, None)
+            .await
+            .map(|(rotated, _)| rotated)
+    }
+
+    /// Validate and detect reuse before invoking issuance. Issuance failure
+    /// leaves the presented token usable; reuse revocation commits without issuance.
+    async fn refresh_rotate_authorized(
+        &self,
+        _tenant_id: &str,
+        _token_hash: &str,
+        _new_hash: &str,
+        _policy: RefreshPolicy,
+        _issuer: Option<&dyn RefreshIssuer>,
+    ) -> Result<(Rotated, Option<Value>), ExecError> {
+        Err(ExecError::Message("authorized rotation unavailable".into()))
+    }
+
+    async fn refresh_revoke(
+        &self,
+        tenant_id: &str,
+        target: RevokeTarget<'_>,
+    ) -> Result<u64, ExecError>;
+
+    /// Immutable subject associated with a stored token, before rotation.
+    async fn refresh_subject(
+        &self,
+        _tenant_id: &str,
+        _token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        Err(ExecError::Message(
+            "refresh subject lookup unavailable".into(),
+        ))
+    }
+
+    /// Family id of a stored refresh token hash (for the per-family limit).
+    async fn refresh_family(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError>;
 
     /// Platform lookup for `sign-jwt`: `users.roles` of the user whose `id`
     /// is `user_id`; `None` when there is no such user.
@@ -99,14 +168,37 @@ impl tokio_postgres::types::ToSql for TextParam {
     tokio_postgres::types::to_sql_checked!();
 }
 
+/// Resolves a committed reservation if its request is dropped or finalization fails.
+struct ReservationGuard<F: FnOnce()>(Option<F>);
+impl<F: FnOnce()> Drop for ReservationGuard<F> {
+    fn drop(&mut self) {
+        if let Some(resolve) = self.0.take() {
+            resolve();
+        }
+    }
+}
+
+const REFRESH_TABLE: &str = "_platform_refresh_tokens";
+
 #[derive(Default)]
 pub struct MemoryExec {
     tables: Mutex<BTreeMap<String, Vec<Row>>>,
+    refresh_gate: tokio::sync::Mutex<()>,
+    /// Test stub for `query` steps (the memory executor runs no SQL).
+    query_stub: Mutex<Option<String>>,
 }
 
 impl MemoryExec {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Tests only: every `query` step returns one row `{column: <first
+    /// param>}` instead of the PostgreSQL-only error (a stand-in lookup).
+    pub fn stub_queries(&self, column: &str) {
+        if let Ok(mut stub) = self.query_stub.lock() {
+            *stub = Some(column.to_string());
+        }
     }
 
     /// Adds a row to a tenant table directly (dev data and tests).
@@ -119,6 +211,25 @@ impl MemoryExec {
 
 #[async_trait]
 impl QueryExec for MemoryExec {
+    async fn raw(
+        &self,
+        _tenant_id: &str,
+        _role: &str,
+        _writes: bool,
+        _sql: &str,
+        params: Vec<Option<String>>,
+    ) -> Result<Vec<Row>, ExecError> {
+        let stub = self.query_stub.lock().ok().and_then(|s| s.clone());
+        let Some(column) = stub else {
+            return Err(ExecError::Message(
+                "query steps need PostgreSQL; the --memory executor does not run them".into(),
+            ));
+        };
+        let mut row = Row::new();
+        row.insert(column, params.into_iter().next().flatten().into());
+        Ok(vec![row])
+    }
+
     async fn user_roles(
         &self,
         tenant_id: &str,
@@ -135,6 +246,224 @@ impl QueryExec for MemoryExec {
             return Ok(None);
         };
         roles_from(row.get("roles")).map(Some)
+    }
+
+    async fn refresh_subject(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        let tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        Ok(tables.get(&key(tenant_id, REFRESH_TABLE)).and_then(|rows| {
+            rows.iter()
+                .find(|r| r.get("token_hash").and_then(Value::as_str) == Some(token_hash))
+                .and_then(|r| r.get("user_id").and_then(Value::as_str))
+                .map(str::to_string)
+        }))
+    }
+
+    async fn refresh_family(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        let tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        Ok(tables.get(&key(tenant_id, REFRESH_TABLE)).and_then(|rows| {
+            rows.iter()
+                .find(|r| r.get("token_hash").and_then(Value::as_str) == Some(token_hash))
+                .and_then(|r| r.get("family_id").and_then(Value::as_str))
+                .map(str::to_string)
+        }))
+    }
+
+    async fn refresh_issue(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        token_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<String, ExecError> {
+        let _gate = self.refresh_gate.lock().await;
+        let mut tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        let rows = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+        let now = chrono::Utc::now().timestamp();
+        // Bounded cleanup of finished families (PostgreSQL: `vibe migrate`).
+        super::refresh::memory_cleanup(rows, now, super::refresh::CLEANUP_BATCH as usize);
+        Ok(super::refresh::memory_issue(
+            rows, tenant_id, user_id, token_hash, policy, now,
+        ))
+    }
+
+    async fn refresh_rotate_authorized(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: RefreshPolicy,
+        issuer: Option<&dyn RefreshIssuer>,
+    ) -> Result<(Rotated, Option<Value>), ExecError> {
+        let gate = self.refresh_gate.lock().await;
+        let validated_at = chrono::Utc::now().timestamp();
+        let reservation = uuid::Uuid::new_v4().to_string();
+        let (rotated, parent) = {
+            let mut tables = self
+                .tables
+                .lock()
+                .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+            let stored = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+            if let Some(row) = stored
+                .iter_mut()
+                .find(|row| row["token_hash"] == token_hash)
+            {
+                if row
+                    .get("pending_until")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|until| until <= validated_at)
+                {
+                    row.remove("pending_rotation");
+                    row.remove("pending_until");
+                }
+            }
+            let mut rows = stored.clone();
+            let rotated = super::refresh::memory_rotate(
+                &mut rows,
+                tenant_id,
+                token_hash,
+                new_hash,
+                policy,
+                validated_at,
+            );
+            if !matches!(rotated, Rotated::Ok { .. }) {
+                *stored = rows;
+                return Ok((rotated, None));
+            }
+            if stored
+                .iter()
+                .any(|row| row["token_hash"] == token_hash && row.get("pending_rotation").is_some())
+            {
+                return Err(ExecError::Conflict);
+            }
+            let parent = stored
+                .iter()
+                .find(|row| row["token_hash"] == token_hash)
+                .cloned()
+                .expect("validated parent");
+            if let Some(row) = stored
+                .iter_mut()
+                .find(|row| row["token_hash"] == token_hash)
+            {
+                row.insert("pending_rotation".into(), reservation.clone().into());
+                row.insert(
+                    "pending_until".into(),
+                    (validated_at
+                        + PgOptions::default().reservation_timeout_ms().div_ceil(1000) as i64)
+                        .into(),
+                );
+            }
+            (rotated, parent)
+        };
+        drop(gate);
+        let mut guard = ReservationGuard(Some(|| {
+            if let Ok(mut tables) = self.tables.lock() {
+                let rows = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+                if let Some(index) = rows.iter().position(|row| {
+                    row["token_hash"] == token_hash
+                        && row.get("pending_rotation").and_then(Value::as_str) == Some(&reservation)
+                }) {
+                    memory_revoke_changed_child(rows, &parent);
+                    rows[index].remove("pending_rotation");
+                    rows[index].remove("pending_until");
+                }
+            }
+        }));
+        let issued = if let (Some(issuer), Rotated::Ok { user_id, .. }) = (issuer, &rotated) {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(PgOptions::default().issuance_timeout_ms()),
+                issuer.issue(user_id),
+            )
+            .await
+            .map_err(|_| ExecError::Timeout)?
+            .map(Some)
+        } else {
+            Ok(None)
+        };
+        let _gate = self.refresh_gate.lock().await;
+        let mut tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        let rows = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+        let mut reserved = false;
+        if let Some(row) = rows.iter_mut().find(|row| row["token_hash"] == token_hash) {
+            if row.get("pending_rotation").and_then(Value::as_str) == Some(&reservation) {
+                reserved = row
+                    .get("pending_until")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|until| until > chrono::Utc::now().timestamp());
+                row.remove("pending_rotation");
+                row.remove("pending_until");
+            }
+        }
+        guard.0.take();
+        if memory_revoke_changed_child(rows, &parent) {
+            return Ok((
+                Rotated::Reuse {
+                    family_id: parent["family_id"].as_str().unwrap().to_owned(),
+                },
+                None,
+            ));
+        }
+        let current = rows.iter().find(|row| row["token_hash"] == token_hash);
+        if !current.is_some_and(|row| {
+            row["revoked_at"].is_null() && row["replaced_by"] == parent["replaced_by"]
+        }) {
+            return Ok((Rotated::Invalid, None));
+        }
+        if !reserved {
+            return Err(ExecError::Timeout);
+        }
+        let value = issued?;
+        let rotated = super::refresh::memory_rotate(
+            rows,
+            tenant_id,
+            token_hash,
+            new_hash,
+            policy,
+            validated_at,
+        );
+        if matches!(rotated, Rotated::Ok { .. }) {
+            Ok((rotated, value))
+        } else {
+            Ok((rotated, None))
+        }
+    }
+
+    async fn refresh_revoke(
+        &self,
+        tenant_id: &str,
+        target: RevokeTarget<'_>,
+    ) -> Result<u64, ExecError> {
+        let _gate = self.refresh_gate.lock().await;
+        let mut tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        let rows = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
+        Ok(super::refresh::memory_revoke(
+            rows,
+            tenant_id,
+            &target,
+            chrono::Utc::now().timestamp(),
+        ))
     }
 
     async fn execute(
@@ -429,6 +758,32 @@ pub fn role_allows(role: &str, stmt: &Stmt) -> Result<(), String> {
     }
 }
 
+fn memory_revoke_changed_child(rows: &mut [Row], parent: &Row) -> bool {
+    let changed = rows.iter().any(|row| {
+        row["id"] == parent["id"]
+            && row["revoked_at"].is_null()
+            && row["replaced_by"] == parent["replaced_by"]
+    }) && !parent["used_at"].is_null()
+        && !rows.iter().any(|row| {
+            row["id"] == parent["replaced_by"]
+                && row["used_at"].is_null()
+                && row["revoked_at"].is_null()
+                && row["replaced_by"].is_null()
+        });
+    if changed {
+        for row in rows
+            .iter_mut()
+            .filter(|row| row["family_id"] == parent["family_id"])
+        {
+            if row["revoked_at"].is_null() {
+                row.insert("revoked_at".into(), chrono::Utc::now().timestamp().into());
+                row.insert("revoke_reason".into(), "reuse-detected".into());
+            }
+        }
+    }
+    changed
+}
+
 /// Connection settings for [`PgExec`].
 #[derive(Clone, Debug)]
 pub struct PgOptions {
@@ -453,6 +808,16 @@ impl Default for PgOptions {
 }
 
 impl PgOptions {
+    fn issuance_timeout_ms(&self) -> u64 {
+        self.statement_timeout_ms
+            .saturating_add(self.pool_timeout_ms)
+    }
+
+    fn reservation_timeout_ms(&self) -> u64 {
+        self.issuance_timeout_ms()
+            .saturating_add(self.statement_timeout_ms)
+    }
+
     pub fn from_env() -> Result<Self, String> {
         let mut out = Self::default();
         let num = |name: &str| -> Result<Option<u64>, String> {
@@ -604,6 +969,14 @@ pub fn check_server_version(server_version_num: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Startup version check using the value returned by `SHOW server_version_num`.
+/// The supplied read can also represent a reported version in tests.
+pub async fn check_server_version_from(
+    read: impl std::future::Future<Output = Result<String, String>>,
+) -> Result<(), String> {
+    check_server_version(&read.await?)
+}
+
 impl PgExec {
     pub async fn connect(url: &str) -> Result<Self, String> {
         Self::connect_with(url, PgOptions::default()).await
@@ -653,13 +1026,18 @@ impl PgExec {
             .map_err(|err| err.to_string())?;
         // Fail at startup, not on the first request.
         let client = pool.get().await.map_err(pool_error)?;
-        let row = client
-            .query_one("SHOW server_version_num", &[])
-            .await
-            .map_err(|err| format!("reading PostgreSQL server version: {err}"))?;
-        check_server_version(row.get::<_, &str>(0))?;
+        check_server_version_from(async {
+            let row = client
+                .query_one("SHOW server_version_num", &[])
+                .await
+                .map_err(|err| format!("reading PostgreSQL server version: {err}"))?;
+            Ok(row.get::<_, String>(0))
+        })
+        .await?;
         drop(client);
-        Ok(Self { pool, options })
+        let exec = Self { pool, options };
+        exec.check_role_separation().await?;
+        Ok(exec)
     }
 
     /// The connection pool (shared with the challenge replay store).
@@ -678,6 +1056,37 @@ impl PgExec {
             client: Some(self.client().await?),
             in_transaction: false,
         })
+    }
+
+    /// The app query roles must never act as the runtime role: none of
+    /// public_reader, public_writer or app_rw may be a member of it,
+    /// directly or through other roles (that would hand them the runtime's
+    /// platform-table access).
+    pub async fn check_role_separation(&self) -> Result<(), String> {
+        self.check_role_separation_for(None).await
+    }
+
+    /// As `check_role_separation`, for a named role (`vibe migrate` checks
+    /// the runtime role it grants to); `None` means the connected role.
+    pub async fn check_role_separation_for(&self, role: Option<&str>) -> Result<(), String> {
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                "SELECT r.rolname::text FROM pg_roles r \
+                 WHERE r.rolname = ANY(ARRAY['public_reader','public_writer','app_rw']) \
+                 AND EXISTS (SELECT 1 FROM pg_roles t WHERE t.rolname = coalesce($1::text, current_user::text) \
+                             AND pg_has_role(r.oid, t.oid, 'MEMBER'))",
+                &[&role],
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        if let Some(row) = rows.first() {
+            let member: String = row.get(0);
+            return Err(format!(
+                "database role {member} is a member of the runtime role; revoke that membership (it would let app queries reach platform tables)"
+            ));
+        }
+        Ok(())
     }
 
     /// Refuses a connection role that can bypass row-level security: a
@@ -862,6 +1271,417 @@ impl QueryExec for PgExec {
         Ok(out)
     }
 
+    async fn refresh_subject(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        let rows = self
+            .run_tx(
+                tenant_id,
+                None,
+                false,
+                "SELECT user_id FROM _platform_refresh_tokens WHERE token_hash = $1",
+                vec![Some(token_hash.to_string())],
+            )
+            .await?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.get("user_id").and_then(Value::as_str))
+            .map(str::to_string))
+    }
+
+    async fn refresh_family(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        let rows = self
+            .run_tx(
+                tenant_id,
+                None,
+                false,
+                "SELECT family_id::text AS family_id FROM _platform_refresh_tokens WHERE token_hash = $1",
+                vec![Some(token_hash.to_string())],
+            )
+            .await?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.get("family_id").and_then(Value::as_str))
+            .map(str::to_string))
+    }
+
+    async fn refresh_issue(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        token_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<String, ExecError> {
+        if !super::slugs::valid_tenant(tenant_id) {
+            return Err(ExecError::Message("invalid tenant id".into()));
+        }
+        let family = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut client = self.client().await.map_err(ExecError::Message)?;
+        let tx = client.transaction().await.map_err(map_pg)?;
+        let schema = format!("\"t_{tenant_id}\"");
+        tx.query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true)",
+            &[&tenant_id, &schema],
+        )
+        .await
+        .map_err(map_pg)?;
+        // Per-user lock shared with logout-all, so a new family is either
+        // committed before logout-all lists the user's families or created
+        // after it finishes.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('vibe-refresh-user:' || $1))",
+            &[&user_id],
+        )
+        .await
+        .map_err(map_pg)?;
+        let family_ttl = policy.family_ttl as f64;
+        let idle_ttl = policy.idle_ttl as f64;
+        tx.execute(
+            "INSERT INTO _platform_refresh_tokens (id, tenant_id, family_id, user_id, token_hash, created_at, family_expires_at, idle_expires_at) \
+             VALUES ($1::text::uuid, $2, $3::text::uuid, $4, $5, clock_timestamp(), clock_timestamp() + make_interval(secs => $6), clock_timestamp() + make_interval(secs => $7))",
+            &[&id, &tenant_id, &family, &user_id, &token_hash, &family_ttl, &idle_ttl],
+        )
+        .await
+        .map_err(map_pg)?;
+        tx.commit().await.map_err(map_pg)?;
+        Ok(family)
+    }
+
+    async fn refresh_rotate_authorized(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: RefreshPolicy,
+        issuer: Option<&dyn RefreshIssuer>,
+    ) -> Result<(Rotated, Option<Value>), ExecError> {
+        if !super::slugs::valid_tenant(tenant_id) {
+            return Err(ExecError::Message("invalid tenant id".into()));
+        }
+        let mut client = self.pool.get().await.map_err(|err| match err {
+            deadpool_postgres::PoolError::Timeout(_) => ExecError::Timeout,
+            other => ExecError::Message(pool_error(other)),
+        })?;
+        let tx = client.transaction().await.map_err(map_pg)?;
+        let schema = format!("\"t_{tenant_id}\"");
+        tx.query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), \
+             set_config('statement_timeout', $3, true), set_config('lock_timeout', $3, true)",
+            &[
+                &tenant_id,
+                &schema,
+                &self.options.statement_timeout_ms.to_string(),
+            ],
+        )
+        .await
+        .map_err(map_pg)?;
+        // Family lock: every rotation and revocation of one family takes
+        // this transaction-scoped advisory lock first, so a family revoke
+        // cannot miss a child inserted by a concurrent rotation (also with
+        // a connection pool or several instances).
+        let family_of = tx
+            .query_opt(
+                "SELECT family_id::text FROM _platform_refresh_tokens WHERE token_hash = $1",
+                &[&token_hash],
+            )
+            .await
+            .map_err(map_pg)?;
+        let Some(family_of) = family_of else {
+            return Ok((Rotated::Invalid, None));
+        };
+        let family_of: String = family_of.get(0);
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('vibe-refresh:' || $1))",
+            &[&family_of],
+        )
+        .await
+        .map_err(map_pg)?;
+        // Row lock: concurrent presentations of one token serialise here.
+        tx.query_opt(
+            "SELECT id FROM _platform_refresh_tokens WHERE token_hash = $1 FOR UPDATE",
+            &[&token_hash],
+        )
+        .await
+        .map_err(map_pg)?;
+        tx.execute("UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE token_hash = $1 AND pending_rotation IS NOT NULL AND pending_until <= clock_timestamp()", &[&token_hash]).await.map_err(map_pg)?;
+        let row = tx
+            .query_opt(
+                "SELECT id::text, family_id::text, user_id, revoke_reason, revoked_at IS NOT NULL, \
+                 (clock_timestamp() >= family_expires_at OR clock_timestamp() >= idle_expires_at), \
+                 used_at IS NOT NULL, \
+                 (used_at IS NOT NULL AND clock_timestamp() - used_at <= make_interval(secs => $2::double precision) AND grace_reissued_at IS NULL \
+                  AND EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = t.replaced_by AND c.used_at IS NULL AND c.revoked_at IS NULL)), \
+                 replaced_by::text, \
+                 floor(extract(epoch FROM family_expires_at - clock_timestamp()))::bigint \
+                 FROM _platform_refresh_tokens t WHERE token_hash = $1 FOR UPDATE",
+                &[&token_hash, &(policy.grace as f64)],
+            )
+            .await
+            .map_err(map_pg)?;
+        let Some(row) = row else {
+            return Ok((Rotated::Invalid, None));
+        };
+        let id: String = row.get(0);
+        let family: String = row.get(1);
+        let user: String = row.get(2);
+        let reason: Option<String> = row.get(3);
+        let revoked: bool = row.get(4);
+        let expired: bool = row.get(5);
+        let used: bool = row.get(6);
+        let in_grace: bool = row.get(7);
+        let old_child: Option<String> = row.get(8);
+        let family_left: i64 = row.get(9);
+        let revoke_family =
+            "UPDATE _platform_refresh_tokens SET revoked_at = clock_timestamp(), revoke_reason = 'reuse-detected' \
+                             WHERE family_id = $1::text::uuid AND revoked_at IS NULL";
+        if revoked {
+            if reason.as_deref() == Some("grace-reissue") {
+                tx.execute(revoke_family, &[&family])
+                    .await
+                    .map_err(map_pg)?;
+                tx.commit().await.map_err(map_pg)?;
+                return Ok((Rotated::Reuse { family_id: family }, None));
+            }
+            return Ok((Rotated::Invalid, None));
+        }
+        // Spent before expired: a late replay still revokes the family. A
+        // grace reissue is allowed only while the earlier child is unused.
+        if used && !in_grace {
+            tx.execute(revoke_family, &[&family])
+                .await
+                .map_err(map_pg)?;
+            tx.commit().await.map_err(map_pg)?;
+            return Ok((Rotated::Reuse { family_id: family }, None));
+        }
+        let pending: Option<String> = tx
+            .query_one(
+                "SELECT CASE WHEN pending_until > clock_timestamp() THEN pending_rotation END FROM _platform_refresh_tokens WHERE id = $1::text::uuid",
+                &[&id],
+            )
+            .await
+            .map_err(map_pg)?
+            .get(0);
+        if pending.is_some() {
+            return Err(ExecError::Conflict);
+        }
+        if expired {
+            return Ok((Rotated::Invalid, None));
+        }
+        // Issuance holds neither a pool connection nor a family lock.
+        let reservation = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "UPDATE _platform_refresh_tokens SET pending_rotation = $1, pending_until = clock_timestamp() + make_interval(secs => $3::double precision) WHERE id = $2::text::uuid",
+            &[&reservation, &id, &(self.options.reservation_timeout_ms() as f64 / 1000.0)],
+        )
+        .await
+        .map_err(map_pg)?;
+        let pool = self.pool.clone();
+        let cleanup_tenant = tenant_id.to_owned();
+        let cleanup_schema = schema.clone();
+        let cleanup_id = id.clone();
+        let cleanup_reservation = reservation.clone();
+        let cleanup_timeout = self.options.statement_timeout_ms.to_string();
+        let cleanup_family = family.clone();
+        let mut guard = ReservationGuard(Some(move || {
+            tokio::spawn(async move {
+                if let Ok(mut client) = pool.get().await {
+                    if let Ok(tx) = client.transaction().await {
+                        if tx.query("SELECT set_config('search_path', $1, true), set_config('app.tenant_id', $2, true), set_config('statement_timeout', $3, true), set_config('lock_timeout', $3, true)", &[&cleanup_schema, &cleanup_tenant, &cleanup_timeout]).await.is_ok() {
+                            if tx.execute("SELECT pg_advisory_xact_lock(hashtext('vibe-refresh:' || $1))", &[&cleanup_family]).await.is_err() { return; }
+                            if tx.execute("UPDATE _platform_refresh_tokens SET revoked_at = clock_timestamp(), revoke_reason = 'reuse-detected' WHERE family_id = $1::text::uuid AND revoked_at IS NULL AND EXISTS (SELECT 1 FROM _platform_refresh_tokens p WHERE p.id = $2::text::uuid AND p.pending_rotation = $3 AND p.used_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = p.replaced_by AND c.used_at IS NULL AND c.revoked_at IS NULL AND c.replaced_by IS NULL))", &[&cleanup_family, &cleanup_id, &cleanup_reservation]).await.is_err() { return; }
+                            let _ = tx.execute("UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE id = $1::text::uuid AND pending_rotation = $2", &[&cleanup_id, &cleanup_reservation]).await;
+                            let _ = tx.commit().await;
+                        }
+                    }
+                }
+            });
+        }));
+        tx.commit().await.map_err(map_pg)?;
+        drop(client);
+        let issued = match issuer {
+            Some(issuer) => tokio::time::timeout(
+                std::time::Duration::from_millis(self.options.issuance_timeout_ms()),
+                issuer.issue(&user),
+            )
+            .await
+            .map_err(|_| ExecError::Timeout)?
+            .map(Some),
+            None => Ok(None),
+        };
+        let mut client = self.pool.get().await.map_err(|err| match err {
+            deadpool_postgres::PoolError::Timeout(_) => ExecError::Timeout,
+            other => ExecError::Message(pool_error(other)),
+        })?;
+        let tx = client.transaction().await.map_err(map_pg)?;
+        tx.query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), set_config('statement_timeout', $3, true), set_config('lock_timeout', $3, true)",
+            &[&tenant_id, &schema, &self.options.statement_timeout_ms.to_string()],
+        ).await.map_err(map_pg)?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('vibe-refresh:' || $1))",
+            &[&family],
+        )
+        .await
+        .map_err(map_pg)?;
+        if used {
+            let child_changed: bool = tx.query_one(
+                "SELECT EXISTS (SELECT 1 FROM _platform_refresh_tokens p WHERE p.id = $1::text::uuid AND p.pending_rotation = $2 AND p.revoked_at IS NULL AND NOT EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = $3::text::uuid AND c.used_at IS NULL AND c.revoked_at IS NULL AND c.replaced_by IS NULL))",
+                &[&id, &reservation, &old_child],
+            ).await.map_err(map_pg)?.get(0);
+            if child_changed {
+                tx.execute(revoke_family, &[&family])
+                    .await
+                    .map_err(map_pg)?;
+                tx.execute("UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE id = $1::text::uuid AND pending_rotation = $2", &[&id, &reservation]).await.map_err(map_pg)?;
+                tx.commit().await.map_err(map_pg)?;
+                guard.0.take();
+                return Ok((Rotated::Reuse { family_id: family }, None));
+            }
+        }
+        let current = tx.execute(
+            "UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE id = $1::text::uuid AND pending_rotation = $2 AND revoked_at IS NULL AND pending_until > clock_timestamp() AND replaced_by IS NOT DISTINCT FROM $3::text::uuid AND (NOT $4 OR EXISTS (SELECT 1 FROM _platform_refresh_tokens c WHERE c.id = $3::text::uuid AND c.used_at IS NULL AND c.revoked_at IS NULL))",
+            &[&id, &reservation, &old_child, &used],
+        ).await.map_err(map_pg)?;
+        let value = match issued {
+            Ok(value) if current == 1 => value,
+            result => {
+                let still_current: bool = tx.query_one(
+                    "SELECT EXISTS (SELECT 1 FROM _platform_refresh_tokens WHERE id = $1::text::uuid AND revoked_at IS NULL AND replaced_by IS NOT DISTINCT FROM $2::text::uuid)",
+                    &[&id, &old_child],
+                ).await.map_err(map_pg)?.get(0);
+                tx.execute("UPDATE _platform_refresh_tokens SET pending_rotation = NULL, pending_until = NULL WHERE id = $1::text::uuid AND pending_rotation = $2", &[&id, &reservation]).await.map_err(map_pg)?;
+                tx.commit().await.map_err(map_pg)?;
+                guard.0.take();
+                if current == 0 && still_current {
+                    return Err(ExecError::Timeout);
+                }
+                return result.map(|_| (Rotated::Invalid, None));
+            }
+        };
+        let child = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO _platform_refresh_tokens (id, tenant_id, family_id, user_id, token_hash, parent_id, created_at, family_expires_at, idle_expires_at) \
+             SELECT $1::text::uuid, tenant_id, family_id, user_id, $2, id, clock_timestamp(), family_expires_at, clock_timestamp() + make_interval(secs => $3::double precision) \
+             FROM _platform_refresh_tokens WHERE id = $4::text::uuid",
+            &[&child, &new_hash, &(policy.idle_ttl as f64), &id],
+        )
+        .await
+        .map_err(map_pg)?;
+        if used {
+            if let Some(old) = old_child {
+                tx.execute(
+                    "UPDATE _platform_refresh_tokens SET revoked_at = clock_timestamp(), revoke_reason = 'grace-reissue' \
+                     WHERE id = $1::text::uuid AND revoked_at IS NULL",
+                    &[&old],
+                )
+                .await
+                .map_err(map_pg)?;
+            }
+            tx.execute(
+                "UPDATE _platform_refresh_tokens SET replaced_by = $1::text::uuid, grace_reissued_at = clock_timestamp() WHERE id = $2::text::uuid",
+                &[&child, &id],
+            )
+            .await
+            .map_err(map_pg)?;
+        } else {
+            tx.execute(
+                "UPDATE _platform_refresh_tokens SET replaced_by = $1::text::uuid, used_at = clock_timestamp() WHERE id = $2::text::uuid",
+                &[&child, &id],
+            )
+            .await
+            .map_err(map_pg)?;
+        }
+        tx.commit().await.map_err(map_pg)?;
+        guard.0.take();
+        Ok((
+            Rotated::Ok {
+                user_id: user,
+                family_id: family,
+                expires_in: policy.idle_ttl.min(family_left),
+            },
+            value,
+        ))
+    }
+
+    async fn refresh_revoke(
+        &self,
+        tenant_id: &str,
+        target: RevokeTarget<'_>,
+    ) -> Result<u64, ExecError> {
+        if !super::slugs::valid_tenant(tenant_id) {
+            return Err(ExecError::Message("invalid tenant id".into()));
+        }
+        let mut client = self.pool.get().await.map_err(|err| match err {
+            deadpool_postgres::PoolError::Timeout(_) => ExecError::Timeout,
+            other => ExecError::Message(pool_error(other)),
+        })?;
+        let tx = client.transaction().await.map_err(map_pg)?;
+        let schema = format!("\"t_{tenant_id}\"");
+        tx.query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), set_config('statement_timeout', $3, true), set_config('lock_timeout', $3, true)",
+            &[&tenant_id, &schema, &self.options.statement_timeout_ms.to_string()],
+        )
+        .await
+        .map_err(map_pg)?;
+        // Take the same per-family lock as rotation for every affected family
+        // (sorted, so concurrent revokes cannot deadlock), then revoke in a
+        // new statement: under READ COMMITTED it sees children committed by
+        // a rotation that held the lock before us.
+        let families = match target {
+            RevokeTarget::FamilyOf { hash, user } => {
+                tx.query(
+                    "SELECT DISTINCT family_id::text FROM _platform_refresh_tokens \
+                     WHERE token_hash = $1 AND user_id = $2 ORDER BY 1",
+                    &[&hash, &user],
+                )
+                .await
+            }
+            RevokeTarget::User(user) => {
+                // Same per-user lock as refresh_issue: a login running at the
+                // same time is either listed here or starts after this commit.
+                tx.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext('vibe-refresh-user:' || $1))",
+                    &[&user],
+                )
+                .await
+                .map_err(map_pg)?;
+                tx.query(
+                    "SELECT DISTINCT family_id::text FROM _platform_refresh_tokens \
+                     WHERE user_id = $1 AND revoked_at IS NULL ORDER BY 1",
+                    &[&user],
+                )
+                .await
+            }
+        }
+        .map_err(map_pg)?;
+        let families: Vec<String> = families.iter().map(|r| r.get(0)).collect();
+        for family in &families {
+            tx.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('vibe-refresh:' || $1))",
+                &[family],
+            )
+            .await
+            .map_err(map_pg)?;
+        }
+        let n = tx
+            .execute(
+                "UPDATE _platform_refresh_tokens SET revoked_at = clock_timestamp(), revoke_reason = 'logout' \
+                 WHERE revoked_at IS NULL AND family_id::text = ANY($1)",
+                &[&families],
+            )
+            .await
+            .map_err(map_pg)?;
+        tx.commit().await.map_err(map_pg)?;
+        Ok(n)
+    }
+
     async fn raw(
         &self,
         tenant_id: &str,
@@ -912,7 +1732,10 @@ impl PgExec {
         if !super::slugs::valid_tenant(tenant_id) {
             return Err(ExecError::Message("invalid tenant id".into()));
         }
-        let mut client = self.client().await.map_err(ExecError::Message)?;
+        let mut client = self.pool.get().await.map_err(|err| match err {
+            deadpool_postgres::PoolError::Timeout(_) => ExecError::Timeout,
+            other => ExecError::Message(pool_error(other)),
+        })?;
         let tx = client
             .transaction()
             .await
@@ -1009,7 +1832,9 @@ fn parse_cell(text: Option<String>, ty: &str) -> Value {
 
 fn map_pg(err: tokio_postgres::Error) -> ExecError {
     let code = err.code().map(|code| code.code());
-    if code == Some("23505") {
+    if matches!(code, Some("57014" | "55P03")) {
+        ExecError::Timeout
+    } else if matches!(code, Some("23505" | "40001" | "40P01")) {
         ExecError::Conflict
     } else {
         ExecError::Message(pg_error(err))
@@ -1155,6 +1980,24 @@ mod tls_tests {
 mod version_tests {
     use super::check_server_version;
 
+    #[tokio::test]
+    async fn startup_check_uses_reported_version() {
+        let err = super::check_server_version_from(async { Ok("150000".into()) })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "PostgreSQL 16 or later required (server_version_num is 150000)"
+        );
+        super::check_server_version_from(async { Ok("160000".into()) })
+            .await
+            .unwrap();
+        assert_eq!(
+            super::check_server_version_from(async { Err("version read failed".into()) }).await,
+            Err("version read failed".into())
+        );
+    }
+
     #[test]
     fn postgres_minimum_version_boundary() {
         assert_eq!(
@@ -1191,5 +2034,165 @@ mod version_tests {
                 "{v}: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+
+    struct Issuer {
+        entered: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl RefreshIssuer for Issuer {
+        async fn issue(&self, _: &str) -> Result<Value, ExecError> {
+            self.entered.notify_one();
+            self.resume.notified().await;
+            Ok(Value::Null)
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_expired_reservation_prevents_original_finalization() {
+        let exec = MemoryExec::new();
+        let tenant = "tenant0001";
+        let policy = RefreshPolicy::default();
+        exec.refresh_issue(tenant, "user", "parent", policy)
+            .await
+            .unwrap();
+        let issuer = Issuer {
+            entered: Default::default(),
+            resume: Default::default(),
+        };
+        let original = exec.refresh_rotate_authorized(
+            tenant,
+            "parent",
+            "original-child",
+            policy,
+            Some(&issuer),
+        );
+        let concurrent = async {
+            issuer.entered.notified().await;
+            {
+                let mut tables = exec.tables.lock().unwrap();
+                let rows = tables.get_mut(&key(tenant, REFRESH_TABLE)).unwrap();
+                rows[0].insert("pending_until".into(), 0.into());
+            }
+            exec.refresh_issue(tenant, "other-user", "unrelated-parent", policy)
+                .await
+                .unwrap();
+            assert!(matches!(
+                exec.refresh_rotate(tenant, "unrelated-parent", "unrelated-child", policy)
+                    .await
+                    .unwrap(),
+                Rotated::Ok { .. }
+            ));
+            issuer.resume.notify_one();
+        };
+        let (result, ()) = tokio::join!(original, concurrent);
+        assert!(matches!(result, Err(ExecError::Timeout)));
+        assert!(matches!(
+            exec.refresh_rotate(tenant, "parent", "other-child", policy)
+                .await
+                .unwrap(),
+            Rotated::Ok { .. }
+        ));
+        assert_eq!(
+            exec.refresh_family(tenant, "original-child").await.unwrap(),
+            None
+        );
+        assert!(exec
+            .refresh_family(tenant, "other-child")
+            .await
+            .unwrap()
+            .is_some());
+    }
+    async fn check_expired_memory_reservation(finalize: bool) {
+        let exec = MemoryExec::new();
+        let tenant = "tenant0001";
+        let policy = RefreshPolicy::default();
+        exec.refresh_issue(tenant, "user", "parent", policy)
+            .await
+            .unwrap();
+        let issuer = Issuer {
+            entered: Default::default(),
+            resume: Default::default(),
+        };
+        let rotation =
+            exec.refresh_rotate_authorized(tenant, "parent", "child", policy, Some(&issuer));
+        tokio::pin!(rotation);
+        tokio::select! {
+            _ = issuer.entered.notified() => {},
+            result = &mut rotation => panic!("rotation completed before reservation inspection: {result:?}"),
+        }
+        {
+            let mut tables = exec.tables.lock().unwrap();
+            tables.get_mut(&key(tenant, REFRESH_TABLE)).unwrap()[0]
+                .insert("pending_until".into(), 0.into());
+        }
+        if finalize {
+            // Memory finalization has no database operation to fail. Expire its
+            // reservation to exercise a failed finalization validation instead.
+            issuer.resume.notify_one();
+            assert!(matches!(rotation.await, Err(ExecError::Timeout)));
+        }
+        assert!(matches!(
+            exec.refresh_rotate(tenant, "parent", "retry", policy)
+                .await
+                .unwrap(),
+            Rotated::Ok { .. }
+        ));
+        assert_eq!(exec.refresh_family(tenant, "child").await.unwrap(), None);
+        assert!(exec
+            .refresh_family(tenant, "retry")
+            .await
+            .unwrap()
+            .is_some());
+        let tables = exec.tables.lock().unwrap();
+        let rows = &tables[&key(tenant, REFRESH_TABLE)];
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["revoked_at"].is_null()));
+        assert!(!rows[0]["replaced_by"].is_null());
+    }
+
+    #[tokio::test]
+    async fn memory_expired_reservation_allows_retry() {
+        check_expired_memory_reservation(false).await;
+    }
+
+    #[tokio::test]
+    async fn memory_finalization_failure_allows_retry() {
+        check_expired_memory_reservation(true).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_errors_are_classified_by_sqlstate() {
+        let Ok(url) = std::env::var("VIBE_TEST_PG_ADMIN_URL") else {
+            return;
+        };
+        let (admin, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        let schema = format!("mapping_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .unwrap();
+        for code in ["57014", "55P03", "23505", "40001", "40P01", "P0001"] {
+            let error = admin.batch_execute(&format!("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = '{code}', MESSAGE = 'neutral message'; END $$")).await.unwrap_err();
+            let mapped = map_pg(error);
+            match code {
+                "57014" | "55P03" => assert!(matches!(mapped, ExecError::Timeout)),
+                "23505" | "40001" | "40P01" => assert!(matches!(mapped, ExecError::Conflict)),
+                _ => assert!(matches!(mapped, ExecError::Message(_))),
+            }
+        }
+        admin
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 }
