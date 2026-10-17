@@ -64,7 +64,8 @@ Which store is used, when a verifier is configured:
   (decision 97: no table shared between tenants). The table has `tenant_id`
   under ENABLE + FORCE row level security with the standard
   `tenant_isolation` policy, is owned by the owner role and is created by that
-  tenant's `vibe migrate`. Every instance shares it, so a token, the per-IP
+  tenant's startup migration (`vibe run --db postgres` with
+  `VIBE_MIGRATE_DATABASE_URL` as owner). Every instance shares it, so a token, the per-IP
   and per-tenant quotas and the per-tenant capacity limit hold across
   instances; one tenant cannot use up another tenant's capacity.
 - The runtime role has only `SELECT, INSERT` on it (decision 27). The table is
@@ -72,7 +73,8 @@ Which store is used, when a verifier is configured:
   nonce; settling it inserts a `verified`, `rejected` or `released` row for
   that nonce. A `released` row only cancels its own `pending` row, so a
   verified token stays used for its whole TTL. Reads ignore expired rows;
-  expired rows are deleted only by the owner role when `vibe migrate` runs.
+  expired rows are deleted only during startup with owner credentials
+  (`VIBE_MIGRATE_DATABASE_URL`), before serving with the non-owner role.
   Checks are serialized per tenant with a transaction-level advisory lock.
 - Client IPs are stored as HMAC-SHA256 under a per-tenant key derived from
   `VIBE_API_KEY_PEPPER`; tokens as SHA-256 of the token.

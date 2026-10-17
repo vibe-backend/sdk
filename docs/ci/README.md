@@ -29,7 +29,7 @@ Locks are build output. They are not committed (`*.lock.md` is in
    `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<version>`,
    issuer `https://token.actions.githubusercontent.com` and the commit
    (fail closed), then deploys the same files to staging and then production.
-4. **Run.** `vibe run --artifact manifest.json` runs the build artifact. Outside development, `vibe run` / `vibe migrate` accept only
+4. **Run.** `vibe run --artifact manifest.json` runs the build artifact. Outside development, `vibe run` / `vibe-runtime run` accept only
    `build_mode: release` manifests with a Sigstore bundle
    (`<manifest>.sigstore.json`, or `VIBE_MANIFEST_BUNDLE`) for the deployed
    version `VIBE_RELEASE_VERSION`. They check that the certificate identity
@@ -55,7 +55,18 @@ Locks are build output. They are not committed (`*.lock.md` is in
 
 ## Local development
 
-`vibe keygen` creates `.vibe/signing.key` (mode 0600). `vibe build` writes
+`vibe build` creates `.vibe/signing.key` (mode 0600) and `.vibe/signing.pub`
+for development; release builds need no key. Every build runs the secret scan
+and fails on findings. It also validates and lists `.vibe/slugs.json` and
+`.vibe/disabled.txt` (edit these files directly; restart for disabled-endpoint
+changes), and warns about destructive migrations. Build writes
 locks and `.vibe/build-record.json`; builds (including `--release`) refuse
 locks that differ from that record. The record is a local
 tripwire, not a trust root; only the attested release artifact is deployable.
+
+For PostgreSQL deployment, `vibe run --db postgres` and
+`vibe-runtime run --db postgres` apply pending migrations before serving.
+Use `VIBE_MIGRATE_DATABASE_URL` for owner credentials and `VIBE_DATABASE_URL`
+for the non-owner serving connection. Once nothing is pending, subsequent
+startups may omit owner credentials. See [automatic migrations](../runtime-config.md#automatic-migrations-decision-179)
+for tenant selection, advisory locks and destructive-migration recovery.

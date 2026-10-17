@@ -42,10 +42,27 @@ pub async fn migrate_tenant(
     // Until COMMIT/ROLLBACK succeeds, dropping the session (error, panic,
     // cancelled future) closes the connection instead of pooling it.
     session.in_transaction(true);
+    // Wait before BEGIN so REPEATABLE READ cannot capture a snapshot from
+    // before the previous migrator committed. Transfer this session lock to
+    // a transaction lock below. The dirty-session flag also closes the
+    // connection (releasing both locks) on cancellation or any early error.
+    let tenant_lock = format!(
+        "hashtextextended('vibe_migrate:' || {}, 0)",
+        literal(tenant)
+    );
+    session
+        .batch(&[format!("SELECT pg_advisory_lock({tenant_lock})")])
+        .await?;
     // REPEATABLE READ: the catalog snapshot used for the cross-tenant checks
     // below must not move while other tenants migrate concurrently.
     session
         .batch(&["BEGIN ISOLATION LEVEL REPEATABLE READ".to_string()])
+        .await?;
+    session
+        .batch(&[
+            format!("SELECT pg_advisory_xact_lock({tenant_lock})"),
+            format!("SELECT pg_advisory_unlock({tenant_lock})"),
+        ])
         .await?;
     // Marker that only lives as long as this transaction. If it is gone at
     // the end, the transaction was ended (and maybe restarted) in between.
@@ -582,7 +599,15 @@ pub fn migration_digest(statements: &[String]) -> String {
 
 pub async fn ensure_tracking(exec: &PgExec, runtime_role: &str) -> Result<(), String> {
     let role = quote(runtime_role)?;
-    exec.batch(&[
+    let mut session = exec.session().await?;
+    session.in_transaction(true);
+    session.batch(&["BEGIN".into()]).await?;
+    // Fixed platform key: serialize first-time catalog creation and grants
+    // across startup instances, on this pinned connection only.
+    session
+        .batch(&["SELECT pg_advisory_xact_lock(1986618469, 179)".into()])
+        .await?;
+    session.batch(&[
         "CREATE SCHEMA IF NOT EXISTS vibe_platform".into(),
         "REVOKE ALL ON SCHEMA vibe_platform FROM PUBLIC".into(),
         "CREATE TABLE IF NOT EXISTS vibe_platform.applied_migrations (tenant_id text NOT NULL, migration_id text NOT NULL, sha256 text NOT NULL, destructive boolean NOT NULL, applied_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (tenant_id, migration_id))".into(),
@@ -591,7 +616,10 @@ pub async fn ensure_tracking(exec: &PgExec, runtime_role: &str) -> Result<(), St
         format!("GRANT USAGE ON SCHEMA vibe_platform TO {role}"),
         format!("REVOKE ALL ON vibe_platform.applied_migrations FROM {role}"),
         format!("GRANT SELECT ON vibe_platform.applied_migrations TO {role}"),
-    ]).await
+    ]).await?;
+    session.batch(&["COMMIT".into()]).await?;
+    session.in_transaction(false);
+    Ok(())
 }
 
 fn parse_records(rows: &[String]) -> std::collections::BTreeMap<String, String> {

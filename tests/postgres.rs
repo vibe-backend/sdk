@@ -1652,3 +1652,55 @@ async fn runtime_binary_automatically_migrates_and_refuses_destructive_sql() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn concurrent_startups_apply_a_tenant_migration_once() {
+    use vibe::run::apply_migrations;
+    let s = require_pg!(setup().await);
+    let owner_url = url_as(&s.admin_url, &s.owner);
+    let first = PgExec::connect(&owner_url).await.unwrap();
+    let second = PgExec::connect(&owner_url).await.unwrap();
+    let serving = PgExec::connect(&url_as(&s.admin_url, &s.app))
+        .await
+        .unwrap();
+    // Exercise tracking creation as well as two fresh-tenant transactions.
+    s.admin
+        .batch_execute("DROP SCHEMA vibe_platform CASCADE")
+        .await
+        .unwrap();
+    let tenants = vec![format!("con{}", suffix())];
+    let mut m = manifest();
+    // No IF NOT EXISTS: applying this SQL twice must fail.
+    m.migrations[0].statements = vec![
+        "CREATE TABLE concurrent_notes (tenant_id text, note text)".into(),
+        // Keep the transaction open so the other startup waits for this
+        // tenant, then must read the newly committed tracking record.
+        format!(
+            "INSERT INTO concurrent_notes SELECT '{}', pg_sleep(0.1)::text",
+            tenants[0]
+        ),
+    ];
+    let (a, b) = tokio::join!(
+        apply_migrations(Some(&first), &serving, &m, &tenants, &s.app, false),
+        apply_migrations(Some(&second), &serving, &m, &tenants, &s.app, false),
+    );
+    let logs = [a.unwrap(), b.unwrap()];
+    let expected = format!("applied {}", m.migrations[0].id);
+    assert_eq!(
+        logs.iter()
+            .flatten()
+            .filter(|line| **line == expected)
+            .count(),
+        1
+    );
+    assert_eq!(
+        first
+            .query_texts(
+                "SELECT count(*)::text FROM vibe_platform.applied_migrations WHERE tenant_id = $1",
+                &tenants[0],
+            )
+            .await
+            .unwrap(),
+        vec!["1"]
+    );
+}
