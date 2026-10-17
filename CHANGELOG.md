@@ -50,6 +50,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Changed
 
+- **Product website:** Source moved from `site/` to `vibe-backend/vibe-backend.github.io`, which builds and deploys itself and reads this repo's `docs/` at build time. Removed the Pages workflow (`.github/workflows/pages.yml`) and `trigger-org-pages` dispatch (`ORG_PAGES_DISPATCH_TOKEN`).
 - **Refresh tokens (#95):** Hardening of `_platform_refresh_tokens`: the runtime role gets SELECT, INSERT and UPDATE only on `used_at`, `replaced_by`, `grace_reissued_at`, `revoked_at` and `revoke_reason` (no DELETE); a `_platform_refresh_guard` trigger keeps identity columns immutable and revocation final; `vibe serve` verifies the grants and trigger per tenant at startup and fails closed. App SQL can no longer name `vibe_*` tables. Re-run `vibe migrate` for existing tenants.
 - **Refresh tokens (#95):** `vibe migrate` now removes refresh-token families whose lifetime ended more than a day ago, in bounded batches (1000 rows per batch, at most 100 batches per run); live families are never removed. Refresh endpoint, policy settings and grace behaviour are documented in `docs/runtime-config.md`.
 - **Refresh tokens (#95):** Hardening: when the refresh-token family lookup fails (for example a database or pool error), token refresh fails closed with a retryable 503 `SERVICE_UNAVAILABLE` instead of skipping the per-family limit. The presented token is not consumed.
