@@ -4,7 +4,7 @@
 
 讓 access token 保持短效（≤ 1 小時），同時讓用戶端維持登入狀態，方法是使用帶重用偵測的**輪換 refresh token**（Decision 6、§4A.1）。Refresh 由內置 `token-refresh` pipeline 處理（Decision 45）；登出由內置 `token-revoke` pipeline 處理（Decision 65）。第一個 refresh token 在登入時簽發：`sign-jwt` 配 `issue-refresh: new-family`（§4A.1、F10；見 [user-login.md](user-login.md)）。
 
-Spec Decision 149（產品經理已批准 2026-10-17，§4A.1c）：`sign-method` 一定唯讀（`writes: false`），包括經 `op: method` 呼叫嘅 method；否則 `vibe validate`、build 同 `vibe serve` 報錯（`REFRESH_SIGN_METHOD_WRITES`）。寫入請放喺 refresh 成功之後嘅 endpoint 或者另一個 method。
+Spec Decision 149（產品經理已批准 2026-10-17，§4A.1c）：`sign-method` 一定唯讀（`writes: false`），包括經 `op: method` 呼叫嘅 method；否則 `vibe validate`、build 同 `vibe serve` 報錯（`REFRESH_SIGN_METHOD_WRITES`）。最後 refresh 時間由平台自己記（`last_used_at`）；其他寫入請放喺另一個寫入 method，由 client 喺 refresh 成功之後另外呼叫。
 
 ## 自然語言 source 範例
 

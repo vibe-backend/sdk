@@ -275,11 +275,13 @@
 
 ### 0.13 v1.8 refresh 簽發一致性（決定 149，issue #270，產品經理已批准 2026-10-17）
 
-源自 #95 review：之前 `token-refresh` 先 commit 一個 reservation，再經另一條 connection 執行 `sign-method`（佢嘅寫入喺自己嘅 transaction commit），最後先 finalize 輪換；finalize 失敗、超時或者 request 被取消嘅話，`sign-method` 嘅寫入已經生效但 token 冇輪換。決定 149 令 `sign-method` 一律唯讀，所以冇任何寫入需要同輪換一齊 commit，解決 #270。只描述防禦設計。
+源自 #95 review：現時 `token-refresh` 先用一個短 transaction commit reservation，再喺 transaction 外面經另一條 connection 執行 `sign-method`（佢每個寫入 step 各自 commit），最後先 finalize 輪換；finalize 失敗、超時或者 request 被取消嘅話，`sign-method` 嘅寫入已經生效但 token 冇輪換。決定 149 令 `sign-method` 一律唯讀，所以冇任何用戶寫入需要同輪換一齊 commit，解決 #270。只描述防禦設計。
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
-| 149 | `sign-method` 一律唯讀：`token-refresh` 嘅 `sign-method`，連同佢經 `op: method`（任何深度）呼叫嘅 method，都唔可以有寫入。`vibe validate`、`vibe build` 同 `vibe serve` 一律阻擋（錯誤碼 `REFRESH_SIGN_METHOD_WRITES`）；`vibe serve` 執行 `sign-method` 時再用 `SET TRANSACTION READ ONLY` 嘅 transaction 做 DB 層兜底。v1.0 前嘅 breaking change。唔改決定 6、45、61、147 嘅對外行為同錯誤碼。選項 B（喺輪換 transaction 入面執行有寫入嘅 method）延後到 vNext。 | 已確認（產品經理 2026-10-17） | 4A.1、4A.1c |
+| 149 | `sign-method` 一律唯讀：`token-refresh` 嘅 `sign-method`，連同佢經 `op: method`（任何深度）呼叫嘅 method，都唔可以有寫入 step。`vibe validate`、`vibe build` 同 `vibe serve` 一律阻擋（錯誤碼 `REFRESH_SIGN_METHOD_WRITES`）；refresh 路徑上 `sign-method` 嘅所有 DB statement 再以 READ ONLY 執行做 DB 層兜底。「最後 refresh 時間」由 SDK 喺輪換確認 transaction 入面寫 `_platform_refresh_tokens.last_used_at`；其他業務寫入搬去 client 喺 refresh 成功之後另外呼叫嘅普通寫入 method。v1.0 前嘅 breaking change。唔改決定 6、45、61、147 嘅對外行為同錯誤碼。 | 已確認（產品經理 2026-10-17） | 4A.1、4A.1c |
+
+點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
 ## 1. 目錄同命名
 
@@ -1217,12 +1219,14 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 | `idle_expires_at` | timestamp | 每次輪換更新 |
 | `used_at` | timestamp | 被用嚟輪換嘅時間 |
 | `grace_reissued_at` | timestamp | 寬限期重發嘅時間；非 null 代表已經重發過一次 |
+| `last_used_at` | timestamp | 最後一次用呢個 token refresh 嘅時間；平台喺輪換確認 transaction 入面寫，只可以向前，撤銷之後唔可以再改（決定 149） |
 | `replaced_by` | uuid | 新 token id |
 | `revoked_at` | timestamp | |
 | `revoke_reason` | string | `logout`、`logout-all`、`reuse-detected`、`grace-reissue`、`email-verified`、`erasure`、`admin` |
 
 - Revoke：一律 UPDATE `revoked_at` 同 `revoke_reason`（家族一次過），唔用 DELETE；過期紀錄唔刪除，冇個人資料（只有 hash 同 id），12.10 刪除時一併 revoke。
 - 只有平台專用 `refresh_store` role 可以讀寫呢張表（見 7.1）。
+- 欄位層 UPDATE grant（runtime role）：`pending_rotation`、`pending_until`、`used_at`、`replaced_by`、`grace_reissued_at`、`last_used_at`、`revoked_at`、`revoke_reason`；其他欄位只由 INSERT 寫一次。Guard trigger：identity 欄位唔可以改、撤銷係最終狀態、`used_at` 只設一次、`last_used_at` 只可以向前而且撤銷之後唔可以改（決定 149）。
 
 ### 4A.1b Refresh cookie 補充細節（決定 141–148，issue #78，已確認（產品經理 2026-10-16））
 
@@ -1338,43 +1342,106 @@ Logout（節錄）：
 - 最低回應耗時 300ms 不變（決定 72）；429 回應（status、body、header 包括 `Retry-After`）同回應耗時，喺有效、無效同冇 cookie 之間完全一樣。
 - 必要測試：分別用有效、無效同冇 cookie 嘅請求，喺同一個 IP 連續送請求，觸發 IP 限流嘅次數、429 status、body、header 同回應耗時都一定完全一樣；有效 cookie 嘅請求唔會因為家族限流提早收到 429。
 
-#### 實作狀態（對照 main，2026-10-16）
+#### 實作狀態（對照 main，2026-10-17）
 
 - **main 已實作**：`sign-jwt` 簽 access token，login body 回 `access_token`（`src/runtime/ops.rs`）；sqlguard 拒絕 app SQL 觸及 `_platform_refresh_tokens`（`src/sqlguard.rs`）。
-- **main 未實作**：`token-refresh`／`token-revoke` pipeline、`_platform_refresh_tokens` 儲存同輪換；`sign-jwt issue-refresh` 除 `none` 以外一律 build／runtime error（`src/validate.rs`、`src/runtime/ops.rs`）；`rate-limit key: family` 被拒絕（`src/manifest.rs`）。Cookie transport（決定 101、141–148）全部未實作。
-- **進行中**：PR #95（Refs #26）實作 body transport 嘅 refresh、輪換、重用偵測同 revoke；cookie transport 明確唔包括。#95 用 `INVALID_REFRESH_TOKEN`，同決定 147 一致（產品經理 2026-10-16 確認兩種 transport 都用呢個名，冇別名）。
+- **main 已實作（#95，Refs #26）**：body transport 嘅 `token-refresh`／`token-revoke`、`_platform_refresh_tokens` 儲存、輪換、寬限期、重用偵測同 revoke；`sign-jwt issue-refresh`；`rate-limit key: family`；錯誤碼 `INVALID_REFRESH_TOKEN`（決定 147）。
+- **main 未實作**：cookie transport（決定 101、141–148）；決定 149（`sign-method` 唯讀、READ ONLY 兜底、`last_used_at`）。
 
 ### 4A.1c Refresh `sign-method` 唯讀（決定 149，issue #270，產品經理已批准 2026-10-17）
 
-決定 149 解決 #270：`sign-method` 冇寫入，一次 refresh 只會有兩種結果：(1) 輪換成功；(2) 輪換失敗，舊 token 照決定 61 仍然係 current，client 可以重試。對外錯誤碼照決定 61、147，唔新增 HTTP 錯誤碼。
+決定 149 解決 #270：`sign-method` 冇用戶寫入，一次 refresh 只會有兩種結果：(1) 輪換成功；(2) 輪換失敗，舊 token 照決定 61 仍然係 current。對外錯誤碼照決定 61、147，只有下面 DB 兜底一種情況用 500 `INTERNAL`。
 
 **靜態檢查（validate、build、serve）：**
 
-- `token-refresh` 嘅 `sign-method` 所指嘅 method，`## Signature` 一定 `writes: false`，而且冇任何 `writes: true` step。
+- 只計 step 同 `op: method` 嘅寫入：`sign-method` 所指嘅 method，`## Signature` 一定 `writes: false`，而且冇任何 `writes: true` step。
 - 間接寫入一樣阻擋：跟 #166 嘅繼承規則（10.8），經 `op: method`（任何深度）呼叫到有寫入嘅 method，`sign-method` 就算有寫入；`op: method` target 未知或者格式錯，當寫入處理（fail closed）。
+- `sign-jwt` 嘅 `issue-refresh` 由平台寫 `_platform_refresh_tokens`（login 時 `new-family`、refresh 時 `rotate`），唔係 step 寫入，唔計；所以同一個 method（例如 12.8 嘅 `user.sign-token`）可以照用喺 login。
 - `vibe validate` 同 `vibe validate --deploy` 報 error，`vibe build` 失敗，`vibe serve` 拒絕載入帶住呢類 manifest 嘅部署（啟動失敗）。
 - 錯誤碼 `REFRESH_SIGN_METHOD_WRITES`。訊息一定要講：邊個 lock 檔案、邊個 `sign-method`、邊個 method／step 寫入（間接寫入要列出 `op: method` 呼叫鏈），同埋點樣修正。範例：
 
 ```text
 error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-refresh sign-method `user.sign-token` writes
   write: models/user/methods/touch-login.lock.md step s2 (writes: true), reached via user.sign-token -> op: method user.touch-login
-  fix: sign-methods must be read-only (decision 149). Move the write into a separate method called by the endpoint after the refresh succeeds, or remove it, then set `writes: false` in ## Signature.
+  fix: sign-methods must be read-only (decision 149). Move the write into a separate write method that the client calls after the refresh succeeds, then set `writes: false` in ## Signature. The last refresh time is recorded by the platform (last_used_at).
 ```
 
-**DB 層兜底（serve）：**
+**DB 層兜底（serve，只限 refresh 路徑）：**
 
-- `vibe serve` 喺 PostgreSQL 執行 `sign-method` 時，用獨立 transaction 並且第一句執行 `SET TRANSACTION READ ONLY`；即使靜態檢查漏咗，任何寫入都會被 DB 拒絕。
-- 呢種失敗當 `sign-method` 失敗：輪換唔 finalize，舊 token 仍然 current，對外照決定 147 回錯誤，server log 寫 error（唔寫 token 或者 secret 明文）。
+- `token-refresh` 執行 `sign-method` 期間，佢所有 DB statement（包括每個 `query` step 同 `platform-claims-source` 嘅 roles 查詢）一律以 READ ONLY transaction 執行，唔理 step 嘅 `writes` 標記；唔要求合併成單一 transaction，method executor 每個 step 各自開 transaction 嘅結構唔使改。Login 等其他路徑唔受影響。
+- 違反 READ ONLY（PostgreSQL SQLSTATE `25006`）係設定錯誤，重試都唔會成功：對外回非重試嘅 500 `INTERNAL`（唔係 503 `TX_CONFLICT`），輪換唔 finalize，舊 token 仍然 current，server log 寫 error（唔寫 token 或者 secret 明文）。
 - 唔可以為咗呢個兜底延長 family lock 持有時間超過現有 `statement_timeout`／`lock_timeout`；pool 細（例如 size 1）都唔可以 deadlock（#95 review）。
+
+**最後 refresh 時間（`last_used_at`，平台寫入）：**
+
+- `_platform_refresh_tokens` 加 `last_used_at timestamptz`（nullable，`vibe migrate` 用 `ADD COLUMN IF NOT EXISTS` 加，見下面儲存表）。
+- SDK 喺輪換確認（finalize）嘅同一個 transaction 入面，將被出示嘅 token 嗰行 `last_used_at` 設做 `now()`；寬限期重發（決定 61）都喺同一個 transaction 更新。所以佢同輪換一齊 commit 或者一齊 rollback，用戶 method 唔使寫。
+- 欄位層 UPDATE grant 列表（runtime role）加 `last_used_at`；其他欄位唔變。
+- 同 #95 已批准嘅單向 guard trigger 一致：`last_used_at` 只可以向前（新值唔可以係 null 或者早過舊值）；行一旦 `revoked_at` 有值，`last_used_at` 都唔可以再改（撤銷係最終狀態）；identity 欄位照舊唔可以改。`vibe serve` 啟動檢查 grant 列表同 trigger 時一併檢查呢條規則。
+
+**範例：唯讀 sign-method 加獨立寫入 method**
+
+`sign-method` 用 12.8 嘅 `user.sign-token`（`writes: false`，只有 `sign-jwt` 同 `respond`），refresh endpoint 照 4A.1 嘅 `token-refresh: { sign-method: user.sign-token }`。之前喺 sign-method 入面做嘅業務寫入，搬去一個普通寫入 method，由 client 喺 refresh 成功之後用新 access token 另外呼叫：
+
+`models/user/methods/record-session.md`
+
+```markdown
+# record-session
+記低用戶最近一次開啟 app 嘅裝置名。
+輸入：device（最多 50 字，必填）。
+用 auth 嘅 sub 搵用戶，更新佢嘅 last_device。
+輸出：冇。
+```
+
+`models/user/methods/record-session.lock.md`（節錄 `## Signature` 同 `## Steps`；model 要有 `last_device` 欄位）
+
+````markdown
+## Signature
+- input: { device: { type: string, max: 50, required: true, untrusted: true } }
+- output: (none)
+- errors: []
+- writes: true
+
+## Calls
+(none)
+
+## Steps
+### s1 query
+- op: query
+- provider: main
+- table: users
+- sql: `update users set last_device = $1 where id = $2`
+- params: [input.device, ctx.auth.sub]
+- writes: true
+- scope: pk
+- columns: [last_device]
+- out: (none)
+- source-lines: 3-4
+````
+
+`api/auth/v1/session/session.md`
+
+```markdown
+# Record session
+POST, path /auth/v1/session。要 JWT。
+用 user.record-session 記低裝置名。
+Request body：device（字串，必填）。
+成功回 204。
+```
+
+Client 流程：`POST …/refresh` 成功攞到新 access token 之後，再 `POST /auth/v1/session`。兩個 request 唔係 atomic：session 寫入失敗唔影響已經完成嘅輪換，client 可以重試；呢個寫入同 refresh token 狀態無關。
 
 **必須有嘅測試：**
 
-1. 直接寫入：`sign-method` 有 `writes: true` step 或者 `## Signature` `writes: true`，validate、build、serve 都報 `REFRESH_SIGN_METHOD_WRITES`。
+1. 直接寫入：`sign-method` 有 `writes: true` step 或者 `## Signature` `writes: true`，validate、build、serve 都報 `REFRESH_SIGN_METHOD_WRITES`，訊息有檔案、method、step 同修正方法。
 2. 間接寫入：`sign-method` 經 `op: method`（包括兩層或以上）呼叫有寫入嘅 method，三者都報錯，訊息列出呼叫鏈；未知 target 都報錯。
-3. 唯讀 `sign-method` 照常通過。
-4. DB 兜底：繞過靜態檢查（測試專用 manifest）令 `sign-method` 執行寫入 SQL，PostgreSQL 拒絕寫入、輪換冇 finalize、舊 token 仍然 current、冇寫入殘留。
+3. 唯讀 `sign-method` 照常通過；同一個 method 用喺 login（`issue-refresh: new-family`）唔受影響。
+4. 上面範例（12.8 `user.sign-token` 做 sign-method，加 `user.record-session` 同 `api/auth/v1/session`）通過 `vibe validate` 同 `vibe build`。
+5. DB 兜底：繞過靜態檢查（測試專用 manifest）令 refresh 期間 `sign-method` 執行寫入 SQL，PostgreSQL 以 `25006` 拒絕，回 500 `INTERNAL`、輪換冇 finalize、舊 token 仍然 current、冇寫入殘留；login 路徑唔套用 READ ONLY。
+6. `last_used_at`：輪換同寬限期重發都喺 finalize transaction 寫入；finalize rollback 時唔變；trigger 拒絕改細、改做 null 同撤銷之後再改；serve 啟動檢查 grant 同 trigger。
+7. 現有 `tests/refresh_tokens.rs` 用緊會寫入嘅 sign-method（`app_with_issuance_control(_, true)`、`rejected_tokens_do_not_run_sign_method_writes`），實作決定 149 時要改寫做上面第 1、2 同 5 項嘅「靜態拒絕」同「READ ONLY 兜底」測試。
 
-**遷移（breaking）：** 現有有寫入嘅 `sign-method` 要拆開：將寫入（例如「最後 refresh 時間」）搬去 refresh 成功之後由 endpoint body 執行，或者搬去另一個由 endpoint 呼叫嘅 method；`sign-method` 只保留讀取同 `sign-jwt`，`## Signature` 設 `writes: false`，再重新 build。
+**遷移（breaking）：** 現有有寫入嘅 `sign-method` 要拆開：(1) 「最後 refresh 時間」之類嘅資料唔使再寫，改用平台嘅 `last_used_at`；(2) 其他業務寫入搬去一個普通寫入 method，由 client 喺 refresh 成功之後另外呼叫（見上面範例）；`token-refresh` route 冇「refresh 之後」嘅 step，唔可以喺 refresh endpoint 入面做。`sign-method` 只保留讀取同 `sign-jwt`，`## Signature` 設 `writes: false`，再重新 build。
 
 **#270：** 決定 149 實作 merge 之後，#270 可以 close。選項 B 延後到 vNext。
 
