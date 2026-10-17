@@ -1325,6 +1325,8 @@ fn verify_jwt(
     validation.set_audience(&[aud]);
     validation.leeway = 60;
     validation.validate_nbf = true;
+    // `aud` and `iss` are only checked when present unless they are required.
+    validation.set_required_spec_claims(&["exp", "aud", "iss"]);
     let data = jsonwebtoken::decode::<Claims>(token, key, &validation)
         .map_err(|_| AuthError::unauthorized("Bearer"))?;
     // A token issued in the future would otherwise pass the lifetime check
