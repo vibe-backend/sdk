@@ -1266,7 +1266,10 @@ async fn query_roles_cannot_inherit_the_runtime_role() {
     let startup = startup.expect("startup must refuse");
     assert!(startup.contains("app_rw"), "{startup}");
     let migrate = format!("{:?}", migrate.expect_err("migrate must refuse"));
-    assert!(migrate.contains("re-run migrate"), "{migrate}");
+    assert!(
+        migrate.contains("restart vibe run --db postgres with VIBE_MIGRATE_DATABASE_URL set"),
+        "{migrate}"
+    );
     assert!(PgExec::connect(&url).await.is_ok());
 }
 

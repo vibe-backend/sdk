@@ -32,6 +32,8 @@ struct RunArgs {
     db: Option<String>,
     #[arg(long)]
     allow_test_build: bool,
+    #[arg(long)]
+    allow_destructive_migrations: bool,
 }
 
 #[tokio::main]
@@ -72,6 +74,7 @@ async fn run(args: RunArgs) -> Result<(), String> {
         addr: args.addr,
         db: DbChoice::from_arg_or_env(args.db.as_deref())?,
         allow_test_build: args.allow_test_build,
+        allow_destructive_migrations: args.allow_destructive_migrations,
     })
     .await
 }
@@ -103,6 +106,7 @@ mod tests {
                 "--db",
                 "memory",
                 "--allow-test-build",
+                "--allow-destructive-migrations",
             ]))
             .unwrap();
             let args = match cli.command {
@@ -112,6 +116,7 @@ mod tests {
             assert_eq!(args.artifact, PathBuf::from("manifest.json"));
             assert_eq!(args.addr, "0.0.0.0:8080");
             assert!(args.allow_test_build);
+            assert!(args.allow_destructive_migrations);
         }
         assert!(Cli::try_parse_from(["vibe-runtime", "--artifact", ".", "run"]).is_err());
     }

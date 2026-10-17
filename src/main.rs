@@ -6,8 +6,7 @@ use std::io::IsTerminal;
 use vibe::compile::{build_project, CompileOptions};
 use vibe::llm::{self, LlmAdapter};
 use vibe::manifest;
-use vibe::run::{check_deployable, load_dotenv, load_manifest};
-use vibe::runtime::PgExec;
+use vibe::run::load_dotenv;
 use vibe::secret::secret_scan;
 use vibe::sign;
 use vibe::validate::{validate_project, ValidateOptions};
@@ -57,6 +56,8 @@ enum Command {
         db: Option<String>,
         #[arg(long)]
         allow_test_build: bool,
+        #[arg(long)]
+        allow_destructive_migrations: bool,
     },
 }
 
@@ -122,6 +123,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             addr,
             db,
             allow_test_build,
+            allow_destructive_migrations,
         } => {
             let db = vibe::run::DbChoice::from_arg_or_env(db.as_deref())?;
             vibe::run::run(vibe::run::RunOptions {
@@ -132,6 +134,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 addr,
                 db,
                 allow_test_build,
+                allow_destructive_migrations,
             })
             .await
         }
@@ -302,6 +305,15 @@ async fn cmd_manifest(
     print_high_risk(&manifest);
     // Relative to the current directory, like `vibe run --artifact` (#31).
     let path = output.to_path_buf();
+    for migration in &manifest.migrations {
+        if let Some(reason) = migration
+            .statements
+            .iter()
+            .find_map(|sql| vibe::runtime::migrate::destructive_reason(sql))
+        {
+            eprintln!("warning: migration {} is destructive ({reason}); `vibe run --db postgres` will refuse it unless started with --allow-destructive-migrations", migration.id);
+        }
+    }
     manifest::write_manifest(&path, &manifest).map_err(|err| err.to_string())?;
     println!("wrote {}", path.display());
     Ok(())
@@ -319,49 +331,6 @@ fn print_high_risk(manifest: &manifest::Manifest) {
     for item in high {
         eprintln!("  {} {}", item.lock, item.item);
     }
-}
-
-#[allow(dead_code)]
-async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Result<(), String> {
-    if !tenant
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        || !(8..=32).contains(&tenant.len())
-    {
-        return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
-    }
-    let run_env = vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), false);
-    let manifest = load_manifest(manifest_path, project, run_env)?;
-    check_deployable(&manifest, run_env)?;
-    // Migrations need the table-owner role; serving must not use it.
-    let url = std::env::var("VIBE_MIGRATE_DATABASE_URL").map_err(|_| {
-        "VIBE_MIGRATE_DATABASE_URL is required (the owner role used for DDL; `vibe run` uses a separate non-owner VIBE_DATABASE_URL)".to_string()
-    })?;
-    let runtime_role = std::env::var("VIBE_RUNTIME_DB_ROLE").map_err(|_| {
-        "VIBE_RUNTIME_DB_ROLE is required (the non-owner role `vibe run` connects as; it is granted SELECT, INSERT, UPDATE)".to_string()
-    })?;
-    let exec = PgExec::connect(&url).await?;
-    for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant, &runtime_role).await? {
-        println!("{line}");
-    }
-    // Last: the revoke is table-level (on `_platform_refresh_tokens` only).
-    // `GRANT ... ON ALL TABLES IN SCHEMA` in a migration expands to per-table
-    // grants when it runs, so revoking afterwards removes those as well.
-    exec.check_role_separation_for(Some(&runtime_role)).await?;
-    if manifest.routes.iter().any(|r| r.refresh.is_some()) {
-        let schema = format!("t_{tenant}");
-        exec.batch(&vibe::runtime::refresh::table_statements(&schema)?)
-            .await?;
-        exec.batch(&vibe::runtime::refresh::runtime_grant_statements(
-            &schema,
-            &runtime_role,
-        )?)
-        .await?;
-        exec.batch(&vibe::runtime::refresh::cleanup_statements(&schema)?)
-            .await?;
-        println!("bootstrapped {schema}._platform_refresh_tokens (finished families cleaned up)");
-    }
-    Ok(())
 }
 
 fn ci_or_prod() -> bool {
@@ -544,5 +513,28 @@ mod tests {
         for command in ["build", "run"] {
             assert!(super::removed_command_hint(command).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_flag_tests {
+    use super::*;
+    #[test]
+    fn run_accepts_destructive_migration_flag() {
+        let cli = Cli::try_parse_from([
+            "vibe",
+            "run",
+            "--db",
+            "postgres",
+            "--allow-destructive-migrations",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run {
+                allow_destructive_migrations: true,
+                ..
+            })
+        ));
     }
 }

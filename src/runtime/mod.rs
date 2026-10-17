@@ -5,7 +5,7 @@ mod exec;
 mod http;
 pub mod jwks;
 mod limiter;
-mod migrate;
+pub mod migrate;
 mod ops;
 pub mod refresh;
 pub mod replay;

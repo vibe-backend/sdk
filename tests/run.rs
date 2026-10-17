@@ -212,6 +212,7 @@ fn prepared_hello_router_without_socket() {
                 source: vibe::run::RunSource::Project,
                 addr: "127.0.0.1:8080".into(),
                 db: vibe::run::DbChoice::Memory,
+                allow_destructive_migrations: false,
                 allow_test_build: true,
             })
             .await

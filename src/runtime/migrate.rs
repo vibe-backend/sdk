@@ -35,6 +35,7 @@ pub async fn migrate_tenant(
             }
         }
     }
+    ensure_tracking(exec, runtime_role).await?;
     // The pool hands out a different connection per call; pin one so the
     // transaction covers every statement.
     let mut session = exec.session().await?;
@@ -165,8 +166,21 @@ async fn migrate_in_tx(
 ) -> Result<Vec<String>, String> {
     let mut log = Vec::new();
     let schema = format!("t_{tenant}");
+    let existed = !exec
+        .query_texts(
+            "SELECT nspname::text FROM pg_namespace WHERE nspname = $1",
+            &schema,
+        )
+        .await?
+        .is_empty();
+    let records = exec.query_texts("SELECT migration_id || '|' || sha256 FROM vibe_platform.applied_migrations WHERE tenant_id = $1", tenant).await?;
+    let recorded = parse_records(&records);
     let others_before = tenant_fingerprint(exec, &schema).await?;
     let problems_before = rls_problems(exec, &schema).await?;
+    exec.batch(&[format!("CREATE SCHEMA IF NOT EXISTS {}", quote(&schema)?)])
+        .await?;
+    exec.batch(&runtime_schema_statements(&schema, runtime_role)?)
+        .await?;
     for model in &manifest.models {
         let fields: Vec<Col> = model
             .fields
@@ -189,8 +203,6 @@ async fn migrate_in_tx(
             &uniques,
         )?)
         .await?;
-        exec.batch(&runtime_schema_statements(&schema, runtime_role)?)
-            .await?;
         exec.batch(&runtime_grant_statements(
             &schema,
             &model.table,
@@ -201,7 +213,19 @@ async fn migrate_in_tx(
     }
     // Migration DDL names tables unqualified; resolve them in the tenant
     // schema; each batch sets it for the migration statements that follow.
+    for id in recorded.keys() {
+        if !manifest.migrations.iter().any(|m| &m.id == id) {
+            log.push(format!(
+                "warning: recorded migration {id} for tenant {tenant} is no longer in the manifest"
+            ));
+        }
+    }
+    let mut applied = 0;
     for migration in &manifest.migrations {
+        let digest = migration_digest(&migration.statements);
+        if check_digest(&recorded, tenant, &migration.id, &digest)? {
+            continue;
+        }
         exec.batch(&[format!("SET LOCAL search_path TO {}", quote(&schema)?)])
             .await?;
         for statement in &migration.statements {
@@ -209,10 +233,28 @@ async fn migrate_in_tx(
             // statement that smuggles `; COMMIT; ...` after the first command.
             exec.execute_one(statement)
                 .await
-                .map_err(|err| format!("{}: {err}", migration.id))?;
+                .map_err(|err| {
+                    let mut error = format!("{}: {err}", migration.id);
+                    if existed && recorded.is_empty() {
+                        error.push_str(&format!("; if {} was already applied by the removed `vibe migrate`, record it with the owner role: INSERT INTO vibe_platform.applied_migrations (tenant_id, migration_id, sha256, destructive) VALUES ({}, {}, '{}', false);", migration.id, literal(tenant), literal(&migration.id), digest));
+                    }
+                    error
+                })?;
         }
         exec.batch(&["RESET search_path".to_string()]).await?;
+        let destructive = migration
+            .statements
+            .iter()
+            .any(|s| destructive_reason(s).is_some());
+        exec.batch(&[format!("INSERT INTO vibe_platform.applied_migrations (tenant_id, migration_id, sha256, destructive) VALUES ({}, {}, '{}', {destructive})", literal(tenant), literal(&migration.id), digest)]).await?;
+        applied += 1;
         log.push(format!("applied {}", migration.id));
+    }
+    if applied == 0 {
+        log.push(format!(
+            "up to date: {} migrations",
+            manifest.migrations.len()
+        ));
     }
     // #157: this tenant's challenge replay table (SELECT/INSERT for the
     // runtime role; expired rows are removed here, as the owner).
@@ -525,5 +567,239 @@ mod tests {
         ] {
             assert_eq!(transaction_control(sql), None, "{sql}");
         }
+    }
+}
+
+fn literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Lowercase SHA-256 of statements joined with exactly "\n;\n".
+pub fn migration_digest(statements: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(statements.join("\n;\n").as_bytes()))
+}
+
+pub async fn ensure_tracking(exec: &PgExec, runtime_role: &str) -> Result<(), String> {
+    let role = quote(runtime_role)?;
+    exec.batch(&[
+        "CREATE SCHEMA IF NOT EXISTS vibe_platform".into(),
+        "REVOKE ALL ON SCHEMA vibe_platform FROM PUBLIC".into(),
+        "CREATE TABLE IF NOT EXISTS vibe_platform.applied_migrations (tenant_id text NOT NULL, migration_id text NOT NULL, sha256 text NOT NULL, destructive boolean NOT NULL, applied_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (tenant_id, migration_id))".into(),
+        "REVOKE ALL ON vibe_platform.applied_migrations FROM PUBLIC".into(),
+        format!("REVOKE ALL ON SCHEMA vibe_platform FROM {role}"),
+        format!("GRANT USAGE ON SCHEMA vibe_platform TO {role}"),
+        format!("REVOKE ALL ON vibe_platform.applied_migrations FROM {role}"),
+        format!("GRANT SELECT ON vibe_platform.applied_migrations TO {role}"),
+    ]).await
+}
+
+fn parse_records(rows: &[String]) -> std::collections::BTreeMap<String, String> {
+    rows.iter()
+        .filter_map(|r| r.rsplit_once('|').map(|(a, b)| (a.into(), b.into())))
+        .collect()
+}
+
+fn check_digest(
+    records: &std::collections::BTreeMap<String, String>,
+    tenant: &str,
+    id: &str,
+    digest: &str,
+) -> Result<bool, String> {
+    if let Some(old) = records.get(id) {
+        if old != digest {
+            return Err(format!("migration {id} was already applied to tenant {tenant} with different SQL (recorded sha256 {old}, manifest {digest}); migrations are append-only: add a new migration instead"));
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub async fn pending_migrations(
+    exec: &PgExec,
+    manifest: &Manifest,
+    tenant: &str,
+) -> Result<Vec<usize>, String> {
+    let exists = exec.query_texts("SELECT coalesce(to_regclass('vibe_platform.applied_migrations')::text, '') WHERE $1::text IS NOT NULL", "").await?;
+    let rows = if exists.first().is_some_and(|s| !s.is_empty()) {
+        exec.query_texts("SELECT migration_id || '|' || sha256 FROM vibe_platform.applied_migrations WHERE tenant_id = $1", tenant).await?
+    } else {
+        Vec::new()
+    };
+    let records = parse_records(&rows);
+    let mut pending = Vec::new();
+    for (i, m) in manifest.migrations.iter().enumerate() {
+        if !check_digest(&records, tenant, &m.id, &migration_digest(&m.statements))? {
+            pending.push(i);
+        }
+    }
+    Ok(pending)
+}
+
+/// Fail closed for PostgreSQL statements whose data effects we cannot classify.
+pub fn destructive_reason(sql: &str) -> Option<String> {
+    use sqlparser::{
+        ast::{AlterColumnOperation as C, AlterTableOperation as A, ObjectType, Statement},
+        dialect::PostgreSqlDialect,
+        parser::Parser,
+    };
+    let unknown = || Some("cannot be classified automatically".into());
+    let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+        return unknown();
+    };
+    if statements.is_empty() {
+        return unknown();
+    }
+    for statement in statements {
+        let reason = match statement {
+            Statement::Drop {
+                object_type: ObjectType::Index,
+                ..
+            } => None,
+            Statement::Drop {
+                object_type, names, ..
+            } => Some(format!(
+                "DROP {object_type} {}",
+                names
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Statement::AlterTable {
+                name, operations, ..
+            } => {
+                let mut reason = None;
+                for op in operations {
+                    reason = match op {
+                        A::DropColumn { column_name, .. } => {
+                            Some(format!("DROP COLUMN {name}.{column_name}"))
+                        }
+                        A::AlterColumn {
+                            column_name,
+                            op: C::SetDataType { .. },
+                        } => Some(format!("type change of {name}.{column_name}")),
+                        A::RenameTable { .. } | A::RenameColumn { .. } => {
+                            Some(format!("rename of {name}"))
+                        }
+                        A::AddColumn { .. }
+                        | A::AddConstraint(_)
+                        | A::DropConstraint { .. }
+                        | A::AlterColumn {
+                            op:
+                                C::SetDefault { .. } | C::SetNotNull | C::DropNotNull | C::DropDefault,
+                            ..
+                        } => None,
+                        _ => unknown(),
+                    };
+                    if reason.is_some() {
+                        break;
+                    }
+                }
+                reason
+            }
+            Statement::DropFunction { func_desc, .. } => Some(format!(
+                "DROP FUNCTION {}",
+                func_desc
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Statement::DropProcedure { proc_desc, .. } => Some(format!(
+                "DROP PROCEDURE {}",
+                proc_desc
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Statement::DropPolicy { name, .. } => Some(format!("DROP POLICY {name}")),
+            Statement::DropTrigger { trigger_name, .. } => {
+                Some(format!("DROP TRIGGER {trigger_name}"))
+            }
+            Statement::Truncate { .. } => Some("TRUNCATE".into()),
+            Statement::Delete(_) => Some("DELETE".into()),
+            Statement::Update { .. }
+            | Statement::Insert(_)
+            | Statement::CreateTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::Comment { .. } => None,
+            _ => unknown(),
+        };
+        if reason.is_some() {
+            return reason;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+    #[test]
+    fn destructive_and_unknown_statements() {
+        for (sql, reason) in [
+            ("DROP TABLE audit", "DROP TABLE audit"),
+            ("DROP SCHEMA audit", "DROP SCHEMA audit"),
+            ("DROP VIEW audit", "DROP VIEW audit"),
+            ("DROP SEQUENCE audit", "DROP SEQUENCE audit"),
+            ("DROP TYPE audit", "DROP TYPE audit"),
+            ("DROP FUNCTION audit()", "DROP FUNCTION audit"),
+            (
+                "ALTER TABLE notes DROP COLUMN body",
+                "DROP COLUMN notes.body",
+            ),
+            (
+                "ALTER TABLE products ALTER COLUMN price TYPE int",
+                "type change of products.price",
+            ),
+            (
+                "ALTER TABLE products ALTER COLUMN price SET DATA TYPE int",
+                "type change of products.price",
+            ),
+            ("ALTER TABLE notes RENAME TO old_notes", "rename of notes"),
+            (
+                "ALTER TABLE notes RENAME COLUMN body TO old_body",
+                "rename of notes",
+            ),
+            ("TRUNCATE notes", "TRUNCATE"),
+            ("DELETE FROM notes", "DELETE"),
+            (
+                "DO $$ BEGIN NULL; END $$",
+                "cannot be classified automatically",
+            ),
+            ("this is not SQL", "cannot be classified automatically"),
+            ("CALL surprise()", "cannot be classified automatically"),
+        ] {
+            assert_eq!(destructive_reason(sql).as_deref(), Some(reason), "{sql}");
+        }
+    }
+    #[test]
+    fn safe_statements() {
+        for sql in [
+            "DROP INDEX idx",
+            "ALTER TABLE notes DROP CONSTRAINT c",
+            "ALTER TABLE notes ADD COLUMN body text",
+            "ALTER TABLE notes ADD CONSTRAINT c CHECK (true)",
+            "ALTER TABLE notes ALTER COLUMN body SET DEFAULT ''",
+            "ALTER TABLE notes ALTER COLUMN body SET NOT NULL",
+            "UPDATE notes SET body = 'backfill'",
+            "INSERT INTO notes VALUES ('a')",
+            "CREATE TABLE notes (body text)",
+            "CREATE INDEX idx ON notes (body)",
+            "CREATE INDEX CONCURRENTLY idx ON notes (body)",
+            "COMMENT ON TABLE notes IS 'notes'",
+        ] {
+            assert_eq!(destructive_reason(sql), None, "{sql}");
+        }
+    }
+    #[test]
+    fn digest_delimiter_is_stable() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            migration_digest(&["one".into(), "two".into()]),
+            hex::encode(Sha256::digest(b"one\n;\ntwo"))
+        );
     }
 }

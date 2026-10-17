@@ -56,7 +56,7 @@ pub enum RevokeTarget<'a> {
 pub const CLEANUP_RETENTION_SECS: i64 = 86_400;
 /// Rows deleted per batch.
 pub const CLEANUP_BATCH: i64 = 1000;
-/// Batches per cleanup run (bounds the work done by one `vibe migrate`).
+/// Batches per cleanup run (bounds the work done by one automatic tenant migration).
 pub const CLEANUP_MAX_BATCHES: i64 = 100;
 
 /// Columns the runtime role may UPDATE (rotation state and revocation).
@@ -81,7 +81,7 @@ fn tenant_of(schema: &str) -> Result<&str, String> {
 }
 
 /// Columns of `_platform_refresh_tokens`. The tenant policy has the same
-/// shape as every other tenant table's (`vibe migrate` checks it).
+/// shape as every other tenant table's (automatic tenant migration checks it).
 pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
     tenant_of(schema)?;
     let qualified = format!("{}._platform_refresh_tokens", super::sql::quote(schema)?);
@@ -128,7 +128,7 @@ pub fn table_statements(schema: &str) -> Result<Vec<String>, String> {
              FOREACH r IN ARRAY ARRAY['public_reader','public_writer','app_rw'] LOOP \
              IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) \
              AND has_table_privilege(r, {lit}, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') THEN \
-             RAISE EXCEPTION 'role % can still reach % (through role membership or a grant); revoke it and re-run migrate', r, {lit}; \
+             RAISE EXCEPTION 'role % can still reach % (through role membership or a grant); revoke it and restart vibe run --db postgres with VIBE_MIGRATE_DATABASE_URL set', r, {lit}; \
              END IF; END LOOP; END $$",
             lit = sql_literal(&qualified)
         ),
@@ -243,7 +243,7 @@ pub async fn check_store(
             .query_one(STORE_STATUS_SQL, &[&format!("\"t_{tenant}\"._platform_refresh_tokens"), &GUARD_BODY])
             .await
             .map_err(|err| {
-                format!("refresh table {table} is not usable ({err}); run `vibe migrate` for this tenant")
+                format!("refresh table {table} is not usable ({err}); restart `vibe run --db postgres` with VIBE_MIGRATE_DATABASE_URL set for this tenant")
             })?;
         let status = StoreStatus {
             can_select_insert: row.get(0),
@@ -257,7 +257,7 @@ pub async fn check_store(
         Ok(())
     } else {
         Err(format!(
-            "refresh token store is not set up safely: {}; run `vibe migrate`",
+            "refresh token store is not set up safely: {}; restart `vibe run --db postgres` with VIBE_MIGRATE_DATABASE_URL set",
             problems.join("; ")
         ))
     }
@@ -265,7 +265,7 @@ pub async fn check_store(
 
 /// Removes refresh rows whose family lifetime ended more than
 /// [`CLEANUP_RETENTION_SECS`] ago, in batches of [`CLEANUP_BATCH`] and at
-/// most [`CLEANUP_MAX_BATCHES`] batches per run. Run by `vibe migrate` as the
+/// most [`CLEANUP_MAX_BATCHES`] batches per run. Run by automatic tenant migration as the
 /// table owner (the runtime role has no DELETE), like the challenge replay
 /// table cleanup. The owner is subject to FORCE RLS, so the tenant setting
 /// is set for the statement's transaction first.

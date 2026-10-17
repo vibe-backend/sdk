@@ -100,6 +100,7 @@ pub struct RunOptions {
     pub addr: String,
     pub db: DbChoice,
     pub allow_test_build: bool,
+    pub allow_destructive_migrations: bool,
 }
 pub struct Prepared {
     pub app: axum::Router,
@@ -129,6 +130,9 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
     let project = opts.project.as_path();
     let addr = opts.addr.as_str();
     let memory = opts.db == DbChoice::Memory;
+    if memory && opts.allow_destructive_migrations {
+        eprintln!("warning: --allow-destructive-migrations has no effect with --db memory");
+    }
     load_dotenv(project);
     let run_env =
         crate::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), memory);
@@ -249,6 +253,11 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
     }
     // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
     auth.add_route_jwks(&manifest.routes)?;
+    let mut loaded = crate::runtime::load_project_slugs(project, memory)?;
+    let tenants = configured_tenants(
+        loaded.slugs.values().map(|s| s.tenant_id.clone()),
+        std::env::var("VIBE_TENANTS").ok().as_deref(),
+    )?;
     let mut pg_pool = None;
     let exec: Arc<dyn QueryExec> = if memory {
         Arc::new(crate::runtime::MemoryExec::new())
@@ -259,11 +268,38 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
                 "set VIBE_DATABASE_URL or pass --db memory for the dev executor".to_string()
             })?;
         let pg = PgExec::connect_with(&url, crate::runtime::PgOptions::from_env()?).await?;
+        let runtime_role = match std::env::var("VIBE_RUNTIME_DB_ROLE") {
+            Ok(role) => role,
+            Err(_) => pg
+                .query_texts("SELECT current_user::text WHERE $1::text IS NOT NULL", "")
+                .await?
+                .into_iter()
+                .next()
+                .ok_or("cannot determine runtime database role")?,
+        };
+        let owner = match std::env::var("VIBE_MIGRATE_DATABASE_URL") {
+            Ok(url) => Some(PgExec::connect(&url).await?),
+            Err(_) => None,
+        };
+        let result = apply_migrations(
+            owner.as_ref(),
+            &pg,
+            &manifest,
+            &tenants,
+            &runtime_role,
+            opts.allow_destructive_migrations,
+        )
+        .await;
+        if let Some(owner) = owner {
+            owner.pool().close();
+        }
+        for line in result? {
+            eprintln!("{line}");
+        }
         pg.check_runtime_role().await?;
         pg_pool = Some(pg.pool());
         Arc::new(pg)
     };
-    let mut loaded = crate::runtime::load_project_slugs(project, memory)?;
     let reload_slugs = memory && run_env.is_dev();
     if crate::runtime::apply_dev_default(&mut loaded.slugs, memory, run_env.is_dev()) {
         eprintln!("dev: slug `dev` (tenant devtenant) is available for public routes, e.g. /<def>/<ver>/dev/...");
@@ -272,9 +308,6 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
         &pg_pool,
         manifest.routes.iter().any(|r| r.refresh.is_some()),
     ) {
-        let mut tenants: Vec<String> = loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
-        tenants.sort();
-        tenants.dedup();
         let client = pool
             .get()
             .await
@@ -304,10 +337,6 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
                 // Per-tenant tables; the IP digest is keyed per tenant from
                 // the API-key pepper.
                 let store = crate::runtime::replay::PgReplayStore::new(pool, &auth.pepper);
-                let mut tenants: Vec<String> =
-                    loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
-                tenants.sort();
-                tenants.dedup();
                 store.check(&tenants).await?;
                 Some(Arc::new(store))
             }
@@ -501,6 +530,7 @@ mod tests {
             source: super::RunSource::Project,
             addr: "127.0.0.1:0".into(),
             db: super::DbChoice::Memory,
+            allow_destructive_migrations: false,
             allow_test_build: false,
         };
         let error = super::prepare(&options).await.err().unwrap();
@@ -521,5 +551,145 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Sorted union of slug tenants and the explicitly configured environment list.
+pub fn configured_tenants(
+    tenants: impl IntoIterator<Item = String>,
+    env: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut result: Vec<String> = tenants.into_iter().collect();
+    if let Some(value) = env {
+        for tenant in value.split(',').map(str::trim) {
+            if !(8..=32).contains(&tenant.len())
+                || !tenant
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            {
+                return Err("VIBE_TENANTS entries must match ^[a-z0-9]{8,32}$".into());
+            }
+            result.push(tenant.into());
+        }
+    }
+    result.sort();
+    result.dedup();
+    Ok(result)
+}
+
+/// Plan every tenant before applying any tenant DDL. The serving pool is never
+/// connected with owner credentials; without an owner this is read-only.
+pub async fn apply_migrations(
+    owner: Option<&PgExec>,
+    serving: &PgExec,
+    manifest: &manifest::Manifest,
+    tenants: &[String],
+    runtime_role: &str,
+    allow_destructive: bool,
+) -> Result<Vec<String>, String> {
+    use crate::runtime::migrate::{destructive_reason, ensure_tracking, pending_migrations};
+    if tenants.is_empty() {
+        return Ok(vec!["no tenants configured (.vibe/slugs.json or VIBE_TENANTS); no tenant migrations to apply".into()]);
+    }
+    let reader = owner.unwrap_or(serving);
+    let mut plans = Vec::new();
+    for tenant in tenants {
+        configured_tenants(std::iter::empty(), Some(tenant))?;
+        plans.push((tenant, pending_migrations(reader, manifest, tenant).await?));
+    }
+    let mut log = Vec::new();
+    for (index, migration) in manifest.migrations.iter().enumerate() {
+        let affected: Vec<_> = plans
+            .iter()
+            .filter(|(_, p)| p.contains(&index))
+            .map(|(t, _)| t.as_str())
+            .collect();
+        if affected.is_empty() || owner.is_none() {
+            continue;
+        }
+        if let Some(reason) = migration
+            .statements
+            .iter()
+            .find_map(|s| destructive_reason(s))
+        {
+            if !allow_destructive {
+                return Err(format!("refusing to apply destructive migration {} to tenant(s) {}: {reason}. Back up the database, then start once with --allow-destructive-migrations (vibe run or vibe-runtime run) and restart without it. Non-destructive alternative: add a new column/table instead of dropping or changing one.", migration.id, affected.join(", ")));
+            }
+            for tenant in affected {
+                log.push(format!(
+                    "warning: applying destructive migration {} to tenant {tenant}: {reason}",
+                    migration.id
+                ));
+            }
+        }
+    }
+    let Some(owner) = owner else {
+        let count: usize = plans.iter().map(|(_, p)| p.len()).sum();
+        let exists = serving.query_texts("SELECT coalesce(to_regclass('vibe_platform.applied_migrations')::text, '') WHERE $1::text IS NOT NULL", "").await?;
+        if count > 0 || exists.first().is_none_or(String::is_empty) {
+            let affected = plans
+                .iter()
+                .filter(|(_, p)| !p.is_empty())
+                .map(|(t, _)| t.as_str())
+                .collect::<Vec<_>>();
+            let ids = plans
+                .iter()
+                .flat_map(|(_, p)| p.iter().map(|i| manifest.migrations[*i].id.as_str()))
+                .collect::<std::collections::BTreeSet<_>>();
+            return Err(format!("{count} pending migration(s) for tenant(s) {} ({}); set VIBE_MIGRATE_DATABASE_URL (the table-owner role) so vibe run can apply them", if affected.is_empty() { tenants.join(", ") } else { affected.join(", ") }, ids.into_iter().collect::<Vec<_>>().join(", ")));
+        }
+        return Ok(vec![format!(
+            "up to date: {} migrations",
+            manifest.migrations.len()
+        )]);
+    };
+    ensure_tracking(owner, runtime_role).await?;
+    for (tenant, _) in plans {
+        log.extend(crate::runtime::migrate_tenant(owner, manifest, tenant, runtime_role).await?);
+        if manifest.routes.iter().any(|r| r.refresh.is_some()) {
+            let schema = format!("t_{tenant}");
+            owner
+                .batch(&crate::runtime::refresh::table_statements(&schema)?)
+                .await?;
+            owner
+                .batch(&crate::runtime::refresh::runtime_grant_statements(
+                    &schema,
+                    runtime_role,
+                )?)
+                .await?;
+            owner
+                .batch(&crate::runtime::refresh::cleanup_statements(&schema)?)
+                .await?;
+            log.push(format!(
+                "bootstrapped {schema}._platform_refresh_tokens (finished families cleaned up)"
+            ));
+        }
+    }
+    owner.check_role_separation_for(Some(runtime_role)).await?;
+    Ok(log)
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::*;
+    #[test]
+    fn environment_tenants_are_validated_sorted_and_merged() {
+        assert_eq!(
+            configured_tenants(["bbbbbbbb".into()], Some(" cccccccc,aaaaaaaa,bbbbbbbb ")).unwrap(),
+            vec!["aaaaaaaa", "bbbbbbbb", "cccccccc"]
+        );
+        for value in [
+            "",
+            "short",
+            "AAAAAAAA",
+            "aaaaaaaa,",
+            "a_bbbbbb",
+            "aaaaaaaa;drop",
+        ] {
+            assert!(configured_tenants(Vec::new(), Some(value))
+                .unwrap_err()
+                .contains("VIBE_TENANTS"));
+        }
+        assert!(configured_tenants(Vec::new(), None).unwrap().is_empty());
     }
 }
