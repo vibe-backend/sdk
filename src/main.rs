@@ -49,7 +49,7 @@ enum Command {
         /// Output path, relative to the current directory (like `serve --manifest`).
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
-        /// Release build: never reads .env, requires an allowlisted LLM host,
+        /// Release build (default): never reads .env, requires an allowlisted LLM host,
         /// uses no key, and writes an unsigned manifest that the release
         /// workflow signs with Sigstore keyless (decision 119). High-risk
         /// items are listed only.
@@ -326,9 +326,7 @@ async fn cmd_manifest(
     commit: Option<String>,
 ) -> Result<(), String> {
     check_dev_mode(dev)?;
-    if !dev && !release {
-        return Err("use --dev for local development or --release in the release workflow".into());
-    }
+    let release = release || !dev;
     // Release manifests are signed by the release workflow with Sigstore
     // keyless (decisions 92, 119); no key is ever loaded for them.
     let key = if release {

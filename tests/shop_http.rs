@@ -1120,13 +1120,14 @@ async fn manifest_dev_creates_a_key_and_keygen_refuses_overwrite() {
 }
 
 #[tokio::test]
-async fn manifest_requires_an_explicit_mode() {
+async fn manifest_defaults_to_release() {
     let root = compiled_shop().await;
     let (ok, out) = vibe_cli(&root, &["manifest", "--project", "."], &[]);
-    assert!(
-        !ok && out.contains("use --dev for local development or --release"),
-        "{out}"
-    );
+    let (release_ok, release_out) =
+        vibe_cli(&root, &["manifest", "--release", "--project", "."], &[]);
+    assert!(!ok, "{out}");
+    assert_eq!(ok, release_ok);
+    assert_eq!(out, release_out);
     assert!(!root.join(".vibe/signing.key").exists());
     let (ok, out) = vibe_cli(&root, &["manifest", "--dev", "--release"], &[]);
     assert!(!ok && out.contains("cannot be used with"), "{out}");
