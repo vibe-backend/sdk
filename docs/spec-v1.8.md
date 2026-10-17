@@ -18,8 +18,8 @@
 
 ### v1.8（草稿，2026-10-14）
 
-- 補編決定 150–165（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
-- 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 compiler-hash 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。
+- 補編決定 150–166（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
+- 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 compiler-hash 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory`）
 - 新增 `vibe build`：一個指令做晒編譯、驗證同 manifest（類似 `nest build`），冇 reviewer 步驟（審核由 Git 平台設定負責，決定 76，見 2C.3）。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext）
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
 - 新增產品經理六條基線做決定 89–94（release 簽名只限 `v*` tag 加 required-reviewer environment（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118）、高風險 fail closed（決定 90 已於 2026-10-16 撤回：高風險項目只列入部署報告）、production 拒絕 in-memory、冇 release 簽名就失敗（決定 119 改用 Sigstore keyless）、決定 29／37 恢復、`/latest/` 永遠唔係草稿），同決定 95（create-user 邀請失敗處理）。
@@ -192,7 +192,7 @@
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
 | 73 | `vibe dev`：本地 web API server，唔使預先編譯。Request 嚟到先按路由搵 `.md`，第一次用先編譯成 lock，cache key 係 source hash 加全部依賴 hash 加 compiler-hash 輸入；file watch 偵測到改動就重編受影響嘅 lock；驗證器每次編譯同每次載入 cache 都跑，唔通過就回 500 並喺 terminal 報錯。 | 已確認（產品經理 2026-10-14） | 2C.2 |
-| 74 | 正式支援 in-memory 資料庫（Jack 新要求，取代原本「預設內嵌 PostgreSQL」）：`vibe dev` 預設用 in-memory，`vibe serve --memory` 亦用同一個 in-memory 執行器。In-memory 只限開發同測試，server 一停所有資料即刻消失。喺非 dev build-mode 或者 production 環境一律拒絕 in-memory，啟動報錯退出，冇 override（決定 91）。因為 in-memory 係預設 dev 路徑，執行器一定要模擬租戶隔離（RLS＋FORCE 語意）、role grant 同 column grant，令 dev 行為同 production 一致；已知語意差異喺 2C.4 列明；CI 整合測試照樣要對真 PostgreSQL 跑。內嵌 PostgreSQL 保留做 opt-in `--db postgres`，用嚟做保真度測試。 | 已確認（產品經理 2026-10-14） | 2C.2、2C.4 |
+| 74 | 正式支援 in-memory 資料庫（Jack 新要求，取代原本「預設內嵌 PostgreSQL」）：`vibe dev` 預設用 in-memory，`vibe serve --memory` 亦用同一個 in-memory 執行器。In-memory 只限開發同測試，server 一停所有資料即刻消失。喺非 dev build-mode 或者 production 環境一律拒絕 in-memory，啟動報錯退出，冇 override（決定 91）。因為 in-memory 係預設 dev 路徑，執行器一定要模擬租戶隔離（RLS＋FORCE 語意）、role grant 同 column grant，令 dev 行為同 production 一致；已知語意差異喺 2C.4 列明；CI 整合測試照樣要對真 PostgreSQL 跑。內嵌 PostgreSQL 保留做 opt-in `--db postgres`，用嚟做保真度測試。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory`） | 已確認（產品經理 2026-10-14） | 2C.2、2C.4 |
 | 75 | Dev 編譯嘅 lock 同 manifest 一律唔可以部署：lock 記 `build-mode: dev`，manifest 用本機 dev key 簽；production runtime 只接受 Sigstore keyless 簽、身份符合決定 119 嘅 release manifest。2A.8 嘅本地 LLM http 規則只喺 dev 適用。 | 已確認（產品經理 2026-10-14） | 2C.2、2A.8.4 |
 | 76 | `vibe build`：一個指令做晒編譯（只編譯過時嘅 lock）、驗證、manifest 產生同簽名，冇 reviewer 步驟（審核由 Git 平台設定負責）；（決定 117）lock 係 build 輸出，冇 `--check-determinism`。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） | 已確認（產品經理 2026-10-14） | 2C.3 |
 | 77 | SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 刪除 `status`、`approval-mode`、`approved-by`、`approved-at`、`approval-ref`、`approved-commit`；SDK 讀到呢啲舊欄位（包括舊 lock 嘅 `approval-ref`，同已撤回嘅決定 90 build 旗標 `--release-approval` 係兩回事）會忽略並出 warning，唔再以佢哋做部署條件。取代決定 10、11、16（人手 review 部分）、20（人手確認部分）、28、33。 | 已確認（產品經理 2026-10-14） | 2A.1、2A.5、10.1 |
@@ -200,7 +200,7 @@
 | 79 | Lock 唔再有 `signature`（lock 完整性靠 `source-hash`、依賴 hash、compiler-hash；v1.8 部署靠決定 113 attestation，決定 117 之後 lock 唔 commit）；manifest 照樣簽名，由 `vibe build` 簽：release 用 Sigstore keyless（決定 119），以 `release` environment（要 Jack 批准；真正人手批准閘門係 environment，唔係 tag；自動閘門仍然係決定 113／114／118）入面 release workflow 嘅 GitHub OIDC 身份簽，本機用 dev key。Production runtime 只信任 pin 死嘅 Sigstore 身份（issuer `https://token.actions.githubusercontent.com`，certificate identity 完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`，trust root 見決定 119），dev key 永遠唔信任。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） | 已確認（產品經理 2026-10-14） | 2A.1、9、9B、10.1 |
 | 80 | （已由決定 117 取代：lock 唔再 commit）建議 `*.lock.md` 同 source 一齊 commit，令 PR diff 睇到編譯結果；CI 重編決定性檢查保留，唔一致照樣封鎖部署，冇 override。 | 已取代（決定 117） | 2A.6、2C.3 |
 | 81 | CLI 所有指令嘅 `--project` 預設係目前目錄（cwd）。 | 已確認（產品經理 2026-10-14） | 2C.1 |
-| 82 | README 快速開始簡化做兩行：`vibe dev` 加一個 `curl`。 | 已確認（產品經理 2026-10-14） | 2C.1 |
+| 82 | README 快速開始簡化做兩行：`vibe dev` 加一個 `curl`。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory`） | 已確認（產品經理 2026-10-14） | 2C.1 |
 | 83 | 接受「未經人手 review 嘅 LLM 輸出可以直接部署」嘅剩餘風險（見 9C）；人手 review 由用戶喺 Git 平台用 rulesets（分支規則） 自行設定（指引見 [`pr-review-guide.md`](pr-review-guide.md)）；release 層面唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（決定 89、118、2C.3a）；CODEOWNERS 仍然係 source PR 合併條件（決定 93、115），唔係 SDK release 檢查。 | 已確認（產品經理 2026-10-14） | 9C |
 | 84 | Admin `user.register` 保留 409 `EMAIL_TAKEN`：只限 admin、已認證、有限流同審計，admin 本身已經可以列出租戶用戶，所以唔當 enumeration 洩漏。 | 已確認（產品經理 2026-10-14） | 11.4、12.11 |
 | 85 | `create-user` 可以安全重試：`user.register` 用「insert CTE + SELECT」一個 statement，以明確 `created` 欄位分辨新建立同重試（唔靠 `xmax`）；兩種都回 202 `{ user_id, created, invite_status }`（決定 95）；對「已存在、未驗證、冇密碼」嘅用戶唔報錯，回原有 id（`created: false`），再由 `user.invite` 重新寄邀請；只有已驗證或者有密碼先回 409 `EMAIL_TAKEN`。解決 7.1 每個 query 獨立 commit 時「建立咗用戶但邀請失敗」嘅狀況。 | 已確認（產品經理 2026-10-14） | 11.4、11.4a |
@@ -284,7 +284,7 @@
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
-### 0.14 v1.8 2026-10-17 決定（決定 150–165，產品經理已批准 2026-10-17）
+### 0.14 v1.8 2026-10-17 決定（決定 150–166，產品經理已批准 2026-10-17）
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
@@ -304,6 +304,7 @@
 | 163 | Structured source `## Limits` 有值同解析結果唔同就 compile error，錯誤講明欄位（provider／timeout／body）、source 寫嘅值、解析出嚟嘅值同修正方法（喺 frontmatter pin 或者刪除嗰行）。 | 已批准（產品經理 2026-10-17） | 2A.2 |
 | 164 | `vibe build` 唔喺 1.0：`vibe manifest`（預設 release；`--dev`、`--release`）係官方 build 指令；`vibe build`（`--labels`、`-o`、部署報告）延至 vNext。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.3 |
 | 165 | 同一 source、同一 `PROMPT_VERSION` 同同一結構，一定產生 byte-identical lock；lock 唔可以包含任何每次 run 都可能改變嘅欄位。Translation stamp 改記喺 build record 同 manifest provenance，唔再寫入 lock。 | 已批准（產品經理 2026-10-17） | 2A.1、2.1a |
+| 166 | `vibe dev` 唔喺 1.0，延至 vNext；1.0 本地開發流程係互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory` → curl。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.2 |
 
 ## 1. 目錄同命名
 
@@ -430,7 +431,7 @@ project/
 - 冇 `## Cors` 就唔回任何 CORS header（同源先用到）。
 - **Origin 比對**：同 `Origin` header 完全相等（scheme、host、port 都要一樣，唔分大小寫只限 host）。
   - `*`：只准單獨使用，而且只限冇 credentials 嘅情況；release build 出 warning。
-  - Port 萬用（`http://localhost:*`、`http://127.0.0.1:*`）：只准 `localhost`／`127.0.0.1`，只喺 dev build（`vibe dev`、`--dev`）生效；release build 遇到就 error。其他萬用（例如 `https://*.example.com`）一律唔准。
+  - Port 萬用（`http://localhost:*`、`http://127.0.0.1:*`）：只准 `localhost`／`127.0.0.1`，只喺 dev build（`vibe manifest --dev`）生效；release build 遇到就 error。其他萬用（例如 `https://*.example.com`）一律唔准。
 - **Credentials**：`## Cors` 唔可以開 credentials（驗證器 error）；access token 用 `Authorization` header，唔使 cookie。Credentials 只限決定 101 嘅 refresh／logout endpoint，由 `token-refresh` 嘅 `allowed-origins` 控制，而嗰個列表一定要係 `allow-origins` 嘅子集（唔准 `*`）。
 - **回應**：origin 喺白名單就回 `Access-Control-Allow-Origin: <origin>`（`*` 模式回 `*`），同 `Access-Control-Expose-Headers`；所有回應（包括 origin 唔喺白名單）都帶 `Vary: Origin`。
 - **Preflight**：runtime 處理所有 `OPTIONS` 請求，唔經 pipeline、唔計限流以外嘅配額：
@@ -522,7 +523,7 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
   永遠唔記 key。2A.6、2A.8、10.1 提到 compiler-hash 一律指呢個定義。
 - 決定 165：同一 source、同一 `PROMPT_VERSION` 同同一結構，一定產生 byte-identical lock；lock 唔可以包含任何每次 run 都可能改變嘅欄位。`translation` stamp 只記喺 build record 同 manifest provenance，唔寫入 lock。舊 lock 嘅 `translation:` 仍然讀得，parse 後忽略，render 唔再寫；validate 每個舊 lock 警告一次："lock contains a `translation` field, which is no longer written (decision 165); run `vibe compile` to refresh it"。Lock format 改動會將 `PROMPT_VERSION` 升到 `prompt-6`，令舊 lock 過時並重新編譯。
 - manifest JSON 用 snake_case：lock 嘅 `build-mode` 對應 manifest 嘅 `build_mode`（`dev`／`release`；冇呢個欄位當 `release`）。
-- `build-mode`：`vibe manifest` 寫 `release`，`vibe manifest --dev`／`vibe dev` 寫 `dev`；`dev` lock 永遠唔可以入 release manifest（決定 75）。
+- `build-mode`：`vibe manifest` 寫 `release`，`vibe manifest --dev` 寫 `dev`；`dev` lock 永遠唔可以入 release manifest（決定 75）。
 - `security-items`：驗證器 deterministic 抽出嘅安全項目清單，`reason` 由驗證器按規則產生；資訊性，用嚟 PR 高亮同部署報告，唔需要確認人（決定 78）；冇安全項目就寫 `[]`。
 - v1.8 起 lock 冇 `signature`，亦冇 `status`／`approval-*`／`approved-*`（決定 77、79）；SDK 讀到舊欄位會忽略並出 warning。
 
@@ -803,7 +804,7 @@ jobs:
 
 - `vibe` 係 SDK CLI 名（暫定）；deploy job 唔設任何 `LLM_*` 或者 `OPENAI_*` 變數。
 
-## 2C. SDK CLI：`vibe dev` 同 `vibe manifest`（決定 73–76、81、82，已確認（產品經理 2026-10-14））
+## 2C. SDK CLI：本地開發同 `vibe manifest`（決定 73–76、81、82、166，已確認（產品經理 2026-10-14））
 
 ### 2C.1 通用
 
@@ -815,30 +816,24 @@ jobs:
 - README 快速開始（決定 82）：
 
   ```bash
-  vibe dev
-  curl http://localhost:8080/catalog/v1/acme/items
+  vibe            # first run asks for LLM settings, then: 幫我開一個 hello world
+  vibe compile
+  vibe manifest --dev
+  vibe serve --memory
+  curl http://127.0.0.1:8080/hello/v1/dev/hello
   ```
 
-### 2C.2 `vibe dev`
+### 2C.2 本地開發流程（決定 166）
 
-- 本地 web API server，唔使預先編譯，預設 listen `127.0.0.1:8080`（只聽 loopback，同現有 `vibe serve --addr` 預設一致）。
-- Request 流程：
-  1. 按 URL 同 method 喺 `api/` 搵對應嘅 feature `.md`（路由規則同第 1 節一樣）；搵唔到回 404。
-  2. 搵出佢依賴嘅 `_definition`、`_version`、pipeline、method、model、provider。
-  3. 每個依賴睇 cache；冇就編譯成 lock，存喺 `.vibe/dev-cache/`（已 gitignore），唔會寫去 build 輸出目錄。
-  4. 驗證器對每個 lock 都跑，包括 cache 命中（驗證器 deterministic，好快）；唔通過回 500 `DEV_VALIDATION_FAILED`，terminal 顯示 lock 檔名、section、step 同原因（第 10 節同一套 error）。
-  5. 執行 request。
-- Cache key：`sha256(source-hash + 依賴 hash 按 id 排序 + compiler-hash 輸入)`；compiler-hash 輸入同 2A.1 標準定義一樣（provider、host、model、seed、sent-params、prompt 版本、編譯器版本）。任何一樣變咗就 cache miss。
-- File watch：`api/`、`models/`、`pipelines/`、`providers/`、`migrations/` 有改動，就令受影響嘅 lock 同依賴佢嘅 lock 失效，下一個 request 再編譯（或者 `--eager` 即時重編）。Migration 改動會重建 dev 資料庫。
-- 資料庫（決定 74）：
-  - 預設 `--db memory`：in-memory 執行器（同 `vibe serve --memory` 同一個），詳細要求見 2C.4。**只限開發同測試；server 一停，所有資料即刻消失。**
-  - `--db postgres`：opt-in，用內嵌 PostgreSQL（同 production 支援嘅同一個 major 版本，data 目錄放暫存目錄，停 server 就清走），用嚟做 RLS、grant 同 SQL 語意嘅保真度測試。
-  - `--db url`：用 `VIBE_DATABASE_URL` 連自己嘅 Postgres。
-  - 唔用 PGlite：佢係 WASM 單用戶模式 Postgres，SDK 係 Rust，要再嵌 WASM runtime，role 同連線行為保真度亦唔夠；需要保真度就用 `--db postgres`。
-- Dev 限制（決定 75）：
-  - Lock 寫 `build-mode: dev`，manifest 用本機 dev key（沿用現有 `.vibe/signing.key`，第一次自動產生）簽。Production runtime 只信任 pin 死嘅 Sigstore 身份（決定 119）；dev key 永遠唔會被信任，就算有人將佢嘅公鑰放入設定，runtime 見到 manifest 標 `build-mode: dev` 都拒絕。
-  - 2A.8.4 嘅本地 LLM 規則（http loopback、`LLM_ALLOW_PRIVATE_HOST`）只喺 `vibe dev` 適用。
-  - Kill switch、配額、captcha 喺 dev 用假實作（captcha 一律通過，terminal 標示）；最低回應耗時照做，令 timing 行為一致。
+1. 喺 terminal 執行互動 `vibe`：首次問 LLM 設定，key 輸入時遮住；project `.env` 用 0600 權限，只補缺少嘅設定，已有值優先，`.gitignore` 只加一次 `.env`（決定 157）。描述 API，例如「幫我開一個 hello world」，預覽檔案再確認寫入；唔會覆蓋現有檔案。Hello world 預設係 `hello/v1/hello`。Timeout／body／provider 要喺 source frontmatter pin，唔靠 prose limits（決定 160）。
+2. `vibe compile` 編譯 source，成個 project 驗證通過先寫 lock 同 `.vibe/build-record.json`；lock 係 gitignore 嘅 build 輸出，唔 commit（決定 117）。改 source 之後要再 compile。
+3. `vibe manifest --dev` 用上一步嘅 lock 同 build record，跑同 `vibe validate --deploy --dev` 一樣嘅部署檢查，再用本機 `.vibe/signing.key` 簽 manifest；第一次自動建立 key（0600），manifest 標 `build-mode: dev`。Dev manifest 喺 development 以外一律拒絕，production 唔信任本機 dev key（決定 75、154、164）。
+4. `vibe serve --memory` 載入 manifest，用 in-memory 執行器（2C.4），預設 listen `127.0.0.1:8080`。Development 一定提供 slug `dev`（tenant `devtenant`），即使設定咗其他 slug；slug 檔改動唔使重啟。只限開發同測試，server 一停資料就消失。
+5. `curl http://127.0.0.1:8080/hello/v1/dev/hello` 測試 API。
+
+2A.8.4 嘅本地 LLM 規則適用於開發環境 `vibe compile`：loopback 准 `http://`，其他內網地址要 `LLM_ALLOW_PRIVATE_HOST=true`；公開名稱解析到非公開地址（例如 fake-IP proxy）亦要呢個設定。互動設定會先問用戶先加呢個值。CI／非開發環境唔准呢個 override，編譯只准公開 HTTPS endpoint。`vibe validate --deploy --dev` 同 `vibe manifest --dev` 唔會呼叫 LLM，亦唔靠呢個環境變數放行；佢哋喺本地開發接受記咗 `endpoint-private: true` 嘅 lock。CI／非開發環境拒絕 `--dev`，release 部署檢查拒絕 private endpoint lock（決定 151）。
+
+**vNext（決定 166）**：`vibe dev` 唔喺 1.0。保留設計係唔使預先編譯，按 URL／method 搵 `.md` 同依賴，首次 request 先編譯，cache 放 `.vibe/dev-cache/`；cache key 係 `sha256(source-hash + 依賴 hash 按 id 排序 + compiler-hash 輸入)`，每次編譯同載入 cache 都跑驗證器。File watch 令改動影響嘅 lock 同依賴失效，下次 request 重編，`--eager` 即時重編，migration 改動重建 dev DB。計劃 `--db memory|postgres|url`：memory 預設、postgres 用內嵌 PostgreSQL 做保真度測試、url 用 `VIBE_DATABASE_URL`；唔用 PGlite，因為 Rust 要額外嵌 WASM runtime，而且 role／連線行為保真度唔夠。Dev captcha（一律通過並標示）、kill-switch 同配額假實作亦只係 vNext 設計，唔代表 1.0 已提供。
 
 ### 2C.3 `vibe manifest`（官方 build 指令，決定 164）
 
@@ -925,7 +920,7 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
 
 ### 2C.4 In-memory 執行器（決定 74，已確認（產品經理 2026-10-14））
 
-適用：`vibe dev`（預設）同 `vibe serve --memory`。
+適用：`vibe serve --memory`（vNext `vibe dev`，決定 166）。
 
 - **用途限制**：只限開發同測試。資料只存喺 process 記憶體，server 停止、重啟或者 crash 就全部消失；冇持久化、冇備份、冇跨 instance 共享。
 - **Dev 提示**：dev 用 in-memory 時，啟動同 health 都要清楚標示資料唔會保存：
@@ -933,7 +928,7 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
   - health endpoint（`/_health`）回 `"db": "memory"` 同 `"warning": "in-memory database, data is lost on stop"`；
   - 每分鐘喺 log 寫一次 `warn` 級別嘅同一句。
   - Production（manifest 唔係 `build-mode: dev`，或者 `VIBE_ENV=production`）一律拒絕 in-memory：啟動直接報錯退出，冇任何 override 旗標（決定 91）。
-  - 只係 listen 地址唔係 loopback（例如 Docker 入面 `vibe dev --addr 0.0.0.0:8080`）唔算 production，只出警告；Docker 入面請明確設 `VIBE_ENV=development`，`vibe dev` 本身產生 `build-mode: dev` manifest，所以照樣准用 in-memory。
+  - 只係 listen 地址唔係 loopback（例如 Docker 入面 `vibe serve --memory --addr 0.0.0.0:8080`）唔算 production，只出警告；Docker 入面請明確設 `VIBE_ENV=development`，先用 `vibe manifest --dev` 產生 `build-mode: dev` manifest，所以照樣准用 in-memory。
 - **一定要模擬嘅語意**（令 dev 行為同 production 一致）：
   - 租戶隔離（RLS＋FORCE）：每個 statement 一定帶 `tenant_id`；冇用租戶身份執行就報錯（同 production 冇權限一樣），唔係回空；租戶邊界係租戶 `LOGIN` role 同佢自己 schema，唔係 GUC；讀寫只見同一 tenant 嘅列；INSERT 嘅 `tenant_id` 由執行器注入，SQL 或者 input 帶 `tenant_id` 一律拒絕。
   - Role grant：每個 statement 用 lock 指定嘅 role（`app_rw`、`public_reader`、`public_writer`）執行，按 model lock `## Policies` 嘅 grant 檢查表級 SELECT／INSERT／UPDATE；冇權限回同 production 一樣嘅 `permission denied` 錯誤類別。
@@ -2438,7 +2433,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 ## 9B. 供應鏈同設定保護
 
 - CODEOWNERS 必須（決定 29、37、93、115）：`api/`、`models/`、`migrations/`、`providers/`、`pipelines/`、`.github/`、`.compiler/`（包括 `injection-allowlist`）、編譯器同驗證器版本設定，全部要有 CODEOWNERS 覆蓋，作為 source PR 合併條件；SDK / `vibe manifest` 唔檢查（2C.3a）。設定方法見 [`pr-review-guide.md`](pr-review-guide.md)。
-- Release manifest 簽名（決定 79、119）：冇長期 production key；`vibe manifest` 輸出 unsigned manifest，由 CI `release` environment 嘅 release workflow 用 GitHub OIDC 身份做 Sigstore keyless 簽名，寫入 Rekor。Environment secret 只可以用喺 dev／test 簽名，永遠唔簽 release。本機 `vibe dev`／`vibe manifest --dev` 用本機 dev key，production runtime 拒絕。
+- Release manifest 簽名（決定 79、119）：冇長期 production key；`vibe manifest` 輸出 unsigned manifest，由 CI `release` environment 嘅 release workflow 用 GitHub OIDC 身份做 Sigstore keyless 簽名，寫入 Rekor。Environment secret 只可以用喺 dev／test 簽名，永遠唔簽 release。本機 `vibe manifest --dev` 用本機 dev key，production runtime 拒絕。
 - Manifest 簽名前 `vibe manifest` 一定再跑一次驗證器；runtime 載入時驗證 manifest 簽名同每個 lock 嘅 hash，唔需要任何人手確認簽名。
 - 業務 secret（DB 連線、JWT 私鑰）只用引用名，永遠唔會出現喺 source、lock、manifest 或者 log。
 - 編譯用 `LLM_API_KEY`（或者別名 `OPENAI_API_KEY`）只存在 CI secret 同開發者本機 `.env`（已 gitignore），runtime 冇（見 2A.8.5）。
@@ -2499,7 +2494,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
   - 編譯請求帶咗 `tools`／`functions`／`toolConfig`，或者唔合 2A.8.2 嘅決定性設定；provider 回報 model 同 `LLM_MODEL` 唔一致。
   - secret scanning 喺 repo、lock、manifest、部署報告或者 CI log 搵到 key。
   - `.env` 冇喺 `.gitignore`，或者 repo 有 `.env`。
-  - runtime 環境變數有任何 `LLM_*` 或者 `OPENAI_*`，除咗開發環境（`vibe dev`，或者 `vibe serve --memory`／VIBE_ENV development）：serve 會警告（只列變數名），並喺 handlers 啟動之前移除所有 `LLM_*`／`OPENAI_*`；runtime 仍然永遠唔會收到 key。
+  - runtime 環境變數有任何 `LLM_*` 或者 `OPENAI_*`，除咗開發環境（`vibe serve --memory`／VIBE_ENV development）：serve 會警告（只列變數名），並喺 handlers 啟動之前移除所有 `LLM_*`／`OPENAI_*`；runtime 仍然永遠唔會收到 key。
 - source 有零寬字元或者 bidi 控制字元。
 - 語意一致性：lock 有 source 冇提及嘅寫入、公開、剔走 auth、簽 token 或者對外 call。
 
