@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 //! #37/#92: Traditional Chinese sample-shop sources compile end to end with a
 //! fake LLM, and the keyword checks accept CJK wording (共享, owner-key) and
 //! writes inherited from called methods.

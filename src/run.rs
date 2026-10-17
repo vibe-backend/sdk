@@ -1,8 +1,7 @@
 use crate::{
-    llm,
     manifest::{self, read_manifest},
     runtime::{router, AppState, AuthConfig, PgExec, QueryExec},
-    sign,
+    runtime_env, sign,
 };
 use std::{
     fs,
@@ -73,6 +72,20 @@ pub enum DbChoice {
     Memory,
     Postgres,
 }
+impl DbChoice {
+    pub fn from_arg_or_env(arg: Option<&str>) -> Result<Self, String> {
+        let value = arg
+            .map(str::to_owned)
+            .or_else(|| std::env::var("VIBE_DB").ok())
+            .unwrap_or_else(|| "memory".into());
+        match value.as_str() {
+            "memory" => Ok(Self::Memory),
+            "postgres" => Ok(Self::Postgres),
+            _ => Err("VIBE_DB must be memory or postgres".into()),
+        }
+    }
+}
+
 pub struct RunOptions {
     pub project: PathBuf,
     pub source: RunSource,
@@ -101,17 +114,21 @@ pub fn artifact_paths(path: &Path) -> (PathBuf, PathBuf) {
 }
 /// Validates and prepares a router and listener address without binding a socket.
 pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
+    #[cfg(not(feature = "sdk"))]
+    if matches!(opts.source, RunSource::Project) {
+        return Err("project mode needs vibe-sdk (`vibe run`); vibe-runtime runs build artifacts: pass --artifact".into());
+    }
     let project = opts.project.as_path();
     let addr = opts.addr.as_str();
     let memory = opts.db == DbChoice::Memory;
     load_dotenv(project);
     let run_env =
         crate::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), memory);
-    if let Some(name) = llm::runtime_llm_env_present() {
+    if let Some(name) = runtime_env::runtime_llm_env_present() {
         if !run_env.is_dev() {
             return Err(format!("runtime environment must not contain {name}"));
         }
-        let names = llm::strip_runtime_llm_env();
+        let names = runtime_env::strip_runtime_llm_env();
         eprintln!(
             "warning: removing compile-time variables from runtime environment: {}",
             names
@@ -146,7 +163,14 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
     )?;
     let mut auth = auth_from_env(run_env)?;
     let manifest = match &opts.source {
-        RunSource::Artifact(path) => load_manifest(&artifact_paths(path).0, project, run_env)?,
+        RunSource::Artifact(path) => {
+            let manifest_path = artifact_paths(path).0;
+            fs::metadata(&manifest_path).map_err(|err| format!("cannot read manifest {}: {err}", manifest_path.display()))?;
+            load_manifest(&manifest_path, project, run_env)?
+        },
+        #[cfg(not(feature = "sdk"))]
+        RunSource::Project => return Err("project mode needs vibe-sdk (`vibe run`); vibe-runtime runs build artifacts: pass --artifact".into()),
+        #[cfg(feature = "sdk")]
         RunSource::Project => {
             let validate = || -> Result<_, String> {
                 let loaded = crate::validate::load_project(project).map_err(|e| e.to_string())?;
@@ -443,14 +467,15 @@ pub fn load_dotenv(project: &Path) {
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
-    let current = llm::env_map_from_process();
-    for (key, value) in llm::merge_dotenv(&text, &current) {
+    let current = runtime_env::env_map_from_process();
+    for (key, value) in runtime_env::merge_dotenv(&text, &current) {
         if current.get(&key) != Some(&value) {
             std::env::set_var(key, value);
         }
     }
 }
 
+#[cfg(feature = "sdk")]
 fn ci_or_prod() -> bool {
     std::env::var("CI").ok().as_deref() == Some("true")
         || std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
@@ -460,6 +485,20 @@ fn ci_or_prod() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "sdk"))]
+    #[tokio::test]
+    async fn project_mode_requires_sdk() {
+        let options = super::RunOptions {
+            project: ".".into(),
+            source: super::RunSource::Project,
+            addr: "127.0.0.1:0".into(),
+            db: super::DbChoice::Memory,
+            allow_test_build: false,
+        };
+        let error = super::prepare(&options).await.err().unwrap();
+        assert_eq!(error, "project mode needs vibe-sdk (`vibe run`); vibe-runtime runs build artifacts: pass --artifact");
+    }
+
     #[test]
     fn artifact_file_and_directory_paths() {
         let root = std::env::temp_dir().join(format!("vibe-artifact-{}", uuid::Uuid::new_v4()));

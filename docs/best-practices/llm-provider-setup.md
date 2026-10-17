@@ -63,7 +63,7 @@ Fork PRs get no secrets, so they only run the validator, not the recompile (§2A
 Decision 174: provider, endpoint host, model, seed and sent parameters are recorded in the build record and manifest provenance `compilers` map. Locks contain `vibe-version`: stable versions use major.minor (including 0.x); pre-releases use the full version. Exact matches are required (decision 176).
 
 ````markdown
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 ````
 
 `model-snapshot` is the **provider-reported** model id (`modelReported`), not the user input; if it differs from `LLM_MODEL` (e.g. the provider resolved an alias) it is an error. `sent-params` is the parameter set the adapter actually sent (Decision 58, §2A.8.6).

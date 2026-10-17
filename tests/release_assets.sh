@@ -14,8 +14,10 @@ mkdist() {
   if [ -n "${SRC:-}" ]; then
     cp "$SRC"/vibe-* "$work/dist/"
   else
-    echo a >"$work/dist/vibe-x86_64-unknown-linux-gnu.tar.gz"
-    echo b >"$work/dist/vibe-x86_64-pc-windows-msvc.zip"
+    echo a >"$work/dist/vibe-sdk-x86_64-unknown-linux-gnu.tar.gz"
+    echo c >"$work/dist/vibe-runtime-x86_64-unknown-linux-gnu.tar.gz"
+    echo d >"$work/dist/vibe-runtime-x86_64-pc-windows-msvc.zip"
+    echo b >"$work/dist/vibe-sdk-x86_64-pc-windows-msvc.zip"
   fi
   (cd "$work/dist" && sha256sum -- vibe-* >SHA256SUMS)
 }

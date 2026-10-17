@@ -16,7 +16,7 @@ verify() {
   local dir=$1
   [ -f "$dir/SHA256SUMS" ] || die "missing $dir/SHA256SUMS"
   local listed actual
-  if LC_ALL=C grep -Evq '^[0-9a-f]{64} [ *]vibe-[A-Za-z0-9._-]+$' "$dir/SHA256SUMS"; then
+  if LC_ALL=C grep -Evq '^[0-9a-f]{64} [ *]vibe-(sdk|runtime)-[A-Za-z0-9._-]+$' "$dir/SHA256SUMS"; then
     die "malformed SHA256SUMS line"
   fi
   listed=$(cut -c67- "$dir/SHA256SUMS")
@@ -25,7 +25,7 @@ verify() {
   while IFS= read -r name; do
     case "$name" in
       -*|.*|SHA256SUMS) die "unexpected name in SHA256SUMS: $name" ;;
-      vibe-*.tar.gz|vibe-*.zip) ;;
+      vibe-sdk-*.tar.gz|vibe-sdk-*.zip|vibe-runtime-*.tar.gz|vibe-runtime-*.zip) ;;
       *) die "unexpected name in SHA256SUMS: $name" ;;
     esac
   done <<<"$listed"

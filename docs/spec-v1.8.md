@@ -18,7 +18,7 @@
 
 ### v1.8（草稿，2026-10-14）
 
-- 補編決定 150–177（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
+- 補編決定 150–178（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 vibe-version 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe build` → `vibe run`（決定 177））
 - `vibe build` 係官方 build 指令：預設更新過時 lock、驗證同寫 dev manifest；`--release` 做 release 打包，`--check` 唔寫檔（決定 175）。
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
@@ -284,7 +284,7 @@
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
-### 0.14 v1.8 2026-10-17 決定（決定 150–177，產品經理已批准 2026-10-17）
+### 0.14 v1.8 2026-10-17 決定（決定 150–178，產品經理已批准 2026-10-17）
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
@@ -316,6 +316,7 @@
 | 175 | 指令集只有 `vibe`（互動，TTY）、`vibe build` 同 `vibe run`（下一個 PR 加入）。`vibe build` 預設 dev build：產生／更新過時 lock（全部 lock 都係最新就唔叫 LLM，CI 冇 LLM key 都得）、自動驗證（等同舊 `vibe validate --deploy --dev`）、輸出 dev manifest；`vibe build --release` 取代 `vibe manifest --release`，保留所有 release 檢查：拒絕 private endpoint、唔准浮動 model alias、一定要記錄 provider；`vibe build --check` 喺記憶體 build 同跑決定 114 policy，唔寫檔。`vibe compile` 改名 `vibe build`；`vibe validate`、`vibe manifest`、`vibe new` 刪除，舊指令提示新指令並以非零退出。`vibe serve` 暫時保留做隱藏指令，`vibe run` 取代後刪除。（決定 177：`vibe serve` 已刪除，改用 `vibe run`）舊 `--labels`、`-o` 擴充同 10.10 部署報告構想延至 vNext，放喺 `vibe build --release` 之下。取代決定 164，亦更新決定 76、82、102、154、166 引用舊指令嘅部分。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.2、2C.3 |
 | 176 | lock 用 `vibe-version`，正式版（包括 0.x）記 major.minor（例如 `0.1`、`1.0`），pre-release 記完整版本（例如 `1.0.0-rc.2`），必須完全一致。版本唔啱（包括舊 `prompt-N` lock）喺 build 驗證同 serve／runtime 載入都係 error，提示用 `vibe build` 重新產生；source 冇改但版本唔同亦當過時。取消獨立 `PROMPT_VERSION`，compile prompt 只可以喺 minor（或者 major）版本改，patch 唔准改。CI `scripts/ci/check-prompt-version.py` 檢查 `src/compile_prompt.sha256`（system、translation、repair prompt 指紋）同 `src/prompt_guide.rs`（grammar、guides、examples、repair input）；PR 改咗呢啲檔而 Cargo.toml major.minor 冇高過 base branch 就 fail。Cargo.toml 係 pre-release 或者 1.0.0 之前跳過。 決定 165 嘅 byte-identical 保證改為「同一 source、同一 vibe 版本戳記同同一結構」。取代決定 162 同所有提及 `PROMPT_VERSION` 嘅舊決定（18、64、165、172、174 嘅相關部分）；`vibe-version` 取代 `compiler:` 同 `compiler-hash:`，即決定 174 嘅 compiler-hash 變成 vibe lock 版本戳記；manifest provenance `compiler_hash` 改為 `vibe_version`。 | 已批准（產品經理 2026-10-17） | 2A.1、2A.6、2C.3、10.1 |
 | 177 | `vibe run` 讀 project lock，喺記憶體做 dev manifest，預設 in-memory store、`127.0.0.1:8080`；`--db postgres`／`VIBE_DB` 用現有 PG 設定。Lock 缺少、過時或版本唔啱就 error 提示 `vibe build`，永遠唔叫 LLM。`--artifact` 跑 `vibe build -o` 或者 release artifact；run 邏輯係 library（`src/run.rs`），下一個 PR 嘅 `vibe-runtime` binary 會用。刪除 `vibe serve`，提示 `vibe run`，exit 2。`LLM_PROVIDER=fake` 做 keyless 測試 build：只喺 build record 同 manifest provenance 標 `test_build`，lock 唔標（決定 174）；`vibe run` 冇 `--allow-test-build` 拒絕、非 development 一律拒絕，`vibe build --release` 永遠拒絕 fake。`LLM_API_KEY_FILE` 讀 key，trim 尾部換行，`LLM_API_KEY` 優先，key 永遠唔顯示。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.2、2C.3、2A.8 |
+| 178 | 同一份 code 出兩個 binary（Cargo feature `sdk`，預設開）：`vibe-sdk`（安裝做 `vibe`，開發同 CI build 用：互動 `vibe`、`vibe build`、`vibe run`，同 PR D 之前嘅輔助指令）同 `vibe-runtime`（部署用，`--no-default-features` build，冇 LLM client、build／compile 同互動 TTY code；`vibe-runtime run` 或者冇 subcommand 跑 `--artifact`（預設目前目錄）嘅 manifest，flags `--addr`、`--db`／`VIBE_DB`、`--allow-test-build`，跟決定 176 lock 版本規則同決定 177 test build 規則）。CI 證明 runtime binary 冇 sdk feature 同 sdk-only 字串；release asset `vibe-sdk-<target>`／`vibe-runtime-<target>`，SHA256SUMS 同 build provenance attestation 覆蓋兩個，Sigstore／attestation 檢查不變；release workflow 喺 build 之前檢查 tag（去咗 v）等於 Cargo.toml version。`vibe-install.sh` 用 `--runtime`／`VIBE_INSTALL_BINARY=runtime` 揀 runtime（預設 sdk），兩者驗證一樣嚴格，rc.2 之前嘅 release 只有 sdk 舊名 asset。版本升到 `1.0.0-rc.2`，lock 戳記係 `1.0.0-rc.2`。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.3b、2C.3d、10.1、14 |
 
 ## 1. 目錄同命名
 
@@ -512,7 +513,7 @@ source-type: natural               # natural | structured
 dependencies:                      # 所有依賴 source／lock 嘅 hash，按 id 排序
   - { id: user, kind: model, hash: sha256:<...> }
   - { id: main, kind: provider, hash: sha256:<...> }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 build-mode: release                # release | dev；dev lock 唔可以部署（決定 75）
 security-items:                    # 驗證器 deterministic 抽出，資訊性（決定 78）
   - { item: public, risk: high, reason: "公開登入入口" }
@@ -813,7 +814,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2，用 SHA pin
       - name: Install vibe（pin 版本同 SHA256）
         run: |
-          curl -fsSL -o vibe.tar.gz https://github.com/vibe-backend/sdk/releases/download/v0.1.0/vibe-x86_64-unknown-linux-gnu.tar.gz
+          curl -fsSL -o vibe.tar.gz https://github.com/vibe-backend/sdk/releases/download/v1.0.0-rc.2/vibe-sdk-x86_64-unknown-linux-gnu.tar.gz
           echo "<SHA256SUMS 入面嘅值>  vibe.tar.gz" | sha256sum --check
           tar -xzf vibe.tar.gz && install -m 755 vibe "$HOME/.local/bin/vibe"
       - name: Secret scan
@@ -836,6 +837,8 @@ jobs:
 ## 2C. SDK CLI：本地開發同 `vibe build`（決定 73–76、81、82、166，已確認（產品經理 2026-10-14））
 
 ### 2C.1 通用
+
+決定 178：`vibe-sdk` 安裝做 `vibe`，開發同 CI build 用；`vibe-runtime` 部署用，見 2C.3d。
 
 - 所有指令嘅 `--project` 預設係目前目錄（cwd）；只有 project 唔喺 cwd 先要寫（決定 81）。
 - 冇 `vibe approve`（決定 77）；舊 workflow 用到會報「指令已移除」並提示用 `vibe build --release`。
@@ -885,6 +888,8 @@ jobs:
   - `release` environment `can_admins_bypass: true` 保持開啟，admin 可以跳過 environment 批准。
 
 ### 2C.3b 部署來源同部署前檢查（決定 113–116，issue #97）
+
+決定 178：SDK 同 runtime archive 都納入 SHA256SUMS 同 build provenance；兩個 binary 嘅 Sigstore／attestation 檢查不變，見 2C.3d。
 
 v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 build 嘅 artifact」加 attestation 同 deterministic policy 檢查。
 
@@ -954,14 +959,30 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
 或者 `DATABASE_URL` 同 PG 租戶設定。
 `--artifact <path>` 跑 `vibe build -o` 或 release artifact：接受 manifest 檔或者
 含 `manifest.json` 嘅目錄；bundle 用 `<manifest>.sigstore.json` 或 `VIBE_MANIFEST_BUNDLE`。
-Sigstore／attestation 驗證不變。Run 邏輯喺 library `src/run.rs`，下一個 PR 嘅
-`vibe-runtime` binary 會共用。舊 `vibe serve` 已刪除，提示 `vibe run`，exit 2。
+Sigstore／attestation 驗證不變。Run 邏輯喺 library `src/run.rs`，`vibe-runtime` binary 共用。舊 `vibe serve` 已刪除，提示 `vibe run`，exit 2。
 
 `LLM_PROVIDER=fake` 只支援 public GET 常數 JSON object API（預設 hello world），
 source 唔使寫 GET/public 字眼，亦接受中文；寫入、認證、model 同 method 唔支援。
 只喺 build record 同 manifest provenance 標 `test_build`，lock 唔標（決定 174）。
 `vibe run` 冇 `--allow-test-build` 拒絕，非 development 一律拒絕；
 `vibe build --release` 永遠拒絕 fake。
+
+### 2C.3d `vibe-runtime`（決定 178）
+
+同一份 code，Cargo `sdk` feature 預設開；SDK 用 `cargo build --release --bin vibe`。
+部署 binary 用 `cargo build --release --no-default-features --bin vibe-runtime`，
+冇 LLM client、build／compile 同互動 TTY code，只跑 artifact manifest。
+`vibe-runtime run --artifact <dir>` 或者 bare `vibe-runtime` 都係 run，artifact 預設 `.`。
+支援 `--addr`、`--db`／`VIBE_DB`、`--allow-test-build`；lock 版本跟決定 176，
+test build 跟決定 177（非 development 一律拒絕）。CI 檢查 feature tree 同 binary 字串。
+
+Release 每個 target 出 `vibe-sdk-<target>.tar.gz`／`.zip`（單一 `vibe`／`vibe.exe`）
+同 `vibe-runtime-<target>.tar.gz`／`.zip`（單一 `vibe-runtime`／`vibe-runtime.exe`）。
+SHA256SUMS 同 build provenance attestation 覆蓋兩者；build 前 tag 去咗 `v` 必須等於
+Cargo.toml version。Installer 預設 sdk，`--runtime`／`VIBE_INSTALL_BINARY=runtime`
+揀 runtime；flags 優先，兩者分開 managed dir 同 lock，可以並存同獨立移除。
+rc.2 之前 SDK 可以用舊名 `vibe-<target>.tar.gz`，runtime 冇 fallback。
+兩者都維持 2C.3b 嘅 checksum、Sigstore 身份同 attestation flags，唔放寬任何驗證。
 
 ### 2C.4 In-memory 執行器（決定 74，已確認（產品經理 2026-10-14））
 
@@ -1066,7 +1087,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: migrations/main/0002-add-last-login, kind: migration, hash: sha256:2b8f...c3 }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items:
   - { item: migration-ddl, risk: high, reason: "加敏感電話欄位" }
 ---
@@ -2517,6 +2538,8 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 
 ### 10.1 Lock 完整性（error）
 
+決定 178：目前版本 `1.0.0-rc.2` 嘅 lock 戳記係 `1.0.0-rc.2`；兩個 binary 都跟決定 176 完全一致規則。
+
 - 過時：`source-hash` 同而家 source 正規化 hash 唔一致；或者任何 `dependencies` hash 唔一致。Release 入面 lock hash 同 dependency hash 喺同一個 release build 入面計同驗，唔用之前 build 或者磁碟上嘅值。
 - 缺失：有 source 冇 lock，或者有 lock 冇 source（孤兒 lock）。
 - Dev lock：release build 入面有 `build-mode: dev` 嘅 lock（決定 75）。
@@ -2660,7 +2683,7 @@ source: providers/main.md
 source-hash: sha256:9a1c...e2
 source-type: natural
 dependencies: []
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items: [{ item: provider-new, risk: high, reason: "新增主資料庫" }]
 ---
 ## Connection
@@ -2748,7 +2771,7 @@ source: pipelines/login-guard.md
 source-hash: sha256:51bd...07
 source-type: natural
 dependencies: []
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items: [{ item: rate-limit-new, risk: medium, reason: "登入防爆破" }]
 ---
 ## Parameters
@@ -2858,7 +2881,7 @@ dependencies:
   - { id: user/methods/register, kind: method, hash: sha256:c3e1...90 }
   - { id: users/_definition, kind: api, hash: sha256:11ab...3c }
   - { id: users/v2/_version, kind: api, hash: sha256:0d9e...51 }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" }]
 ---
 ## Route
@@ -2961,7 +2984,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 build-mode: release
 security-items:
   - { item: write-sql, risk: medium, reason: "建立用戶" }
@@ -3030,7 +3053,7 @@ dependencies:
   - { id: email-outbox/methods/enqueue, kind: method, hash: sha256:81aa...c2 }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 build-mode: release
 security-items:
   - { item: write-sql, risk: medium, reason: "寫邀請 token" }
@@ -3114,7 +3137,7 @@ dependencies:
   - { id: user/methods/invite, kind: method, hash: sha256:5b7d...e4 }
   - { id: users/_definition, kind: api, hash: sha256:11ab...3c }
   - { id: users/v2/_version, kind: api, hash: sha256:0d9e...51 }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 build-mode: release
 security-items: [{ item: roles, risk: high, reason: "只限 admin 寄邀請" }]
 ---
@@ -3601,7 +3624,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: migrations/main/0004-add-email-verification, kind: migration, hash: sha256:5e77...b1 }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items:
   - { item: public-writable-column, risk: high, reason: "last_login_at 畀 public 登入寫" }
 ---
@@ -3664,7 +3687,7 @@ source-hash: sha256:3b90...d4
 source-type: natural
 dependencies:
   - { id: user, kind: model, hash: sha256:aa41...0f }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items:
   - { item: sign-token, risk: high, reason: "唯一簽 token 入口" }
 ---
@@ -3727,7 +3750,7 @@ dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
   - { id: user/methods/sign-token, kind: method, hash: sha256:3b90...d4 }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items:
   - { item: write-sql, risk: medium, reason: "記錄最後登入時間" }
 ---
@@ -3830,7 +3853,7 @@ dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: login-guard, kind: pipeline, hash: sha256:51bd...07 }
   - { id: user/methods/login, kind: method, hash: sha256:e81f...2a }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items:
   - { item: public, risk: high, reason: "登入入口一定要公開" }
   - { item: auth-removed, risk: high, reason: "未登入先要登入" }
@@ -4121,7 +4144,7 @@ source-type: natural
 dependencies:
   - { id: email-outbox, kind: model, hash: sha256:4f10...9d }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items:
   - { item: write-sql, risk: medium, reason: "註冊信件排隊" }
 ---
@@ -4193,7 +4216,7 @@ dependencies:
   - { id: email-outbox/methods/enqueue, kind: method, hash: sha256:81aa...c2 }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items:
   - { item: write-sql, risk: medium, reason: "建立未驗證用戶或者輪換驗證 token" }
 ---
@@ -4275,7 +4298,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items:
   - { item: set-password, risk: high, reason: "用 email token 設定密碼" }
   - { item: confirm-verification, risk: high, reason: "訪客用 token 確認 email" }
@@ -4366,7 +4389,7 @@ source-type: natural
 dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: user/methods/self-register, kind: method, hash: sha256:d3c9...10 }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items:
   - { item: public, risk: high, reason: "訪客註冊入口" }
   - { item: auth-removed, risk: high, reason: "未有帳戶" }
@@ -4484,7 +4507,7 @@ source-type: natural
 dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: user/methods/complete-verification, kind: method, hash: sha256:9e02...7b }
-vibe-version: 0.1
+vibe-version: 1.0.0-rc.2
 security-items:
   - { item: public, risk: high, reason: "email 連結入口" }
   - { item: auth-removed, risk: high, reason: "未有密碼" }
@@ -4611,6 +4634,8 @@ security-items:
 另外，0.10 嘅決定 73–119 已經由產品經理確認（2026-10-14；決定 80、116 已取代）；文件仍然係草稿，v1.8 正式定稿之前 v1.7 定稿照樣有效。
 
 ## 14. 後續版本
+
+決定 178 嘅雙 binary 屬於本版；PR D 之前嘅輔助指令照舊留喺 `vibe-sdk`，唔喺今次改動。
 
 - 排程、queue、webhook 入口。
 - 線上（唔凍結寫入）嘅 schema 升級去 database 遷移。

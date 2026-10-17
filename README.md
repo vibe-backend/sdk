@@ -4,6 +4,35 @@ Rust SDK and `vibe` CLI for a markdown-driven serverless backend. Source files u
 
 The specification is [docs/spec-v1.7.md](docs/spec-v1.7.md). The draft [docs/spec-v1.8.md](docs/spec-v1.8.md) is under review.
 
+## SDK and deployment runtime
+
+**vibe-sdk** installs as `vibe` for development and CI builds: interactive `vibe`,
+`vibe build`, `vibe run`, and the auxiliary commands.
+**vibe-runtime** is for deployment and only runs build artifacts. It contains no
+LLM client, build or interactive code. Use `vibe-runtime run --artifact <dir>`;
+bare `vibe-runtime` means run, with artifact `.` by default. Both forms accept
+`--addr`, `--db` / `VIBE_DB`, and `--allow-test-build` (development only).
+
+Once the release is published, install either or both with the verified manager:
+
+```sh
+./scripts/vibe-install.sh install --version v1.0.0-rc.2
+./scripts/vibe-install.sh install --version v1.0.0-rc.2 --runtime
+VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.2
+```
+
+The default installs `vibe`; `--runtime` installs `vibe-runtime`. They coexist.
+Release archives are `vibe-sdk-<target>.tar.gz` / `.zip` and
+`vibe-runtime-<target>.tar.gz` / `.zip`; SHA256SUMS and build provenance
+attestations cover both. See [installation details](docs/install.md).
+
+Build from source with Rust 1.89:
+
+```sh
+cargo build --release --bin vibe
+cargo build --release --no-default-features --bin vibe-runtime
+```
+
 ## Development
 
 `vibe dev` (no precompile) is planned for vNext (spec decision 166); use the Hello world flow below.
@@ -21,7 +50,7 @@ The specification is [docs/spec-v1.7.md](docs/spec-v1.7.md). The draft [docs/spe
 There are currently no published tags, GitHub Releases, or downloadable release assets for this repository. The `vibe` CLI is not published to crates.io or as a container image. For now, build it from a source checkout with Rust 1.89:
 
 ```bash
-cargo build --release --locked
+cargo build --release --locked --bin vibe
 ./target/release/vibe --help
 ```
 
@@ -69,7 +98,7 @@ all release checks, ready for Sigstore signing. Options include `--project`,
 `-o`/`--output`, `--release-version`, and `--commit`.
 
 Run the project with `vibe run`, then curl the API. Use `--artifact` to run a build artifact.
-Locks record `vibe-version: 0.1`: stable versions use major.minor and
+Locks record `vibe-version: 1.0.0-rc.2`: stable versions use major.minor and
 pre-releases use the full version, with an exact match required. Run
 `vibe build` to regenerate locks from another version or the old lock format.
 

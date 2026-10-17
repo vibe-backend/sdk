@@ -178,8 +178,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Run { project, artifact, addr, db, allow_test_build } => {
-            let db = db.or_else(|| std::env::var("VIBE_DB").ok()).unwrap_or_else(|| "memory".into());
-            let db = match db.as_str() { "memory" => vibe::run::DbChoice::Memory, "postgres" => vibe::run::DbChoice::Postgres, _ => return Err("VIBE_DB must be memory or postgres".into()) };
+            let db = vibe::run::DbChoice::from_arg_or_env(db.as_deref())?;
             vibe::run::run(vibe::run::RunOptions { project, source: artifact.map(vibe::run::RunSource::Artifact).unwrap_or(vibe::run::RunSource::Project), addr, db, allow_test_build }).await
         },
         Command::Migrate {

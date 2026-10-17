@@ -96,6 +96,27 @@ jobs:
       - if: steps.detect.outputs.present != 'true'
         run: echo "No Cargo.toml yet; skipping Rust checks."
 
+  runtime-binary:
+    name: Runtime binary (no LLM, build or TTY code)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.89"
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: cargo build --release --locked --bin vibe
+      - run: cargo build --release --locked --no-default-features --bin vibe-runtime
+      - run: cargo clippy --locked --no-default-features --lib --bins -- -D warnings
+      - run: scripts/ci/check-runtime-features.sh
+      - run: scripts/ci/check-runtime-binary.sh target/release/vibe-runtime target/release/vibe
+      - run: ls -l target/release/vibe-runtime target/release/vibe
+
   postgres-tls:
     name: Postgres TLS integration tests
     runs-on: ubuntu-latest
@@ -188,5 +209,6 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: |
-          cargo build --release --locked --target ${{ matrix.target }}
-          ls -l target/${{ matrix.target }}/release/ | grep -E 'vibe(\.exe)?$'
+          cargo build --release --locked --target ${{ matrix.target }} --bin vibe
+          cargo build --release --locked --target ${{ matrix.target }} --no-default-features --bin vibe-runtime
+          ls -l target/${{ matrix.target }}/release/ | grep -E 'vibe(-runtime)?(\.exe)?$'

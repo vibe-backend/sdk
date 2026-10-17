@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 //! #37: on a lock grammar error the compiler re-prompts with the validator
 //! errors, a bounded number of times.
 

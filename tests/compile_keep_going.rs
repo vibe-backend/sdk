@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 //! #83: per-file lock writes and transient-error retries.
 
 use std::fs;

@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 //! #83: the overall retry deadline stops backoff early. Own test binary
 //! because it sets a process-wide env var.
 

@@ -489,12 +489,15 @@ mod url_tests {
             "https://[100::1]/jwks.json",
         ] {
             assert!(crate::runtime::jwks::HttpsJwks::new(uri).is_err(), "{uri}");
-            let host = url::Url::parse(uri)
-                .unwrap()
-                .host_str()
-                .unwrap()
-                .to_string();
-            assert!(crate::llm::is_private_host(&host), "{uri}");
+            #[cfg(feature = "sdk")]
+            {
+                let host = url::Url::parse(uri)
+                    .unwrap()
+                    .host_str()
+                    .unwrap()
+                    .to_string();
+                assert!(crate::llm::is_private_host(&host), "{uri}");
+            }
         }
         assert!(
             crate::runtime::jwks::HttpsJwks::new("https://auth.example.com./jwks.json").is_ok()

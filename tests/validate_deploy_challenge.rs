@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 //! `vibe build` refuses locks with unverified challenges (#199).
 
 use std::fs;

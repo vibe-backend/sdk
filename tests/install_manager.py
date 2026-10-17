@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import hashlib,os,pathlib,shutil,subprocess,tarfile,tempfile,unittest
-ROOT=pathlib.Path(__file__).resolve().parents[1]; SCRIPT=ROOT/"scripts/vibe-install.sh"; ASSET="vibe-x86_64-unknown-linux-gnu.tar.gz"
+ROOT=pathlib.Path(__file__).resolve().parents[1]; SCRIPT=ROOT/"scripts/vibe-install.sh"; ASSET="vibe-sdk-x86_64-unknown-linux-gnu.tar.gz"
 class T(unittest.TestCase):
  def setUp(self):
   self.t=pathlib.Path(tempfile.mkdtemp()); self.server=self.t/"server"; self.cmd=self.t/"cmd"; self.dest=self.t/"install"; self.server.mkdir(); self.cmd.mkdir()
@@ -19,8 +19,11 @@ name=${url##*/};rest=${url#*/download/};version=${rest%%/*};cp "$MOCK_SERVER/$ve
  def command(self,n,b):p=self.cmd/n;p.write_text(b);p.chmod(0o755)
  def release(self,v,text,bad=False):
   d=self.server/v;d.mkdir();q=self.t/f"p-{v}";q.mkdir();x=q/"vibe";x.write_text(f"#!/bin/sh\necho {text}\n");x.chmod(0o755)
-  with tarfile.open(d/ASSET,"w:gz")as f:f.add(x,arcname="vibe")
-  h=hashlib.sha256((d/ASSET).read_bytes()).hexdigest();(d/"SHA256SUMS").write_text(f"{'0'*64 if bad else h}  {ASSET}\n")
+  sums=[]
+  for asset,entry in [(ASSET,"vibe"),(ASSET.replace("vibe-sdk-","vibe-runtime-"),"vibe-runtime")]:
+   with tarfile.open(d/asset,"w:gz")as f:f.add(x,arcname=entry)
+   h=hashlib.sha256((d/asset).read_bytes()).hexdigest();sums.append(f"{'0'*64 if bad else h}  {asset}\n")
+  (d/"SHA256SUMS").write_text("".join(sums))
  def runit(self,*a,env=None):return subprocess.run([str(SCRIPT),*a],env=env or self.env,text=True,capture_output=True)
  def install1(self):r=self.runit("install","--version","v1.0.0","--non-interactive");self.assertEqual(r.returncode,0,r.stderr)
  def test_help(self):self.assertEqual(self.runit("--help").returncode,0)
@@ -57,6 +60,51 @@ name=${url##*/};rest=${url#*/download/};version=${rest%%/*};cp "$MOCK_SERVER/$ve
   self.install1();before=os.readlink(self.dest/"vibe");self.release("v1.2.3-rc.1","bad",True);self.release("v1.2.3-rc.2","rc")
   for version,env,error in [("v1.2.3-rc.1",self.env,"checksum verification failed"),("v1.2.3-rc.2",self.env|{"MOCK_ATTEST_FAIL":"1"},"GitHub artifact attestation verification failed")]:
    with self.subTest(version=version):r=self.runit("upgrade","--version",version,env=env);self.assertNotEqual(r.returncode,0);self.assertIn(error,r.stderr);self.assertEqual(os.readlink(self.dest/"vibe"),before);self.assertEqual(subprocess.check_output([self.dest/"vibe"],text=True).strip(),"one")
+ def test_runtime_flags_env_and_coexistence(self):
+  self.install1();sdk=os.readlink(self.dest/"vibe")
+  for flags,env in [(('--runtime',),self.env),((),self.env|{"VIBE_INSTALL_BINARY":"runtime"})]:
+   r=self.runit("install","--version","v1.0.0",*flags,env=env);self.assertEqual(r.returncode,0,r.stderr)
+   self.assertEqual(subprocess.check_output([self.dest/"vibe-runtime"],text=True).strip(),"one")
+   self.assertEqual(os.readlink(self.dest/"vibe"),sdk)
+  self.assertEqual(self.runit("remove","--runtime").returncode,0)
+  self.assertFalse((self.dest/"vibe-runtime").exists());self.assertEqual(os.readlink(self.dest/"vibe"),sdk)
+ def test_runtime_only_and_flag_precedence(self):
+  r=self.runit("install","--version","v1.0.0","--runtime",env=self.env|{"VIBE_INSTALL_BINARY":"invalid"});self.assertEqual(r.returncode,0,r.stderr)
+  self.assertFalse((self.dest/"vibe").exists())
+ def test_invalid_binary_before_network(self):
+  r=self.runit("install","--version","v1.0.0",env=self.env|{"VIBE_INSTALL_BINARY":"invalid"})
+  self.assertIn("VIBE_INSTALL_BINARY must be sdk or runtime",r.stderr);self.assertNotEqual(r.returncode,0)
+  self.assertFalse((self.t/"curl.log").exists())
+ def test_sdk_flag_overrides_runtime_environment(self):
+  r=self.runit("install","--version","v1.0.0","--sdk",env=self.env|{"VIBE_INSTALL_BINARY":"runtime"})
+  self.assertEqual(r.returncode,0,r.stderr);self.assertTrue((self.dest/"vibe").exists());self.assertFalse((self.dest/"vibe-runtime").exists())
+ def test_empty_binary_rejected(self):
+  r=self.runit("install","--version","v1.0.0",env=self.env|{"VIBE_INSTALL_BINARY":""})
+  self.assertNotEqual(r.returncode,0);self.assertIn("VIBE_INSTALL_BINARY must be sdk or runtime",r.stderr)
+  self.assertFalse((self.t/"curl.log").exists())
+ def test_runtime_rc_identity_and_failure_preserves(self):
+  self.release("v1.0.0-rc.2","rc")
+  r=self.runit("install","--version","v1.0.0-rc.2","--runtime");self.assertEqual(r.returncode,0,r.stderr)
+  before=os.readlink(self.dest/"vibe-runtime")
+  line=(self.t/"gh.log").read_text().splitlines()[1]
+  archive=line.split()[2]
+  self.assertEqual(line,f"attestation verify {archive} --repo vibe-backend/sdk --signer-workflow vibe-backend/sdk/.github/workflows/release.yml --source-ref refs/tags/v1.0.0-rc.2 --source-digest 0123456789abcdef0123456789abcdef01234567 --deny-self-hosted-runners")
+  self.release("v3.0.0","bad",True)
+  for version,env,error in [("v3.0.0",self.env,"checksum verification failed"),("v2.0.0",self.env|{"MOCK_ATTEST_FAIL":"1"},"attestation verification failed")]:
+   r=self.runit("upgrade","--runtime","--version",version,env=env);self.assertNotEqual(r.returncode,0);self.assertIn(error,r.stderr)
+   self.assertEqual(os.readlink(self.dest/"vibe-runtime"),before)
+   self.assertEqual(subprocess.check_output([self.dest/"vibe-runtime"],text=True).strip(),"rc")
+ def test_runtime_wrong_archive_entry(self):
+  d=self.server/"v2.0.0";asset=ASSET.replace("vibe-sdk-","vibe-runtime-")
+  shutil.copyfile(d/ASSET,d/asset)
+  h=hashlib.sha256((d/asset).read_bytes()).hexdigest();(d/"SHA256SUMS").write_text(f"{h}  {asset}\n")
+  r=self.runit("install","--runtime","--version","v2.0.0");self.assertNotEqual(r.returncode,0);self.assertIn("unexpected path",r.stderr)
+ def test_legacy_sdk_only(self):
+  self.release("v1.0.0-rc.1","legacy");d=self.server/"v1.0.0-rc.1";legacy=ASSET.replace("vibe-sdk-","vibe-")
+  (d/ASSET).rename(d/legacy);(d/ASSET.replace("vibe-sdk-","vibe-runtime-")).unlink()
+  h=hashlib.sha256((d/legacy).read_bytes()).hexdigest();(d/"SHA256SUMS").write_text(f"{h}  {legacy}\n")
+  r=self.runit("install","--version","v1.0.0-rc.1");self.assertEqual(r.returncode,0,r.stderr)
+  r=self.runit("install","--runtime","--version","v1.0.0-rc.1");self.assertNotEqual(r.returncode,0);self.assertIn("this release has no vibe-runtime asset for x86_64-unknown-linux-gnu",r.stderr)
  def test_curl_https_only(self):
   t=SCRIPT.read_text();self.assertEqual(t.count("curl -f"),t.count("--proto '=https' --tlsv1.2"))
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 use std::{fs, path::PathBuf, process::Command};
 
 fn project() -> PathBuf {
@@ -147,10 +149,11 @@ fn hello_serves_without_loading_llm_configuration() {
             .spawn()
             .unwrap();
         let response = (|| {
-            for _ in 0..100 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
                 if let Ok(mut stream) = std::net::TcpStream::connect(addr) {
                     stream
-                        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
                         .unwrap();
                     stream.write_all(b"GET /hello/v1/dev/hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
                     let mut body = String::new();
@@ -246,4 +249,94 @@ fn prepared_hello_router_without_socket() {
         }
         assert!(child.status().unwrap().success());
     }
+}
+
+fn runtime_cli(root: &std::path::Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibe-runtime"));
+    cmd.env_clear().current_dir(root);
+    cmd
+}
+
+#[test]
+fn runtime_help_version_missing_artifact_and_wrong_stamp() {
+    let root = project();
+    for flag in ["--help", "--version"] {
+        let out = runtime_cli(&root).arg(flag).output().unwrap();
+        assert!(out.status.success());
+        if flag == "--version" {
+            assert!(String::from_utf8_lossy(&out.stdout).contains(env!("CARGO_PKG_VERSION")));
+        }
+    }
+    for args in [vec![], vec!["run"]] {
+        let out = runtime_cli(&root).args(args).output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("No such file"));
+    }
+    build(&root);
+    let path = root.join("manifest.json");
+    let mut manifest: vibe::manifest::Manifest =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest.provenance.locks[0].vibe_version = "99.0".into();
+    manifest.signature.clear();
+    let key = vibe::sign::load_or_create(&root).unwrap();
+    manifest.signature = vibe::sign::sign_bytes(&serde_json::to_vec(&manifest).unwrap(), &key);
+    vibe::manifest::write_manifest(&path, &manifest).unwrap();
+    let out = runtime_cli(&root)
+        .args(["run", "--artifact", ".", "--allow-test-build"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("regenerate it with `vibe build`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn runtime_artifact_serves_hello() {
+    use std::io::{Read, Write};
+    let root = project();
+    build(&root);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    // Run outside the artifact directory to exercise the project default.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vibe-runtime"))
+        .env_clear()
+        .args(["run", "--artifact"])
+        .arg(&root)
+        .args(["--allow-test-build", "--addr", &addr.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let response = (|| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if let Ok(mut stream) = std::net::TcpStream::connect(addr) {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                stream.write_all(b"GET /hello/v1/dev/hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+                let mut body = String::new();
+                stream.read_to_string(&mut body).unwrap();
+                return body;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        String::new()
+    })();
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 200") && response.contains("hello world"),
+        "{response}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

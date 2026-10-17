@@ -1,15 +1,24 @@
 [package]
 name = "vibe"
-version = "0.1.0"
+version = "1.0.0-rc.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Markdown-driven serverless backend SDK and the vibe CLI"
 readme = "README.md"
 rust-version = "1.89"
 
+[features]
+default = ["sdk"]
+sdk = []
+
 [[bin]]
 name = "vibe"
 path = "src/main.rs"
+required-features = ["sdk"]
+
+[[bin]]
+name = "vibe-runtime"
+path = "src/bin/vibe-runtime.rs"
 
 [dependencies]
 async-trait = "0.1"
