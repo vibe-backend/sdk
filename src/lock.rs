@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 pub const COMPILER_NAME: &str = "md-logic";
 pub const COMPILER_VERSION: &str = "0.1.0";
-pub const PROMPT_VERSION: &str = "prompt-2";
+pub const PROMPT_VERSION: &str = "prompt-4";
 pub const LOCK_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,55 +95,6 @@ impl SourceType {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
-    Pending,
-    Approved,
-    Rejected,
-}
-
-impl Status {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Approved => "approved",
-            Self::Rejected => "rejected",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        Some(match value {
-            "pending" => Self::Pending,
-            "approved" => Self::Approved,
-            "rejected" => Self::Rejected,
-            _ => return None,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ApprovalMode {
-    Manual,
-    Auto,
-}
-
-impl ApprovalMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Manual => "manual",
-            Self::Auto => "auto",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        Some(match value {
-            "manual" => Self::Manual,
-            "auto" => Self::Auto,
-            _ => return None,
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Risk {
     High,
@@ -202,12 +153,23 @@ impl CompilerStamp {
     }
 }
 
+/// D109: audit record of the 2.1a translation. Only the prompt version,
+/// provider/model and the hash of the translated text are stamped; the
+/// translated text itself goes into the release audit artifact, never into
+/// the lock. Not part of `source-hash` or `compiler-hash`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslationStamp {
+    pub prompt_version: String,
+    pub llm_provider: String,
+    pub model_snapshot: String,
+    pub hash: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecurityItem {
     pub item: String,
     pub risk: Risk,
     pub reason: String,
-    pub approved_by: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,14 +184,13 @@ pub struct Meta {
     pub dependencies: Vec<Dependency>,
     pub compiler: CompilerStamp,
     pub compiler_hash: String,
-    pub status: Status,
-    pub approval_mode: ApprovalMode,
-    pub approved_by: Vec<String>,
-    pub approved_at: String,
-    pub approval_ref: String,
-    pub approved_commit: String,
+    /// Present only for translated sources.
+    pub translation: Option<TranslationStamp>,
     pub security_items: Vec<SecurityItem>,
-    pub signature: String,
+    /// Pre-v1.8 frontmatter keys (`status`, `approval-*`, `approved-*`,
+    /// `signature`, item `approved-by`) found while parsing. They are ignored
+    /// and never rendered; the validator reports them as warnings.
+    pub legacy_fields: Vec<String>,
 }
 
 impl Meta {
@@ -250,14 +211,9 @@ impl Meta {
             dependencies: Vec::new(),
             compiler: CompilerStamp::deterministic(),
             compiler_hash: String::new(),
-            status: Status::Pending,
-            approval_mode: ApprovalMode::Manual,
-            approved_by: Vec::new(),
-            approved_at: "(none)".into(),
-            approval_ref: "(none)".into(),
-            approved_commit: "(none)".into(),
+            translation: None,
             security_items: Vec::new(),
-            signature: "(none)".into(),
+            legacy_fields: Vec::new(),
         }
     }
 }
@@ -389,8 +345,7 @@ fn sent_params_json(params: &BTreeMap<String, String>) -> Value {
 
 /// Hash of the definition a dependent should pin.
 ///
-/// Approval metadata and the signature are excluded so a later approval does
-/// not force every dependent to be rewritten.
+/// Only the kind, id, source hash and sections count.
 pub fn content_hash(doc: &LockDoc) -> String {
     let raw = format!(
         "{}\n{}\n{}\n{}",
@@ -456,27 +411,25 @@ fn render_meta(meta: &Meta) -> String {
         render_sent_params(&meta.compiler.sent_params)
     ));
     push_line(&mut out, "compiler-hash", &meta.compiler_hash);
-    push_line(&mut out, "status", meta.status.as_str());
-    push_line(&mut out, "approval-mode", meta.approval_mode.as_str());
-    push_line(&mut out, "approved-by", &render_list(&meta.approved_by));
-    push_line(&mut out, "approved-at", &meta.approved_at);
-    push_line(&mut out, "approval-ref", &meta.approval_ref);
-    push_line(&mut out, "approved-commit", &meta.approved_commit);
+    if let Some(t) = &meta.translation {
+        out.push_str(&format!(
+            "translation: {{ prompt-version: {}, llm-provider: {}, model-snapshot: {}, hash: {} }}\n",
+            t.prompt_version, t.llm_provider, t.model_snapshot, t.hash
+        ));
+    }
     if meta.security_items.is_empty() {
         push_line(&mut out, "security-items", "[]");
     } else {
         out.push_str("security-items:\n");
         for item in &meta.security_items {
             out.push_str(&format!(
-                "  - {{ item: {}, risk: {}, reason: {}, approved-by: {} }}\n",
+                "  - {{ item: {}, risk: {}, reason: {} }}\n",
                 item.item,
                 item.risk.as_str(),
-                quote_inline(&item.reason),
-                render_list(&item.approved_by)
+                quote_inline(&item.reason)
             ));
         }
     }
-    push_line(&mut out, "signature", &meta.signature);
     out
 }
 
@@ -485,13 +438,6 @@ fn push_line(out: &mut String, key: &str, value: &str) {
     out.push_str(": ");
     out.push_str(value);
     out.push('\n');
-}
-
-fn render_list(items: &[String]) -> String {
-    if items.is_empty() {
-        return "[]".into();
-    }
-    format!("[{}]", items.join(", "))
 }
 
 fn quote_inline(value: &str) -> String {
@@ -769,8 +715,21 @@ fn parse_meta(front: &str) -> Result<Meta, String> {
         None => None,
     };
     let dependencies = parse_dependencies(&get("dependencies").unwrap_or_else(|_| "[]".into()))?;
-    let security = parse_security(&get("security-items").unwrap_or_else(|_| "[]".into()))?;
+    let (security, item_approvals) =
+        parse_security(&get("security-items").unwrap_or_else(|_| "[]".into()))?;
+    let mut legacy_fields: Vec<String> = LEGACY_FIELDS
+        .iter()
+        .filter(|name| fields.iter().any(|(key, _)| key == *name))
+        .map(|name| name.to_string())
+        .collect();
+    if item_approvals {
+        legacy_fields.push("security-items approved-by".into());
+    }
     let compiler = parse_compiler(&get("compiler")?)?;
+    let translation = match fields.iter().find(|(k, _)| k == "translation") {
+        Some((_, raw)) => Some(parse_translation(raw)?),
+        None => None,
+    };
     Ok(Meta {
         lock_version: get("lock-version")?
             .parse()
@@ -784,16 +743,22 @@ fn parse_meta(front: &str) -> Result<Meta, String> {
         dependencies,
         compiler,
         compiler_hash: get("compiler-hash")?,
-        status: Status::parse(&get("status")?).ok_or("bad status")?,
-        approval_mode: ApprovalMode::parse(&get("approval-mode")?).ok_or("bad approval-mode")?,
-        approved_by: parse_string_list(&get("approved-by")?)?,
-        approved_at: get("approved-at")?,
-        approval_ref: get("approval-ref")?,
-        approved_commit: get("approved-commit")?,
+        translation,
         security_items: security,
-        signature: get("signature")?,
+        legacy_fields,
     })
 }
+
+/// Frontmatter keys removed in v1.8 (decisions 77, 79): ignored with a warning.
+pub const LEGACY_FIELDS: &[&str] = &[
+    "status",
+    "approval-mode",
+    "approved-by",
+    "approved-at",
+    "approval-ref",
+    "approved-commit",
+    "signature",
+];
 
 fn parse_dependencies(raw: &str) -> Result<Vec<Dependency>, String> {
     if raw.trim() == "[]" {
@@ -813,23 +778,29 @@ fn parse_dependencies(raw: &str) -> Result<Vec<Dependency>, String> {
         .collect()
 }
 
-fn parse_security(raw: &str) -> Result<Vec<SecurityItem>, String> {
+/// Security items, plus whether any carried a legacy `approved-by`.
+fn parse_security(raw: &str) -> Result<(Vec<SecurityItem>, bool), String> {
     if raw.trim() == "[]" {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
-    raw.lines()
+    let mut legacy = false;
+    let items = raw
+        .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let map = parse_inline_map(line.trim())?;
             let risk = Risk::parse(map_get(&map, "risk")?).ok_or("bad risk")?;
+            if map_get(&map, "approved-by").is_ok() {
+                legacy = true;
+            }
             Ok(SecurityItem {
                 item: map_get(&map, "item")?.to_string(),
                 risk,
-                reason: unquote(map_get(&map, "reason")?),
-                approved_by: parse_string_list(map_get(&map, "approved-by")?)?,
+                reason: map_get(&map, "reason").map(unquote).unwrap_or_default(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((items, legacy))
 }
 
 fn render_sent_params(params: &BTreeMap<String, String>) -> String {
@@ -865,6 +836,28 @@ fn parse_compiler(raw: &str) -> Result<CompilerStamp, String> {
         endpoint_private: map_get(&map, "endpoint-private")? == "true",
         seed: seed.parse().map_err(|_| "bad seed".to_string())?,
         sent_params: parse_sent_params(sent_raw)?,
+    })
+}
+
+fn parse_translation(raw: &str) -> Result<TranslationStamp, String> {
+    let map = parse_inline_map(raw)?;
+    for (key, _) in &map {
+        if !matches!(
+            key.as_str(),
+            "prompt-version" | "llm-provider" | "model-snapshot" | "hash"
+        ) {
+            return Err(format!("translation: unknown key {key}"));
+        }
+    }
+    let hash = map_get(&map, "hash")?.to_string();
+    if !hash.starts_with("sha256:") {
+        return Err("translation: hash must be sha256:<hex>".into());
+    }
+    Ok(TranslationStamp {
+        prompt_version: map_get(&map, "prompt-version")?.to_string(),
+        llm_provider: map_get(&map, "llm-provider")?.to_string(),
+        model_snapshot: map_get(&map, "model-snapshot")?.to_string(),
+        hash,
     })
 }
 
@@ -1009,6 +1002,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn translation_stamp_roundtrips_and_has_no_text_field() {
+        let mut meta = Meta::pending(Kind::Model, None, "product", "models/product/product.md");
+        meta.source_hash = "sha256:abc".into();
+        meta.compiler_hash = compiler_hash(&meta.compiler);
+        let before = meta.compiler_hash.clone();
+        meta.translation = Some(TranslationStamp {
+            prompt_version: "translate-1".into(),
+            llm_provider: "openai".into(),
+            model_snapshot: "gpt-test-2026-01-01".into(),
+            hash: "sha256:0123".into(),
+        });
+        assert_eq!(compiler_hash(&meta.compiler), before);
+        let doc = LockDoc {
+            meta,
+            sections: Vec::new(),
+        };
+        let text = render_lock(&doc);
+        assert!(text.contains(
+            "translation: { prompt-version: translate-1, llm-provider: openai, model-snapshot: gpt-test-2026-01-01, hash: sha256:0123 }\n"
+        ));
+        let parsed = parse_lock(&text).expect("parse");
+        assert_eq!(parsed.meta.translation, doc.meta.translation);
+        assert_eq!(render_lock(&parsed), text);
+        // A `text` key (or any other) is rejected: the text never goes in the lock.
+        let bad = text.replace("hash: sha256:0123 }", "hash: sha256:0123, text: hi }");
+        assert!(parse_lock(&bad).is_err());
+    }
+
+    #[test]
     fn roundtrip_frontmatter() {
         let mut meta = Meta::pending(Kind::Model, None, "product", "models/product/product.md");
         meta.source_hash = "sha256:abc".into();
@@ -1023,7 +1045,6 @@ mod tests {
             item: "write-sql".into(),
             risk: Risk::Medium,
             reason: "creates rows".into(),
-            approved_by: vec!["a@example".into()],
         });
         let doc = LockDoc {
             meta,

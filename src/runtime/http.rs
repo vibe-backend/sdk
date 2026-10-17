@@ -131,6 +131,7 @@ impl AuthConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct Slug {
     pub tenant_id: String,
     pub public_access: bool,
@@ -142,6 +143,7 @@ pub struct AppState {
     pub exec: Arc<dyn QueryExec>,
     pub auth: AuthConfig,
     pub slugs: HashMap<String, Slug>,
+    pub dev_slugs: Option<super::slugs::DevSlugs>,
     pub rates: Mutex<RateBuckets>,
     pub quotas: Mutex<QuotaBuckets>,
     pub disabled: HashSet<String>,
@@ -524,7 +526,12 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     };
     let principal = if found.route.public && found.route.auth_removed {
         let slug = found.params.get("slug").cloned().unwrap_or_default();
-        match state.slugs.get(&slug) {
+        let entry = match &state.dev_slugs {
+            Some(slugs) => slugs.lookup(&slug),
+            None => state.slugs.get(&slug).cloned(),
+        };
+        let unknown = entry.is_none();
+        match entry {
             Some(entry)
                 if entry.public_access && (!found.route.public_writes || entry.public_write) =>
             {
@@ -536,9 +543,8 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                 }
             }
             _ => {
-                let unknown = !state.slugs.contains_key(&slug);
                 let message = if state.dev_hints && unknown {
-                    format!("Not found. Unknown slug `{slug}`; run `vibe slug add {slug} --tenant <id>` or copy slugs.example.json to .vibe/slugs.json")
+                    format!("Not found. Unknown slug `{slug}`; run `vibe slug add {slug} --tenant <id>` or copy slugs.example.json to .vibe/slugs.json{}", if state.dev_slugs.is_some() { "; `vibe slug add` is picked up without restart under `serve --memory`" } else { "" })
                 } else {
                     "Not found".into()
                 };
@@ -745,7 +751,11 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             refresh_token: None,
         }),
     );
-    let input = match crud::eval_expr(&found.route.transform_in, &vars) {
+    let transform_in = match found.route.transform_in.trim() {
+        "" | "(none)" => "{}",
+        expr => expr,
+    };
+    let input = match crud::eval_expr(transform_in, &vars) {
         Ok(value) => value,
         Err(err) => {
             return finish(found.route, &state, started, {
@@ -761,6 +771,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             .await;
         }
     };
+    vars.insert("input".into(), input.clone());
     let role = if found.route.public {
         if found.route.public_writes {
             "public_writer"
@@ -840,11 +851,47 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             "respond" => {
                 let value = if step.value == "transform.out" || step.value.is_empty() {
                     match crud::eval_expr(&found.route.transform_out, &vars) {
+                        Ok(Value::Null) if found.route.transform_out.trim() == "result" => {
+                            result_value.clone()
+                        }
                         Ok(value) => value,
-                        Err(_) => result_value.clone(),
+                        Err(err) => {
+                            tracing::error!(%request_id, error = %err, "respond value failed");
+                            return finish(
+                                found.route,
+                                &state,
+                                started,
+                                error_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "INTERNAL",
+                                    "Internal error",
+                                    &request_id,
+                                    &[],
+                                ),
+                            )
+                            .await;
+                        }
                     }
                 } else {
-                    result_value.clone()
+                    match crud::eval_expr(&step.value, &vars) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            tracing::error!(%request_id, error = %err, "respond value failed");
+                            return finish(
+                                found.route,
+                                &state,
+                                started,
+                                error_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "INTERNAL",
+                                    "Internal error",
+                                    &request_id,
+                                    &[],
+                                ),
+                            )
+                            .await;
+                        }
+                    }
                 };
                 result_value = value;
                 if step.status != 0 {
@@ -873,7 +920,6 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     .await;
                 }
             }
-            "transform" => {}
             _ => {
                 return finish(
                     found.route,

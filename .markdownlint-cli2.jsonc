@@ -7,6 +7,5 @@
     },
     "MD033": false,
     "MD041": false
-  },
-  "ignores": ["site/node_modules/**", "site/dist/**"]
+  }
 }
