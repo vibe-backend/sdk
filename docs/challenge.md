@@ -72,8 +72,34 @@ Which store is used, when a verifier is configured:
   nonce; settling it inserts a `verified`, `rejected` or `released` row for
   that nonce. A `released` row only cancels its own `pending` row, so a
   verified token stays used for its whole TTL. Reads ignore expired rows;
-  expired rows are deleted only by the owner role when `vibe migrate` runs.
+  expired rows are deleted only by the owner role, when `vibe migrate` runs
+  and periodically with `vibe replay-cleanup` (below).
   Checks are serialized per tenant with a transaction-level advisory lock.
+- **Cleanup (#193).** `vibe replay-cleanup --tenant <id> [--tenant <id> ...]`
+  deletes each tenant's rows whose `expires_at` has passed, in one
+  transaction per tenant, and appends one row to the owner-only audit table
+  `t_<tenant>.vibe_challenge_replay_cleanup` (`ran_at`, `run_by`, `trigger`
+  = `scheduled` or `migrate`, `deleted`). It connects with the owner
+  connection `vibe migrate` uses (`VIBE_MIGRATE_DATABASE_URL`) and refuses to
+  run as `VIBE_RUNTIME_DB_ROLE` or a member of it; the runtime role has no
+  DELETE (decision 27) and no access to the audit table. It also refuses to
+  run if `VIBE_RUNTIME_DB_ROLE` names a role that does not exist. Run it from
+  a scheduler (cron, Kubernetes CronJob), for example every 15 minutes, with
+  the same owner credentials as `vibe migrate`. The SDK does not change the
+  owner role's `LOGIN`/`NOLOGIN` attribute; if your deployment keeps the
+  owner role `NOLOGIN` outside migrations, schedule cleanup inside the same
+  procedure that enables owner login for `vibe migrate`.
+- Verification never depends on cleanup. Expired rows are already ignored by
+  reads. A verified row is kept for `VERIFIED_RETENTION` =
+  `TOKEN_LIFETIME + MAX_CLOCK_SKEW + RETENTION_MARGIN` (300s + 60s + 120s =
+  480s), where `RETENTION_MARGIN` is the larger of 60s and twice
+  `MAX_CLOCK_SKEW`. A token is accepted for at most `TOKEN_LIFETIME +
+  MAX_CLOCK_SKEW` after it is verified (its `challenge_ts` may be up to
+  `MAX_CLOCK_SKEW` in the future), and the margin covers clock drift between
+  the application hosts and the database, so by the time a verified row can
+  be deleted its token is already rejected as expired. A compile-time
+  assertion and tests pin this relationship, including a database clock ahead
+  of the application.
 - Client IPs are stored as HMAC-SHA256 under a per-tenant key derived from
   `VIBE_API_KEY_PEPPER`; tokens as SHA-256 of the token.
 - `memory` is an explicit opt-in for a single development or CI process. It

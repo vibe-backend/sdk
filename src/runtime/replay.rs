@@ -10,8 +10,10 @@
 //! The runtime role only has SELECT and INSERT on the table: the table is an
 //! append-only log. A reservation is a `pending` row; settling it appends a
 //! `verified`, `rejected` or `released` row. Reads ignore expired rows, and
-//! only the owner role deletes them (during `vibe migrate`), so the runtime
-//! cannot remove or shorten a live verified row. Every store error is
+//! only the owner role deletes them (during `vibe migrate`, and periodically
+//! with `vibe replay-cleanup`, see [`cleanup_expired`]), so the runtime
+//! cannot remove or shorten a live verified row. Each deletion run appends a
+//! row to the owner-only audit table [`REPLAY_CLEANUP_AUDIT_TABLE`]. Every store error is
 //! reported as [`ChallengeError::Unavailable`]: the request fails closed.
 
 use std::sync::Arc;
@@ -23,11 +25,36 @@ use sha2::{Digest, Sha256};
 
 use super::challenge::{
     ChallengeError, DEFAULT_PENDING_PER_IP, DEFAULT_PENDING_PER_TENANT, DEFAULT_REJECTED_HOLD,
-    TOKEN_LIFETIME,
+    MAX_CLOCK_SKEW, TOKEN_LIFETIME,
 };
 
 /// Table in each tenant schema (created by `vibe migrate`).
 pub const REPLAY_TABLE: &str = "vibe_challenge_replay";
+/// Owner-only audit log of expired-row deletions (one row per run).
+pub const REPLAY_CLEANUP_AUDIT_TABLE: &str = "vibe_challenge_replay_cleanup";
+/// Extra time a verified row is kept beyond [`TOKEN_LIFETIME`] +
+/// [`MAX_CLOCK_SKEW`]. It absorbs clock drift between the application hosts
+/// (which run the token age check) and the database (whose `now()` sets and
+/// checks `expires_at`): at least 60s and at least twice the allowed skew.
+pub const RETENTION_MARGIN: Duration = {
+    let twice_skew = MAX_CLOCK_SKEW.as_secs() * 2;
+    Duration::from_secs(if twice_skew > 60 { twice_skew } else { 60 })
+};
+/// How long a verified row is kept. It must outlive the token: once a
+/// verified row is deleted, reuse of that token is only refused by the
+/// token age check, so deletion must never happen while the token itself is
+/// still acceptable. A token is accepted for up to [`TOKEN_LIFETIME`] +
+/// [`MAX_CLOCK_SKEW`] after verification (its `challenge_ts` may be up to
+/// [`MAX_CLOCK_SKEW`] in the future), plus [`RETENTION_MARGIN`] for clock
+/// drift between the application and the database.
+pub const VERIFIED_RETENTION: Duration = Duration::from_secs(
+    TOKEN_LIFETIME.as_secs() + MAX_CLOCK_SKEW.as_secs() + RETENTION_MARGIN.as_secs(),
+);
+const _: () =
+    assert!(VERIFIED_RETENTION.as_secs() > TOKEN_LIFETIME.as_secs() + MAX_CLOCK_SKEW.as_secs());
+const _: () = assert!(
+    VERIFIED_RETENTION.as_secs() - TOKEN_LIFETIME.as_secs() - MAX_CLOCK_SKEW.as_secs() >= 60
+);
 /// Live rows allowed per tenant.
 const DEFAULT_CAPACITY: i64 = 10_000;
 const PENDING_HOLD: Duration = Duration::from_secs(30);
@@ -219,13 +246,95 @@ pub fn ip_digest(secret: &[u8], tenant: &str, ip: &str) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+/// One statement: delete this tenant's expired rows and append one audit row
+/// with the count. `tenant` must already be validated; `tenant_value` is the
+/// SQL for the tenant id (a literal, or `$1::text` when bound).
+fn cleanup_sql(tenant: &str, tenant_value: &str, trigger: &str) -> String {
+    let t = format!("\"t_{tenant}\".{REPLAY_TABLE}");
+    let a = format!("\"t_{tenant}\".{REPLAY_CLEANUP_AUDIT_TABLE}");
+    format!(
+        "WITH d AS (DELETE FROM {t} WHERE tenant_id = {tenant_value} AND expires_at <= now() RETURNING 1) \
+         INSERT INTO {a} (tenant_id, trigger, deleted) SELECT {tenant_value}, '{trigger}', count(*) FROM d \
+         RETURNING deleted::text"
+    )
+}
+
+/// Deletes one tenant's expired replay rows and records the run in
+/// [`REPLAY_CLEANUP_AUDIT_TABLE`], in one transaction. Returns the number of
+/// rows deleted.
+///
+/// `exec` must be the tenant owner connection (the one `vibe migrate` uses);
+/// the runtime role has no DELETE (decision 27) and is refused here even if
+/// it were granted one. Only rows whose `expires_at` has passed are removed,
+/// and reads already ignore them, so verification never depends on this
+/// running: an expired token is refused by its age check either way.
+pub async fn cleanup_expired(
+    exec: &super::PgExec,
+    tenant: &str,
+    runtime_role: &str,
+) -> Result<u64, String> {
+    if !super::slugs::valid_tenant(tenant) {
+        return Err("invalid tenant id".into());
+    }
+    let mut session = exec.session().await?;
+    let who = session
+        .query_texts(
+            "SELECT current_user::text || '|' || pg_has_role(current_user, $1::text, 'MEMBER')::text \
+             FROM pg_roles WHERE rolname = $1::text",
+            runtime_role,
+        )
+        .await?;
+    // A runtime role that does not exist is a configuration error, not a
+    // pass: the membership check would have nothing to compare against.
+    let Some(who) = who.first() else {
+        return Err(format!(
+            "VIBE_RUNTIME_DB_ROLE {runtime_role:?} does not exist in this database"
+        ));
+    };
+    let (user, member) = who.split_once('|').unwrap_or((who.as_str(), "true"));
+    if user == runtime_role || member != "false" {
+        return Err(format!(
+            "replay cleanup must run as the tenant owner role, not the runtime role {runtime_role} (connected as {user})"
+        ));
+    }
+    session.in_transaction(true);
+    session.batch(&["BEGIN".to_string()]).await?;
+    let result = async {
+        session
+            .query_texts("SELECT set_config('app.tenant_id', $1, true)", tenant)
+            .await?;
+        let deleted = session
+            .query_texts(&cleanup_sql(tenant, "$1::text", "scheduled"), tenant)
+            .await?;
+        let n: u64 = deleted
+            .first()
+            .and_then(|v| v.parse().ok())
+            .ok_or("replay cleanup returned no count")?;
+        Ok::<u64, String>(n)
+    }
+    .await;
+    match result {
+        Ok(n) => {
+            session.batch(&["COMMIT".to_string()]).await?;
+            session.in_transaction(false);
+            Ok(n)
+        }
+        Err(err) => {
+            if session.batch(&["ROLLBACK".to_string()]).await.is_ok() {
+                session.in_transaction(false);
+            }
+            Err(err)
+        }
+    }
+}
+
 impl PgReplayStore {
     /// `ip_secret` keys the per-tenant IP digest (the API-key pepper).
     pub fn new(pool: deadpool_postgres::Pool, ip_secret: &[u8]) -> Self {
         Self {
             pool,
             ip_secret: ip_secret.to_vec(),
-            ttl: TOKEN_LIFETIME + Duration::from_secs(60),
+            ttl: VERIFIED_RETENTION,
             capacity: DEFAULT_CAPACITY,
             per_ip: DEFAULT_PENDING_PER_IP as i64,
             per_tenant: DEFAULT_PENDING_PER_TENANT as i64,
@@ -265,6 +374,7 @@ impl PgReplayStore {
         }
         let role = quote_ident(runtime_role);
         let t = format!("\"t_{tenant}\".{REPLAY_TABLE}");
+        let a = format!("\"t_{tenant}\".{REPLAY_CLEANUP_AUDIT_TABLE}");
         Ok(vec![
             format!("CREATE SCHEMA IF NOT EXISTS \"t_{tenant}\""),
             format!("GRANT USAGE ON SCHEMA \"t_{tenant}\" TO {role}"),
@@ -279,8 +389,26 @@ impl PgReplayStore {
             format!("GRANT SELECT, INSERT ON {t} TO {role}"),
             format!("ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"),
             format!("ALTER TABLE {t} FORCE ROW LEVEL SECURITY"),
+            format!(
+                "CREATE TABLE IF NOT EXISTS {a} (tenant_id text NOT NULL, ran_at timestamptz NOT NULL DEFAULT now(), \
+                 run_by text NOT NULL DEFAULT current_user, trigger text NOT NULL, deleted bigint NOT NULL)"
+            ),
+            format!("REVOKE ALL ON {a} FROM PUBLIC"),
+            format!("REVOKE ALL ON {a} FROM {role}"),
+            format!("ALTER TABLE {a} ENABLE ROW LEVEL SECURITY"),
+            format!("ALTER TABLE {a} FORCE ROW LEVEL SECURITY"),
+        ])
+    }
+
+    /// Run by `vibe migrate` after the tenant policies are installed: delete
+    /// expired rows and audit the run (trigger `migrate`).
+    pub fn migrate_cleanup_sql(tenant: &str) -> Result<Vec<String>, String> {
+        if !super::slugs::valid_tenant(tenant) {
+            return Err("invalid tenant id".into());
+        }
+        Ok(vec![
             format!("SELECT set_config('app.tenant_id', '{tenant}', true)"),
-            format!("DELETE FROM {t} WHERE expires_at <= now()"),
+            cleanup_sql(tenant, &format!("'{tenant}'"), "migrate"),
         ])
     }
 
@@ -584,6 +712,94 @@ mod tests {
             .iter()
             .filter(|s| s.starts_with("GRANT"))
             .all(|s| !s.contains("DELETE") && !s.contains("UPDATE")));
+    }
+
+    #[test]
+    fn verified_rows_outlive_the_token() {
+        // Cleanup may delete a verified row only once the token it records
+        // is already refused by the age check.
+        assert!(VERIFIED_RETENTION > TOKEN_LIFETIME + MAX_CLOCK_SKEW);
+        assert!(RETENTION_MARGIN >= Duration::from_secs(60));
+        assert!(RETENTION_MARGIN >= MAX_CLOCK_SKEW * 2);
+        assert_eq!(
+            VERIFIED_RETENTION,
+            TOKEN_LIFETIME + MAX_CLOCK_SKEW + RETENTION_MARGIN
+        );
+    }
+
+    /// Steps app time second by second from verification until well past
+    /// the last moment the token is accepted, with the database clock
+    /// `db_ahead` ahead of the app, and checks the verified row (whose
+    /// `expires_at` is the database's `now() + VERIFIED_RETENTION` at
+    /// verification) is live whenever the age check accepts the token.
+    fn assert_row_live_while_token_accepted(
+        db_ahead: chrono::Duration,
+        ts_offset: chrono::Duration,
+    ) {
+        use super::super::challenge::check_token_age;
+        let app_verify = chrono::DateTime::parse_from_rfc3339("2026-10-16T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let issued = (app_verify + ts_offset).fixed_offset();
+        assert!(check_token_age(app_verify, issued).is_ok());
+        let expires_at =
+            app_verify + db_ahead + chrono::Duration::from_std(VERIFIED_RETENTION).unwrap();
+        let horizon = (TOKEN_LIFETIME + MAX_CLOCK_SKEW + VERIFIED_RETENTION).as_secs() as i64;
+        let mut last_accepted = None;
+        for s in 0..=horizon {
+            let app_now = app_verify + chrono::Duration::seconds(s);
+            if check_token_age(app_now, issued).is_ok() {
+                let db_now = app_now + db_ahead;
+                assert!(
+                    expires_at > db_now,
+                    "row expired at app +{s}s while the token is still accepted"
+                );
+                last_accepted = Some(s);
+            }
+        }
+        // The token is accepted until challenge_ts + TOKEN_LIFETIME.
+        let expected =
+            (ts_offset + chrono::Duration::from_std(TOKEN_LIFETIME).unwrap()).num_seconds();
+        assert_eq!(last_accepted, Some(expected));
+    }
+
+    #[test]
+    fn verified_row_covers_future_skew_with_db_clock_ahead() {
+        let skew = chrono::Duration::from_std(MAX_CLOCK_SKEW).unwrap();
+        let margin = chrono::Duration::from_std(RETENTION_MARGIN).unwrap();
+        // challenge_ts at the future skew limit, database clock ahead of the
+        // app by up to the full margin (just under it, since the comparison
+        // with expires_at is strict).
+        for db_ahead in [
+            chrono::Duration::zero(),
+            skew,
+            margin - chrono::Duration::seconds(1),
+        ] {
+            assert_row_live_while_token_accepted(db_ahead, skew);
+            assert_row_live_while_token_accepted(db_ahead, chrono::Duration::zero());
+            assert_row_live_while_token_accepted(db_ahead, -skew);
+        }
+    }
+
+    #[test]
+    fn cleanup_deletes_only_expired_rows_and_audits() {
+        let sql = cleanup_sql("tenant0001", "$1::text", "scheduled");
+        assert!(sql.contains("DELETE FROM \"t_tenant0001\".vibe_challenge_replay WHERE tenant_id = $1::text AND expires_at <= now()"));
+        assert!(sql.contains("INSERT INTO \"t_tenant0001\".vibe_challenge_replay_cleanup"));
+        let migration = PgReplayStore::migration_sql("tenant0001", "app").unwrap();
+        // The audit table is owner-only: nothing is granted to the runtime role.
+        assert!(migration
+            .iter()
+            .any(|s| s
+                == "REVOKE ALL ON \"t_tenant0001\".vibe_challenge_replay_cleanup FROM \"app\""));
+        assert!(!migration
+            .iter()
+            .any(|s| s.starts_with("GRANT") && s.contains("vibe_challenge_replay_cleanup")));
+        assert!(PgReplayStore::migrate_cleanup_sql("tenant0001")
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("'tenant0001', 'migrate', count(*)"));
     }
 
     #[test]

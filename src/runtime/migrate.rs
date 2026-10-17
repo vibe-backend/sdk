@@ -215,7 +215,7 @@ async fn migrate_in_tx(
         log.push(format!("applied {}", migration.id));
     }
     // #157: this tenant's challenge replay table (SELECT/INSERT for the
-    // runtime role; expired rows are removed here, as the owner).
+    // runtime role) and its owner-only cleanup audit table.
     exec.batch(&super::replay::PgReplayStore::migration_sql(
         tenant,
         runtime_role,
@@ -226,6 +226,10 @@ async fn migrate_in_tx(
         super::replay::REPLAY_TABLE
     ));
     log.extend(protect_schema(exec, &schema).await?);
+    // #193: expired replay rows go here too (audited), now that the tenant
+    // policy covers the audit table.
+    exec.batch(&super::replay::PgReplayStore::migrate_cleanup_sql(tenant)?)
+        .await?;
     // Fail closed: any RLS problem in any tenant schema fails the migration,
     // whether this run introduced it or it was already there (for example
     // left by an earlier, unprotected migration). `vibe serve` refuses to

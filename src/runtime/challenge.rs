@@ -359,11 +359,8 @@ impl super::replay::ReplayStore for ReplayCache {
 
 impl Default for ReplayCache {
     fn default() -> Self {
-        // A little over the token lifetime, so a token cannot outlive its entry.
-        Self::new(
-            TOKEN_LIFETIME + Duration::from_secs(60),
-            DEFAULT_REPLAY_CAPACITY,
-        )
+        // Same retention as the shared store, so a token cannot outlive its entry.
+        Self::new(super::replay::VERIFIED_RETENTION, DEFAULT_REPLAY_CAPACITY)
     }
 }
 
@@ -526,17 +523,26 @@ impl TurnstileVerifier {
             .ok_or_else(|| ChallengeError::Rejected("challenge_ts is missing".into()))?;
         let issued = chrono::DateTime::parse_from_rfc3339(ts)
             .map_err(|_| ChallengeError::Rejected("challenge_ts is not a timestamp".into()))?;
-        let age = chrono::Utc::now().signed_duration_since(issued);
-        if age > chrono::Duration::from_std(TOKEN_LIFETIME).unwrap_or_default() {
-            return Err(ChallengeError::Rejected("challenge token expired".into()));
-        }
-        if -age > chrono::Duration::from_std(MAX_CLOCK_SKEW).unwrap_or_default() {
-            return Err(ChallengeError::Rejected(
-                "challenge_ts is in the future".into(),
-            ));
-        }
-        Ok(())
+        check_token_age(chrono::Utc::now(), issued)
     }
+}
+
+/// Accepts a token issued at `issued` when, at `now`, it is at most
+/// [`TOKEN_LIFETIME`] old and at most [`MAX_CLOCK_SKEW`] in the future.
+pub(crate) fn check_token_age(
+    now: chrono::DateTime<chrono::Utc>,
+    issued: chrono::DateTime<chrono::FixedOffset>,
+) -> Result<(), ChallengeError> {
+    let age = now.signed_duration_since(issued);
+    if age > chrono::Duration::from_std(TOKEN_LIFETIME).unwrap_or_default() {
+        return Err(ChallengeError::Rejected("challenge token expired".into()));
+    }
+    if -age > chrono::Duration::from_std(MAX_CLOCK_SKEW).unwrap_or_default() {
+        return Err(ChallengeError::Rejected(
+            "challenge_ts is in the future".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Builds the verifier from the environment:

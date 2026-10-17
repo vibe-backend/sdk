@@ -1341,6 +1341,118 @@ async fn replay_store_fails_closed_when_unusable() {
     ));
 }
 
+// #193: periodic cleanup of expired replay rows, as the owner role.
+
+#[tokio::test]
+async fn replay_cleanup_removes_only_expired_rows_as_owner_and_audits() {
+    let s = require_pg!(setup().await);
+    let t = Some(s.tenant.as_str());
+    let table = format!("t_{}.vibe_challenge_replay", s.tenant);
+    let audit = format!("t_{}.vibe_challenge_replay_cleanup", s.tenant);
+    // One verified row that is still live, two already expired.
+    let live = PgReplayStore::new(replay_pool(&s).await, IP_SECRET);
+    let short = PgReplayStore::new(replay_pool(&s).await, IP_SECRET)
+        .with_ttl(std::time::Duration::from_millis(1));
+    let kept = token_key("cleanup-live");
+    let slot = live.reserve(&kept, None, t).await.unwrap();
+    live.settle(&slot, Outcome::Verified).await.unwrap();
+    let gone = token_key("cleanup-expired");
+    let slot = short.reserve(&gone, None, t).await.unwrap();
+    short.settle(&slot, Outcome::Verified).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let count = |sql: String| {
+        let admin = &s.admin;
+        async move { admin.query_one(&sql, &[]).await.unwrap().get::<_, i64>(0) }
+    };
+    let before = count(format!("SELECT count(*) FROM {table}")).await;
+    let expired = count(format!(
+        "SELECT count(*) FROM {table} WHERE expires_at <= now()"
+    ))
+    .await;
+    assert!(expired >= 1, "the expired verified row");
+
+    // The runtime role is refused before anything is deleted.
+    let app = PgExec::connect(&url_as(&s.admin_url, &s.app))
+        .await
+        .unwrap();
+    let err = vibe::runtime::replay::cleanup_expired(&app, &s.tenant, &s.app)
+        .await
+        .unwrap_err();
+    assert!(err.contains("owner"), "{err}");
+    assert_eq!(count(format!("SELECT count(*) FROM {table}")).await, before);
+    // A runtime role name that does not exist is refused, not waved through.
+    let owner_check = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    let err = vibe::runtime::replay::cleanup_expired(&owner_check, &s.tenant, "no_such_role_x")
+        .await
+        .unwrap_err();
+    assert!(err.contains("does not exist"), "{err}");
+    assert_eq!(count(format!("SELECT count(*) FROM {table}")).await, before);
+
+    let owner = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    let deleted = vibe::runtime::replay::cleanup_expired(&owner, &s.tenant, &s.app)
+        .await
+        .unwrap();
+    assert_eq!(deleted as i64, expired);
+    assert_eq!(
+        count(format!("SELECT count(*) FROM {table}")).await,
+        before - expired
+    );
+    assert_eq!(
+        count(format!(
+            "SELECT count(*) FROM {table} WHERE expires_at <= now()"
+        ))
+        .await,
+        0
+    );
+    // The live verified token is still single-use after cleanup.
+    assert!(is_rejected(live.reserve(&kept, None, t).await));
+    // One audit row for this run, written by the owner.
+    let row = s
+        .admin
+        .query_one(
+            &format!(
+                "SELECT run_by, deleted FROM {audit} WHERE trigger = 'scheduled' ORDER BY ran_at DESC LIMIT 1"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), s.owner);
+    assert_eq!(row.get::<_, i64>(1), expired);
+    // Migrate's own cleanup is audited too.
+    assert!(
+        count(format!(
+            "SELECT count(*) FROM {audit} WHERE trigger = 'migrate'"
+        ))
+        .await
+            >= 1
+    );
+    // The runtime role cannot read or write the audit table.
+    let app_client = connect(&url_as(&s.admin_url, &s.app)).await;
+    assert!(app_client
+        .batch_execute(&format!("SELECT * FROM {audit}"))
+        .await
+        .is_err());
+    // A second run finds nothing and still leaves an audit row.
+    assert_eq!(
+        vibe::runtime::replay::cleanup_expired(&owner, &s.tenant, &s.app)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        count(format!(
+            "SELECT count(*) FROM {audit} WHERE trigger = 'scheduled'"
+        ))
+        .await,
+        2
+    );
+}
+
 #[tokio::test]
 async fn sslmode_require_fails_against_server_without_tls() {
     let Some(admin) = admin_url() else {
