@@ -5,6 +5,9 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Breaking: api step op `transform` removed:** Validate rejects `op: transform` in api feature `## Steps`, telling you to delete the step and use `## Transform` (`- in:` / `- out:`). Pre-1.0, no deprecation period; the compile prompt no longer offers it.
+- **Deterministic api feature locks:** Natural-language sources ignore model output for Limits and Request `path.slug` rows. Limits always writes provider, timeout and body from source pins/inherited defaults; slug routes get one canonical first `path.slug` row, and other routes drop it.
+
 - **Undefined variable roots (#284):** Validate rejects undefined expression roots, naming the root, location and sorted allowed roots.
 - **Compile validation (#288):** Each LLM lock is validated after normalization and repaired with exact validate feedback within the existing shared retry bound. Prompts clarify API steps, expressions and routes. Compilation validates the whole project before writing locks or a build record, and fails without writing either if invalid.
 

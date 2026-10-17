@@ -920,7 +920,6 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                     .await;
                 }
             }
-            "transform" => {}
             _ => {
                 return finish(
                     found.route,

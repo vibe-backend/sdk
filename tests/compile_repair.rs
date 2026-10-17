@@ -171,7 +171,9 @@ async fn validate_feedback_repairs_api_steps() {
                 Ok(invalid_api())
             } else {
                 assert!(
-                    request.input.contains("unknown key `in`"),
+                    request
+                        .input
+                        .contains("api step op `transform` was removed"),
                     "{}",
                     request.input
                 );
@@ -212,7 +214,7 @@ async fn invalid_api_exhausts_shared_retry_budget_without_writes() {
     .unwrap()
     .to_string();
     assert!(err.contains("does not pass validate"), "{err}");
-    assert!(err.contains("unknown key `in`"), "{err}");
+    assert!(err.contains("api step op `transform` was removed"), "{err}");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1 + vibe::prompt_guide::format_retries().unwrap() as usize
