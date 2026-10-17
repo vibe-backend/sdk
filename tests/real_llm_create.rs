@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 //! Local, paid real-model smoke test. Set LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
 //! (and any optional LLM_* settings), then run:
 //! `cargo test --test real_llm_create -- --ignored --nocapture`

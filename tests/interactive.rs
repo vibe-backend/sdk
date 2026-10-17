@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 use std::{
     collections::{HashMap, VecDeque},
     fs,

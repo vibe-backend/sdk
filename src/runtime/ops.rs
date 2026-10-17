@@ -374,7 +374,7 @@ pub async fn sign_jwt(
     }
     let ttl_ms = match opt(step, "ttl") {
         "" => 3_600_000,
-        raw => crate::llm::parse_duration_ms(raw).ok_or_else(|| internal("bad ttl"))?,
+        raw => crate::duration::parse_duration_ms(raw).ok_or_else(|| internal("bad ttl"))?,
     };
     if ttl_ms == 0 || ttl_ms > 3_600_000 {
         return Err(internal("access token ttl must be within 1h"));

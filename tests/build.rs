@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 use std::{fs, process::Command, time::Duration};
 use vibe::compile::{build_project, CompileOptions};
 use vibe::llm::{FakeAdapter, LlmConfig, LlmRequest};

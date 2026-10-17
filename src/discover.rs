@@ -135,6 +135,7 @@ fn classify(root: &Path, path: &Path) -> Result<SourceFile, Diag> {
     })
 }
 
+#[cfg(feature = "sdk")]
 pub(crate) fn check_source_path(rel: &str) -> Result<(), Diag> {
     classify_parts(rel, &rel.split('/').collect::<Vec<_>>()).map(|_| ())
 }

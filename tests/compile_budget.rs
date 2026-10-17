@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 //! #37/#83: format re-prompts draw from the same per-source LLM call budget
 //! as transport retries. Own test binary because it sets process-wide env.
 

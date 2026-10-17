@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 //! #83: one budget caps every LLM attempt (calls and wall clock), and no
 //! attempt may overrun it by an LLM_TIMEOUT.
 

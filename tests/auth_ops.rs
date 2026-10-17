@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 //! Method ops behind auth flows (#26): query, verify-password, hash-password,
 //! random-token, hash-token, sign-jwt. Fixture: tests/fixtures/auth-app.
 //! Postgres tests run when VIBE_TEST_PG_ADMIN_URL points at a superuser.

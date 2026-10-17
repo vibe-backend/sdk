@@ -1,16 +1,22 @@
 use std::collections::BTreeMap;
+#[cfg(feature = "sdk")]
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+#[cfg(feature = "sdk")]
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::diag::{Diag, Report};
+#[cfg(feature = "sdk")]
 use crate::lock::{find_section, Kind, LockDoc, Scope};
+#[cfg(feature = "sdk")]
 use crate::security::pipeline_name;
 use crate::sign;
+#[cfg(feature = "sdk")]
 use crate::validate::{self, ValidateOptions};
 
 pub const MANIFEST_VERSION: u32 = 1;
@@ -521,11 +527,13 @@ pub struct MigrationSpec {
     pub statements: Vec<String>,
 }
 
+#[cfg(feature = "sdk")]
 pub fn manifest_from_project(root: &Path, signing_key: &SigningKey) -> Result<Manifest, Report> {
     manifest_from_project_with_mode(root, signing_key, false)
 }
 
 /// Build a local manifest with explicit private-endpoint policy.
+#[cfg(feature = "sdk")]
 pub fn manifest_from_project_with_mode(
     root: &Path,
     signing_key: &SigningKey,
@@ -546,6 +554,7 @@ pub fn manifest_from_project_with_mode(
 
 /// Validates (deploy rules, including the recompile check) and builds the
 /// manifest from exactly the loaded lock texts; nothing is re-read.
+#[cfg(feature = "sdk")]
 pub fn manifest_from_loaded(
     root: &Path,
     loaded: &validate::LoadedProject,
@@ -560,6 +569,7 @@ pub fn manifest_from_loaded(
 /// unsigned for the release workflow's Sigstore keyless signature (decisions
 /// 92, 119). High-risk items are listed in the provenance, never blocking
 /// (decision 90 withdrawn).
+#[cfg(feature = "sdk")]
 pub fn build_signed(
     root: &Path,
     loaded: &validate::LoadedProject,
@@ -753,10 +763,12 @@ pub fn verify_manifest(mut manifest: Manifest, key: &VerifyingKey) -> Result<Man
     Ok(manifest)
 }
 
+#[cfg(feature = "sdk")]
 pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Report> {
     build_manifest_with_mode(docs, false)
 }
 
+#[cfg(feature = "sdk")]
 pub fn build_manifest_with_mode(
     docs: &HashMap<String, LockDoc>,
     dev: bool,
@@ -764,6 +776,7 @@ pub fn build_manifest_with_mode(
     build_manifest_with_record(docs, dev, None)
 }
 
+#[cfg(feature = "sdk")]
 pub fn build_manifest_with_record(
     docs: &HashMap<String, LockDoc>,
     dev: bool,
@@ -846,6 +859,7 @@ pub fn build_manifest_with_record(
     })
 }
 
+#[cfg(feature = "sdk")]
 fn model_from(doc: &LockDoc) -> ModelSpec {
     let provider = find_section(&doc.sections, "Table")
         .and_then(|s| s.get("provider"))
@@ -948,6 +962,7 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
 }
 
 /// The single value of `key` in `bullets`. A repeated key is an error.
+#[cfg(feature = "sdk")]
 pub(crate) fn single_value<'a>(
     bullets: &'a [crate::lock::Bullet],
     key: &str,
@@ -962,6 +977,7 @@ pub(crate) fn single_value<'a>(
 
 /// Strict `writes`: absent is `None`; present must be exactly `true` or
 /// `false` and appear once.
+#[cfg(feature = "sdk")]
 pub(crate) fn parse_writes(bullets: &[crate::lock::Bullet]) -> Result<Option<bool>, String> {
     match single_value(bullets, "writes")?.map(str::trim) {
         None => Ok(None),
@@ -975,6 +991,7 @@ pub(crate) fn parse_writes(bullets: &[crate::lock::Bullet]) -> Result<Option<boo
 
 /// Strict step `status`: absent is `None`; present must be a plain decimal
 /// HTTP status (100-599) and appear once.
+#[cfg(feature = "sdk")]
 pub(crate) fn parse_status(bullets: &[crate::lock::Bullet]) -> Result<Option<u16>, String> {
     let Some(raw) = single_value(bullets, "status")? else {
         return Ok(None);
@@ -989,6 +1006,7 @@ pub(crate) fn parse_status(bullets: &[crate::lock::Bullet]) -> Result<Option<u16
     }
 }
 
+#[cfg(feature = "sdk")]
 fn method_from(doc: &LockDoc) -> Result<MethodSpec, Diag> {
     let target = doc
         .meta
@@ -1028,6 +1046,7 @@ fn method_from(doc: &LockDoc) -> Result<MethodSpec, Diag> {
     })
 }
 
+#[cfg(feature = "sdk")]
 fn migration_from(doc: &LockDoc) -> MigrationSpec {
     let provider = find_section(&doc.sections, "Target")
         .and_then(|s| s.get("provider"))
@@ -1053,6 +1072,7 @@ fn migration_from(doc: &LockDoc) -> MigrationSpec {
     }
 }
 
+#[cfg(feature = "sdk")]
 fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpec, Diag> {
     let route = find_section(&doc.sections, "Route")
         .ok_or_else(|| Diag::error(&doc.meta.id, "missing route"))?;
@@ -1199,7 +1219,7 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         parse_challenge(access.and_then(|s| s.get("challenge")).unwrap_or(""));
     let min_response_ms = access
         .and_then(|s| s.get("min-response"))
-        .and_then(crate::llm::parse_duration_ms)
+        .and_then(crate::duration::parse_duration_ms)
         .unwrap_or(if public { 300 } else { 0 });
     let (deprecated, sunset) = lifecycle(doc, docs);
     Ok(RouteSpec {
@@ -1233,6 +1253,7 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
     })
 }
 
+#[cfg(feature = "sdk")]
 fn lifecycle(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> (bool, String) {
     let mut parts = doc.meta.id.split('/');
     let definition = parts.next().unwrap_or("");
@@ -1249,6 +1270,7 @@ fn lifecycle(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> (bool, String) {
     )
 }
 
+#[cfg(feature = "sdk")]
 fn request_fields(section: Option<&crate::lock::Section>) -> Vec<ReqField> {
     let Some(section) = section else {
         return Vec::new();
@@ -1276,6 +1298,7 @@ fn request_fields(section: Option<&crate::lock::Section>) -> Vec<ReqField> {
         .collect()
 }
 
+#[cfg(feature = "sdk")]
 fn error_rows(section: Option<&crate::lock::Section>) -> Vec<ErrMap> {
     let Some(section) = section else {
         return Vec::new();
@@ -1296,6 +1319,7 @@ fn error_rows(section: Option<&crate::lock::Section>) -> Vec<ErrMap> {
         .collect()
 }
 
+#[cfg(feature = "sdk")]
 fn steps_from(section: Option<&crate::lock::Section>, file: &str) -> Result<Vec<StepSpec>, Diag> {
     let Some(section) = section else {
         return Ok(Vec::new());
@@ -1393,6 +1417,7 @@ pub(crate) fn parse_challenge(raw: &str) -> (String, String) {
     (ty, when)
 }
 
+#[cfg(feature = "sdk")]
 fn number_rule(rules: &str, key: &str) -> Option<i64> {
     for part in rules.split(',') {
         let part = part.trim();
@@ -1407,6 +1432,7 @@ fn number_rule(rules: &str, key: &str) -> Option<i64> {
     None
 }
 
+#[cfg(feature = "sdk")]
 fn text_rule(rules: &str, key: &str) -> String {
     for part in rules.split(',') {
         let part = part.trim();
@@ -1417,6 +1443,7 @@ fn text_rule(rules: &str, key: &str) -> String {
     String::new()
 }
 
+#[cfg(feature = "sdk")]
 fn bracket_list(options: &str, key: &str) -> Vec<String> {
     let Some(idx) = options.find(&format!("{key}:")) else {
         return Vec::new();
@@ -1453,7 +1480,7 @@ pub fn json_null() -> Value {
     Value::Null
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sdk"))]
 mod rule_tests {
     use super::number_rule;
 
@@ -1686,11 +1713,12 @@ mod roles_list_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sdk"))]
 mod malformed_list_tests {
     use super::{method_from, route_from, steps_from, MethodSpec};
     use crate::diag::Level;
     use crate::lock::{parse_sections, Kind, LockDoc, Meta, Scope};
+    #[cfg(feature = "sdk")]
     use std::collections::HashMap;
 
     fn method_doc(body: &str) -> LockDoc {
@@ -1911,7 +1939,7 @@ mod refresh_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sdk"))]
 mod constant_response_tests {
     use super::*;
     use crate::runtime::{router, AppState, AuthConfig, MemoryExec, Slug};

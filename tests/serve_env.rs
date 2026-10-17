@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 //! `vibe run` refuses unsafe configurations before loading anything.
 
 use std::process::Command;

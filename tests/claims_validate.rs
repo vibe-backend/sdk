@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 //! `vibe build` rules for sign-jwt claims (claims source hardening).
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -1,3 +1,5 @@
+#![cfg(feature = "sdk")]
+
 //! Spec v1.8 §4A.1c example (decision 149, #270): a read-only refresh
 //! `sign-method` (`user.sign-token`) plus a separate write method
 //! (`user.record-session`) behind `api/auth/v1/session`.
