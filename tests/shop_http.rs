@@ -836,7 +836,7 @@ async fn manifest_output_is_relative_to_the_current_directory() {
     sign::create_dev_key(&root).unwrap();
     let cwd = std::env::temp_dir().join(format!("vibe-cwd-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&cwd).unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_vibe"))
+    let out = dev_command()
         .args(["manifest", "--dev", "--project"])
         .arg(&root)
         .args(["-o", "out.json"])
@@ -896,7 +896,7 @@ async fn manifest_refuses_a_hand_edited_lock_and_writes_nothing() {
     let err = manifest_from_project(&root, &key).unwrap_err().to_string();
     assert!(err.contains("hand-edited"), "{err}");
     let out = root.join("out/manifest.json");
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_vibe"))
+    let status = dev_command()
         .args(["manifest", "--dev", "--project"])
         .arg(&root)
         .arg("-o")
@@ -1049,8 +1049,17 @@ async fn removing_roles_from_a_lock_cannot_deploy() {
     assert!(manifest_from_project(&root, &key).is_err());
 }
 
-fn vibe_cli(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> (bool, String) {
+fn dev_command() -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_vibe"));
+    // Development flows must not inherit the test runner's CI environment.
+    cmd.env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
+        .env("VIBE_ENV", "development");
+    cmd
+}
+
+fn vibe_cli(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> (bool, String) {
+    let mut cmd = dev_command();
     cmd.args(args).current_dir(root);
     for key in [
         "VIBE_ENV",
