@@ -1870,6 +1870,22 @@ mod constant_response_tests {
     use tower::ServiceExt;
 
     #[test]
+    fn lowercase_body_limit_builds_in_bytes() {
+        let doc = LockDoc {
+            meta: crate::lock::Meta::pending(
+                Kind::Api, Some(Scope::Feature), "hello", "hello.md",
+            ),
+            sections: crate::lock::parse_sections(
+                "## Route\n- method: GET\n- path: /hello\n## Access\n- public: true\n## Pipelines\n### -auth\n## Limits\n- body: 64kb\n",
+            ).unwrap(),
+        };
+        assert_eq!(
+            route_from(&doc, &HashMap::new()).unwrap().body_limit,
+            65_536
+        );
+    }
+
+    #[test]
     fn malformed_transform_bullets_cannot_build() {
         for key in ["in", "out"] {
             for expr in ["", "{a: }"] {

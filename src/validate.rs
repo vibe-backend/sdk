@@ -22,6 +22,42 @@ static DDL_SQL: LazyLock<Regex> = LazyLock::new(|| {
 });
 static PARAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$([1-9][0-9]*)").expect("regex"));
 
+/// Strict validation shared by source pins, locks and interactive generation.
+pub(crate) fn check_limit_value(key: &str, value: &str) -> Result<(), String> {
+    let example = match key {
+        "timeout" => "10s",
+        "body" => "64kb",
+        "provider" => "main",
+        _ => return Ok(()),
+    };
+    let valid = if key == "provider" {
+        crate::discover::check_kebab(value).is_ok()
+    } else if key == "body" {
+        parse_size_bytes(value).is_some_and(|n| n > 0 && n <= 1_048_576)
+    } else {
+        let strict = ["ms", "s", "m", "h"].iter().any(|unit| {
+            value
+                .strip_suffix(unit)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        });
+        strict && crate::llm::parse_duration_ms(value).is_some_and(|ms| ms > 0 && ms <= 30_000)
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "{key}: {value:?} is invalid; use e.g. `{key}: {example}` ({})",
+            if key == "timeout" {
+                "timeout cannot exceed 30s; must be positive"
+            } else if key == "body" {
+                "body limit cannot exceed 1MB; must be positive"
+            } else {
+                "lowercase kebab-case name"
+            }
+        ))
+    }
+}
+
 pub struct ValidateOptions<'a> {
     pub root: &'a Path,
     pub deploy: bool,
@@ -70,6 +106,19 @@ pub fn validate_loaded(
 
     for (source, text) in sources.iter().zip(&loaded.lock_texts) {
         source_by_id.insert(source.id.clone(), source.clone());
+        if source.kind == Kind::Api && source.scope == Some(Scope::Feature) {
+            match crate::compile::parse_source_frontmatter(&source.text) {
+                Ok(front) => {
+                    for (key, value) in front {
+                        if let Err(error) = check_limit_value(&key, &value) {
+                            report.push(Diag::error(&source.rel, error));
+                        }
+                    }
+                }
+                Err(error) => report.push(Diag::error(&source.rel, error)),
+            }
+        }
+
         for hit in scan::scan_text(&source.combined_text()) {
             if hit.fatal {
                 report.push(Diag::error(&source.rel, hit.message));
@@ -1197,17 +1246,11 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
         }
     }
     if let Some(limits) = find_section(&doc.sections, "Limits") {
-        if let Some(ms) = limits
-            .get("timeout")
-            .and_then(crate::llm::parse_duration_ms)
-        {
-            if ms > 30_000 {
-                report.push(Diag::error(file, "timeout cannot exceed 30s").at_section("Limits"));
-            }
-        }
-        if let Some(body) = limits.get("body") {
-            if parse_bytes(body) > 1_048_576 {
-                report.push(Diag::error(file, "body limit cannot exceed 1MB").at_section("Limits"));
+        for key in ["provider", "timeout", "body"] {
+            if let Some(value) = limits.get(key) {
+                if let Err(error) = check_limit_value(key, value) {
+                    report.push(Diag::error(file, error).at_section("Limits"));
+                }
             }
         }
     }
@@ -2041,7 +2084,27 @@ fn urlencoding_decode(path: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| path.to_string())
 }
 
+/// Parse digits with an optional case-insensitive b, kb or mb suffix.
+/// Whitespace, signs and overflowing sizes are rejected.
+pub fn parse_size_bytes(raw: &str) -> Option<u64> {
+    let digits = raw.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let multiplier = match raw[digits..].to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" => 1024,
+        "mb" => 1_048_576,
+        _ => return None,
+    };
+    raw[..digits].parse::<u64>().ok()?.checked_mul(multiplier)
+}
+
 pub fn parse_bytes(raw: &str) -> u64 {
+    if let Some(bytes) = parse_size_bytes(raw) {
+        return bytes;
+    }
+    // Preserve legacy whitespace, numeric and saturating uppercase-unit behavior.
     let raw = raw.trim();
     if let Some(n) = raw.strip_suffix("MB") {
         return n
@@ -2914,5 +2977,110 @@ mod tests {
             &mut report,
         );
         assert!(!report.to_string().contains("always true"), "{report}");
+    }
+}
+
+#[cfg(test)]
+mod limits_value_tests {
+    use super::{check_limit_value, parse_bytes, parse_size_bytes};
+
+    #[test]
+    fn accepted_limits_match_runtime_parsers() {
+        for (value, expected) in [
+            ("64kb", 65_536),
+            ("64KB", 65_536),
+            ("512b", 512),
+            ("1MB", 1_048_576),
+            ("1mb", 1_048_576),
+            ("4KB", 4096),
+            ("512", 512),
+            ("1B", 1),
+            ("4kB", 4096),
+        ] {
+            assert!(check_limit_value("body", value).is_ok(), "{value}");
+            assert_eq!(parse_size_bytes(value), Some(expected));
+            assert_eq!(parse_bytes(value), expected);
+        }
+        for (value, expected) in [
+            ("1ms", 1),
+            ("500ms", 500),
+            ("10s", 10_000),
+            ("30s", 30_000),
+            ("30000ms", 30_000),
+        ] {
+            assert!(check_limit_value("timeout", value).is_ok(), "{value}");
+            assert_eq!(crate::llm::parse_duration_ms(value), Some(expected));
+        }
+    }
+
+    #[test]
+    fn strict_sizes_reject_malformed_and_overflowing_values() {
+        for value in [
+            "",
+            "+1",
+            " 1kb",
+            "1kb ",
+            "1 kb",
+            "1.5mb",
+            "1gb",
+            "18446744073709551616",
+            "18446744073709551615kb",
+        ] {
+            assert_eq!(parse_size_bytes(value), None, "{value}");
+        }
+        for (value, expected) in [
+            (" 4 KB ", 4096),
+            ("+4KB", 4096),
+            ("18446744073709551615MB", u64::MAX),
+            ("invalid", 0),
+        ] {
+            assert_eq!(parse_bytes(value), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn strict_limits_reject_malformed_zero_and_excess_values() {
+        for (key, good, bad) in [
+            (
+                "timeout",
+                vec!["500ms", "10s", "30s"],
+                vec![
+                    "garbage",
+                    "0s",
+                    "31s",
+                    "1 s",
+                    "10s junk",
+                    "18446744073709551615s",
+                ],
+            ),
+            (
+                "body",
+                vec!["64kb", "4KB", "1MB"],
+                vec![
+                    "garbage",
+                    "0MB",
+                    "2MB",
+                    "1 MB",
+                    "1MB junk",
+                    "18446744073709551615MB",
+                ],
+            ),
+            (
+                "provider",
+                vec!["main", "db-2"],
+                vec!["Main", "db_name", "-db", "db--name", "db-", ""],
+            ),
+        ] {
+            for value in good {
+                assert!(check_limit_value(key, value).is_ok(), "{key}: {value}");
+            }
+            for value in bad {
+                let error = check_limit_value(key, value).unwrap_err();
+                assert!(
+                    error.contains(key) && error.contains(value) && error.contains("e.g."),
+                    "{error}"
+                );
+            }
+        }
     }
 }

@@ -6,7 +6,9 @@ use serde_json::{json, Value};
 
 pub const COMPILER_NAME: &str = "md-logic";
 pub const COMPILER_VERSION: &str = "0.1.0";
-pub const PROMPT_VERSION: &str = "prompt-4";
+// Every compile prompt text change (system, guide, examples) must bump PROMPT_VERSION:
+// it feeds compiler-hash and the LLM cache key.
+pub const PROMPT_VERSION: &str = "prompt-5";
 pub const LOCK_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,7 +504,18 @@ fn render_table(table: &Table) -> String {
     let sep: Vec<String> = table.headers.iter().map(|_| "---".into()).collect();
     out.push_str(&render_row(&sep));
     for row in &table.rows {
-        out.push_str(&render_row(row));
+        // Parsing treats `-` as an empty cell. Preserve the canonical slug
+        // rules placeholder on render, including offline recompile hashes.
+        if table.headers.get(2).is_some_and(|h| h == "rules")
+            && row.first().is_some_and(|field| field == "path.slug")
+            && row.get(2).is_some_and(String::is_empty)
+        {
+            let mut row = row.clone();
+            row[2] = "-".into();
+            out.push_str(&render_row(&row));
+        } else {
+            out.push_str(&render_row(row));
+        }
     }
     out
 }

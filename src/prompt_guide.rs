@@ -55,7 +55,7 @@ API FEATURE KEYS:
 - ## Route: method (GET|POST|PUT|DELETE), path (/definition/version/...; `{slug}` for public tenants, `{id}` for params).
 - ## Access: public (true|false); for public also public-writes and tenant: path.slug.
 - ## Pipelines: blocks `### auth` (mode: jwt|api-key, optional roles: [..]), `### -auth` with `- removed: true` ONLY if the source explicitly removes auth, `### rate-limit` (per-minute: N, key: ip|tenant|input.email). Removing auth never adds JWT/token settings. Write `(none)` when the source says nothing.
-- ## Limits: provider, timeout (<= 30s), body (<= 1MB).
+- ## Limits: computed by the compiler from frontmatter pins (provider, timeout, body) and inherited defaults; never derive limits from prose.
 - ## Request table header exactly `| field | type | rules | required |`; field is path.x, query.x, body.x or header.x; required yes|no.
 - ## Response: status.
 - ## Transform: optional in ({ k: req.body.x }) and out (expression).
