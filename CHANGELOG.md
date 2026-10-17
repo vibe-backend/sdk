@@ -5,6 +5,7 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Lock-format semantics (decision 167):** `source-lines` is computed by the compiler: the model's cited range is snapped to the enclosing markdown block(s) (paragraph, list, table, fenced code including its fence lines, heading, frontmatter); invalid or out-of-range citations fall back to the whole source body; values are always `A-B`. `vibe validate` rejects non-aligned values. PROMPT_VERSION bumped to prompt-7, so locks recompile. Known issue: if the model cites a different paragraph, the lock can still differ.
 - **Spec decision 166:** `vibe dev` is deferred to vNext; spec §2C.2, README and docs describe the 1.0 flow (interactive `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory` → curl).
 - **Lock-format change (decision 165):** Bumped PROMPT_VERSION to prompt-6. Locks no longer write run-varying translation stamps; per-lock stamps live in the backward-compatible build record and optional manifest provenance, preserving D109 audit links. Old locks parse and discard `translation:` and validate warns once per lock to recompile.
 - **Empty Errors:** Missing, empty, header-only and `(none)` feature Errors sections normalize identically for structured and natural-language sources. No warning for no custom errors.

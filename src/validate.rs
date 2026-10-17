@@ -224,6 +224,21 @@ pub(crate) fn check_lock(
     if doc.meta.source != source.rel {
         report.push(Diag::error(&file, "source path does not match the lock"));
     }
+    for section in &doc.sections {
+        for block in &section.blocks {
+            for bullet in &block.bullets {
+                if bullet.key == "source-lines" {
+                    let expected = crate::source_lines::snap_source_lines(
+                        &source.combined_text(),
+                        Some(&bullet.value),
+                    );
+                    if bullet.value != expected {
+                        report.push(Diag::error(&file, format!("{} / {}: source-lines `{}` must equal `{expected}`; run `vibe compile`", section.name, block.heading, bullet.value)));
+                    }
+                }
+            }
+        }
+    }
     let hash = source_hash(&source.combined_text());
     if doc.meta.source_hash != hash {
         report.push(Diag::error(&file, "source-hash does not match the source"));

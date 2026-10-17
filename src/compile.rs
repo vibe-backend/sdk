@@ -277,7 +277,7 @@ async fn compile_docs(
             report.extend(diags);
             continue;
         }
-        ensure_source_lines(&mut doc.sections);
+        normalize_source_lines(&mut doc.sections, &source.combined_text());
         if hits.iter().any(|hit| !hit.fatal) {
             doc.meta.security_items.push(crate::lock::SecurityItem {
                 item: "prompt-injection".into(),
@@ -582,7 +582,7 @@ fn checked_llm_sections(
     doc.meta.compiler_hash = compiler_hash(&doc.meta.compiler);
     normalize(&mut doc, source, docs)
         .map_err(|diags| diags.into_iter().map(|d| d.to_string()).collect::<Vec<_>>())?;
-    ensure_source_lines(&mut doc.sections);
+    normalize_source_lines(&mut doc.sections, &source.combined_text());
     doc.meta.security_items = security::extract_items(&doc);
     if scan::scan_text(&source.combined_text())
         .iter()
@@ -1931,13 +1931,21 @@ fn reorder_named(sections: &[Section], order: &[&str]) -> Vec<Section> {
     out
 }
 
-fn ensure_source_lines(sections: &mut [Section]) {
+fn normalize_source_lines(sections: &mut [Section], text: &str) {
     for section in sections {
         for block in &mut section.blocks {
-            if !block.bullets.iter().any(|b| b.key == "source-lines") {
+            let mut found = false;
+            for bullet in &mut block.bullets {
+                if bullet.key == "source-lines" {
+                    bullet.value =
+                        crate::source_lines::snap_source_lines(text, Some(&bullet.value));
+                    found = true;
+                }
+            }
+            if !found {
                 block.bullets.push(Bullet {
                     key: "source-lines".into(),
-                    value: "1-1".into(),
+                    value: crate::source_lines::snap_source_lines(text, None),
                 });
             }
         }
@@ -2958,8 +2966,8 @@ mod prompt_tests {
         assert_eq!(
             (crate::lock::PROMPT_VERSION, actual.as_str()),
             (
-                "prompt-6",
-                "a76a7fcafca78423772a30255a4e058831f0a75afe1c504004cb00e2bf96ba94"
+                "prompt-7",
+                "3ff6e67cbc20d568ced8c98971648a342a3a98c714887c73cfd95c85a6dea807"
             ),
             "compile prompt changed: bump PROMPT_VERSION and update the recorded hash"
         );
