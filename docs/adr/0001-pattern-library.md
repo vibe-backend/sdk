@@ -2,7 +2,7 @@
 
 - **Status:** Proposed (draft, not yet reviewed). The PM hard rules below were set by the PM on 2026-10-17 09:59 HKT; the §9 points were approved by the PM on 2026-10-17 10:08 HKT (decisions 158–163). This ADR feeds the v1.1 spec and does not block any v1 blocker.
 - **Date:** 2026-10-17
-- **Spec:** [`../spec-pattern-library-v1.1.md`](../spec-pattern-library-v1.1.md) (decisions 150–163)
+- **Spec:** [`../spec-pattern-library-v1.1.md`](../spec-pattern-library-v1.1.md) (decisions 150–167)
 - **Related:** decisions 79, 113, 117, 118, 119 (provenance, lock as build output, Sigstore keyless), 149 (read-only sign-method); PRs #147, #95.
 
 This ADR describes defensive design only.
@@ -31,6 +31,12 @@ The compiler turns natural-language Markdown into a lock and then into an execut
 3. More than one match MUST be a compile error, resolved only by an explicit `use:`; there MUST NOT be implicit scoring.
 4. The signer identity MUST be pinned to an exact repo and workflow (issuer + SAN). Offline verification (bundle + cached trust root) MUST be supported so deploys still work when Sigstore/Rekor is down. Verification failure MUST fail closed. A `vibe serve` cold start MUST NOT download anything.
 5. The v1 internal refactor onto the same interface MUST wait until #147, #95 and the D149 implementation have merged, MUST be additive with no behaviour change, and MUST be scheduled at the end of the GA plan.
+
+## Architect decisions (2026-10-17)
+
+- Pattern IR rules (D166): the core MUST enforce RLS and `owner-key` on every pattern IR, a pattern MUST NOT choose or switch DB roles (the executor decides), and a secret MUST only be sent to a host declared in `egress:`. Violations are compile errors.
+- `use:` (D167) is a structured endpoint frontmatter field, consistent with #92.
+- Pending PM: committed `patterns.md` pins (D164, P8); endpoint `egress:` and `secrets:` fields (D165, P9).
 
 ## Consequences
 
