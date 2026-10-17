@@ -1771,6 +1771,7 @@ mod constant_response_tests {
                 }
                 assert_eq!(route.transform_in, "{}");
                 let manifest = Manifest {
+                    build_mode: None,
                     manifest_version: MANIFEST_VERSION,
                     routes: vec![route],
                     models: vec![],

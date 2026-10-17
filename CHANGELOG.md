@@ -27,7 +27,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Fixed
 
-- **Local LLM endpoints:** Private-host opt-in also covers DNS answers from fake-IP proxies. Transport errors include masked causes, requests send a SDK User-Agent, and non-JSON authorization failures identify possible proxy blocks. `validate --deploy --dev` and `manifest --dev` support local testing of private-endpoint locks; signed dev manifests are refused outside development. Structured locks use deterministic compiler stamps.
+- **Local LLM endpoints:** Private-host opt-in also covers DNS answers from fake-IP proxies. Development serve warns and strips all LLM/OpenAI environment variables, including project `.env` values, before runtime startup; other environments still refuse them. Diagnostics omit keys, request headers and response body text. Transport errors include masked causes, requests send a SDK User-Agent, and non-JSON authorization failures identify possible proxy blocks. `validate --deploy --dev` and `manifest --dev` support local testing of private-endpoint locks; signed dev manifests are refused outside development. Structured locks use deterministic compiler stamps.
 
 - **Refresh 家族限流（決定 147，文件更新）：** 超過上限會要求重新登入。
 

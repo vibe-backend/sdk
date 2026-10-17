@@ -68,6 +68,24 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
         send_sampling: true,
         api_style: "chat".into(),
     };
+    let malformed = FakeAdapter {
+        responder: |_: &LlmRequest| Ok("BODY-MARKER-7f3a Bearer sk-test-value".into()),
+    };
+    let errors = compile_project(&CompileOptions {
+        root: &root,
+        llm: Some(&malformed),
+        llm_config: Some(&config),
+        check: false,
+    })
+    .await
+    .err()
+    .expect("malformed output must fail");
+    let message = format!("{errors:?}");
+    assert!(message.contains("LLM output is not lock markdown"));
+    for secret in ["BODY-MARKER-7f3a", "sk-test-value", "Bearer sk-test-value"] {
+        assert!(!message.contains(secret), "{message}");
+    }
+
     let adapter = FakeAdapter {
         responder: |request: &LlmRequest| {
             assert_eq!(request.model, "gpt-test-2026-01-01");

@@ -497,6 +497,7 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 
   永遠唔記 key。2A.6、2A.8、10.1 提到 compiler-hash 一律指呢個定義。
 - `translation`：只喺 source 經過 2.1a 翻譯先有；記 translate prompt 版本、provider、model 同譯文 hash，只做審計，唔計入 `source-hash` 同 `compiler-hash`（決定 109）。
+- manifest JSON 用 snake_case：lock 嘅 `build-mode` 對應 manifest 嘅 `build_mode`（`dev`／`release`；冇呢個欄位當 `release`）。
 - `build-mode`：`vibe build` 寫 `release`，`vibe dev` 寫 `dev`；`dev` lock 永遠唔可以入 release manifest（決定 75）。
 - `security-items`：驗證器 deterministic 抽出嘅安全項目清單，`reason` 由驗證器按規則產生；資訊性，用嚟 PR 高亮同部署報告，唔需要確認人（決定 78）；冇安全項目就寫 `[]`。
 - v1.8 起 lock 冇 `signature`，亦冇 `status`／`approval-*`／`approved-*`（決定 77、79）；SDK 讀到舊欄位會忽略並出 warning。
@@ -659,13 +660,15 @@ v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`（決定 57�
 - 用本地或者內網 host 編譯出嚟嘅 lock（`endpoint-private: true`）**唔可以部署去 production**；一定要喺 CI 用公開 https endpoint 重新編譯，再經 CI 決定性比對同正常確認，先可以部署。
 - 本地 lock 只可以用嚟本地試；佢係 gitignore 嘅 build 輸出（決定 117），部署只用 release job 用 release 設定 build 嘅 artifact（決定 113）。
 
+- `LLM_ALLOW_PRIVATE_HOST=true` 亦適用於公開名稱但 DNS 解析到非公開地址嘅 host（例如 fake-IP proxy）；lock 記 `endpoint-private: true`；CI／production 照樣 error。
+
 #### 2A.8.5 Key 保護
 
-- Key 永遠唔可以出現喺 repo、source、lock、manifest、log、部署報告、PR 留言或者錯誤訊息；錯誤訊息只可以講「`LLM_API_KEY` 無效或者缺少」。
+- Key 永遠唔可以出現喺 repo、source、lock、manifest、log、部署報告、PR 留言或者錯誤訊息；錯誤訊息可以講「`LLM_API_KEY` 無效或者缺少」，亦可以提供 network／DNS／TLS 原因、HTTP status 同 endpoint host／URL（secret query 值一定要遮蔽），但永遠唔可以包含 key、request headers 或者 response body。
 - 編譯器同 CLI 輸出 log 前會遮蔽 key（同第 9 節 token／secret 規則一致）。
 - CI 用 secret scanning 掃 repo、lock、manifest、部署報告同 CI log；發現疑似 key（包括 `LLM_API_KEY`／`OPENAI_API_KEY` 嘅實際值）即刻 fail build。
 - CI 用 GitHub Actions secrets 提供變數：release job 用 `release` environment secret `VIBE_LLM_API_KEY`；PR CI 用另一條 `VIBE_LLM_API_KEY_PREVIEW`（決定 118）。fork 嚟嘅 PR 攞唔到 secret，只跑驗證器，唔編譯。
-- Runtime 環境變數唔可以有任何 `LLM_*` 或者 `OPENAI_*`；部署時平台檢查，發現就部署失敗。
+- Runtime 環境變數唔可以有任何 `LLM_*` 或者 `OPENAI_*`；部署時平台檢查，發現就部署失敗。開發環境嘅 serve 會警告（只列變數名）並喺 handlers 啟動之前移除呢啲變數，runtime 仍然唔會收到 key（見第 10 節）。
 - `.env` 一定要喺 `.gitignore`；repo 只准有 `.env.example`（冇真 key）。改 `.gitignore` 移除 `.env`、改 CI workflow 嘅 secret 用法，都受 CODEOWNERS 保護（9B）。
 
 `.env.example`
@@ -809,6 +812,7 @@ jobs:
   4. 輸出部署報告（10.10）同安全項目清單。高風險安全項目列入部署報告，唔阻 release（決定 90 已撤回，見 2C.3a）。
   5. CODEOWNERS 覆蓋係 source PR 合併條件（決定 93、115），唔喺 `vibe build` 檢查（2C.3a）。
 - 選項：`--labels`（輸出建議 PR label）、`--dev`、`-o manifest.json`。
+- 喺 `vibe build` 實作之前，`vibe validate --deploy --dev`／`vibe manifest --dev` 做同等嘅本地用途；CI／production 拒絕；dev manifest 只准喺 development 環境 serve。
 - 冇 reviewer 步驟（審核由 Git 平台設定負責）；lock 唔 commit（決定 117）。`--check-determinism` 已移除（決定 117）。
 
 ### 2C.3a `--release-approval`（已撤回，產品經理 2026-10-16）
@@ -2454,7 +2458,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
   - 編譯請求帶咗 `tools`／`functions`／`toolConfig`，或者唔合 2A.8.2 嘅決定性設定；provider 回報 model 同 `LLM_MODEL` 唔一致。
   - secret scanning 喺 repo、lock、manifest、部署報告或者 CI log 搵到 key。
   - `.env` 冇喺 `.gitignore`，或者 repo 有 `.env`。
-  - runtime 環境變數有任何 `LLM_*` 或者 `OPENAI_*`。
+  - runtime 環境變數有任何 `LLM_*` 或者 `OPENAI_*`，除咗開發環境（`vibe dev`，或者 `vibe serve --memory`／VIBE_ENV development）：serve 會警告（只列變數名），並喺 handlers 啟動之前移除所有 `LLM_*`／`OPENAI_*`；runtime 仍然永遠唔會收到 key。
 - source 有零寬字元或者 bidi 控制字元。
 - 語意一致性：lock 有 source 冇提及嘅寫入、公開、剔走 auth、簽 token 或者對外 call。
 

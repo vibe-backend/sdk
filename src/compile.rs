@@ -266,12 +266,8 @@ async fn llm_sections(
         .compile(&request)
         .await
         .map_err(|err| Diag::error(&source.rel, err))?;
-    let sections = crate::lock::parse_sections(&strip_fence(&response.text)).map_err(|err| {
-        Diag::error(
-            &source.rel,
-            format!("LLM output is not lock markdown: {err}"),
-        )
-    })?;
+    let sections = crate::lock::parse_sections(&strip_fence(&response.text))
+        .map_err(|_| Diag::error(&source.rel, "LLM output is not lock markdown"))?;
     Ok((sections, response.system_fingerprint))
 }
 

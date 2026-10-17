@@ -151,7 +151,7 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 
 - **絕不提交 key**：不可出現在 repo、source、lock、manifest、log、部署報告、PR 留言或錯誤訊息；錯誤只可說「`LLM_API_KEY` 無效或缺少」（§2A.8.5）。CI 會對 repo、lock、manifest、部署報告和 CI log 做 secret 掃描，懷疑有 key 即令 build 失敗。
 - `.env` 必須被 gitignore；從 `.gitignore` 移除它或改變 CI secret 用法受 CODEOWNERS 保護（§2A.8.5、§9B）。
-- Runtime 不可有任何 `LLM_*` 或 `OPENAI_*` 變數；有的話部署失敗（§2A.8.5）。
+- 開發環境以外，runtime 不可有任何 `LLM_*` 或 `OPENAI_*` 變數；在開發環境，serve 會出 warning 並在啟動前移除這些變數（§2A.8.5）。
 - **Sandbox**：compiler 的對外網絡只限 endpoint host；沒有 tools、function calling 或 streaming；除 `LLM_API_KEY` 外沒有其他 secret（§2A.7、§2A.8.6）。
 - CI 和 production 編譯必須用公開 host 的 `https://`；在 CI 使用 loopback、私有 host 或 `LLM_ALLOW_PRIVATE_HOST=true` 屬錯誤（§2A.8.4）。
 - `LLM_ALLOW_PRIVATE_HOST=true` 亦適用於解析至非公開地址的網域名稱，例如 fake-IP DNS 代理；只限本地開發。即使名稱看似公開，編譯結果亦會記錄 `endpoint-private: true`。 公開網域名稱仍須使用 HTTPS；CI 和 production 拒絕此旗標。

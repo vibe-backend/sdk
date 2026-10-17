@@ -738,8 +738,8 @@ fn error_chain(error: &(dyn std::error::Error + 'static), api_key: &str) -> Stri
 }
 
 /// Explains a failed or non-JSON LLM response. JSON or empty 401/403 responses blame the key;
-/// HTML (or a 404) hints at the base URL. The request URL and a short body
-/// excerpt are included, with the API key and secret query values masked.
+/// HTML (or a 404) hints at the base URL. Only the masked URL and response
+/// classification are included; response body text is never included.
 pub fn describe_failure(
     url: &str,
     status: u16,
@@ -749,19 +749,12 @@ pub fn describe_failure(
 ) -> String {
     let shown_url = mask_secrets(url, api_key);
     let raw = String::from_utf8_lossy(body);
-    let excerpt: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Mask the full body first so a key straddling the 200-char cut cannot leak.
-    let excerpt = mask_secrets(&excerpt, api_key);
-    let excerpt: String = excerpt.chars().take(200).collect();
     let html = content_type.to_ascii_lowercase().contains("text/html")
-        || excerpt
+        || raw
             .trim_start()
             .to_ascii_lowercase()
             .starts_with("<!doctype html")
-        || excerpt
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("<html");
+        || raw.trim_start().to_ascii_lowercase().starts_with("<html");
     let lead = match status {
         401 | 403 if body.is_empty() || serde_json::from_slice::<Value>(body).is_ok() => {
             format!("LLM_API_KEY was rejected (http {status})")
@@ -771,7 +764,7 @@ pub fn describe_failure(
         429 => format!("LLM rate limit or quota exceeded (http {status})"),
         400 => format!("LLM request rejected (http {status}); check LLM_MODEL and the provider"),
         s if s >= 500 => format!("LLM provider error (http {s})"),
-        s if (200..300).contains(&s) => "LLM response was not JSON".to_string(),
+        s if (200..300).contains(&s) => format!("LLM response was not JSON (http {s})"),
         s => format!("LLM request failed (http {s})"),
     };
     let hint = if html || status == 404 {
@@ -779,10 +772,7 @@ pub fn describe_failure(
     } else {
         ""
     };
-    mask_secrets(
-        &format!("{lead}{hint}. URL: {shown_url}. Response: {excerpt}"),
-        api_key,
-    )
+    mask_secrets(&format!("{lead}{hint}. URL: {shown_url}"), api_key)
 }
 
 impl HttpAdapter {
@@ -925,10 +915,7 @@ impl HttpAdapter {
         if let Some(reported) = &parsed.model_reported {
             if reported != &request.model && !reported.is_empty() {
                 return Err(CallError {
-                    message: format!(
-                        "provider reported model {reported}, expected {}",
-                        request.model
-                    ),
+                    message: "provider reported an unexpected model".into(),
                     retryable: false,
                 });
             }
@@ -1112,24 +1099,14 @@ pub fn parse_openai_responses(value: &Value) -> Result<LlmResponse, String> {
     parse_openai_responses_masked(value, "")
 }
 
-/// Like [`parse_openai_responses`]; provider error messages are masked
-/// (API key, `key=`-style values) before they are cut to 200 characters.
-pub fn parse_openai_responses_masked(value: &Value, api_key: &str) -> Result<LlmResponse, String> {
+/// Like [`parse_openai_responses`]; diagnostics never include provider body text.
+pub fn parse_openai_responses_masked(value: &Value, _api_key: &str) -> Result<LlmResponse, String> {
     let status = value["status"].as_str().unwrap_or("");
     if status == "incomplete" {
-        let reason = value["incomplete_details"]["reason"]
-            .as_str()
-            .unwrap_or("unknown");
-        return Err(format!("openai responses output is incomplete ({reason})"));
+        return Err("openai responses output is incomplete".into());
     }
     if matches!(status, "failed" | "error") || !value["error"].is_null() {
-        let error = &value["error"];
-        let code = error["code"].as_str().unwrap_or("unknown");
-        let message = mask_secrets(error["message"].as_str().unwrap_or("no message"), api_key);
-        let message: String = message.chars().take(200).collect();
-        return Err(format!(
-            "openai responses returned an error ({code}): {message}"
-        ));
+        return Err("openai responses returned an error".into());
     }
     let text = if let Some(text) = value["output_text"].as_str() {
         text.to_string()
@@ -1188,12 +1165,34 @@ pub fn env_map_from_process() -> HashMap<String, String> {
     std::env::vars().collect()
 }
 
-pub fn runtime_llm_env_present() -> Option<String> {
-    std::env::vars()
-        .find(|(key, value)| {
-            !value.is_empty() && (key.starts_with("LLM_") || key.starts_with("OPENAI_"))
+/// Names only, including empty and non-Unicode values.
+pub fn runtime_llm_env_names(
+    keys: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    let mut names: Vec<_> = keys
+        .into_iter()
+        .filter(|key| {
+            let key = key.to_string_lossy();
+            key.starts_with("LLM_") || key.starts_with("OPENAI_")
         })
-        .map(|(key, _)| key)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Remove compile-time credentials before building runtime state or spawning tasks.
+pub fn strip_runtime_llm_env() -> Vec<std::ffi::OsString> {
+    let names = runtime_llm_env_names(std::env::vars_os().map(|(key, _)| key));
+    for name in &names {
+        std::env::remove_var(name);
+    }
+    names
+}
+
+pub fn runtime_llm_env_present() -> Option<String> {
+    runtime_llm_env_names(std::env::vars_os().map(|(key, _)| key))
+        .first()
+        .map(|key| key.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -1602,7 +1601,7 @@ mod failure_message_tests {
         );
         assert!(!m.contains("sk-STRADDLE"), "{m}");
         assert!(!m.contains(key), "{m}");
-        assert!(m.contains("***"), "{m}");
+        assert!(!m.contains(&filler), "{m}");
     }
 
     #[test]
@@ -1634,13 +1633,13 @@ mod responses_tests {
         let key = "sk-test-secret-value-1234567890";
         let long = format!("{}{key} and api_key=abc123secret", "x".repeat(190));
         let err = parse_openai_responses_masked(
-            &json!({"status": "failed", "error": {"code": "bad", "message": long}}),
+            &json!({"status": "failed", "error": {"code": "bad", "message": &long}}),
             key,
         )
         .unwrap_err();
         assert!(!err.contains("sk-test-secret"), "{err}");
         assert!(!err.contains("sk-test"), "partial key leaked: {err}");
-        assert!(err.contains("***"), "{err}");
+        assert!(!err.contains(&long), "{err}");
         let err = parse_openai_responses(&json!({
             "error": {"code": "bad", "message": "see https://x/?api_key=abc123secret"}
         }))
@@ -1691,6 +1690,51 @@ mod responses_tests {
             assert!(err.contains(&status.to_string()), "{status}: {err}");
             assert!(!err.contains(key), "{status}: {err}");
             let _ = retry;
+        }
+    }
+
+    #[tokio::test]
+    async fn all_provider_failures_omit_headers_and_body() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let key = "sk-private-test-key";
+        let marker = "BODY-MARKER-7f3a";
+        for provider in [OPENAI, ANTHROPIC, GEMINI] {
+            for (status, body) in [
+                (401, format!(r#"{{"error":"{marker} Bearer {key}"}}"#)),
+                (403, format!("<html>{marker} Bearer {key}</html>")),
+                (500, format!("{marker} Bearer {key}")),
+                (200, format!("{marker} malformed Bearer {key}")),
+                (
+                    200,
+                    format!(r#"{{"error":{{"code":"{marker}","message":"{key}"}}}}"#),
+                ),
+            ] {
+                let app = Router::new().fallback(post(move || {
+                    let body = body.clone();
+                    async move { (StatusCode::from_u16(status).unwrap(), body) }
+                }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let mut config = responses_config("test-model");
+                config.provider = provider.into();
+                config.api_key = key.into();
+                config.base_url = format!("http://{addr}/v1");
+                config.endpoint_private = true;
+                let adapter = HttpAdapter::new(config).unwrap();
+                let request = LlmRequest {
+                    system: "sys".into(),
+                    input: "in".into(),
+                    model: "test-model".into(),
+                    seed: 0,
+                    timeout: Duration::from_secs(2),
+                };
+                let err = adapter.compile(&request).await.unwrap_err();
+                for secret in [key, &format!("Bearer {key}"), marker] {
+                    assert!(!err.contains(secret), "{err}");
+                }
+                server.abort();
+            }
         }
     }
 
@@ -1768,7 +1812,7 @@ mod responses_tests {
         }))
         .unwrap_err();
         assert!(
-            err.contains("incomplete") && err.contains("max_output_tokens"),
+            err.contains("incomplete") && !err.contains("max_output_tokens"),
             "{err}"
         );
         for value in [
@@ -1778,7 +1822,7 @@ mod responses_tests {
         ] {
             let err = parse_openai_responses(&value).unwrap_err();
             assert!(
-                err.contains("server_error") && err.contains("boom"),
+                err.contains("returned an error") && !err.contains("boom"),
                 "{err}"
             );
         }
@@ -1839,7 +1883,7 @@ mod responses_tests {
             "error": {"code": "server_error", "message": "boom"}
         });
         let err = adapter.compile(&request).await.unwrap_err();
-        assert!(err.contains("server_error"), "{err}");
+        assert!(err.contains("returned an error"), "{err}");
     }
 
     #[test]
@@ -1915,7 +1959,11 @@ mod transport_policy_tests {
             .build()
             .unwrap();
         let error = client
-            .get("https://proxy.example.com/v1?key=test-key")
+            .post("https://proxy.example.com/v1?key=test-key")
+            .header("Authorization", "Bearer test-key")
+            .header("x-api-key", "test-key")
+            .header("x-goog-api-key", "test-key")
+            .body("BODY-MARKER-7f3a")
             .send()
             .await
             .unwrap_err();
@@ -1927,6 +1975,8 @@ mod transport_policy_tests {
             "{message}"
         );
         assert!(!message.contains("test-key"));
+        assert!(!message.contains("Bearer test-key"));
+        assert!(!message.contains("BODY-MARKER-7f3a"));
     }
 
     #[test]
@@ -1996,5 +2046,7 @@ mod transport_policy_tests {
         assert!(message.contains("probably not an API key problem"));
         assert!(message.contains("LLM_BASE_URL"));
         assert!(!message.contains("test-key"));
+        assert!(!message.contains("Bearer test-key"));
+        assert!(!message.contains("BODY-MARKER-7f3a"));
     }
 }

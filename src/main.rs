@@ -388,11 +388,23 @@ async fn cmd_serve(
     addr: &str,
     memory: bool,
 ) -> Result<(), String> {
-    if let Some(name) = llm::runtime_llm_env_present() {
-        return Err(format!("runtime environment must not contain {name}"));
-    }
+    load_dotenv(project);
     let run_env =
         vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), memory);
+    if let Some(name) = llm::runtime_llm_env_present() {
+        if !run_env.is_dev() {
+            return Err(format!("runtime environment must not contain {name}"));
+        }
+        let names = llm::strip_runtime_llm_env();
+        eprintln!(
+            "warning: removing compile-time variables from runtime environment: {}",
+            names
+                .iter()
+                .map(|key| key.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     if memory && !run_env.is_dev() {
         return Err(format!(
             "--memory is a development executor and is refused when VIBE_ENV is {:?}; use PostgreSQL",
