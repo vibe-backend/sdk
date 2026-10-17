@@ -11,6 +11,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 use vibe::manifest::Manifest;
+use vibe::runtime::refresh::{RefreshPolicy, RevokeTarget, Rotated};
 use vibe::runtime::{
     router, run_method, AppState, AuthConfig, CallCtx, Caller, ExecError, MemoryExec, PgExec,
     QueryExec, Row, Slug, Stmt,
@@ -26,6 +27,46 @@ const PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0mqNqll14aIJEhYqCiRLWJX63Ty6\n\
 Q0UxBzbmJ2wI9FMVJLw4XEhuIJFqIdA/P6b6ozSNGyOUZK7OjIfGKtpNYw==\n\
 -----END PUBLIC KEY-----\n";
+
+#[test]
+fn jsonwebtoken_rejects_off_curve_key_without_startup_checks() {
+    use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+    use serde_json::{json, Value};
+
+    let token = encode(
+        &Header::new(Algorithm::ES256),
+        &json!({"sub": "test", "exp": 4_102_444_800u64}),
+        &EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let validation = Validation::new(Algorithm::ES256);
+    let valid_key = DecodingKey::from_ec_pem(PUBLIC_PEM.as_bytes()).unwrap();
+    assert!(decode::<Value>(&token, &valid_key, &validation).is_ok());
+
+    // Keep the valid x coordinate and change y's low bit to leave P-256.
+    // Pass the PEM directly to jsonwebtoken, bypassing our startup checks.
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mut der = STANDARD
+        .decode(
+            PUBLIC_PEM
+                .lines()
+                .filter(|line| !line.starts_with("-----"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    let last = der.len() - 1;
+    der[last] ^= 1;
+    let pem = format!(
+        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+        STANDARD.encode(&der)
+    );
+    assert_eq!(
+        vibe::runtime::eckey::p256_public(&pem),
+        Err(vibe::runtime::eckey::EcProblem::BadPoint)
+    );
+    let key = DecodingKey::from_ec_pem(pem.as_bytes()).expect("off-curve PEM loads");
+    assert!(decode::<Value>(&token, &key, &validation).is_err());
+}
 
 fn fixture() -> Manifest {
     let path = concat!(
@@ -56,6 +97,7 @@ fn ctx<'a>(auth: &'a AuthConfig, tenant: &'a str) -> CallCtx<'a> {
             subject: "",
             roles: &[],
         },
+        refresh_token: None,
     }
 }
 
@@ -247,6 +289,45 @@ impl QueryExec for Lookup {
     ) -> Result<Option<Vec<String>>, ExecError> {
         self.0.user_roles(tenant_id, user_id).await
     }
+    async fn refresh_issue(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        token_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<String, ExecError> {
+        self.0
+            .refresh_issue(tenant_id, user_id, token_hash, policy)
+            .await
+    }
+
+    async fn refresh_rotate(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: RefreshPolicy,
+    ) -> Result<Rotated, ExecError> {
+        self.0
+            .refresh_rotate(tenant_id, token_hash, new_hash, policy)
+            .await
+    }
+
+    async fn refresh_revoke(
+        &self,
+        tenant_id: &str,
+        target: RevokeTarget<'_>,
+    ) -> Result<u64, ExecError> {
+        self.0.refresh_revoke(tenant_id, target).await
+    }
+
+    async fn refresh_family(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        self.0.refresh_family(tenant_id, token_hash).await
+    }
 }
 
 /// A store with user u1 holding roles [staff].
@@ -417,17 +498,83 @@ async fn sign_jwt_refuses_issue_refresh_until_supported() {
     assert!(err.1.contains("issue-refresh"), "{err:?}");
 }
 
-/// The runtime's own JWT verification accepts what sign-jwt issues: a
-/// role-gated route lets the signed token through.
-#[tokio::test]
-async fn signed_token_round_trips_through_runtime_verification() {
+const RSA_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCV1TuPgK11dA6o\n\
+HIiBaAue2y1tMYish6kP/0n831p6EK4q86z7zyTUI9uQLY9QdvHA1JzEaZIrIk31\n\
+eS2M44mteGh0/u+yAgs0vkBwuiZ62twBC/FwN2cMlV/e1Scc9zOWKsOalauYmLO7\n\
+Mibj5qCGyhP6T6Uvhu78gKrE++YW8sPJN/8+EByOvZhw7dwhd11RybxxAnAzPYDl\n\
+wwcVH5zp1+I406MvGbZifX17kpf0rQoWGgdGsipGeCLGPwakz4Oq6kVYc4WAueWA\n\
+tYxuZy5BlW1AVHjrS9wYzLuyc69FAyDQC+icc0bmAc+6Cyfl4VpeRBjIDSRf4Qq8\n\
+qo+uJGBLAgMBAAECggEAOnunCl3LFt/MgsDUZVJjysc5RXhCpTk0e6qFSh8yNRgC\n\
+q4A+gnE5qlYusumdmWY7+azjXeTpKU30CP8aEPaVfDDV8Oi7TYtvrVAfXgDC2UxI\n\
++F2diVQOtIIvkA45/JvetlwNym5mMqNT8BrkxCr2eHYy8w6YZuMvsD5WqZm7FzRk\n\
+3HIvF+Iwt2xuLoS7uRHtTHOFR681+Zh15czZJH2qnpbC9Gg5rNVohUu0ymhLwshf\n\
+aY/LjsXmvs+p4k4z4oy84JjFs6+oLCQmGpeUvQXq2Ye/8wszNCacehjPzCH9NncG\n\
+xENGLMhwSfYu35Q4Sco/aiBr92ucP65bRA56cLCzFQKBgQDHxKcqJMTPlbIB2Ju5\n\
+4t/GvaLpUXmWQ3A7Z+QDJSDSgLgtXijXQorshUbb0q1sAz0g4LXHqc8EhQdVRKsI\n\
+T2wH/IpiNgcgQ1iY7pPY3PkVHgs+wShphJ01sXBsu3TO61AY10aWhiSrt2CGFO8+\n\
+AimSPJInzmhDYl8ntnklvS+u5wKBgQDAAjvIQNs/06FbNdTn7VLgjmi6Qx8smgRj\n\
+dPeHlZksEo3ZlJjVAqilCf2AidNfFM7JSjcjT4OGQxNGSdmLaJJt+3yfA1N+L4+z\n\
+tkRvQUhPiSlDVGctfto8p/eHGmebkYZDxPiOKEZMlAmdIYSTHkrKrMCtNctKm5jD\n\
+yADSZOSK/QKBgQCGaxqYTvlnPLD0cQ4H/FLa5cty93G63FHuhy9ztk3pltdXH56X\n\
+iZz1HZDaZV5v6ZX+Q3XNjcNQpTqT84qqItbsYM+02endmbNJ5G7zY2zu+rJSXaKV\n\
+rbgi4uxlHZWxjcDtlh1XN5gBO3jlf7yjmsziK4Ok6Uxa2xxwGmZWMICfTQKBgHKg\n\
+oroBZiLrn/fI4mr3drPSsNkJ+1FwPVB24tORztjN1ttfaAI6zR2CIlIbdhHcZTss\n\
+UFCHRrjf0GD086fTbR+1tIdlv/GkSUD7fk2BBr9c3kJw4Av8ICN4D0Eb1WC9dw98\n\
+RvrvNlC/TCH/gZsmyXXHvltpswy+aWvwOfVhAEOtAoGADt7iadF7r8Urkw+qWJs5\n\
+0DkUePxzfCXL9zLLzsZGWOrH2Z4kwagIDV7QXkmtNpJ5yCz1hglwRpWuWs0CS6sK\n\
+sUU5Jdw+uTdMDkC4LZ6yy9/FbDjcD514xyg/CiGzFM1B3CbAaQiahTWQaIyxtrVl\n\
+xjwFjbNtOH5kVjRCe+Q0Hlk=\n\
+-----END PRIVATE KEY-----\n";
+
+const RSA_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAldU7j4CtdXQOqByIgWgL\n\
+ntstbTGIrIepD/9J/N9aehCuKvOs+88k1CPbkC2PUHbxwNScxGmSKyJN9XktjOOJ\n\
+rXhodP7vsgILNL5AcLometrcAQvxcDdnDJVf3tUnHPczlirDmpWrmJizuzIm4+ag\n\
+hsoT+k+lL4bu/ICqxPvmFvLDyTf/PhAcjr2YcO3cIXddUcm8cQJwMz2A5cMHFR+c\n\
+6dfiONOjLxm2Yn19e5KX9K0KFhoHRrIqRngixj8GpM+DqupFWHOFgLnlgLWMbmcu\n\
+QZVtQFR460vcGMy7snOvRQMg0AvonHNG5gHPugsn5eFaXkQYyA0kX+EKvKqPriRg\n\
+SwIDAQAB\n\
+-----END PUBLIC KEY-----\n";
+
+/// Signs a token through a `sign-jwt` step with `alg` and the given private
+/// key, then sends it through the runtime verifier configured with
+/// `public_pem`. Returns the statuses for the token and a tampered copy.
+async fn sign_and_verify(
+    alg: &str,
+    private_pem: &str,
+    public_pem: &str,
+    verifier_alg: Algorithm,
+) -> (StatusCode, StatusCode, String) {
     let m = method_manifest(
         &["sign-token"],
-        sign_steps(json!({"claims": "{ sub: u.id }"})),
+        sign_steps(json!({"alg": alg, "claims": "{ sub: u.id }"})),
     );
+    let mut auth = AuthConfig::anonymous();
+    auth.public_pem = public_pem.into();
+    auth.alg = verifier_alg;
+    auth.signing_keys = vibe::runtime::load_signing_keys(
+        &m,
+        &|name| (name == "JWT_SIGNING_KEY").then(|| private_pem.to_string()),
+        "local",
+    )
+    .unwrap();
     let exec = users();
-    let out = run(&m, &exec, json!({"sub": "u1"})).await.unwrap();
+    let out = run_method(
+        &m,
+        &exec,
+        "t.run",
+        &json!({"sub": "u1"}),
+        ctx(&auth, "tenant0001"),
+        0,
+    )
+    .await
+    .map_err(|f| f.message)
+    .unwrap()
+    .value;
     let token = out["access_token"].as_str().unwrap().to_string();
+    let header = jsonwebtoken::decode_header(&token).unwrap();
+    assert_eq!(format!("{:?}", header.alg), alg);
     let mut gated = fixture();
     gated.routes = vec![serde_json::from_value(json!({
         "method": "GET", "path": "/v1/me", "feature_id": "me/v1/get",
@@ -442,7 +589,7 @@ async fn signed_token_round_trips_through_runtime_verification() {
     let app = router(Arc::new(AppState {
         manifest: gated,
         exec: Arc::new(exec),
-        auth: auth(),
+        auth,
         slugs: HashMap::new(),
         rates: std::sync::Mutex::new(Default::default()),
         quotas: std::sync::Mutex::new(Default::default()),
@@ -468,17 +615,67 @@ async fn signed_token_round_trips_through_runtime_verification() {
             .status()
         }
     };
-    assert_eq!(
-        call(format!("Bearer {token}")).await,
-        StatusCode::NO_CONTENT
-    );
+    let ok = call(format!("Bearer {token}")).await;
     let mut tampered = token.clone();
     tampered.pop();
     tampered.push(if token.ends_with('A') { 'B' } else { 'A' });
+    let bad = call(format!("Bearer {tampered}")).await;
+    (ok, bad, token)
+}
+
+/// The runtime's own JWT verification accepts what sign-jwt issues: a
+/// role-gated route lets the signed token through (ES256).
+#[tokio::test]
+async fn signed_token_round_trips_through_runtime_verification() {
+    let (ok, bad, _) = sign_and_verify("ES256", PRIVATE_PEM, PUBLIC_PEM, Algorithm::ES256).await;
+    assert_eq!(ok, StatusCode::NO_CONTENT);
+    assert_eq!(bad, StatusCode::UNAUTHORIZED);
+}
+
+/// Same round trip with an RS256 signing key and RSA public key.
+#[tokio::test]
+async fn rs256_signed_token_round_trips_through_runtime_verification() {
+    let (ok, bad, token) =
+        sign_and_verify("RS256", RSA_PRIVATE_PEM, RSA_PUBLIC_PEM, Algorithm::RS256).await;
+    assert_eq!(ok, StatusCode::NO_CONTENT);
+    assert_eq!(bad, StatusCode::UNAUTHORIZED);
+    let mut v = Validation::new(Algorithm::RS256);
+    v.validate_aud = false;
+    jsonwebtoken::decode::<Value>(
+        &token,
+        &DecodingKey::from_rsa_pem(RSA_PUBLIC_PEM.as_bytes()).unwrap(),
+        &v,
+    )
+    .unwrap();
+}
+
+/// A verifier configured for one algorithm rejects tokens signed with the other.
+#[tokio::test]
+async fn verifier_rejects_tokens_signed_with_a_different_algorithm() {
+    let (ok, _, _) = sign_and_verify("ES256", PRIVATE_PEM, RSA_PUBLIC_PEM, Algorithm::RS256).await;
+    assert_eq!(ok, StatusCode::UNAUTHORIZED);
+    let (ok, _, _) = sign_and_verify("RS256", RSA_PRIVATE_PEM, PUBLIC_PEM, Algorithm::ES256).await;
+    assert_eq!(ok, StatusCode::UNAUTHORIZED);
+}
+
+/// The verifier only accepts the algorithms it knows; others fail closed.
+#[tokio::test]
+async fn verifier_rejects_unsupported_configured_algorithm() {
+    let (ok, _, _) = sign_and_verify("ES256", PRIVATE_PEM, PUBLIC_PEM, Algorithm::ES384).await;
+    assert_eq!(ok, StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn detect_jwt_alg_picks_rs256_and_es256() {
     assert_eq!(
-        call(format!("Bearer {tampered}")).await,
-        StatusCode::UNAUTHORIZED
+        vibe::runtime::detect_jwt_alg(RSA_PUBLIC_PEM).unwrap(),
+        Algorithm::RS256
     );
+    assert_eq!(
+        vibe::runtime::detect_jwt_alg(PUBLIC_PEM).unwrap(),
+        Algorithm::ES256
+    );
+    assert!(vibe::runtime::detect_jwt_alg("not a pem").is_err());
 }
 
 #[tokio::test]
@@ -530,6 +727,49 @@ fn missing_signing_key_refuses_to_start() {
         .err()
         .unwrap();
     assert!(err.contains("JWT_SIGNING_KEY"), "{err}");
+}
+
+/// PRIVATE_PEM with its private scalar replaced by `d`, or with two bytes
+/// appended after the key.
+fn altered_private_pem(d: Option<[u8; 32]>) -> String {
+    use base64::Engine;
+    let b64: String = PRIVATE_PEM
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect();
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut der = engine.decode(b64).unwrap();
+    match d {
+        Some(d) => {
+            let marker = [0x02, 0x01, 0x01, 0x04, 0x20];
+            let at = der.windows(5).position(|w| w == marker).unwrap() + 5;
+            der[at..at + 32].copy_from_slice(&d);
+        }
+        None => der.extend_from_slice(&[0x05, 0x00]),
+    }
+    format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        engine.encode(der)
+    )
+}
+
+#[test]
+fn unusable_es256_signing_key_refuses_to_start() {
+    let order: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
+        0x25, 0x51,
+    ];
+    for (name, pem) in [
+        ("d = 0", altered_private_pem(Some([0; 32]))),
+        ("d = n", altered_private_pem(Some(order))),
+        ("d = 2^256 - 1", altered_private_pem(Some([0xff; 32]))),
+        ("trailing bytes", altered_private_pem(None)),
+    ] {
+        let res = vibe::runtime::load_signing_keys(&fixture(), &|_| Some(pem.clone()), "local");
+        let err = res.err().unwrap_or_else(|| panic!("{name} accepted"));
+        assert!(err.contains("JWT_SIGNING_KEY"), "{name}: {err}");
+    }
 }
 
 #[tokio::test]
@@ -980,4 +1220,144 @@ async fn writing_query_needs_a_method_marked_writes() {
     m.methods[0].writes = false;
     let err = run(&m, &users(), json!({"n": "x"})).await.unwrap_err();
     assert!(err.1.contains("method is not marked writes"), "{err:?}");
+}
+
+/// App query roles may not inherit the runtime role; migrate and startup
+/// both refuse such a setup.
+#[tokio::test]
+async fn query_roles_cannot_inherit_the_runtime_role() {
+    let Some((_app, admin, tenant, url)) = pg_app().await else {
+        return;
+    };
+    let app_role = url::Url::parse(&url).unwrap().username().to_string();
+    let schema = format!("t_{tenant}");
+    let statements = vibe::runtime::refresh::table_statements(&schema).unwrap();
+    for statement in &statements {
+        admin.batch_execute(statement).await.unwrap();
+    }
+    admin
+        .batch_execute(&format!(
+            "DO $$ BEGIN CREATE ROLE app_rw NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
+             GRANT SELECT ON {schema}._platform_refresh_tokens TO {app_role}; \
+             GRANT {app_role} TO app_rw"
+        ))
+        .await
+        .unwrap();
+    let startup = PgExec::connect(&url).await.err();
+    let mut migrate = Ok(());
+    for statement in &statements {
+        if let Err(err) = admin.batch_execute(statement).await {
+            migrate = Err(err
+                .as_db_error()
+                .map_or_else(|| err.to_string(), |e| e.message().to_string()));
+            break;
+        }
+    }
+    admin
+        .batch_execute(&format!("REVOKE {app_role} FROM app_rw"))
+        .await
+        .unwrap();
+    let startup = startup.expect("startup must refuse");
+    assert!(startup.contains("app_rw"), "{startup}");
+    let migrate = format!("{:?}", migrate.expect_err("migrate must refuse"));
+    assert!(migrate.contains("re-run migrate"), "{migrate}");
+    assert!(PgExec::connect(&url).await.is_ok());
+}
+
+fn fixture_with_alg(alg: Option<&str>) -> Manifest {
+    let mut m = fixture();
+    for method in &mut m.methods {
+        for step in method.steps.iter_mut().filter(|s| s.op == "sign-jwt") {
+            match alg {
+                Some(alg) => {
+                    step.opts.insert("alg".into(), alg.into());
+                }
+                None => {
+                    step.opts.remove("alg");
+                }
+            }
+        }
+    }
+    m
+}
+
+#[test]
+fn rs256_signing_key_under_2048_bits_refuses_to_start() {
+    // Decision 139 (#222).
+    let short = include_str!("../src/runtime/testdata/rsa-k1024.pem");
+    let ok = include_str!("../src/runtime/testdata/rsa-k2048.pem");
+    let m = fixture_with_alg(Some("RS256"));
+    let err = vibe::runtime::load_signing_keys(
+        &m,
+        &|name| (name == "JWT_SIGNING_KEY").then(|| short.to_string()),
+        "local",
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("at least 2048 bits"), "{err}");
+    assert!(
+        !err.contains("MII"),
+        "key material must not be printed: {err}"
+    );
+    let keys = vibe::runtime::load_signing_keys(
+        &m,
+        &|name| (name == "JWT_SIGNING_KEY").then(|| ok.to_string()),
+        "local",
+    )
+    .unwrap();
+    assert_eq!(keys["JWT_SIGNING_KEY"].alg, jsonwebtoken::Algorithm::RS256);
+}
+
+#[test]
+fn sign_jwt_without_alg_defaults_to_es256() {
+    // Decision 139 (#226).
+    let keys = vibe::runtime::load_signing_keys(
+        &fixture_with_alg(None),
+        &|name| (name == "JWT_SIGNING_KEY").then(|| PRIVATE_PEM.to_string()),
+        "local",
+    )
+    .unwrap();
+    assert_eq!(keys["JWT_SIGNING_KEY"].alg, jsonwebtoken::Algorithm::ES256);
+}
+
+#[test]
+fn es256_signing_key_must_be_p256() {
+    // Decision 139: other curves refuse to start.
+    let pem = include_str!("../src/runtime/testdata/ec-p384-k.pem");
+    for alg in [Some("ES256"), None] {
+        let err = vibe::runtime::load_signing_keys(
+            &fixture_with_alg(alg),
+            &|name| (name == "JWT_SIGNING_KEY").then(|| pem.to_string()),
+            "local",
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("P-256"), "{err}");
+        assert!(
+            !err.contains("MI"),
+            "key material must not be printed: {err}"
+        );
+    }
+}
+
+#[test]
+fn sec1_signing_keys_are_rejected() {
+    for pem in [
+        include_str!("../src/runtime/testdata/ec-p256-sec1.pem"),
+        include_str!("../src/runtime/testdata/ec-p384-sec1.pem"),
+    ] {
+        for alg in [Some("ES256"), None] {
+            let err = vibe::runtime::load_signing_keys(
+                &fixture_with_alg(alg),
+                &|name| (name == "JWT_SIGNING_KEY").then(|| pem.to_string()),
+                "local",
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                err,
+                "JWT_SIGNING_KEY: SEC1 EC PRIVATE KEY is not supported; use PKCS#8 PRIVATE KEY"
+            );
+        }
+    }
 }

@@ -13,11 +13,13 @@ Every guarded job must:
 - download artifacts from the current run only, by exact `name` with an
   optional `path` and no other inputs;
 - attest only exact `subject-path` entries (no wildcards);
-- in `run` steps (bash only), call only allowlisted commands; anything else,
+- in `run` steps (bash only), match an exact reviewed verification program and call only allowlisted
+  commands; anything else,
   including any other way to fetch files, is refused.
 
 Checks .github/workflows/*.yml and docs/ci/*.yml (or the paths given).
 """
+import hashlib
 import glob
 import re
 import sys
@@ -60,11 +62,21 @@ FORBIDDEN_TEXT = ("system(", "getline", "|&")
 ALLOWED_SHELLS = {None, "bash"}
 # Expressions a guarded `run` step may interpolate.
 EXPR_OK = re.compile(r"^(steps|needs|env|runner)\.[A-Za-z0-9_.-]+$|^github\.(sha|ref|ref_name)$")
-FORBIDDEN_ENV = {"BASH_ENV", "ENV", "LD_PRELOAD", "LD_LIBRARY_PATH", "PATH", "NODE_OPTIONS"}
+FORBIDDEN_ENV = {"BASH_ENV", "ENV", "LD_PRELOAD", "LD_LIBRARY_PATH", "PATH", "NODE_OPTIONS", "SHELLOPTS", "BASHOPTS", "CDPATH", "GLOBIGNORE", "LD_AUDIT", "PYTHONPATH"}
 
 GLOB_CHARS = set("*?[]{}")
 SHA_REF = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
 
+
+# Exact reviewed shell programs, hashed without normalization. New programs
+# require policy review; command-name parsing alone is not a shell sandbox.
+ALLOWED_RUN_SHA256 = {
+    "45318d17a3b590330d1b6ffe6af1744648d6bce8ddd9788d29ca76e139578a52",  # Check the downloaded files against the expected list
+    "d6d952a29a747d71d38c16dba3f7f503552467d19577b94017cec1d0bd88bf6a",  # Check assets against SHA256SUMS
+    "cd605121c56b92ed6ebb2a7b3320693aa5cf34c53a0e32f6d74517d445f0b295",  # Same digest as the release build
+    "a1dae5bedbae7993c29952c9cdd17087b9726097f9eed35b7add8a269353d83c",  # Keep the Sigstore bundle next to the manifest
+    "ad4a545acdd2762662bf63b75ab47b4e32730b3e72440db47fdf48126900df94",  # pass_id_token_only_job.yml
+}
 
 def grants(perms):
     if perms == "write-all":
@@ -83,13 +95,16 @@ def env_name(env):
 def check(path):
     with open(path, encoding="utf-8") as f:
         doc = yaml.safe_load(f) or {}
-    problems = []
+    problems = env_problems(doc.get("env"), "workflow")
     for key in grants(doc.get("permissions")):
         problems.append(f"{path}: workflow-level permissions grant {key}: write")
     for name, job in (doc.get("jobs") or {}).items():
         job = job or {}
         granted = grants(job.get("permissions"))
         if granted:
+            defaults = (doc.get("defaults") or {}).get("run") or {}
+            if defaults.get("shell") not in ALLOWED_SHELLS or "working-directory" in defaults:
+                problems.append(f"{path}: workflow run defaults are not allowed for guarded jobs")
             problems += [f"{path}: job `{name}`: {p}" for p in guarded_job(job, granted)]
     return problems
 
@@ -103,7 +118,7 @@ def guarded_job(job, granted):
             problems.append(f"`{key}` is not allowed in a job that can mint OIDC tokens")
     runs_on = job.get("runs-on")
     labels = runs_on if isinstance(runs_on, list) else [runs_on]
-    if any("self-hosted" in str(label) for label in labels):
+    if len(labels) != 1 or labels[0] not in {"ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "windows-2022", "macos-14"}:
         problems.append("must run on a GitHub-hosted runner")
     problems += env_problems(job.get("env"), "job")
     shell = ((job.get("defaults") or {}).get("run") or {}).get("shell")
@@ -155,10 +170,21 @@ def uses_problems(uses, args):
         artifact = str(args.get("name") or "")
         if not artifact or GLOB_CHARS & set(artifact) or "${{" in artifact:
             problems.append("downloads an artifact without an exact name")
+    for key, value in args.items():
+        if not isinstance(value, str) or "${{" in value:
+            problems.append(f"`{action}` input `{key}` must be literal text")
+    if action in (DOWNLOAD_ARTIFACT, UPLOAD_ARTIFACT):
+        for key in ("name", "path"):
+            value = str(args.get(key) or "")
+            if key == "name" or action == UPLOAD_ARTIFACT or value:
+                if not value or value.startswith(("/", "~", "-")) or ".." in value.split("/") or GLOB_CHARS & set(value) or "\\" in value:
+                    problems.append(f"`{action}` input `{key}` must be an exact relative name/path")
+    if action == UPLOAD_ARTIFACT and args.get("if-no-files-found") != "error":
+        problems.append("upload must set if-no-files-found: error")
     if action == ATTEST:
         subjects = str(args.get("subject-path") or "")
         entries = [e.strip() for e in subjects.replace(",", "\n").splitlines() if e.strip()]
-        if not entries or any(GLOB_CHARS & set(e) or "${{" in e for e in entries):
+        if not entries or any(GLOB_CHARS & set(e) or "${{" in e or e.startswith(("/", "~", "-")) or ".." in e.split("/") or "\\" in e for e in entries):
             problems.append("attests subject-path with a wildcard or no path")
     return problems
 
@@ -232,6 +258,8 @@ ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 def run_problems(script):
     problems = []
+    if hashlib.sha256(script.encode()).hexdigest() not in ALLOWED_RUN_SHA256:
+        problems.append("run script is not an explicitly allowlisted verification program")
     for expr in re.findall(r"\$\{\{(.*?)\}\}", script, re.S):
         if not EXPR_OK.match(expr.strip()):
             problems.append(f"run step interpolates `${{{{{expr.strip()}}}}}`")

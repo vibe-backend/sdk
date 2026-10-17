@@ -47,8 +47,8 @@ commit.
 
 ## `VIBE_RELEASE_SIGNING_KEY`
 
-Release builds (`vibe build`, `vibe manifest --release`) take no key and
-**refuse to run** if `VIBE_RELEASE_SIGNING_KEY` is set. The secret itself is
+Release builds (`vibe build`, `vibe manifest --release`) ignore
+`VIBE_RELEASE_SIGNING_KEY`, even when set; the release job signs keyless. The secret itself is
 not removed by this change; Jack decides whether to delete it. Dev builds
 (`vibe build --dev`) keep using `.vibe/signing.key`.
 

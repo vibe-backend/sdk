@@ -19,12 +19,12 @@ Locks are build output. They are not committed (`*.lock.md` is in
    inherited auth), records per-lock hashes and the commit, and writes the
    compiled locks to a local build directory (`--locks-dir`, default
    `.vibe/build/locks`; never the repo). Lock files on disk are not read.
-   High-risk items fail closed until release-environment approval
-   verification (#80) is implemented; `--release-approval` is not approval.
+   High-risk items are listed in the deployment report only; decision 90’s
+   high-risk fail-closed policy was withdrawn.
    Release builds never read `.env` and send the LLM key only to an
    allowlisted host (`api.openai.com`, the default when `LLM_BASE_URL` is
    unset; `api.anthropic.com`; `generativelanguage.googleapis.com`). The
-   build takes **no signing key** and refuses `VIBE_RELEASE_SIGNING_KEY`.
+   build ignores `VIBE_RELEASE_SIGNING_KEY`; the release job signs keyless.
 3. **Sign keyless.** A separate `sign` job in the `release` environment
    downloads `manifest` from the same run by exact name, checks its digest
    and attests `manifest.json` with `actions/attest-build-provenance`:

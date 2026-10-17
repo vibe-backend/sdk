@@ -30,11 +30,8 @@ permissions:
   contents: read
 
 env:
-  # WARNING: this pin is a vibe-backend/sdk feature-branch commit (PR #116),
-  # not yet on main, so the "Require VIBE_SDK_REV ... on sdk main" step below
-  # fails until it is re-pinned. Re-pin to the #116 merge commit on main
-  # right after merge; do not copy this template before then.
-  VIBE_SDK_REV: 2d9d2cfcaf592c7ac94ec2f54a5ea4f96f3b64b8 # pin: full sdk commit SHA
+  # Pinned SDK commit on main.
+  VIBE_SDK_REV: 967478684f1c4432680146a9e9e9f658f12a93fb
   # The identity a release must carry. Keep in sync with the runtime's
   # VIBE_RELEASE_REPO / VIBE_RELEASE_WORKFLOW (defaults shown).
   VIBE_RELEASE_REPO: vibe-backend/sdk
@@ -114,8 +111,9 @@ jobs:
 
   release-build:
     # `vibe build` recompiles from source in memory (lock files are never an
-    # input) and validates; it takes no signing key. High-risk items fail
-    # closed until release-environment approval verification (#80) lands.
+    # input) and validates; it takes no signing key. High-risk items are
+    # listed in the deployment report only
+    # (decision 90 high-risk fail-closed policy was withdrawn).
     # There is no approval variable or string.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [install, release-policy]
@@ -146,7 +144,7 @@ jobs:
         env:
           VIBE_LLM_API_KEY: ${{ secrets.VIBE_LLM_API_KEY }}
         run: |
-          # A release build refuses VIBE_RELEASE_SIGNING_KEY; do not pass it.
+          # Release builds ignore VIBE_RELEASE_SIGNING_KEY and use keyless signing.
           LLM_API_KEY="$VIBE_LLM_API_KEY" bin/vibe build --project . \
             --version "${GITHUB_REF_NAME#v}" \
             --commit "$GITHUB_SHA" \
@@ -180,14 +178,18 @@ jobs:
         with:
           name: manifest
       - name: Same digest as the release build
-        run: echo "${{ needs.release-build.outputs.digest }}  manifest.json" | sha256sum -c -
+        env:
+          EXPECTED_DIGEST: ${{ needs.release-build.outputs.digest }}
+        run: echo "$EXPECTED_DIGEST  manifest.json" | sha256sum -c -
       - name: Sign keyless (Sigstore via GitHub attestation)
         id: attest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: manifest.json
       - name: Keep the Sigstore bundle next to the manifest
-        run: cp "${{ steps.attest.outputs.bundle-path }}" manifest.json.sigstore.json
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: cp -- "$BUNDLE_PATH" manifest.json.sigstore.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: manifest-sigstore-bundle
@@ -213,7 +215,9 @@ jobs:
         with:
           name: manifest-sigstore-bundle
       - name: Same digest as the release build
-        run: echo "${{ needs.release-build.outputs.digest }}  manifest.json" | sha256sum -c -
+        env:
+          EXPECTED_DIGEST: ${{ needs.release-build.outputs.digest }}
+        run: echo "$EXPECTED_DIGEST  manifest.json" | sha256sum -c -
       - name: Verify Sigstore bundle (signature, Fulcio identity, Rekor entry; fail closed)
         env:
           GH_TOKEN: ${{ github.token }}

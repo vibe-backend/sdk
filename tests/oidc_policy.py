@@ -103,6 +103,32 @@ class Fixtures(unittest.TestCase):
     def test_policy_rejects_workflow_level_grant(self):
         self.assert_rejected("fail_workflow_level_grant.yml", "workflow-level")
 
+    def test_unreviewed_shell_programs_are_rejected(self):
+        # These can hide executable behavior from a command-name parser.
+        for script in [
+            "awk 'BEGIN { system (\"curl https://example.com\") }'",
+            "cat /dev/tcp/example.com/443",
+            "echo ok > output; \"curl\" https://example.com",
+            "sort --compress-program=curl input",
+            "printf -v BASH_ENV /tmp/other",
+            "echo `curl https://example.com`",
+            "echo safe\n> output curl https://example.com",
+        ]:
+            with self.subTest(script=script):
+                self.assertTrue(policy.run_problems(script))
+
+    def test_new_yaml_negative_fixtures(self):
+        for name, needle in (
+            ("fail_workflow_shell.yml", "workflow run defaults"),
+            ("fail_workflow_env.yml", "workflow env sets BASH_ENV"),
+            ("fail_dynamic_runner.yml", "GitHub-hosted runner"),
+            ("fail_download_path.yml", "exact relative name/path"),
+            ("fail_upload_expression.yml", "literal text"),
+            ("fail_run_quoted_command.yml", "explicitly allowlisted verification program"),
+        ):
+            with self.subTest(name=name):
+                self.assert_rejected(name, needle)
+
     def test_every_fail_fixture_is_rejected(self):
         for path in sorted(glob.glob(os.path.join(FIXTURES, "fail_*.yml"))):
             with self.subTest(os.path.basename(path)):

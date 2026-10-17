@@ -103,6 +103,12 @@ jobs:
         with:
           toolchain: "1.89"
           targets: ${{ matrix.target }}
+      - name: Install NASM (aws-lc-sys, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm --version=3.2.0 -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Install aarch64 Linux linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
@@ -110,8 +116,6 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          # Use prebuilt NASM for Windows x86_64; aws-lc-sys ignores this elsewhere.
-          AWS_LC_SYS_PREBUILT_NASM: '1'
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package tar.gz
         if: endsWith(matrix.asset, '.tar.gz')
