@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use vibe::compile::{compile_project, CompileOptions, TRANSLATE_PROMPT};
+use vibe::compile::{regenerate_project, CompileOptions, TRANSLATE_PROMPT};
 use vibe::llm::{FakeAdapter, LlmConfig, LlmRequest};
 use vibe::validate::{validate_project, ValidateOptions};
 
@@ -89,7 +89,7 @@ async fn compile(root: &Path, config: &LlmConfig) {
             }
         },
     };
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root,
         llm: Some(&adapter),
         llm_config: Some(config),
@@ -138,6 +138,22 @@ async fn locks_exclude_environment_and_record_llm_provenance() {
     assert_eq!(stamp.model_snapshot, config.model);
     assert!(stamp.endpoint_private);
     assert_eq!(record.translations.len(), 1);
+    let reused = vibe::compile::build_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(reused.reused, 2);
+    assert_eq!(locks(&root), written);
+    let reused_record: vibe::buildrecord::BuildRecord =
+        serde_json::from_slice(&fs::read(root.join(vibe::buildrecord::PATH)).unwrap()).unwrap();
+    assert_eq!(
+        reused_record, record,
+        "reuse must preserve LLM and translation provenance"
+    );
     validate_project(&ValidateOptions {
         root: &root,
         dev: true,
@@ -149,7 +165,7 @@ async fn locks_exclude_environment_and_record_llm_provenance() {
     assert_eq!(manifest.provenance.compilers, record.compilers);
     let lock_path = root.join("models/product/product.lock.md");
     let text = fs::read_to_string(&lock_path).unwrap();
-    let legacy = text.replace("version: 0.1.0 }", "version: 0.1.0, model-snapshot: ignored, llm-provider: ignored, endpoint-host: ignored, endpoint-private: true, llm-seed: 1, seed: ignored, sent-params: {} }");
+    let legacy = text.replacen("security-items:", "compiler: { name: md-logic, version: 0.1.0, model-snapshot: ignored, llm-provider: ignored, endpoint-host: ignored, endpoint-private: true, llm-seed: 1, seed: ignored, sent-params: {} }\nsecurity-items:", 1);
     fs::write(&lock_path, &legacy).unwrap();
     let report = validate_project(&ValidateOptions {
         root: &root,
@@ -196,7 +212,7 @@ async fn locks_exclude_environment_and_record_llm_provenance() {
     })
     .unwrap_err()
     .to_string();
-    assert!(error.contains("no build-record LLM stamp; run `vibe compile`"));
+    assert!(error.contains("no build-record LLM stamp; run `vibe build`"));
     fs::remove_dir_all(root).unwrap();
 }
 #[tokio::test]

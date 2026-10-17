@@ -9,7 +9,7 @@ use crate::diag::{Diag, Report};
 use crate::discover::{self, SourceFile};
 use crate::hashutil::source_hash;
 use crate::lock::{
-    compiler_hash, find_section, parse_lock, section_order, Kind, LockDoc, Scope, SourceType,
+    check_lock_stamp, find_section, parse_lock, section_order, Kind, LockDoc, Scope, SourceType,
     LOCK_VERSION,
 };
 use crate::scan;
@@ -165,7 +165,7 @@ pub fn validate_loaded(
                 {
                     report.push(Diag::error(
                         &file,
-                        "natural locks must record an LLM provider; run `vibe compile`",
+                        "natural locks must record an LLM provider; run `vibe build`",
                     ));
                 }
                 if stamp.model_snapshot == "latest"
@@ -183,7 +183,7 @@ pub fn validate_loaded(
             } else if !opts.dev && doc.meta.source_type == SourceType::Natural {
                 report.push(Diag::error(
                     &file,
-                    "natural lock has no build-record LLM stamp; run `vibe compile`",
+                    "natural lock has no build-record LLM stamp; run `vibe build`",
                 ));
             }
         }
@@ -213,7 +213,7 @@ pub fn validate_loaded(
 
 /// Spec 10.1 "hand edit" / "recompile mismatch": structured sources compile
 /// deterministically, so recompile them in memory and require the lock body
-/// to match. Natural-language locks are left to `vibe compile --check` in CI,
+/// to match. Natural-language locks are left to `vibe build --check` in CI,
 /// which has the LLM.
 fn check_recompile(
     root: &Path,
@@ -248,7 +248,7 @@ fn check_recompile(
         {
             report.push(Diag::error(
                 lock_rel(&source.rel),
-                "lock does not match a recompile of its source (hand-edited?); run `vibe compile`",
+                "lock does not match a recompile of its source (hand-edited?); run `vibe build`",
             ));
         }
     }
@@ -283,7 +283,7 @@ pub(crate) fn check_lock(
                         Some(&bullet.value),
                     );
                     if bullet.value != expected {
-                        report.push(Diag::error(&file, format!("{} / {}: source-lines `{}` must equal `{expected}`; run `vibe compile`", section.name, block.heading, bullet.value)));
+                        report.push(Diag::error(&file, format!("{} / {}: source-lines `{}` must equal `{expected}`; run `vibe build`", section.name, block.heading, bullet.value)));
                     }
                 }
             }
@@ -301,14 +301,8 @@ pub(crate) fn check_lock(
             "source-type is structured but the source contains prose",
         ));
     }
-    if doc.meta.compiler.name != crate::lock::COMPILER_NAME {
-        report.push(Diag::error(&file, "compiler name is not md-logic"));
-    }
-    if compiler_hash(&doc.meta.compiler) != doc.meta.compiler_hash {
-        report.push(Diag::error(
-            &file,
-            "compiler-hash does not match the compiler stamp; run `vibe compile`",
-        ));
+    if let Err(message) = check_lock_stamp(&doc.meta.vibe_version) {
+        report.push(Diag::error(&file, message));
     }
     let mut order = section_order(doc.meta.kind, doc.meta.scope).to_vec();
     if doc.meta.kind == Kind::Api
@@ -361,7 +355,7 @@ pub(crate) fn check_lock(
         .cloned()
         .collect();
     if !env_fields.is_empty() {
-        report.push(Diag::warning(&file, format!("lock contains developer-environment fields ({}) that are no longer written (decision 174); run `vibe compile` to refresh it", env_fields.join(", "))));
+        report.push(Diag::warning(&file, format!("lock contains developer-environment fields ({}) that are no longer written (decision 174); run `vibe build` to refresh it", env_fields.join(", "))));
     }
     if doc
         .meta
@@ -369,7 +363,7 @@ pub(crate) fn check_lock(
         .iter()
         .any(|field| field == "translation")
     {
-        report.push(Diag::warning(&file, "lock contains a `translation` field, which is no longer written (decision 165); run `vibe compile` to refresh it"));
+        report.push(Diag::warning(&file, "lock contains a `translation` field, which is no longer written (decision 165); run `vibe build` to refresh it"));
     }
     if doc
         .meta
@@ -547,7 +541,7 @@ fn check_dependencies(
                     report.push(Diag::error(
                         lock_rel(&source.rel),
                         format!(
-                            "dependency {} hash does not match its lock (stale or edited); run `vibe compile`",
+                            "dependency {} hash does not match its lock (stale or edited); run `vibe build`",
                             dep.id
                         ),
                     ))

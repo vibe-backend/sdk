@@ -273,30 +273,14 @@ fn development_allows_after_failures_challenge_lock() {
 }
 
 #[test]
-fn dev_flags_are_refused_in_ci_and_production() {
-    for env in ["CI", "GITHUB_ACTIONS", "VIBE_ENV"] {
-        for args in [
-            vec!["validate", "--deploy", "--dev"],
-            vec!["manifest", "--dev"],
-        ] {
-            let output = Command::new(env!("CARGO_BIN_EXE_vibe"))
-                .env_clear()
-                .env(
-                    env,
-                    if env == "VIBE_ENV" {
-                        "production"
-                    } else {
-                        "true"
-                    },
-                )
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(!output.status.success());
-            assert!(String::from_utf8_lossy(&output.stderr)
-                .contains("--dev is for local development and is refused in CI and production"));
-        }
-    }
+fn removed_dev_flag_is_refused() {
+    let output = Command::new(env!("CARGO_BIN_EXE_vibe"))
+        .env_clear()
+        .args(["build", "--dev"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--dev'"));
 }
 
 #[test]
@@ -307,8 +291,10 @@ fn signed_dev_manifest_starts_with_memory_in_development() {
     std::fs::create_dir_all(&root).unwrap();
     let compiled = Command::new(env!("CARGO_BIN_EXE_vibe"))
         .env_clear()
-        .args(["compile", "--project"])
+        .args(["build", "--project"])
         .arg(&root)
+        .arg("--output")
+        .arg(root.join("built.json"))
         .output()
         .unwrap();
     assert!(

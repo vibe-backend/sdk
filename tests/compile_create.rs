@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use vibe::compile::{compile_project, CompileOptions};
+use vibe::compile::{regenerate_project, CompileOptions};
 use vibe::llm::{FakeAdapter, LlmConfig, LlmRequest};
 use vibe::lock::{find_section, parse_lock};
 use vibe::validate::{validate_project, ValidateOptions};
@@ -84,7 +84,7 @@ async fn missing_create_step_and_invented_errors_are_repaired() {
             }
         },
     };
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config()),
@@ -171,7 +171,7 @@ async fn chinese_create_is_canonical_across_three_cache_free_compiles() {
             },
         };
         let _ = fs::remove_dir_all(root.join(".vibe/cache"));
-        let out = compile_project(&CompileOptions {
+        let out = regenerate_project(&CompileOptions {
             root: &root,
             llm: Some(&adapter),
             llm_config: Some(&config()),
@@ -285,7 +285,7 @@ async fn structured_create_example_and_writes_contracts() {
         let root = project();
         let good = GOOD.replace("product.create", &format!("product.{action}"));
         source(&root, &format!("---\nwrites: false\n---\n{good}"));
-        let err = compile_project(&CompileOptions {
+        let err = regenerate_project(&CompileOptions {
             root: &root,
             llm: None,
             llm_config: None,
@@ -301,7 +301,7 @@ async fn structured_create_example_and_writes_contracts() {
         );
         for front in ["", "---\nwrites: true\n---\n"] {
             source(&root, &format!("{front}{good}"));
-            compile_project(&CompileOptions {
+            regenerate_project(&CompileOptions {
                 root: &root,
                 llm: None,
                 llm_config: None,
@@ -330,7 +330,7 @@ async fn structured_create_example_and_writes_contracts() {
     }
     let root = project();
     source(&root, GOOD);
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -361,7 +361,7 @@ async fn custom_writing_method_and_declared_errors_are_inherited() {
     fs::write(root.join("models/inventory/methods/bump-stock.md"), "---\nwrites: true\n---\n## Signature\n- writes: true\n- errors: [OUT_OF_STOCK]\n- capabilities: []\n## Calls\n(none)\n## Steps\n### s1\n- op: query\n- sql: UPDATE products SET price_cents = price_cents + 1 WHERE id = $1\n- params: [input.id]\n- writes: true\n- scope: pk\n- out: row\n### s2\n- op: respond\n- value: row\n").unwrap();
     let body = GOOD.replace("product.create", "inventory.bump-stock").replace("## Errors\n(none)", "## Errors\n| status | code | from |\n| --- | --- | --- |\n| 409 | OUT_OF_STOCK | OUT_OF_STOCK |");
     source(&root, &format!("---\nwrites: true\n---\n{body}"));
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -385,7 +385,7 @@ async fn custom_writing_method_and_declared_errors_are_inherited() {
     })
     .unwrap_or_else(|e| panic!("{e}"));
     source(&root, &format!("---\nwrites: false\n---\n{body}"));
-    let err = compile_project(&CompileOptions {
+    let err = regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -409,7 +409,7 @@ async fn duplicate_transform_keys_and_true_without_steps_fail() {
         &root,
         &GOOD.replace("name: req.body.name", "sku: req.body.name"),
     );
-    let err = compile_project(&CompileOptions {
+    let err = regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -428,7 +428,7 @@ async fn duplicate_transform_keys_and_true_without_steps_fail() {
             + GOOD.split_once("## Steps").unwrap().0
             + "## Steps\n(none)\n## Errors\n(none)\n"),
     );
-    let err = compile_project(&CompileOptions {
+    let err = regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -443,7 +443,7 @@ async fn duplicate_transform_keys_and_true_without_steps_fail() {
         "{err}"
     );
     source(&root, &GOOD.replace("## Errors\n(none)", "## Errors\n| status | code | from |\n| --- | --- | --- |\n| 409 | INVENTED | INVENTED |"));
-    let err = compile_project(&CompileOptions {
+    let err = regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -501,7 +501,7 @@ async fn missing_list_is_repaired_and_constants_are_preserved() {
                 }
             },
         };
-        compile_project(&CompileOptions {
+        regenerate_project(&CompileOptions {
             root: &root,
             llm: Some(&adapter),
             llm_config: Some(&config()),
@@ -545,7 +545,7 @@ async fn missing_list_is_repaired_and_constants_are_preserved() {
                     Ok(body.clone())
                 },
             };
-            compile_project(&CompileOptions {
+            regenerate_project(&CompileOptions {
                 root: &root,
                 llm: Some(&adapter),
                 llm_config: Some(&config()),
@@ -563,7 +563,7 @@ async fn missing_list_is_repaired_and_constants_are_preserved() {
 async fn validate_rejects_source_writes_false_with_create_step() {
     let root = project();
     source(&root, GOOD);
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -592,7 +592,7 @@ async fn validate_rejects_source_writes_false_with_create_step() {
 async fn validate_rejects_hand_edited_lock_unknown_errors_code() {
     let root = project();
     source(&root, GOOD);
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,

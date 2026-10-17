@@ -6,12 +6,12 @@ Locks are build output. They are not committed (`*.lock.md` is in
 ## Flow
 
 1. **Review the source PR.** People review the markdown sources and
-   frontmatter. PR CI (`preview` job) runs `vibe compile --check`, which
+   frontmatter. PR CI (`preview` job) runs `vibe build --check`, which
    compiles in memory and runs the deterministic policy, then writes the
    result to the job summary. It is informational and never deployed. It uses
    `VIBE_LLM_API_KEY_PREVIEW`.
 2. **Build once.** A `v*` tag runs the `release` job in the `release`
-   environment (Jack approves it): `vibe manifest --release` compiles every
+   environment (Jack approves it): `vibe build --release` compiles every
    source in memory, validates the in-memory locks (policy, dependency hashes,
    SQL allowlist, inherited auth) and writes an unsigned manifest recording
    per-lock hashes, the version and the commit. High-risk security items are
@@ -29,7 +29,8 @@ Locks are build output. They are not committed (`*.lock.md` is in
    `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<version>`,
    issuer `https://token.actions.githubusercontent.com` and the commit
    (fail closed), then deploys the same files to staging and then production.
-4. **Run.** Outside development, `vibe serve` / `vibe migrate` accept only
+4. **Run.** `vibe serve` is a temporary hidden run step; the next release adds
+   `vibe run`. Outside development, `vibe serve` / `vibe migrate` accept only
    `build_mode: release` manifests with a Sigstore bundle
    (`<manifest>.sigstore.json`, or `VIBE_MANIFEST_BUNDLE`) for the deployed
    version `VIBE_RELEASE_VERSION`. They check that the certificate identity
@@ -55,7 +56,7 @@ Locks are build output. They are not committed (`*.lock.md` is in
 
 ## Local development
 
-`vibe keygen` creates `.vibe/signing.key` (mode 0600). `vibe compile` writes
-locks and `.vibe/build-record.json`; `vibe validate --deploy` and `vibe
-manifest` refuse locks that differ from that record. The record is a local
+`vibe keygen` creates `.vibe/signing.key` (mode 0600). `vibe build` writes
+locks and `.vibe/build-record.json`; builds (including `--release`) refuse
+locks that differ from that record. The record is a local
 tripwire, not a trust root; only the attested release artifact is deployable.

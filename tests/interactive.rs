@@ -93,21 +93,17 @@ fn nonterminal_help_and_removed_new() {
         .output()
         .unwrap();
     let help = String::from_utf8_lossy(&out.stdout);
-    assert!(help.contains(
-        "Running vibe with no arguments in a terminal starts interactive setup and generation."
-    ));
+    assert!(help.contains("Running vibe with no arguments in a terminal starts interactive setup."));
     assert!(!help
         .lines()
         .any(|l| l.trim_start().starts_with("new ") || l.trim_start().starts_with("approve ")));
     let out = Command::new(env!("CARGO_BIN_EXE_vibe"))
-        .args(["manifest", "--help"])
+        .args(["build", "--help"])
         .output()
         .unwrap();
     let help = String::from_utf8_lossy(&out.stdout);
-    assert!(!help.lines().next().unwrap().contains("signed"));
-    assert!(help.contains("unsigned"));
-    assert!(help.contains("Sigstore keyless"));
-    assert!(help.contains("local dev key"));
+    assert!(help.contains("--release"));
+    assert!(!help.contains("--dev"));
 }
 #[test]
 fn setup_and_existing_config() {
@@ -348,7 +344,7 @@ async fn generation_confirmation_and_preservation() {
                     Ok("## Route\n- method: GET\n- path: /hello/v1/{slug}/hello\n## Access\n- public: true\n- tenant: path.slug\n## Pipelines\n(none)\n## Limits\n- provider: main\n## Request\n(none)\n## Response\n- status: 200\n## Transform\n(none)\n## Steps\n### s1 respond\n- op: respond\n- value: { message: \"hello world\" }\n- source-lines: 7\n## Errors\n(none)\n".into())
                 },
             };
-            vibe::compile::compile_project(&vibe::compile::CompileOptions {
+            vibe::compile::regenerate_project(&vibe::compile::CompileOptions {
                 root: &p,
                 llm: Some(&compiler),
                 llm_config: Some(&config()),

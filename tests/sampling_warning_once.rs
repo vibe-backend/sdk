@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use vibe::compile::{compile_project, CompileOptions};
+use vibe::compile::{regenerate_project, CompileOptions};
 use vibe::llm::{FakeAdapter, LlmConfig, LlmRequest};
 
 fn copy(from: &Path, to: &Path) {
@@ -74,7 +74,7 @@ async fn sampling_warning_is_emitted_once_across_compile_calls() {
         if cache.exists() {
             fs::remove_dir_all(cache).unwrap();
         }
-        let out = compile_project(&CompileOptions {
+        let out = regenerate_project(&CompileOptions {
             root: &root,
             llm: Some(&adapter),
             llm_config: Some(&config),

@@ -8,9 +8,9 @@ use crate::discover::{self, SourceFile};
 use crate::hashutil::source_hash;
 use crate::llm::{LlmAdapter, LlmConfig, LlmRequest};
 use crate::lock::{
-    compiler_hash, content_hash, find_section, find_section_mut, is_structured_source, render_lock,
+    content_hash, find_section, find_section_mut, is_structured_source, lock_stamp, render_lock,
     Block, Bullet, CompilerStamp, Dependency, Kind, LockDoc, Meta, Scope, Section, SourceType,
-    Table, COMPILER_NAME, COMPILER_VERSION, PROMPT_VERSION,
+    Table, COMPILER_NAME, VIBE_VERSION,
 };
 use crate::scan;
 use crate::security::{self, pipeline_name};
@@ -40,13 +40,15 @@ pub struct CompileOptions<'a> {
 }
 
 pub struct CompileOutput {
+    pub reused: usize,
     pub files: Vec<String>,
     pub report: Report,
 }
 
-pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, Report> {
+/// Recompiles all sources without reusing locks (also used for the in-memory check).
+pub async fn regenerate_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, Report> {
     let sources = discover::discover(opts.root)?;
-    let (docs, ordered, mut report) = compile_docs(
+    let (docs, ordered, mut report, _) = compile_docs(
         &sources,
         CompileOptions {
             root: opts.root,
@@ -58,6 +60,102 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
     )
     .await?;
     write_or_check(opts, &sources, &docs, &ordered, &mut report)
+}
+
+/// Builds with fresh natural locks, loading LLM configuration only when necessary.
+pub async fn build_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, Report> {
+    if opts.check {
+        return regenerate_project(opts).await;
+    }
+    let sources = discover::discover(opts.root)?;
+    let record_exists = opts.root.join(crate::buildrecord::PATH).exists();
+    let record = fs::read_to_string(opts.root.join(crate::buildrecord::PATH))
+        .ok()
+        .and_then(|s| serde_json::from_str::<crate::buildrecord::BuildRecord>(&s).ok());
+    let mut natural = HashMap::new();
+    for source in &sources {
+        if is_structured_source(&source.combined_text()) {
+            continue;
+        }
+        let rel = lock_rel(&source.rel);
+        let Some(text) = fs::read_to_string(opts.root.join(&rel)).ok() else {
+            continue;
+        };
+        let Ok(doc) = crate::lock::parse_lock(&text) else {
+            continue;
+        };
+        if doc.meta.vibe_version == lock_stamp()
+            && doc.meta.lock_version == crate::lock::LOCK_VERSION
+            && doc.meta.source_hash == source_hash(&source.combined_text())
+            && (!record_exists
+                || record.as_ref().is_some_and(|r| {
+                    r.locks.get(&rel) == Some(&crate::buildrecord::lock_hash(&text))
+                }))
+            && render_lock(&doc) == text
+        {
+            natural.insert(source.id.clone(), doc);
+        }
+    }
+    let mut config = None;
+    let mut adapter = None;
+    loop {
+        let stale: Vec<_> = sources
+            .iter()
+            .filter(|s| !is_structured_source(&s.combined_text()) && !natural.contains_key(&s.id))
+            .map(|s| s.rel.clone())
+            .collect();
+        if !stale.is_empty() && opts.llm.is_none() && adapter.is_none() {
+            let ci_or_prod = std::env::var("CI").ok().as_deref() == Some("true")
+                || std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
+                || !crate::runtime::RunEnv::from_var(
+                    std::env::var("VIBE_ENV").ok().as_deref(),
+                    true,
+                )
+                .is_dev();
+            let loaded =
+                crate::llm::load_llm_config(&crate::llm::env_map_from_process(), ci_or_prod)
+                    .and_then(|c| {
+                        crate::llm::HttpAdapter::new(c.clone())
+                            .map(|a| (c, a))
+                            .map_err(|e| {
+                                let mut r = Report::new();
+                                r.push(Diag::error("build", e));
+                                r
+                            })
+                    });
+            match loaded {
+                Ok((c, a)) => {
+                    config = Some(c);
+                    adapter = Some(a);
+                }
+                Err(error) => {
+                    let mut r = Report::new();
+                    r.push(Diag::error("build", format!("{} natural-language source(s) need regeneration ({}); set LLM_* configuration: {error}", stale.len(), stale.join(", "))));
+                    return Err(r);
+                }
+            }
+        }
+        let (docs, ordered, mut report, stale_deps) = compile_docs(
+            &sources,
+            CompileOptions {
+                root: opts.root,
+                check: false,
+                llm: opts.llm.or(adapter.as_ref().map(|a| a as &dyn LlmAdapter)),
+                llm_config: opts.llm_config.or(config.as_ref()),
+            },
+            &natural,
+        )
+        .await?;
+        if !stale_deps.is_empty() {
+            for id in stale_deps {
+                natural.remove(&id);
+            }
+            continue;
+        }
+        let mut output = write_or_check(opts, &sources, &docs, &ordered, &mut report)?;
+        output.reused = natural.len();
+        return Ok(output);
+    }
 }
 
 /// Compiles every source in memory and returns the result as a
@@ -77,7 +175,7 @@ pub async fn compile_in_memory(
         llm_config,
         check: true,
     };
-    let (docs, ordered, report) = compile_docs(&sources, opts, &HashMap::new()).await?;
+    let (docs, ordered, report, _) = compile_docs(&sources, opts, &HashMap::new()).await?;
     let (texts, record) = collect_build_record(root, &docs, &ordered);
     let loaded = crate::validate::LoadedProject {
         lock_texts: sources
@@ -93,7 +191,7 @@ pub async fn compile_in_memory(
 /// Recompiles structured sources in memory, without an LLM and without
 /// touching the disk. Natural-language sources cannot be recompiled offline,
 /// so their parsed locks are passed in `natural` and used as-is (they still
-/// feed dependency hashes). CI runs `vibe compile --check` with the LLM for
+/// feed dependency hashes). CI runs `vibe build --check` with the LLM for
 /// those.
 pub fn recompile_offline(
     root: &Path,
@@ -109,7 +207,13 @@ pub fn recompile_offline(
     let mut fut = std::pin::pin!(compile_docs(sources, opts, natural));
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     match fut.as_mut().poll(&mut cx) {
-        std::task::Poll::Ready(result) => result.map(|(docs, _, _)| docs),
+        std::task::Poll::Ready(result) => result.and_then(|(docs, _, report, _)| {
+            if report.has_errors() {
+                Err(report)
+            } else {
+                Ok(docs)
+            }
+        }),
         // Without an adapter nothing awaits I/O, so this cannot happen.
         std::task::Poll::Pending => {
             let mut report = Report::new();
@@ -122,7 +226,7 @@ pub fn recompile_offline(
     }
 }
 
-type Compiled = (HashMap<String, LockDoc>, Vec<String>, Report);
+type Compiled = (HashMap<String, LockDoc>, Vec<String>, Report, Vec<String>);
 
 async fn compile_docs(
     sources: &[SourceFile],
@@ -256,7 +360,7 @@ async fn compile_docs(
             SourceType::Natural
         };
         doc.meta.compiler = stamp.clone();
-        doc.meta.compiler_hash = compiler_hash(&stamp);
+        doc.meta.vibe_version = lock_stamp();
         if let Err(diags) = normalize(&mut doc, source, &docs) {
             report.extend(diags);
             continue;
@@ -306,6 +410,7 @@ async fn compile_docs(
 
     // #83: one failing source no longer blocks the others. Sources that
     // failed above are not in `docs`; failures below are tracked per id.
+    let mut stale_deps = Vec::new();
     let mut failed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for id in &ordered {
         let deps = match dependencies(id, &docs) {
@@ -316,7 +421,7 @@ async fn compile_docs(
                 continue;
             }
         };
-        // Same extraction as `vibe validate` (check_security_items_enriched):
+        // Same extraction as `vibe build` (check_security_items_enriched):
         // a feature that calls a writing method gets write-sql too.
         let mut items = security::extract_items(&docs[id]);
         security::enrich_feature_writes(&docs[id], &docs, &mut items);
@@ -330,6 +435,16 @@ async fn compile_docs(
             });
         }
         let doc = docs.get_mut(id).expect("doc inserted");
+        if natural.contains_key(id) {
+            let pairs = |deps: &[Dependency]| {
+                deps.iter()
+                    .map(|d| (d.id.clone(), d.hash.clone()))
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            if pairs(&doc.meta.dependencies) != pairs(&deps) {
+                stale_deps.push(id.clone());
+            }
+        }
         doc.meta.dependencies = deps;
         if doc
             .meta
@@ -362,6 +477,9 @@ async fn compile_docs(
     // #83 (PM option b): the official locks are all-or-nothing. Any failure
     // leaves every lock on disk untouched; successful LLM outputs stay in
     // `.vibe/cache` so a rerun does not pay for them again.
+    if !stale_deps.is_empty() {
+        return Ok((docs, ordered, report, stale_deps));
+    }
     if report.has_errors() || !failed.is_empty() {
         let bad: std::collections::BTreeSet<String> =
             report.errors().map(|diag| diag.file.clone()).collect();
@@ -375,7 +493,7 @@ async fn compile_docs(
         ));
         return Err(report);
     }
-    Ok((docs, ordered, report))
+    Ok((docs, ordered, report, stale_deps))
 }
 
 fn collect_build_record(
@@ -512,7 +630,11 @@ fn write_or_check(
     if report.has_errors() {
         return Err(report);
     }
-    Ok(CompileOutput { files, report })
+    Ok(CompileOutput {
+        files,
+        report,
+        reused: 0,
+    })
 }
 
 pub(crate) fn commit_locks(writes: &[(std::path::PathBuf, String)]) -> std::io::Result<()> {
@@ -530,8 +652,7 @@ fn cache_key(
     let config = opts.llm_config?;
     let stamp = stamp_from(Some(config));
     let material = serde_json::json!({
-        "compiler": compiler_hash(&stamp),
-        "prompt": PROMPT_VERSION,
+        "vibe-version": lock_stamp(),
         "system": system_prompt(source.kind, source.scope),
         "input": llm_input(source, docs),
         "model": config.model,
@@ -581,7 +702,7 @@ fn stamp_from(config: Option<&LlmConfig>) -> CompilerStamp {
     match config {
         Some(config) => CompilerStamp {
             name: COMPILER_NAME.into(),
-            version: COMPILER_VERSION.into(),
+            version: VIBE_VERSION.into(),
             model_snapshot: config.model.clone(),
             llm_provider: crate::llm::lock_provider(config),
             endpoint_host: config.endpoint_host.clone(),
@@ -608,7 +729,7 @@ fn checked_llm_sections(
     doc.meta.source_hash = source_hash(&source.combined_text());
     doc.meta.source_type = SourceType::Natural;
     doc.meta.compiler = stamp_from(opts.llm_config);
-    doc.meta.compiler_hash = compiler_hash(&doc.meta.compiler);
+    doc.meta.vibe_version = lock_stamp();
     normalize(&mut doc, source, docs)
         .map_err(|diags| diags.into_iter().map(|d| d.to_string()).collect::<Vec<_>>())?;
     normalize_source_lines(&mut doc.sections, &source.combined_text());
@@ -1139,6 +1260,7 @@ async fn translate_source(
             "provider": stamp.llm_provider,
             "model": config.model,
             "prompt": TRANSLATE_PROMPT_VERSION,
+            "vibe-version": lock_stamp(),
             "sent": stamp.sent_params,
             "seed": config.seed,
         })
@@ -1181,7 +1303,9 @@ async fn translate_source(
     Ok(text)
 }
 
+/// Compile prompt text lives in compile.rs and prompt_guide.rs (including repairs and translation).
 pub fn system_prompt(kind: Kind, scope: Option<Scope>) -> String {
+    let stamp = lock_stamp();
     let sections = crate::lock::section_order(kind, scope).join(", ");
     // Examples follow lock::section_order exactly; every step has source-lines.
     let example = match (kind, scope) {
@@ -1190,7 +1314,7 @@ pub fn system_prompt(kind: Kind, scope: Option<Scope>) -> String {
         _ => "\n\nPrefer existing method targets from DEPENDENCIES (object.action).\n",
     };
     format!(
-        "You are {COMPILER_NAME} {COMPILER_VERSION} prompt {PROMPT_VERSION}. \
+        "You are {COMPILER_NAME} for vibe {stamp}. \
 Compile the source into lock markdown sections only. \
 No frontmatter, no prose, no code fences. \
 API feature ## Limits is computed by the compiler from frontmatter pins (timeout, body, provider) and inherited defaults; never derive limits from prose. Required sections in order: {sections}. \
@@ -3089,7 +3213,7 @@ mod prompt_tests {
     }
 
     #[test]
-    fn compile_prompt_version_and_hash() {
+    fn compile_prompt_fingerprint() {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         for kind in [
@@ -3106,20 +3230,24 @@ mod prompt_tests {
                 Some(Scope::Version),
                 Some(Scope::Feature),
             ] {
-                let prompt = system_prompt(kind, scope);
+                let prompt = system_prompt(kind, scope).replacen(
+                    &format!("for vibe {}.", crate::lock::lock_stamp()),
+                    "for vibe <stamp>.",
+                    1,
+                );
                 hash.update((prompt.len() as u64).to_be_bytes());
                 hash.update(prompt.as_bytes());
             }
         }
+        for prompt in [
+            super::TRANSLATE_PROMPT.to_string(),
+            crate::prompt_guide::repair_input("<source>", "<previous>", &["<error>".into()]),
+        ] {
+            hash.update((prompt.len() as u64).to_be_bytes());
+            hash.update(prompt.as_bytes());
+        }
         let actual = hex::encode(hash.finalize());
-        assert_eq!(
-            (crate::lock::PROMPT_VERSION, actual.as_str()),
-            (
-                "prompt-10",
-                "9132299dbe723ad8b4b54ec21a6f8d143cbe8fc6752fb6b96dfc8d607b3c9975"
-            ),
-            "compile prompt changed: bump PROMPT_VERSION and update the recorded hash"
-        );
+        assert_eq!(actual, include_str!("compile_prompt.sha256").trim(), "compile prompt changed: update src/compile_prompt.sha256 and bump the minor version in Cargo.toml (prompts change only in minor versions; scripts/ci/check-prompt-version.py enforces this)");
     }
 
     #[test]
@@ -3155,7 +3283,7 @@ mod prompt_tests {
             llm_config: None,
             check: false,
         };
-        super::compile_project(&opts).await.unwrap();
+        super::regenerate_project(&opts).await.unwrap();
         let sources = crate::discover::discover(&root).unwrap();
         let mut docs: HashMap<_, _> = sources
             .iter()
@@ -3220,7 +3348,7 @@ mod prompt_tests {
             llm_config: None,
             check: false,
         };
-        if super::compile_project(&opts).await.is_err() {
+        if super::regenerate_project(&opts).await.is_err() {
             panic!("compile shop");
         }
         let mut docs = HashMap::new();
@@ -3410,7 +3538,7 @@ mod prompt_tests {
             llm_config: None,
             check: false,
         };
-        if let Err(report) = super::compile_project(&opts).await {
+        if let Err(report) = super::regenerate_project(&opts).await {
             panic!("compile: {:?}", report.diags);
         }
         let lock_path = api.with_extension("lock.md");
@@ -3454,7 +3582,7 @@ mod prompt_tests {
             llm_config: None,
             check: false,
         };
-        let report = match super::compile_project(&opts).await {
+        let report = match super::regenerate_project(&opts).await {
             Ok(out) => out.report,
             Err(report) => report,
         };

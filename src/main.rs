@@ -5,10 +5,8 @@ use std::sync::Arc;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use std::io::IsTerminal;
-use vibe::compile::{compile_project, CompileOptions};
-use vibe::discover;
+use vibe::compile::{build_project, CompileOptions};
 use vibe::llm::{self, HttpAdapter, LlmAdapter};
-use vibe::lock::is_structured_source;
 use vibe::manifest::{self, read_manifest};
 use vibe::runtime::{router, AppState, AuthConfig, PgExec, QueryExec};
 use vibe::secret::secret_scan;
@@ -18,8 +16,8 @@ use vibe::validate::{validate_project, ValidateOptions};
 #[derive(Parser)]
 #[command(
     name = "vibe",
-    about = "Compile and serve a markdown-driven backend",
-    after_help = "Running vibe with no arguments in a terminal starts interactive setup and generation."
+    about = "Build a markdown-driven backend",
+    after_help = "Running vibe with no arguments in a terminal starts interactive setup.\nvibe build generates locks, checks and packages.\nvibe build --release builds a release package."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -28,52 +26,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Compile source markdown into lock files.
-    Compile {
+    /// Generate locks, check and package the project.
+    Build {
         #[arg(long, default_value = ".")]
         project: PathBuf,
-        /// Build in memory and run the deploy policy. Ignores and does not write lock files.
-        #[arg(long)]
+        /// Build from source in memory and apply the deploy policy without writing locks.
+        #[arg(long, conflicts_with = "release")]
         check: bool,
-    },
-    /// Run the deterministic validator.
-    Validate {
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// Also apply deploy-only checks (e.g. no locks compiled against a private LLM endpoint).
-        #[arg(long)]
-        deploy: bool,
-        /// Allow private-endpoint locks for local development.
-        #[arg(long)]
-        dev: bool,
-    },
-    /// Build a manifest from validated locks: release by default.
-    ///
-    /// Release output is unsigned; the release workflow signs it with Sigstore keyless.
-    /// Use --dev to sign with the local dev key.
-    Manifest {
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// Output path, relative to the current directory (like `serve --manifest`).
-        #[arg(long, short, default_value = "manifest.json")]
-        output: PathBuf,
-        /// Release build (default): never reads .env, requires an allowlisted LLM host,
-        /// uses no key, and writes an unsigned manifest that the release
-        /// workflow signs with Sigstore keyless (decision 119). High-risk
-        /// items are listed only.
+        /// Build an unsigned release package from source; never read .env or committed locks.
         #[arg(long)]
         release: bool,
-        /// Sign for local development only.
-        #[arg(long, conflicts_with = "release")]
-        dev: bool,
-        /// Release version without `v` (default: GITHUB_REF_NAME of a `v*` tag).
+        /// Output path, relative to the current working directory.
+        #[arg(short, long, default_value = "manifest.json")]
+        output: PathBuf,
+        /// Release version without v (default: GITHUB_REF_NAME of a v* tag).
         #[arg(long)]
         release_version: Option<String>,
-        /// Source commit to record (default: GITHUB_SHA or `git rev-parse HEAD`).
+        /// Source commit (default: GITHUB_SHA or git rev-parse HEAD).
         #[arg(long)]
         commit: Option<String>,
     },
-    /// Create a development manifest signing key (.vibe/signing.key, mode 0600).
+    /// Create a development signing key (.vibe/signing.key, mode 0600).
     Keygen {
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -83,12 +56,8 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    #[command(hide = true)]
-    New {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
     /// Serve HTTP from a signed manifest.
+    #[command(hide = true)]
     Serve {
         #[arg(long, default_value = "manifest.json")]
         manifest: PathBuf,
@@ -163,6 +132,12 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    if let Some(name) = std::env::args().skip(1).find(|arg| !arg.starts_with('-')) {
+        if let Some(hint) = removed_command_hint(&name) {
+            eprintln!("{hint}");
+            std::process::exit(2);
+        }
+    }
     let cli = Cli::parse();
     let code = match run(cli).await {
         Ok(()) => 0,
@@ -188,18 +163,16 @@ async fn run(cli: Cli) -> Result<(), String> {
         return vibe::interactive::run(project, &mut io, &config, &adapter).await;
     };
     match command {
-        Command::Compile { project, check } => cmd_compile(&project, check).await,
-        Command::New { .. } => Err("`vibe new` was removed; run `vibe` with no arguments in a terminal for interactive setup and generation".into()),
-        Command::Approve { .. } => Err("`vibe approve` has been removed in spec v1.8 (decision 77): review happens on the source pull request. Use `vibe validate --deploy --dev` and `vibe manifest --dev` locally.".into()),
-        Command::Validate { project, deploy, dev } => cmd_validate(&project, deploy, dev),
-        Command::Manifest {
-            project,
-            output,
-            release,
-            dev,
-            release_version,
-            commit,
-        } => cmd_manifest(&project, &output, release, dev, release_version, commit).await,
+        Command::Build { project, check, release, output, release_version, commit } => {
+            if release { cmd_manifest(&project, &output, true, release_version, commit).await }
+            else {
+                cmd_build(&project, check).await?;
+                if check { return Ok(()); }
+                cmd_validate(&project, true, !ci_or_prod())?;
+                cmd_manifest(&project, &output, false, release_version, commit).await
+            }
+        },
+        Command::Approve { .. } => Err("`vibe approve` was removed: use `vibe build`; review happens on the source pull request.".into()),
         Command::Keygen { project } => {
             sign::create_dev_key(&project)?;
             println!("wrote {}", project.join(".vibe/signing.key").display());
@@ -280,51 +253,64 @@ async fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
-async fn cmd_compile(project: &Path, check: bool) -> Result<(), String> {
-    // The project .env is a development convenience only; CI and production
-    // take every input from the environment.
+async fn cmd_build(project: &Path, check: bool) -> Result<(), String> {
     if !ci_or_prod() {
         load_dotenv(project);
     }
-    let sources = discover::discover(project).map_err(|err| err.to_string())?;
-    let natural = sources
-        .iter()
-        .any(|source| !is_structured_source(&source.combined_text()));
-    let config = match llm::load_llm_config(&llm::env_map_from_process(), ci_or_prod()) {
-        Ok(config) => Some(config),
-        Err(report) if natural => return Err(report.to_string()),
-        Err(_) => None,
-    };
-    let adapter;
-    let adapter_ref: Option<&dyn LlmAdapter> = if natural {
-        let config = config.as_ref().ok_or("LLM config is required")?;
-        adapter = HttpAdapter::new(config.clone()).map_err(|err| err.to_string())?;
-        Some(&adapter)
-    } else {
-        None
-    };
-    let output = compile_project(&CompileOptions {
+    if check {
+        // Check and release always compile from source, ignoring disk locks.
+        let config = llm::load_llm_config(&llm::env_map_from_process(), ci_or_prod()).ok();
+        let adapter = config
+            .as_ref()
+            .map(|c| HttpAdapter::new(c.clone()))
+            .transpose()?;
+        let output = vibe::compile::regenerate_project(&CompileOptions {
+            root: project,
+            check: true,
+            llm: adapter.as_ref().map(|a| a as &dyn LlmAdapter),
+            llm_config: config.as_ref(),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        print_report(&output.report);
+        return Ok(());
+    }
+    let output = build_project(&CompileOptions {
         root: project,
-        llm: adapter_ref,
-        llm_config: config.as_ref(),
         check,
+        llm: None,
+        llm_config: None,
     })
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(|e| e.to_string())?;
     print_report(&output.report);
-    println!("compiled {} locks", output.files.len());
+    println!(
+        "built {} locks ({} regenerated, {} up to date)",
+        output.files.len(),
+        output.files.len() - output.reused,
+        output.reused
+    );
     Ok(())
 }
 
+pub fn removed_command_hint(name: &str) -> Option<&'static str> {
+    match name {
+        "compile" => Some("`vibe compile` was removed: use `vibe build` (it validates automatically; add `--release` for release packaging)"),
+        "validate" => Some("`vibe validate` was removed: use `vibe build` (it validates automatically; add `--release` for release packaging)"),
+        "manifest" => Some("`vibe manifest` was removed: use `vibe build` (it validates automatically; add `--release` for release packaging)"),
+        "new" => Some("`vibe new` was removed: run `vibe` with no arguments in a terminal"),
+        _ => None,
+    }
+}
+
 fn cmd_validate(project: &Path, deploy: bool, dev: bool) -> Result<(), String> {
-    check_dev_mode(dev)?;
     let report = validate_project(&ValidateOptions {
         dev,
         root: project,
         deploy,
     })
     .map_err(|err| err.to_string())?;
-    // #118: `vibe validate --deploy` (and any validate with a production
+    // #118: `vibe build` (and any validate with a production
     // VIBE_ENV) refuses `challenge_when: always` until a verifier is configured.
     let run_env =
         vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), !deploy);
@@ -347,12 +333,9 @@ async fn cmd_manifest(
     project: &Path,
     output: &Path,
     release: bool,
-    dev: bool,
     release_version: Option<String>,
     commit: Option<String>,
 ) -> Result<(), String> {
-    check_dev_mode(dev)?;
-    let release = release || !dev;
     // Release manifests are signed by the release workflow with Sigstore
     // keyless (decisions 92, 119); no key is ever loaded for them.
     let key = if release {
@@ -385,7 +368,7 @@ async fn cmd_manifest(
         })
         .unwrap_or_default();
     // A release build compiles from source in memory and never reads lock
-    // files from disk; a dev manifest uses the locks `vibe compile` wrote
+    // files from disk; a dev manifest uses the locks `vibe build` wrote
     // (checked against the build record).
     let loaded = if release {
         // A release build never reads the project .env: every input comes
@@ -466,7 +449,7 @@ fn load_manifest(
             .map_err(|e| e.to_string())?;
     if mode.build_mode == Some(manifest::BuildMode::Dev) {
         return Err(format!(
-            "this manifest was built with --dev and is refused when VIBE_ENV is {:?}",
+            "this development manifest (`vibe build`) is refused when VIBE_ENV is {:?}",
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
@@ -839,13 +822,6 @@ fn load_dotenv(project: &Path) {
     }
 }
 
-fn check_dev_mode(dev: bool) -> Result<(), String> {
-    if dev && ci_or_prod() {
-        return Err("--dev is for local development and is refused in CI and production".into());
-    }
-    Ok(())
-}
-
 fn ci_or_prod() -> bool {
     std::env::var("CI").ok().as_deref() == Some("true")
         || std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
@@ -940,6 +916,23 @@ impl Drop for EchoGuard {
     fn drop(&mut self) {
         unsafe {
             SetConsoleMode(self.0, self.1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn removed_commands_have_migration_hints() {
+        for command in ["compile", "validate", "manifest"] {
+            let hint = super::removed_command_hint(command).unwrap();
+            assert!(hint.contains("vibe build") && hint.contains("--release"));
+        }
+        assert!(super::removed_command_hint("new")
+            .unwrap()
+            .contains("no arguments in a terminal"));
+        for command in ["build", "serve", "keygen"] {
+            assert!(super::removed_command_hint(command).is_none());
         }
     }
 }

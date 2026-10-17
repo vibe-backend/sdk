@@ -30,7 +30,7 @@ pub mod sqlguard;
 pub mod sqlpolicy;
 pub mod validate;
 
-pub use compile::{compile_project, CompileOptions, CompileOutput};
+pub use compile::{build_project, regenerate_project, CompileOptions, CompileOutput};
 pub use diag::{Diag, Level, Report};
 pub use llm::{load_llm_config, FakeAdapter, HttpAdapter, LlmAdapter, LlmConfig};
 pub use manifest::{manifest_from_project, read_manifest, write_manifest, Manifest};

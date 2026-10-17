@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
-use vibe::compile::{compile_project, CompileOptions};
+use vibe::compile::{regenerate_project, CompileOptions};
 use vibe::llm::{FakeAdapter, LlmConfig, LlmRequest};
 use vibe::lock::{find_section, parse_lock};
 use vibe::runtime::{router, AppState, AuthConfig, MemoryExec, Slug};
@@ -65,7 +65,7 @@ async fn compile(root: &Path, output: &str) -> Result<vibe::CompileOutput, vibe:
             }
         },
     };
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root,
         llm: Some(&adapter),
         llm_config: Some(&config()),

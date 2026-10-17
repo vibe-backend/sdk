@@ -4,7 +4,7 @@ use std::fs;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use vibe::compile::{compile_project, CompileOptions};
+use vibe::compile::{regenerate_project, CompileOptions};
 use vibe::llm::{FakeAdapter, HttpAdapter, LlmAdapter, LlmConfig, LlmRequest};
 use vibe::lock::parse_lock;
 use vibe::validate::{validate_project, ValidateOptions};
@@ -75,7 +75,7 @@ async fn any_failure_leaves_official_locks_untouched_and_caches_successes() {
         llm_config: Some(&config),
         check: false,
     };
-    let report = compile_project(&opts)
+    let report = regenerate_project(&opts)
         .await
         .err()
         .expect("broken source fails the run");
@@ -103,7 +103,7 @@ async fn any_failure_leaves_official_locks_untouched_and_caches_successes() {
     // Rerun after the upstream recovers: product comes from the cache.
     calls.lock().unwrap().clear();
     broken_ok.store(true, std::sync::atomic::Ordering::SeqCst);
-    let out = compile_project(&opts)
+    let out = regenerate_project(&opts)
         .await
         .unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(*calls.lock().unwrap(), vec!["zbroken".to_string()]);
@@ -145,14 +145,14 @@ async fn corrupt_cache_entry_is_ignored() {
         llm_config: Some(&config),
         check: false,
     };
-    compile_project(&opts)
+    regenerate_project(&opts)
         .await
         .unwrap_or_else(|err| panic!("{err}"));
     let cache = root.join(".vibe/cache/llm");
     for entry in fs::read_dir(&cache).unwrap() {
         fs::write(entry.unwrap().path(), "- nested\n  - bullet\n").unwrap();
     }
-    compile_project(&opts)
+    regenerate_project(&opts)
         .await
         .unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);

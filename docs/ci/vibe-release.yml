@@ -39,9 +39,9 @@ jobs:
         run: |
           set -o pipefail
           {
-            echo '## vibe manifest preview (not a deploy artifact)'
+            echo '## vibe build --check preview (not a deploy artifact)'
             echo '```'
-            LLM_API_KEY="$VIBE_LLM_API_KEY" vibe compile --check --project . 2>&1
+            LLM_API_KEY="$VIBE_LLM_API_KEY" vibe build --check --project . 2>&1
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -67,7 +67,7 @@ jobs:
         env:
           VIBE_LLM_API_KEY: ${{ secrets.VIBE_LLM_API_KEY }}
         run: |
-          vibe manifest --project . --release \
+          vibe build --release --project . \
             --release-version "${GITHUB_REF_NAME#v}" \
             --commit "$GITHUB_SHA" \
             -o manifest.json 2> >(tee -a "$GITHUB_STEP_SUMMARY" >&2)

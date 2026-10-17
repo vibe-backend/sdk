@@ -61,7 +61,8 @@ pub struct LockProvenance {
     pub lock_sha256: String,
     pub content_hash: String,
     pub source_hash: String,
-    pub compiler_hash: String,
+    #[serde(alias = "compiler_hash")]
+    pub vibe_version: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -615,7 +616,7 @@ pub fn build_signed(
             lock_sha256: crate::buildrecord::lock_hash(text),
             content_hash: crate::lock::content_hash(doc),
             source_hash: doc.meta.source_hash.clone(),
-            compiler_hash: doc.meta.compiler_hash.clone(),
+            vibe_version: doc.meta.vibe_version.clone(),
         });
         for item in &doc.meta.security_items {
             items.push(ItemProvenance {
@@ -654,17 +655,25 @@ pub fn build_signed(
 }
 
 /// Outside development only release manifests run (decisions 75, 79, 91):
-/// built with `vibe manifest --release` and verified with Sigstore keyless
+/// built with `vibe build --release` and verified with Sigstore keyless
 /// ([`read_release_manifest`]). High-risk items are reported, not blocking
 /// (decision 90 withdrawn).
 pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), String> {
+    for lock in &manifest.provenance.locks {
+        if lock.vibe_version.starts_with("sha256:") {
+            return Err(
+                "manifest uses an old compiler-hash format; regenerate it with `vibe build`".into(),
+            );
+        }
+        crate::lock::check_lock_stamp(&lock.vibe_version)?;
+    }
     if development {
         return Ok(());
     }
     let provenance = &manifest.provenance;
     if manifest.build_mode == Some(BuildMode::Dev) {
         return Err(
-            "only release manifests (`vibe manifest --release`) can run outside development".into(),
+            "only release manifests (`vibe build --release`) can run outside development".into(),
         );
     }
     if provenance.locks.is_empty() {
@@ -693,7 +702,7 @@ pub fn read_release_manifest(
     let provenance = &manifest.provenance;
     if manifest.build_mode == Some(BuildMode::Dev) {
         return Err(single(
-            "only release manifests (`vibe manifest --release`) can run outside development".into(),
+            "only release manifests (`vibe build --release`) can run outside development".into(),
         ));
     }
     if !manifest.signature.is_empty() {

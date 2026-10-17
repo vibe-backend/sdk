@@ -190,7 +190,7 @@ async fn real_model_create_zh_and_en() {
             if cache.exists() {
                 fs::remove_dir_all(cache).unwrap();
             }
-            run(root, &["compile"], &redact);
+            run(root, &["build"], &redact);
             let mut snapshot = BTreeMap::new();
             locks(root, root, &mut snapshot);
             assert!(!snapshot.is_empty(), "compile produced no locks");
@@ -228,8 +228,8 @@ async fn real_model_create_zh_and_en() {
                 }
             }
         }
-        run(root, &["validate", "--deploy", "--dev"], &redact);
-        run(root, &["manifest", "--dev"], &redact);
+        run(root, &["build"], &redact);
+        run(root, &["build"], &redact);
         let create = route(root, "create-product");
         let list = route(root, "list-products");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

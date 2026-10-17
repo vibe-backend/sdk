@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use vibe::compile::{compile_project, CompileOptions};
+use vibe::compile::{regenerate_project, CompileOptions};
 use vibe::llm::{FakeAdapter, LlmConfig, LlmRequest};
 use vibe::lock::parse_lock;
 use vibe::validate::{validate_project, ValidateOptions};
@@ -189,7 +189,7 @@ async fn zh_hant_sample_shop_compiles_and_validates() {
         send_sampling: true,
         api_style: "chat".into(),
     };
-    let out = compile_project(&CompileOptions {
+    let out = regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),
@@ -290,7 +290,7 @@ async fn translation_failure_fails_the_compile() {
         },
     };
     let config = config();
-    let Err(report) = compile_project(&CompileOptions {
+    let Err(report) = regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),
@@ -315,7 +315,7 @@ async fn feature_writes_declaration_is_optional() {
     let text = fs::read_to_string(&f).unwrap();
     fs::write(&f, text.replace("writes: true\n", "")).unwrap();
     let adapter = FakeAdapter { responder };
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config()),
@@ -353,7 +353,7 @@ async fn chinese_left_in_translation_is_not_an_error() {
         responder: responder_keeps_chinese,
     };
     let config = config();
-    let out = compile_project(&CompileOptions {
+    let out = regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),
@@ -396,7 +396,7 @@ async fn check_source_keywords_text(translated_keyword: bool, replacement: &str)
         },
     };
     let config = config();
-    let report = compile_project(&CompileOptions {
+    let report = regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),
@@ -437,7 +437,7 @@ async fn supported_chinese_source_compiles() {
         },
     };
     let config = config();
-    let out = compile_project(&CompileOptions {
+    let out = regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),
