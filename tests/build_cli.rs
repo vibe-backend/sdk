@@ -12,6 +12,13 @@ fn copy_shop() -> PathBuf {
     root
 }
 
+fn copy_plain() -> PathBuf {
+    let root = std::env::temp_dir().join(format!("vibe-plain-{}", uuid::Uuid::new_v4()));
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plain");
+    copy_dir(&src, &root);
+    root
+}
+
 fn copy_dir(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for entry in fs::read_dir(src).unwrap() {
@@ -93,29 +100,101 @@ fn tree(root: &Path) -> Vec<String> {
 
 const BUILD: &[&str] = &[
     "build",
-    "--release-approval",
-    "pr:1",
+    "--version",
+    "1.8.0",
     "--commit",
-    "abc123",
+    "0123456789abcdef0123456789abcdef01234567",
     "-o",
     "out/manifest.json",
 ];
 
-const FAIL_CLOSED: &str = "high-risk release builds fail closed";
+fn read_out(root: &Path) -> vibe::Manifest {
+    serde_json::from_slice(&fs::read(root.join("out/manifest.json")).unwrap()).unwrap()
+}
 
 #[test]
-fn release_build_fails_closed_on_high_risk_even_with_an_approval_string() {
-    // Decision 90/118: approval is the release environment approval (#80),
-    // so no --release-approval value unlocks a high-risk release build.
+fn release_build_writes_a_keyless_manifest_when_there_are_no_high_risk_items() {
+    let root = copy_plain();
+    let (ok, out) = vibe(&root, BUILD, &[]);
+    assert!(ok, "{out}");
+    let manifest: vibe::Manifest =
+        serde_json::from_slice(&fs::read(root.join("out/manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest.signature, vibe::attest::SIGSTORE_SIGNATURE);
+    assert_eq!(manifest.provenance.build_mode, "release");
+    assert_eq!(manifest.provenance.version, "1.8.0");
+    assert_eq!(
+        manifest.provenance.commit,
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+    assert!(
+        manifest.provenance.high_risk().is_empty(),
+        "{:?}",
+        manifest.provenance.security_items
+    );
+}
+
+#[test]
+fn release_build_lists_high_risk_items_and_writes_a_keyless_manifest() {
+    // Decision 90 is withdrawn: high-risk items are reported, and the human
+    // gate is the `release` environment approval.
     let root = copy_shop();
-    let before = tree(&root);
-    let (secret, _) = release_key();
-    let (ok, out) = vibe(&root, BUILD, &[("VIBE_RELEASE_SIGNING_KEY", &secret)]);
+    let (ok, out) = vibe(&root, BUILD, &[]);
+    assert!(ok, "{out}");
+    assert!(out.contains("high-risk items"), "{out}");
+    let manifest = read_out(&root);
+    assert_eq!(manifest.signature, vibe::attest::SIGSTORE_SIGNATURE);
+    assert!(!manifest.provenance.high_risk().is_empty());
+}
+
+#[test]
+fn release_approval_flag_is_gone() {
+    let root = copy_shop();
+    for args in [
+        &["build", "--release-approval", "pr:1"][..],
+        &["manifest", "--release", "--release-approval", "pr:1"][..],
+    ] {
+        let (ok, out) = vibe(&root, args, &[]);
+        assert!(!ok, "{out}");
+        assert!(out.contains("--release-approval"), "{out}");
+    }
+    let (ok, out) = vibe(&root, &["approve"], &[]);
     assert!(!ok, "{out}");
-    assert!(out.contains(FAIL_CLOSED), "{out}");
-    assert!(out.contains("not accepted as approval"), "{out}");
-    assert!(out.contains("nothing was written"), "{out}");
-    assert_eq!(tree(&root), before, "no manifest and no locks");
+    assert!(out.contains("removed"), "{out}");
+}
+
+#[test]
+fn release_build_requires_a_full_commit_and_a_release_version() {
+    let root = copy_plain();
+    let before = tree(&root);
+    for args in [
+        &["build", "--version", "1.8.0", "-o", "out/manifest.json"][..],
+        &[
+            "build",
+            "--version",
+            "1.8.0",
+            "--commit",
+            "0123abc",
+            "-o",
+            "out/manifest.json",
+        ][..],
+        &[
+            "build",
+            "--version",
+            "latest",
+            "--commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "-o",
+            "out/manifest.json",
+        ][..],
+    ] {
+        let (ok, out) = vibe(&root, args, &[]);
+        assert!(!ok, "{args:?}: {out}");
+        assert!(
+            out.contains("full 40-character") || out.contains("invalid release version"),
+            "{args:?}: {out}"
+        );
+    }
+    assert_eq!(tree(&root), before);
 }
 
 #[test]
@@ -123,8 +202,7 @@ fn build_with_a_validation_error_writes_nothing() {
     let root = copy_shop();
     break_migration(&root);
     let before = tree(&root);
-    let (secret, _) = release_key();
-    let (ok, out) = vibe(&root, BUILD, &[("VIBE_RELEASE_SIGNING_KEY", &secret)]);
+    let (ok, out) = vibe(&root, BUILD, &[]);
     assert!(!ok, "{out}");
     assert!(
         out.contains("0001-products-name"),
@@ -145,18 +223,14 @@ fn build_validates_before_it_needs_a_key() {
 }
 
 #[test]
-fn release_build_shows_warnings_before_failing_closed() {
+fn release_build_shows_warnings() {
     let root = copy_shop();
-    let (secret, _) = release_key();
-    let (ok, out) = vibe(&root, BUILD, &[("VIBE_RELEASE_SIGNING_KEY", &secret)]);
-    assert!(!ok, "{out}");
+    let (ok, out) = vibe(&root, BUILD, &[]);
+    assert!(ok, "{out}");
     assert!(
         out.contains("warning: models/product"),
         "warnings are displayed: {out}"
     );
-    assert!(out.contains(FAIL_CLOSED), "{out}");
-    assert!(!root.join("out/manifest.json").exists());
-    assert!(!root.join(".vibe/build/locks").exists());
 }
 
 #[tokio::test]
@@ -187,7 +261,7 @@ async fn build_signs_the_validated_content_not_a_later_edit() {
         &key,
         &vibe::manifest::BuildInfo {
             release: false,
-            release_approval: None,
+            version: String::new(),
             commit: String::new(),
         },
     )
@@ -197,28 +271,13 @@ async fn build_signs_the_validated_content_not_a_later_edit() {
 }
 
 #[test]
-fn build_without_the_release_key_fails_and_writes_nothing() {
-    let root = copy_shop();
-    let before = tree(&root);
-    let (ok, out) = vibe(&root, BUILD, &[]);
-    assert!(!ok, "{out}");
-    assert!(out.contains("VIBE_RELEASE_SIGNING_KEY"), "{out}");
-    assert_eq!(tree(&root), before);
-}
-
-#[test]
-fn build_with_high_risk_items_and_no_approval_writes_nothing() {
-    let root = copy_shop();
-    let before = tree(&root);
+fn release_build_takes_no_key_from_the_environment() {
+    let root = copy_plain();
     let (secret, _) = release_key();
-    let (ok, out) = vibe(
-        &root,
-        &["build", "-o", "out/manifest.json"],
-        &[("VIBE_RELEASE_SIGNING_KEY", &secret)],
-    );
-    assert!(!ok, "{out}");
-    assert!(out.contains(FAIL_CLOSED), "{out}");
-    assert_eq!(tree(&root), before);
+    let (ok, out) = vibe(&root, BUILD, &[("VIBE_RELEASE_SIGNING_KEY", &secret)]);
+    assert!(ok, "{out}");
+    let manifest = read_out(&root);
+    assert_eq!(manifest.signature, vibe::attest::SIGSTORE_SIGNATURE);
 }
 
 #[test]
@@ -251,20 +310,8 @@ fn release_build_never_uses_the_dev_key() {
     let root = copy_shop();
     sign::create_dev_key(&root).unwrap();
     let (ok, out) = vibe(&root, BUILD, &[]);
-    assert!(!ok, "{out}");
-    assert!(out.contains("no fallback"), "{out}");
-    assert!(!root.join("out/manifest.json").exists());
-}
-
-#[test]
-fn dev_build_rejects_a_release_approval() {
-    let root = copy_shop();
-    sign::create_dev_key(&root).unwrap();
-    let (ok, out) = vibe(
-        &root,
-        &["build", "--dev", "--release-approval", "pr:1"],
-        &[],
-    );
-    assert!(!ok, "{out}");
-    assert!(out.contains("only to release builds"), "{out}");
+    assert!(ok, "{out}");
+    let manifest = read_out(&root);
+    assert_eq!(manifest.signature, vibe::attest::SIGSTORE_SIGNATURE);
+    assert_eq!(manifest.provenance.build_mode, "release");
 }

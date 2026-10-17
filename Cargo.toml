@@ -22,13 +22,16 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "3"
 hex = "0.4"
 hmac = "0.13"
-jsonwebtoken = "9"
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 rand = "0.10"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+sigstore-trust-root = { version = "0.15", default-features = false }
+sigstore-types = "0.15"
+sigstore-verify = { version = "0.15", default-features = true }
 subtle = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "net"] }
 deadpool-postgres = "0.14"
@@ -40,8 +43,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-sqlparser = { version = "0.52", features = ["visitor"] }
 zeroize = "1"
+sqlparser = { version = "0.52", features = ["visitor"] }
 
 [dev-dependencies]
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+rcgen = "0.13"
 tower = { version = "0.5", features = ["util"] }

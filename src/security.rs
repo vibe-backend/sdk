@@ -138,24 +138,76 @@ pub fn enrich_feature_writes(
     }
 }
 
-/// True when the named method lock writes (Signature or step SQL / writes: true).
+/// True when the named method lock writes (Signature or step SQL / writes: true),
+/// including writes inherited from methods it calls via `op: method`.
+/// A target that is malformed or does not resolve to a method lock or a CRUD
+/// action on an existing model is treated as a write, so risk is never lowered.
 pub fn method_doc_writes(docs: &std::collections::HashMap<String, LockDoc>, target: &str) -> bool {
-    let Some((object, method)) = target.split_once('.') else {
-        return target_looks_like_write(target);
+    let mut seen = std::collections::HashSet::new();
+    method_writes_inner(docs, target, true, &mut seen)
+}
+
+/// Like [`method_doc_writes`] but only counts locks that exist in `docs`
+/// (unresolved targets count as non-writing; validation reports them as
+/// errors separately). Used by validation to decide inherited writes.
+pub fn known_method_writes(
+    docs: &std::collections::HashMap<String, LockDoc>,
+    target: &str,
+) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    method_writes_inner(docs, target, false, &mut seen)
+}
+
+fn method_writes_inner(
+    docs: &std::collections::HashMap<String, LockDoc>,
+    target: &str,
+    unknown_is_write: bool,
+    seen: &mut std::collections::HashSet<String>,
+) -> bool {
+    let Some((object, method)) = target.trim().split_once('.') else {
+        return unknown_is_write;
     };
     let id = format!("{object}/methods/{method}");
-    let Some(doc) = docs.get(&id) else {
-        return target_looks_like_write(target);
+    let Some(doc) = docs.get(&id).filter(|d| d.meta.kind == Kind::Method) else {
+        // A built-in CRUD action on an existing model writes per its name.
+        let model = docs.get(object).is_some_and(|d| d.meta.kind == Kind::Model);
+        if model && crate::validate::CRUD_ACTIONS.contains(&method) {
+            return target_looks_like_write(target);
+        }
+        return unknown_is_write;
     };
+    // Cycle guard: a method already on the path adds nothing new.
+    if !seen.insert(id) {
+        return false;
+    }
     if let Some(sig) = find_section(&doc.sections, "Signature") {
-        if sig.get("writes") == Some("true") {
+        // Anything other than an explicit `false` counts as a write, so a
+        // malformed value never lowers the risk (validation rejects it).
+        if sig
+            .bullets
+            .iter()
+            .any(|b| b.key == "writes" && b.value.trim() != "false")
+        {
             return true;
         }
     }
     if let Some(steps) = find_section(&doc.sections, "Steps") {
         for block in &steps.blocks {
-            if block_value(block, "writes") == "true" || sql_writes(&block_value(block, "sql")) {
+            let marked = block
+                .bullets
+                .iter()
+                .any(|b| b.key == "writes" && b.value.trim() != "false");
+            if marked || sql_writes(&block_value(block, "sql")) {
                 return true;
+            }
+        }
+        for block in &steps.blocks {
+            if block_value(block, "op") == "method" {
+                let callee = block_value(block, "target");
+                if !callee.is_empty() && method_writes_inner(docs, &callee, unknown_is_write, seen)
+                {
+                    return true;
+                }
             }
         }
     }

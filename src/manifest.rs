@@ -32,14 +32,17 @@ pub struct Manifest {
 pub struct Provenance {
     /// `release` or `dev`.
     pub build_mode: String,
+    /// Release version without a leading `v` (e.g. `1.8.0`). Empty for
+    /// development builds. Required for release manifests and must match the
+    /// deployer expectation and the attested tag.
+    #[serde(default)]
+    pub version: String,
     /// Source commit (`GITHUB_SHA`, `--commit`, or `git rev-parse HEAD`).
     pub commit: String,
     /// One entry per lock, sorted by id.
     pub locks: Vec<LockProvenance>,
     /// Every security item of every lock, sorted.
     pub security_items: Vec<ItemProvenance>,
-    /// Release approval reference given for high-risk items (decision 90).
-    pub release_approval: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -70,10 +73,11 @@ impl Provenance {
 /// How a manifest is built.
 #[derive(Clone, Debug, Default)]
 pub struct BuildInfo {
-    /// Release build. High-risk items fail closed until release-environment
-    /// approval verification (#80) lands (decision 90/118).
+    /// Release build: unsigned here (signed keyless by the release job);
+    /// needs a release version and the full commit SHA.
     pub release: bool,
-    pub release_approval: Option<String>,
+    /// Release version without a leading `v`. Required for release builds.
+    pub version: String,
     pub commit: String,
 }
 
@@ -112,6 +116,209 @@ pub struct RouteSpec {
     pub challenge_when: String,
     pub deprecated: bool,
     pub sunset: String,
+    /// `### token-refresh` pipeline: this route rotates refresh tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<RefreshSpec>,
+    /// `### token-revoke` pipeline: revoke refresh tokens before the steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoke: Option<RevokeSpec>,
+}
+
+/// Platform refresh-token rotation (spec 4A.1).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RefreshSpec {
+    /// Method that signs the new access token (needs `sign-token`).
+    pub sign_method: String,
+    pub refresh_ttl_s: i64,
+    pub idle_ttl_s: i64,
+    pub reuse_grace_s: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RevokeSpec {
+    /// `family` (the presented refresh token's family) or `all` (every
+    /// family of the caller).
+    pub scope: String,
+}
+
+pub const MAX_REFRESH_TTL_S: i64 = 30 * 86_400;
+pub const MAX_IDLE_TTL_S: i64 = 7 * 86_400;
+/// Spec §4A.1 (decision 61): `reuse-grace` defaults to 10s and is at most 10s.
+pub const DEFAULT_REUSE_GRACE_S: i64 = 10;
+pub const MAX_REUSE_GRACE_S: i64 = 10;
+
+/// Startup check of a manifest's token-refresh settings (a manifest built by
+/// an older compiler may carry values outside the current limits).
+pub fn refresh_spec_problem(route: &str, spec: &RefreshSpec) -> Option<String> {
+    let checks = [
+        ("refresh-ttl", spec.refresh_ttl_s, MAX_REFRESH_TTL_S),
+        ("idle-ttl", spec.idle_ttl_s, MAX_IDLE_TTL_S),
+        ("reuse-grace", spec.reuse_grace_s, MAX_REUSE_GRACE_S),
+    ];
+    checks.iter().find_map(|(name, value, max)| {
+        (!(1..=*max).contains(value)).then(|| {
+            format!("route {route}: token-refresh {name} is {value}s; it must be between 1s and {max}s (spec §4A.1); recompile the lock")
+        })
+    })
+}
+
+fn bullet<'a>(bullets: &'a [crate::lock::Bullet], key: &str) -> Option<&'a str> {
+    bullets
+        .iter()
+        .find(|b| b.key == key)
+        .map(|b| b.value.trim())
+}
+
+fn secs(raw: Option<&str>, default: i64, max: i64, name: &str) -> Result<i64, String> {
+    let Some(raw) = raw else { return Ok(default) };
+    let raw = raw.trim();
+    let (number, unit) = [
+        ("ms", 1u128),
+        ("s", 1000),
+        ("m", 60_000),
+        ("h", 3_600_000),
+        ("d", 86_400_000),
+    ]
+    .into_iter()
+    .find_map(|(suffix, unit)| raw.strip_suffix(suffix).map(|n| (n.trim(), unit)))
+    .unwrap_or((raw, 1000));
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(format!("token-refresh {name}: bad duration `{raw}`"));
+    }
+    // Multiply decimal digits before converting to whole seconds.
+    let mut digits = Vec::new();
+    let mut carry = 0;
+    for digit in whole.bytes().chain(fraction.bytes()).rev() {
+        carry += u128::from(digit - b'0') * unit;
+        digits.push((carry % 10) as u8 + b'0');
+        carry /= 10;
+    }
+    while carry > 0 {
+        digits.push((carry % 10) as u8 + b'0');
+        carry /= 10;
+    }
+    while digits.len() <= fraction.len() {
+        digits.push(b'0');
+    }
+    digits.reverse();
+    let split = digits.len() - fraction.len();
+    let ms = std::str::from_utf8(&digits[..split])
+        .ok()
+        .and_then(|n| n.parse::<u128>().ok());
+    let fractional = digits[split..].iter().any(|b| *b != b'0');
+    let cap = max as u128 * 1000;
+    let Some(ms) = ms.filter(|ms| *ms >= 1000 && (*ms < cap || (*ms == cap && !fractional))) else {
+        return Err(format!(
+            "token-refresh {name} must be between 1s and {max}s"
+        ));
+    };
+    let s = (ms / 1000) as i64;
+    Ok(s)
+}
+
+/// Parses a `### token-refresh` block.
+pub fn parse_refresh_block(bullets: &[crate::lock::Bullet]) -> Result<RefreshSpec, String> {
+    let sign_method = bullet(bullets, "sign-method").unwrap_or("").to_string();
+    if sign_method.is_empty() {
+        return Err("token-refresh needs sign-method".into());
+    }
+    match bullet(bullets, "transport") {
+        None | Some("body") => {}
+        Some(other) => {
+            return Err(format!(
+                "token-refresh transport `{other}` is not supported by this runtime (only body)"
+            ))
+        }
+    }
+    for b in bullets {
+        // `source-lines` is metadata the compiler adds to every block.
+        if b.key == "source-lines" {
+            continue;
+        }
+        if ![
+            "sign-method",
+            "refresh-ttl",
+            "idle-ttl",
+            "reuse-grace",
+            "transport",
+        ]
+        .contains(&b.key.as_str())
+        {
+            return Err(format!("unknown token-refresh option `{}`", b.key));
+        }
+    }
+    Ok(RefreshSpec {
+        sign_method,
+        refresh_ttl_s: secs(
+            bullet(bullets, "refresh-ttl"),
+            MAX_REFRESH_TTL_S,
+            MAX_REFRESH_TTL_S,
+            "refresh-ttl",
+        )?,
+        idle_ttl_s: secs(
+            bullet(bullets, "idle-ttl"),
+            MAX_IDLE_TTL_S,
+            MAX_IDLE_TTL_S,
+            "idle-ttl",
+        )?,
+        reuse_grace_s: secs(
+            bullet(bullets, "reuse-grace"),
+            DEFAULT_REUSE_GRACE_S,
+            MAX_REUSE_GRACE_S,
+            "reuse-grace",
+        )?,
+    })
+}
+
+/// Checks that a `token-refresh` `sign-method` names an existing method
+/// with a `sign-jwt` step. A typo here must fail the build, not every
+/// refresh call at runtime.
+pub fn refresh_sign_method_problem(sign_method: &str, methods: &[MethodSpec]) -> Option<String> {
+    match methods.iter().find(|m| m.target == sign_method) {
+        None => Some(format!(
+            "token-refresh sign-method `{sign_method}` is not a known method"
+        )),
+        Some(m) if !m.steps.iter().any(|s| s.op == "sign-jwt") => Some(format!(
+            "token-refresh sign-method `{sign_method}` has no sign-jwt step"
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Parses a `### token-revoke` block.
+pub fn parse_revoke_block(bullets: &[crate::lock::Bullet]) -> Result<RevokeSpec, String> {
+    let scope = bullet(bullets, "scope").unwrap_or("family");
+    if scope != "family" && scope != "all" {
+        return Err(format!(
+            "token-revoke scope must be family or all (got `{scope}`)"
+        ));
+    }
+    Ok(RevokeSpec {
+        scope: scope.to_string(),
+    })
+}
+
+/// Route-shape rules for the refresh pipelines.
+pub fn check_refresh_route(
+    refresh: Option<&RefreshSpec>,
+    revoke: Option<&RevokeSpec>,
+    public: bool,
+    auth_removed: bool,
+) -> Result<(), String> {
+    if refresh.is_some() && revoke.is_some() {
+        return Err("a route cannot have both token-refresh and token-revoke".into());
+    }
+    if refresh.is_some() && !(public && auth_removed) {
+        return Err("token-refresh routes must be public with auth removed (the refresh token is the credential)".into());
+    }
+    if revoke.is_some() && auth_removed {
+        return Err("token-revoke needs auth".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -176,16 +383,11 @@ pub fn check_rate_key(key: &str, auth_removed: bool, auth_mode: &str) -> Result<
             Err("rate-limit key `api-key` needs `auth: { mode: api-key }`".into())
         }
         "api-key" => Ok(()),
-        "family" => Err(
-            "rate-limit key `family` is only for token-refresh, which is not implemented yet (see #26)"
-                .into(),
-        ),
+        "family" => Err("rate-limit key `family` is only allowed on token-refresh routes".into()),
         _ => match key.strip_prefix("input.") {
             Some(field)
                 if !field.is_empty()
-                    && field
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                    && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
             {
                 Ok(())
             }
@@ -321,12 +523,40 @@ pub fn manifest_from_loaded(
 }
 
 /// Validates (deploy rules) and builds the manifest from exactly the loaded
-/// lock texts; nothing is re-read. Records provenance and, for a release
-/// build, fails closed on high-risk items without a release approval.
+/// lock texts; nothing is re-read. Records provenance and high-risk items
+/// for the deployment report (decision 90’s fail-closed policy was withdrawn).
 pub fn build_signed(
     root: &Path,
     loaded: &validate::LoadedProject,
     signing_key: &SigningKey,
+    info: &BuildInfo,
+) -> Result<Manifest, Report> {
+    let mut manifest = build_unsigned(root, loaded, info)?;
+    let bytes =
+        serde_json::to_vec(&manifest).map_err(|err| single(format!("manifest json: {err}")))?;
+    manifest.signature = sign::sign_bytes(&bytes, signing_key);
+    Ok(manifest)
+}
+
+/// Official release manifest: no key signature. Its signature is the
+/// Sigstore keyless attestation the release job creates for the written file
+/// (decisions 113, 118); `signature` only marks that.
+pub fn build_release(
+    root: &Path,
+    loaded: &validate::LoadedProject,
+    info: &BuildInfo,
+) -> Result<Manifest, Report> {
+    if !info.release {
+        return Err(single("build_release needs a release BuildInfo".into()));
+    }
+    let mut manifest = build_unsigned(root, loaded, info)?;
+    manifest.signature = crate::attest::SIGSTORE_SIGNATURE.into();
+    Ok(manifest)
+}
+
+fn build_unsigned(
+    root: &Path,
+    loaded: &validate::LoadedProject,
     info: &BuildInfo,
 ) -> Result<Manifest, Report> {
     let (result, docs) = validate::validate_loaded(&ValidateOptions { root, deploy: true }, loaded);
@@ -355,45 +585,36 @@ pub fn build_signed(
     }
     locks.sort_by(|a, b| a.id.cmp(&b.id));
     items.sort_by(|a, b| (&a.lock, &a.item).cmp(&(&b.lock, &b.item)));
+    let version = info
+        .version
+        .trim()
+        .trim_start_matches('v')
+        .trim()
+        .to_string();
+    if info.release && version.is_empty() {
+        return Err(single(
+            "release build needs a version (`--version` or the tag name without v)".into(),
+        ));
+    }
+    if info.release {
+        crate::attest::check_release_version(&version).map_err(single)?;
+        crate::attest::check_release_commit(&info.commit).map_err(single)?;
+    }
     manifest.provenance = Provenance {
         build_mode: if info.release { "release" } else { "dev" }.into(),
+        version,
         commit: info.commit.clone(),
         locks,
         security_items: items,
-        release_approval: info
-            .release_approval
-            .clone()
-            .filter(|r| !r.trim().is_empty()),
     };
-    // Decision 90/118: the approval is the `release` environment approval,
-    // verified against the platform (#80). Until that verification exists,
-    // a release build with high-risk items fails closed; no
-    // `--release-approval` value counts as approval.
-    if info.release {
-        let high: Vec<String> = manifest
-            .provenance
-            .high_risk()
-            .iter()
-            .map(|item| format!("{} ({})", item.lock, item.item))
-            .collect();
-        if !high.is_empty() {
-            return Err(single(format!(
-                "release build has high-risk items: {}; release-environment approval verification (#80) is not implemented yet, so high-risk release builds fail closed (--release-approval is not accepted as approval)",
-                high.join(", ")
-            )));
-        }
-    }
     manifest.signature = String::new();
-    let bytes =
-        serde_json::to_vec(&manifest).map_err(|err| single(format!("manifest json: {err}")))?;
-    manifest.signature = sign::sign_bytes(&bytes, signing_key);
     Ok(manifest)
 }
 
-/// Outside development only release manifests run (decisions 79, 90, 91):
+/// Outside development only release manifests run (decisions 79, 91):
 /// built with `vibe manifest --release` (compiled in memory in the release
-/// environment) and, if they have high-risk items, carrying a release
-/// approval.
+/// environment). High-risk items are listed in the deploy report; the human
+/// gate is the `release` environment approval (decision 90 withdrawn).
 pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), String> {
     if development {
         return Ok(());
@@ -406,11 +627,6 @@ pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), St
     }
     if provenance.locks.is_empty() {
         return Err("manifest has no lock provenance".into());
-    }
-    // Fail closed until release-environment approval verification (#80):
-    // a recorded approval string is not proof of approval.
-    if !provenance.high_risk().is_empty() {
-        return Err("manifest has high-risk items without a verified release approval".into());
     }
     Ok(())
 }
@@ -432,6 +648,78 @@ pub fn read_manifest(path: &Path, key: &VerifyingKey) -> Result<Manifest, Report
     }
     manifest.signature = signature;
     Ok(manifest)
+}
+
+/// Reads a release manifest and verifies its Sigstore bundle (keyless
+/// signature, certificate identity, Rekor entry) against `policy`. Fails
+/// closed on any problem, including a missing bundle.
+pub fn read_release_manifest(
+    path: &Path,
+    bundle: &Path,
+    policy: &crate::attest::Policy,
+    expected: &crate::attest::Expectation,
+) -> Result<(Manifest, crate::attest::Identity), Report> {
+    let bytes = fs::read(path).map_err(|err| single(format!("cannot read manifest: {err}")))?;
+    let bundle_bytes = fs::read(bundle).map_err(|err| {
+        single(format!(
+            "cannot read the Sigstore bundle {}: {err}; release manifests are verified only with their keyless attestation",
+            bundle.display()
+        ))
+    })?;
+    let manifest: Manifest =
+        serde_json::from_slice(&bytes).map_err(|err| single(format!("manifest json: {err}")))?;
+    if manifest.signature != crate::attest::SIGSTORE_SIGNATURE
+        || manifest.provenance.build_mode != "release"
+    {
+        return Err(single(
+            "attested manifest is not a keyless release manifest".into(),
+        ));
+    }
+    if manifest.provenance.version.is_empty() {
+        return Err(single(
+            "manifest version is empty; a release manifest must record its version".into(),
+        ));
+    }
+    if manifest.provenance.commit.is_empty() {
+        return Err(single(
+            "manifest commit is empty; a release manifest must record its commit".into(),
+        ));
+    }
+    let manifest_version = manifest
+        .provenance
+        .version
+        .trim()
+        .trim_start_matches('v')
+        .trim();
+    if manifest_version != expected.version {
+        return Err(single(format!(
+            "manifest version {} is not the expected {}",
+            manifest.provenance.version, expected.version
+        )));
+    }
+    if manifest.provenance.commit != expected.commit {
+        return Err(single(format!(
+            "manifest commit {} is not the expected {}",
+            manifest.provenance.commit, expected.commit
+        )));
+    }
+    let identity =
+        crate::attest::verify_bundle(&bytes, &bundle_bytes, policy, expected).map_err(single)?;
+    if manifest.provenance.commit != identity.commit {
+        return Err(single(format!(
+            "manifest commit {} is not the attested commit {}",
+            manifest.provenance.commit, identity.commit
+        )));
+    }
+    // `identity.version` is read from the certificate tag; `expected` comes
+    // from the deployer (CLI or environment), never from the bundle.
+    if identity.version != expected.version || manifest_version != identity.version {
+        return Err(single(format!(
+            "attested version {} does not match the expected {} and the manifest version {}",
+            identity.version, expected.version, manifest.provenance.version
+        )));
+    }
+    Ok((manifest, identity))
 }
 
 pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Report> {
@@ -477,6 +765,13 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
                 crud_model: model.id.clone(),
                 crud_action: action.clone(),
             });
+        }
+    }
+    for route in &routes {
+        if let Some(spec) = &route.refresh {
+            if let Some(err) = refresh_sign_method_problem(&spec.sign_method, &methods) {
+                report.push(Diag::error(&route.feature_id, err).at_section("Pipelines"));
+            }
         }
     }
     if report.has_errors() {
@@ -593,6 +888,48 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
     }
 }
 
+/// The single value of `key` in `bullets`. A repeated key is an error.
+pub(crate) fn single_value<'a>(
+    bullets: &'a [crate::lock::Bullet],
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    let mut found = bullets.iter().filter(|b| b.key == key);
+    let first = found.next().map(|b| b.value.as_str());
+    if found.next().is_some() {
+        return Err(format!("duplicate `{key}`"));
+    }
+    Ok(first)
+}
+
+/// Strict `writes`: absent is `None`; present must be exactly `true` or
+/// `false` and appear once.
+pub(crate) fn parse_writes(bullets: &[crate::lock::Bullet]) -> Result<Option<bool>, String> {
+    match single_value(bullets, "writes")?.map(str::trim) {
+        None => Ok(None),
+        Some("true") => Ok(Some(true)),
+        Some("false") => Ok(Some(false)),
+        Some(other) => Err(format!(
+            "invalid writes `{other}`: expected `true` or `false`"
+        )),
+    }
+}
+
+/// Strict step `status`: absent is `None`; present must be a plain decimal
+/// HTTP status (100-599) and appear once.
+pub(crate) fn parse_status(bullets: &[crate::lock::Bullet]) -> Result<Option<u16>, String> {
+    let Some(raw) = single_value(bullets, "status")? else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    let valid = !raw.is_empty() && raw.len() == 3 && raw.bytes().all(|b| b.is_ascii_digit());
+    match raw.parse::<u16>() {
+        Ok(code) if valid && (100..600).contains(&code) => Ok(Some(code)),
+        _ => Err(format!(
+            "invalid status `{raw}`: expected an HTTP status (100-599)"
+        )),
+    }
+}
+
 fn method_from(doc: &LockDoc) -> Result<MethodSpec, Diag> {
     let target = doc
         .meta
@@ -601,7 +938,12 @@ fn method_from(doc: &LockDoc) -> Result<MethodSpec, Diag> {
         .map(|(object, method)| format!("{object}.{method}"))
         .unwrap_or_else(|| doc.meta.id.clone());
     let signature = find_section(&doc.sections, "Signature");
-    let writes = signature.and_then(|s| s.get("writes")) == Some("true");
+    let writes = match signature {
+        Some(sig) => parse_writes(&sig.bullets)
+            .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Signature"))?
+            .unwrap_or(false),
+        None => false,
+    };
     let mut errors = Vec::new();
     if let Some(raw) = signature.and_then(|s| s.get("errors")) {
         errors = crate::lock::parse_string_list(raw).map_err(|err| {
@@ -666,9 +1008,23 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
     let mut jwt_aud = String::new();
     let mut jwks_uri = String::new();
     let mut rates = Vec::new();
+    let mut refresh = None;
+    let mut revoke = None;
     if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
         for block in &pipes.blocks {
             let name = pipeline_name(&block.heading);
+            if name == "token-refresh" {
+                refresh = Some(
+                    parse_refresh_block(&block.bullets)
+                        .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?,
+                );
+            }
+            if name == "token-revoke" {
+                revoke = Some(
+                    parse_revoke_block(&block.bullets)
+                        .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?,
+                );
+            }
             if name == "-auth"
                 || (name == "auth"
                     && block
@@ -746,12 +1102,17 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
             }
         }
     }
+    check_refresh_route(refresh.as_ref(), revoke.as_ref(), public, auth_removed)
+        .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
     if let Some(problem) =
         jwt_override_problem(&jwt_iss, &jwt_aud, &jwks_uri, auth_removed, &auth_mode)
     {
         return Err(Diag::error(&doc.meta.id, problem).at_section("Pipelines"));
     }
     for rate in &rates {
+        if rate.key == "family" && refresh.is_some() {
+            continue;
+        }
         check_rate_key(&rate.key, auth_removed, &auth_mode)
             .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
     }
@@ -800,6 +1161,8 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         challenge_when,
         deprecated,
         sunset,
+        refresh,
+        revoke,
     })
 }
 
@@ -893,21 +1256,30 @@ fn steps_from(section: Option<&crate::lock::Section>, file: &str) -> Result<Vec<
                 Diag::error(file, format!("invalid params: {err}")).at_section("Steps")
             })?;
         }
+        let step_err = |err: String| {
+            Diag::error(file, err)
+                .at_step(&block.heading)
+                .at_section("Steps")
+        };
+        let status = parse_status(&block.bullets)
+            .map_err(step_err)?
+            .unwrap_or(if op == "respond" { 200 } else { 0 });
+        let writes = parse_writes(&block.bullets)
+            .map_err(step_err)?
+            .unwrap_or(false);
         steps.push(StepSpec {
             id,
             op: op.clone(),
             target: get("target"),
             args: get("args"),
             value: get("value"),
-            status: get("status")
-                .parse()
-                .unwrap_or(if op == "respond" { 200 } else { 0 }),
+            status,
             sql: get("sql").trim_matches('`').trim().to_string(),
             params,
             out: get("out"),
             fail: get("fail"),
             when_expr: get("when"),
-            writes: get("writes") == "true",
+            writes,
             table: get("table"),
             opts: block
                 .bullets
@@ -1229,9 +1601,10 @@ mod roles_list_tests {
 
 #[cfg(test)]
 mod malformed_list_tests {
-    use super::{method_from, steps_from};
+    use super::{method_from, route_from, steps_from, MethodSpec};
     use crate::diag::Level;
-    use crate::lock::{parse_sections, Kind, LockDoc, Meta};
+    use crate::lock::{parse_sections, Kind, LockDoc, Meta, Scope};
+    use std::collections::HashMap;
 
     fn method_doc(body: &str) -> LockDoc {
         LockDoc {
@@ -1270,6 +1643,80 @@ mod malformed_list_tests {
     }
 
     #[test]
+    fn writes_must_be_exactly_true_or_false() {
+        for bad in ["TRUE", "yes", "1", "", "true, false"] {
+            let doc = method_doc(&format!("## Signature\n\n- writes: {bad}\n"));
+            let err = method_from(&doc).unwrap_err();
+            assert!(err.message.contains("invalid writes"), "{bad:?}: {err:?}");
+        }
+        let doc = method_doc("## Signature\n\n- writes: false\n- writes: true\n");
+        assert!(method_from(&doc)
+            .unwrap_err()
+            .message
+            .contains("duplicate `writes`"));
+        let doc = method_doc(
+            "## Signature\n\n- writes: false\n\n## Steps\n\n### s1\n\n- op: query\n- writes: True\n",
+        );
+        assert!(method_from(&doc)
+            .unwrap_err()
+            .message
+            .contains("invalid writes"));
+        let doc = method_doc("## Steps\n\n### s1\n\n- op: query\n- writes: true\n- writes: true\n");
+        assert!(method_from(&doc)
+            .unwrap_err()
+            .message
+            .contains("duplicate `writes`"));
+    }
+
+    #[test]
+    fn status_must_be_an_http_status() {
+        for bad in ["abc", "", "99", "600", "+200", "200.0", "0200", "2 00"] {
+            let doc = method_doc(&format!(
+                "## Steps\n\n### s1\n\n- op: respond\n- status: {bad}\n"
+            ));
+            let err = method_from(&doc).unwrap_err();
+            assert!(err.message.contains("invalid status"), "{bad:?}: {err:?}");
+        }
+        let doc = method_doc("## Steps\n\n### s1\n\n- op: respond\n- status: 201\n- status: 200\n");
+        assert!(method_from(&doc)
+            .unwrap_err()
+            .message
+            .contains("duplicate `status`"));
+        let doc = method_doc("## Steps\n\n### s1\n\n- op: respond\n");
+        assert_eq!(method_from(&doc).unwrap().steps[0].status, 200);
+    }
+
+    #[test]
+    fn valid_method_round_trip() {
+        let doc = method_doc(
+            "## Signature\n\n- writes: true\n- errors: [NOT_FOUND, TAKEN]\n- capabilities: [sign-token]\n\n## Steps\n\n### s1 query\n\n- op: query\n- sql: `INSERT INTO t (a, b) VALUES ($1, $2)`\n- params: [input.a, input.b]\n- writes: true\n\n### s2 respond\n\n- op: respond\n- status: 201\n",
+        );
+        let method = method_from(&doc).unwrap();
+        assert!(method.writes);
+        assert_eq!(method.errors, vec!["NOT_FOUND", "TAKEN"]);
+        assert_eq!(method.capabilities, vec!["sign-token"]);
+        assert_eq!(method.steps[0].params, vec!["input.a", "input.b"]);
+        assert!(method.steps[0].writes);
+        assert_eq!(method.steps[1].status, 201);
+        let json = serde_json::to_string(&method).unwrap();
+        let back: MethodSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn malformed_params_in_an_api_route_is_a_build_error() {
+        let doc = LockDoc {
+            meta: Meta::pending(Kind::Api, Some(Scope::Feature), "shop/api/x", "shop/api/x.md"),
+            sections: parse_sections(
+                "## Route\n\n- method: GET\n- path: /x\n\n## Steps\n\n### s1\n\n- op: respond\n- params: a, b\n",
+            )
+            .unwrap(),
+        };
+        let err = route_from(&doc, &HashMap::new()).unwrap_err();
+        assert!(err.message.contains("invalid params"), "{err:?}");
+    }
+
+    #[test]
     fn absent_lists_stay_empty() {
         let doc = LockDoc {
             meta: Meta::pending(Kind::Method, None, "shop/methods/ok", "shop/methods/ok.md"),
@@ -1300,10 +1747,9 @@ mod rate_key_tests {
         assert!(check_rate_key("user", true, "jwt").is_err());
         let family = check_rate_key("family", false, "jwt").unwrap_err();
         assert!(
-            family.contains("family is only for token-refresh")
-                || family.contains("`family` is only for token-refresh")
+            family.contains("only allowed on token-refresh routes"),
+            "{family}"
         );
-        assert!(family.contains("not implemented") && family.contains("#26"));
         for bad in ["per-hour", "per-day", "burst"] {
             assert!(super::check_rate_params(["key", bad]).is_err(), "{bad}");
         }
@@ -1321,5 +1767,59 @@ mod rate_key_tests {
         for bad in ["family", "req.ip", "input.", "input.a-b", "everyone"] {
             assert!(check_rate_key(bad, false, "jwt").is_err(), "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    #[test]
+    fn token_refresh_accepts_compiler_source_lines() {
+        let bullets = vec![
+            crate::lock::Bullet {
+                key: "sign-method".into(),
+                value: "user.sign-token".into(),
+            },
+            crate::lock::Bullet {
+                key: "source-lines".into(),
+                value: "12-18".into(),
+            },
+        ];
+        let spec = parse_refresh_block(&bullets).expect("source-lines is metadata");
+        assert_eq!(spec.sign_method, "user.sign-token");
+    }
+
+    #[test]
+    fn token_refresh_sign_method_typo_is_a_build_error() {
+        let method = |steps: Vec<StepSpec>| MethodSpec {
+            target: "user.sign-token".into(),
+            writes: false,
+            input: Vec::new(),
+            errors: Vec::new(),
+            capabilities: vec!["sign-token".into()],
+            steps,
+            crud_model: String::new(),
+            crud_action: String::new(),
+        };
+        let sign: StepSpec = serde_json::from_value(serde_json::json!({
+            "id": "s", "op": "sign-jwt", "target": "", "args": "", "value": "", "status": 0,
+            "sql": "", "params": [], "out": "", "fail": "", "when_expr": "", "writes": false,
+            "table": "", "opts": {}
+        }))
+        .unwrap();
+        let methods = vec![method(vec![sign])];
+        assert_eq!(
+            refresh_sign_method_problem("user.sign-token", &methods),
+            None
+        );
+        assert!(refresh_sign_method_problem("user.sign-tokn", &methods)
+            .unwrap()
+            .contains("not a known method"));
+        assert!(
+            refresh_sign_method_problem("user.sign-token", &[method(Vec::new())])
+                .unwrap()
+                .contains("no sign-jwt step")
+        );
     }
 }

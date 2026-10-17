@@ -1,0 +1,14 @@
+defaults:
+  run:
+    shell: python
+name: negative fixture
+permissions:
+  contents: read
+jobs:
+  sign:
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - run: echo ok

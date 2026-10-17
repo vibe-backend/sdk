@@ -1,0 +1,33 @@
+name: fixture
+on: push
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: make dist
+  attest:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: app.tar.gz
+          path: dl
+      - name: Check
+        run: |
+          set -euo pipefail
+          found="$(cd dl && find . -type f -printf '%P\n' | LC_ALL=C sort)"
+          [ "$found" = "app.tar.gz" ] || { echo "::error::unexpected files"; exit 1; }
+          sha256sum --strict -c SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: dl/app.tar.gz

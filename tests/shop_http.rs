@@ -497,7 +497,11 @@ async fn legacy_approval_fields_are_ignored_with_a_warning() {
         1,
     );
     let legacy = legacy.replacen("reason: \"\" }", "reason: \"\", approved-by: [a@x] }", 1);
-    let legacy = legacy.replacen("\n---\n", "\nsignature: abc123\n---\n", 1);
+    let legacy = legacy.replacen(
+        "\n---\n",
+        "\nsignature: 0123456789abcdef0123456789abcdef01234567\n---\n",
+        1,
+    );
     fs::write(&lock, &legacy).unwrap();
     let report = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
         root: &root,
@@ -1032,6 +1036,9 @@ fn vibe_cli(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> (bool, String)
         "VIBE_ENV",
         "VIBE_MANIFEST_PUBKEY",
         "VIBE_RELEASE_SIGNING_KEY",
+        "VIBE_MANIFEST_BUNDLE",
+        "VIBE_RELEASE_REPO",
+        "VIBE_RELEASE_WORKFLOW",
         "GITHUB_SHA",
         "LLM_API_KEY",
         "VIBE_LLM_API_KEY",
@@ -1098,11 +1105,27 @@ async fn approve_is_gone_with_a_pointer_to_its_replacement() {
 }
 
 #[tokio::test]
-async fn release_build_without_its_key_fails() {
+async fn release_build_takes_no_key_from_the_environment() {
     let root = copy_shop();
-    let (ok, out) = vibe_cli(&root, &["manifest", "--project", ".", "--release"], &[]);
-    assert!(!ok);
-    assert!(out.contains("VIBE_RELEASE_SIGNING_KEY"), "{out}");
+    let (secret, _) = release_key_hex();
+    let (ok, out) = vibe_cli(
+        &root,
+        &[
+            "manifest",
+            "--project",
+            ".",
+            "--release",
+            "--version",
+            "1.8.0",
+            "--commit",
+            "0123456789abcdef0123456789abcdef01234567",
+        ],
+        &[("VIBE_RELEASE_SIGNING_KEY", &secret)],
+    );
+    assert!(ok, "{out}");
+    let manifest: vibe::Manifest =
+        serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest.signature, vibe::attest::SIGSTORE_SIGNATURE);
 }
 
 fn release_key_hex() -> (String, String) {
@@ -1135,10 +1158,8 @@ async fn release_build_ignores_lock_files_in_the_repo() {
     );
     let on_disk = fs::read_to_string(root.join(PRODUCT_LOCK)).unwrap();
     assert_ne!(*product, on_disk);
-    // The CLI release build reaches signing only after compiling from
-    // source; the shop has high-risk items, so it fails closed (#80) even
-    // with a --release-approval string, and writes nothing.
-    let (secret, _) = release_key_hex();
+    // The CLI release build compiles from source and writes an unsigned
+    // keyless manifest that records the version and the full commit.
     let (ok, out) = vibe_cli(
         &root,
         &[
@@ -1146,21 +1167,24 @@ async fn release_build_ignores_lock_files_in_the_repo() {
             "--project",
             ".",
             "--release",
-            "--release-approval",
-            "pr:1",
+            "--version",
+            "1.8.0",
             "--commit",
-            "abc123",
+            "0123456789abcdef0123456789abcdef01234567",
             "-o",
             "release.json",
         ],
-        &[("VIBE_RELEASE_SIGNING_KEY", &secret)],
+        &[],
     );
-    assert!(!ok, "{out}");
-    assert!(
-        out.contains("high-risk release builds fail closed"),
-        "{out}"
+    assert!(ok, "{out}");
+    let release: vibe::Manifest =
+        serde_json::from_slice(&fs::read(root.join("release.json")).unwrap()).unwrap();
+    assert_eq!(release.signature, vibe::attest::SIGSTORE_SIGNATURE);
+    assert_eq!(release.provenance.version, "1.8.0");
+    assert_eq!(
+        release.provenance.commit,
+        "0123456789abcdef0123456789abcdef01234567"
     );
-    assert!(!root.join("release.json").exists());
     // The same old lock cannot reach a dev manifest either.
     sign::create_dev_key(&root).unwrap();
     let (ok, out) = vibe_cli(&root, &["manifest", "--project", "."], &[]);
@@ -1170,7 +1194,6 @@ async fn release_build_ignores_lock_files_in_the_repo() {
 #[tokio::test]
 async fn release_build_never_reads_the_project_env_file() {
     let root = compiled_shop().await;
-    let (secret, _) = release_key_hex();
     fs::write(
         root.join(".env"),
         "LLM_BASE_URL=https://attacker.example/v1\nLLM_API_KEY=sk-from-env-file\nLLM_MODEL=gpt-5.1-2026-01-01\n",
@@ -1183,23 +1206,22 @@ async fn release_build_never_reads_the_project_env_file() {
             "--project",
             ".",
             "--release",
+            "--version",
+            "1.8.0",
+            "--commit",
+            "0123456789abcdef0123456789abcdef01234567",
             "-o",
             "release.json",
         ],
-        &[("VIBE_RELEASE_SIGNING_KEY", &secret)],
+        &[],
     );
-    assert!(!ok);
+    assert!(ok, "{out}");
     assert!(!out.contains("attacker.example"), "{out}");
-    assert!(
-        out.contains("high-risk release builds fail closed"),
-        "{out}"
-    );
 }
 
 #[tokio::test]
 async fn release_build_refuses_a_non_allowlisted_llm_host() {
     let root = compiled_shop().await;
-    let (secret, _) = release_key_hex();
     let (ok, out) = vibe_cli(
         &root,
         &[
@@ -1207,11 +1229,12 @@ async fn release_build_refuses_a_non_allowlisted_llm_host() {
             "--project",
             ".",
             "--release",
+            "--version",
+            "1.8.0",
             "-o",
             "release.json",
         ],
         &[
-            ("VIBE_RELEASE_SIGNING_KEY", &secret),
             ("VIBE_LLM_API_KEY", "sk-release-compiler-key"),
             ("LLM_MODEL", "gpt-5.1-2026-01-01"),
             ("LLM_BASE_URL", "https://llm.attacker.example/v1"),
@@ -1262,7 +1285,7 @@ async fn release_build_is_immune_to_lock_edits_during_the_build() {
         &key,
         &vibe::manifest::BuildInfo {
             release: false,
-            release_approval: None,
+            version: String::new(),
             commit: "abc".into(),
         },
     )
@@ -1280,43 +1303,37 @@ async fn release_build_is_immune_to_lock_edits_during_the_build() {
 }
 
 #[tokio::test]
-async fn release_build_with_high_risk_items_needs_an_approval() {
+async fn release_build_records_version_and_full_commit() {
     let root = copy_shop();
     let (loaded, _) = vibe::compile::compile_in_memory(&root, None, None)
         .await
         .unwrap();
     let key = sign::generate_key();
-    let err = vibe::manifest::build_signed(
-        &root,
-        &loaded,
-        &key,
-        &vibe::manifest::BuildInfo {
-            release: true,
-            release_approval: None,
-            commit: String::new(),
-        },
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        err.contains("high-risk release builds fail closed"),
-        "{err}"
+    let build = |commit: &str| {
+        vibe::manifest::build_signed(
+            &root,
+            &loaded,
+            &key,
+            &vibe::manifest::BuildInfo {
+                release: true,
+                version: "1.8.0".into(),
+                commit: commit.into(),
+            },
+        )
+    };
+    for short in ["", "abc", "0123456789ABCDEF0123456789ABCDEF01234567"] {
+        let err = build(short).unwrap_err().to_string();
+        assert!(err.contains("full 40-character"), "{short}: {err}");
+    }
+    let manifest =
+        build("0123456789abcdef0123456789abcdef01234567").unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(manifest.provenance.version, "1.8.0");
+    assert_eq!(
+        manifest.provenance.commit,
+        "0123456789abcdef0123456789abcdef01234567"
     );
-    assert!(err.contains("public"), "{err}");
-    // An arbitrary approval string is not approval.
-    let err = vibe::manifest::build_signed(
-        &root,
-        &loaded,
-        &key,
-        &vibe::manifest::BuildInfo {
-            release: true,
-            release_approval: Some("pr:1".into()),
-            commit: String::new(),
-        },
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(err.contains("not accepted as approval"), "{err}");
+    // High-risk items are listed, not a build failure (decision 90 withdrawn).
+    assert!(!manifest.provenance.high_risk().is_empty());
 }
 
 #[tokio::test]
@@ -1329,13 +1346,6 @@ async fn production_runs_only_attested_release_manifests() {
     vibe::manifest::check_deployable(&dev, true).unwrap();
     let err = vibe::manifest::check_deployable(&dev, false).unwrap_err();
     assert!(err.contains("only release manifests"), "{err}");
-    let mut forged = dev.clone();
-    forged.provenance.build_mode = "release".into();
-    let err = vibe::manifest::check_deployable(&forged, false).unwrap_err();
-    assert!(err.contains("without a verified release approval"), "{err}");
-    forged.provenance.release_approval = Some("pr:1".into());
-    let err = vibe::manifest::check_deployable(&forged, false).unwrap_err();
-    assert!(err.contains("without a verified release approval"), "{err}");
 }
 
 #[tokio::test]
@@ -1354,10 +1364,15 @@ async fn production_serve_ignores_the_project_public_key() {
                 "0123456789abcdef0123456789abcdef0123",
             ),
             ("VIBE_DATABASE_URL", "postgres://invalid.invalid/x"),
+            ("VIBE_EXPECT_VERSION", "1.8.0"),
+            (
+                "VIBE_EXPECT_COMMIT",
+                "0123456789abcdef0123456789abcdef01234567",
+            ),
         ],
     );
     assert!(!ok);
-    assert!(out.contains("no pinned manifest key"), "{out}");
+    assert!(out.contains("Sigstore bundle"), "{out}");
     // With the dev key pinned, the dev manifest is still refused.
     let public = fs::read_to_string(root.join(".vibe/signing.pub")).unwrap();
     let (ok, out) = vibe_cli(
@@ -1370,11 +1385,140 @@ async fn production_serve_ignores_the_project_public_key() {
                 "0123456789abcdef0123456789abcdef0123",
             ),
             ("VIBE_DATABASE_URL", "postgres://invalid.invalid/x"),
+            ("VIBE_EXPECT_VERSION", "1.8.0"),
+            (
+                "VIBE_EXPECT_COMMIT",
+                "0123456789abcdef0123456789abcdef01234567",
+            ),
             ("VIBE_MANIFEST_PUBKEY", public.trim()),
         ],
     );
     assert!(!ok);
-    assert!(out.contains("only release manifests"), "{out}");
+    assert!(out.contains("Sigstore bundle"), "{out}");
+}
+
+#[path = "support/sigstore_fixture.rs"]
+mod sigstore_fixture;
+
+/// Writes a keyless release manifest of the shop and returns its path.
+/// `vibe build` refuses high-risk release builds until release approval
+/// verification (#80) exists, so this builds the manifest content, drops
+/// the high-risk items and marks it as a keyless release to exercise the
+/// runtime's bundle checks.
+async fn release_manifest(root: &Path) -> PathBuf {
+    let (loaded, _) = vibe::compile::compile_in_memory(root, None, None)
+        .await
+        .unwrap();
+    let mut manifest = vibe::manifest::build_signed(
+        root,
+        &loaded,
+        &sign::generate_key(),
+        &vibe::manifest::BuildInfo {
+            release: false,
+            version: "1.8.0".into(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+        },
+    )
+    .unwrap_or_else(|err| panic!("{err}"));
+    manifest.provenance.build_mode = "release".into();
+    manifest.provenance.version = "1.8.0".into();
+    manifest
+        .provenance
+        .security_items
+        .retain(|item| item.risk != "high");
+    manifest.signature = vibe::attest::SIGSTORE_SIGNATURE.into();
+    let path = root.join("manifest.json");
+    vibe::manifest::write_manifest(&path, &manifest).unwrap();
+    path
+}
+
+fn production_serve(root: &Path, extra: &[(&str, &str)]) -> (bool, String) {
+    let mut envs = vec![
+        ("VIBE_ENV", "production"),
+        (
+            "VIBE_API_KEY_PEPPER",
+            "0123456789abcdef0123456789abcdef0123",
+        ),
+        ("VIBE_DATABASE_URL", "postgres://invalid.invalid/x"),
+        ("VIBE_EXPECT_VERSION", "1.8.0"),
+        (
+            "VIBE_EXPECT_COMMIT",
+            "0123456789abcdef0123456789abcdef01234567",
+        ),
+    ];
+    envs.extend_from_slice(extra);
+    vibe_cli(
+        root,
+        &["serve", "--project", ".", "--addr", "127.0.0.1:0"],
+        &envs,
+    )
+}
+
+#[tokio::test]
+async fn production_serve_verifies_the_sigstore_bundle() {
+    let root = copy_shop();
+    let path = release_manifest(&root).await;
+    let bytes = fs::read(&path).unwrap();
+    let bundle = vibe::attest::default_bundle_path(&path);
+    // Missing bundle: refused.
+    let (ok, out) = production_serve(&root, &[]);
+    assert!(!ok);
+    assert!(out.contains("cannot read the Sigstore bundle"), "{out}");
+    // A self-signed bundle is refused (trust root / Fulcio chain).
+    fs::write(&bundle, sigstore_fixture::Fixture::default().bundle(&bytes)).unwrap();
+    let (ok, out) = production_serve(&root, &[]);
+    assert!(!ok);
+    assert!(
+        out.contains("sigstore bundle:")
+            || out.contains("certificate")
+            || out.contains("trust")
+            || out.contains("verify"),
+        "{out}"
+    );
+    // Incomplete Rekor material is refused.
+    fs::write(
+        &bundle,
+        sigstore_fixture::Fixture {
+            tlog: false,
+            ..Default::default()
+        }
+        .bundle(&bytes),
+    )
+    .unwrap();
+    let (ok, out) = production_serve(&root, &[]);
+    assert!(!ok);
+    assert!(
+        out.contains("sigstore bundle:") || out.contains("Rekor") || out.contains("bundle"),
+        "{out}"
+    );
+    // A release-repo override outside development is refused.
+    fs::write(&bundle, sigstore_fixture::Fixture::default().bundle(&bytes)).unwrap();
+    let (ok, out) = production_serve(&root, &[("VIBE_RELEASE_REPO", "attacker/sdk")]);
+    assert!(!ok);
+    assert!(out.contains("VIBE_RELEASE_REPO"), "{out}");
+    assert!(out.contains("development"), "{out}");
+    // A pinned key does not replace the bundle.
+    fs::remove_file(&bundle).unwrap();
+    let (_, public) = release_key_hex();
+    let (ok, out) = production_serve(&root, &[("VIBE_MANIFEST_PUBKEY", &public)]);
+    assert!(!ok);
+    assert!(out.contains("Sigstore bundle"), "{out}");
+}
+
+#[tokio::test]
+async fn production_serve_refuses_an_empty_manifest_commit() {
+    let root = copy_shop();
+    let path = release_manifest(&root).await;
+    let bytes = fs::read(&path).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    manifest["provenance"]["commit"] = serde_json::json!("");
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let bundle = vibe::attest::default_bundle_path(&path);
+    fs::write(&bundle, sigstore_fixture::Fixture::default().bundle(&bytes)).unwrap();
+    let (ok, out) = production_serve(&root, &[]);
+    assert!(!ok);
+    assert!(out.contains("manifest commit is empty"), "{out}");
 }
 
 #[tokio::test]
@@ -1486,30 +1630,22 @@ async fn route_jwt_overrides_end_to_end() {
     const URI: &str = "https://idp.example.com/t1/keys";
     let build = |jwks: &'static str| async move {
         let root = copy_shop();
-        // v1.8: locks must match a recompile, so the override lives in the source.
-        let source = root.join("api/catalog/v1/create-product/create-product.md");
-        let text = fs::read_to_string(&source).unwrap();
-        fs::write(
-            &source,
-            text.replacen(
-                "## Pipelines\n\n(none)",
-                &format!(
-                    "## Pipelines\n\n### auth\n\n- mode: jwt\n- iss: {IDP}\n- aud: catalog-api\n- jwks-uri: {jwks}\n- roles: [staff]"
-                ),
-                1,
+        edit(
+            &root,
+            "api/catalog/v1/create-product/create-product.md",
+            "## Pipelines\n\n(none)",
+            &format!(
+                "## Pipelines\n\n### auth\n\n- mode: jwt\n- roles: [staff]\n- iss: {IDP}\n- aud: catalog-api\n- jwks-uri: {jwks}"
             ),
-        )
-        .unwrap();
-        let compiled = compile_project(&CompileOptions {
+        );
+        compile_project(&CompileOptions {
             root: &root,
             llm: None,
             llm_config: None,
             check: false,
         })
-        .await;
-        if let Err(err) = compiled {
-            return (root, Err(err.to_string()));
-        }
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
         let report = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
             root: &root,
             deploy: false,
@@ -1526,7 +1662,6 @@ async fn route_jwt_overrides_end_to_end() {
 
     let (root, ok) = build(URI).await;
     ok.unwrap_or_else(|err| panic!("{err}"));
-    // v1.8: no approve step.
     let key = sign::generate_key();
     let manifest = manifest_from_project(&root, &key).unwrap_or_else(|err| panic!("{err}"));
     let route = manifest

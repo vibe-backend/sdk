@@ -18,6 +18,7 @@ on:
       - "scripts/ci/release-assets.sh"
       - "tests/release_assets.sh"
 
+
 permissions:
   contents: read
 
@@ -72,6 +73,7 @@ jobs:
     # Tag push: verify-tag must succeed. Dry-run: verify-tag is skipped.
     if: ${{ !cancelled() && (needs.verify-tag.result == 'success' || (github.event_name != 'push' && needs.verify-tag.result == 'skipped')) }}
     runs-on: ${{ matrix.os }}
+    # Builds run project and dependency code: no id-token, no attestations.
     permissions:
       contents: read
     strategy:
@@ -101,6 +103,12 @@ jobs:
         with:
           toolchain: "1.89"
           targets: ${{ matrix.target }}
+      - name: Install NASM (aws-lc-sys, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm --version=3.2.0 -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Install aarch64 Linux linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
@@ -130,28 +138,6 @@ jobs:
           path: ${{ matrix.asset }}
           if-no-files-found: error
 
-  # Tag-only: build provenance for each archive (id-token lives only here).
-  attest-build:
-    name: Attest build provenance
-    needs: [build, checksums]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: |
-            dist/*.tar.gz
-            dist/*.zip
-
   checksums:
     name: SHA256SUMS
     needs: build
@@ -159,63 +145,247 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+    env:
+      RELEASE_ASSETS: >-
+        vibe-x86_64-unknown-linux-gnu.tar.gz
+        vibe-aarch64-unknown-linux-gnu.tar.gz
+        vibe-x86_64-apple-darwin.tar.gz
+        vibe-aarch64-apple-darwin.tar.gz
+        vibe-x86_64-pc-windows-msvc.zip
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - name: Download vibe-x86_64-unknown-linux-gnu.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: dist
-          merge-multiple: true
-      - name: SHA256 checksums
+          name: vibe-x86_64-unknown-linux-gnu.tar.gz
+          path: dl/vibe-x86_64-unknown-linux-gnu.tar.gz
+      - name: Download vibe-aarch64-unknown-linux-gnu.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-aarch64-unknown-linux-gnu.tar.gz
+          path: dl/vibe-aarch64-unknown-linux-gnu.tar.gz
+      - name: Download vibe-x86_64-apple-darwin.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-x86_64-apple-darwin.tar.gz
+          path: dl/vibe-x86_64-apple-darwin.tar.gz
+      - name: Download vibe-aarch64-apple-darwin.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-aarch64-apple-darwin.tar.gz
+          path: dl/vibe-aarch64-apple-darwin.tar.gz
+      - name: Download vibe-x86_64-pc-windows-msvc.zip
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-x86_64-pc-windows-msvc.zip
+          path: dl/vibe-x86_64-pc-windows-msvc.zip
+      - name: SHA256 checksums of the expected assets
+        shell: bash
         run: |
+          set -euo pipefail
+          mkdir dist
+          for n in $RELEASE_ASSETS; do
+            [ "$(find "dl/$n" -mindepth 1 | wc -l)" -eq 1 ] && [ -f "dl/$n/$n" ] && [ ! -L "dl/$n/$n" ] \
+              || { echo "::error::Artifact $n must hold exactly the file $n"; exit 1; }
+            mv -n "dl/$n/$n" "dist/$n"
+          done
           cd dist
-          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
-          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          sha256sum -- $RELEASE_ASSETS > SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
           if-no-files-found: error
 
-  # Tag-only: provenance for SHA256SUMS.
-  attest-checksums:
-    name: Attest SHA256SUMS
+  # The only job with id-token/attestations: runs in the `release`
+  # environment, checks out nothing and runs no project or dependency code.
+  # It downloads each expected release file by name, checks the set against
+  # RELEASE_FILES and SHA256SUMS, and attests only those files.
+  # RELEASE_FILES = the build matrix `asset` names + SHA256SUMS (keep in sync).
+  attest:
+    name: Attest build provenance
     needs: checksums
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: read
       id-token: write
       attestations: write
+    env:
+      RELEASE_FILES: >-
+        vibe-x86_64-unknown-linux-gnu.tar.gz
+        vibe-aarch64-unknown-linux-gnu.tar.gz
+        vibe-x86_64-apple-darwin.tar.gz
+        vibe-aarch64-apple-darwin.tar.gz
+        vibe-x86_64-pc-windows-msvc.zip
+        SHA256SUMS
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - name: Download vibe-x86_64-unknown-linux-gnu.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-x86_64-unknown-linux-gnu.tar.gz
+          path: dl/vibe-x86_64-unknown-linux-gnu.tar.gz
+      - name: Download vibe-aarch64-unknown-linux-gnu.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-aarch64-unknown-linux-gnu.tar.gz
+          path: dl/vibe-aarch64-unknown-linux-gnu.tar.gz
+      - name: Download vibe-x86_64-apple-darwin.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-x86_64-apple-darwin.tar.gz
+          path: dl/vibe-x86_64-apple-darwin.tar.gz
+      - name: Download vibe-aarch64-apple-darwin.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-aarch64-apple-darwin.tar.gz
+          path: dl/vibe-aarch64-apple-darwin.tar.gz
+      - name: Download vibe-x86_64-pc-windows-msvc.zip
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-x86_64-pc-windows-msvc.zip
+          path: dl/vibe-x86_64-pc-windows-msvc.zip
+      - name: Download SHA256SUMS
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: SHA256SUMS
-          path: dist
-      - name: Attest SHA256SUMS
+          path: dl/SHA256SUMS
+      - name: Check the downloaded files against the expected list
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Each artifact holds exactly one file with the artifact's name.
+          expected="$(for n in $RELEASE_FILES; do printf '%s/%s\n' "$n" "$n"; done | LC_ALL=C sort)"
+          found="$(cd dl && find . -mindepth 1 ! -type d -printf '%P\n' | LC_ALL=C sort)"
+          if [ "$found" != "$expected" ]; then
+            echo "::error::Downloaded files do not match the expected release files"
+            diff <(echo "$expected") <(echo "$found") || true
+            exit 1
+          fi
+          if [ -n "$(cd dl && find . -mindepth 1 ! -type d ! -type f -print)" ]; then
+            echo "::error::Release files must be regular files"
+            exit 1
+          fi
+          mkdir dist
+          for n in $RELEASE_FILES; do
+            mv -n "dl/$n/$n" "dist/$n"
+          done
+          count="$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)"
+          [ "$count" -eq "$(echo $RELEASE_FILES | wc -w)" ] || { echo "::error::Duplicate release file names"; exit 1; }
+      - name: Check assets against SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # SHA256SUMS lists exactly the expected assets, once each.
+          listed="$(awk '{ sub(/^\*/, "", $2); print $2 }' SHA256SUMS | LC_ALL=C sort)"
+          want="$(for n in $RELEASE_FILES; do [ "$n" = SHA256SUMS ] || echo "$n"; done | LC_ALL=C sort)"
+          if [ "$listed" != "$want" ] || [ "$(wc -l < SHA256SUMS)" -ne "$(echo "$want" | wc -l)" ]; then
+            echo "::error::SHA256SUMS does not list exactly the expected assets"
+            exit 1
+          fi
+          sha256sum --strict -c SHA256SUMS
+      - name: Attest the expected release files
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/SHA256SUMS
+          subject-path: |
+            dist/vibe-x86_64-unknown-linux-gnu.tar.gz
+            dist/vibe-aarch64-unknown-linux-gnu.tar.gz
+            dist/vibe-x86_64-apple-darwin.tar.gz
+            dist/vibe-aarch64-apple-darwin.tar.gz
+            dist/vibe-x86_64-pc-windows-msvc.zip
+            dist/SHA256SUMS
 
   # The publishing job holds only contents: write (no id-token/attestations).
   release:
     name: GitHub Release
-    needs: [install-script, checksums, attest-build, attest-checksums]
+    needs: [install-script, attest]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     environment: release
     permissions:
       contents: write
+    env:
+      RELEASE_FILES: >-
+        vibe-x86_64-unknown-linux-gnu.tar.gz
+        vibe-aarch64-unknown-linux-gnu.tar.gz
+        vibe-x86_64-apple-darwin.tar.gz
+        vibe-aarch64-apple-darwin.tar.gz
+        vibe-x86_64-pc-windows-msvc.zip
+        SHA256SUMS
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          path: dist
-          merge-multiple: true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           path: src
+      - name: Download vibe-x86_64-unknown-linux-gnu.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-x86_64-unknown-linux-gnu.tar.gz
+          path: dl/vibe-x86_64-unknown-linux-gnu.tar.gz
+      - name: Download vibe-aarch64-unknown-linux-gnu.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-aarch64-unknown-linux-gnu.tar.gz
+          path: dl/vibe-aarch64-unknown-linux-gnu.tar.gz
+      - name: Download vibe-x86_64-apple-darwin.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-x86_64-apple-darwin.tar.gz
+          path: dl/vibe-x86_64-apple-darwin.tar.gz
+      - name: Download vibe-aarch64-apple-darwin.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-aarch64-apple-darwin.tar.gz
+          path: dl/vibe-aarch64-apple-darwin.tar.gz
+      - name: Download vibe-x86_64-pc-windows-msvc.zip
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-x86_64-pc-windows-msvc.zip
+          path: dl/vibe-x86_64-pc-windows-msvc.zip
+      - name: Download SHA256SUMS
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: SHA256SUMS
+          path: dl/SHA256SUMS
+      - name: Check the downloaded files against the expected list
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Each artifact holds exactly one file with the artifact's name.
+          expected="$(for n in $RELEASE_FILES; do printf '%s/%s\n' "$n" "$n"; done | LC_ALL=C sort)"
+          found="$(cd dl && find . -mindepth 1 ! -type d -printf '%P\n' | LC_ALL=C sort)"
+          if [ "$found" != "$expected" ]; then
+            echo "::error::Downloaded files do not match the expected release files"
+            diff <(echo "$expected") <(echo "$found") || true
+            exit 1
+          fi
+          if [ -n "$(cd dl && find . -mindepth 1 ! -type d ! -type f -print)" ]; then
+            echo "::error::Release files must be regular files"
+            exit 1
+          fi
+          mkdir dist
+          for n in $RELEASE_FILES; do
+            mv -n "dl/$n/$n" "dist/$n"
+          done
+          count="$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)"
+          [ "$count" -eq "$(echo $RELEASE_FILES | wc -w)" ] || { echo "::error::Duplicate release file names"; exit 1; }
+      - name: Check assets against SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # SHA256SUMS lists exactly the expected assets, once each.
+          listed="$(awk '{ sub(/^\*/, "", $2); print $2 }' SHA256SUMS | LC_ALL=C sort)"
+          want="$(for n in $RELEASE_FILES; do [ "$n" = SHA256SUMS ] || echo "$n"; done | LC_ALL=C sort)"
+          if [ "$listed" != "$want" ] || [ "$(wc -l < SHA256SUMS)" -ne "$(echo "$want" | wc -l)" ]; then
+            echo "::error::SHA256SUMS does not list exactly the expected assets"
+            exit 1
+          fi
+          sha256sum --strict -c SHA256SUMS
       # Uploads exactly SHA256SUMS and the files it lists, after
       # `sha256sum -c --strict` and an exact file-set match (no dist/* glob).
-      - name: Create release and upload assets
+      - name: Create release and upload the expected files
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: src/scripts/ci/release-assets.sh publish dist "$GITHUB_REF_NAME"
@@ -229,15 +399,72 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+    env:
+      RELEASE_FILES: >-
+        vibe-x86_64-unknown-linux-gnu.tar.gz
+        vibe-aarch64-unknown-linux-gnu.tar.gz
+        vibe-x86_64-apple-darwin.tar.gz
+        vibe-aarch64-apple-darwin.tar.gz
+        vibe-x86_64-pc-windows-msvc.zip
+        SHA256SUMS
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+          path: src
+      - name: Download vibe-x86_64-unknown-linux-gnu.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: dist
-          merge-multiple: true
+          name: vibe-x86_64-unknown-linux-gnu.tar.gz
+          path: dl/vibe-x86_64-unknown-linux-gnu.tar.gz
+      - name: Download vibe-aarch64-unknown-linux-gnu.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-aarch64-unknown-linux-gnu.tar.gz
+          path: dl/vibe-aarch64-unknown-linux-gnu.tar.gz
+      - name: Download vibe-x86_64-apple-darwin.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-x86_64-apple-darwin.tar.gz
+          path: dl/vibe-x86_64-apple-darwin.tar.gz
+      - name: Download vibe-aarch64-apple-darwin.tar.gz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-aarch64-apple-darwin.tar.gz
+          path: dl/vibe-aarch64-apple-darwin.tar.gz
+      - name: Download vibe-x86_64-pc-windows-msvc.zip
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vibe-x86_64-pc-windows-msvc.zip
+          path: dl/vibe-x86_64-pc-windows-msvc.zip
+      - name: Download SHA256SUMS
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: SHA256SUMS
+          path: dl/SHA256SUMS
+      - name: Check the downloaded files against the expected list
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Each artifact holds exactly one file with the artifact's name.
+          expected="$(for n in $RELEASE_FILES; do printf '%s/%s\n' "$n" "$n"; done | LC_ALL=C sort)"
+          found="$(cd dl && find . -mindepth 1 ! -type d -printf '%P\n' | LC_ALL=C sort)"
+          if [ "$found" != "$expected" ]; then
+            echo "::error::Downloaded files do not match the expected release files"
+            diff <(echo "$expected") <(echo "$found") || true
+            exit 1
+          fi
+          if [ -n "$(cd dl && find . -mindepth 1 ! -type d ! -type f -print)" ]; then
+            echo "::error::Release files must be regular files"
+            exit 1
+          fi
+          mkdir dist
+          for n in $RELEASE_FILES; do
+            mv -n "dl/$n/$n" "dist/$n"
+          done
+          count="$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)"
+          [ "$count" -eq "$(echo $RELEASE_FILES | wc -w)" ] || { echo "::error::Duplicate release file names"; exit 1; }
       - name: Verify real artifacts against SHA256SUMS
-        run: scripts/ci/release-assets.sh verify dist
+        run: src/scripts/ci/release-assets.sh verify dist
       - name: Rehearse publish (stub gh) and negative cases on real artifacts
-        run: tests/release_assets.sh dist
+        run: src/tests/release_assets.sh dist

@@ -114,9 +114,9 @@ Return 204.
 - **每次使用都輪換**：發新的 refresh 和 access token；舊 refresh token 即時失效。
 - **家族**：重用已失效的 token 會撤銷整個家族、寫審計記錄並通知用戶。撤銷以 UPDATE `revoked_at`／`revoke_reason` 進行，絕不 DELETE。
 - **寬限期**（Decision 61，`reuse-grace` ≤ 10s）：寬限期內平台**不會**回傳先前的明文（它只有 hash）。它撤銷上一次發出的子 token（`revoke_reason: grace-reissue`），在同一家族發新的子 token，並設定 `grace_reissued_at`；以條件更新 `update ... where grace_reissued_at is null` 確保兩個並發請求只有一個成功。每個舊 token 最多重發一次；第二次使用、超過寬限期使用、或子 token 已再被輪換後使用，都當作重用並撤銷家族。`used_at` 不變，所以寬限期不會延長。
-- **Cookie 傳送**（`transport: cookie`）：一律 `HttpOnly; Secure; SameSite=Strict; Path=/{definition}/{version}/{slug}/refresh`（Decision 60）。
+- **Cookie 傳送**（`transport: cookie`）：`__Host-vibe_rt_{slug}` cookie，一律 `HttpOnly; Secure; SameSite=<cookie-mode>; Path=/; Max-Age=<秒>`，不設 `Domain`（規格 v1.8 Decision 101、143；Decision 60 的 slug `Path` 只適用於 `transport: body`）。
 - **分類**（Decision 72）：`public: true`（沒有 access token），但**不屬**公開寫入：用戶 lock 沒有寫入 step，只有平台寫自己的表，因此不計每日公開寫入配額，亦不需要 captcha；固定限流為每 IP 每分鐘 30 次、每家族每分鐘 10 次；最低回應耗時 300ms。
-- **登出**（`token-revoke`，Decision 65）：必須經 `auth`；`scope: family` 撤銷當前家族（登出），`scope: all` 撤銷該用戶所有家族（全部裝置登出）；只可撤銷呼叫者自己（`sub`）的家族；即使 token 不存在或已撤銷也回 204；cookie 傳送時會清除 cookie（`Max-Age=0`）。
+- **登出**（`token-revoke`，Decision 65）：必須經 `auth`；`scope: family` 撤銷當前家族（登出），`scope: all` 撤銷該用戶所有家族（全部裝置登出）；只可撤銷呼叫者自己（`sub`）的家族。例外（規格 v1.8 Decision 145）：`token-source: cookie` 加 `scope: family` 時登出不需要 access token，但必須通過 refresh 路由的 `Origin` 白名單及 `X-Vibe-CSRF: 1`（否則 403 `CSRF_REJECTED`）；之後只從 `__Host-` cookie 讀 token，一律回 204，只撤銷該 cookie 的家族。登出永不回 401 `INVALID_REFRESH_TOKEN`；即使 token 不存在或已撤銷也回 204；cookie 傳送時會清除 cookie（`Max-Age=0`）。
 - **其他撤銷**：電郵驗證成功會撤銷所有家族（`email-verified`，Decision 67）；私隱刪除會撤銷所有家族（`erasure`，§12.10）。
 - **用戶端儲存**（一般建議，規格以外）：瀏覽器優先用 `transport: cookie`；原生 app 應把 token 存在作業系統的 keychain／keystore。絕不要把 refresh token 存在 `localStorage`／`sessionStorage`。
 - Token 永不寫入 log（§9）。簽發只經 `sign-token` capability（§12.6），見 [sign-token.md](sign-token.md)。
@@ -127,3 +127,5 @@ Return 204.
 - 由 pipeline 產生回應時，feature lock 的 `## Transform`／`## Steps` 應包含甚麼**未有規定**。
 - Decision 72 說固定的 refresh 限流會「用 §4.3 的 schema 寫入 lock」，但沒有展示是以明確的 `rate-limit` step 出現（如本頁所示），還是由 `token-refresh` 隱含。
 - 寬限期內可選的用戶端指紋比對（§4A.1 第 5 點）沒有對應參數。
+
+輪換進行中的 reservation 回傳可重試的 503 `TX_CONFLICT`，不含 `Set-Cookie`。先檢查重用：超過寬限期的已使用 token 即使仍有 reservation 也撤銷家族。完成後在寬限期內重試依決定 61 重發，超過寬限期則視為重用。簽發錯誤清除 reservation；取消請求、簽發逾時、完成交易失敗或 reservation 過期同樣清除 reservation，原 token 維持有效，可以重試；只有已提交的子 token 才會消耗原 token。資料庫／連線池逾時回傳 504 `TX_TIMEOUT`。升級後先執行 `vibe migrate`，再執行 `vibe serve`；reservation 欄位由 migration 按租戶新增。

@@ -5,6 +5,7 @@
 
 #![allow(clippy::result_large_err)]
 
+pub mod attest;
 pub mod buildrecord;
 pub mod compile;
 pub mod diag;
