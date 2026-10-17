@@ -5,6 +5,8 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **API expressions:** Support JSON string/number literals, reserved true/false/null words and quoted object keys (no arrays). API `respond value` evaluates expressions; empty or `transform.out` evaluates Transform out, with failures returning 500 INTERNAL without fallback. Missing or `(none)` Transform defaults to in = {} and out = result, including `- in: (none)` / `- out: (none)`. Validation and manifest building reject statically failing expressions and empty Transform bullets.
+
 - **Refresh rotation upgrade:** Run `vibe migrate` before `vibe serve` after upgrading. Reservation columns are added per tenant by migration. A request presenting a token while an earlier request for it is in progress returns a retryable 503 `TX_CONFLICT` without clearing cookies; after it completes, a presentation within the 10-second grace window follows the grace rule, and later presentations are treated as reuse and revoke the family; database/pool timeouts return 504 `TX_TIMEOUT`. Reservations without a committed child are cleared, leaving the presented token current and allowing a retry.
 
 ### Upcoming (advance notice)
@@ -52,6 +54,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Changed
 
+- **Product website:** Source moved from `site/` to `vibe-backend/vibe-backend.github.io`, which builds and deploys itself and reads this repo's `docs/` at build time. Removed the Pages workflow (`.github/workflows/pages.yml`) and `trigger-org-pages` dispatch (`ORG_PAGES_DISPATCH_TOKEN`).
 - **Refresh tokens (#95):** Hardening of `_platform_refresh_tokens`: the runtime role gets SELECT, INSERT and UPDATE only on `used_at`, `replaced_by`, `grace_reissued_at`, `revoked_at` and `revoke_reason` (no DELETE); a `_platform_refresh_guard` trigger keeps identity columns immutable and revocation final; `vibe serve` verifies the grants and trigger per tenant at startup and fails closed. App SQL can no longer name `vibe_*` tables. Re-run `vibe migrate` for existing tenants.
 - **Refresh tokens (#95):** `vibe migrate` now removes refresh-token families whose lifetime ended more than a day ago, in bounded batches (1000 rows per batch, at most 100 batches per run); live families are never removed. Refresh endpoint, policy settings and grace behaviour are documented in `docs/runtime-config.md`.
 - **Refresh tokens (#95):** Hardening: when the refresh-token family lookup fails (for example a database or pool error), token refresh fails closed with a retryable 503 `SERVICE_UNAVAILABLE` instead of skipping the per-family limit. The presented token is not consumed.
