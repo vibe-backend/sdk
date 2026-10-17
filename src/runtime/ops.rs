@@ -1,6 +1,6 @@
 //! Executable method ops (spec §12.8, decisions 52/55/62): `query`,
 //! `verify-password`, `hash-password`, `random-token`, `hash-token` and
-//! `sign-jwt`. Refresh tokens (`issue-refresh`) come in a later change.
+//! `sign-jwt` (with platform refresh tokens via `issue-refresh`).
 
 use std::sync::OnceLock;
 
@@ -134,6 +134,7 @@ pub async fn query(
             ExecError::Message(msg) if msg.contains("--memory") => internal(msg),
             // SQLSTATE 23505 (unique violation), mapped in exec.
             ExecError::Conflict => MethodFail::code("CONFLICT", "already exists"),
+            ExecError::Timeout => MethodFail::code("TX_TIMEOUT", "transaction timed out"),
             other => {
                 tracing::warn!(error = ?other, "query step failed");
                 internal("query failed")
@@ -342,7 +343,7 @@ pub async fn sign_jwt(
         ));
     }
     match opt(step, "issue-refresh") {
-        "" | "none" => {}
+        "" | "none" | "platform-decided" | "new-family" => {}
         other => {
             return Err(internal(format!(
                 "issue-refresh {other} is not supported by this runtime yet"
@@ -404,14 +405,18 @@ pub async fn sign_jwt(
     let roles = exec
         .user_roles(ctx.tenant_id, &sub)
         .await
-        .map_err(|err| {
-            tracing::warn!(error = ?err, "sign-jwt roles lookup failed");
-            internal("sign-jwt roles lookup failed")
+        .map_err(|err| match err {
+            ExecError::Timeout => MethodFail::code("TX_TIMEOUT", "transaction timed out"),
+            ExecError::Conflict => MethodFail::code("TX_CONFLICT", "transaction conflict"),
+            other => {
+                tracing::warn!(error = ?other, "sign-jwt roles lookup failed");
+                internal("sign-jwt roles lookup failed")
+            }
         })?
         .ok_or_else(|| internal("sign-jwt sub is not a user"))?;
     let now = chrono::Utc::now().timestamp();
     let ttl = (ttl_ms / 1000) as i64;
-    claims.insert("sub".into(), sub.into());
+    claims.insert("sub".into(), sub.clone().into());
     claims.insert("iss".into(), ctx.auth.iss.clone().into());
     claims.insert("aud".into(), ctx.auth.aud.clone().into());
     claims.insert("iat".into(), now.into());
@@ -427,14 +432,101 @@ pub async fn sign_jwt(
     header.kid = Some(key.kid.clone());
     let token = jsonwebtoken::encode(&header, &Value::Object(claims), &key.key)
         .map_err(|err| internal(format!("sign-jwt: {err}")))?;
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "access_token": token,
         "token_type": "Bearer",
         "expires_in": ttl,
         "expires_at": chrono::DateTime::from_timestamp(now + ttl, 0)
             .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_default(),
-    }))
+    });
+    attach_refresh(manifest, exec, method, step, &mut out, &sub, ctx).await?;
+    Ok(out)
+}
+
+/// A fresh opaque refresh token and its stored HMAC.
+pub fn new_refresh_token(pepper: &[u8]) -> (String, String) {
+    let mut buf = [0u8; 32];
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut buf)
+        .expect("OS random number generator failed");
+    let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
+    let hash = refresh_hash(pepper, &value);
+    (value, hash)
+}
+
+/// HMAC-SHA-256 of a refresh token (hex) under its own key derived from
+/// the pepper; only this is stored.
+pub fn refresh_hash(pepper: &[u8], value: &str) -> String {
+    hex::encode(hmac(
+        &hmac(pepper, b"vibe/refresh-token/v1"),
+        value.as_bytes(),
+    ))
+}
+
+/// The rotation route whose `sign-method` is `target`, if any.
+pub fn refresh_route_for<'a>(
+    manifest: &'a crate::manifest::Manifest,
+    target: &str,
+) -> Option<&'a crate::manifest::RefreshSpec> {
+    manifest
+        .routes
+        .iter()
+        .filter_map(|r| r.refresh.as_ref())
+        .find(|spec| spec.sign_method == target)
+}
+
+pub fn policy_of(spec: &crate::manifest::RefreshSpec) -> super::refresh::RefreshPolicy {
+    super::refresh::RefreshPolicy {
+        family_ttl: spec.refresh_ttl_s,
+        idle_ttl: spec.idle_ttl_s,
+        grace: spec.reuse_grace_s,
+    }
+}
+
+/// `issue-refresh` (spec §4A.1): on a rotation call (from the refresh route)
+/// the rotated token was already stored and is handed back; it must be for
+/// the same user. Otherwise (login) a new family starts. Either way a
+/// `token-refresh` route must sign with this method, or the step errors.
+async fn attach_refresh(
+    manifest: &crate::manifest::Manifest,
+    exec: &dyn QueryExec,
+    method: &MethodSpec,
+    step: &StepSpec,
+    out: &mut Value,
+    sub: &str,
+    ctx: CallCtx<'_>,
+) -> Result<(), MethodFail> {
+    let mode = opt(step, "issue-refresh");
+    if mode.is_empty() || mode == "none" {
+        return Ok(());
+    }
+    let Some(spec) = refresh_route_for(manifest, &method.target) else {
+        return Err(internal(format!(
+            "issue-refresh {mode} needs a token-refresh route whose sign-method is {}",
+            method.target
+        )));
+    };
+    let token = match ctx.refresh_token {
+        Some(token) => {
+            if ctx.caller.subject != sub {
+                return Err(internal("refreshed token must be for the same user"));
+            }
+            token.to_string()
+        }
+        None => {
+            let (value, hash) = new_refresh_token(&ctx.auth.pepper);
+            exec.refresh_issue(ctx.tenant_id, sub, &hash, policy_of(spec))
+                .await
+                .map_err(|err| internal(format!("refresh token: {err:?}")))?;
+            value
+        }
+    };
+    out["refresh_token"] = Value::String(token);
+    // Seconds until this token expires if unused: the smaller of idle-ttl
+    // and the family lifetime (a new family here; the refresh route replaces
+    // it with the remaining value on rotation).
+    out["refresh_expires_in"] = Value::from(spec.idle_ttl_s.min(spec.refresh_ttl_s));
+    Ok(())
 }
 
 /// Loads a P-256 private key from PKCS#8 PEM, checking it at load time.
