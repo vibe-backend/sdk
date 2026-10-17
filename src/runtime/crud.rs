@@ -922,11 +922,30 @@ pub fn eval_expr(input: &str, vars: &Map<String, Value>) -> Result<Value, String
 
 enum Expr {
     Path(String),
+    Literal(Value),
     Object(Vec<(String, Expr)>),
 }
 
 fn parse_expr(input: &str) -> Result<(Expr, &str), String> {
     let input = input.trim();
+    if input.is_empty() {
+        return Err("empty expression".into());
+    }
+    if input.starts_with('"') {
+        let (value, rest) = take_json_string(input)?;
+        return Ok((Expr::Literal(Value::String(value)), rest));
+    }
+    if input.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
+        let end = input
+            .find(|c: char| c.is_whitespace() || c == ',' || c == '}')
+            .unwrap_or(input.len());
+        let value: Value =
+            serde_json::from_str(&input[..end]).map_err(|err| format!("invalid number: {err}"))?;
+        if !value.is_number() {
+            return Err("expected JSON number".into());
+        }
+        return Ok((Expr::Literal(value), &input[end..]));
+    }
     if let Some(rest) = input.strip_prefix('{') {
         let mut rest = rest.trim();
         let mut fields = Vec::new();
@@ -937,7 +956,11 @@ fn parse_expr(input: &str) -> Result<(Expr, &str), String> {
             return Ok((Expr::Object(fields), stripped));
         }
         loop {
-            let (key, next) = take_ident(rest)?;
+            let (key, next) = if rest.starts_with('"') {
+                take_json_string(rest)?
+            } else {
+                take_ident(rest)?
+            };
             let next = next.trim().strip_prefix(':').ok_or("expected :")?.trim();
             let (value, next) = parse_expr(next)?;
             fields.push((key, value));
@@ -953,7 +976,22 @@ fn parse_expr(input: &str) -> Result<(Expr, &str), String> {
         }
     }
     let (path, rest) = take_path(input)?;
-    Ok((Expr::Path(path), rest))
+    let expr = match path.as_str() {
+        "true" => Expr::Literal(Value::Bool(true)),
+        "false" => Expr::Literal(Value::Bool(false)),
+        "null" => Expr::Literal(Value::Null),
+        _ => Expr::Path(path),
+    };
+    Ok((expr, rest))
+}
+
+fn take_json_string(input: &str) -> Result<(String, &str), String> {
+    let mut stream = serde_json::Deserializer::from_str(input).into_iter::<String>();
+    let value = stream
+        .next()
+        .ok_or("expected JSON string")?
+        .map_err(|err| format!("invalid JSON string: {err}"))?;
+    Ok((value, &input[stream.byte_offset()..]))
 }
 
 fn take_ident(input: &str) -> Result<(String, &str), String> {
@@ -986,11 +1024,12 @@ fn take_path(input: &str) -> Result<(String, &str), String> {
 fn eval_parsed(expr: &Expr, vars: &Map<String, Value>) -> Value {
     match expr {
         Expr::Path(path) => lookup(path, vars),
+        Expr::Literal(value) => value.clone(),
         Expr::Object(fields) => {
             let mut obj = Map::new();
             for (key, value) in fields {
                 let resolved = eval_parsed(value, vars);
-                if !resolved.is_null() {
+                if !resolved.is_null() || matches!(value, Expr::Literal(Value::Null)) {
                     obj.insert(key.clone(), resolved);
                 }
             }
@@ -1232,6 +1271,51 @@ mod ownership_tests {
 mod expr_check_tests {
     use super::{check_expr, check_when, when_matches};
     use serde_json::Map;
+
+    #[test]
+    fn json_literals_and_objects() {
+        use super::eval_expr;
+        use serde_json::{json, Value};
+        let vars = Map::new();
+        for text in [
+            r#""hello\nworld\t\"quoted\"\u263a""#,
+            "0",
+            "-42",
+            "1.25",
+            "-0.5",
+            "1e3",
+            "-2.5E-2",
+            "true",
+            "false",
+            "null",
+        ] {
+            let expected: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(eval_expr(text, &vars).unwrap(), expected, "{text}");
+            assert!(check_expr(text).is_ok());
+        }
+        assert_eq!(
+            eval_expr(
+                r#"{"message": "hello world", nested: {a: null, missing: req.nope}, bare: true}"#,
+                &vars
+            )
+            .unwrap(),
+            json!({"message": "hello world", "nested": {"a": null}, "bare": true})
+        );
+        assert_eq!(eval_expr("{}", &vars).unwrap(), json!({}));
+        for bad in [
+            "",
+            "  ",
+            "\"unterminated",
+            "01",
+            "1.",
+            "[1]",
+            "{a: }",
+            r#""bad\q""#,
+        ] {
+            assert!(check_expr(bad).is_err(), "{bad}");
+            assert!(eval_expr(bad, &vars).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn expressions_and_conditions_are_checked_like_the_runtime() {

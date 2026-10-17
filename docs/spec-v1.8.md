@@ -385,7 +385,7 @@ project/
 | `## Limits` | `provider`、`timeout`、`body` |
 | `## Request` | 欄位宣告；未宣告嘅欄位一律拒絕，回 422 |
 | `## Response` | 狀態碼同 schema |
-| `## Transform` | request → method input、method output → response 嘅映射；處理唔同 api version 嘅差異 |
+| `## Transform` | 可省略（等同 `(none)`）；request → method input、method output → response 嘅映射；處理唔同 api version 嘅差異 |
 | `## Steps` | 有序步驟；api 層只准 `method`、`validate`、`transform`、`respond` 四種 op，**唔准 `query` 或者 `call`** |
 | `## Errors` | 業務錯誤碼對應狀態碼 |
 
@@ -503,11 +503,16 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 
 ### 2A.2 通用 section 規則
 
-- section 用 `##` 標題，名稱同次序按 kind 固定（見 2A.3）；唔准有額外 section，缺 section 用 `(none)` 表示。
+- section 用 `##` 標題，名稱同次序按 kind 固定（見 2A.3）；唔准有額外 section，缺 section 用 `(none)` 表示；api feature 可以省略 `## Transform`，等同 `(none)`，compile 會喺 lock 嘅固定位置補返。
 - 每個 step 用 `### s{n} {op}` 做標題，下面用 `- key: value` 列點，key 次序固定：`op`、（op 專用參數）、`out`、`source-lines`。
 - 變數參照一律用 `input.x`、`ctx.x`、`req.x`、或者之前 step 嘅 `out` 名；唔准參照未定義變數。
 - sql 一律寫喺 inline code 入面，用 `$1`、`$2` 參數，`params` 列出對應來源；唔准字串拼接。
 - `source-lines` 指返 source `.md` 嘅行數，方便 review 對照。
+
+- expression 支援字面值：JSON 字串、數字、`true`／`false`／`null`；object key 可以加雙引號；暫時唔支援 array。
+- `true`／`false`／`null` 係保留字，唔可以做變數名。object 入面明確寫嘅 `null` 會保留；path 解析成 `null` 嘅欄位會省略。
+- api feature 嘅 `respond value` 留空或者係 `transform.out` 時，會 evaluate Transform out；其他值當 expression evaluate。runtime evaluation 失敗會回 `500 INTERNAL`，唔會 fallback；validate 會拒絕靜態可確定會失敗嘅 expression。
+- 缺少 Transform、整個 section 係 `(none)`、或者 `- in: (none)`／`- out: (none)`，對應預設係 in = `{}`、out = `result`；空白 bullet（例如 `- in:`）會報 `empty expression`，validate 同 manifest 都會拒絕。
 
 ### 2A.3 各 kind 嘅固定 section
 
@@ -520,7 +525,7 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 | migration | `## Target`、`## Up`、`## Verify`、`## Data` |
 | api（scope: definition） | `## Providers`、`## Pipelines`、`## Defaults` |
 | api（scope: version） | `## Pipelines`、`## Defaults`、`## Lifecycle` |
-| api（scope: feature） | `## Route`、`## Access`、`## Pipelines`、`## Limits`、`## Request`、`## Response`、`## Transform`、`## Steps`、`## Errors` |
+| api（scope: feature） | `## Route`、`## Access`、`## Pipelines`、`## Limits`、`## Request`、`## Response`、`## Transform`（可省略，等同 `(none)`）、`## Steps`、`## Errors` |
 
 api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature`。
 
