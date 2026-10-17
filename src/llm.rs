@@ -728,17 +728,18 @@ pub fn parse_duration_ms(raw: &str) -> Option<u64> {
 pub fn redact(text: &str, secrets: &[&str]) -> String {
     let mut known: Vec<String> = std::env::vars()
         .filter(|(name, _)| {
-            [
-                "KEY",
-                "TOKEN",
-                "SECRET",
-                "PASSWORD",
-                "PASSWD",
-                "PWD",
-                "DATABASE_URL",
-            ]
-            .iter()
-            .any(|part| name.to_ascii_uppercase().contains(part))
+            !matches!(name.as_str(), "PWD" | "OLDPWD")
+                && [
+                    "KEY",
+                    "TOKEN",
+                    "SECRET",
+                    "PASSWORD",
+                    "PASSWD",
+                    "PWD",
+                    "DATABASE_URL",
+                ]
+                .iter()
+                .any(|part| name.to_ascii_uppercase().contains(part))
         })
         .map(|(_, value)| value)
         .filter(|v| !v.is_empty())
@@ -746,88 +747,85 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
     known.extend(secrets.iter().map(|v| v.to_string()));
     let mut text = text.to_string();
     let mut ranges = Vec::new();
-    for secret in known {
+    static KEYS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)(?:\b[a-z0-9_-]*(?:password|passwd|pwd|secret|token|api[ _-]?key|database_url|private_key|credentials?|passphrase|authorization|auth|set-cookie|cookie|session)[a-z0-9_-]*|密碼|密码|口令|憑證)[ 	"']*[:=][ 	]*|\bbearer[ 	]+"#).expect("redaction keys")
+    });
+    static TOKENS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"[a-zA-Z][a-zA-Z0-9+.-]*://[^\r\n"'<>]*@[^\s"'<>]*|\b(?:sk-|xai-|github_pat_|gh[pousr]_)[A-Za-z0-9_-]+|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bxox[abprs]-[A-Za-z0-9-]+|\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"#).expect("redaction tokens")
+    });
+    static URL_VALUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\r\n"'<>]*:[^\r\n"'<>]*"#)
+            .expect("URL credentials")
+    });
+    static PEM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----").expect("private key marker")
+    });
+    let mut view = text.as_bytes().to_vec();
+    let mut spans: Vec<_> = (0..view.len()).map(|i| (i, i + 1)).collect();
+    for secret in &known {
         if !secret.is_empty() {
             ranges.extend(
-                text.match_indices(&secret)
-                    .map(|(start, value)| (start, start + value.len())),
+                text.match_indices(secret)
+                    .map(|(at, value)| (at, at + value.len())),
             );
         }
     }
-    static PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> = std::sync::LazyLock::new(|| {
-        [
-            r#"(?i)\b[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[ _-]?key|database_url)[a-z0-9_]*[\s"']*[:=]\s*"#,
-            r"(?i)authorization\s*:",
-            r"(?i)bearer\s+",
-        ]
-        .into_iter()
-        .map(|pattern| regex::Regex::new(pattern).expect("redaction pattern"))
-        .collect()
-    });
-    static CREDENTIALS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(
-            r#"(?i)[a-z][a-z0-9+.-]*://(?:\\.|[^\s/"'<>\\])*@(?:\\.|[^\s"'<>\\])*|\b(?:sk-|xai-|ghp_)[A-Za-z0-9_-]+"#,
-        )
-        .expect("credential pattern")
-    });
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        let original = line.trim_end_matches(['\r', '\n']);
-        let mut view = original.as_bytes().to_vec();
-        let mut spans: Vec<_> = (0..view.len()).map(|i| (i, i + 1)).collect();
-        for iteration in 0..=16 {
-            // Lossy conversion is local: invalid bytes cannot hide other fields.
-            let mut readable = String::new();
-            let mut mapped = Vec::new();
-            let mut cursor = 0;
-            while cursor < view.len() {
-                let (valid, invalid) = match std::str::from_utf8(&view[cursor..]) {
-                    Ok(_) => (view.len() - cursor, 0),
-                    Err(err) => (
-                        err.valid_up_to(),
-                        err.error_len()
-                            .unwrap_or(view.len() - cursor - err.valid_up_to()),
-                    ),
-                };
-                readable.push_str(
-                    std::str::from_utf8(&view[cursor..cursor + valid]).expect("valid prefix"),
-                );
-                mapped.extend_from_slice(&spans[cursor..cursor + valid]);
-                cursor += valid;
-                if invalid > 0 {
-                    readable.push('\u{fffd}');
-                    mapped.extend(std::iter::repeat_n(
-                        (spans[cursor].0, spans[cursor + invalid - 1].1),
-                        3,
-                    ));
-                    cursor += invalid;
+    for iteration in 0..=16 {
+        let (readable, mapped) = readable_redaction_view(&view, &spans);
+        for secret in &known {
+            if !secret.is_empty() {
+                for (start, value) in readable.match_indices(secret) {
+                    ranges.push((mapped[start].0, mapped[start + value.len() - 1].1));
                 }
             }
-            for pattern in PATTERNS.iter() {
-                for found in pattern.find_iter(&readable) {
-                    let start = mapped[found.start()].0;
-                    let value = mapped[found.end() - 1].1;
-                    ranges.push((offset + start, offset + redaction_end(original, value)));
-                }
-            }
-            for found in CREDENTIALS.find_iter(&readable) {
-                ranges.push((
-                    offset + mapped[found.start()].0,
-                    offset + mapped[found.end() - 1].1,
-                ));
-            }
-            let (next, next_spans) = decode_redaction_view(&view, &spans);
-            if next == view {
-                break;
-            }
-            if iteration == 16 {
-                ranges.push((offset, offset + original.len()));
-                break;
-            }
-            view = next;
-            spans = next_spans;
         }
-        offset += line.len();
+        let mut cursor = 0;
+        while let Some(found) = KEYS.find_at(&readable, cursor) {
+            let key = readable[found.start()..found.end()]
+                .trim_end_matches([' ', '\t', ':', '=', '\'', '"']);
+            if matches!(key, "PWD" | "OLDPWD") {
+                cursor = found.end();
+                continue;
+            }
+            let start = mapped[found.start()].0;
+            let value = mapped[found.end() - 1].1;
+            let header =
+                key.eq_ignore_ascii_case("cookie") || key.eq_ignore_ascii_case("set-cookie");
+            let end = redaction_end(&text, start, value, header);
+            ranges.push((start, end));
+            cursor = found.end();
+            while cursor < mapped.len() && mapped[cursor].0 < end {
+                cursor += 1;
+            }
+        }
+        for found in TOKENS.find_iter(&readable) {
+            ranges.push((mapped[found.start()].0, mapped[found.end() - 1].1));
+        }
+        for found in URL_VALUE.find_iter(&readable) {
+            if !readable[found.start()..found.end()].contains('@') {
+                ranges.push((mapped[found.start()].0, mapped[found.end() - 1].1));
+            }
+        }
+        let mut cursor = 0;
+        while let Some(capture) = PEM.captures_at(&readable, cursor) {
+            let found = capture.get(0).expect("marker");
+            let closing = format!("-----END {}-----", &capture[1]);
+            let end = readable[found.end()..]
+                .find(&closing)
+                .map_or(readable.len(), |at| found.end() + at + closing.len());
+            ranges.push((mapped[found.start()].0, mapped[end - 1].1));
+            cursor = end;
+        }
+        let (next, next_spans) = decode_redaction_view(readable.as_bytes(), &mapped);
+        if next == view {
+            break;
+        }
+        if iteration == 16 {
+            ranges.push((0, text.len()));
+            break;
+        }
+        view = next;
+        spans = next_spans;
     }
     ranges.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
@@ -844,15 +842,36 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
     text
 }
 
-// Delimiters are interpreted only in the original text. An escaped opening
-// quote has no reliable closing boundary at this level.
-fn redaction_end(line: &str, value: usize) -> usize {
-    let tail = &line[value..];
-    if tail.starts_with('\\')
-        || tail.starts_with('%')
-        || (tail.starts_with(['\'', '"']) && tail.contains('\\'))
-    {
-        return line.len();
+// Original offsets keep encoded delimiters from shortening a redaction.
+fn redaction_end(text: &str, start: usize, value: usize, header: bool) -> usize {
+    let line_end = text[value..].find('\n').map_or(text.len(), |n| value + n);
+    let tail = &text[value..];
+    if header {
+        return line_end;
+    }
+    let first_line = text[value..line_end].trim();
+    if first_line.is_empty() || first_line.starts_with(['|', '>']) {
+        let line_start = text[..start].rfind('\n').map_or(0, |n| n + 1);
+        let indent = text[line_start..]
+            .chars()
+            .take_while(|c| matches!(c, ' ' | '\t'))
+            .count();
+        let mut end = line_end;
+        while end < text.len() {
+            let next = end + 1;
+            let next_end = text[next..].find('\n').map_or(text.len(), |n| next + n);
+            let line = &text[next..next_end];
+            if !line.trim().is_empty()
+                && line.chars().take_while(|c| matches!(c, ' ' | '\t')).count() <= indent
+            {
+                break;
+            }
+            end = next_end;
+        }
+        return end;
+    }
+    if tail.starts_with(['\\', '%', '&']) {
+        return text.len();
     }
     let mut quote = None;
     let mut escaped = false;
@@ -865,15 +884,60 @@ fn redaction_end(line: &str, value: usize) -> usize {
             escaped = true;
         } else if let Some(open) = quote {
             if ch == open {
+                // Repeated decoding can change which quote closes a value.
+                if tail[..index].contains('\\') {
+                    return text.len();
+                }
                 return value + index + ch.len_utf8();
             }
         } else if index == 0 && matches!(ch, '\'' | '"') {
             quote = Some(ch);
-        } else if matches!(ch, ';' | ',' | '}' | ']' | '&') {
+        } else if ch == '\n' || matches!(ch, ';' | ',' | '}' | ']' | '&') {
             return value + index;
         }
     }
-    line.len()
+    text.len()
+}
+
+fn readable_redaction_view(
+    bytes: &[u8],
+    spans: &[(usize, usize)],
+) -> (String, Vec<(usize, usize)>) {
+    use unicode_normalization::UnicodeNormalization;
+    let mut readable = String::new();
+    let mut mapped = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let width = match bytes[cursor] {
+            0..=0x7f => 1,
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => 1,
+        };
+        let width = width.min(bytes.len() - cursor);
+        let length = if std::str::from_utf8(&bytes[cursor..cursor + width]).is_ok() {
+            width
+        } else {
+            1
+        };
+        let decoded = String::from_utf8_lossy(&bytes[cursor..cursor + length]);
+        let normalized: String = decoded.nfkc().collect();
+        mapped.extend(std::iter::repeat_n(
+            (spans[cursor].0, spans[cursor + length - 1].1),
+            normalized.len(),
+        ));
+        readable.push_str(&normalized);
+        cursor += length;
+    }
+    let normalized: String = readable.nfkc().collect();
+    if normalized != readable {
+        // Composition across characters uses a conservative original span.
+        let span = (spans[0].0, spans[spans.len() - 1].1);
+        mapped = vec![span; normalized.len()];
+        readable = normalized;
+    }
+    (readable, mapped)
 }
 
 fn decode_redaction_view(bytes: &[u8], spans: &[(usize, usize)]) -> (Vec<u8>, Vec<(usize, usize)>) {
@@ -882,7 +946,44 @@ fn decode_redaction_view(bytes: &[u8], spans: &[(usize, usize)]) -> (Vec<u8>, Ve
     let mut i = 0;
     while i < bytes.len() {
         let mut replacement = None;
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
+        if bytes[i] == b'&' {
+            if let Some(end) = bytes[i..]
+                .iter()
+                .take(33)
+                .position(|b| *b == b';')
+                .filter(|end| *end <= 32)
+            {
+                let entity = std::str::from_utf8(&bytes[i + 1..i + end]).unwrap_or("");
+                let ch = match entity {
+                    "equals" => Some('='),
+                    "colon" => Some(':'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "Tab" => Some('\t'),
+                    "NewLine" => Some('\n'),
+                    "nbsp" => Some(' '),
+                    "lowbar" => Some('_'),
+                    "sol" => Some('/'),
+                    "bsol" => Some('\\'),
+                    "semi" => Some(';'),
+                    "percnt" => Some('%'),
+                    "commat" => Some('@'),
+                    "period" => Some('.'),
+                    "num" => Some('#'),
+                    "hyphen" => Some('-'),
+                    _ => entity
+                        .strip_prefix("#x")
+                        .or_else(|| entity.strip_prefix("#X"))
+                        .and_then(|n| u32::from_str_radix(n, 16).ok())
+                        .or_else(|| entity.strip_prefix('#').and_then(|n| n.parse().ok()))
+                        .and_then(char::from_u32),
+                };
+                replacement = ch.map(|ch| (ch.to_string().into_bytes(), end + 1));
+            }
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(a), Some(b)) = (
                 (bytes[i + 1] as char).to_digit(16),
                 (bytes[i + 2] as char).to_digit(16),
@@ -890,10 +991,31 @@ fn decode_redaction_view(bytes: &[u8], spans: &[(usize, usize)]) -> (Vec<u8>, Ve
                 replacement = Some((vec![(a * 16 + b) as u8], 3));
             }
         } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'u' && i + 5 < bytes.len() {
+            if bytes[i + 1] == b'x' && i + 3 < bytes.len() {
+                if let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 4]) {
+                    replacement = u8::from_str_radix(hex, 16).ok().map(|ch| (vec![ch], 4));
+                }
+            } else if bytes[i + 1] == b'u' && i + 5 < bytes.len() {
                 if let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 6]) {
-                    if let Some(ch) = u32::from_str_radix(hex, 16).ok().and_then(char::from_u32) {
-                        replacement = Some((ch.to_string().into_bytes(), 6));
+                    if let Ok(code) = u32::from_str_radix(hex, 16) {
+                        let mut scalar = code;
+                        let mut consumed = 6;
+                        if (0xd800..=0xdbff).contains(&code)
+                            && bytes.get(i + 6..i + 8) == Some(b"\\u")
+                        {
+                            if let Some(low) = bytes
+                                .get(i + 8..i + 12)
+                                .and_then(|hex| std::str::from_utf8(hex).ok())
+                                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                                .filter(|low| (0xdc00..=0xdfff).contains(low))
+                            {
+                                scalar = 0x10000 + ((code - 0xd800) << 10) + low - 0xdc00;
+                                consumed = 12;
+                            }
+                        }
+                        if let Some(ch) = char::from_u32(scalar) {
+                            replacement = Some((ch.to_string().into_bytes(), consumed));
+                        }
                     }
                 }
             } else {
@@ -1481,6 +1603,116 @@ pub fn runtime_llm_env_present() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_fullwidth_colon() {
+        assert_eq!(redact("password：value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_fullwidth_equals() {
+        assert_eq!(redact("password＝value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_html_separator() {
+        assert_eq!(redact("password&#61;value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_hex_separator() {
+        assert_eq!(redact("password\\x3dvalue", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_yaml_block_scalar() {
+        assert_eq!(redact("password: |-\n  first\n  second", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_multiline_quote() {
+        assert_eq!(redact("password: \"first\nsecond\"", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_encoded_known_secret() {
+        assert_eq!(redact("value%2Dhidden", &["value-hidden"]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_url_userinfo_variant() {
+        assert_eq!(redact("https://user:pa ss@host", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_pem_private_key() {
+        assert_eq!(
+            redact(
+                "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----",
+                &[]
+            ),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_cookie_header() {
+        assert_eq!(redact("Cookie: a=value; b=other", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_json_auth() {
+        assert_eq!(redact("{\"auth\":\"value\"}", &[]), "{\"[redacted]}");
+    }
+
+    #[test]
+    fn redact_credentials_setting() {
+        assert_eq!(redact("credentials=value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_chinese_password() {
+        assert_eq!(redact("密碼：value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_aws_access_key() {
+        assert_eq!(redact("AKIA1234567890ABCDEF", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_github_pat() {
+        assert_eq!(redact("github_pat_abcdef123456", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_slack_token() {
+        assert_eq!(redact("xoxb-123456-abcdef", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_compact_token_format() {
+        assert_eq!(
+            redact("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature", &[]),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_pwd_path() {
+        assert_eq!(
+            redact("PWD=/tmp/project\nOLDPWD=/tmp/other", &[]),
+            "PWD=/tmp/project\nOLDPWD=/tmp/other"
+        );
+    }
+
+    #[test]
+    fn redact_line_after_multiline_value() {
+        assert_eq!(
+            redact("password: >\n  first\n  second\nmessage: retained", &[]),
+            "[redacted]\nmessage: retained"
+        );
+    }
 
     #[test]
     fn redact_json_escaped_opening_quote() {

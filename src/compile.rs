@@ -2100,13 +2100,15 @@ const SECURITY_TERMS: &[&str] = &[
 /// Returns (affirmed, ambiguous, directly negated). Negators belong only to
 /// the nearest following security term; ambiguous language retains the requirement.
 fn keyword_reading(text: &str, word: &str) -> (bool, bool, bool) {
-    let (affirmed, ambiguous, negative, _) = keyword_occurrences(text, word);
+    let Ok(text) = security_prose(text) else {
+        return (true, true, false);
+    };
+    let (affirmed, ambiguous, negative, _) = keyword_occurrences(&text, word);
     (affirmed, ambiguous, negative)
 }
 
 /// Returns requirement presence, ambiguity, direct negation, and unambiguous affirmation.
 fn keyword_occurrences(text: &str, word: &str) -> (bool, bool, bool, bool) {
-    let text = security_prose(text).unwrap_or_else(|_| text.to_string());
     static NEGATOR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
             r"(?:\b(?:not|no|never|without|cannot|non)\b|\b[a-z]+n't\b|[唔不冇無毋非])",

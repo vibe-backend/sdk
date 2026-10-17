@@ -29,17 +29,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Fixed
 
-- Security checks use original Chinese and English prose, retain ambiguous requirements with confirmation warnings, validate Markdown fences, and report structured declaration conflicts (PM decision 2026-10-16, supersedes #37 English-only rules).
-- LLM dumps redact complete escaped quoted values, escaped spaces, DSN credentials and URL-encoded connection strings.
-
-- LLM dumps redact password settings and credential-bearing URLs and connection strings, preserve existing directory permissions, and refuse symlink components inside the project.
-- Calls without an explicit LLM budget share an environment-configured counter across calls.
-- The direct `libc` dependency is restricted to Unix targets.
-
-- Security keyword checks require support in the original source, including Chinese wording; translations cannot supply support.
-- LLM dump writes refuse symbolic links, use private permissions and redact known keys, tokens and authorization headers.
-- `LLM_FORMAT_RETRIES` accepts only ASCII digits within its supported range and rejects invalid values.
-- Public LLM requests without an explicit budget receive a default bound.
+- **Compile validation and LLM handling (#92):** Security checks use original Chinese and English prose, retain ambiguous requirements with confirmation warnings, validate Markdown fences, and report structured declaration conflicts (PM decision 2026-10-16, supersedes #37 English-only rules); translations cannot supply support. LLM dumps redact decoded secrets, multi-line values, credential-bearing URLs, private keys, tokens and authorization headers, preserve directory permissions, and refuse symbolic links. `LLM_FORMAT_RETRIES` accepts only ASCII digits within its supported range. Calls without an explicit LLM budget share an environment-configured counter. The direct `libc` dependency is restricted to Unix targets.
 - **Refresh 家族限流（決定 147，文件更新）：** 超過上限會要求重新登入。
 
 - **EC signing keys checked at load (#257):** ES256 private keys (PEM and DER) are now checked when they are loaded: PKCS#8 and SEC1 PEMs (PKCS#8 for DER) must name P-256, included public points must lie on the curve, the encoding must cover the input exactly (no trailing data) and the private scalar must be in `1..n-1`. Such keys are refused at startup instead of being accepted or failing at the first signature.
