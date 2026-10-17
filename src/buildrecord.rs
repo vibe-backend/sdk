@@ -26,6 +26,8 @@ pub struct BuildRecord {
     /// Lock path (relative to the project) -> `sha256:<hex>` of its text.
     pub locks: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub compilers: BTreeMap<String, crate::lock::LlmStamp>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub translations: BTreeMap<String, crate::lock::TranslationStamp>,
 }
 
@@ -44,7 +46,17 @@ pub fn write_with_translations(
     locks: BTreeMap<String, String>,
     translations: BTreeMap<String, crate::lock::TranslationStamp>,
 ) -> Result<(), String> {
+    write_with_compilers(root, locks, translations, BTreeMap::new())
+}
+
+pub fn write_with_compilers(
+    root: &Path,
+    locks: BTreeMap<String, String>,
+    translations: BTreeMap<String, crate::lock::TranslationStamp>,
+    compilers: BTreeMap<String, crate::lock::LlmStamp>,
+) -> Result<(), String> {
     let record = BuildRecord {
+        compilers,
         version: VERSION,
         locks,
         translations,
@@ -95,10 +107,12 @@ mod tests {
         let old = r#"{"version":1,"locks":{}}"#;
         let record: super::BuildRecord = serde_json::from_str(old).unwrap();
         assert!(record.translations.is_empty());
+        assert!(record.compilers.is_empty());
         assert_eq!(serde_json::to_string(&record).unwrap(), old);
         let old = r#"{"commit":"abc","locks":[],"security_items":[],"version":""}"#;
         let provenance: crate::manifest::Provenance = serde_json::from_str(old).unwrap();
         assert!(provenance.translations.is_empty());
+        assert!(provenance.compilers.is_empty());
         assert_eq!(serde_json::to_string(&provenance).unwrap(), old);
     }
 }

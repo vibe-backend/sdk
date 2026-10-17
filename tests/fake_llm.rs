@@ -124,9 +124,13 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
     let text = fs::read_to_string(root.join("models/product/product.lock.md")).unwrap();
     let doc = parse_lock(&text).unwrap();
     assert_eq!(doc.meta.source_type, SourceType::Natural);
-    assert_eq!(doc.meta.compiler.llm_provider, "openai");
-    assert!(doc.meta.compiler.endpoint_private);
-    assert_eq!(doc.meta.compiler.model_snapshot, "gpt-test-2026-01-01");
+    let record: vibe::buildrecord::BuildRecord =
+        serde_json::from_str(&fs::read_to_string(root.join(vibe::buildrecord::PATH)).unwrap())
+            .unwrap();
+    let stamp = &record.compilers["models/product/product.lock.md"];
+    assert_eq!(stamp.llm_provider, "openai");
+    assert!(stamp.endpoint_private);
+    assert_eq!(stamp.model_snapshot, "gpt-test-2026-01-01");
     assert!(doc
         .meta
         .security_items

@@ -6,7 +6,7 @@
 >
 > 核心架構：所有定義（model、method、api、pipeline、provider、migration）嘅 source `.md` 一律用自然語言寫。編譯流程係「自然語言 source `.md` → 結構化 lock markdown（`{name}.lock.md`）→ 簽名 manifest」。lock md 係 runtime 唯一依據，runtime 永遠唔會解譯自然語言。
 >
-> v1.4 起嘅內容：安全設定照用自然語言寫，唔強制結構化 frontmatter，防線改為「獨立 deterministic 驗證器 + 收緊嘅人手 review」（v1.8 起 SDK 唔再做人手 review，見決定 77、78 同 9C）；編譯器冇工具、網絡只准連編譯用 LLM endpoint；model snapshot pin 死同 compiler-hash；確認綁定 commit；收緊 public 寫入；禁止 DDL／TRUNCATE；token 簽發用 capability 旗標；新增緊急 kill switch；public 最低回應耗時改為固定值。
+> v1.4 起嘅內容：安全設定照用自然語言寫，唔強制結構化 frontmatter，防線改為「獨立 deterministic 驗證器 + 收緊嘅人手 review」（v1.8 起 SDK 唔再做人手 review，見決定 77、78 同 9C）；編譯器冇工具、網絡只准連編譯用 LLM endpoint；model snapshot pin 死，compiler-hash 只計編譯器版本同 prompt 版本（決定 174）；確認綁定 commit；收緊 public 寫入；禁止 DDL／TRUNCATE；token 簽發用 capability 旗標；新增緊急 kill switch；public 最低回應耗時改為固定值。
 >
 > v1.5 定稿：refresh token 輪換、密碼底線、帳戶鎖定、固定回應耗時 300ms／500ms、私隱刪除（crypto-shredding 加匿名化）同所有營運數值全部定案。
 >
@@ -18,7 +18,7 @@
 
 ### v1.8（草稿，2026-10-14）
 
-- 補編決定 150–173（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
+- 補編決定 150–174（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 compiler-hash 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory`）
 - 新增 `vibe build`：一個指令做晒編譯、驗證同 manifest（類似 `nest build`），冇 reviewer 步驟（審核由 Git 平台設定負責，決定 76，見 2C.3）。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext）
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
@@ -79,7 +79,7 @@
 | --- | --- | --- |
 | 16 | （v1.8 由決定 112 修訂：高風險欄位一定要喺 frontmatter 宣告）安全設定照用自然語言寫，**唔強制**結構化 frontmatter；防線係 frontmatter 高風險宣告（決定 112）、獨立驗證器、決定 114 deterministic policy、決定 113 attestation（build once, promote，決定 118；LLM 輸出唔決定性，所以冇重編比對）同 runtime 限制（v1.8 決定 77：SDK 唔再做人手 review，已確認（產品經理 2026-10-14））。 | 2.2、2A.5、2A.7 |
 | 17 | 編譯器輸出一定要通過獨立、deterministic 嘅驗證器（唔靠 LLM 自律）；編譯器冇任何工具權限，網絡只准連編譯用 LLM endpoint 嘅 host（v1.7 決定 57 修訂）；source 入面似指令嘅句子（prompt injection 模式）出 warning 並喺 PR 高亮。 | 2A.7、10.9 |
-| 18 | 編譯用嘅 model pin 死 snapshot；compiler-hash（model snapshot + prompt + 編譯器版本）寫入 lock；（v1.8 決定 113、117：唔再做重編比對，部署靠 attestation 同決定 114 policy）；會改變輸出嘅 minor 升級當 major 處理。 | 2A.1、2A.6 |
+| 18 | 編譯用嘅 model pin 死 snapshot；compiler-hash（決定 174：只計 prompt + 編譯器版本）寫入 lock；（v1.8 決定 113、117：唔再做重編比對，部署靠 attestation 同決定 114 policy）；會改變輸出嘅 minor 升級當 major 處理。 | 2A.1、2A.6 |
 | 19 | （v1.8 由決定 78 修訂，已確認（產品經理 2026-10-14））安全項目由驗證器 deterministic 抽出，寫入 lock 同部署報告做資訊性高亮；唔再要求逐項確認人、兩個非作者或者 PR 數量上限；PR 同部署報告照樣顯示有效權限摘要。 | 2A.5、10.10 |
 | 20 | 「係咪 structured」由 deterministic parser 判斷（v1.8 決定 77 修訂，已確認（產品經理 2026-10-14）：唔再影響確認，只決定編譯使唔使 call LLM）。 | 2A.5 |
 | 21 | Public 寫入收緊：每租戶每日寫入配額（強制）；建立資料嘅 endpoint 要 captcha 或者 proof-of-work；一律 audit-log；配額用完只封鎖 public 寫入。 | 7.2 |
@@ -163,7 +163,7 @@
 
 | # | 決定 | 影響章節 |
 | --- | --- | --- |
-| 57 | 初始化 project／SDK 時，用戶揀編譯用 LLM：`LLM_PROVIDER` 係 `openai`（預設，涵蓋所有 OpenAI-compatible endpoint 包括 Ollama、LM Studio、vLLM）、`anthropic` 或者 `gemini`；只喺部署／編譯時用。中立變數 `LLM_BASE_URL`、`LLM_API_KEY`（必填）、`LLM_MODEL`（必填，pin 死 snapshot）；`OPENAI_*` 只做 `openai` 嘅別名，`LLM_*` 優先，值衝突 error；選填 `LLM_TIMEOUT`、`LLM_MAX_RETRIES`、`LLM_SEED`。本地開發准 http loopback，其他內網要 `LLM_ALLOW_PRIVATE_HOST=true`；CI／production 一定 https 公開 host，本地 lock 唔可以部署。Key 永遠唔寫入 repo、lock、manifest、log、部署報告或者錯誤訊息；runtime 唔可以有任何 `LLM_*`／`OPENAI_*`。沙盒網絡只准連 endpoint host；provider、host、model 寫入 lock 並計入 compiler-hash，改任何一樣都當 major。 | 2A.1、2A.6、2A.7、2A.8、9B、10.1、14 |
+| 57 | 初始化 project／SDK 時，用戶揀編譯用 LLM：`LLM_PROVIDER` 係 `openai`（預設，涵蓋所有 OpenAI-compatible endpoint 包括 Ollama、LM Studio、vLLM）、`anthropic` 或者 `gemini`；只喺部署／編譯時用。中立變數 `LLM_BASE_URL`、`LLM_API_KEY`（必填）、`LLM_MODEL`（必填，pin 死 snapshot）；`OPENAI_*` 只做 `openai` 嘅別名，`LLM_*` 優先，值衝突 error；選填 `LLM_TIMEOUT`、`LLM_MAX_RETRIES`、`LLM_SEED`。本地開發准 http loopback，其他內網要 `LLM_ALLOW_PRIVATE_HOST=true`；CI／production 一定 https 公開 host，本地 lock 唔可以部署。Key 永遠唔寫入 repo、lock、manifest、log、部署報告或者錯誤訊息；runtime 唔可以有任何 `LLM_*`／`OPENAI_*`。沙盒網絡只准連 endpoint host；決定 174：provider、host、model 寫入 build record 同 manifest provenance 嘅 compilers stamp，唔計入 compiler-hash。 | 2A.1、2A.6、2A.7、2A.8、9B、10.1、14 |
 
 ### 0.9 v1.7 review 修訂（決定 58 起）
 
@@ -177,7 +177,7 @@
 | 61 | Refresh 寬限期精確定義：DB 只存 hash；寬限期內用返舊 token，平台用 `used_at` 判斷，撤銷上一次發出嘅子 token，再喺同一家族發一組新 token；唔儲存、唔重發明文。並行請求喺第一個請求處理中出示同一 token，會收到可重試嘅 503 TX_CONFLICT（retryable: true，唔清 cookie）。第一個請求完成之後，喺寬限期（10 秒）內再出示，按寬限期規則處理；超過寬限期先當重用，撤銷整個 family。每個舊 token 最多重發一次（`used_at` 加 `grace_reissued_at`）；寬限期內第二次再用即當重用，撤銷成個家族。 | 已確認（產品經理 2026-10-17） | 4A.1 |
 | 62 | `sign-token` 嘅 `tenant_id` 只有一個來源：平台由 slug（public）或者已驗證 token（auth）解析出嚟嘅 `ctx.tenant_id`；永遠唔由 client 或者 method 傳入，亦唔由 `users` 表讀。 | 已確認 | 12.6、12.8 |
 | 63 | `mail_worker` 加入 7.1 平台專用 role 表。 | 已確認 | 7.1 |
-| 64 | `compiler-hash` 只有一個標準定義（2A.1），包括 seed 同實際送出嘅決定性參數。 | 已確認 | 2A.1、2A.6、10.1 |
+| 64 | `compiler-hash` 只有一個標準定義（2A.1），決定 174：只包括 compiler.version 同 prompt-version，seed 同實際送出嘅參數移去 build record 同 manifest provenance。 | 已確認 | 2A.1、2A.6、10.1 |
 | 65 | 補齊 grammar：`rate-limit` 參數 schema、`## Order` 准用值、`subject-key` 寫法、`token-revoke` 參數。 | 已確認 | 4.3、4.4、4A.1、12.10 |
 | 66 | 非阻塞修正：CI 範例 pin `vibe` 版本同用 SHA pin action；Ollama 記 tag（唔係 digest）；token 類型統一；`email-outbox.enqueue` 嘅 `template` 寫入 Signature；註冊耗時用固定下限＋固定工作量（唔受 argon2 排隊影響）。 | 已確認 | 2A.8.3、2A.8.8、12.11 |
 | 67 | 防預先註冊搶帳戶：公開註冊只收 email（同 name），唔收密碼；驗證連結帶用戶去「設定密碼」一步，一個 UPDATE 同時設 password 同 `email_verified_at`（同決定 69 邀請共用同一個 method `user.complete-verification`）。未驗證 email 再註冊只會輪換驗證 token（舊 token 即時失效），永遠唔改任何 credential。驗證成功即撤銷該用戶所有 session（refresh 家族）。未驗證帳戶喺 `email_verify_expires_at` 過咗之後由平台匿名化並 soft delete（唔 DELETE，決定 13）。決定 56 入面「註冊一律做 `hash-password`」改為喺設定密碼一步做（56 狀態唔變）。 | 已確認（產品經理 2026-10-14） | 12.11 |
@@ -284,7 +284,7 @@
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
-### 0.14 v1.8 2026-10-17 決定（決定 150–173，產品經理已批准 2026-10-17）
+### 0.14 v1.8 2026-10-17 決定（決定 150–174，產品經理已批准 2026-10-17）
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
@@ -312,6 +312,7 @@
 | 171 | Errors 嘅 code 同 from 只准 runtime 公開錯誤碼、被呼叫 method Signature errors／model CRUD errors，同本 feature validate fail；未知碼列出排序後嘅允許清單並 repair，structured 都適用。CRUD 唯一衝突用 UNIQUE_VIOLATION。 | 已批准（產品經理 2026-10-17） | 2A.4、2A.6、8、12.2 |
 | 172 | Transform in 平面 object 按 Request row 次序排 key（同名或 req.field 對應），其餘按 byte 字典序；冒號後一個空格、逗號後一個空格，expression 字串外空白正規化（包括 req.body.x），重複 key 報錯，唔能解析就保留原值。structured 同自然語言都適用；Transform out expression 同 respond value 相同就寫 transform.out。自然語言 model table 若等於 id_snake 或固定英文複數（不分大小寫），一律寫複數，其餘保留。 | 已批准（產品經理 2026-10-17） | 2A.4、2A.6 |
 | 173 | 未知 capability model 同 LLM_SEND_SAMPLING=0 嘅 sampling warning 合計每個 process 最多一次，跨 compile、repair 同 keep-going 共用。 | 已批准（產品經理 2026-10-17） | 2A.8.2 |
+| 174 | Lock 唔包含任何開發者環境資料；compiler 只留 name、version；LLM stamp 移去 build record 同 manifest provenance，compiler-hash 只計 compiler.version 同 prompt-version，PROMPT_VERSION 升到 prompt-10。決定 174：`scripts/vibe-install.sh` 接受 `vX.Y.Z` 同 `vX.Y.Z-rc.N` pre-release tags；checksum 同 attestation 驗證不變：signer workflow 係 `release.yml`，source ref 係 `refs/tags/v<version>`，issuer 係 `https://token.actions.githubusercontent.com`；決定 118 不變。 | 已批准（產品經理 2026-10-17） | 2A.1、2A.6、2A.8、10.1 |
 
 ## 1. 目錄同命名
 
@@ -508,7 +509,7 @@ source-type: natural               # natural | structured
 dependencies:                      # 所有依賴 source／lock 嘅 hash，按 id 排序
   - { id: user, kind: model, hash: sha256:<...> }
   - { id: main, kind: provider, hash: sha256:<...> }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: { temperature: 0, top_p: 1, seed: 0 } }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:<見下面標準定義>
 build-mode: release                # release | dev；dev lock 唔可以部署（決定 75）
 security-items:                    # 驗證器 deterministic 抽出，資訊性（決定 78）
@@ -519,17 +520,8 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 - `source-hash`：source 先正規化（統一換行、去行尾空白、去 BOM、合併多餘空行），再計 sha256。淨係改排版而正規化內容唔變，hash 就唔變，**唔會重新編譯**。
 - `dependencies`：lock 用到嘅所有其他定義（例如 method 依賴 model 同 provider、api 依賴 method、`_definition`、`_version` 同 pipeline）。任何一個依賴嘅 hash 變咗，lock 都當過時，要重新編譯。
 - `source-type: structured` 只限 source 完全由結構化 frontmatter 同結構化列點組成、冇自由文字；判斷由平台嘅 deterministic parser 做，唔由 LLM 編譯器判斷（決定 20）。
-- `compiler-hash`（標準定義，全文只此一個，決定 18、57、64）：`sha256` of 以下欄位按呢個次序、用 canonical JSON（key 排序、UTF-8、冇空白）串成嘅字串：
-  1. `llm-provider`
-  2. `endpoint-host`（只記 host，例如 `api.openai.com`，唔記 path／query）
-  3. `endpoint-private`
-  4. `model-snapshot`（provider 回報嘅 model id／snapshot id；Ollama 係 tag，見 2A.8.3）
-  5. `llm-seed`（`LLM_SEED` 嘅值；就算 model 唔支援 seed 冇送出，都照計）
-  6. `sent-params`（adapter 實際送出嘅決定性參數，見 2A.8.6）
-  7. `prompt-version`
-  8. `compiler.version`
-
-  永遠唔記 key。2A.6、2A.8、10.1 提到 compiler-hash 一律指呢個定義。
+- `compiler-hash`（標準定義，決定 174）：`sha256` of canonical JSON（key 排序、UTF-8、冇空白），只包含 `compiler.version` 同 `prompt-version`。唔受任何 LLM 設定影響。
+- 決定 174：`compiler` 只寫 `name` 同 `version`。連 model id 都唔留喺 lock，因為 `LLM_MODEL` 係每位開發者嘅設定，同一 source 唔應該因為機器設定唔同而產生唔同 lock。Model、provider、endpoint、seed 同實際送出參數嘅重現證據，按 lock path 記喺 `.vibe/build-record.json` optional `compilers` map 同 manifest provenance 同名 map，欄位係 `llm-provider`、`model-snapshot`、`endpoint-host`、`endpoint-private`、`llm-seed`、`sent-params`；deterministic lock 冇 entry。唔記 key、URL path、username 或其他環境值。舊 compiler 環境欄位仍然 parse 得，但忽略、唔再 render；validate 每個 lock 出一次 decision 174 warning，要求執行 `vibe compile`。`PROMPT_VERSION` 係 `prompt-10`。
 - 決定 165：同一 source、同一 `PROMPT_VERSION` 同同一結構，一定產生 byte-identical lock；lock 唔可以包含任何每次 run 都可能改變嘅欄位。`translation` stamp 只記喺 build record 同 manifest provenance，唔寫入 lock。舊 lock 嘅 `translation:` 仍然讀得，parse 後忽略，render 唔再寫；validate 每個舊 lock 警告一次："lock contains a `translation` field, which is no longer written (decision 165); run `vibe compile` to refresh it"。Lock format 改動會將 `PROMPT_VERSION` 升到 `prompt-6`，令舊 lock 過時並重新編譯。
 - manifest JSON 用 snake_case：lock 嘅 `build-mode` 對應 manifest 嘅 `build_mode`（`dev`／`release`；冇呢個欄位當 `release`）。
 - `build-mode`：`vibe manifest` 寫 `release`，`vibe manifest --dev` 寫 `dev`；`dev` lock 永遠唔可以入 release manifest（決定 75）。
@@ -640,14 +632,14 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 
 ### 2A.6 重新編譯規則
 
-決定 169–172：compile prompt 版本係 `prompt-9`；prompt 提供 canonical create feature 同 runtime 允許錯誤碼清單。Repair loop 喺 model 仲答緊時檢查 writes 宣告、缺少寫入／讀取 step、冇 constant response 同未知 Errors 碼，提示加返 method step 或改用已知碼。
+決定 169–172、174：compile prompt 版本係 `prompt-10`；prompt 提供 canonical create feature 同 runtime 允許錯誤碼清單。Repair loop 喺 model 仲答緊時檢查 writes 宣告、缺少寫入／讀取 step、冇 constant response 同未知 Errors 碼，提示加返 method step 或改用已知碼。
 
 - 決定 162：每次改 compile prompt 文字（system prompt、prompt guide、examples）一定要 bump `PROMPT_VERSION`；佢計入 compiler-hash 同 LLM cache key。今次係 `prompt-5`，舊 lock 要重新編譯；hash 測試記錄版本同所有 kind／scope 嘅 prompt SHA-256，改 prompt 後要一齊更新。
 
 - 只有 `source-hash` 或者任何 `dependencies` hash 變咗先會重新編譯；source 改咗但正規化 hash 唔變就唔會重新編譯。
 - 編譯用嘅 model 一定 pin 死 snapshot（唔准用會浮動嘅別名）；`compiler-hash` 按 2A.1 標準定義計，寫入每個 lock（決定 18、64）。
-- 編譯器 major version 升級（例如 1.x → 2.0）、或者 model snapshot／prompt 改咗：所有 lock 強制重新編譯，即使 source hash 冇變；release job 由 source build、通過決定 114 policy 同 attestation 先可以部署（決定 77、113、117）。建議用獨立 PR 做升級；release summary 會列出同上一個已部署版本相比嘅高風險變化（決定 117）。
-- 編譯器 minor／patch 升級：唔會強制重新編譯；但平台會用 golden corpus 對比新舊輸出，**只要任何輸出唔同，該升級就當 major 處理**。
+- 編譯器版本升級（包括 major、minor、patch）、或者 prompt 版本改咗（決定 174：compiler-hash 只計編譯器版本同 prompt 版本，model snapshot 改動唔會令 lock 過時）：所有 lock 強制重新編譯，即使 source hash 冇變；release job 由 source build、通過決定 114 policy 同 attestation 先可以部署（決定 77、113、117）。建議用獨立 PR 做升級；release summary 會列出同上一個已部署版本相比嘅高風險變化（決定 117）。
+- 編譯器 minor／patch 升級（決定 174）：版本改動會改變 compiler-hash，舊 lock 要重新編譯；平台仍然會用 golden corpus 對比新舊輸出，**只要任何輸出唔同，該升級就當 major 處理**。
 - Golden corpus 由平台編譯器團隊維護，最少 500 個案例，覆蓋所有 kind 同所有安全項目；項目可以喺 `.golden/` 加自己嘅案例，一樣會參與比對（決定 35）。
 - Model snapshot 淘汰（決定 35）：平台承諾宣布淘汰後最少保留 12 個月；項目有 90 日遷移窗口，窗口內舊 lock 照常有效、照常可以部署；窗口完結前未遷移，部署會被封鎖（runtime 已部署嘅 manifest 照常運作）。
 - 編譯一定要盡量 deterministic：固定 prompt、固定 snapshot；`temperature`、`top_p`、`seed` 等參數只喺 model capability 支援時先送固定值（決定 58，見 2A.8.6），唔支援就唔送，唔可以強送。決定性只係盡力而為，只用嚟減少 release summary 入面嘅無謂變化；唔做重編比對，部署安全靠決定 113 attestation 同決定 114 policy（決定 117）。
@@ -704,30 +696,30 @@ v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`（決定 57�
 | `LLM_PROVIDER` | 否 | `openai`、`anthropic`、`gemini`；預設 `openai` |
 | `LLM_BASE_URL` | 否 | 預設用上表嘅 provider base URL；規則見 2A.8.4 |
 | `LLM_API_KEY` | 是 | 只經環境變數、`.env`（已 gitignore）或者 CI secret 提供；本地 API 唔需要 key 時可以用任意占位值 |
-| `LLM_MODEL` | 是 | 一定係 provider 承諾唔會浮動嘅 model id／snapshot id（決定 58）。判斷唔靠有冇日期後綴：provider 文件列明會浮動嘅別名（例如 `latest`、`default`、`*-latest`、OpenAI 冇日期嘅 alias）一律拒絕；provider 文件列明係固定 snapshot 嘅冇日期 id（例如 Anthropic 4.6 代之後嘅 id）可以用。Lock 記錄 provider 回報嘅 model id（`modelReported`），唔係用戶輸入。本地 API 用完整 tag（例如 `qwen2.5-coder:32b-instruct-q8_0`），唔准 `:latest` |
+| `LLM_MODEL` | 是 | 一定係 provider 承諾唔會浮動嘅 model id／snapshot id（決定 58）。判斷唔靠有冇日期後綴：provider 文件列明會浮動嘅別名（例如 `latest`、`default`、`*-latest`、OpenAI 冇日期嘅 alias）一律拒絕；provider 文件列明係固定 snapshot 嘅冇日期 id（例如 Anthropic 4.6 代之後嘅 id）可以用。Build record 同 manifest provenance 嘅 `compilers` stamp 記錄 provider 回報嘅 model id（`modelReported`）（決定 174），唔係用戶輸入。本地 API 用完整 tag（例如 `qwen2.5-coder:32b-instruct-q8_0`），唔准 `:latest` |
 | `LLM_TIMEOUT` | 否 | 單次請求超時，預設 60s，上限 300s |
 | `LLM_MAX_RETRIES` | 否 | 網絡錯誤重試次數，預設 2，上限 5；重試唔會改變輸入 |
-| `LLM_SEED` | 否 | model capability 支援 seed 先送，預設 `0`；冇送出都照計入 compiler-hash（2A.1） |
+| `LLM_SEED` | 否 | model capability 支援 seed 先送，預設 `0`；記喺 build record 同 manifest provenance 嘅 `compilers` stamp，唔計入 compiler-hash、唔會令 lock 過時（決定 174，2A.1） |
 | `LLM_ALLOW_PRIVATE_HOST` | 否 | 預設 `false`；只喺本地開發用（見 2A.8.4） |
 
 - 別名：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL` 只喺 `LLM_PROVIDER=openai` 時接受，分別等於 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`。
 - 優先次序：`LLM_*` 優先；只設咗別名就用別名。兩邊都有設而且值唔同，即刻 error（唔會靜靜揀一個）。
 - `LLM_PROVIDER` 唔係 `openai` 但設咗任何 `OPENAI_*`，error。
-- Ollama 嘅 API 只回報 tag，唔回報 model 檔 digest：lock 嘅 `model-snapshot` 記 tag。注意同一個 tag 可以被重新 pull 換成另一個檔，所以本地 lock 一律唔可以部署（2A.8.4）；可以部署嘅 lock 一定喺 CI 用公開 provider 編譯。
+- Ollama 嘅 API 只回報 tag，唔回報 model 檔 digest：build record 嘅 `compilers` stamp 記 tag（決定 174）。注意同一個 tag 可以被重新 pull 換成另一個檔，所以本地 lock 一律唔可以部署（2A.8.4）；可以部署嘅 lock 一定喺 CI 用公開 provider 編譯。
 
 #### 2A.8.4 Endpoint 地址規則（包括本地 API）
 
-| 情況 | 准用 | 記錄 |
+| 情況 | 准用 | Build-record compilers stamp（決定 174） |
 | --- | --- | --- |
 | 公開 host | 一定 `https://` | `endpoint-private: false` |
 | 本地 loopback（`localhost`、`127.0.0.1`、`::1`） | 只限本地開發；准 `http://` | `endpoint-private: true` |
 | 其他內網地址（例如 `10.x`、`192.168.x`、`*.internal`） | 只限本地開發，而且要 `LLM_ALLOW_PRIVATE_HOST=true` | `endpoint-private: true` |
 
 - CI 同 production 編譯一定要 `https://` 加公開 host；喺 CI 偵測到 loopback、內網地址或者 `LLM_ALLOW_PRIVATE_HOST=true`，即刻 error。
-- 用本地或者內網 host 編譯出嚟嘅 lock（`endpoint-private: true`）**唔可以部署去 production**；一定要喺 CI 用公開 https endpoint 重新編譯，再經 CI 決定性比對同正常確認，先可以部署。
+- 用本地或者內網 host 編譯出嚟嘅 lock（build-record stamp 嘅 `endpoint-private: true`，決定 174）**唔可以部署去 production**；一定要喺 CI 用公開 https endpoint 重新編譯，再經 CI 決定性比對同正常確認，先可以部署。
 - 本地 lock 只可以用嚟本地試；佢係 gitignore 嘅 build 輸出（決定 117），部署只用 release job 用 release 設定 build 嘅 artifact（決定 113）。
 
-- `LLM_ALLOW_PRIVATE_HOST=true` 亦適用於公開名稱但 DNS 解析到非公開地址嘅 host（例如 fake-IP proxy）；lock 記 `endpoint-private: true`；CI／production 照樣 error。
+- `LLM_ALLOW_PRIVATE_HOST=true` 亦適用於公開名稱但 DNS 解析到非公開地址嘅 host（例如 fake-IP proxy）；build record 記 `endpoint-private: true`（決定 174）；CI／production 照樣 error。
 
 #### 2A.8.5 Key 保護
 
@@ -785,16 +777,16 @@ interface LlmAdapter {
 ```
 
 - adapter 只發一個非 streaming 請求，唔准送 `tools`、function calling 或者任何會令 provider 執行動作嘅參數；request 參數全部由 adapter 按 `modelCapabilities` 固定，用戶唔可以覆蓋（決定 58）。
-- `modelCapabilities` 某參數回 `null`／`false` 就完全唔送嗰個參數，唔可以送 model 會拒絕嘅值；實際送出嘅參數集寫入 lock `compiler.sent-params` 並計入 compiler-hash。
+- `modelCapabilities` 某參數回 `null`／`false` 就完全唔送嗰個參數，唔可以送 model 會拒絕嘅值；實際送出嘅參數集寫入 build record 同 manifest provenance 嘅 `compilers` stamp，唔計入 compiler-hash（決定 174）。
 - capability 表冇登記嘅 model：只送 provider 必填參數，其他決定性參數一律唔送，並出 warning。
-- `modelReported`（provider 回報嘅 model id）係 lock `model-snapshot` 嘅來源；佢同 `LLM_MODEL` 唔一致（例如 provider 將別名解析成另一個 id）就 error。
+- `modelReported`（provider 回報嘅 model id）係 build record `compilers` stamp 嘅 `model-snapshot` 來源（決定 174）；佢同 `LLM_MODEL` 唔一致（例如 provider 將別名解析成另一個 id）就 error。
 - 新增 provider 要改 SDK 同驗證器，屬平台改動，唔可以喺 project 內加。
 
 #### 2A.8.7 同其他規則嘅關係
 
 - 2A.7 沙盒：網絡只准 egress 去 `LLM_BASE_URL`（或者 provider 預設 base URL）嘅 host；冇工具規則不變。
-- 2A.1／2A.6：lock 嘅 `compiler` 記 `llm-provider`、`endpoint-host`、`endpoint-private` 同 `model-snapshot`，全部計入 `compiler-hash`；永遠唔記 key。
-- 改 provider、endpoint host 或者 model：當 major 改動，所有 lock 強制重新編譯，release job 由 source build、通過決定 114 policy 同 attestation 先可以部署（決定 77、113、117）。
+- 2A.1／2A.6（決定 174）：LLM stamp 只記喺 build record 同 manifest provenance，唔寫入 lock，唔計入 compiler-hash；永遠唔記 key。
+- 決定 174：改 provider、endpoint host 或者 model 唔會令 lock 過時，亦唔改 compiler-hash；改動記喺 build record 同 manifest provenance 嘅 `compilers` stamps。Release job 仍然喺 CI 由 source build、通過決定 114 policy 同 attestation 先可以部署（決定 77、113、117）。
 - 只改 base URL 嘅 path（host 唔變）唔當 major，但 CI 決定性比對照樣要通過。
 - 唔再做 CI 重編比對（決定 113、117）；2A.8.2 決定性設定照送，只為減少 release summary 入面嘅無謂變化。
 
@@ -830,6 +822,7 @@ jobs:
         run: vibe manifest                       # 編譯 + 驗證 + policy 檢查 + manifest（決定 76、114、117）
 ```
 
+- 決定 174：`scripts/vibe-install.sh` 接受 `vX.Y.Z` 同 `vX.Y.Z-rc.N` pre-release tags；checksum 同 attestation 驗證不變：signer workflow 係 `release.yml`，source ref 係 `refs/tags/v<version>`，issuer 係 `https://token.actions.githubusercontent.com`；決定 118 不變。
 - `v0.1.0` 係示範版本號；`vibe` 由 GitHub Releases 派發（唔係 npm），實際一定 pin 死確切版本同 SHA256，唔准 `latest`。所有第三方 action 一律用完整 commit SHA pin，tag 只寫喺註解。
 
 - `vibe` 係 SDK CLI 名（暫定）；deploy job 唔設任何 `LLM_*` 或者 `OPENAI_*` 變數。
@@ -861,7 +854,7 @@ jobs:
 4. `vibe serve --memory` 載入 manifest，用 in-memory 執行器（2C.4），預設 listen `127.0.0.1:8080`。Development 一定提供 slug `dev`（tenant `devtenant`），即使設定咗其他 slug；slug 檔改動唔使重啟。只限開發同測試，server 一停資料就消失。
 5. `curl http://127.0.0.1:8080/hello/v1/dev/hello` 測試 API。
 
-2A.8.4 嘅本地 LLM 規則適用於開發環境 `vibe compile`：loopback 准 `http://`，其他內網地址要 `LLM_ALLOW_PRIVATE_HOST=true`；公開名稱解析到非公開地址（例如 fake-IP proxy）亦要呢個設定。互動設定會先問用戶先加呢個值。CI／非開發環境唔准呢個 override，編譯只准公開 HTTPS endpoint。`vibe validate --deploy --dev` 同 `vibe manifest --dev` 唔會呼叫 LLM，亦唔靠呢個環境變數放行；佢哋喺本地開發接受記咗 `endpoint-private: true` 嘅 lock。CI／非開發環境拒絕 `--dev`，release 部署檢查拒絕 private endpoint lock（決定 151）。
+2A.8.4 嘅本地 LLM 規則適用於開發環境 `vibe compile`：loopback 准 `http://`，其他內網地址要 `LLM_ALLOW_PRIVATE_HOST=true`；公開名稱解析到非公開地址（例如 fake-IP proxy）亦要呢個設定。互動設定會先問用戶先加呢個值。CI／非開發環境唔准呢個 override，編譯只准公開 HTTPS endpoint。`vibe validate --deploy --dev` 同 `vibe manifest --dev` 唔會呼叫 LLM，亦唔靠呢個環境變數放行；佢哋喺本地開發接受 build-record stamp 記咗 `endpoint-private: true` 嘅 lock（決定 174）。CI／非開發環境拒絕 `--dev`，release 部署檢查拒絕 private endpoint lock（決定 151）。
 
 **vNext（決定 166）**：`vibe dev` 唔喺 1.0。保留設計係唔使預先編譯，按 URL／method 搵 `.md` 同依賴，首次 request 先編譯，cache 放 `.vibe/dev-cache/`；cache key 係 `sha256(source-hash + 依賴 hash 按 id 排序 + compiler-hash 輸入)`，每次編譯同載入 cache 都跑驗證器。File watch 令改動影響嘅 lock 同依賴失效，下次 request 重編，`--eager` 即時重編，migration 改動重建 dev DB。計劃 `--db memory|postgres|url`：memory 預設、postgres 用內嵌 PostgreSQL 做保真度測試、url 用 `VIBE_DATABASE_URL`；唔用 PGlite，因為 Rust 要額外嵌 WASM runtime，而且 role／連線行為保真度唔夠。Dev captcha（一律通過並標示）、kill-switch 同配額假實作亦只係 vNext 設計，唔代表 1.0 已提供。
 
@@ -1051,7 +1044,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: migrations/main/0002-add-last-login, kind: migration, hash: sha256:2b8f...c3 }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items:
   - { item: migration-ddl, risk: high, reason: "加敏感電話欄位" }
@@ -2512,7 +2505,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 - Manifest 簽名錯：runtime 驗證 manifest 簽名失敗，或者 manifest 入面 lock hash 同 lock 內容唔一致（決定 79）。
 - 手改：lock 格式唔合 2A（frontmatter 欄位或者次序錯、多咗或者少咗 section、step 欄位次序錯）。
 - （已取消，決定 113、117）重編唔一致唔再封鎖部署；改為 attestation 或者決定 114 policy 唔通過就封鎖。
-- 編譯器：`compiler-hash` 按 2A.1 標準定義重算唔一致；`model-snapshot` 唔係 provider 回報嘅 model id；`compiler.version` major 唔一致；冇 `model-snapshot` 或者用咗浮動別名；編譯器名唔係平台登記。
+- 編譯器（決定 174）：`compiler-hash` 按 2A.1 重算唔一致就要求 `vibe compile`；`compiler.version` major 唔一致；編譯器名唔係平台登記。部署驗證同 manifest 從 build record 檢查 LLM provider 同浮動 model alias。
 - `kind` 或者 `id` 同檔案路徑唔一致；`lock-version` 唔支援。
 - 編譯器 LLM 設定（決定 57）：
   - `LLM_PROVIDER` 唔係 `openai`、`anthropic`、`gemini`。
@@ -2521,9 +2514,9 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
   - `LLM_MODEL` 係別名（例如 `latest`、`:latest`），唔係 pin 死 snapshot id。
   - 公開 host 用 http；loopback 以外嘅內網 host 冇 `LLM_ALLOW_PRIVATE_HOST=true`。
   - CI 或者 production 編譯用咗 http、loopback、內網 host，或者設咗 `LLM_ALLOW_PRIVATE_HOST=true`。
-  - 部署去 production 嘅 lock 有 `endpoint-private: true`。
-  - lock 嘅 `llm-provider`、`endpoint-host` 或者 `model-snapshot` 同而家設定唔一致，而且冇重新編譯。
-  - lock 冇 `llm-provider`、`endpoint-host` 或者 `endpoint-private`。
+  - 決定 174：部署去 production 嘅 build-record stamp 有 `endpoint-private: true`。
+  - 決定 174：唔再將 lock 同而家嘅 LLM 設定比較；stale 檢查唔受 LLM 設定影響。
+  - 決定 174：非 dev 部署嘅 natural lock 冇 build-record stamp，必須 error 並要求執行 `vibe compile`。
   - 編譯請求帶咗 `tools`／`functions`／`toolConfig`，或者唔合 2A.8.2 嘅決定性設定；provider 回報 model 同 `LLM_MODEL` 唔一致。
   - secret scanning 喺 repo、lock、manifest、部署報告或者 CI log 搵到 key。
   - `.env` 冇喺 `.gitignore`，或者 repo 有 `.env`。
@@ -2646,7 +2639,7 @@ source: providers/main.md
 source-hash: sha256:9a1c...e2
 source-type: natural
 dependencies: []
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items: [{ item: provider-new, risk: high, reason: "新增主資料庫" }]
 ---
@@ -2735,7 +2728,7 @@ source: pipelines/login-guard.md
 source-hash: sha256:51bd...07
 source-type: natural
 dependencies: []
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items: [{ item: rate-limit-new, risk: medium, reason: "登入防爆破" }]
 ---
@@ -2846,7 +2839,7 @@ dependencies:
   - { id: user/methods/register, kind: method, hash: sha256:c3e1...90 }
   - { id: users/_definition, kind: api, hash: sha256:11ab...3c }
   - { id: users/v2/_version, kind: api, hash: sha256:0d9e...51 }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" }]
 ---
@@ -2950,7 +2943,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: {} }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 build-mode: release
 security-items:
@@ -3020,7 +3013,7 @@ dependencies:
   - { id: email-outbox/methods/enqueue, kind: method, hash: sha256:81aa...c2 }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: {} }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 build-mode: release
 security-items:
@@ -3105,7 +3098,7 @@ dependencies:
   - { id: user/methods/invite, kind: method, hash: sha256:5b7d...e4 }
   - { id: users/_definition, kind: api, hash: sha256:11ab...3c }
   - { id: users/v2/_version, kind: api, hash: sha256:0d9e...51 }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: {} }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 build-mode: release
 security-items: [{ item: roles, risk: high, reason: "只限 admin 寄邀請" }]
@@ -3593,7 +3586,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: migrations/main/0004-add-email-verification, kind: migration, hash: sha256:5e77...b1 }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items:
   - { item: public-writable-column, risk: high, reason: "last_login_at 畀 public 登入寫" }
@@ -3657,7 +3650,7 @@ source-hash: sha256:3b90...d4
 source-type: natural
 dependencies:
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items:
   - { item: sign-token, risk: high, reason: "唯一簽 token 入口" }
@@ -3721,7 +3714,7 @@ dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
   - { id: user/methods/sign-token, kind: method, hash: sha256:3b90...d4 }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items:
   - { item: write-sql, risk: medium, reason: "記錄最後登入時間" }
@@ -3825,7 +3818,7 @@ dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: login-guard, kind: pipeline, hash: sha256:51bd...07 }
   - { id: user/methods/login, kind: method, hash: sha256:e81f...2a }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items:
   - { item: public, risk: high, reason: "登入入口一定要公開" }
@@ -4117,7 +4110,7 @@ source-type: natural
 dependencies:
   - { id: email-outbox, kind: model, hash: sha256:4f10...9d }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: llm-2026-09-01, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items:
   - { item: write-sql, risk: medium, reason: "註冊信件排隊" }
@@ -4190,7 +4183,7 @@ dependencies:
   - { id: email-outbox/methods/enqueue, kind: method, hash: sha256:81aa...c2 }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: {} }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items:
   - { item: write-sql, risk: medium, reason: "建立未驗證用戶或者輪換驗證 token" }
@@ -4273,7 +4266,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: {} }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items:
   - { item: set-password, risk: high, reason: "用 email token 設定密碼" }
@@ -4365,7 +4358,7 @@ source-type: natural
 dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: user/methods/self-register, kind: method, hash: sha256:d3c9...10 }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: {} }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items:
   - { item: public, risk: high, reason: "訪客註冊入口" }
@@ -4484,7 +4477,7 @@ source-type: natural
 dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: user/methods/complete-verification, kind: method, hash: sha256:9e02...7b }
-compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: {} }
+compiler: { name: md-logic, version: 2.0.0 }
 compiler-hash: sha256:c0de...77
 security-items:
   - { item: public, risk: high, reason: "email 連結入口" }

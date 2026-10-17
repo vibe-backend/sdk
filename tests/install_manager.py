@@ -7,13 +7,14 @@ class T(unittest.TestCase):
   self.command("uname",'#!/bin/sh\n[ "$1" = "-s" ] && echo Linux || echo x86_64\n'); self.command("gh",'#!/bin/sh\nprintf "%s\\n" "$*" >> "$MOCK_GH_LOG"\nif [ "$1" = api ]; then echo "${MOCK_SHA:-0123456789abcdef0123456789abcdef01234567}"; exit 0; fi\n[ "${MOCK_ATTEST_FAIL:-0}" != 1 ]\n')
   self.command("curl",'''#!/bin/sh
 set -eu
+printf "%s\\n" "$*" >> "$MOCK_CURL_LOG"
 out=; url=
 while [ $# -gt 0 ]; do case $1 in -o) out=$2;shift 2;;-w|--retry|--proto)shift 2;;--tlsv1.2|-f|-L|-s|-S|-I|-fsSIL)shift;;*)url=$1;shift;;esac;done
 if echo "$url"|grep -q '/releases/latest$';then printf '%s/test/repo/releases/tag/%s' "$VIBE_INSTALL_DOWNLOAD_URL" "${MOCK_LATEST:-v2.0.0}";exit 0;fi
 [ "${MOCK_NETWORK_FAIL:-0}" != 1 ]||exit 22
 name=${url##*/};rest=${url#*/download/};version=${rest%%/*};cp "$MOCK_SERVER/$version/$name" "$out"
 ''')
-  self.env=os.environ|{"PATH":f"{self.cmd}:{os.environ['PATH']}","MOCK_SERVER":str(self.server),"MOCK_GH_LOG":str(self.t/"gh.log"),"VIBE_INSTALL_REPOSITORY":"test/repo","VIBE_INSTALL_DOWNLOAD_URL":"https://mock.invalid","VIBE_INSTALL_DIR":str(self.dest)}; self.release("v1.0.0","one");self.release("v2.0.0","two")
+  self.env=os.environ|{"PATH":f"{self.cmd}:{os.environ['PATH']}","MOCK_SERVER":str(self.server),"MOCK_GH_LOG":str(self.t/"gh.log"),"MOCK_CURL_LOG":str(self.t/"curl.log"),"VIBE_INSTALL_REPOSITORY":"test/repo","VIBE_INSTALL_DOWNLOAD_URL":"https://mock.invalid","VIBE_INSTALL_DIR":str(self.dest)}; self.release("v1.0.0","one");self.release("v2.0.0","two")
  def tearDown(self):shutil.rmtree(self.t)
  def command(self,n,b):p=self.cmd/n;p.write_text(b);p.chmod(0o755)
  def release(self,v,text,bad=False):
@@ -39,7 +40,23 @@ name=${url##*/};rest=${url#*/download/};version=${rest%%/*};cp "$MOCK_SERVER/$ve
   verify=[l for l in log if l.startswith("attestation verify ")];self.assertEqual(len(verify),1)
   self.assertTrue(verify[0].endswith(" --repo vibe-backend/sdk --signer-workflow vibe-backend/sdk/.github/workflows/release.yml --source-ref refs/tags/v1.0.0 --source-digest 0123456789abcdef0123456789abcdef01234567 --deny-self-hosted-runners"),verify[0])
  def test_bad_source_sha_fails(self):self.assertNotEqual(self.runit("install","--version","v1.0.0",env=self.env|{"MOCK_SHA":"not-a-sha"}).returncode,0);self.assertFalse((self.dest/"vibe").exists())
- def test_multiline_version_rejected(self):r=self.runit("install","--version","x\nv1.0.0\ny",env=self.env|{"MOCK_NETWORK_FAIL":"1"});self.assertNotEqual(r.returncode,0);self.assertIn("invalid stable release version",r.stderr);self.assertFalse((self.t/"gh.log").exists())
+ def test_rc_install_attestation_identity_is_pinned(self):
+  self.release("v1.2.3-rc.1","rc");r=self.runit("install","--version","v1.2.3-rc.1");self.assertEqual(r.returncode,0,r.stderr);self.assertEqual(subprocess.check_output([self.dest/"vibe"],text=True).strip(),"rc")
+  log=(self.t/"gh.log").read_text().splitlines();self.assertIn("api repos/vibe-backend/sdk/commits/refs/tags/v1.2.3-rc.1 --jq .sha",log)
+  verify=[l for l in log if l.startswith("attestation verify ")];self.assertEqual(len(verify),1)
+  self.assertTrue(verify[0].endswith(" --repo vibe-backend/sdk --signer-workflow vibe-backend/sdk/.github/workflows/release.yml --source-ref refs/tags/v1.2.3-rc.1 --source-digest 0123456789abcdef0123456789abcdef01234567 --deny-self-hosted-runners"),verify[0])
+ def test_upgrade_to_rc_then_stable(self):
+  self.install1();self.release("v1.2.3-rc.1","rc")
+  for version,text in [("v1.2.3-rc.1","rc"),("v2.0.0","two")]:
+   with self.subTest(version=version):r=self.runit("upgrade","--version",version);self.assertEqual(r.returncode,0,r.stderr);self.assertEqual(subprocess.check_output([self.dest/"vibe"],text=True).strip(),text)
+ def test_invalid_versions_rejected(self):
+  for action in ["install","upgrade"]:
+   for version in ["v1.2.3-rc","v1.2.3-rc.01","v1.2.3-beta.1","v1.2.3-rc.1+build","v01.2.3","1.2.3-rc.1","v1.2.3-rc.1-rc.2","v1.2.3-RC.1","x\nv1.2.3-rc.1\ny","v1.2.3-rc.1\n","v1.02.3","v1.2.03"]:
+    with self.subTest(action=action,version=version):r=self.runit(action,"--version",version);self.assertNotEqual(r.returncode,0);self.assertIn("invalid release version",r.stderr);self.assertFalse((self.t/"gh.log").exists());self.assertFalse((self.t/"curl.log").exists())
+ def test_rc_verification_failure_preserves(self):
+  self.install1();before=os.readlink(self.dest/"vibe");self.release("v1.2.3-rc.1","bad",True);self.release("v1.2.3-rc.2","rc")
+  for version,env,error in [("v1.2.3-rc.1",self.env,"checksum verification failed"),("v1.2.3-rc.2",self.env|{"MOCK_ATTEST_FAIL":"1"},"GitHub artifact attestation verification failed")]:
+   with self.subTest(version=version):r=self.runit("upgrade","--version",version,env=env);self.assertNotEqual(r.returncode,0);self.assertIn(error,r.stderr);self.assertEqual(os.readlink(self.dest/"vibe"),before);self.assertEqual(subprocess.check_output([self.dest/"vibe"],text=True).strip(),"one")
  def test_curl_https_only(self):
   t=SCRIPT.read_text();self.assertEqual(t.count("curl -f"),t.count("--proto '=https' --tlsv1.2"))
 if __name__=='__main__':unittest.main(verbosity=2)

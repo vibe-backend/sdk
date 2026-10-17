@@ -5,6 +5,8 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Breaking (decision 174):** Locks no longer contain model-snapshot, llm-provider, endpoint-host, endpoint-private, llm-seed or sent-params. These move to `.vibe/build-record.json` `compilers` and manifest provenance. Compiler-hash depends only on compiler version and prompt version. Old locks still parse with one warning per legacy lock until refreshed. `PROMPT_VERSION` is `prompt-10`.
+- **Decision 174:** `scripts/vibe-install.sh` accepts `vX.Y.Z-rc.N` pre-release tags as well as `vX.Y.Z`. Checksum and attestation verification are unchanged: signer workflow `release.yml`, source ref `refs/tags/v<version>`, issuer `https://token.actions.githubusercontent.com` (decision 118 unchanged).
 - **Breaking (decisions 169–170):** Feature writes derive from method steps; omitted declarations are allowed, false declarations reject writing steps, and true declarations or clear natural-language write routes require a writing method step. Natural-language features without a method step or constant response are rejected with model read hints.
 - **Breaking (decision 171):** Errors code/from mappings reject unknown codes; use runtime codes, called method errors, or local validation failures.
 - **Decision 172:** Canonicalize Transform in object order and spacing, Transform out and equivalent respond values, and natural-language model tables matching the model id or its simple plural; reject duplicate keys. Compile prompt is prompt-9.

@@ -115,6 +115,11 @@ pub fn validate_loaded(
     let mut docs: HashMap<String, LockDoc> = HashMap::new();
     let mut source_by_id: HashMap<String, SourceFile> = HashMap::new();
 
+    let record = loaded
+        .build_record
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<crate::buildrecord::BuildRecord>(raw).ok());
+
     for (source, text) in sources.iter().zip(&loaded.lock_texts) {
         source_by_id.insert(source.id.clone(), source.clone());
         if source.kind == Kind::Api && source.scope == Some(Scope::Feature) {
@@ -149,6 +154,39 @@ pub fn validate_loaded(
             }
         };
         check_lock(&doc, source, opts, &callees, &mut report);
+        if opts.deploy {
+            let stamp = record
+                .as_ref()
+                .and_then(|record| record.compilers.get(&lock_rel(&source.rel)));
+            let file = lock_rel(&source.rel);
+            if let Some(stamp) = stamp {
+                if doc.meta.source_type == SourceType::Natural
+                    && (stamp.llm_provider == "none" || stamp.llm_provider.is_empty())
+                {
+                    report.push(Diag::error(
+                        &file,
+                        "natural locks must record an LLM provider; run `vibe compile`",
+                    ));
+                }
+                if stamp.model_snapshot == "latest"
+                    || stamp.model_snapshot.ends_with(":latest")
+                    || stamp.model_snapshot.ends_with("-latest")
+                {
+                    report.push(Diag::error(&file, "model snapshot is a floating alias"));
+                }
+                if !opts.dev && stamp.endpoint_private {
+                    report.push(Diag::error(
+                        &file,
+                        "locks compiled against a private endpoint cannot be deployed",
+                    ));
+                }
+            } else if !opts.dev && doc.meta.source_type == SourceType::Natural {
+                report.push(Diag::error(
+                    &file,
+                    "natural lock has no build-record LLM stamp; run `vibe compile`",
+                ));
+            }
+        }
         docs.insert(source.id.clone(), doc);
     }
     check_dependencies(&docs, sources, &mut report);
@@ -219,7 +257,7 @@ fn check_recompile(
 pub(crate) fn check_lock(
     doc: &LockDoc,
     source: &SourceFile,
-    opts: &ValidateOptions<'_>,
+    _opts: &ValidateOptions<'_>,
     docs: &HashMap<String, LockDoc>,
     report: &mut Report,
 ) {
@@ -269,25 +307,7 @@ pub(crate) fn check_lock(
     if compiler_hash(&doc.meta.compiler) != doc.meta.compiler_hash {
         report.push(Diag::error(
             &file,
-            "compiler-hash does not match the compiler stamp",
-        ));
-    }
-    if doc.meta.compiler.llm_provider == "none" && doc.meta.source_type == SourceType::Natural {
-        report.push(Diag::error(
-            &file,
-            "natural locks must record an LLM provider",
-        ));
-    }
-    if doc.meta.compiler.model_snapshot == "latest"
-        || doc.meta.compiler.model_snapshot.ends_with(":latest")
-        || doc.meta.compiler.model_snapshot.ends_with("-latest")
-    {
-        report.push(Diag::error(&file, "model snapshot is a floating alias"));
-    }
-    if opts.deploy && !opts.dev && doc.meta.compiler.endpoint_private {
-        report.push(Diag::error(
-            &file,
-            "locks compiled against a private endpoint cannot be deployed",
+            "compiler-hash does not match the compiler stamp; run `vibe compile`",
         ));
     }
     let mut order = section_order(doc.meta.kind, doc.meta.scope).to_vec();
@@ -333,6 +353,16 @@ pub(crate) fn check_lock(
     }
     check_sections(doc, &file, report);
     check_variable_roots(doc, &file, report);
+    let env_fields: Vec<_> = doc
+        .meta
+        .legacy_fields
+        .iter()
+        .filter(|field| field.starts_with("compiler."))
+        .cloned()
+        .collect();
+    if !env_fields.is_empty() {
+        report.push(Diag::warning(&file, format!("lock contains developer-environment fields ({}) that are no longer written (decision 174); run `vibe compile` to refresh it", env_fields.join(", "))));
+    }
     if doc
         .meta
         .legacy_fields
@@ -345,13 +375,13 @@ pub(crate) fn check_lock(
         .meta
         .legacy_fields
         .iter()
-        .any(|field| field != "translation")
+        .any(|field| field != "translation" && !field.starts_with("compiler."))
     {
         let fields: Vec<String> = doc
             .meta
             .legacy_fields
             .iter()
-            .filter(|field| field.as_str() != "translation")
+            .filter(|field| field.as_str() != "translation" && !field.starts_with("compiler."))
             .map(|field| format!("`{field}`"))
             .collect();
         report.push(Diag::warning(
