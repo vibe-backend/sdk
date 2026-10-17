@@ -1,4 +1,4 @@
-//! `vibe serve` refuses unsafe configurations before loading anything.
+//! `vibe run` refuses unsafe configurations before loading anything.
 
 use std::process::Command;
 
@@ -6,16 +6,14 @@ fn serve(envs: &[(&str, &str)], memory: bool) -> (bool, String) {
     let dir = std::env::temp_dir().join(format!("vibe-serve-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibe"));
-    cmd.arg("serve")
+    cmd.arg("run")
         .arg("--project")
         .arg(&dir)
-        .arg("--manifest")
+        .arg("--artifact")
         .arg(dir.join("missing.json"))
         .arg("--addr")
         .arg("127.0.0.1:0");
-    if memory {
-        cmd.arg("--memory");
-    }
+    cmd.args(["--db", if memory { "memory" } else { "postgres" }]);
     for key in [
         "VIBE_ENV",
         "VIBE_API_KEY_PEPPER",
@@ -64,7 +62,7 @@ fn memory_is_refused_outside_development() {
         let (ok, err) = serve(&[("VIBE_ENV", env)], true);
         assert!(!ok, "{env}");
         assert!(
-            err.contains("--memory is a development executor"),
+            err.contains("--db memory is a development executor"),
             "{env}: {err}"
         );
     }
@@ -130,7 +128,7 @@ fn development_needs_an_explicit_replay_store() {
 
 #[test]
 fn static_jwt_key_must_match_the_configured_alg() {
-    // Decision 139: checked by `vibe serve` before anything else is loaded.
+    // Decision 139: checked by `vibe run` before anything else is loaded.
     let ec = include_str!("../src/runtime/testdata/ec-p256-p.pem");
     let p384 = include_str!("../src/runtime/testdata/ec-p384-p.pem");
     let (ok, err) = serve(
@@ -203,16 +201,12 @@ signature: (none)
 
 fn serve_project(project: &std::path::Path, envs: &[(&str, &str)], memory: bool) -> (bool, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibe"));
-    cmd.arg("serve")
+    cmd.arg("run")
         .arg("--project")
         .arg(project)
-        .arg("--manifest")
-        .arg(project.join("missing.json"))
         .arg("--addr")
         .arg("127.0.0.1:0");
-    if memory {
-        cmd.arg("--memory");
-    }
+    cmd.args(["--db", if memory { "memory" } else { "postgres" }]);
     for key in [
         "VIBE_ENV",
         "VIBE_API_KEY_PEPPER",
@@ -315,9 +309,9 @@ fn signed_dev_manifest_starts_with_memory_in_development() {
         .env("VIBE_ENV", "development")
         .env("LLM_API_KEY", "private-key-value")
         .env("LLM_BASE_URL", "https://private-url-value.example")
-        .args(["serve", "--memory", "--addr", &addr, "--project"])
+        .args(["run", "--db", "memory", "--addr", &addr, "--project"])
         .arg(&root)
-        .arg("--manifest")
+        .arg("--artifact")
         .arg(&path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

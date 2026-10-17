@@ -228,7 +228,7 @@ async fn migrate_in_tx(
     log.extend(protect_schema(exec, &schema).await?);
     // Fail closed: any RLS problem in any tenant schema fails the migration,
     // whether this run introduced it or it was already there (for example
-    // left by an earlier, unprotected migration). `vibe serve` refuses to
+    // left by an earlier, unprotected migration). `vibe run` refuses to
     // start on the same problems.
     let problems = rls_problems(exec, &schema).await?;
     if !problems.is_empty() {
@@ -352,7 +352,7 @@ async fn protect_schema(exec: &PgSession, schema: &str) -> Result<Vec<String>, S
 /// expressions vibe installs. The owner role owns every tenant schema, so a
 /// migration for tenant A could otherwise weaken tenant B (e.g. `CREATE POLICY
 /// open ON t_b.notes USING (true)` or `ALTER TABLE ... NO FORCE ROW LEVEL
-/// SECURITY`), and `vibe serve` only checks at startup.
+/// SECURITY`), and `vibe run` only checks at startup.
 async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>, String> {
     exec.query_texts(
         r#"WITH ref AS (

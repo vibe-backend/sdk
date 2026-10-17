@@ -150,11 +150,11 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 
 - **絕不提交 key**：不可出現在 repo、source、lock、manifest、log、部署報告、PR 留言或錯誤訊息；錯誤只可說「`LLM_API_KEY` 無效或缺少」（§2A.8.5）。CI 會對 repo、lock、manifest、部署報告和 CI log 做 secret 掃描，懷疑有 key 即令 build 失敗。
 - `.env` 必須被 gitignore；從 `.gitignore` 移除它或改變 CI secret 用法受 CODEOWNERS 保護（§2A.8.5、§9B）。
-- 開發環境以外，runtime 不可有任何 `LLM_*` 或 `OPENAI_*` 變數；在開發環境，serve 會出 warning 並在啟動前移除這些變數（§2A.8.5）。
+- 開發環境以外，runtime 不可有任何 `LLM_*` 或 `OPENAI_*` 變數；在開發環境，`vibe run` 會出 warning 並在啟動前移除這些變數（§2A.8.5）。
 - **Sandbox**：compiler 的對外網絡只限 endpoint host；沒有 tools、function calling 或 streaming；除 `LLM_API_KEY` 外沒有其他 secret（§2A.7、§2A.8.6）。
 - CI 和 production 編譯必須用公開 host 的 `https://`；在 CI 使用 loopback、私有 host 或 `LLM_ALLOW_PRIVATE_HOST=true` 屬錯誤（§2A.8.4）。
 - `LLM_ALLOW_PRIVATE_HOST=true` 亦適用於解析至非公開地址的網域名稱，例如 fake-IP DNS 代理；只限本地開發。即使名稱看似公開，編譯結果亦會記錄 `endpoint-private: true`。 公開網域名稱仍須使用 HTTPS；CI 和 production 拒絕此旗標。
-- 本地測試私有 endpoint 編譯的 lock，可用 `vibe build`。Manifest 簽署和其他驗證檢查維持不變；CI 同 release build 拒絕 private-endpoint lock。 Dev manifest 的簽署內容包含 `build_mode: "dev"`，`vibe serve` 只在開發環境接受 （可配合 `--memory`）；release manifest 不接受私有 endpoint lock。
+- 本地測試私有 endpoint 編譯的 lock，可用 `vibe build`。Manifest 簽署和其他驗證檢查維持不變；CI 同 release build 拒絕 private-endpoint lock。 Dev manifest 的簽署內容包含 `build_mode: "dev"`，`vibe run` 只在開發環境接受 （可配合 `--db memory`）；release manifest 不接受私有 endpoint lock。
 - 更換 provider、endpoint host 或 model 屬 **major** 變更：所有 lock 重新編譯，涉及自然語言／安全的 lock 需要重新審批。只改 base URL 的 path 不屬 major，但 CI 確定性檢查仍須通過（§2A.8.7）。
 
 ## 規格缺口
@@ -163,3 +163,34 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 - adapter capability 表（哪些 model 收到哪些參數）隨 SDK 提供，沒有在規格中公開。
 - 規格的 CI 範例把 `LLM_BASE_URL` 存為 secret；base URL 本身並非機密，規格亦沒有說明可否改用 repository variable。
 - 規格沒有點名第三方 provider（OpenRouter、Groq）；它們只以「OpenAI 相容 endpoint」涵蓋。
+
+## 跑 project 同 artifact（決定 177）
+
+本地流程係互動 `vibe` → `vibe build` → `vibe run` →
+`curl http://127.0.0.1:8080/hello/v1/dev/hello`。
+Project mode 驗證 lock，喺記憶體產生 dev manifest，永遠唔叫 LLM。
+Lock 缺少、過時或者版本唔啱會報錯，提示行 `vibe build`。
+
+- `--project <dir>` 揀 project，預設目前目錄。
+- `--artifact <path>` 接受 manifest 檔或者包含 `manifest.json` 嘅目錄，
+  可以係 `vibe build -o` 或者 release artifact；release bundle 係
+  `<manifest>.sigstore.json` 或 `VIBE_MANIFEST_BUNDLE`，Sigstore 同 attestation 驗證照舊。
+- `--addr <address>` 預設 `127.0.0.1:8080`。
+- `--db memory|postgres` 或環境變數 `VIBE_DB` 揀 store；預設 memory 只限開發。
+  PostgreSQL 用現有 `VIBE_DATABASE_URL` 或 `DATABASE_URL` 同租戶設定。
+- `--allow-test-build` 只喺 development 准許 test build。
+
+## 冇 key 嘅測試 build 同 key file
+
+`LLM_PROVIDER=fake` 係確定性、唔連網嘅 provider，畀 CI 做冇 key 嘅測試 build。
+只支援 public GET 常數 JSON object API response，預設 `{"message":"hello world"}`；
+英文或者中文 hello source 唔使寫 GET/public 字眼。寫入、認證、model 同 method 一律拒絕；
+翻譯原樣回傳輸入，唔係通用 LLM。`test_build` 只記喺 `.vibe/build-record.json`
+同 manifest provenance，永遠唔入 lock（決定 174）。`vibe run` 冇
+`--allow-test-build` 就拒絕，非 development 一律拒絕。
+`vibe build --release` 永遠拒絕 fake provider。
+
+`LLM_API_KEY_FILE` 從檔案讀 key，例如 BuildKit secret `/run/secrets/llm_api_key`。
+尾部換行會 trim（頭尾空白亦會 trim）。優先次序係 `LLM_API_KEY` >
+`VIBE_LLM_API_KEY`（release build）> `LLM_API_KEY_FILE`；key 永遠唔顯示。
+Runtime 唔應該有編譯用 LLM 變數；development 喺啟動 handler 前移除，其他環境拒絕。

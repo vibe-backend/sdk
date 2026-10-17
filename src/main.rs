@@ -1,14 +1,13 @@
 use std::fs;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use std::io::IsTerminal;
 use vibe::compile::{build_project, CompileOptions};
-use vibe::llm::{self, HttpAdapter, LlmAdapter};
-use vibe::manifest::{self, read_manifest};
-use vibe::runtime::{router, AppState, AuthConfig, PgExec, QueryExec};
+use vibe::llm::{self, LlmAdapter};
+use vibe::manifest;
+use vibe::run::{check_deployable, load_dotenv, load_manifest};
+use vibe::runtime::PgExec;
 use vibe::secret::secret_scan;
 use vibe::sign;
 use vibe::validate::{validate_project, ValidateOptions};
@@ -17,7 +16,7 @@ use vibe::validate::{validate_project, ValidateOptions};
 #[command(
     name = "vibe",
     about = "Build a markdown-driven backend",
-    after_help = "Running vibe with no arguments in a terminal starts interactive setup.\nvibe build generates locks, checks and packages.\nvibe build --release builds a release package."
+    after_help = "Running vibe with no arguments in a terminal starts interactive setup.\nvibe build generates locks, checks and packages.\nvibe run serves a project or artifact.\nvibe build --release builds a release package."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -56,18 +55,18 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Serve HTTP from a signed manifest.
-    #[command(hide = true)]
-    Serve {
-        #[arg(long, default_value = "manifest.json")]
-        manifest: PathBuf,
+    /// Run a project or a signed artifact.
+    Run {
         #[arg(long, default_value = ".")]
         project: PathBuf,
+        #[arg(long)]
+        artifact: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
-        /// Dev-only executor that does not use PostgreSQL.
+        #[arg(long, value_parser = ["memory", "postgres"])]
+        db: Option<String>,
         #[arg(long)]
-        memory: bool,
+        allow_test_build: bool,
     },
     /// Create tenant tables from model locks. Development bootstrap, not a production migration.
     Migrate {
@@ -159,8 +158,8 @@ async fn run(cli: Cli) -> Result<(), String> {
         load_dotenv(project);
         let mut io = TerminalIo;
         let config = vibe::interactive::setup(project, &mut io, llm::env_map_from_process())?;
-        let adapter = HttpAdapter::new(config.clone())?;
-        return vibe::interactive::run(project, &mut io, &config, &adapter).await;
+        let adapter = llm::adapter_for(&config)?;
+        return vibe::interactive::run(project, &mut io, &config, adapter.as_ref()).await;
     };
     match command {
         Command::Build { project, check, release, output, release_version, commit } => {
@@ -178,12 +177,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!("wrote {}", project.join(".vibe/signing.key").display());
             Ok(())
         }
-        Command::Serve {
-            manifest,
-            project,
-            addr,
-            memory,
-        } => cmd_serve(&manifest, &project, &addr, memory).await,
+        Command::Run { project, artifact, addr, db, allow_test_build } => {
+            let db = db.or_else(|| std::env::var("VIBE_DB").ok()).unwrap_or_else(|| "memory".into());
+            let db = match db.as_str() { "memory" => vibe::run::DbChoice::Memory, "postgres" => vibe::run::DbChoice::Postgres, _ => return Err("VIBE_DB must be memory or postgres".into()) };
+            vibe::run::run(vibe::run::RunOptions { project, source: artifact.map(vibe::run::RunSource::Artifact).unwrap_or(vibe::run::RunSource::Project), addr, db, allow_test_build }).await
+        },
         Command::Migrate {
             manifest,
             project,
@@ -260,14 +258,11 @@ async fn cmd_build(project: &Path, check: bool) -> Result<(), String> {
     if check {
         // Check and release always compile from source, ignoring disk locks.
         let config = llm::load_llm_config(&llm::env_map_from_process(), ci_or_prod()).ok();
-        let adapter = config
-            .as_ref()
-            .map(|c| HttpAdapter::new(c.clone()))
-            .transpose()?;
+        let adapter = config.as_ref().map(|c| llm::adapter_for(c)).transpose()?;
         let output = vibe::compile::regenerate_project(&CompileOptions {
             root: project,
             check: true,
-            llm: adapter.as_ref().map(|a| a as &dyn LlmAdapter),
+            llm: adapter.as_ref().map(|a| a.as_ref() as &dyn LlmAdapter),
             llm_config: config.as_ref(),
         })
         .await
@@ -295,6 +290,7 @@ async fn cmd_build(project: &Path, check: bool) -> Result<(), String> {
 
 pub fn removed_command_hint(name: &str) -> Option<&'static str> {
     match name {
+        "serve" => Some("`vibe serve` was removed: use `vibe run`"),
         "compile" => Some("`vibe compile` was removed: use `vibe build` (it validates automatically; add `--release` for release packaging)"),
         "validate" => Some("`vibe validate` was removed: use `vibe build` (it validates automatically; add `--release` for release packaging)"),
         "manifest" => Some("`vibe manifest` was removed: use `vibe build` (it validates automatically; add `--release` for release packaging)"),
@@ -320,7 +316,7 @@ fn cmd_validate(project: &Path, deploy: bool, dev: bool) -> Result<(), String> {
     // #199: challenges that are declared but never verified at runtime.
     let unverified = vibe::runtime::challenge::unverified_challenge_locks(project);
     vibe::runtime::challenge::unverified_gate(run_env, &unverified)?;
-    // #157: the replay store choice (the table itself is checked by `vibe serve`).
+    // #157: the replay store choice (the table itself is checked by `vibe run`).
     let replay_kind =
         vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?;
     vibe::runtime::replay::resolve_replay_store(run_env, configured, replay_kind, true)?;
@@ -336,6 +332,9 @@ async fn cmd_manifest(
     release_version: Option<String>,
     commit: Option<String>,
 ) -> Result<(), String> {
+    if release && std::env::var("LLM_PROVIDER").as_deref() == Ok("fake") {
+        return Err("the fake LLM provider (LLM_PROVIDER=fake) is for tests and cannot be used for a release build".into());
+    }
     // Release manifests are signed by the release workflow with Sigstore
     // keyless (decisions 92, 119); no key is ever loaded for them.
     let key = if release {
@@ -377,6 +376,7 @@ async fn cmd_manifest(
         if let Some(key) = env.get("VIBE_LLM_API_KEY").cloned() {
             env.entry("LLM_API_KEY".into()).or_insert(key);
         }
+        llm::resolve_api_key_file(&mut env)?;
         // No LLM key (VIBE_LLM_API_KEY or LLM_API_KEY) is ever sent to a
         // host outside the release allowlist.
         if let Ok(config) = llm::load_llm_config(&env, true) {
@@ -384,12 +384,12 @@ async fn cmd_manifest(
         }
         let config = llm::load_llm_config(&env, true).ok();
         let adapter = match &config {
-            Some(config) => Some(HttpAdapter::new(config.clone()).map_err(|err| err.to_string())?),
+            Some(config) => Some(llm::adapter_for(config).map_err(|err| err.to_string())?),
             None => None,
         };
         let (loaded, report) = vibe::compile::compile_in_memory(
             project,
-            adapter.as_ref().map(|a| a as &dyn LlmAdapter),
+            adapter.as_ref().map(|a| a.as_ref() as &dyn LlmAdapter),
             config.as_ref(),
         )
         .await
@@ -407,7 +407,7 @@ async fn cmd_manifest(
     let manifest = manifest::build_signed(project, &loaded, key.as_ref(), &info)
         .map_err(|err| err.to_string())?;
     print_high_risk(&manifest);
-    // Relative to the current directory, like `vibe serve --manifest` (#31).
+    // Relative to the current directory, like `vibe run --artifact` (#31).
     let path = output.to_path_buf();
     manifest::write_manifest(&path, &manifest).map_err(|err| err.to_string())?;
     println!("wrote {}", path.display());
@@ -428,251 +428,6 @@ fn print_high_risk(manifest: &manifest::Manifest) {
     }
 }
 
-/// Loads and verifies the manifest. Outside development only a release
-/// manifest with a Sigstore keyless signature from the release workflow is
-/// trusted (decision 119): the bundle (`VIBE_MANIFEST_BUNDLE`, default
-/// `<manifest>.sigstore.json`) is verified offline against the compiled-in
-/// trust root for the deployed version `VIBE_RELEASE_VERSION`. The
-/// development key in `.vibe/signing.pub` is accepted in development only.
-fn load_manifest(
-    manifest_path: &Path,
-    project: &Path,
-    run_env: vibe::runtime::RunEnv,
-) -> Result<manifest::Manifest, String> {
-    if run_env.is_dev() {
-        eprintln!("warning: verifying the manifest with the development key in .vibe/signing.pub");
-        let key = sign::load_dev_public(project)?;
-        return read_manifest(manifest_path, &key).map_err(|err| err.to_string());
-    }
-    let mode: manifest::Manifest =
-        serde_json::from_slice(&fs::read(manifest_path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-    if mode.build_mode == Some(manifest::BuildMode::Dev) {
-        return Err(format!(
-            "this development manifest (`vibe build`) is refused when VIBE_ENV is {:?}",
-            std::env::var("VIBE_ENV").unwrap_or_default()
-        ));
-    }
-    let version = std::env::var("VIBE_RELEASE_VERSION").map_err(|_| {
-        "VIBE_RELEASE_VERSION (the deployed version, e.g. 1.8.0) is required to verify the release manifest's Sigstore identity; the project's .vibe/signing.pub is not trusted outside development".to_string()
-    })?;
-    let bundle = std::env::var_os("VIBE_MANIFEST_BUNDLE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let mut name = manifest_path.as_os_str().to_owned();
-            name.push(".sigstore.json");
-            PathBuf::from(name)
-        });
-    manifest::read_release_manifest(manifest_path, &bundle, &version).map_err(|err| err.to_string())
-}
-
-fn check_deployable(
-    manifest: &manifest::Manifest,
-    run_env: vibe::runtime::RunEnv,
-) -> Result<(), String> {
-    let provenance = &manifest.provenance;
-    tracing::info!(
-        build_mode = ?manifest.build_mode,
-        commit = %provenance.commit,
-        locks = provenance.locks.len(),
-        high_risk = provenance.high_risk().len(),
-        "manifest provenance"
-    );
-    manifest::check_deployable(manifest, run_env.is_dev())
-}
-
-async fn cmd_serve(
-    manifest_path: &Path,
-    project: &Path,
-    addr: &str,
-    memory: bool,
-) -> Result<(), String> {
-    load_dotenv(project);
-    let run_env =
-        vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), memory);
-    if let Some(name) = llm::runtime_llm_env_present() {
-        if !run_env.is_dev() {
-            return Err(format!("runtime environment must not contain {name}"));
-        }
-        let names = llm::strip_runtime_llm_env();
-        eprintln!(
-            "warning: removing compile-time variables from runtime environment: {}",
-            names
-                .iter()
-                .map(|key| key.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    if memory && !run_env.is_dev() {
-        return Err(format!(
-            "--memory is a development executor and is refused when VIBE_ENV is {:?}; use PostgreSQL",
-            std::env::var("VIBE_ENV").unwrap_or_default()
-        ));
-    }
-    // #199: refuse locks whose challenge is not verified at runtime, before
-    // loading the database or the manifest (locks in the project tree).
-    let unverified_locks = vibe::runtime::challenge::unverified_challenge_locks(project);
-    vibe::runtime::challenge::unverified_gate(run_env, &unverified_locks)?;
-    // #157: production always uses the PostgreSQL replay store and
-    // refuses the memory switch; dev/CI must choose explicitly. Decided
-    // before loading anything.
-    let replay_choice = vibe::runtime::replay::resolve_replay_store(
-        run_env,
-        vibe::runtime::challenge::configured_in_env()?,
-        vibe::runtime::replay::replay_kind_from_vars(|name| std::env::var(name).ok())?,
-        !memory,
-    )?;
-    let mut auth = auth_from_env(run_env)?;
-    let manifest = load_manifest(manifest_path, project, run_env)?;
-    check_deployable(&manifest, run_env)?;
-    for route in &manifest.routes {
-        if let Some(problem) = route
-            .refresh
-            .as_ref()
-            .and_then(|spec| vibe::manifest::refresh_spec_problem(&route.feature_id, spec))
-        {
-            return Err(problem);
-        }
-    }
-    // `sign-jwt` key-refs name environment variables holding private PEMs.
-    auth.signing_keys =
-        vibe::runtime::load_signing_keys(&manifest, &|name| std::env::var(name).ok(), &auth.kid)?;
-    if memory {
-        let with_query: Vec<&str> = manifest
-            .methods
-            .iter()
-            .filter(|m| m.steps.iter().any(|s| s.op == "query"))
-            .map(|m| m.target.as_str())
-            .collect();
-        if !with_query.is_empty() {
-            eprintln!(
-                "warning: --memory does not run `query` steps; these methods will fail until you use PostgreSQL: {}",
-                with_query.join(", ")
-            );
-        }
-    }
-    // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
-    auth.add_route_jwks(&manifest.routes)?;
-    let mut pg_pool = None;
-    let exec: Arc<dyn QueryExec> = if memory {
-        Arc::new(vibe::runtime::MemoryExec::new())
-    } else {
-        let url = std::env::var("VIBE_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .map_err(|_| {
-                "set VIBE_DATABASE_URL or pass --memory for the dev executor".to_string()
-            })?;
-        let pg = PgExec::connect_with(&url, vibe::runtime::PgOptions::from_env()?).await?;
-        pg.check_runtime_role().await?;
-        pg_pool = Some(pg.pool());
-        Arc::new(pg)
-    };
-    let mut loaded = vibe::runtime::load_project_slugs(project, memory)?;
-    let reload_slugs = memory && run_env.is_dev();
-    if vibe::runtime::apply_dev_default(&mut loaded.slugs, memory, run_env.is_dev()) {
-        eprintln!("dev: slug `dev` (tenant devtenant) is available for public routes, e.g. /<def>/<ver>/dev/...");
-    }
-    if let (Some(pool), true) = (
-        &pg_pool,
-        manifest.routes.iter().any(|r| r.refresh.is_some()),
-    ) {
-        let mut tenants: Vec<String> = loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
-        tenants.sort();
-        tenants.dedup();
-        let client = pool
-            .get()
-            .await
-            .map_err(|err| format!("refresh token store check: {err}"))?;
-        vibe::runtime::refresh::check_store(&client, &tenants).await?;
-    }
-    for warning in &loaded.warnings {
-        eprintln!("warning: {warning}");
-    }
-    if loaded.slugs.is_empty()
-        && manifest
-            .routes
-            .iter()
-            .any(|route| route.public && route.path.contains("{slug}"))
-    {
-        eprintln!(
-            "warning: public routes use {{slug}} but no tenants are configured; copy slugs.example.json to .vibe/slugs.json or run `vibe slug add <slug> --tenant <id>`"
-        );
-    }
-    // #118: refuse `challenge_when: always` in production until a verifier
-    // is configured.
-    // #157: build the per-tenant store chosen at startup; a missing or unusable
-    // table refuses to start.
-    let replay_store: Option<Arc<dyn vibe::runtime::replay::ReplayStore>> =
-        match (replay_choice, pg_pool) {
-            (Some(vibe::runtime::replay::StoreKind::Postgres), Some(pool)) => {
-                // Per-tenant tables; the IP digest is keyed per tenant from
-                // the API-key pepper.
-                let store = vibe::runtime::replay::PgReplayStore::new(pool, &auth.pepper);
-                let mut tenants: Vec<String> =
-                    loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
-                tenants.sort();
-                tenants.dedup();
-                store.check(&tenants).await?;
-                Some(Arc::new(store))
-            }
-            (Some(vibe::runtime::replay::StoreKind::Postgres), None) => {
-                return Err("the challenge replay store needs PostgreSQL".into())
-            }
-            _ => None,
-        };
-    let challenge = vibe::runtime::challenge::verifier_from_env_with_store(replay_store)?;
-    let always: Vec<String> = manifest
-        .routes
-        .iter()
-        .filter(|r| r.public && r.challenge_type != "none" && r.challenge_when == "always")
-        .map(|r| r.feature_id.clone())
-        .collect();
-    vibe::runtime::challenge::production_gate(run_env, challenge.is_some(), &always)?;
-    // #199: refuse challenges that are declared but never verified.
-    let unverified: Vec<String> = manifest
-        .routes
-        .iter()
-        .filter(|r| {
-            vibe::runtime::challenge::challenge_unverified(
-                r.public,
-                &r.challenge_type,
-                &r.challenge_when,
-            )
-        })
-        .map(|r| r.feature_id.clone())
-        .collect();
-    vibe::runtime::challenge::unverified_gate(run_env, &unverified)?;
-    let addr: SocketAddr = addr.parse().map_err(|err| format!("bad address: {err}"))?;
-    let state = Arc::new(AppState {
-        manifest,
-        exec,
-        auth,
-        dev_slugs: reload_slugs
-            .then(|| vibe::runtime::DevSlugs::new(project, loaded.slugs.clone())),
-        slugs: loaded.slugs,
-        rates: std::sync::Mutex::new(Default::default()),
-        quotas: std::sync::Mutex::new(Default::default()),
-        disabled: load_disabled(project),
-        min_override_ms: None,
-        honor_test_ip: false,
-        trusted_proxies: trusted_proxies_from_env()?,
-        dev_hints: memory,
-        challenge,
-    });
-    let app = router(state);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|err| err.to_string())?;
-    println!("listening on {addr}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .map_err(|err| err.to_string())
-}
-
 async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Result<(), String> {
     if !tenant
         .chars()
@@ -686,10 +441,10 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
     check_deployable(&manifest, run_env)?;
     // Migrations need the table-owner role; serving must not use it.
     let url = std::env::var("VIBE_MIGRATE_DATABASE_URL").map_err(|_| {
-        "VIBE_MIGRATE_DATABASE_URL is required (the owner role used for DDL; `vibe serve` uses a separate non-owner VIBE_DATABASE_URL)".to_string()
+        "VIBE_MIGRATE_DATABASE_URL is required (the owner role used for DDL; `vibe run` uses a separate non-owner VIBE_DATABASE_URL)".to_string()
     })?;
     let runtime_role = std::env::var("VIBE_RUNTIME_DB_ROLE").map_err(|_| {
-        "VIBE_RUNTIME_DB_ROLE is required (the non-owner role `vibe serve` connects as; it is granted SELECT, INSERT, UPDATE)".to_string()
+        "VIBE_RUNTIME_DB_ROLE is required (the non-owner role `vibe run` connects as; it is granted SELECT, INSERT, UPDATE)".to_string()
     })?;
     let exec = PgExec::connect(&url).await?;
     for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant, &runtime_role).await? {
@@ -713,113 +468,6 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
         println!("bootstrapped {schema}._platform_refresh_tokens (finished families cleaned up)");
     }
     Ok(())
-}
-
-fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
-    let mut auth = AuthConfig::anonymous();
-    if let Ok(pem) = std::env::var("VIBE_JWT_PUBLIC_KEY_PEM") {
-        auth.public_pem = pem.replace("\\n", "\n");
-    }
-    let alg_env = std::env::var("VIBE_JWT_ALG").ok();
-    auth.alg = vibe::runtime::static_jwt_alg(
-        (!auth.public_pem.is_empty()).then_some(auth.public_pem.as_str()),
-        alg_env.as_deref(),
-    )?;
-    if let Ok(iss) = std::env::var("VIBE_JWT_ISS") {
-        auth.iss = iss;
-    }
-    if let Ok(aud) = std::env::var("VIBE_JWT_AUD") {
-        auth.aud = aud;
-    }
-    if let Ok(kid) = std::env::var("VIBE_JWT_KID") {
-        auth.kid = kid;
-    }
-    let pepper = std::env::var("VIBE_API_KEY_PEPPER").ok();
-    let (pepper, warning) = vibe::runtime::resolve_pepper(run_env, pepper.as_deref())?;
-    if let Some(warning) = warning {
-        eprintln!("warning: {warning}");
-    }
-    auth.pepper = pepper;
-    // API keys are `mbk_live_…` in production and `mbk_test_…` elsewhere.
-    auth.env_name = if run_env == vibe::runtime::RunEnv::Production {
-        "live".into()
-    } else {
-        "test".into()
-    };
-    if let Ok(claim) = std::env::var("VIBE_JWT_ROLES_CLAIM") {
-        if !claim.trim().is_empty() {
-            if let Some(problem) = vibe::manifest::roles_claim_problem(claim.trim()) {
-                return Err(format!("VIBE_JWT_ROLES_CLAIM: {problem}"));
-            }
-            auth.roles_claim = claim.trim().to_string();
-        }
-    }
-    let jwks_uri = std::env::var("VIBE_JWT_JWKS_URI")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            // Spec §4.1: default `{iss}/.well-known/jwks.json` when no PEM is pinned.
-            (auth.public_pem.is_empty() && std::env::var("VIBE_JWT_ISS").is_ok())
-                .then(|| format!("{}/.well-known/jwks.json", auth.iss.trim_end_matches('/')))
-        });
-    if jwks_uri.is_some() && !auth.public_pem.is_empty() {
-        return Err("set either VIBE_JWT_PUBLIC_KEY_PEM or VIBE_JWT_JWKS_URI, not both".into());
-    }
-    if let Some(uri) = jwks_uri {
-        let allow_private = std::env::var("VIBE_JWT_ALLOW_PRIVATE_HOST").as_deref() == Ok("true");
-        if allow_private && !run_env.is_dev() {
-            return Err("VIBE_JWT_ALLOW_PRIVATE_HOST is only allowed in development".into());
-        }
-        let source = vibe::runtime::jwks::HttpsJwks::with_policy(&uri, allow_private)?;
-        auth.jwks = Some(std::sync::Arc::new(
-            vibe::runtime::jwks::JwksCache::with_alg(std::sync::Arc::new(source), auth.alg),
-        ));
-    }
-    if let Ok(path) = std::env::var("VIBE_API_KEYS_FILE") {
-        auth.api_keys_file = Some(std::sync::Arc::new(vibe::runtime::ApiKeyFile::open(
-            Path::new(&path).to_path_buf(),
-        )?));
-    }
-    Ok(auth)
-}
-
-/// `VIBE_TRUSTED_PROXIES`: comma-separated proxy IPs or CIDR blocks whose
-/// `X-Forwarded-For` is honoured. Unset = trust no proxy (use the peer).
-fn trusted_proxies_from_env() -> Result<Vec<vibe::runtime::ProxyNet>, String> {
-    let Ok(raw) = std::env::var("VIBE_TRUSTED_PROXIES") else {
-        return Ok(Vec::new());
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            vibe::runtime::ProxyNet::parse(s).map_err(|err| format!("VIBE_TRUSTED_PROXIES: {err}"))
-        })
-        .collect()
-}
-
-fn load_disabled(project: &Path) -> std::collections::HashSet<String> {
-    let path = project.join(".vibe").join("disabled.txt");
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.split('\t').next())
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn load_dotenv(project: &Path) {
-    let path = project.join(".env");
-    let Ok(text) = fs::read_to_string(path) else {
-        return;
-    };
-    let current = llm::env_map_from_process();
-    for (key, value) in llm::merge_dotenv(&text, &current) {
-        if current.get(&key) != Some(&value) {
-            std::env::set_var(key, value);
-        }
-    }
 }
 
 fn ci_or_prod() -> bool {
@@ -931,7 +579,7 @@ mod tests {
         assert!(super::removed_command_hint("new")
             .unwrap()
             .contains("no arguments in a terminal"));
-        for command in ["build", "serve", "keygen"] {
+        for command in ["build", "run", "keygen"] {
             assert!(super::removed_command_hint(command).is_none());
         }
     }

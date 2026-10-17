@@ -39,6 +39,8 @@ pub struct Manifest {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Provenance {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub test_build: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub compilers: BTreeMap<String, crate::lock::LlmStamp>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -629,6 +631,9 @@ pub fn build_signed(
     locks.sort_by(|a, b| a.id.cmp(&b.id));
     items.sort_by(|a, b| (&a.lock, &a.item).cmp(&(&b.lock, &b.item)));
     manifest.provenance = Provenance {
+        test_build: record.as_ref().is_some_and(|r| {
+            r.test_build || r.compilers.values().any(|s| s.llm_provider == "fake")
+        }),
         compilers: record.map(|record| record.compilers).unwrap_or_default(),
         translations: loaded
             .build_record
@@ -731,8 +736,13 @@ pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), Report> {
 
 pub fn read_manifest(path: &Path, key: &VerifyingKey) -> Result<Manifest, Report> {
     let bytes = fs::read(path).map_err(|err| single(format!("cannot read manifest: {err}")))?;
-    let mut manifest: Manifest =
+    let manifest: Manifest =
         serde_json::from_slice(&bytes).map_err(|err| single(format!("manifest json: {err}")))?;
+    verify_manifest(manifest, key)
+}
+
+/// Verifies a development manifest in memory using the same canonical bytes as disk artifacts.
+pub fn verify_manifest(mut manifest: Manifest, key: &VerifyingKey) -> Result<Manifest, Report> {
     let signature = manifest.signature.clone();
     manifest.signature.clear();
     let canonical = serde_json::to_vec(&manifest).map_err(|err| single(err.to_string()))?;

@@ -506,7 +506,27 @@ pub fn load_llm_config(
     env: &HashMap<String, String>,
     ci_or_prod: bool,
 ) -> Result<LlmConfig, Report> {
-    let nonempty = merge_dotenv("", env);
+    let mut nonempty = merge_dotenv("", env);
+    if nonempty.get("LLM_PROVIDER").map(String::as_str) == Some("fake") {
+        return Ok(LlmConfig {
+            provider: "fake".into(),
+            model: "fake".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            timeout: Duration::from_secs(60),
+            max_retries: 0,
+            seed: 0,
+            endpoint_host: String::new(),
+            endpoint_private: false,
+            send_sampling: false,
+            api_style: "chat".into(),
+        });
+    }
+    resolve_api_key_file(&mut nonempty).map_err(|message| {
+        let mut r = Report::new();
+        r.push(Diag::error("env", message));
+        r
+    })?;
     let env = &nonempty;
     let mut report = Report::new();
     let provider = env
@@ -3299,5 +3319,160 @@ mod known_value_tests {
         assert!(!parse_openai_responses_masked(&body, "server_error")
             .unwrap_err()
             .contains("server_error"));
+    }
+}
+
+/// Key precedence: LLM_API_KEY > VIBE_LLM_API_KEY (mapped by release builds)
+/// > LLM_API_KEY_FILE. File contents are trimmed and never enter errors.
+pub fn resolve_api_key_file(env: &mut HashMap<String, String>) -> Result<(), String> {
+    if env.get("LLM_API_KEY").is_some_and(|s| !s.trim().is_empty()) {
+        return Ok(());
+    }
+    if let Some(path) = env.get("LLM_API_KEY_FILE") {
+        let key = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read LLM_API_KEY_FILE ({path}): {:?}", e.kind()))?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(format!("LLM_API_KEY_FILE ({path}) is empty"));
+        }
+        env.insert("LLM_API_KEY".into(), key.into());
+    }
+    Ok(())
+}
+
+/// Creates the network adapter or the deterministic, network-free test adapter.
+/// Fake supports only public GET API features returning constant JSON objects
+/// (default {"message":"hello world"}); GET/public words need not appear in source.
+/// Sources mentioning writes or authentication, models, methods and other shapes fail.
+/// Translation returns its input unchanged; repair requests use the original input.
+pub fn adapter_for(config: &LlmConfig) -> Result<Box<dyn LlmAdapter>, String> {
+    if config.provider == "fake" {
+        Ok(Box::new(FakeAdapter {
+            responder: fake_response,
+        }))
+    } else {
+        Ok(Box::new(HttpAdapter::new(config.clone())?))
+    }
+}
+fn fake_response(request: &LlmRequest) -> Result<String, String> {
+    let input = &request.input;
+    if !input.contains("KIND:") && request.system.to_ascii_lowercase().contains("translat") {
+        return Ok(input.clone());
+    }
+    let unsupported = || {
+        "the fake LLM (LLM_PROVIDER=fake) only supports constant-response API features such as hello world".to_string()
+    };
+    if !input.contains("KIND: api") {
+        return Err(unsupported());
+    }
+    let id = input
+        .lines()
+        .find_map(|l| l.strip_prefix("ID: "))
+        .ok_or_else(unsupported)?;
+    let parts: Vec<_> = id.split('/').collect();
+    if parts.len() != 3 {
+        return Err(unsupported());
+    }
+    let source = input
+        .split("\n<<<SOURCE ")
+        .nth(1)
+        .and_then(|s| s.split_once("\n"))
+        .map(|(_, s)| s.split("<<<END SOURCE").next().unwrap_or(s))
+        .unwrap_or(input);
+    let lower = source.to_ascii_lowercase();
+    if [
+        "put",
+        "patch",
+        "post",
+        "delete",
+        "update",
+        "database",
+        "private",
+        "authenticated",
+        "登入",
+        "登錄",
+        "寫入",
+        "刪除",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
+        return Err(unsupported());
+    }
+    let mut body = serde_json::json!({"message":"hello world"});
+    for (offset, c) in source.char_indices() {
+        if c == '{' {
+            let mut stream =
+                serde_json::Deserializer::from_str(&source[offset..]).into_iter::<Value>();
+            if let Some(Ok(value)) = stream.next() {
+                if value.is_object() {
+                    body = value;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(format!("## Route\n- method: GET\n- path: /{}/{}/{{slug}}/{}\n## Access\n- public: true\n- tenant: path.slug\n## Pipelines\n### -auth\n- removed: true\n## Limits\n(none)\n## Request\n(none)\n## Response\n- status: 200\n## Transform\n- in: {{}}\n- out: {}\n## Steps\n### s1\n- op: respond\n- value: transform.out\n- status: 200\n- source-lines: 1-1\n## Errors\n(none)\n", parts[0], parts[1], parts[2], body))
+}
+
+#[cfg(test)]
+mod key_file_tests {
+    #[test]
+    fn config_key_file_and_precedence() {
+        let path = std::env::temp_dir().join(format!("vibe-key-{}", uuid::Uuid::new_v4()));
+        let mut env = std::collections::HashMap::from([
+            (
+                "LLM_API_KEY_FILE".into(),
+                path.to_string_lossy().into_owned(),
+            ),
+            ("LLM_MODEL".into(), "gpt-test-2026-01-01".into()),
+        ]);
+        std::fs::write(&path, "  private-test-key\r\n").unwrap();
+        assert_eq!(
+            super::load_llm_config(&env, false).unwrap().api_key,
+            "private-test-key"
+        );
+        env.insert("LLM_API_KEY".into(), "explicit-key".into());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            super::load_llm_config(&env, false).unwrap().api_key,
+            "explicit-key"
+        );
+        env.remove("LLM_API_KEY");
+        let error = super::load_llm_config(&env, false).unwrap_err().to_string();
+        assert!(error.contains("cannot read LLM_API_KEY_FILE"));
+        std::fs::write(&path, " \n").unwrap();
+        assert!(super::load_llm_config(&env, false)
+            .unwrap_err()
+            .to_string()
+            .contains("is empty"));
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fake_response_tests {
+    #[test]
+    fn hello_sources_and_write_rejection() {
+        let request = |source: &str| super::LlmRequest {
+            system: String::new(),
+            input: format!(
+                "KIND: api\nID: hello/v1/hello\n<<<SOURCE hello\n{source}\n<<<END SOURCE"
+            ),
+            model: "fake".into(),
+            seed: 0,
+            timeout: std::time::Duration::from_secs(1),
+            budget: None,
+        };
+        let expected = super::fake_response(&request("Public GET returns hello world")).unwrap();
+        assert!(expected.contains("## Route\n- method: GET"));
+        assert!(expected.contains("## Access\n- public: true"));
+        assert!(expected.contains(r#"- out: {"message":"hello world"}"#));
+        for source in ["Return hello world", "回傳 hello world"] {
+            assert_eq!(super::fake_response(&request(source)).unwrap(), expected);
+        }
+        assert!(super::fake_response(&request("delete hello"))
+            .unwrap_err()
+            .contains("the fake LLM (LLM_PROVIDER=fake) only supports"));
     }
 }

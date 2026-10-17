@@ -545,7 +545,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             }
             _ => {
                 let message = if state.dev_hints && unknown {
-                    format!("Not found. Unknown slug `{slug}`; run `vibe slug add {slug} --tenant <id>` or copy slugs.example.json to .vibe/slugs.json{}", if state.dev_slugs.is_some() { "; `vibe slug add` is picked up without restart under `serve --memory`" } else { "" })
+                    format!("Not found. Unknown slug `{slug}`; run `vibe slug add {slug} --tenant <id>` or copy slugs.example.json to .vibe/slugs.json{}", if state.dev_slugs.is_some() { "; `vibe slug add` is picked up without restart under `run --db memory`" } else { "" })
                 } else {
                     "Not found".into()
                 };
@@ -1529,7 +1529,7 @@ pub(crate) fn ec_problem_message(what: &str, problem: super::eckey::EcProblem) -
 }
 
 /// Resolves the deployment JWT alg from `VIBE_JWT_PUBLIC_KEY_PEM` and
-/// `VIBE_JWT_ALG` and checks the static key against it (what `vibe serve`
+/// `VIBE_JWT_ALG` and checks the static key against it (what `vibe run`
 /// does at startup). `pem` must already have escaped newlines expanded.
 pub fn static_jwt_alg(pem: Option<&str>, alg_env: Option<&str>) -> Result<Algorithm, String> {
     let mut alg = Algorithm::ES256;

@@ -84,7 +84,12 @@ pub async fn build_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, R
         let Ok(doc) = crate::lock::parse_lock(&text) else {
             continue;
         };
-        if doc.meta.vibe_version == lock_stamp()
+        if !(record
+            .as_ref()
+            .and_then(|r| r.compilers.get(&rel))
+            .is_some_and(|s| s.llm_provider == "fake")
+            && std::env::var("LLM_PROVIDER").as_deref() != Ok("fake"))
+            && doc.meta.vibe_version == lock_stamp()
             && doc.meta.lock_version == crate::lock::LOCK_VERSION
             && doc.meta.source_hash == source_hash(&source.combined_text())
             && (!record_exists
@@ -115,13 +120,11 @@ pub async fn build_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, R
             let loaded =
                 crate::llm::load_llm_config(&crate::llm::env_map_from_process(), ci_or_prod)
                     .and_then(|c| {
-                        crate::llm::HttpAdapter::new(c.clone())
-                            .map(|a| (c, a))
-                            .map_err(|e| {
-                                let mut r = Report::new();
-                                r.push(Diag::error("build", e));
-                                r
-                            })
+                        crate::llm::adapter_for(&c).map(|a| (c, a)).map_err(|e| {
+                            let mut r = Report::new();
+                            r.push(Diag::error("build", e));
+                            r
+                        })
                     });
             match loaded {
                 Ok((c, a)) => {
@@ -140,7 +143,9 @@ pub async fn build_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, R
             CompileOptions {
                 root: opts.root,
                 check: false,
-                llm: opts.llm.or(adapter.as_ref().map(|a| a as &dyn LlmAdapter)),
+                llm: opts
+                    .llm
+                    .or(adapter.as_ref().map(|a| a.as_ref() as &dyn LlmAdapter)),
                 llm_config: opts.llm_config.or(config.as_ref()),
             },
             &natural,
@@ -542,6 +547,7 @@ fn collect_build_record(
     (
         texts,
         crate::buildrecord::BuildRecord {
+            test_build: compilers.values().any(|s| s.llm_provider == "fake"),
             version: 1,
             locks: record,
             translations,
