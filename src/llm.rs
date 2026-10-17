@@ -2748,7 +2748,9 @@ mod responses_tests {
                     model: "test-model".into(),
                     seed: 0,
                     timeout: Duration::from_secs(2),
-                    budget: None,
+                    budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                        crate::llm_budget::Limits::default(),
+                    ))),
                 };
                 let err = adapter.compile(&request).await.unwrap_err();
                 for secret in [
@@ -2793,7 +2795,9 @@ mod responses_tests {
                 model: "gpt-4.1".into(),
                 seed: 7,
                 timeout: Duration::from_secs(5),
-                budget: None,
+                budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                    crate::llm_budget::Limits::default(),
+                ))),
             };
             let message = adapter.compile(&request).await.unwrap_err();
             server.abort();
