@@ -1,10 +1,10 @@
-//! `vibe validate --deploy` refuses locks with unverified challenges (#199).
+//! `vibe build` refuses locks with unverified challenges (#199).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use vibe::compile::{compile_project, CompileOptions};
+use vibe::compile::{regenerate_project, CompileOptions};
 
 fn copy_dir(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
@@ -21,9 +21,13 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 fn validate_cli(project: &Path, deploy: bool, envs: &[(&str, &str)]) -> (bool, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibe"));
-    cmd.arg("validate").arg("--project").arg(project);
-    if deploy {
-        cmd.arg("--deploy");
+    cmd.arg("build")
+        .arg("--project")
+        .arg(project)
+        .arg("--output")
+        .arg(project.join("manifest.json"));
+    if !deploy {
+        cmd.arg("--check");
     }
     for key in [
         "VIBE_ENV",
@@ -61,7 +65,7 @@ async fn validate_deploy_refuses_after_failures_fixture_lock() {
     )
     .unwrap();
 
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -69,7 +73,7 @@ async fn validate_deploy_refuses_after_failures_fixture_lock() {
     })
     .await
     .unwrap_or_else(|err| panic!("{err}"));
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -86,10 +90,10 @@ async fn validate_deploy_refuses_after_failures_fixture_lock() {
     );
 
     let (ok, text) = validate_cli(&root, false, &[]);
-    assert!(ok, "validate without --deploy should pass: {text}");
+    assert!(ok, "build --check should pass: {text}");
 
     let (ok, text) = validate_cli(&root, true, &[]);
-    assert!(!ok, "validate --deploy should fail: {text}");
+    assert!(!ok, "build deploy validation should fail: {text}");
     assert!(
         text.contains("after-failures") || text.contains("not verified"),
         "{text}"

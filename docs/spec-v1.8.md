@@ -6,7 +6,7 @@
 >
 > 核心架構：所有定義（model、method、api、pipeline、provider、migration）嘅 source `.md` 一律用自然語言寫。編譯流程係「自然語言 source `.md` → 結構化 lock markdown（`{name}.lock.md`）→ 簽名 manifest」。lock md 係 runtime 唯一依據，runtime 永遠唔會解譯自然語言。
 >
-> v1.4 起嘅內容：安全設定照用自然語言寫，唔強制結構化 frontmatter，防線改為「獨立 deterministic 驗證器 + 收緊嘅人手 review」（v1.8 起 SDK 唔再做人手 review，見決定 77、78 同 9C）；編譯器冇工具、網絡只准連編譯用 LLM endpoint；model snapshot pin 死，compiler-hash 只計編譯器版本同 prompt 版本（決定 174）；確認綁定 commit；收緊 public 寫入；禁止 DDL／TRUNCATE；token 簽發用 capability 旗標；新增緊急 kill switch；public 最低回應耗時改為固定值。
+> v1.4 起嘅內容：安全設定照用自然語言寫，唔強制結構化 frontmatter，防線改為「獨立 deterministic 驗證器 + 收緊嘅人手 review」（v1.8 起 SDK 唔再做人手 review，見決定 77、78 同 9C）；編譯器冇工具、網絡只准連編譯用 LLM endpoint；model snapshot pin 死，lock 用 vibe 版本戳記（決定 176）；確認綁定 commit；收緊 public 寫入；禁止 DDL／TRUNCATE；token 簽發用 capability 旗標；新增緊急 kill switch；public 最低回應耗時改為固定值。
 >
 > v1.5 定稿：refresh token 輪換、密碼底線、帳戶鎖定、固定回應耗時 300ms／500ms、私隱刪除（crypto-shredding 加匿名化）同所有營運數值全部定案。
 >
@@ -18,9 +18,9 @@
 
 ### v1.8（草稿，2026-10-14）
 
-- 補編決定 150–174（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
-- 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 compiler-hash 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory`）
-- 新增 `vibe build`：一個指令做晒編譯、驗證同 manifest（類似 `nest build`），冇 reviewer 步驟（審核由 Git 平台設定負責，決定 76，見 2C.3）。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext）
+- 補編決定 150–176（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
+- 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 vibe-version 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe build` → 暫時隱藏嘅 `vibe serve --memory`，下一個 PR 加 `vibe run`）
+- `vibe build` 係官方 build 指令：預設更新過時 lock、驗證同寫 dev manifest；`--release` 做 release 打包，`--check` 唔寫檔（決定 175）。
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
 - 新增產品經理六條基線做決定 89–94（release 簽名只限 `v*` tag 加 required-reviewer environment（臨時方案 (i) 下有寫權限嘅人都可以開 `v*` tag，tag 唔係閘門；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118）、高風險 fail closed（決定 90 已於 2026-10-16 撤回：高風險項目只列入部署報告）、production 拒絕 in-memory、冇 release 簽名就失敗（決定 119 改用 Sigstore keyless）、決定 29／37 恢復、`/latest/` 永遠唔係草稿），同決定 95（create-user 邀請失敗處理）。
 - Lock 係 build 輸出，唔再 commit（`.gitignore`），由 CI／CD 喺部署時由 source build（決定 117，取代決定 80）。
@@ -79,7 +79,7 @@
 | --- | --- | --- |
 | 16 | （v1.8 由決定 112 修訂：高風險欄位一定要喺 frontmatter 宣告）安全設定照用自然語言寫，**唔強制**結構化 frontmatter；防線係 frontmatter 高風險宣告（決定 112）、獨立驗證器、決定 114 deterministic policy、決定 113 attestation（build once, promote，決定 118；LLM 輸出唔決定性，所以冇重編比對）同 runtime 限制（v1.8 決定 77：SDK 唔再做人手 review，已確認（產品經理 2026-10-14））。 | 2.2、2A.5、2A.7 |
 | 17 | 編譯器輸出一定要通過獨立、deterministic 嘅驗證器（唔靠 LLM 自律）；編譯器冇任何工具權限，網絡只准連編譯用 LLM endpoint 嘅 host（v1.7 決定 57 修訂）；source 入面似指令嘅句子（prompt injection 模式）出 warning 並喺 PR 高亮。 | 2A.7、10.9 |
-| 18 | 編譯用嘅 model pin 死 snapshot；compiler-hash（決定 174：只計 prompt + 編譯器版本）寫入 lock；（v1.8 決定 113、117：唔再做重編比對，部署靠 attestation 同決定 114 policy）；會改變輸出嘅 minor 升級當 major 處理。 | 2A.1、2A.6 |
+| 18 | 編譯用嘅 model pin 死 snapshot；compiler-hash（決定 174：只計 prompt + 編譯器版本）寫入 lock；（v1.8 決定 113、117：唔再做重編比對，部署靠 attestation 同決定 114 policy）；會改變輸出嘅 minor 升級當 major 處理。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 2A.1、2A.6 |
 | 19 | （v1.8 由決定 78 修訂，已確認（產品經理 2026-10-14））安全項目由驗證器 deterministic 抽出，寫入 lock 同部署報告做資訊性高亮；唔再要求逐項確認人、兩個非作者或者 PR 數量上限；PR 同部署報告照樣顯示有效權限摘要。 | 2A.5、10.10 |
 | 20 | 「係咪 structured」由 deterministic parser 判斷（v1.8 決定 77 修訂，已確認（產品經理 2026-10-14）：唔再影響確認，只決定編譯使唔使 call LLM）。 | 2A.5 |
 | 21 | Public 寫入收緊：每租戶每日寫入配額（強制）；建立資料嘅 endpoint 要 captcha 或者 proof-of-work；一律 audit-log；配額用完只封鎖 public 寫入。 | 7.2 |
@@ -163,7 +163,7 @@
 
 | # | 決定 | 影響章節 |
 | --- | --- | --- |
-| 57 | 初始化 project／SDK 時，用戶揀編譯用 LLM：`LLM_PROVIDER` 係 `openai`（預設，涵蓋所有 OpenAI-compatible endpoint 包括 Ollama、LM Studio、vLLM）、`anthropic` 或者 `gemini`；只喺部署／編譯時用。中立變數 `LLM_BASE_URL`、`LLM_API_KEY`（必填）、`LLM_MODEL`（必填，pin 死 snapshot）；`OPENAI_*` 只做 `openai` 嘅別名，`LLM_*` 優先，值衝突 error；選填 `LLM_TIMEOUT`、`LLM_MAX_RETRIES`、`LLM_SEED`。本地開發准 http loopback，其他內網要 `LLM_ALLOW_PRIVATE_HOST=true`；CI／production 一定 https 公開 host，本地 lock 唔可以部署。Key 永遠唔寫入 repo、lock、manifest、log、部署報告或者錯誤訊息；runtime 唔可以有任何 `LLM_*`／`OPENAI_*`。沙盒網絡只准連 endpoint host；決定 174：provider、host、model 寫入 build record 同 manifest provenance 嘅 compilers stamp，唔計入 compiler-hash。 | 2A.1、2A.6、2A.7、2A.8、9B、10.1、14 |
+| 57 | 初始化 project／SDK 時，用戶揀編譯用 LLM：`LLM_PROVIDER` 係 `openai`（預設，涵蓋所有 OpenAI-compatible endpoint 包括 Ollama、LM Studio、vLLM）、`anthropic` 或者 `gemini`；只喺部署／編譯時用。中立變數 `LLM_BASE_URL`、`LLM_API_KEY`（必填）、`LLM_MODEL`（必填，pin 死 snapshot）；`OPENAI_*` 只做 `openai` 嘅別名，`LLM_*` 優先，值衝突 error；選填 `LLM_TIMEOUT`、`LLM_MAX_RETRIES`、`LLM_SEED`。本地開發准 http loopback，其他內網要 `LLM_ALLOW_PRIVATE_HOST=true`；CI／production 一定 https 公開 host，本地 lock 唔可以部署。Key 永遠唔寫入 repo、lock、manifest、log、部署報告或者錯誤訊息；runtime 唔可以有任何 `LLM_*`／`OPENAI_*`。沙盒網絡只准連 endpoint host；決定 174：provider、host、model 寫入 build record 同 manifest provenance 嘅 compilers stamp，唔計入 compiler-hash。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 2A.1、2A.6、2A.7、2A.8、9B、10.1、14 |
 
 ### 0.9 v1.7 review 修訂（決定 58 起）
 
@@ -177,7 +177,7 @@
 | 61 | Refresh 寬限期精確定義：DB 只存 hash；寬限期內用返舊 token，平台用 `used_at` 判斷，撤銷上一次發出嘅子 token，再喺同一家族發一組新 token；唔儲存、唔重發明文。並行請求喺第一個請求處理中出示同一 token，會收到可重試嘅 503 TX_CONFLICT（retryable: true，唔清 cookie）。第一個請求完成之後，喺寬限期（10 秒）內再出示，按寬限期規則處理；超過寬限期先當重用，撤銷整個 family。每個舊 token 最多重發一次（`used_at` 加 `grace_reissued_at`）；寬限期內第二次再用即當重用，撤銷成個家族。 | 已確認（產品經理 2026-10-17） | 4A.1 |
 | 62 | `sign-token` 嘅 `tenant_id` 只有一個來源：平台由 slug（public）或者已驗證 token（auth）解析出嚟嘅 `ctx.tenant_id`；永遠唔由 client 或者 method 傳入，亦唔由 `users` 表讀。 | 已確認 | 12.6、12.8 |
 | 63 | `mail_worker` 加入 7.1 平台專用 role 表。 | 已確認 | 7.1 |
-| 64 | `compiler-hash` 只有一個標準定義（2A.1），決定 174：只包括 compiler.version 同 prompt-version，seed 同實際送出嘅參數移去 build record 同 manifest provenance。 | 已確認 | 2A.1、2A.6、10.1 |
+| 64 | `compiler-hash` 只有一個標準定義（2A.1），決定 174：只包括 compiler.version 同 prompt-version，seed 同實際送出嘅參數移去 build record 同 manifest provenance。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 已確認 | 2A.1、2A.6、10.1 |
 | 65 | 補齊 grammar：`rate-limit` 參數 schema、`## Order` 准用值、`subject-key` 寫法、`token-revoke` 參數。 | 已確認 | 4.3、4.4、4A.1、12.10 |
 | 66 | 非阻塞修正：CI 範例 pin `vibe` 版本同用 SHA pin action；Ollama 記 tag（唔係 digest）；token 類型統一；`email-outbox.enqueue` 嘅 `template` 寫入 Signature；註冊耗時用固定下限＋固定工作量（唔受 argon2 排隊影響）。 | 已確認 | 2A.8.3、2A.8.8、12.11 |
 | 67 | 防預先註冊搶帳戶：公開註冊只收 email（同 name），唔收密碼；驗證連結帶用戶去「設定密碼」一步，一個 UPDATE 同時設 password 同 `email_verified_at`（同決定 69 邀請共用同一個 method `user.complete-verification`）。未驗證 email 再註冊只會輪換驗證 token（舊 token 即時失效），永遠唔改任何 credential。驗證成功即撤銷該用戶所有 session（refresh 家族）。未驗證帳戶喺 `email_verify_expires_at` 過咗之後由平台匿名化並 soft delete（唔 DELETE，決定 13）。決定 56 入面「註冊一律做 `hash-password`」改為喺設定密碼一步做（56 狀態唔變）。 | 已確認（產品經理 2026-10-14） | 12.11 |
@@ -191,16 +191,16 @@
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
-| 73 | `vibe dev`：本地 web API server，唔使預先編譯。Request 嚟到先按路由搵 `.md`，第一次用先編譯成 lock，cache key 係 source hash 加全部依賴 hash 加 compiler-hash 輸入；file watch 偵測到改動就重編受影響嘅 lock；驗證器每次編譯同每次載入 cache 都跑，唔通過就回 500 並喺 terminal 報錯。 | 已確認（產品經理 2026-10-14） | 2C.2 |
-| 74 | 正式支援 in-memory 資料庫（Jack 新要求，取代原本「預設內嵌 PostgreSQL」）：`vibe dev` 預設用 in-memory，`vibe serve --memory` 亦用同一個 in-memory 執行器。In-memory 只限開發同測試，server 一停所有資料即刻消失。喺非 dev build-mode 或者 production 環境一律拒絕 in-memory，啟動報錯退出，冇 override（決定 91）。因為 in-memory 係預設 dev 路徑，執行器一定要模擬租戶隔離（RLS＋FORCE 語意）、role grant 同 column grant，令 dev 行為同 production 一致；已知語意差異喺 2C.4 列明；CI 整合測試照樣要對真 PostgreSQL 跑。內嵌 PostgreSQL 保留做 opt-in `--db postgres`，用嚟做保真度測試。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory`） | 已確認（產品經理 2026-10-14） | 2C.2、2C.4 |
+| 73 | `vibe dev`：本地 web API server，唔使預先編譯。Request 嚟到先按路由搵 `.md`，第一次用先編譯成 lock，cache key 係 source hash 加全部依賴 hash 加 compiler-hash 輸入；file watch 偵測到改動就重編受影響嘅 lock；驗證器每次編譯同每次載入 cache 都跑，唔通過就回 500 並喺 terminal 報錯。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 已確認（產品經理 2026-10-14） | 2C.2 |
+| 74 | 正式支援 in-memory 資料庫（Jack 新要求，取代原本「預設內嵌 PostgreSQL」）：`vibe dev` 預設用 in-memory，`vibe serve --memory` 亦用同一個 in-memory 執行器。In-memory 只限開發同測試，server 一停所有資料即刻消失。喺非 dev build-mode 或者 production 環境一律拒絕 in-memory，啟動報錯退出，冇 override（決定 91）。因為 in-memory 係預設 dev 路徑，執行器一定要模擬租戶隔離（RLS＋FORCE 語意）、role grant 同 column grant，令 dev 行為同 production 一致；已知語意差異喺 2C.4 列明；CI 整合測試照樣要對真 PostgreSQL 跑。內嵌 PostgreSQL 保留做 opt-in `--db postgres`，用嚟做保真度測試。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory`） （決定 175 取代：官方指令用 `vibe build`，`vibe serve` 只係暫時隱藏 run 步驟） | 已確認（產品經理 2026-10-14） | 2C.2、2C.4 |
 | 75 | Dev 編譯嘅 lock 同 manifest 一律唔可以部署：lock 記 `build-mode: dev`，manifest 用本機 dev key 簽；production runtime 只接受 Sigstore keyless 簽、身份符合決定 119 嘅 release manifest。2A.8 嘅本地 LLM http 規則只喺 dev 適用。 | 已確認（產品經理 2026-10-14） | 2C.2、2A.8.4 |
-| 76 | `vibe build`：一個指令做晒編譯（只編譯過時嘅 lock）、驗證、manifest 產生同簽名，冇 reviewer 步驟（審核由 Git 平台設定負責）；（決定 117）lock 係 build 輸出，冇 `--check-determinism`。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） | 已確認（產品經理 2026-10-14） | 2C.3 |
+| 76 | `vibe build`：一個指令做晒編譯（只編譯過時嘅 lock）、驗證、manifest 產生同簽名，冇 reviewer 步驟（審核由 Git 平台設定負責）；（決定 117）lock 係 build 輸出，冇 `--check-determinism`。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） （決定 175：指令改為 `vibe build`） | 已確認（產品經理 2026-10-14） | 2C.3 |
 | 77 | SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 刪除 `status`、`approval-mode`、`approved-by`、`approved-at`、`approval-ref`、`approved-commit`；SDK 讀到呢啲舊欄位（包括舊 lock 嘅 `approval-ref`，同已撤回嘅決定 90 build 旗標 `--release-approval` 係兩回事）會忽略並出 warning，唔再以佢哋做部署條件。取代決定 10、11、16（人手 review 部分）、20（人手確認部分）、28、33。 | 已確認（產品經理 2026-10-14） | 2A.1、2A.5、10.1 |
 | 78 | `security-items` 保留，但改為資訊性：驗證器 deterministic 抽出、寫入 lock 同部署報告，方便 PR 高亮同 label；唔再要求逐項確認人、原因、兩個非作者，亦冇每個 PR 5 項上限。取代決定 19（確認部分）、34。 | 已確認（產品經理 2026-10-14） | 2A.5、10.10 |
-| 79 | Lock 唔再有 `signature`（lock 完整性靠 `source-hash`、依賴 hash、compiler-hash；v1.8 部署靠決定 113 attestation，決定 117 之後 lock 唔 commit）；manifest 照樣簽名，由 `vibe build` 簽：release 用 Sigstore keyless（決定 119），以 `release` environment（要 Jack 批准；真正人手批准閘門係 environment，唔係 tag；自動閘門仍然係決定 113／114／118）入面 release workflow 嘅 GitHub OIDC 身份簽，本機用 dev key。Production runtime 只信任 pin 死嘅 Sigstore 身份（issuer `https://token.actions.githubusercontent.com`，certificate identity 完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`，trust root 見決定 119），dev key 永遠唔信任。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） | 已確認（產品經理 2026-10-14） | 2A.1、9、9B、10.1 |
+| 79 | Lock 唔再有 `signature`（lock 完整性靠 `source-hash`、依賴 hash、compiler-hash；v1.8 部署靠決定 113 attestation，決定 117 之後 lock 唔 commit）；manifest 照樣簽名，由 `vibe build` 簽：release 用 Sigstore keyless（決定 119），以 `release` environment（要 Jack 批准；真正人手批准閘門係 environment，唔係 tag；自動閘門仍然係決定 113／114／118）入面 release workflow 嘅 GitHub OIDC 身份簽，本機用 dev key。Production runtime 只信任 pin 死嘅 Sigstore 身份（issuer `https://token.actions.githubusercontent.com`，certificate identity 完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`，trust root 見決定 119），dev key 永遠唔信任。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） （決定 175：指令改為 `vibe build`）（決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 已確認（產品經理 2026-10-14） | 2A.1、9、9B、10.1 |
 | 80 | （已由決定 117 取代：lock 唔再 commit）建議 `*.lock.md` 同 source 一齊 commit，令 PR diff 睇到編譯結果；CI 重編決定性檢查保留，唔一致照樣封鎖部署，冇 override。 | 已取代（決定 117） | 2A.6、2C.3 |
 | 81 | CLI 所有指令嘅 `--project` 預設係目前目錄（cwd）。 | 已確認（產品經理 2026-10-14） | 2C.1 |
-| 82 | README 快速開始簡化做兩行：`vibe dev` 加一個 `curl`。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory`） | 已確認（產品經理 2026-10-14） | 2C.1 |
+| 82 | README 快速開始簡化做兩行：`vibe dev` 加一個 `curl`。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory`） （決定 175 取代：官方指令用 `vibe build`，`vibe serve` 只係暫時隱藏 run 步驟） | 已確認（產品經理 2026-10-14） | 2C.1 |
 | 83 | 接受「未經人手 review 嘅 LLM 輸出可以直接部署」嘅剩餘風險（見 9C）；人手 review 由用戶喺 Git 平台用 rulesets（分支規則） 自行設定（指引見 [`pr-review-guide.md`](pr-review-guide.md)）；release 層面唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（決定 89、118、2C.3a）；CODEOWNERS 仍然係 source PR 合併條件（決定 93、115），唔係 SDK release 檢查。 | 已確認（產品經理 2026-10-14） | 9C |
 | 84 | Admin `user.register` 保留 409 `EMAIL_TAKEN`：只限 admin、已認證、有限流同審計，admin 本身已經可以列出租戶用戶，所以唔當 enumeration 洩漏。 | 已確認（產品經理 2026-10-14） | 11.4、12.11 |
 | 85 | `create-user` 可以安全重試：`user.register` 用「insert CTE + SELECT」一個 statement，以明確 `created` 欄位分辨新建立同重試（唔靠 `xmax`）；兩種都回 202 `{ user_id, created, invite_status }`（決定 95）；對「已存在、未驗證、冇密碼」嘅用戶唔報錯，回原有 id（`created: false`），再由 `user.invite` 重新寄邀請；只有已驗證或者有密碼先回 409 `EMAIL_TAKEN`。解決 7.1 每個 query 獨立 commit 時「建立咗用戶但邀請失敗」嘅狀況。 | 已確認（產品經理 2026-10-14） | 11.4、11.4a |
@@ -211,7 +211,7 @@
 | 90 | （已撤回，產品經理 2026-10-16）原本要求高風險 release build 提供 `--release-approval`；呢個機制已撤回，唔會實作。高風險 `security-items` 只列入部署報告，唔阻 release；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118。剩餘風險（Jack 已接受）：admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass）；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；同一個帳戶（`j113203`）可以自己批准；`release` environment admin bypass 保持開啟。 | 已撤回（產品經理 2026-10-16） | 2A.5、2C.3a、9C |
 | 91 | 產品經理基線 3：production 一律拒絕 in-memory 資料庫，啟動直接報錯退出；冇任何 override 旗標。Production 定義只睇 build-mode 同環境：manifest 唔係 `build-mode: dev`，或者 `VIBE_ENV=production`。Listen 地址唔係 loopback（例如 Docker 入面 `vibe dev` 綁 `0.0.0.0`）只會警告，唔會拒絕；Docker 入面請明確設 `VIBE_ENV=development`。 | 已確認（產品經理 2026-10-14） | 2C.4、9C |
 | 92 | 產品經理基線 4（v1.8 由決定 119 修訂）：CI release build 用 Sigstore keyless 加 Rekor 簽；OIDC、Fulcio 或者 Rekor 用唔到就失敗，永遠冇 fallback（唔 fallback 去 dev key、任何 secret 或者冇 Rekor 嘅簽名）；production runtime 只信任 pin 死嘅 Sigstore 身份，dev key 永遠唔信任。 | 已確認（產品經理 2026-10-14） | 2C.2、2C.3、9B |
-| 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；CODEOWNERS required 係 source PR 合併條件（決定 115），SDK / `vibe build` 唔檢查 CODEOWNERS（2C.3a）。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） | 已確認（產品經理 2026-10-14）：CODEOWNERS required 係 source PR 合併條件 | 2A.7、9B |
+| 93 | 產品經理基線 5：決定 29（CODEOWNERS 必須）同 37（injection allowlist 受 CODEOWNERS 保護）照舊有效，唔由決定 77 取代；CODEOWNERS required 係 source PR 合併條件（決定 115），SDK / `vibe build` 唔檢查 CODEOWNERS（2C.3a）。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） （決定 175：指令改為 `vibe build`） | 已確認（產品經理 2026-10-14）：CODEOWNERS required 係 source PR 合併條件 | 2A.7、9B |
 | 94 | 產品經理基線 6：網站 `/latest/` 永遠唔指向草稿 spec；spec 文件用 `<!-- spec-status: draft -->` 標記，網站 build（`vibe-backend/vibe-backend.github.io` 嘅 `build.mjs`）揀 latest 時跳過有呢個標記嘅版本。 | 已確認（產品經理 2026-10-14） | 文件標頭、網站 |
 | 95 | create-user 邀請（v1.8 修訂）：邀請信寫入 transactional outbox（同其他寫入同一個 transaction）之後，create-user 同 re-invite 回 **202**，body 帶 `user_id` 同 `invite_status: invite_pending`。Mail worker 喺背景寄同重試；超過重試上限標 `delivery_failed`。邀請狀態（`invite_pending`／`sent`／`delivery_failed`）可以查詢，亦可以經 re-invite 重寄。只有 transaction 失敗（outbox 冇寫入，成個 request rollback，決定 99）先回 503 `INVITE_NOT_QUEUED`（帶 `Retry-After`）。`INVITE_DELIVERY_FAILED` 唔再係 503 錯誤碼，改為狀態值 `delivery_failed`。同 issue #26 相關。 | 已確認（產品經理 2026-10-14） | 11.4、11.4a、11.4b |
 | 96 | （v1.8 修訂，issue #70；產品經理代 Jack 決定採用 (i) 做**臨時方案**）Release ruleset：專用 tag ruleset（target `tag`、`refs/tags/v*`），只有 `update`、`deletion`、`non_fast_forward` 三條 rule，**冇 `creation` rule**：任何有 write 權限嘅人都可以開 `v*` tag，但開咗就改唔到、刪唔到、force push 唔到。`bypass_actors` 一定要係空（冇 creation rule 之後同開 tag 冇衝突，保持空令 admin 都改唔到已發佈嘅 tag）。Release build 只可以由 `v*` tag 出。人手批准把關**而家只靠** `release` environment（reviewer `j113203`，Prevent self-review 關閉）；自動閘門仍然係決定 113／114／118；任何用 `j113203` 嘅 agent 都可以開 tag 再自己批准 release，呢個風險 Jack 已經接受。`--release-approval` 已撤回（產品經理 2026-10-16），冇額外把關。目標方案 (iii)（未生效）：專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，同時開返 Prevent self-review。另外 live `release` environment `can_admins_bypass: true` 由 Jack 直接決定保持開啟，係已接受嘅風險（admin 可以跳過 environment 批准）。上面 ruleset 設定照舊要求，但 SDK 唔讀（原本嘅 ruleset 檢查屬 `--release-approval`，已撤回）。`main` ruleset 保留 OrganizationAdmin bypass。**已接受例外（Jack 決定 2026-10-16，issue #70；人手／文件層面）**：`main` ruleset `bypass_actors` 唔係空（例如 `[OrganizationAdmin, always]`）**唔會**阻 release。而家**冇**任何自動化檢查讀 ruleset 或者 `bypass_actors`（決定 90／#127：SDK 同 release workflow 唔讀 ruleset）；呢條例外係人手／文件層面接受。原因係而家得一個維護者、冇第二個 reviewer，冇 bypass 就冇嘢 merge 到。有第二個 reviewer 之後要重新檢討。如果將來 `release.yml` 加呢類步驟，只可以係唯讀、資訊性、永遠唔會擋 release（同決定 90、第 2C.3a 對齊）。呢條例外唔改 ruleset 設定，亦唔適用於 `v*` tag ruleset（嗰個 `bypass_actors` 照舊要求係空）。剩餘風險（Jack 已接受）：admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass）；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；同一個帳戶（`j113203`）可以自己批准；`release` environment admin bypass 保持開啟。 | 已確認（產品經理 2026-10-14；Jack 2026-10-16, #70） | 2C.3、2C.3a、9C、[`pr-review-guide.md`](pr-review-guide.md) |
@@ -220,14 +220,14 @@
 | 99 | 跨 model transaction：一個 request = 一個 runtime 管理嘅 transaction（`READ COMMITTED`）；用戶 SQL 控制唔到 transaction 邊界；庫存扣減用條件 UPDATE（`WHERE stock >= qty`）再檢查 affected rows，唔夠就 409 同 rollback；冇跨 request、跨 DB 或者分散式 transaction；寫入按固定次序、喺租戶 role 之下執行。取代 7.1「每個 query 獨立 transaction」。 | 已確認（產品經理 2026-10-14） | 7.1、7.4、12.6 |
 | 100 | Transaction 超時同衝突：預設 `statement_timeout` 5s、transaction 總時間 10s、`idle_in_transaction_session_timeout` 5s；超時 rollback，回 504 `TX_TIMEOUT`。Deadlock（`40P01`）同 serialization failure（`40001`）回 503 `TX_CONFLICT`，body `retryable: true`，帶 `Retry-After: 1`；平台永遠唔會自動重試非冪等寫入。 | 已確認（產品經理 2026-10-14） | 7.4、8 |
 | 101 | 瀏覽器 refresh cookie（issue #78）：refresh token 放 `__Host-vibe_rt_{slug}` cookie（`HttpOnly; Secure; Path=/`，冇 `Domain`）；產品經理確認防 subdomain 覆蓋比限定 Path 重要。兩個模式：預設 `same-site`（`SameSite=Strict`）；明確開嘅 `cross-site`（`SameSite=None`），一定要同時有嚴格 `Origin` 白名單（完全相等、唔准 `*`）同 `X-Vibe-CSRF` 自訂 header 檢查（強制 CORS preflight），缺任何一樣 build／部署失敗。每次 refresh 輪換，重用撤銷成個家族；access token 唔放 cookie；CORS credentials 只限 refresh 同 logout；logout 清 cookie 同撤銷家族。 | 已確認（產品經理 2026-10-14） | 4A.1、4A.1a |
-| 102 | Build TOCTOU：`vibe build` 只讀一次 source 同 lock 入記憶體，驗證同之後所有 build 步驟（manifest、報告、簽名）都用同一份內容；之後檔案改動唔會影響今次 build。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） | 已確認（產品經理 2026-10-14） | 2C.3 |
+| 102 | Build TOCTOU：`vibe build` 只讀一次 source 同 lock 入記憶體，驗證同之後所有 build 步驟（manifest、報告、簽名）都用同一份內容；之後檔案改動唔會影響今次 build。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） （決定 175：指令改為 `vibe build`） | 已確認（產品經理 2026-10-14） | 2C.3 |
 | 103 | CORS（issue #84）：`_definition.md` 加 `## Cors`（`allow-origins`、`allow-headers`、`expose-headers`、`max-age`）；origin 完全相等比對；`*` 只准喺冇 credentials 時用而且 release build 出 warning；`localhost` port 萬用只限 dev build；`## Cors` 唔准開 credentials（credentials 只限決定 101 嘅 refresh／logout）；永遠帶 `Vary: Origin`；`OPTIONS` preflight 由 runtime 處理。 | 已確認（產品經理 2026-10-14） | 2.3a、4A.1a、8 |
 | 104 | `Idempotency-Key`（issue #85）：POST／PATCH api 可以喺 lock 開 `## Idempotency`；public endpoint 唔准開；key 範圍 `(tenant, subject, route, key)`；request hash 同成功回應喺同一個 request transaction（決定 99）寫入；同 key 唔同 body 回 422 `IDEMPOTENCY_KEY_REUSED`；處理中租約（`lease` 預設 30s，一定大過 transaction 上限 10s）有效時先回 409 `IDEMPOTENCY_IN_PROGRESS`，租約過期（例如 crash）當未開始、重試可以接手；過期紀錄由 runtime 按 TTL 清理（平台系統表，唔受決定 13 限制）；ttl 預設 24h；失敗回應唔儲存。平台照樣唔自動重試（決定 100）。 | 已確認（產品經理 2026-10-14） | 2.3b、8 |
 | 105 | PATCH（issue #86）：route method 加 `PATCH`（修訂 0.1、2.3 嘅 GET／POST／PUT／DELETE）；語意係 JSON Merge Patch（RFC 7396），只限宣告欄位；`null` 只可以清 nullable 欄位；唔可以改嘅欄位回 422；內置 CRUD `update`（`partial: true`）用 PATCH、`partial: false` 用 PUT；CRUD update 照樣一定要 `If-Match`（決定 48），自訂 PATCH 可以選擇要唔要。 | 已確認（產品經理 2026-10-14） | 0.1、2.3、2.3c、12.9 |
 | 106 | Cursor 分頁同區間篩選（issue #87）：CRUD `list` 可以揀 `pagination: cursor`（offset 照樣係預設，決定 14）；cursor 係簽名嘅不透明值，綁定 sort、filter 同租戶；排序一定加主鍵做 tiebreaker；`page-size` 預設 20，`max-page-size` 同 offset 一樣跟決定 71（平台上限 500），冇另外嘅 100 上限；`range` 篩選只准宣告咗而且有 index 嘅欄位，運算子 `gte`／`gt`／`lte`／`lt`；編譯時驗證；cursor 同 sort／filter 唔對應回 400 `INVALID_CURSOR`。 | 已確認（產品經理 2026-10-14） | 12.9 |
 | 107 | 多欄唯一鍵：model lock 加 `## Constraints`（`- unique: [col_a, col_b]`，平台自動喺前面加 `tenant_id`）；一定要有對應 migration 建 unique index；衝突回 409 `UNIQUE_VIOLATION`，唔回顯欄位值。（決定 168：實作細節見 12.2） | 已確認（產品經理 2026-10-14） | 12.2、8 |
 | 108 | 翻譯階段（issue #37）：非 ASCII source 按 `translate-1` 翻譯，只供語意一致性檢查；安全關鍵字一律檢查中文及英文原文，譯文不能補足。原文保留作 lock、hash、編譯 prompt 及 cache key。否定及 code 規則見 2.1a。此規則取代 #37 的 English-only／不處理中文否定決定。翻譯失敗即編譯失敗，沒有 fallback。翻譯 cache key 包含 source-hash、provider、model、prompt 版本及實際參數。 | 已確認（產品經理 2026-10-16） | 2.1a、2A.7 |
-| 109 | Lock 記錄翻譯資料（審計用，唔計入 `source-hash`）：`translation: { prompt-version, llm-provider, model-snapshot, hash }`。（決定 165：translation stamp 改記喺 build record 同 manifest provenance，lock 唔再有） | 已確認（產品經理 2026-10-14） | 2A.1、2.1a |
+| 109 | Lock 記錄翻譯資料（審計用，唔計入 `source-hash`）：`translation: { prompt-version, llm-provider, model-snapshot, hash }`。（決定 165：translation stamp 改記喺 build record 同 manifest provenance，lock 唔再有） （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 已確認（產品經理 2026-10-14） | 2A.1、2.1a |
 | 110 | 高風險 release build 唔可以用翻譯 cache，一定重新翻譯。 | 已確認（產品經理 2026-10-14） | 2.1a、2C.3 |
 | 111 | 翻譯 call 計入 #92 P5 每次編譯 LLM call 上限；超過即編譯失敗。 | 已確認（產品經理 2026-10-14） | 2.1a |
 | 112 | 修訂決定 16：高風險欄位（寫入、公開、auth、secret）一定要喺 source frontmatter 宣告；宣告同譯文唔一致，或者偵測到未宣告嘅高風險行為，即 fail closed，錯誤訊息講明缺咗邊個宣告。關鍵字檢查係一致性檢查（縱深防禦），唔係唯一防線。api feature 唔再做寫入 sql 關鍵字檢查（由已檢查嘅 method lock 繼承）。 | 已確認（產品經理 2026-10-14） | 2.2、2.1a、2A.7 |
@@ -235,13 +235,13 @@
 | 114 | 部署前 deterministic policy 檢查（對 artifact）：roles、寫入、public、auth 一定要等於決定 112 嘅 frontmatter 宣告；SQL 通過決定 98 parser 白名單；UPDATE 一定要有引用主鍵／唯一鍵或者宣告篩選欄位、而且綁參數嘅 WHERE；保守規則拒絕冇 WHERE、常數或者恆真條件；判斷唔到即 fail closed；任何錯誤即 fail closed。 | 已確認（產品經理 2026-10-14） | 2C.3b、10.1 |
 | 115 | CODEOWNERS 唔係部署 gate，部署由決定 113／114 把關；CODEOWNERS required 照舊係 source PR 合併條件（決定 93）。 | 已確認（產品經理 2026-10-14） | 2C.3b、9C |
 | 116 | （已由決定 117 取代）Artifact 同 repo lock 嘅差異：release job 產生 artifact 同 repo lock 嘅 deterministic diff（SQL 先經 parse tree 正規化，只係格式唔同唔計），放入 job summary 並 attest；高風險 release 嘅 diff 涉及 roles、寫入、public、auth 或者 SQL 就失敗，錯誤訊息講明 artifact 同 repo lock 喺邊度唔同（lock id、section、step），直到 repo lock 更新到一致。 | 已確認（產品經理 2026-10-14） | 2C.3b |
-| 117 | Lock 係 build 輸出（Jack 方向，取代決定 80 同決定 116）：`*.lock.md` 唔再 commit（加入 `.gitignore`），由 CI／CD 喺部署時 build。Release job 將產生嘅 lock 存做審計 artifact 並納入 attestation，同上一個已部署版本比較，喺 release summary **列出**（唔阻擋）roles、寫入、public、auth 同 SQL 嘅變化（SQL 經 parse tree 正規化比較）。主要閘門照樣係決定 113 attestation 加決定 114 deterministic policy。`compile --check` 只喺本地／CI 驗證 build 結果同 policy，唔同已 commit 嘅 lock 比較。剩餘風險：產生嘅 SQL 唔再有人手 review；保護靠 source PR review frontmatter 宣告、決定 114 policy 同 release summary 列出變化。 | 已確認（產品經理 2026-10-14） | 2.1、2A.6、2C.3、2C.3b、9C |
-| 118 | Build once, promote：release job 只喺 `v*` tag build 一次，同一個 artifact 原封不動 promote 去各環境，唔重新 build；部署器用 `gh attestation verify --source-ref refs/tags/v<version>` 驗證。PR CI build 只係非權威預覽，結果唔可以部署。LLM key：release 用 `release` environment secret `VIBE_LLM_API_KEY`，PR 預覽用 `VIBE_LLM_API_KEY_PREVIEW`，兩條分開。Artifact 入面要有審計戳記（tag、commit SHA、workflow run id、compiler-hash、build 時間），唔包含任何 key。閘門：臨時方案 (i) 下任何有寫權限嘅人都可以開 `v*` tag，所以 tag 唔係真正閘門；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（`--release-approval` 已撤回）。將來目標係方案 (iii)：專用 release App 係唯一可以開 `v*` tag 嘅 actor，並開啟 `prevent_self_review`。兩條 LLM secret 由 Jack 本人建立。 | 已確認（產品經理 2026-10-14） | 2A.8、2C.3b |
+| 117 | Lock 係 build 輸出（Jack 方向，取代決定 80 同決定 116）：`*.lock.md` 唔再 commit（加入 `.gitignore`），由 CI／CD 喺部署時 build。Release job 將產生嘅 lock 存做審計 artifact 並納入 attestation，同上一個已部署版本比較，喺 release summary **列出**（唔阻擋）roles、寫入、public、auth 同 SQL 嘅變化（SQL 經 parse tree 正規化比較）。主要閘門照樣係決定 113 attestation 加決定 114 deterministic policy。`build --check` 只喺本地／CI 驗證 build 結果同 policy，唔同已 commit 嘅 lock 比較。剩餘風險：產生嘅 SQL 唔再有人手 review；保護靠 source PR review frontmatter 宣告、決定 114 policy 同 release summary 列出變化。 | 已確認（產品經理 2026-10-14） | 2.1、2A.6、2C.3、2C.3b、9C |
+| 118 | Build once, promote：release job 只喺 `v*` tag build 一次，同一個 artifact 原封不動 promote 去各環境，唔重新 build；部署器用 `gh attestation verify --source-ref refs/tags/v<version>` 驗證。PR CI build 只係非權威預覽，結果唔可以部署。LLM key：release 用 `release` environment secret `VIBE_LLM_API_KEY`，PR 預覽用 `VIBE_LLM_API_KEY_PREVIEW`，兩條分開。Artifact 入面要有審計戳記（tag、commit SHA、workflow run id、compiler-hash、build 時間），唔包含任何 key。閘門：臨時方案 (i) 下任何有寫權限嘅人都可以開 `v*` tag，所以 tag 唔係真正閘門；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（`--release-approval` 已撤回）。將來目標係方案 (iii)：專用 release App 係唯一可以開 `v*` tag 嘅 actor，並開啟 `prevent_self_review`。兩條 LLM secret 由 Jack 本人建立。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 已確認（產品經理 2026-10-14） | 2A.8、2C.3b |
 | 119 | Manifest 簽名改用 Sigstore keyless（Jack 決定，取代 KMS）：release manifest 由 release workflow 喺 `release` environment 用 GitHub OIDC 身份經 Sigstore（Fulcio 證書）簽，簽名一定要記錄喺 Rekor transparency log。驗證時證書身份一定要完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`（只接受完全相等，唔可以寬鬆配對 `refs/tags/v*`；如果工具一定要用 regex，只可以用完全錨定、正確轉義、寫死部署版本嘅式，例如 `^https://github\.com/vibe-backend/sdk/\.github/workflows/release\.yml@refs/tags/v1\.8\.0$`），commit SHA 同 GitHub-hosted runner 都要對，同決定 113 attestation 一致；issuer pin 死 `https://token.actions.githubusercontent.com`；冇 Rekor inclusion 證明即拒絕。驗證離線做：Rekor inclusion proof／SET 隨 Sigstore bundle 一齊交付；trust root（`trusted_root.json`：Fulcio CA、Rekor 公鑰、CT log key）由 Sigstore TUF repository 取得，release 時 pin 一份入 runtime binary，見 2C.3b。Keyless 身份只證明邊個 workflow 同 tag 產生呢個 build，唔證明邊個批准；佢唔會加多一個人，因為任何 `j113203` agent 都可以開 tag 再自己批准。冇任何長期簽名 key 或者 KMS，冇自管簽名 key 輪換（Sigstore trust root 輪換見 2C.3b）。Environment secret（例如簽名 secret）只可以用喺 dev／test，永遠唔用嚟簽 release。剩餘風險：臨時方案 (i) 下 tag 身份唔係閘門，唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；trust root 更新都係經同一個 `release` environment 出，同一個帳戶可以自己批准，冇額外嘅人把關。 | 已確認（產品經理 2026-10-14） | 2C.2、2C.3、2C.3b、9B、9C |
 | 120 | Email 正規化（issue #106）：v1 唔合併 plus addressing，`a+x@` 同 `a@` 係兩個唔同地址；local part 入面嘅點（`.`）照樣保留，`a.b@` 同 `ab@` 係兩個唔同地址。Local part：先做 Unicode NFC（唔係 NFKC），再 trim，再 lowercase。Domain：用 IDNA UTS #46 轉做 punycode，再 lowercase；IDNA 轉換失敗回 422 `VALIDATION_FAILED`。唯一 index、查找同發送全部用正規化後嘅值；login、註冊、邀請、驗證、重發同 rate-limit 全部先正規化再儲存同查找（12.11）。v1 只儲存正規化後嘅值，唔另外保留原本地址做顯示。現有資料遷移：migration 先偵測正規化後衝突（只差大小寫或者 Unicode 形式嘅重複地址）；有任何衝突就 fail closed 停止，唔自動合併；衝突報告只列 user id，任何公開 log 都唔出現完整 email；由人手按 12.11 嘅處理程序解決之後先重新跑。 | 已確認（產品經理 2026-10-16） | 4.3、9、12.11 |
 | 129 | 租戶 role 細節（補充決定 97，SDK #147）：(1) Runtime role 係 `tenant_<id>_rw`、`tenant_<id>_public_reader`、`tenant_<id>_public_writer`；`<id>` 係系統產生、只有 `[a-z0-9_]` 嘅不透明 id，永遠唔用用戶提供嘅名；role 名超過 63 bytes 即拒絕，永遠唔截斷。(2) 連線池每個（租戶、role）5 條，每個租戶最多 15 條；另有全 process 上限，預設 200，可以設定（設定名 `VIBE_DB_POOL_MAX_TOTAL`（已確認（產品經理 2026-10-16）））。三個上限（每個（租戶、role）5 條、每個租戶 15 條、全 process）任何一個滿咗，都即刻回 503 `DB_POOL_EXHAUSTED` 加 `Retry-After`（值 `1`（已確認（產品經理 2026-10-16））），並發 metric（名 `vibe_db_pool_exhausted_total{scope="role"\|"tenant"\|"process"}`（已確認（產品經理 2026-10-16）））；永遠唔排隊等 timeout，包括每個（租戶、role）同每個租戶上限。(3) `VIBE_TENANT_DB_SECRETS` JSON 檔只限開發同測試，權限一定 0600，永遠唔 commit、唔寫 log；production 憑證來源係 secret manager，經每個租戶 role 嘅環境變數參照注入（同 #147 實作一致），process 只讀參照、唔落地成檔；production 見到呢個檔就拒絕啟動（fail closed）。Owner role（`tenant_<id>_owner`）憑證：平台只喺每次 migrate 開始時由 secret manager 發一次性密碼，migrate 完成即作廢並將 role 設返 `NOLOGIN`；即係每次 migrate 都輪換，runtime 永遠攞唔到。(4) 閒置連線池 5 分鐘後關閉（v1 固定，冇環境變數設定）；呢點阻 GA，唔阻 v1 preview。(5) Migration role 係 `tenant_<id>_owner`，擁有該租戶 schema 同表，只畀 migrate 用。決定 27 嘅例外（已確認（產品經理 2026-10-16））：PostgreSQL owner 天生可以 TRUNCATE／DROP 同重新授權，冇辦法靠收權限禁止，所以 owner 係決定 27 嘅受控例外，條件見 2B「Owner role 條件」：migration parser 用正面白名單、migrate 單一 transaction、finally 由獨立平台 admin 連線收回登入、定期檢查、runtime 連線池永遠唔以 owner 登入；runtime role 唔係 owner，每張表都要 `FORCE ROW LEVEL SECURITY`；migrate 兩樣都檢查，缺任何一樣就失敗。(6) 編譯器輸出每個租戶常數 policy（`TO tenant_<id>_rw`），唔用 `current_setting('app.tenant_id')`；部署時比較編譯出嚟嘅 policy 同 DB 實際安裝嘅 policy，唔一致即 fail closed。 實作狀態（對照 #147 @8066b69）：#147 已包括三層連線池上限即時 503、`VIBE_DB_POOL_MAX_TOTAL`、`vibe_db_pool_exhausted_total{scope}`、production 拒絕 `VIBE_TENANT_DB_SECRETS`、一次性 owner 密碼、`pg_policies` 比對、migrate 拆做主 transaction 加 commit 後 concurrent index 步驟、finally 由獨立 admin 連線將 owner 設返 `NOLOGIN`、定期 owner 檢查（`vibe check-owners`）、連線池拒絕 owner role、parser 白名單（2B.3，#206）、INVALID index 只 drop 平台紀錄嘅（#207）、閒置連線池固定 5 分鐘關閉（v1 冇環境變數設定，#165）。受控 membership 例外（已確認（產品經理 2026-10-16））：每個租戶剛好一行 membership `tenant_<id>_rw` ← `tenant_<id>_owner`，`ADMIN FALSE`、`INHERIT FALSE`、`SET TRUE`（PostgreSQL 16+），反方向同其他任何 membership 令啟動失敗；owner migrate 以外 `NOLOGIN` 加定期偏差檢查；必須測試跨租戶、INHERIT、ADMIN OPTION 三種失敗情況——未實作，#246（#147 啟動檢查要調整）。另外嘅 lock 驗證器加固由 #147 進行中。未完成：backfill 同 replay 清理按租戶設定 RLS context、參數化同分批——未實作，#233。未完成：v1 要求 PostgreSQL 16 或以上（架構師決定 2026-10-16），16 以下 `vibe migrate`／`vibe serve` 啟動時 fail closed 並報明確錯誤，冇 fallback——未實作（code 仲未檢查版本），#254。 | 已確認（產品經理 2026-10-16）；owner `SET ROLE` 剩餘風險已接受（產品經理 2026-10-16） | 7.1、7.1a、9C |
 | 130 | IP 限流計數鍵同驅逐（SDK #132，v1 blocker；修訂 #73 嘅限流設計）：(1) 網段 slot 上限（跟 #73）：上限係每個網段可以開嘅**新計數器 slot** 數目，唔係 request 次數。計數前 IPv4-mapped IPv6（`::ffff:a.b.c.d`）一律先轉做 IPv4（同 #182 一致）。IPv4 每個（`tenant_id`、/24）最多 10 個新 slot；IPv6 每個（`tenant_id`、/48）最多 10 個，另加每個（`tenant_id`、/32）最多 50 個。Request 次數限流照舊用 4.3 嘅滑動窗口同數字。(2) 平台層：另有一個跨租戶網段 slot 計數器，鍵係 /24 同 /48，預設上限係租戶 slot 上限 ×5（單位同樣係新計數器 slot），倍數用 `VIBE_RATE_PLATFORM_FACTOR` 設定（預設 5，最大 100（已確認（產品經理 2026-10-16）））；兩層都通過先放行；平台層亦保證每個租戶 64 slot 保底。拒絕回 429 加 `Retry-After`，回應永遠唔講係邊一層觸發。(3) 驅逐：固定窗口長度 60 秒，只用喺本決定嘅網段 slot 計數同佢嘅 LRU 驅逐（4.3 request 限流仍然係滑動窗口）；LRU 有上限，先驅逐已過期嘅項目；每個租戶有自己嘅計數器 slot 上限；slot 滿而冇過期項目就 fail closed，回 429 並記 metric；永遠唔驅逐仲喺窗口內嘅計數器。Metric：拒絕記 metric（名 `vibe_rate_limit_slot_refused_total{layer="tenant"\|"platform", reason="network_cap"\|"table_full"\|"tenant_budget_exhausted"\|"prefix_cap_exceeded"}`（已確認（產品經理 2026-10-16））；`layer` 只喺內部 metric 出現，回應唔講）。Slot 表（同 #182 新設計（已確認（產品經理 2026-10-16）））：租戶表：每個租戶有自己一個 4,096 slot 嘅表，滿咗只拒絕嗰個租戶；全部租戶總預算 = `VIBE_RATE_EXPECTED_TENANTS`（預設 256，範圍 1–4096）× 4,096；用緊少過 64 個 slot 嘅租戶一定放行。平台表：IPv4 按 /24、IPv6 按 /32 分開嘅表，每個最多 4,096 項。平台表保證每個租戶嘅 64 slot 保底：平台總量 = 租戶總預算 + 租戶數 × 64，預設 1,064,960（256 × 4,096 + 256 × 64），所以就算好多租戶填滿平台表，新租戶都唔會冇 slot 可用。多 instance 部署一定要用共用儲存（#157）。#73 嘅 shard 內 owner／reserve 上限（每個網段 100 個 bucket、較闊網段 1,000 個、最後 1,000 個保留 slot）照舊保留，喺本決定之外再疊加（已確認（產品經理 2026-10-16））。Test IP 覆寫由環境變數 `VIBE_HONOR_TEST_IP=true` 開啟，只喺 debug build 生效；release build 唔理 `x-vibe-test-ip` header，而且設定咗 `VIBE_HONOR_TEST_IP=true` 時 `vibe serve`／router 拒絕啟動（fail closed）。剩餘風險：(a) 固定窗口邊界前後，網段新 slot 數目最多可以去到上限 ×2（已接受）；(b) 平台層令一個租戶嘅流量可以用埋同一 /24 或者 /48 其他租戶嘅額度（已接受）；(c) 平台總量只有保底以上嘅部分係跨租戶共用；共用部分喺一個窗口內用晒嘅話，保底以上嘅新 slot 會被拒絕，保底照樣保證（已確認（產品經理 2026-10-16））；(d) 同時滿咗嘅租戶多過 `VIBE_RATE_EXPECTED_TENANTS`，就只有用緊少過 64 個 slot 嘅租戶可以開新 slot（已確認（產品經理 2026-10-16））；呢個情況一定記 metric reason `tenant_budget_exhausted`（已確認（產品經理 2026-10-16））並發 WARN 告警（每分鐘最多一次），唔可以靜默拒絕；(e) 最差情況每個表大約 300 MB 記憶體（估計，未實測）（已確認（產品經理 2026-10-16））；唔可以靠呢個估計：v1 一定要有硬記憶體上限 `VIBE_RATE_TABLE_MEMORY_MAX_BYTES`（預設 268435456，即 256 MiB，限 limiter 全部 slot 表合計；名同預設已確認（產品經理 2026-10-16）；預設刻意細過單一表最差估計（大約 300 MB），滿載時 limiter 會先到 `table_full`（fail closed），#195 實測後再調整預設），超過即以 reason `table_full` fail closed。記憶體上限預先保留保底份額：租戶數 × 64 × 3 KiB（每個保底 slot 一個租戶計數器、一個平台計數器同一個 bucket），256 個租戶即 48 MiB，最多佔上限一半。保底以內嘅增長對照完整上限檢查；其他增長對照「上限減保留」檢查，超過即 `table_full`。#195 實測：每個 slot 大約 481 B，上限按每個 slot 1 KiB 估算；**GA blocker：記憶體實測（#195）**；(f) 活躍租戶多過 `VIBE_RATE_EXPECTED_TENANTS` 時，就算喺保底以內嘅請求都可能撞到硬記憶體上限，以 `table_full` fail closed（已接受（產品經理 2026-10-16））；接受條件：活躍租戶超過 `VIBE_RATE_EXPECTED_TENANTS` 嘅 80% 就發告警 `rate_limit_active_tenants_high`；保底以內嘅 `table_full` 拒絕要喺 `vibe_rate_limit_slot_refused_total{reason="table_full"}` 用 `within_floor` label 分辨（或者只寫入內部 log），永遠唔出現喺任何回應；#195 實測要一併驗證呢個風險同保底記憶體預留嘅大小；營運調整見 4.3；(g) 一個 IPv6 /32 入面活躍 /48 太多、超過該 /32 嘅平台表上限時，嗰個 /32 自己嘅用戶會 fail closed（已確認（產品經理 2026-10-16））；呢個情況一定記 metric reason `prefix_cap_exceeded`（reason 名已確認（產品經理 2026-10-16））並發 WARN 告警（每分鐘最多一次），唔可以靜默拒絕。 實作狀態（對照 #182 @679e128（2026-10-16 核對））：#182 實作每租戶 4,096 slot 表、`VIBE_RATE_EXPECTED_TENANTS`、64 slot 保底（平台表同記憶體保留，保底以內增長對照完整上限）、平台 /24、/32 表（預設總量 1,064,960）、`VIBE_RATE_PLATFORM_FACTOR`、IPv4-mapped 轉 IPv4、四個 reason、每分鐘最多一次嘅 WARN 告警、`VIBE_RATE_TABLE_MEMORY_MAX_BYTES` 硬上限（#210、#211），同埋 release build 唔理 test IP header。未完成：告警 `rate_limit_active_tenants_high`——#182 未實作，#234；`within_floor` 分辨——#182 未實作，#235；release build 設定 `VIBE_HONOR_TEST_IP=true` 時拒絕啟動——#182 已實作（自 @c12736c 由環境變數讀取，有測試），#230 喺 #182 merge 之後由 maintainer 關閉。記憶體實測見 #195（GA blocker）。 | 已確認（產品經理 2026-10-16） | 4.3、4A.3、7.2 |
-| 139 | `sign-jwt` 簽名算法政策（issue #198）：v1 只支援 ES256 同 RS256，預設 ES256；RS256 用嚟同第三方／JWKS 互通。RS256 key 最少 2048 bit，喺 `vibe validate --deploy`／部署同 `vibe serve` 啟動時檢查，唔夠就 fail closed（拒絕啟動，永遠唔會降級或者改用其他 alg）。驗證端只接受設定好嘅一個 alg；`alg` header 係其他值一律拒絕，包括 `none`、HS*，同埋 ES256／RS256 之中另一個（唔准混用）。EdDSA 留到 vNext。實作狀態：部分未實作，見 4.1a。 | 已確認（產品經理 2026-10-16） | 4.1、4.1a、12.6 |
+| 139 | `sign-jwt` 簽名算法政策（issue #198）：v1 只支援 ES256 同 RS256，預設 ES256；RS256 用嚟同第三方／JWKS 互通。RS256 key 最少 2048 bit，喺 `vibe validate --deploy`／部署同 `vibe serve` 啟動時檢查，唔夠就 fail closed（拒絕啟動，永遠唔會降級或者改用其他 alg）。驗證端只接受設定好嘅一個 alg；`alg` header 係其他值一律拒絕，包括 `none`、HS*，同埋 ES256／RS256 之中另一個（唔准混用）。EdDSA 留到 vNext。實作狀態：部分未實作，見 4.1a。 （決定 175：指令改為 `vibe build`） | 已確認（產品經理 2026-10-16） | 4.1、4.1a、12.6 |
 
 ### 0.11 v1.8 refresh cookie 補充（決定 141 起，issue #78，已確認（產品經理 2026-10-16））
 
@@ -264,10 +264,10 @@
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
-| 131 | v1 challenge provider 係 Cloudflare Turnstile：`type: captcha` 一律由 server 端 siteverify 驗證，只有 header 存在唔算通過。`type: pow` v1 唔支援（修訂決定 49：v1 有 INSERT 嘅 public endpoint 一定要 `type: captcha`）；`type: pow` 係 **build 時驗證器 error**，`vibe build`、`vibe validate` 同部署一律失敗，唔會去到 runtime。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） | 已確認（產品經理 2026-10-16） | 7.2a、10.7 |
+| 131 | v1 challenge provider 係 Cloudflare Turnstile：`type: captcha` 一律由 server 端 siteverify 驗證，只有 header 存在唔算通過。`type: pow` v1 唔支援（修訂決定 49：v1 有 INSERT 嘅 public endpoint 一定要 `type: captcha`）；`type: pow` 係 **build 時驗證器 error**，`vibe build`、`vibe validate` 同部署一律失敗，唔會去到 runtime。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） （決定 175：指令改為 `vibe build`） | 已確認（產品經理 2026-10-16） | 7.2a、10.7 |
 | 132 | Server 端 siteverify：每個 request 帶 `x-challenge-proof` header；server 先拒絕空或者超過 2048 字元嘅 token，再喺 replay store 預留 token（只存 SHA-256），然後 call Turnstile siteverify（5s timeout、唔跟 redirect、只准公網地址），送 secret、token 同 client IP。一定要 `success: true`、`hostname` 喺 `VIBE_CHALLENGE_HOSTNAMES`、`action` 等於 endpoint 名、`challenge_ts` 存在而且唔超過 300s 前、唔超過 60s 後。每個 token 最多用一次。**Replay store（#177）**：production 一律用共用 Postgres replay store（所有 instance 共用），冇設定或者連唔到就拒絕啟動；per-process cache 只限 dev／test。Turnstile 本身嘅單次使用檢查（`timeout-or-duplicate`）只係額外一層，唔係主要防線。 | 已確認（產品經理 2026-10-16） | 7.2a |
 | 133 | 邊啲 endpoint 要 challenge：跟決定 38、49：有 INSERT 嘅 public endpoint `{ type: captcha, when: always }`；login 類 `{ type: captcha, when: after-failures, after-failures: 3 }`；其他冇 INSERT 嘅 public 寫入可以 `type: none`。已認證 endpoint 預設**唔要**，但可以經 source frontmatter `challenge: captcha` opt-in（lock 寫 `{ type: captcha, when: always }`）；refresh endpoint（決定 72）唔要求。 | 已確認（產品經理 2026-10-16） | 7.2、7.2a |
-| 134 | 失敗、超時同 fail closed：503 `CHALLENGE_UNAVAILABLE` **只限** provider 或者網絡失敗（provider 唔可達、超時、回應唔啱，同 replay store 暫時連唔到），永遠唔會當通過、冇 fallback；token 無效一律係 403，唔會變 503。**Replay store 滿**（已確認（產品經理 2026-10-16））：係流量造成嘅容量限制，唔係 provider 失敗，所以回 **429** `CHALLENGE_RATE_LIMITED`加 `Retry-After`，唔回 503；照樣 fail closed：未成功記錄 replay 就永遠唔准放行。`Retry-After` = 該租戶自己最舊紀錄嘅剩餘有效時間，上限 360 秒，計唔到就用 60 秒。同時發 metric `vibe_challenge_rejected_total{reason="replay_store_full"}`並觸發告警 `challenge_replay_store_full`（store 滿時觸發；metric reason `replay_store_full`）；名稱已確認（產品經理 2026-10-16）。**每個網段上限**（已確認（產品經理 2026-10-16））：每個租戶嘅 replay store 入面，每個網段（IPv4 /24、IPv6 /48）可以持有嘅記錄有上限，預設 16（同決定 137 每個 IP 16 個未驗證預留一致）；超過回 429 `CHALLENGE_RATE_LIMITED`（內部 reason `replay_prefix_cap`），`Retry-After` = 該租戶該網段最舊紀錄嘅剩餘有效時間，上限 360s，計唔到就 60，同 store 滿規則一樣（網段 `Retry-After` 已確認（產品經理 2026-10-16））。**429 回應一致**（已確認（產品經理 2026-10-16））：網段超過上限同 store 滿都用同一個錯誤碼 `CHALLENGE_RATE_LIMITED`；reason（`replay_store_full`、`replay_prefix_cap` 等）只寫入 metric 同內部 log，永遠唔出現喺 HTTP 回應（body、header、error detail 都冇）；所有呢類 429 回應除咗 `Retry-After` 之外完全一樣。Replay store 使用率超過 80% 觸發告警 `challenge_replay_store_high_usage`（已確認（產品經理 2026-10-16））。設定問題喺啟動時擋：production（`VIBE_ENV`）有任何 challenge route 而冇設定 verifier 或者共用 replay store，`vibe serve` 拒絕啟動、`vibe validate --deploy` 失敗。Dev（`vibe dev`）用假 verifier（一律通過，terminal 標示，決定 74），production 永遠唔准用。 | 已確認（產品經理 2026-10-16） | 7.2a、2C.4 |
+| 134 | 失敗、超時同 fail closed：503 `CHALLENGE_UNAVAILABLE` **只限** provider 或者網絡失敗（provider 唔可達、超時、回應唔啱，同 replay store 暫時連唔到），永遠唔會當通過、冇 fallback；token 無效一律係 403，唔會變 503。**Replay store 滿**（已確認（產品經理 2026-10-16））：係流量造成嘅容量限制，唔係 provider 失敗，所以回 **429** `CHALLENGE_RATE_LIMITED`加 `Retry-After`，唔回 503；照樣 fail closed：未成功記錄 replay 就永遠唔准放行。`Retry-After` = 該租戶自己最舊紀錄嘅剩餘有效時間，上限 360 秒，計唔到就用 60 秒。同時發 metric `vibe_challenge_rejected_total{reason="replay_store_full"}`並觸發告警 `challenge_replay_store_full`（store 滿時觸發；metric reason `replay_store_full`）；名稱已確認（產品經理 2026-10-16）。**每個網段上限**（已確認（產品經理 2026-10-16））：每個租戶嘅 replay store 入面，每個網段（IPv4 /24、IPv6 /48）可以持有嘅記錄有上限，預設 16（同決定 137 每個 IP 16 個未驗證預留一致）；超過回 429 `CHALLENGE_RATE_LIMITED`（內部 reason `replay_prefix_cap`），`Retry-After` = 該租戶該網段最舊紀錄嘅剩餘有效時間，上限 360s，計唔到就 60，同 store 滿規則一樣（網段 `Retry-After` 已確認（產品經理 2026-10-16））。**429 回應一致**（已確認（產品經理 2026-10-16））：網段超過上限同 store 滿都用同一個錯誤碼 `CHALLENGE_RATE_LIMITED`；reason（`replay_store_full`、`replay_prefix_cap` 等）只寫入 metric 同內部 log，永遠唔出現喺 HTTP 回應（body、header、error detail 都冇）；所有呢類 429 回應除咗 `Retry-After` 之外完全一樣。Replay store 使用率超過 80% 觸發告警 `challenge_replay_store_high_usage`（已確認（產品經理 2026-10-16））。設定問題喺啟動時擋：production（`VIBE_ENV`）有任何 challenge route 而冇設定 verifier 或者共用 replay store，`vibe serve` 拒絕啟動、`vibe validate --deploy` 失敗。Dev（`vibe dev`）用假 verifier（一律通過，terminal 標示，決定 74），production 永遠唔准用。 （決定 175：指令改為 `vibe build`） | 已確認（產品經理 2026-10-16） | 7.2a、2C.4 |
 | 135 | 錯誤碼：400 `CHALLENGE_REQUIRED`（冇 proof）；403 `CHALLENGE_FAILED`（偽造、重用、過期、時間錯、hostname／action 唔啱、每 IP／每租戶未驗證預留上限，即係所有 token 無效情況）；503 `CHALLENGE_UNAVAILABLE`（只限 provider／網絡失敗，固定帶 `Retry-After: 5`）；429 `CHALLENGE_RATE_LIMITED`（replay store 滿或者網段超過上限，決定 134；帶 `Retry-After`：store 滿按該租戶自己最舊紀錄、網段超過上限按該租戶喺嗰個網段最舊紀錄嘅剩餘有效時間，上限 360 秒，計唔到用 60 秒（網段 `Retry-After` 已確認（產品經理 2026-10-16））；回應唔包含 reason）。限流同配額係另一回事，回 429 `RATE_LIMITED`（帶 `Retry-After`），唔會用 503。錯誤 body 唔包含 token、provider 原始錯誤碼或者 secret；詳細原因只入 server log 同審計。 | 已確認（產品經理 2026-10-16） | 7.2a、8 |
 | 136 | Secret 處理：`VIBE_TURNSTILE_SECRET` 只可以由環境變數或者 secret manager（例如 CI environment secret）注入；唔准寫入 source、lock、manifest、`.env` commit 或者 log；錯誤訊息同 debug 輸出只顯示「已設定／未設定」。驗證器見到 lock 或者 source 有疑似 secret 值即報 error。設定：`VIBE_CHALLENGE_PROVIDER`（預設 `turnstile`）、`VIBE_TURNSTILE_SECRET`、`VIBE_CHALLENGE_HOSTNAMES`（有 secret 就一定要有）、`VIBE_CHALLENGE_REPLAY_STORE`（production 一定 `postgres`，#177）；預設同 production 規則見 7.2a。 | 已確認（產品經理 2026-10-16） | 7.2a、2A.8.5 |
 | 137 | 同限流組合：route 限流（決定 25、39）同 public 寫入每日配額喺 challenge 之前檢查，超過回 **429**（同 challenge 嘅 503 分開），被限流嘅 request 唔會去到 replay store 或者 provider；challenge 唔取代限流同配額。v1 用固定平台數值：token 壽命 300s、每 client IP 最多 16、每租戶最多 1,000 個未驗證預留（超過回 403 `CHALLENGE_FAILED`，唔 call provider）；**冇租戶 override**。將來如果加 override，只可以調低，唔可以調高。 | 已確認（產品經理 2026-10-16） | 7.2a、4.3 |
@@ -280,19 +280,19 @@
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
-| 149 | `sign-method` 一律唯讀：`token-refresh` 嘅 `sign-method`，連同佢經 `op: method`（任何深度）呼叫嘅 method，都唔可以有寫入 step。`vibe validate`、`vibe build` 同 `vibe serve` 一律阻擋（錯誤碼 `REFRESH_SIGN_METHOD_WRITES`）；refresh 路徑上 `sign-method` 嘅所有 DB statement 再以 READ ONLY 執行做 DB 層兜底。「最後 refresh 時間」以家族為單位，由 SDK 喺輪換確認 transaction 入面寫 `_platform_refresh_families.last_refreshed_at`（只可以向前，成個家族撤銷之後唔可以改；寬限期重發只撤銷單一 child，唔計）；其他業務寫入搬去 client 喺 refresh 成功之後另外呼叫嘅普通寫入 method。v1.0 前嘅 breaking change。唔改決定 6、45、61、147 嘅對外行為同錯誤碼。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） | 已確認（產品經理 2026-10-17） | 4A.1、4A.1c |
+| 149 | `sign-method` 一律唯讀：`token-refresh` 嘅 `sign-method`，連同佢經 `op: method`（任何深度）呼叫嘅 method，都唔可以有寫入 step。`vibe validate`、`vibe build` 同 `vibe serve` 一律阻擋（錯誤碼 `REFRESH_SIGN_METHOD_WRITES`）；refresh 路徑上 `sign-method` 嘅所有 DB statement 再以 READ ONLY 執行做 DB 層兜底。「最後 refresh 時間」以家族為單位，由 SDK 喺輪換確認 transaction 入面寫 `_platform_refresh_families.last_refreshed_at`（只可以向前，成個家族撤銷之後唔可以改；寬限期重發只撤銷單一 child，唔計）；其他業務寫入搬去 client 喺 refresh 成功之後另外呼叫嘅普通寫入 method。v1.0 前嘅 breaking change。唔改決定 6、45、61、147 嘅對外行為同錯誤碼。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext） （決定 175：指令改為 `vibe build`） | 已確認（產品經理 2026-10-17） | 4A.1、4A.1c |
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
-### 0.14 v1.8 2026-10-17 決定（決定 150–174，產品經理已批准 2026-10-17）
+### 0.14 v1.8 2026-10-17 決定（決定 150–176，產品經理已批准 2026-10-17）
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
 | 150 | （#285）Expression 支援 JSON 字串／數字、`true`／`false`／`null` 字面值同加引號嘅 object key（未支援 array）；三個字係保留字。api `respond value` 會 evaluate，runtime 失敗回 500 `INTERNAL`，唔 fallback；validate／manifest 拒絕靜態可確定失敗嘅 expression。`## Transform` 可省略，等同 `(none)`（in = `{}`、out = `result`），`- in: (none)`／`- out: (none)` 都接受。 | 已批准（產品經理 2026-10-17） | 2.3、2A.2、2A.3 |
-| 151 | （#287）LLM 連線錯誤顯示底層原因（地址／範圍被拒、DNS、TLS）同遮咗嘅 URL，永遠唔包含 key、request header 或 response body。`vibe validate --deploy --dev` 同 `vibe manifest --dev` 接受本地開發 private endpoint lock，CI／production 拒絕。開發環境 `vibe serve` 啟動 runtime 前警告並移除 `LLM_*`／`OPENAI_*`（包括 `.env` 值），其他環境照舊拒絕。 | 已批准（產品經理 2026-10-17） | 2A.8.4、2A.8.5、2C.3、10 |
+| 151 | （#287）LLM 連線錯誤顯示底層原因（地址／範圍被拒、DNS、TLS）同遮咗嘅 URL，永遠唔包含 key、request header 或 response body。`vibe validate --deploy --dev` 同 `vibe manifest --dev` 接受本地開發 private endpoint lock，CI／production 拒絕。開發環境 `vibe serve` 啟動 runtime 前警告並移除 `LLM_*`／`OPENAI_*`（包括 `.env` 值），其他環境照舊拒絕。 （決定 175 取代：官方指令用 `vibe build`，`vibe serve` 只係暫時隱藏 run 步驟） | 已批准（產品經理 2026-10-17） | 2A.8.4、2A.8.5、2C.3、10 |
 | 152 | （#92）api source frontmatter `auth: none`（同 `removed`／`false`／`off`）一律編譯成 `-auth`，取代繼承或 model auth。固定清單嘅中英文移除 auth 句子當直接否定，唔出歧義 warning；login 要求照樣衝突，雙重否定保留嚴格檢查。 | 已批准（產品經理 2026-10-17） | 2.2、2.1a |
 | 153 | （#289）LLM 錯誤只顯示寫死 allowlist 嘅值（已知 model 名、provider 錯誤碼、Responses API incomplete reason），其餘顯示 `unknown`；provider 訊息文字同 response body 永遠唔顯示。 | 已批准（產品經理 2026-10-17） | 2A.8.5 |
-| 154 | （#97）移除 `vibe approve` 同 lock 簽名；lock 冇 `status`／`approval-*`／`approved-*`／`signature`，舊欄位出一次 warning 後忽略。`vibe manifest` 冇 `--dev` 就 build release manifest（同 `--release`）；release workflow 用 Sigstore keyless 簽名，非開發環境 `vibe serve` 只接受經 Sigstore 驗證嘅 release manifest。 | 已批准（產品經理 2026-10-17） | 2A.1、2A.5、2C.2、2C.3、2C.3b |
+| 154 | （#97）移除 `vibe approve` 同 lock 簽名；lock 冇 `status`／`approval-*`／`approved-*`／`signature`，舊欄位出一次 warning 後忽略。`vibe manifest` 冇 `--dev` 就 build release manifest（同 `--release`）；release workflow 用 Sigstore keyless 簽名，非開發環境 `vibe serve` 只接受經 Sigstore 驗證嘅 release manifest。 （決定 175：指令改為 `vibe build`） | 已批准（產品經理 2026-10-17） | 2A.1、2A.5、2C.2、2C.3、2C.3b |
 | 155 | （#290／#291）開發環境 `vibe serve --memory` 一定有 slug `dev`（tenant `devtenant`），即使 slug 檔設定咗其他 slug；檔案改動唔使重啟。非 memory 同非開發環境不變。 | 已批准（產品經理 2026-10-17） | 2C.1 |
 | 156 | （#291）validate 按位置檢查 expression 變數根：Transform in 准 `req`、`ctx`；api step 同 Transform out 准 `input`、`req`、`ctx` 同之前 method step 嘅 out；method 准 `input`、`ctx` 同之前 step 嘅 out。錯誤報根名、位置同准用根。compile 每個 LLM lock 正規化後跑 validate，失敗經現有 repair loop 回饋 model，共用 `LLM_FORMAT_RETRIES` 上限；最後失敗就停止，成個 project 通過先寫 lock 同 build record。 | 已批准（產品經理 2026-10-17） | 2A.2、2A.8 |
 | 157 | （#292）互動 `vibe` 取代 `vibe new`；首次問 LLM 設定，寫 project `.env`（0600），只補缺少嘅行，已有值優先；`.gitignore` 只加一次 `.env`。Endpoint 解析到 private／本地地址先問用戶再加 `LLM_ALLOW_PRIVATE_HOST=true`。產生 source 要簡單小寫 kebab-case 名，hello world 預設 `hello/v1/hello`。 | 已批准（產品經理 2026-10-17） | 2C.1 |
@@ -300,19 +300,21 @@
 | 159 | （#293）api feature lock 嘅 `## Limits` 同 `## Request` `path.slug` row 由 code 按固定規則正規化，唔由 model 揀，同一 source 編譯出 byte-identical lock。 | 已批准（產品經理 2026-10-17） | 2A.2 |
 | 160 | Frontmatter 可以 pin `timeout`、`body` 同 `provider`；timeout／body 按 pin → `_version` Defaults → `_definition` Defaults → `10s`／`1MB`；provider 按 pin → `_definition` Providers default → `main`。validate 檢查 pin 格式；Limits 只嚟自 frontmatter 同繼承預設，prose limits 唔會用，warning 留到 vNext。compile 同互動 prompt 都叫 model 同用戶將 limits 寫喺 frontmatter。 | 已批准（產品經理 2026-10-17） | 2.2、2A.2 |
 | 161 | Structured source 用同一套 `path.slug` 同 Limits 規則；structured `## Limits` 有值同解析結果唔同就 compile error，要移去 frontmatter 或刪除。 | 已批准（產品經理 2026-10-17） | 2A.2 |
-| 162 | 每次改 compile prompt（system prompt、guide、examples）一定要 bump `PROMPT_VERSION`，佢計入 compiler-hash 同 LLM cache key。 | 已批准（產品經理 2026-10-17） | 2A.6 |
+| 162 | 每次改 compile prompt（system prompt、guide、examples）一定要 bump `PROMPT_VERSION`，佢計入 compiler-hash 同 LLM cache key。 （已由決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 已批准（產品經理 2026-10-17） | 2A.6 |
 | 163 | Structured source `## Limits` 有值同解析結果唔同就 compile error，錯誤講明欄位（provider／timeout／body）、source 寫嘅值、解析出嚟嘅值同修正方法（喺 frontmatter pin 或者刪除嗰行）。 | 已批准（產品經理 2026-10-17） | 2A.2 |
-| 164 | `vibe build` 唔喺 1.0：`vibe manifest`（預設 release；`--dev`、`--release`）係官方 build 指令；`vibe build`（`--labels`、`-o`、部署報告）延至 vNext。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.3 |
-| 165 | 同一 source、同一 `PROMPT_VERSION` 同同一結構，一定產生 byte-identical lock；lock 唔可以包含任何每次 run 都可能改變嘅欄位。Translation stamp 改記喺 build record 同 manifest provenance，唔再寫入 lock。 | 已批准（產品經理 2026-10-17） | 2A.1、2.1a |
-| 166 | `vibe dev` 唔喺 1.0，延至 vNext；1.0 本地開發流程係互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory` → curl。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.2 |
+| 164 | `vibe build` 唔喺 1.0：`vibe manifest`（預設 release；`--dev`、`--release`）係官方 build 指令；`vibe build`（`--labels`、`-o`、部署報告）延至 vNext。 （已由決定 175 取代：官方指令係 `vibe build`／`vibe build --release`） | 已批准（產品經理 2026-10-17） | 2C.1、2C.3 |
+| 165 | 同一 source、同一 `PROMPT_VERSION` 同同一結構，一定產生 byte-identical lock；lock 唔可以包含任何每次 run 都可能改變嘅欄位。Translation stamp 改記喺 build record 同 manifest provenance，唔再寫入 lock。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 已批准（產品經理 2026-10-17） | 2A.1、2.1a |
+| 166 | `vibe dev` 唔喺 1.0，延至 vNext；1.0 本地開發流程係互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory` → curl。 （決定 175 取代：官方指令用 `vibe build`，`vibe serve` 只係暫時隱藏 run 步驟） | 已批准（產品經理 2026-10-17） | 2C.1、2C.2 |
 | 167 | `source-lines` 由 compiler 計，model 引用嘅範圍 snap 去所在 markdown block（段落、list、table、fenced code、heading、frontmatter）嘅 union；無效或者超出範圍用 body 全部 block 範圍做 fallback；validate 要求 block 對齊。已知問題：model 引用另一段落時 lock 仍然可能唔同；唔阻 rc。 | 已批准（產品經理 2026-10-17） | 2A.2、2A.4 |
-| 168 | Fields 按 header 名（包括中文同必填欄）對應；全形 pipe 同 min/max 長度別名正規化，lock 唔准留別名；所有路徑（包括 method query 同 memory）嘅 SQLSTATE 23505 都回 409 `UNIQUE_VIOLATION`，永遠唔重試，唔影響 40001／40P01 嘅 `TX_CONFLICT`。PROMPT_VERSION 改為 prompt-8。 | 已批准（產品經理 2026-10-17） | 2A.2、12.2、8 |
+| 168 | Fields 按 header 名（包括中文同必填欄）對應；全形 pipe 同 min/max 長度別名正規化，lock 唔准留別名；所有路徑（包括 method query 同 memory）嘅 SQLSTATE 23505 都回 409 `UNIQUE_VIOLATION`，永遠唔重試，唔影響 40001／40P01 嘅 `TX_CONFLICT`。PROMPT_VERSION 改為 prompt-8。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 已批准（產品經理 2026-10-17） | 2A.2、12.2、8 |
 | 169 | Feature 嘅 writes 由 method steps（CRUD、Signature、SQL 同遞迴呼叫）推導；唔使宣告 writes，false 同寫入 step 衝突就報錯，true 冇寫入 step 要 repair。Method 規則照舊。 | 已批准（產品經理 2026-10-17） | 2.2、2A.4 |
 | 170 | 自然語言 POST／PUT／PATCH／DELETE 明確要求新增、更新或刪除記錄，英文動詞嘅常見屈折形式（例如 created／creating、updated／updating、deleted／deleting、listed／listing）都計；必須有對應 model.create／update／delete method step 同 respond；唔准 Steps (none)。排除否定、code、移除 auth 同 writes: false。自然語言 feature 冇 method step 又冇 literal constant response 就報錯；GET 肯定要求讀取時提示單一 model.list／帶 {id} 用 model.get。 | 已批准（產品經理 2026-10-17） | 2A.4、2A.6 |
 | 171 | Errors 嘅 code 同 from 只准 runtime 公開錯誤碼、被呼叫 method Signature errors／model CRUD errors，同本 feature validate fail；未知碼列出排序後嘅允許清單並 repair，structured 都適用。CRUD 唯一衝突用 UNIQUE_VIOLATION。 | 已批准（產品經理 2026-10-17） | 2A.4、2A.6、8、12.2 |
 | 172 | Transform in 平面 object 按 Request row 次序排 key（同名或 req.field 對應），其餘按 byte 字典序；冒號後一個空格、逗號後一個空格，expression 字串外空白正規化（包括 req.body.x），重複 key 報錯，唔能解析就保留原值。structured 同自然語言都適用；Transform out expression 同 respond value 相同就寫 transform.out。自然語言 model table 若等於 id_snake 或固定英文複數（不分大小寫），一律寫複數，其餘保留。 | 已批准（產品經理 2026-10-17） | 2A.4、2A.6 |
 | 173 | 未知 capability model 同 LLM_SEND_SAMPLING=0 嘅 sampling warning 合計每個 process 最多一次，跨 compile、repair 同 keep-going 共用。 | 已批准（產品經理 2026-10-17） | 2A.8.2 |
-| 174 | Lock 唔包含任何開發者環境資料；compiler 只留 name、version；LLM stamp 移去 build record 同 manifest provenance，compiler-hash 只計 compiler.version 同 prompt-version，PROMPT_VERSION 升到 prompt-10。決定 174：`scripts/vibe-install.sh` 接受 `vX.Y.Z` 同 `vX.Y.Z-rc.N` pre-release tags；checksum 同 attestation 驗證不變：signer workflow 係 `release.yml`，source ref 係 `refs/tags/v<version>`，issuer 係 `https://token.actions.githubusercontent.com`；決定 118 不變。 | 已批准（產品經理 2026-10-17） | 2A.1、2A.6、2A.8、10.1 |
+| 174 | Lock 唔包含任何開發者環境資料；compiler 只留 name、version；LLM stamp 移去 build record 同 manifest provenance，compiler-hash 只計 compiler.version 同 prompt-version，PROMPT_VERSION 升到 prompt-10。決定 174：`scripts/vibe-install.sh` 接受 `vX.Y.Z` 同 `vX.Y.Z-rc.N` pre-release tags；checksum 同 attestation 驗證不變：signer workflow 係 `release.yml`，source ref 係 `refs/tags/v<version>`，issuer 係 `https://token.actions.githubusercontent.com`；決定 118 不變。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 已批准（產品經理 2026-10-17） | 2A.1、2A.6、2A.8、10.1 |
+| 175 | 指令集只有 `vibe`（互動，TTY）、`vibe build` 同 `vibe run`（下一個 PR 加入）。`vibe build` 預設 dev build：產生／更新過時 lock（全部 lock 都係最新就唔叫 LLM，CI 冇 LLM key 都得）、自動驗證（等同舊 `vibe validate --deploy --dev`）、輸出 dev manifest；`vibe build --release` 取代 `vibe manifest --release`，保留所有 release 檢查：拒絕 private endpoint、唔准浮動 model alias、一定要記錄 provider；`vibe build --check` 喺記憶體 build 同跑決定 114 policy，唔寫檔。`vibe compile` 改名 `vibe build`；`vibe validate`、`vibe manifest`、`vibe new` 刪除，舊指令提示新指令並以非零退出。`vibe serve` 暫時保留做隱藏指令，`vibe run` 取代後刪除。舊 `--labels`、`-o` 擴充同 10.10 部署報告構想延至 vNext，放喺 `vibe build --release` 之下。取代決定 164，亦更新決定 76、82、102、154、166 引用舊指令嘅部分。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.2、2C.3 |
+| 176 | lock 用 `vibe-version`，正式版（包括 0.x）記 major.minor（例如 `0.1`、`1.0`），pre-release 記完整版本（例如 `1.0.0-rc.2`），必須完全一致。版本唔啱（包括舊 `prompt-N` lock）喺 build 驗證同 serve／runtime 載入都係 error，提示用 `vibe build` 重新產生；source 冇改但版本唔同亦當過時。取消獨立 `PROMPT_VERSION`，compile prompt 只可以喺 minor（或者 major）版本改，patch 唔准改。CI `scripts/ci/check-prompt-version.py` 檢查 `src/compile_prompt.sha256`（system、translation、repair prompt 指紋）同 `src/prompt_guide.rs`（grammar、guides、examples、repair input）；PR 改咗呢啲檔而 Cargo.toml major.minor 冇高過 base branch 就 fail。Cargo.toml 係 pre-release 或者 1.0.0 之前跳過。 決定 165 嘅 byte-identical 保證改為「同一 source、同一 vibe 版本戳記同同一結構」。取代決定 162 同所有提及 `PROMPT_VERSION` 嘅舊決定（18、64、165、172、174 嘅相關部分）；`vibe-version` 取代 `compiler:` 同 `compiler-hash:`，即決定 174 嘅 compiler-hash 變成 vibe lock 版本戳記；manifest provenance `compiler_hash` 改為 `vibe_version`。 | 已批准（產品經理 2026-10-17） | 2A.1、2A.6、2C.3、10.1 |
 
 ## 1. 目錄同命名
 
@@ -362,7 +364,7 @@ project/
 
 1. **Source（`{name}.md`）**：用自然語言寫，講清楚「要做咩」。可以有選填嘅結構化 frontmatter（例如 `method: POST`），但唔係必須。
 2. **Lock（`{name}.lock.md`）**：編譯器將 source 編譯成固定格式嘅結構化 markdown（格式見 2A）。Lock 係 **build 輸出**，唔 commit 入 repo（`.gitignore`，決定 117）；CI／CD 喺部署時由 source build，通過驗證器同決定 114 policy 檢查，而且被收入有 attestation 同簽名嘅 manifest 之後先算生效（決定 77、79、113）。
-3. **Manifest**：`vibe manifest` 將所有通過驗證嘅 lock 合併成一份 manifest，release 輸出 unsigned manifest，由 release workflow 用 Sigstore keyless 簽名（決定 79、89、119）。runtime 只載入 manifest。
+3. **Manifest**：`vibe build --release` 將所有通過驗證嘅 lock 合併成一份 manifest，release 輸出 unsigned manifest，由 release workflow 用 Sigstore keyless 簽名（決定 79、89、119）。runtime 只載入 manifest。
 
 - runtime 永遠唔會解譯自然語言，亦唔會讀 source `.md`；lock md 係 runtime 嘅唯一依據（經 manifest 載入）。
 - 所有安全同驗證規則都喺 lock 層檢查（見第 10 節），唔係喺 source 層。
@@ -382,7 +384,7 @@ project/
 - **失敗**：翻譯 call 失敗、回應格式唔啱、或者譯文缺咗原文嘅識別字／數字，成次編譯失敗（#93 全部或者冇，冇 lock 會寫入）；冇 fallback，唔會略過檢查。
 - **Cache**：`.vibe/cache/translate/<sha256>`，key 係 `source-hash` + provider + model snapshot + translate prompt 版本 + 實際送出參數。**高風險 release build 唔可以用翻譯 cache**（決定 110），一定重新翻譯。
 - **Call 上限**：翻譯 call 計入 #92 P5 嘅每次編譯 LLM call 上限；超過即編譯失敗（決定 111）。
-- **審計**：translation stamp（prompt-version、llm-provider、model-snapshot、hash）按 lock path 記喺 `.vibe/build-record.json` 嘅 `translations` map 同 manifest provenance 嘅 optional `translations` map（決定 109、165）；lock 唔再有。譯文保留喺 `.vibe/audit/translations`，header 帶 hash；stamp 唔計入 `source-hash` 同 `compiler-hash`。
+- **審計**：translation stamp（翻譯版本、llm-provider、model-snapshot、hash）按 lock path 記喺 `.vibe/build-record.json` 嘅 `translations` map 同 manifest provenance 嘅 optional `translations` map（決定 109、165）；lock 唔再有。譯文保留喺 `.vibe/audit/translations`，header 帶 hash；stamp 唔計入 `source-hash` 同 `vibe-version`。
 - **高風險宣告**（決定 112）：frontmatter 宣告咗嘅高風險欄位同譯文（同 lock）唔一致，或者偵測到未宣告嘅高風險行為，一律 fail closed，錯誤訊息講明缺咗邊個宣告。關鍵字檢查係一致性檢查（縱深防禦），唔係唯一防線；真正嘅閘門係 frontmatter 宣告加 lock 層驗證。
 - **Api feature**：唔再對 api feature 做寫入 sql 關鍵字檢查；寫入由被呼叫、已經檢查過嘅 method lock（`writes`）繼承。
 
@@ -441,7 +443,7 @@ project/
 - 冇 `## Cors` 就唔回任何 CORS header（同源先用到）。
 - **Origin 比對**：同 `Origin` header 完全相等（scheme、host、port 都要一樣，唔分大小寫只限 host）。
   - `*`：只准單獨使用，而且只限冇 credentials 嘅情況；release build 出 warning。
-  - Port 萬用（`http://localhost:*`、`http://127.0.0.1:*`）：只准 `localhost`／`127.0.0.1`，只喺 dev build（`vibe manifest --dev`）生效；release build 遇到就 error。其他萬用（例如 `https://*.example.com`）一律唔准。
+  - Port 萬用（`http://localhost:*`、`http://127.0.0.1:*`）：只准 `localhost`／`127.0.0.1`，只喺 dev build（`vibe build`）生效；release build 遇到就 error。其他萬用（例如 `https://*.example.com`）一律唔准。
 - **Credentials**：`## Cors` 唔可以開 credentials（驗證器 error）；access token 用 `Authorization` header，唔使 cookie。Credentials 只限決定 101 嘅 refresh／logout endpoint，由 `token-refresh` 嘅 `allowed-origins` 控制，而嗰個列表一定要係 `allow-origins` 嘅子集（唔准 `*`）。
 - **回應**：origin 喺白名單就回 `Access-Control-Allow-Origin: <origin>`（`*` 模式回 `*`），同 `Access-Control-Expose-Headers`；所有回應（包括 origin 唔喺白名單）都帶 `Vary: Origin`。
 - **Preflight**：runtime 處理所有 `OPTIONS` 請求，唔經 pipeline、唔計限流以外嘅配額：
@@ -509,22 +511,21 @@ source-type: natural               # natural | structured
 dependencies:                      # 所有依賴 source／lock 嘅 hash，按 id 排序
   - { id: user, kind: model, hash: sha256:<...> }
   - { id: main, kind: provider, hash: sha256:<...> }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:<見下面標準定義>
+vibe-version: 0.1
 build-mode: release                # release | dev；dev lock 唔可以部署（決定 75）
 security-items:                    # 驗證器 deterministic 抽出，資訊性（決定 78）
   - { item: public, risk: high, reason: "公開登入入口" }
 ---
 ```
 
-- `source-hash`：source 先正規化（統一換行、去行尾空白、去 BOM、合併多餘空行），再計 sha256。淨係改排版而正規化內容唔變，hash 就唔變，**唔會重新編譯**。
+- `source-hash`：source 先正規化（統一換行、去行尾空白、去 BOM、合併多餘空行），再計 sha256。淨係改排版而正規化內容唔變，hash 就唔變；只要版本戳記、依賴同 build record 亦一致，就唔會重新編譯。
 - `dependencies`：lock 用到嘅所有其他定義（例如 method 依賴 model 同 provider、api 依賴 method、`_definition`、`_version` 同 pipeline）。任何一個依賴嘅 hash 變咗，lock 都當過時，要重新編譯。
 - `source-type: structured` 只限 source 完全由結構化 frontmatter 同結構化列點組成、冇自由文字；判斷由平台嘅 deterministic parser 做，唔由 LLM 編譯器判斷（決定 20）。
-- `compiler-hash`（標準定義，決定 174）：`sha256` of canonical JSON（key 排序、UTF-8、冇空白），只包含 `compiler.version` 同 `prompt-version`。唔受任何 LLM 設定影響。
-- 決定 174：`compiler` 只寫 `name` 同 `version`。連 model id 都唔留喺 lock，因為 `LLM_MODEL` 係每位開發者嘅設定，同一 source 唔應該因為機器設定唔同而產生唔同 lock。Model、provider、endpoint、seed 同實際送出參數嘅重現證據，按 lock path 記喺 `.vibe/build-record.json` optional `compilers` map 同 manifest provenance 同名 map，欄位係 `llm-provider`、`model-snapshot`、`endpoint-host`、`endpoint-private`、`llm-seed`、`sent-params`；deterministic lock 冇 entry。唔記 key、URL path、username 或其他環境值。舊 compiler 環境欄位仍然 parse 得，但忽略、唔再 render；validate 每個 lock 出一次 decision 174 warning，要求執行 `vibe compile`。`PROMPT_VERSION` 係 `prompt-10`。
-- 決定 165：同一 source、同一 `PROMPT_VERSION` 同同一結構，一定產生 byte-identical lock；lock 唔可以包含任何每次 run 都可能改變嘅欄位。`translation` stamp 只記喺 build record 同 manifest provenance，唔寫入 lock。舊 lock 嘅 `translation:` 仍然讀得，parse 後忽略，render 唔再寫；validate 每個舊 lock 警告一次："lock contains a `translation` field, which is no longer written (decision 165); run `vibe compile` to refresh it"。Lock format 改動會將 `PROMPT_VERSION` 升到 `prompt-6`，令舊 lock 過時並重新編譯。
+- 決定 176：lock 用 `vibe-version`，正式版（包括 0.x）記 major.minor（例如 `0.1`、`1.0`），pre-release 記完整版本（例如 `1.0.0-rc.2`），必須完全一致。版本唔啱（包括舊 `prompt-N` lock）喺 build 驗證同 serve／runtime 載入都係 error，提示用 `vibe build` 重新產生；source 冇改但版本唔同亦當過時。
+- LLM stamp 只記喺 build record 同 manifest provenance 嘅 `compilers` map；唔記 key 或開發者環境資料入 lock（決定 174、176）。
+- 決定 165、176：同一 source、同一 vibe 版本戳記同同一結構，產生 byte-identical lock；translation stamp 只記喺 build record 同 manifest provenance。
 - manifest JSON 用 snake_case：lock 嘅 `build-mode` 對應 manifest 嘅 `build_mode`（`dev`／`release`；冇呢個欄位當 `release`）。
-- `build-mode`：`vibe manifest` 寫 `release`，`vibe manifest --dev` 寫 `dev`；`dev` lock 永遠唔可以入 release manifest（決定 75）。
+- `build-mode`：`vibe build --release` 寫 `release`，`vibe build` 寫 `dev`；`dev` lock 永遠唔可以入 release manifest（決定 75）。
 - `security-items`：驗證器 deterministic 抽出嘅安全項目清單，`reason` 由驗證器按規則產生；資訊性，用嚟 PR 高亮同部署報告，唔需要確認人（決定 78）；冇安全項目就寫 `[]`。
 - v1.8 起 lock 冇 `signature`，亦冇 `status`／`approval-*`／`approved-*`（決定 77、79）；SDK 讀到舊欄位會忽略並出 warning。
 
@@ -546,7 +547,7 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 - `source-lines` 係 compiler 計出嘅 enclosing markdown block 範圍，方便 review 對照；model 引用只係 hint。行數由 1 開始，以 compile prompt 送出嘅完整 `source.combined_text()` 為準（prompt 本身唔顯示行號），包括 frontmatter 同附加 schema 部分；自然語言、structured source 同 validate 都用同一份文字。
 - Block 定義（決定 167）：第 1 行係 `---` 時，由第 1 行到 closing `---`（包括兩端）係一個 frontmatter block。其餘文字逐行分 block：trim start 後以至少三個連續 backtick 或 `~` 開頭就開 fenced code block，去到下一行 trim start 後以同一字元、至少同樣長度 marker 開頭嘅行為止（包括兩條 fence 同中間空行）；冇 closing fence 就去到文字結尾。Fence 即使緊貼其他非空行都獨立成 block。Fence／frontmatter 外，符合 `^#{1,6}(\s|$)` 嘅 ATX heading 每行獨立成 block。其餘連續非空行嘅最大範圍係一個 block，涵蓋段落、list 同 table；空行分隔 block，所以 loose list 項目之間有空行就係幾個 block。`<!-- schema.md -->` 等 HTML comment 當普通行。空行本身唔屬任何 block。
 - Snap：引用接受 ASCII 數字 `N` 或 `A-B`（`-` 兩邊可有空格），要求 `1 <= A <= B`。結果由第一個同引用相交嘅 block 開始，到最後一個相交 block 結尾，包含中間空行。只引用空行就揀最近嘅下一個 block；後面冇 block 就揀前一個。開始仍然喺文字內、結尾超出最後一行，就先 clamp 結尾再 snap。缺少、無法解析、倒轉、0、整段超出最後一行，或者文字冇 body block，都用固定 fallback：由 body 第一個到最後一個 block（排除 frontmatter）；body 冇 block 就用 frontmatter；完全冇 block 就用 `1-1`。結果永遠寫 `A-B`，單行亦一樣；只係 provenance metadata，唔發 warning，亦唔係 compile error。
-- `vibe validate` 對有 source 文字嘅 lock，逐個 `source-lines` 檢查值係咪等於同一 snap function 嘅結果，即必須已經 block 對齊同用 canonical `A-B`；唔一致就報 error，列明 lock、section／step、原值同預期值，提示行 `vibe compile`。
+- `vibe build` 對有 source 文字嘅 lock，逐個 `source-lines` 檢查值係咪等於同一 snap function 嘅結果，即必須已經 block 對齊同用 canonical `A-B`；唔一致就報 error，列明 lock、section／step、原值同預期值，提示行 `vibe build`。
 
 - expression 支援字面值：JSON 字串、數字、`true`／`false`／`null`；object key 可以加雙引號；暫時唔支援 array。
 - `true`／`false`／`null` 係保留字，唔可以做變數名。object 入面明確寫嘅 `null` 會保留；path 解析成 `null` 嘅欄位會省略。
@@ -625,26 +626,26 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 | output 新增欄位 | 中 |
 | source 出現似指令句子（見 2A.7） | 中 |
 
-- 安全項目係資訊性（決定 78）：驗證器寫入 lock `security-items`、`vibe manifest` 輸出、部署報告；vNext `vibe build --labels`（決定 164）計劃輸出建議 PR label（例如 `security:high`），俾 rulesets（分支規則） 用（見 [`pr-review-guide.md`](pr-review-guide.md)）。
+- 安全項目係資訊性（決定 78）：驗證器寫入 lock `security-items`、`vibe build --release` 輸出、部署報告；vNext `vibe build --release --labels`（決定 175）計劃輸出建議 PR label（例如 `security:high`），俾 rulesets（分支規則） 用（見 [`pr-review-guide.md`](pr-review-guide.md)）。
 - 唔再要求逐項確認人、原因簽核、兩個非作者確認，亦冇每個 PR 上限（決定 19、34 由決定 78 修訂）。
 - PR 同部署報告顯示**有效權限摘要**：每個 endpoint 最終係咪公開、用咩 role、可以讀寫邊啲表同欄位、會唔會簽 token、有冇對外 call、限流同配額。
 - Lock 過時（source 或者依賴 hash 唔一致）或者驗證唔通過，就唔可以 build release manifest。
 
 ### 2A.6 重新編譯規則
 
-決定 169–172、174：compile prompt 版本係 `prompt-10`；prompt 提供 canonical create feature 同 runtime 允許錯誤碼清單。Repair loop 喺 model 仲答緊時檢查 writes 宣告、缺少寫入／讀取 step、冇 constant response 同未知 Errors 碼，提示加返 method step 或改用已知碼。
+決定 176：compile prompt 跟 vibe 版本戳記，唔再有獨立 prompt 版本；prompt 提供 canonical create feature 同 runtime 允許錯誤碼清單。Repair loop 喺 model 仲答緊時檢查 writes 宣告、缺少寫入／讀取 step、冇 constant response 同未知 Errors 碼，提示加返 method step 或改用已知碼。
 
-- 決定 162：每次改 compile prompt 文字（system prompt、prompt guide、examples）一定要 bump `PROMPT_VERSION`；佢計入 compiler-hash 同 LLM cache key。今次係 `prompt-5`，舊 lock 要重新編譯；hash 測試記錄版本同所有 kind／scope 嘅 prompt SHA-256，改 prompt 後要一齊更新。
+- 決定 176：取消獨立 `PROMPT_VERSION`，compile prompt 只可以喺 minor（或者 major）版本改，patch 唔准改。CI `scripts/ci/check-prompt-version.py` 檢查 `src/compile_prompt.sha256`（system、translation、repair prompt 指紋）同 `src/prompt_guide.rs`（grammar、guides、examples、repair input）；PR 改咗呢啲檔而 Cargo.toml major.minor 冇高過 base branch 就 fail。Cargo.toml 係 pre-release 或者 1.0.0 之前跳過。
 
-- 只有 `source-hash` 或者任何 `dependencies` hash 變咗先會重新編譯；source 改咗但正規化 hash 唔變就唔會重新編譯。
-- 編譯用嘅 model 一定 pin 死 snapshot（唔准用會浮動嘅別名）；`compiler-hash` 按 2A.1 標準定義計，寫入每個 lock（決定 18、64）。
-- 編譯器版本升級（包括 major、minor、patch）、或者 prompt 版本改咗（決定 174：compiler-hash 只計編譯器版本同 prompt 版本，model snapshot 改動唔會令 lock 過時）：所有 lock 強制重新編譯，即使 source hash 冇變；release job 由 source build、通過決定 114 policy 同 attestation 先可以部署（決定 77、113、117）。建議用獨立 PR 做升級；release summary 會列出同上一個已部署版本相比嘅高風險變化（決定 117）。
-- 編譯器 minor／patch 升級（決定 174）：版本改動會改變 compiler-hash，舊 lock 要重新編譯；平台仍然會用 golden corpus 對比新舊輸出，**只要任何輸出唔同，該升級就當 major 處理**。
+- `vibe build` 將缺少 lock、source-hash 改變、依賴 hash 改變、vibe-version 唔一致、build-record hash 唔一致視為過時；只有過時嘅自然語言 lock 需要 LLM。全部最新就直接驗證同寫 dev manifest，CI 冇 LLM key 都得（決定 175、176）。
+- 編譯用嘅 model 一定 pin 死 snapshot（唔准用會浮動嘅別名）；`vibe-version` 按 2A.1 標準定義計，寫入每個 lock（決定 18、64）。
+- 決定 176：lock 用 `vibe-version`，正式版（包括 0.x）記 major.minor（例如 `0.1`、`1.0`），pre-release 記完整版本（例如 `1.0.0-rc.2`），必須完全一致。版本唔啱（包括舊 `prompt-N` lock）喺 build 驗證同 serve／runtime 載入都係 error，提示用 `vibe build` 重新產生；source 冇改但版本唔同亦當過時。
+- 正式版 patch 唔改版本戳記；minor／major 改戳記，舊 lock 要重新產生（決定 176）。
 - Golden corpus 由平台編譯器團隊維護，最少 500 個案例，覆蓋所有 kind 同所有安全項目；項目可以喺 `.golden/` 加自己嘅案例，一樣會參與比對（決定 35）。
 - Model snapshot 淘汰（決定 35）：平台承諾宣布淘汰後最少保留 12 個月；項目有 90 日遷移窗口，窗口內舊 lock 照常有效、照常可以部署；窗口完結前未遷移，部署會被封鎖（runtime 已部署嘅 manifest 照常運作）。
 - 編譯一定要盡量 deterministic：固定 prompt、固定 snapshot；`temperature`、`top_p`、`seed` 等參數只喺 model capability 支援時先送固定值（決定 58，見 2A.8.6），唔支援就唔送，唔可以強送。決定性只係盡力而為，只用嚟減少 release summary 入面嘅無謂變化；唔做重編比對，部署安全靠決定 113 attestation 同決定 114 policy（決定 117）。
-- 翻譯（2.1a，決定 108–111）：譯文同 build record／manifest provenance 嘅 translation stamp 唔計入 `source-hash` 同 `compiler-hash`，所以翻譯 prompt 或者翻譯 model 改咗唔會令 lock 過時；但編譯（包括 `vibe manifest` 同 CI 重編）一定會用當前設定重新做翻譯同一致性檢查，失敗即封鎖。
-- **決定 113、117 修訂**：lock 係 build 輸出，唔 commit，所以冇「同 repo lock 比對」呢回事；`--check-determinism` 同重編比對唔再係部署條件。部署只接受 CI 由 source 重新 build、有 attestation 嘅 artifact（2C.3b）；`compile --check` 只驗證 build 結果同決定 114 policy。
+- 翻譯（2.1a，決定 108–111）：譯文同 build record／manifest provenance 嘅 translation stamp 唔計入 `source-hash` 同 `vibe-version`，翻譯 prompt 同其他 compile prompt 一樣受決定 176 minor／major 規則管，翻譯 model 改咗本身唔會令 lock 過時；但編譯（包括 `vibe build --release` 同 CI 重編）一定會用當前設定重新做翻譯同一致性檢查，失敗即封鎖。
+- **決定 113、117 修訂**：lock 係 build 輸出，唔 commit，所以冇「同 repo lock 比對」呢回事；`--check-determinism` 同重編比對唔再係部署條件。部署只接受 CI 由 source 重新 build、有 attestation 嘅 artifact（2C.3b）；`build --check` 只驗證 build 結果同決定 114 policy。
 - 唔准手改 lock：要改就改 source 再重新編譯。Lock 冇簽名（決定 79），而且 lock 唔 commit（決定 117），部署只用 CI 由 source build 嘅 artifact（決定 113），所以手改嘅 lock 唔會去到部署。
 
 ### 2A.7 獨立驗證器同編譯器隔離
@@ -683,7 +684,7 @@ v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`（決定 57�
     - `temperature`／`top_p` 只喺 capability 表列明支援、而且 adapter 同時送 `reasoning_effort: "none"` 嘅 model 先送（例如 GPT-5.1、GPT-5.2）；唔支援 `none` 嘅 reasoning model（例如較舊 GPT-5、GPT-6 Astra、GPT-6.1 Sol）唔送任何 sampling 參數。
     - 決定 173：未知 capability model 同 `LLM_SEND_SAMPLING=0` 嘅 sampling warning 合計每個 process 最多一次；跨 compile、repair 同 keep-going 共用。
     - capability 表冇列出嘅 model（包括所有 OpenAI-compatible 本地 API 嘅 model，除非表有登記），一律唔送任何 sampling 參數（`temperature`、`top_p`、`seed`、`reasoning_effort` 都唔送）。
-    - `seed`：OpenAI API reference（Create chat completion，<https://platform.openai.com/docs/api-reference/chat/create>）寫明 "This feature is in Beta"、系統只會 "make a best effort to sample deterministically"、"Determinism is not guaranteed"，並建議用 `system_fingerprint` 監察 backend 變動。所以 `seed` 只當 best-effort，冇決定性保證；adapter 將回應嘅 `system_fingerprint` 寫入編譯報告（唔計入 compiler-hash）。
+    - `seed`：OpenAI API reference（Create chat completion，<https://platform.openai.com/docs/api-reference/chat/create>）寫明 "This feature is in Beta"、系統只會 "make a best effort to sample deterministically"、"Determinism is not guaranteed"，並建議用 `system_fingerprint` 監察 backend 變動。所以 `seed` 只當 best-effort，冇決定性保證；adapter 將回應嘅 `system_fingerprint` 寫入編譯報告（唔計入 vibe-version）。
   - Gemini：`generationConfig.temperature`、`topP`、`topK`、`seed` 都接受，但 `seed` 只係 best-effort。
 - 所有 provider 一律唔帶 `tools`／`functions`／`tool_choice`／`toolConfig`，唔用 streaming。
 - 決定性只係盡力而為；部署安全唔靠重編比對，靠決定 113 attestation 同決定 114 deterministic policy（決定 117）。
@@ -699,7 +700,7 @@ v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`（決定 57�
 | `LLM_MODEL` | 是 | 一定係 provider 承諾唔會浮動嘅 model id／snapshot id（決定 58）。判斷唔靠有冇日期後綴：provider 文件列明會浮動嘅別名（例如 `latest`、`default`、`*-latest`、OpenAI 冇日期嘅 alias）一律拒絕；provider 文件列明係固定 snapshot 嘅冇日期 id（例如 Anthropic 4.6 代之後嘅 id）可以用。Build record 同 manifest provenance 嘅 `compilers` stamp 記錄 provider 回報嘅 model id（`modelReported`）（決定 174），唔係用戶輸入。本地 API 用完整 tag（例如 `qwen2.5-coder:32b-instruct-q8_0`），唔准 `:latest` |
 | `LLM_TIMEOUT` | 否 | 單次請求超時，預設 60s，上限 300s |
 | `LLM_MAX_RETRIES` | 否 | 網絡錯誤重試次數，預設 2，上限 5；重試唔會改變輸入 |
-| `LLM_SEED` | 否 | model capability 支援 seed 先送，預設 `0`；記喺 build record 同 manifest provenance 嘅 `compilers` stamp，唔計入 compiler-hash、唔會令 lock 過時（決定 174，2A.1） |
+| `LLM_SEED` | 否 | model capability 支援 seed 先送，預設 `0`；記喺 build record 同 manifest provenance 嘅 `compilers` stamp，唔計入 vibe-version、唔會令 lock 過時（決定 174，2A.1） |
 | `LLM_ALLOW_PRIVATE_HOST` | 否 | 預設 `false`；只喺本地開發用（見 2A.8.4） |
 
 - 別名：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL` 只喺 `LLM_PROVIDER=openai` 時接受，分別等於 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`。
@@ -767,7 +768,7 @@ interface LlmAdapter {
     seed: boolean;              // true 先送 LLM_SEED（唔代表保證決定性）
   };
   compile(request: {
-    system: string;             // 平台 prompt（版本計入 compiler-hash）
+    system: string;             // 平台 prompt（版本計入 vibe-version）
     input: string;              // source 加依賴 lock
     model: string;              // LLM_MODEL
     seed?: number;              // LLM_SEED（capabilities.seed 為 true 先送）
@@ -777,7 +778,7 @@ interface LlmAdapter {
 ```
 
 - adapter 只發一個非 streaming 請求，唔准送 `tools`、function calling 或者任何會令 provider 執行動作嘅參數；request 參數全部由 adapter 按 `modelCapabilities` 固定，用戶唔可以覆蓋（決定 58）。
-- `modelCapabilities` 某參數回 `null`／`false` 就完全唔送嗰個參數，唔可以送 model 會拒絕嘅值；實際送出嘅參數集寫入 build record 同 manifest provenance 嘅 `compilers` stamp，唔計入 compiler-hash（決定 174）。
+- `modelCapabilities` 某參數回 `null`／`false` 就完全唔送嗰個參數，唔可以送 model 會拒絕嘅值；實際送出嘅參數集寫入 build record 同 manifest provenance 嘅 `compilers` stamp，唔計入 vibe-version（決定 174）。
 - capability 表冇登記嘅 model：只送 provider 必填參數，其他決定性參數一律唔送，並出 warning。
 - `modelReported`（provider 回報嘅 model id）係 build record `compilers` stamp 嘅 `model-snapshot` 來源（決定 174）；佢同 `LLM_MODEL` 唔一致（例如 provider 將別名解析成另一個 id）就 error。
 - 新增 provider 要改 SDK 同驗證器，屬平台改動，唔可以喺 project 內加。
@@ -785,8 +786,8 @@ interface LlmAdapter {
 #### 2A.8.7 同其他規則嘅關係
 
 - 2A.7 沙盒：網絡只准 egress 去 `LLM_BASE_URL`（或者 provider 預設 base URL）嘅 host；冇工具規則不變。
-- 2A.1／2A.6（決定 174）：LLM stamp 只記喺 build record 同 manifest provenance，唔寫入 lock，唔計入 compiler-hash；永遠唔記 key。
-- 決定 174：改 provider、endpoint host 或者 model 唔會令 lock 過時，亦唔改 compiler-hash；改動記喺 build record 同 manifest provenance 嘅 `compilers` stamps。Release job 仍然喺 CI 由 source build、通過決定 114 policy 同 attestation 先可以部署（決定 77、113、117）。
+- 2A.1／2A.6（決定 174）：LLM stamp 只記喺 build record 同 manifest provenance，唔寫入 lock，唔計入 vibe-version；永遠唔記 key。
+- 決定 174：改 provider、endpoint host 或者 model 唔會令 lock 過時，亦唔改 vibe-version；改動記喺 build record 同 manifest provenance 嘅 `compilers` stamps。Release job 仍然喺 CI 由 source build、通過決定 114 policy 同 attestation 先可以部署（決定 77、113、117）。
 - 只改 base URL 嘅 path（host 唔變）唔當 major，但 CI 決定性比對照樣要通過。
 - 唔再做 CI 重編比對（決定 113、117）；2A.8.2 決定性設定照送，只為減少 release summary 入面嘅無謂變化。
 
@@ -819,7 +820,7 @@ jobs:
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_API_KEY: ${{ secrets.VIBE_LLM_API_KEY }}   # release environment；PR 預覽用 VIBE_LLM_API_KEY_PREVIEW（決定 118）
           LLM_MODEL: ${{ vars.LLM_MODEL }}
-        run: vibe manifest                       # 編譯 + 驗證 + policy 檢查 + manifest（決定 76、114、117）
+        run: vibe build --release                       # 編譯 + 驗證 + policy 檢查 + manifest（決定 76、114、117）
 ```
 
 - 決定 174：`scripts/vibe-install.sh` 接受 `vX.Y.Z` 同 `vX.Y.Z-rc.N` pre-release tags；checksum 同 attestation 驗證不變：signer workflow 係 `release.yml`，source ref 係 `refs/tags/v<version>`，issuer 係 `https://token.actions.githubusercontent.com`；決定 118 不變。
@@ -827,21 +828,20 @@ jobs:
 
 - `vibe` 係 SDK CLI 名（暫定）；deploy job 唔設任何 `LLM_*` 或者 `OPENAI_*` 變數。
 
-## 2C. SDK CLI：本地開發同 `vibe manifest`（決定 73–76、81、82、166，已確認（產品經理 2026-10-14））
+## 2C. SDK CLI：本地開發同 `vibe build`（決定 73–76、81、82、166，已確認（產品經理 2026-10-14））
 
 ### 2C.1 通用
 
 - 所有指令嘅 `--project` 預設係目前目錄（cwd）；只有 project 唔喺 cwd 先要寫（決定 81）。
-- 冇 `vibe approve`（決定 77）；舊 workflow 用到會報「指令已移除」並提示用 `vibe manifest`。
-- 同現有 CLI（`4239c95`）嘅對照：`vibe compile`、`vibe validate` 保留做獨立指令，`vibe manifest` 係官方 build 指令（決定 164）；`vibe compile --check` 只喺本地／CI 驗證 build 結果同決定 114 policy，唔同 commit 咗嘅 lock 比較（決定 117）；`vibe validate --deploy` 唔再檢查確認同 lock 簽名（決定 77、79）；`vibe serve --memory` 保留，改用 2C.4 嘅 in-memory 執行器。
+- 冇 `vibe approve`（決定 77）；舊 workflow 用到會報「指令已移除」並提示用 `vibe build --release`。
+- 指令集係互動 `vibe` 同 `vibe build`；下一個 PR 加 `vibe run`。`vibe serve` 暫時隱藏，唔列入 help（決定 175）。
 - `vibe`（冇參數、喺 terminal）進入互動模式（`vibe>`）：第一次用會問 LLM provider、base URL、model 同用戶自己嘅 API key（輸入時遮住，唔會顯示），寫入 project `.env`（確保喺 `.gitignore`，同決定 57、2A.8.3 一致）；之後用自然語言描述要做嘅 API，CLI 用設定好嘅 LLM 產生 feature source，`_definition.md`、`_version.md`、`providers/main.md` 用固定範本；寫入之前列出檔案同要用戶確認，唔會覆蓋現有檔案。非 terminal（例如 CI）執行 `vibe` 只顯示 help。
 - `vibe serve --memory` 嘅預設 slug `dev`（tenant `devtenant`）喺 development `--memory` 一律可用，就算 slug 檔有其他 slug，slug 檔改咗唔使重啟就生效；production 同非 `--memory` 不變。
 - README 快速開始（決定 82）：
 
   ```bash
   vibe            # first run asks for LLM settings, then: 幫我開一個 hello world
-  vibe compile
-  vibe manifest --dev
+  vibe build
   vibe serve --memory
   curl http://127.0.0.1:8080/hello/v1/dev/hello
   ```
@@ -849,24 +849,23 @@ jobs:
 ### 2C.2 本地開發流程（決定 166）
 
 1. 喺 terminal 執行互動 `vibe`：首次問 LLM 設定，key 輸入時遮住；project `.env` 用 0600 權限，只補缺少嘅設定，已有值優先，`.gitignore` 只加一次 `.env`（決定 157）。描述 API，例如「幫我開一個 hello world」，預覽檔案再確認寫入；唔會覆蓋現有檔案。Hello world 預設係 `hello/v1/hello`。Timeout／body／provider 要喺 source frontmatter pin，唔靠 prose limits（決定 160）。
-2. `vibe compile` 編譯 source，成個 project 驗證通過先寫 lock 同 `.vibe/build-record.json`；lock 係 gitignore 嘅 build 輸出，唔 commit（決定 117）。改 source 之後要再 compile。
-3. `vibe manifest --dev` 用上一步嘅 lock 同 build record，跑同 `vibe validate --deploy --dev` 一樣嘅部署檢查，再用本機 `.vibe/signing.key` 簽 manifest；第一次自動建立 key（0600），manifest 標 `build-mode: dev`。Dev manifest 喺 development 以外一律拒絕，production 唔信任本機 dev key（決定 75、154、164）。
-4. `vibe serve --memory` 載入 manifest，用 in-memory 執行器（2C.4），預設 listen `127.0.0.1:8080`。Development 一定提供 slug `dev`（tenant `devtenant`），即使設定咗其他 slug；slug 檔改動唔使重啟。只限開發同測試，server 一停資料就消失。
-5. `curl http://127.0.0.1:8080/hello/v1/dev/hello` 測試 API。
+2. `vibe build` 更新過時 lock、自動驗證同寫 dev manifest；lock 同 build record 係 build 輸出，唔 commit。全部 lock 最新就唔叫 LLM，CI 冇 LLM key 都得。Dev manifest 只准 development 用。
+3. 暫時用隱藏指令 `vibe serve --memory`（下一個 PR 加 `vibe run`） 載入 manifest，用 in-memory 執行器（2C.4），預設 listen `127.0.0.1:8080`。Development 一定提供 slug `dev`（tenant `devtenant`），即使設定咗其他 slug；slug 檔改動唔使重啟。只限開發同測試，server 一停資料就消失。
+4. `curl http://127.0.0.1:8080/hello/v1/dev/hello` 測試 API。
 
-2A.8.4 嘅本地 LLM 規則適用於開發環境 `vibe compile`：loopback 准 `http://`，其他內網地址要 `LLM_ALLOW_PRIVATE_HOST=true`；公開名稱解析到非公開地址（例如 fake-IP proxy）亦要呢個設定。互動設定會先問用戶先加呢個值。CI／非開發環境唔准呢個 override，編譯只准公開 HTTPS endpoint。`vibe validate --deploy --dev` 同 `vibe manifest --dev` 唔會呼叫 LLM，亦唔靠呢個環境變數放行；佢哋喺本地開發接受 build-record stamp 記咗 `endpoint-private: true` 嘅 lock（決定 174）。CI／非開發環境拒絕 `--dev`，release 部署檢查拒絕 private endpoint lock（決定 151）。
+2A.8.4 嘅本地 LLM 規則適用於開發環境 `vibe build`：loopback 准 `http://`，其他內網地址要 `LLM_ALLOW_PRIVATE_HOST=true`；公開名稱解析到非公開地址（例如 fake-IP proxy）亦要呢個設定。互動設定會先問用戶先加呢個值。CI／非開發環境唔准呢個 override，編譯只准公開 HTTPS endpoint。`vibe build` 只喺自然語言 lock 過時先叫 LLM；本地開發接受 private endpoint lock，CI／release 拒絕（決定 151、175）。
 
-**vNext（決定 166）**：`vibe dev` 唔喺 1.0。保留設計係唔使預先編譯，按 URL／method 搵 `.md` 同依賴，首次 request 先編譯，cache 放 `.vibe/dev-cache/`；cache key 係 `sha256(source-hash + 依賴 hash 按 id 排序 + compiler-hash 輸入)`，每次編譯同載入 cache 都跑驗證器。File watch 令改動影響嘅 lock 同依賴失效，下次 request 重編，`--eager` 即時重編，migration 改動重建 dev DB。計劃 `--db memory|postgres|url`：memory 預設、postgres 用內嵌 PostgreSQL 做保真度測試、url 用 `VIBE_DATABASE_URL`；唔用 PGlite，因為 Rust 要額外嵌 WASM runtime，而且 role／連線行為保真度唔夠。Dev captcha（一律通過並標示）、kill-switch 同配額假實作亦只係 vNext 設計，唔代表 1.0 已提供。
+**vNext（決定 166）**：`vibe dev` 唔喺 1.0。保留設計係唔使預先編譯，按 URL／method 搵 `.md` 同依賴，首次 request 先編譯，cache 放 `.vibe/dev-cache/`；cache key 係 `sha256(source-hash + 依賴 hash 按 id 排序 + vibe-version 輸入)`，每次編譯同載入 cache 都跑驗證器。File watch 令改動影響嘅 lock 同依賴失效，下次 request 重編，`--eager` 即時重編，migration 改動重建 dev DB。計劃 `--db memory|postgres|url`：memory 預設、postgres 用內嵌 PostgreSQL 做保真度測試、url 用 `VIBE_DATABASE_URL`；唔用 PGlite，因為 Rust 要額外嵌 WASM runtime，而且 role／連線行為保真度唔夠。Dev captcha（一律通過並標示）、kill-switch 同配額假實作亦只係 vNext 設計，唔代表 1.0 已提供。
 
-### 2C.3 `vibe manifest`（官方 build 指令，決定 164）
+### 2C.3 `vibe build`（官方 build 指令，決定 175）
 
-- v1 官方 build 指令係 `vibe manifest`；預設係 release，同 `--release` 一樣。每次由 source 將所有 lock 重新編譯入記憶體，永遠唔讀磁碟上嘅 lock，亦唔寫返 lock（決定 117）；驗證通過先寫 manifest。
-- Release 永遠唔讀 project `.env`，LLM key 只會送去 allowlist 入面嘅 host；唔載入任何 signing key。輸出係 unsigned manifest，帶 build-mode、version、commit、每個 lock 嘅內容同 hash、安全項目等 provenance；由 release workflow 用 Sigstore keyless 簽名（決定 119）。版本用 `--release-version` 或 `v*` tag，commit 用 `--commit` 或 CI／Git 資訊。
-- 高風險項目會列出，唔阻 release（決定 90 撤回）；冇 reviewer 步驟，CODEOWNERS 覆蓋係 source PR 合併條件，SDK 唔檢查（決定 93、115）。
-- `--dev` 用 `vibe compile` 產生嘅 lock，驗證 build record，再用本機 `.vibe/signing.key` 簽 dev manifest；第一次用會自動建立 key，權限 0600，標 `build-mode: dev`。CI／production 拒絕 `--dev`，dev manifest 只准喺 development serve。等同嘅本地檢查係 `vibe validate --deploy --dev`。
-- 只讀一次／唔出部分輸出仍然係規則（決定 102）：驗證同 manifest 用同一份記憶體輸入，失敗唔應留下部分輸出。Release 高風險翻譯唔用 cache 仍然係規則（決定 110）；目前翻譯路徑仍會讀 cache，唔代表已實作 bypass。
-- 選項包括 `--release`、`--dev`、`--release-version`、`--commit`、`--project` 同 `-o`／`--output`（預設 `manifest.json`，相對目前工作目錄）。Lock 唔 commit；`--check-determinism` 已移除（決定 117）。
-- **vNext（決定 164）**：`vibe build` 一個指令組合 compile／validate／manifest、`--labels`、`-o` 同 10.10 部署報告，唔喺 1.0；v1 `vibe manifest` 已有上面列明嘅 output 選項。
+- 預設係 dev build：更新過時 lock，跑驗證（等同舊 `vibe validate --deploy --dev`），輸出 dev manifest。全部 lock 最新就唔叫 LLM，CI 冇 LLM key 都得。
+- 只有過時嘅自然語言 lock 先需要 LLM：lock 缺少、source-hash 改咗、vibe-version 唔一致、依賴 hash 改咗，或者 build-record hash 唔一致。Deterministic source 唔需要 LLM。
+- `vibe build --release` 由 source 喺記憶體重新編譯，唔讀磁碟 lock，輸出 unsigned release manifest，交由 release workflow 用 Sigstore keyless 簽名。保留所有 release 檢查：拒絕 private endpoint、浮動 model alias，同缺少 provider 記錄。Release 唔讀 project `.env`，唔載入本機 signing key。
+- `vibe build --check` 喺記憶體 build 同跑決定 114 deploy policy，唔寫 lock、build record 或 manifest。
+- 選項：`--project` 揀 project；`-o`／`--output` 指定 manifest（預設 `manifest.json`，相對目前工作目錄）；`--release-version` 或 `v*` tag 指定 release 版本；`--commit` 或 CI／Git 資訊指定 commit。`--release` 同 `--check` 唔可以一齊用。
+- Dev manifest 用本機 `.vibe/signing.key` 簽，首次自動建立（0600），只准 development 載入。驗證同 manifest 使用同一份記憶體輸入；驗證失敗唔輸出部分結果。高風險項目列出但唔阻 release；CODEOWNERS 仍然係 source PR 合併條件，SDK 唔檢查。
+- **vNext**：`--labels`、`-o` 擴充同 10.10 部署報告構想放喺 `vibe build --release` 之下；現有 `-o` manifest 輸出已支援。`vibe serve` 只係暫時隱藏嘅 run 步驟，下一個 PR 加 `vibe run`。
 
 ### 2C.3a `--release-approval`（已撤回，產品經理 2026-10-16）
 
@@ -886,7 +885,7 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
 
 #### 1. 部署輸入（決定 113，已確認（產品經理 2026-10-14））
 
-- Runtime 同部署器**只**接受 CI 喺 `release` environment 由 source 重新 build（`vibe manifest`，包括重新編譯）嘅 artifact（manifest 同佢包含嘅 lock 內容）。
+- Runtime 同部署器**只**接受 CI 喺 `release` environment 由 source 重新 build（`vibe build --release`，包括重新編譯）嘅 artifact（manifest 同佢包含嘅 lock 內容）。
 - Artifact 一定要有 GitHub artifact attestation（build provenance，predicate `https://slsa.dev/provenance/v1`），綁定：repo、workflow 路徑（例如 `.github/workflows/release.yml`）、ref（`refs/tags/v*`，決定 96；呢個綁定只證明來源，唔係閘門，見第 5 節）、commit SHA；runner 一定係 GitHub-hosted。
 - 另外要有 Sigstore keyless manifest 簽名（決定 119）：release workflow 喺 `release` environment 用 GitHub OIDC 身份簽，一定要有 Rekor transparency log inclusion。冇任何長期 key。
 - 部署器全部驗證，任何一樣失敗即拒絕部署：
@@ -936,7 +935,7 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
 - 每次 promote，部署器都用 `gh attestation verify <artifact> --source-ref refs/tags/v<version>`（加第 1 節其他條件）驗證。
 - PR CI 嘅 build 只係**非權威預覽**（例如畀 release summary 預覽同 label），永遠唔可以部署。
 - LLM key 分開：release job 用 `release` environment secret `VIBE_LLM_API_KEY`；PR 預覽用 `VIBE_LLM_API_KEY_PREVIEW`。兩條 key 都唔可以出現喺 artifact、log 或者 summary。
-- Artifact 入面有審計戳記：tag、commit SHA、workflow run id、compiler-hash、build 時間。
+- Artifact 入面有審計戳記：tag、commit SHA、workflow run id、vibe-version、build 時間。
 - `VIBE_LLM_API_KEY` 同 `VIBE_LLM_API_KEY_PREVIEW` 兩條 secret 由 Jack 本人建立。
 - **閘門**：臨時方案 (i) 下，任何有寫權限嘅人都可以開 `v*` tag，所以 `v*` tag **唔係**真正閘門；`--source-ref` 驗證只證明 artifact 嚟自邊個 tag。真正人手批准閘門係 `release` environment 要 Jack 批准（`--release-approval` 已撤回，唔會加）；自動閘門仍然係決定 113／114／118。剩餘風險（Jack 已接受）：admin 可以 bypass `main` ruleset 保護（OrganizationAdmin bypass）；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；同一個帳戶（`j113203`）可以自己批准；`release` environment admin bypass 保持開啟。
 - 將來目標：方案 (iii)，專用 release GitHub App 係唯一可以開 `v*` tag 嘅 actor，並開啟 `prevent_self_review`。
@@ -951,7 +950,7 @@ v1.8 冇 lock 簽名（決定 79），部署閘門改為「CI 由 source 重新 
   - health endpoint（`/_health`）回 `"db": "memory"` 同 `"warning": "in-memory database, data is lost on stop"`；
   - 每分鐘喺 log 寫一次 `warn` 級別嘅同一句。
   - Production（manifest 唔係 `build-mode: dev`，或者 `VIBE_ENV=production`）一律拒絕 in-memory：啟動直接報錯退出，冇任何 override 旗標（決定 91）。
-  - 只係 listen 地址唔係 loopback（例如 Docker 入面 `vibe serve --memory --addr 0.0.0.0:8080`）唔算 production，只出警告；Docker 入面請明確設 `VIBE_ENV=development`，先用 `vibe manifest --dev` 產生 `build-mode: dev` manifest，所以照樣准用 in-memory。
+  - 只係 listen 地址唔係 loopback（例如 Docker 入面 `vibe serve --memory --addr 0.0.0.0:8080`）唔算 production，只出警告；Docker 入面請明確設 `VIBE_ENV=development`，先用 `vibe build` 產生 `build-mode: dev` manifest，所以照樣准用 in-memory。
 - **一定要模擬嘅語意**（令 dev 行為同 production 一致）：
   - 租戶隔離（RLS＋FORCE）：每個 statement 一定帶 `tenant_id`；冇用租戶身份執行就報錯（同 production 冇權限一樣），唔係回空；租戶邊界係租戶 `LOGIN` role 同佢自己 schema，唔係 GUC；讀寫只見同一 tenant 嘅列；INSERT 嘅 `tenant_id` 由執行器注入，SQL 或者 input 帶 `tenant_id` 一律拒絕。
   - Role grant：每個 statement 用 lock 指定嘅 role（`app_rw`、`public_reader`、`public_writer`）執行，按 model lock `## Policies` 嘅 grant 檢查表級 SELECT／INSERT／UPDATE；冇權限回同 production 一樣嘅 `permission denied` 錯誤類別。
@@ -1044,8 +1043,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: migrations/main/0002-add-last-login, kind: migration, hash: sha256:2b8f...c3 }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items:
   - { item: migration-ddl, risk: high, reason: "加敏感電話欄位" }
 ---
@@ -1130,7 +1128,7 @@ security-items:
 | --- | --- |
 | 支援 alg | 只有 ES256（P-256）同 RS256；預設 ES256。RS256 只建議用嚟同第三方／JWKS 互通。 |
 | RS256 key 長度 | 最少 2048 bit（按 modulus 實際長度計）。簽名私鑰、靜態驗證公鑰同 JWKS 入面嘅 RSA key 都適用。 |
-| 唔符合 key 長度 | 簽名私鑰或者靜態驗證公鑰唔夠長：`vibe validate --deploy`、部署同 `vibe serve` 啟動 fail closed，拒絕啟動；唔會降級、唔會改用其他 alg、唔會只出 warning。JWKS 入面唔夠長嘅 key 當冇呢個 `kid`，用佢簽嘅 token 回 401。 |
+| 唔符合 key 長度 | 簽名私鑰或者靜態驗證公鑰唔夠長：`vibe build`、部署同 `vibe serve` 啟動 fail closed，拒絕啟動；唔會降級、唔會改用其他 alg、唔會只出 warning。JWKS 入面唔夠長嘅 key 當冇呢個 `kid`，用佢簽嘅 token 回 401。 |
 | 驗證 alg | 每個部署（或者每個 issuer）只設定一個 alg。token header 嘅 `alg` 一定要等於設定值；`none`、HS*、ES256／RS256 之中另一個同任何未知值一律回 401。alg 由設定決定，唔由 token header 或者 key 類型推斷。 |
 | key 同 alg 一致 | 設定 alg 同 key 類型唔夾（例如設定 ES256 但 key 係 RSA）：啟動 fail closed。JWKS key 嘅 `kty`／`alg` 同設定 alg 唔夾，嗰個 key 唔用。 |
 | EdDSA | v1 唔支援，留到 vNext（見 14）。 |
@@ -1139,8 +1137,8 @@ security-items:
 
 實作狀態（main，2026-10-16 檢查）：
 
-- 已實作：`vibe validate` 拒絕 ES256／RS256 以外嘅 `sign-jwt` alg；`sign-jwt` 執行時 alg 要同已載入 key 一致；`VIBE_JWT_ALG` 只接受 ES256、RS256；驗證時 header `alg` 要等於 key 嘅 alg（`none`、HS* 會被拒）；JWKS 只載入 P-256 同 ≥ 2048 bit 嘅 RSA key。
-- RS256 簽名私鑰最少 2048 bit；ES256 簽名私鑰一定要係 P-256，私鑰純量 d 要喺 `1..n-1` 範圍內，編碼入面唔可以有多餘資料：`vibe serve` 啟動時檢查，唔符合就拒絕啟動（#222）。`vibe validate --deploy` 讀唔到執行環境嘅私鑰，所以唔檢查 key 大細或者曲線；呢個檢查只喺 `vibe serve` 啟動時做。
+- 已實作：`vibe build` 拒絕 ES256／RS256 以外嘅 `sign-jwt` alg；`sign-jwt` 執行時 alg 要同已載入 key 一致；`VIBE_JWT_ALG` 只接受 ES256、RS256；驗證時 header `alg` 要等於 key 嘅 alg（`none`、HS* 會被拒）；JWKS 只載入 P-256 同 ≥ 2048 bit 嘅 RSA key。
+- RS256 簽名私鑰最少 2048 bit；ES256 簽名私鑰一定要係 P-256，私鑰純量 d 要喺 `1..n-1` 範圍內，編碼入面唔可以有多餘資料：`vibe serve` 啟動時檢查，唔符合就拒絕啟動（#222）。`vibe build` 讀唔到執行環境嘅私鑰，所以唔檢查 key 大細或者曲線；呢個檢查只喺 `vibe serve` 啟動時做。
 - 靜態驗證公鑰（`VIBE_JWT_PUBLIC_KEY_PEM`）：啟動時檢查 key 類型同設定 alg 一致，RSA 最少 2048 bit，ES256 一定要係 P-256 同有效點（P-384 等其他曲線拒絕啟動）（#224）。
 - JWKS 驗證只用設定 alg（`VIBE_JWT_ALG`，預設 ES256）嘅 key：解析 JWKS 時就按 kty／crv／alg 篩走其他 key；同一個 kid 喺文件出現多過一次就成個 kid 都唔用（記錄警告）；結果同 key 次序無關。route 層 issuer 嘅 JWKS 暫時用同一個部署設定 alg（#225）。
 - `sign-jwt` 冇寫 `alg` 時預設 ES256（#226）。
@@ -1224,7 +1222,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
   - **`cross-site`（要明確開）**：`SameSite=None`，畀唔同 site 嘅前端用。一定要**同時**有：
     1. 嚴格 `Origin` 白名單（完全相等，唔准 `*` 或者 wildcard，最少一個 origin）；同埋
     2. 自訂 header CSRF 檢查：refresh 同 logout 一定要帶 `X-Vibe-CSRF: 1`，冇就回 403。自訂 header 令瀏覽器一定先做 CORS preflight，跨 site 表單或者簡單請求帶唔到。
-  - 開咗 `cross-site` 但缺少任何一樣，驗證器報 error，`vibe manifest` 同部署一律失敗。
+  - 開咗 `cross-site` 但缺少任何一樣，驗證器報 error，`vibe build --release` 同部署一律失敗。
   - `same-site` 模式都會檢查 `Origin` 白名單；refresh 嘅 `X-Vibe-CSRF` 可選，cookie logout 一定要（決定 145）。
 - **輪換同重用偵測**：跟 4A.1，每次 refresh 輪換；偵測到重用已失效 token（寬限期外）撤銷成個家族，同時回 `Set-Cookie` 清除 cookie。
 - **CSRF**：refresh 同 logout 一定要有 `Origin` header，而且喺租戶設定嘅前端 origin 白名單入面（完全相等，唔准 wildcard）；冇 `Origin` 或者唔喺白名單回 403，唔讀 cookie。`same-site` 模式再加 `SameSite=Strict`；`cross-site` 模式再加 `X-Vibe-CSRF` header 檢查。只接受 `POST`。
@@ -1435,7 +1433,7 @@ Logout（節錄）：
 - 只計 step 同 `op: method` 嘅寫入：`sign-method` 所指嘅 method，`## Signature` 一定 `writes: false`，而且冇任何 `writes: true` step。
 - 間接寫入一樣阻擋：跟 #166 嘅繼承規則（10.8），經 `op: method`（任何深度）呼叫到有寫入嘅 method，`sign-method` 就算有寫入；`op: method` target 未知或者格式錯，當寫入處理（fail closed）。
 - `sign-jwt` 嘅 `issue-refresh` 由平台寫 `_platform_refresh_tokens`（login 時 `new-family`、refresh 時 `rotate`），唔係 step 寫入，唔計；所以同一個 method（例如 12.8 嘅 `user.sign-token`）可以照用喺 login。
-- `vibe validate` 同 `vibe validate --deploy` 報 error，`vibe manifest` 失敗，`vibe serve` 拒絕載入帶住呢類 manifest 嘅部署（啟動失敗）。
+- `vibe build` 報 error，`vibe build --release` 失敗，`vibe serve` 拒絕載入帶住呢類 manifest 嘅部署（啟動失敗）。
 - 錯誤碼 `REFRESH_SIGN_METHOD_WRITES`。訊息一定要講：邊個 lock 檔案、邊個 `sign-method`、邊個 method／step 寫入（間接寫入要列出 `op: method` 呼叫鏈），同埋點樣修正。範例：
 
 ```text
@@ -1462,7 +1460,7 @@ error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-re
 
 **範例：唯讀 sign-method 加獨立寫入 method：**
 
-完整、可以照抄嘅版本就係 repo 入面嘅 fixture `tests/fixtures/refresh-session`，由 `tests/refresh_sign_method_example.rs` 嘅 `refresh_session_example_passes_validate_and_build` 測試（`vibe compile` → `vibe validate` → `vibe validate --deploy --dev` → `vibe manifest --dev`）。以下檔案全部係 structured source（`source-type: structured`），`vibe compile` 唔使 LLM 就會產生對應嘅 `.lock.md`（lock 嘅 frontmatter，例如 `source-hash`，係由 compile 計出嚟，唔好手寫）。之前喺 sign-method 入面做嘅業務寫入，搬去一個普通寫入 method，由 client 喺 refresh 成功之後用新 access token 另外呼叫。
+完整、可以照抄嘅版本就係 repo 入面嘅 fixture `tests/fixtures/refresh-session`，由 `tests/refresh_sign_method_example.rs` 嘅 `refresh_session_example_passes_validate_and_build` 測試（`vibe build`）。以下檔案全部係 structured source（`source-type: structured`），`vibe build` 唔使 LLM 就會產生對應嘅 `.lock.md`（lock 嘅 frontmatter，例如 `source-hash`，係由 compile 計出嚟，唔好手寫）。之前喺 sign-method 入面做嘅業務寫入，搬去一個普通寫入 method，由 client 喺 refresh 成功之後用新 access token 另外呼叫。
 
 `models/user/user.md`（model 要有 `last_device`；`id`、`tenant_id`、`created_at` 等 system 欄位由 compile 自動加）
 
@@ -1728,7 +1726,7 @@ body: 4KB
 | 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ```
 
-Fixture 仲有 `providers/main.md`、`api/auth/_definition.md`（`auth` pipeline `mode: jwt`）、`api/auth/v1/_version.md` 同 `slugs.example.json`，同 `tests/fixtures/shop` 嘅寫法一樣。`vibe compile` 會為上面每個檔案產生 `.lock.md`（包括 `api/auth/v1/session/session.lock.md`），本地開發用 `vibe validate --deploy --dev` 驗證之後，再用 `vibe manifest --dev` build。
+Fixture 仲有 `providers/main.md`、`api/auth/_definition.md`（`auth` pipeline `mode: jwt`）、`api/auth/v1/_version.md` 同 `slugs.example.json`，同 `tests/fixtures/shop` 嘅寫法一樣。`vibe build` 會為上面每個檔案產生 `.lock.md`（包括 `api/auth/v1/session/session.lock.md`），本地開發用 `vibe build` 驗證之後，再用 `vibe build` build。
 
 Client 流程：`POST …/refresh` 成功攞到新 access token 之後，再 `POST /auth/v1/session`。兩個 request 唔係 atomic：session 寫入失敗唔影響已經完成嘅輪換，client 可以重試；呢個寫入同 refresh token 狀態無關。
 
@@ -1737,7 +1735,7 @@ Client 流程：`POST …/refresh` 成功攞到新 access token 之後，再 `PO
 1. 直接寫入：`sign-method` 有 `writes: true` step 或者 `## Signature` `writes: true`，validate、build、serve 都報 `REFRESH_SIGN_METHOD_WRITES`，訊息有檔案、method、step 同修正方法。
 2. 間接寫入：`sign-method` 經 `op: method`（包括兩層或以上）呼叫有寫入嘅 method，三者都報錯，訊息列出呼叫鏈；未知 target 都報錯。
 3. 唯讀 `sign-method` 照常通過；同一個 method 用喺 login（`issue-refresh: new-family`）唔受影響。
-4. 上面範例（fixture `tests/fixtures/refresh-session`：唯讀 `user.sign-token` 做 sign-method，加 `user.record-session` 同 `api/auth/v1/session`）通過 `vibe validate` 同 build（`vibe manifest`）：`tests/refresh_sign_method_example.rs` 嘅 `refresh_session_example_passes_validate_and_build`（已經喺 CI 行）。同一個檔案嘅 `refresh_session_example_writing_sign_method_is_rejected`（sign-method 加一個寫入 step，要報 `REFRESH_SIGN_METHOD_WRITES`）暫時 `#[ignore]`，由決定 149 嘅 code PR 啟用。
+4. 上面範例（fixture `tests/fixtures/refresh-session`：唯讀 `user.sign-token` 做 sign-method，加 `user.record-session` 同 `api/auth/v1/session`）通過 `vibe build` 同 `vibe build --release`：`tests/refresh_sign_method_example.rs` 嘅 `refresh_session_example_passes_validate_and_build`（已經喺 CI 行）。同一個檔案嘅 `refresh_session_example_writing_sign_method_is_rejected`（sign-method 加一個寫入 step，要報 `REFRESH_SIGN_METHOD_WRITES`）暫時 `#[ignore]`，由決定 149 嘅 code PR 啟用。
 5. DB 兜底：繞過靜態檢查（測試專用 manifest）令 refresh 期間 `sign-method` 執行寫入 SQL，PostgreSQL 以 `25006` 拒絕，回 500 `INTERNAL`、輪換冇 finalize、舊 token 仍然 current、冇寫入殘留；login 路徑唔套用 READ ONLY。
 6. `_platform_refresh_families.last_refreshed_at`／`revoked_at`：login 插入家族行（`revoked_at` null）；輪換同寬限期重發都喺 finalize transaction 更新 `last_refreshed_at`；finalize rollback 時唔變；寬限期重發（只撤銷舊 child，`grace-reissue`）唔設家族 `revoked_at`，而且照樣可以更新 `last_refreshed_at`（包括家族入面已經有 `grace-reissue` 撤銷嘅 token 之後）；成個家族撤銷（重用偵測、`logout`、`logout-all` 等）喺同一個 transaction 設家族 `revoked_at`，rollback 時兩張表都唔變；trigger 拒絕 `last_refreshed_at` 改細、改做 null、改 identity 欄位、`revoked_at` 改值或者改返 null，同家族 `revoked_at` 有值之後再改 `last_refreshed_at`；`_platform_refresh_tokens` 嘅 grant 列表冇變；serve 啟動檢查兩張表嘅 grant 同 trigger；`vibe migrate` 為現有家族補行而且可以重複行。
 7. 現有 `tests/refresh_tokens.rs` 用緊會寫入嘅 sign-method（`app_with_issuance_control(_, true)`、`rejected_tokens_do_not_run_sign_method_writes`），實作決定 149 時要改寫做上面第 1、2 同 5 項嘅「靜態拒絕」同「READ ONLY 兜底」測試。
@@ -1969,7 +1967,7 @@ v1 challenge provider 係 **Cloudflare Turnstile**（決定 131），由 server 
 | 變數 | 預設 | 意思 | Production 規則 |
 | --- | --- | --- | --- |
 | `VIBE_CHALLENGE_PROVIDER` | `turnstile` | v1 只接受 `turnstile`；其他值（例如 `hcaptcha`）未實作，啟動時拒絕 | 同 dev 一樣 |
-| `VIBE_TURNSTILE_SECRET` | 冇（未設定 = verifier 未設定） | Turnstile secret key；只由環境變數／secret manager 注入，永遠唔 log、唔入 source、lock、manifest 或者 commit 嘅 `.env` | 有任何 challenge route 就一定要有，否則 `vibe serve` 拒絕啟動、`vibe validate --deploy` 失敗 |
+| `VIBE_TURNSTILE_SECRET` | 冇（未設定 = verifier 未設定） | Turnstile secret key；只由環境變數／secret manager 注入，永遠唔 log、唔入 source、lock、manifest 或者 commit 嘅 `.env` | 有任何 challenge route 就一定要有，否則 `vibe serve` 拒絕啟動、`vibe build --release` 失敗 |
 | `VIBE_CHALLENGE_HOSTNAMES` | 冇 | 逗號分隔 widget hostname；siteverify 回應嘅 `hostname` 一定要喺入面 | 有 secret 就一定要有 |
 | `VIBE_CHALLENGE_REPLAY_STORE` | Production：`postgres`；其他環境冇預設，一定要明確設定 | `postgres`（每租戶一份、所有 instance 共用，用 `VIBE_DATABASE_URL`）或者 `memory`（per process，只限 dev／CI） | 一定係 `postgres`；設 `memory` 或者冇 PostgreSQL 即拒絕啟動 |
 
@@ -1999,7 +1997,7 @@ Production 一定用共用 Postgres replay store（#177），冇就拒絕啟動�
 | 決定 | 狀態 | 差異 |
 | --- | --- | --- |
 | 134 啟動閘門 | **Implementation status: not yet implemented**（部分） | `production_gate` 仍然只檢查 `public` 而且 `when: always` 嘅 verifier 設定；未驗證嘅 `after-failures`／已認證 opt-in 改由 #199 `unverified_gate` 喺 production 拒絕（見下一列）。follow-up issue #200（verifier 覆蓋範圍）。 |
-| 133／#199 未驗證 challenge | **Implemented**（production 拒絕；runtime 未驗證） | Runtime 而家只驗證 public route 嘅 `when: always` challenge。`when: after-failures`（login 類）同非 public（已認證）route 宣告嘅 challenge 未驗證，所以 production 下 `vibe serve` 同 `vibe validate --deploy` 會拒絕（就算已設定 verifier）；dev／CI 照樣接受。Runtime 驗證呢啲 mode 見 #201。 |
+| 133／#199 未驗證 challenge | **Implemented**（production 拒絕；runtime 未驗證） | Runtime 而家只驗證 public route 嘅 `when: always` challenge。`when: after-failures`（login 類）同非 public（已認證）route 宣告嘅 challenge 未驗證，所以 production 下 `vibe serve` 同 `vibe build --release` 會拒絕（就算已設定 verifier）；dev／CI 照樣接受。Runtime 驗證呢啲 mode 見 #201。 |
 | 133 Runtime 執行範圍 | **Implementation status: not yet implemented**（部分） | `src/runtime/http.rs` 只對 `public` 而且 `when: always` 嘅 route 做 challenge；`after-failures`（login）同已認證 opt-in route 而家唔會驗證 challenge。follow-up issue #201。 |
 | 135 `Retry-After: 5` | **Implementation status: not yet implemented** | `src/runtime/http.rs` `check_challenge` 回 503 `CHALLENGE_UNAVAILABLE` 時冇 `Retry-After` header。follow-up issue #202。 |
 | 131 `type: pow` build error | **Implementation status: not yet implemented** | `src/validate.rs` 冇呢個檢查；而家係 runtime 回 503。follow-up issue #203。 |
@@ -2128,8 +2126,8 @@ Server 以 streaming 方式計 body hash，同時套用 body 上限；未讀完 
 
 #### 推出
 
-- 新 lock 預設 `bind: request`。現有冇寫 `bind` 嘅 lock 當 `none`，維持一個 release，期間 `vibe validate` 出 warning；下一個 release 預設變 `request`。
-- v1：`bind: none` 准用，但 `vibe validate` 一定出 warning。
+- 新 lock 預設 `bind: request`。現有冇寫 `bind` 嘅 lock 當 `none`，維持一個 release，期間 `vibe build` 出 warning；下一個 release 預設變 `request`。
+- v1：`bind: none` 准用，但 `vibe build` 一定出 warning。
 - **由下一個 minor release 起**：新增嘅 public INSERT route 唔准用 `bind: none`（驗證器 error）；追蹤 issue #245。
 
 #### 測試向量
@@ -2439,8 +2437,8 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
   - 同 `subject-key` 嘅 `hash:{column}` 唔同：嗰個係 DB 欄位，值係 `HMAC-SHA-256(pepper, normalize(email))` 嘅 raw bytes（`bytea`），用嚟做私隱刪除；audit 用另一條 key，所以 audit log 外洩唔可以直接對比 DB。
   - lock 入面 `hash: [req.body.email]`（例如 11.2、12.11.6）一律指呢個格式。
 - 部署時將所有 lock 編譯成 manifest，入面有 routes、pipelines、steps、provider 對應、公開 endpoint 清單、public 寫入 endpoint 清單，同埋每個 lock 嘅 id、hash 同簽名。
-- manifest 由 `vibe manifest --dev` 用 dev key 簽名；release 由 `vibe manifest` 輸出 unsigned manifest，再由 release workflow 用 Sigstore keyless 簽名（決定 79、119）；runtime 只會載入驗證成功而且簽名有效嘅 manifest，冷啟動唔會再解析任何 md（source 或者 lock 都唔會）。
-- 編譯 manifest 前 `vibe manifest` 會逐個檢查 lock 嘅 hash（source、依賴、compiler-hash）同驗證器結果；lock 本身冇簽名（決定 79）。任何一個 lock 唔合格，成個部署失敗。
+- manifest 由 `vibe build` 用 dev key 簽名；release 由 `vibe build --release` 輸出 unsigned manifest，再由 release workflow 用 Sigstore keyless 簽名（決定 79、119）；runtime 只會載入驗證成功而且簽名有效嘅 manifest，冷啟動唔會再解析任何 md（source 或者 lock 都唔會）。
+- 編譯 manifest 前 `vibe build --release` 會逐個檢查 lock 嘅 hash（source、依賴、vibe-version）同驗證器結果；lock 本身冇簽名（決定 79）。任何一個 lock 唔合格，成個部署失敗。
 
 ## 9A. 緊急 Kill Switch
 
@@ -2458,9 +2456,9 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 
 ## 9B. 供應鏈同設定保護
 
-- CODEOWNERS 必須（決定 29、37、93、115）：`api/`、`models/`、`migrations/`、`providers/`、`pipelines/`、`.github/`、`.compiler/`（包括 `injection-allowlist`）、編譯器同驗證器版本設定，全部要有 CODEOWNERS 覆蓋，作為 source PR 合併條件；SDK / `vibe manifest` 唔檢查（2C.3a）。設定方法見 [`pr-review-guide.md`](pr-review-guide.md)。
-- Release manifest 簽名（決定 79、119）：冇長期 production key；`vibe manifest` 輸出 unsigned manifest，由 CI `release` environment 嘅 release workflow 用 GitHub OIDC 身份做 Sigstore keyless 簽名，寫入 Rekor。Environment secret 只可以用喺 dev／test 簽名，永遠唔簽 release。本機 `vibe manifest --dev` 用本機 dev key，production runtime 拒絕。
-- Manifest 簽名前 `vibe manifest` 一定再跑一次驗證器；runtime 載入時驗證 manifest 簽名同每個 lock 嘅 hash，唔需要任何人手確認簽名。
+- CODEOWNERS 必須（決定 29、37、93、115）：`api/`、`models/`、`migrations/`、`providers/`、`pipelines/`、`.github/`、`.compiler/`（包括 `injection-allowlist`）、編譯器同驗證器版本設定，全部要有 CODEOWNERS 覆蓋，作為 source PR 合併條件；SDK / `vibe build --release` 唔檢查（2C.3a）。設定方法見 [`pr-review-guide.md`](pr-review-guide.md)。
+- Release manifest 簽名（決定 79、119）：冇長期 production key；`vibe build --release` 輸出 unsigned manifest，由 CI `release` environment 嘅 release workflow 用 GitHub OIDC 身份做 Sigstore keyless 簽名，寫入 Rekor。Environment secret 只可以用喺 dev／test 簽名，永遠唔簽 release。本機 `vibe build` 用本機 dev key，production runtime 拒絕。
+- Manifest 簽名前 `vibe build --release` 一定再跑一次驗證器；runtime 載入時驗證 manifest 簽名同每個 lock 嘅 hash，唔需要任何人手確認簽名。
 - 業務 secret（DB 連線、JWT 私鑰）只用引用名，永遠唔會出現喺 source、lock、manifest 或者 log。
 - 編譯用 `LLM_API_KEY`（或者別名 `OPENAI_API_KEY`）只存在 CI secret 同開發者本機 `.env`（已 gitignore），runtime 冇（見 2A.8.5）。
 
@@ -2490,7 +2488,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 - Production 一律拒絕 in-memory，冇 override（決定 91）。
 - `/latest/` 永遠唔係草稿（決定 94）。
 
-建議（SDK 外，見 [`pr-review-guide.md`](pr-review-guide.md)）：開 rulesets（分支規則）、required PR review、CODEOWNERS（必須，覆蓋 `api/`、`models/`、`migrations/`、`providers/`、`pipelines/`、`.github/`）、required CI status（`vibe manifest`／`vibe compile --check`，決定 117）、`security:high` label 要兩個 reviewer。
+建議（SDK 外，見 [`pr-review-guide.md`](pr-review-guide.md)）：開 rulesets（分支規則）、required PR review、CODEOWNERS（必須，覆蓋 `api/`、`models/`、`migrations/`、`providers/`、`pipelines/`、`.github/`）、required CI status（`vibe build --release`／`vibe build --check`，決定 117）、`security:high` label 要兩個 reviewer。
 
 ## 10. 部署驗證（全部喺 lock 層檢查；每個 error 都會報 lock 檔名、section、step id、對應 source 行數同原因）
 
@@ -2505,7 +2503,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 - Manifest 簽名錯：runtime 驗證 manifest 簽名失敗，或者 manifest 入面 lock hash 同 lock 內容唔一致（決定 79）。
 - 手改：lock 格式唔合 2A（frontmatter 欄位或者次序錯、多咗或者少咗 section、step 欄位次序錯）。
 - （已取消，決定 113、117）重編唔一致唔再封鎖部署；改為 attestation 或者決定 114 policy 唔通過就封鎖。
-- 編譯器（決定 174）：`compiler-hash` 按 2A.1 重算唔一致就要求 `vibe compile`；`compiler.version` major 唔一致；編譯器名唔係平台登記。部署驗證同 manifest 從 build record 檢查 LLM provider 同浮動 model alias。
+- 決定 176：lock 用 `vibe-version`，正式版（包括 0.x）記 major.minor（例如 `0.1`、`1.0`），pre-release 記完整版本（例如 `1.0.0-rc.2`），必須完全一致。版本唔啱（包括舊 `prompt-N` lock）喺 build 驗證同 serve／runtime 載入都係 error，提示用 `vibe build` 重新產生；source 冇改但版本唔同亦當過時。
 - `kind` 或者 `id` 同檔案路徑唔一致；`lock-version` 唔支援。
 - 編譯器 LLM 設定（決定 57）：
   - `LLM_PROVIDER` 唔係 `openai`、`anthropic`、`gemini`。
@@ -2516,7 +2514,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
   - CI 或者 production 編譯用咗 http、loopback、內網 host，或者設咗 `LLM_ALLOW_PRIVATE_HOST=true`。
   - 決定 174：部署去 production 嘅 build-record stamp 有 `endpoint-private: true`。
   - 決定 174：唔再將 lock 同而家嘅 LLM 設定比較；stale 檢查唔受 LLM 設定影響。
-  - 決定 174：非 dev 部署嘅 natural lock 冇 build-record stamp，必須 error 並要求執行 `vibe compile`。
+  - 決定 174：非 dev 部署嘅 natural lock 冇 build-record stamp，必須 error 並要求執行 `vibe build`。
   - 編譯請求帶咗 `tools`／`functions`／`toolConfig`，或者唔合 2A.8.2 嘅決定性設定；provider 回報 model 同 `LLM_MODEL` 唔一致。
   - secret scanning 喺 repo、lock、manifest、部署報告或者 CI log 搵到 key。
   - `.env` 冇喺 `.gitignore`，或者 repo 有 `.env`。
@@ -2639,8 +2637,7 @@ source: providers/main.md
 source-hash: sha256:9a1c...e2
 source-type: natural
 dependencies: []
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items: [{ item: provider-new, risk: high, reason: "新增主資料庫" }]
 ---
 ## Connection
@@ -2728,8 +2725,7 @@ source: pipelines/login-guard.md
 source-hash: sha256:51bd...07
 source-type: natural
 dependencies: []
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items: [{ item: rate-limit-new, risk: medium, reason: "登入防爆破" }]
 ---
 ## Parameters
@@ -2839,8 +2835,7 @@ dependencies:
   - { id: user/methods/register, kind: method, hash: sha256:c3e1...90 }
   - { id: users/_definition, kind: api, hash: sha256:11ab...3c }
   - { id: users/v2/_version, kind: api, hash: sha256:0d9e...51 }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" }]
 ---
 ## Route
@@ -2943,8 +2938,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 build-mode: release
 security-items:
   - { item: write-sql, risk: medium, reason: "建立用戶" }
@@ -3013,8 +3007,7 @@ dependencies:
   - { id: email-outbox/methods/enqueue, kind: method, hash: sha256:81aa...c2 }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 build-mode: release
 security-items:
   - { item: write-sql, risk: medium, reason: "寫邀請 token" }
@@ -3098,8 +3091,7 @@ dependencies:
   - { id: user/methods/invite, kind: method, hash: sha256:5b7d...e4 }
   - { id: users/_definition, kind: api, hash: sha256:11ab...3c }
   - { id: users/v2/_version, kind: api, hash: sha256:0d9e...51 }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 build-mode: release
 security-items: [{ item: roles, risk: high, reason: "只限 admin 寄邀請" }]
 ---
@@ -3586,8 +3578,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: migrations/main/0004-add-email-verification, kind: migration, hash: sha256:5e77...b1 }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items:
   - { item: public-writable-column, risk: high, reason: "last_login_at 畀 public 登入寫" }
 ---
@@ -3650,8 +3641,7 @@ source-hash: sha256:3b90...d4
 source-type: natural
 dependencies:
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items:
   - { item: sign-token, risk: high, reason: "唯一簽 token 入口" }
 ---
@@ -3714,8 +3704,7 @@ dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
   - { id: user/methods/sign-token, kind: method, hash: sha256:3b90...d4 }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items:
   - { item: write-sql, risk: medium, reason: "記錄最後登入時間" }
 ---
@@ -3818,8 +3807,7 @@ dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: login-guard, kind: pipeline, hash: sha256:51bd...07 }
   - { id: user/methods/login, kind: method, hash: sha256:e81f...2a }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items:
   - { item: public, risk: high, reason: "登入入口一定要公開" }
   - { item: auth-removed, risk: high, reason: "未登入先要登入" }
@@ -4110,8 +4098,7 @@ source-type: natural
 dependencies:
   - { id: email-outbox, kind: model, hash: sha256:4f10...9d }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items:
   - { item: write-sql, risk: medium, reason: "註冊信件排隊" }
 ---
@@ -4183,8 +4170,7 @@ dependencies:
   - { id: email-outbox/methods/enqueue, kind: method, hash: sha256:81aa...c2 }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items:
   - { item: write-sql, risk: medium, reason: "建立未驗證用戶或者輪換驗證 token" }
 ---
@@ -4266,8 +4252,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items:
   - { item: set-password, risk: high, reason: "用 email token 設定密碼" }
   - { item: confirm-verification, risk: high, reason: "訪客用 token 確認 email" }
@@ -4358,8 +4343,7 @@ source-type: natural
 dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: user/methods/self-register, kind: method, hash: sha256:d3c9...10 }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items:
   - { item: public, risk: high, reason: "訪客註冊入口" }
   - { item: auth-removed, risk: high, reason: "未有帳戶" }
@@ -4477,8 +4461,7 @@ source-type: natural
 dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: user/methods/complete-verification, kind: method, hash: sha256:9e02...7b }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 security-items:
   - { item: public, risk: high, reason: "email 連結入口" }
   - { item: auth-removed, risk: high, reason: "未有密碼" }

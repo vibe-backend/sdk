@@ -1239,7 +1239,7 @@ fn check_type(field: &crate::manifest::ReqField, value: &Value) -> Result<(), Me
             }
         }
         other => {
-            // `vibe validate` rejects unknown types; an old manifest fails closed.
+            // `vibe build` rejects unknown types; an old manifest fails closed.
             return Err(MethodFail::code(
                 "INTERNAL",
                 format!("unsupported request type {other} for {}", field.name),

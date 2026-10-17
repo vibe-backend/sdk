@@ -347,7 +347,7 @@ impl RunLock {
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(std::io::Error::new(
                 err.kind(),
                 format!(
-                    "another vibe compile is running in this project ({} exists; delete it if no compile is running)",
+                    "another vibe build is running in this project ({} exists; delete it if no compile is running)",
                     path.display()
                 ),
             )),
@@ -655,7 +655,7 @@ mod tests {
         let (root, _, _) = setup();
         let first = RunLock::acquire(&root).unwrap();
         let err = RunLock::acquire(&root).err().expect("second run must fail");
-        assert!(err.to_string().contains("another vibe compile"), "{err}");
+        assert!(err.to_string().contains("another vibe build"), "{err}");
         drop(first);
         RunLock::acquire(&root).unwrap();
     }

@@ -57,8 +57,7 @@ source: pipelines/login-guard.md
 source-hash: sha256:51bd...07
 source-type: natural
 dependencies: []
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 status: approved
 approval-mode: manual
 approved-by: [jack@example]

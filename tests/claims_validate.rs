@@ -1,8 +1,8 @@
-//! `vibe validate` rules for sign-jwt claims (claims source hardening).
+//! `vibe build` rules for sign-jwt claims (claims source hardening).
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use vibe::compile::{compile_project, CompileOptions};
+use vibe::compile::{regenerate_project, CompileOptions};
 use vibe::validate::{validate_project, ValidateOptions};
 
 fn copy_dir(src: &Path, dst: &Path) {
@@ -36,7 +36,7 @@ async fn problems(claims: &str, custom: &str) -> String {
         method(claims, custom),
     )
     .unwrap();
-    let compiled = compile_project(&CompileOptions {
+    let compiled = regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,

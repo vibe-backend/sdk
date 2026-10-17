@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The compiler turns natural-language source `.md` into lock md using an LLM (§2.1, §2A.6). Initializing a project and running a compile need an LLM provider, endpoint, key and pinned model (§2A.8, Decision 57). The endpoint is used **only at deploy/compile time**; the validator, manifest compilation and runtime never use it, and runtime never receives any LLM key (§2A.8.1, §2A.8.5).
+The compiler turns natural-language source `.md` into lock md using an LLM (§2.1, §2A.6). Interactive source authoring and regenerating stale natural-language locks need an LLM provider, endpoint, key and pinned model (§2A.8, Decision 57). The endpoint is used **only at deploy/compile time**; validation and dev manifest generation from fresh locks never call it, and runtime never uses it, and runtime never receives any LLM key (§2A.8.1, §2A.8.5).
 
 ## Natural-language source example
 
@@ -17,12 +17,12 @@ There is no source `.md` for this: the endpoint is configuration, not a definiti
 | `LLM_TIMEOUT` | no | default 60s, max 300s |
 | `LLM_RETRY_DEADLINE` | no | total seconds one LLM call may spend retrying, default 120, max 600 |
 | `LLM_MAX_CALLS_PER_SOURCE` | no | HTTP attempts one source may make, counting retries and translation, default 8, max 16 |
-| `LLM_MAX_CALLS_PER_RUN` | no | HTTP attempts one `vibe compile` may make, default 200, max 400 |
+| `LLM_MAX_CALLS_PER_RUN` | no | HTTP attempts one `vibe build` may make, default 200, max 400 |
 | `LLM_SOURCE_DEADLINE` | no | seconds one source may spend in LLM calls, default 300, max 600 |
 | `LLM_RUN_DEADLINE` | no | seconds one run may spend in LLM calls, default 1800, max 3600 |
 | `LLM_MAX_RETRIES` | no | retries for network errors, timeouts, 408, 429 and 5xx with exponential backoff (1s, 2s, 4s, … capped at 16s, plus jitter), default 2, max 5; a `Retry-After` header (seconds, capped at 60) replaces the backoff; 400/401/403/404 are never retried |
 | `LLM_FORMAT_RETRIES` | no | re-prompts with the validator errors when the LLM output is not valid lock markdown, default 2, max 5; each re-prompt counts against `LLM_MAX_CALLS_PER_SOURCE` |
-| `LLM_SEED` | no | sent only if the model supports seed; default `0`; recorded in build-record `compilers`, never in `compiler-hash` (decision 174) |
+| `LLM_SEED` | no | sent only if the model supports seed; default `0`; recorded in build-record `compilers`, never in `vibe-version` (decision 174) |
 | `LLM_ALLOW_PRIVATE_HOST` | no | default `false`; local development only |
 
 `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` are **aliases** accepted only with `LLM_PROVIDER=openai`. `LLM_*` takes precedence; if both are set with different values it is an error. Setting any `OPENAI_*` with another provider is an error (§2A.8.3).
@@ -53,18 +53,17 @@ GitHub Actions (from §2A.8.8; `vibe@0.1.0` is the spec's illustrative, provisio
     LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
     LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
     LLM_MODEL: ${{ vars.LLM_MODEL }}
-  run: npx --yes vibe@0.1.0 compile --check-determinism
+  run: npx --yes vibe@0.1.0 build --check-determinism
 ```
 
 Fork PRs get no secrets, so they only run the validator, not the recompile (§2A.8.5). The deploy job must not set any `LLM_*` or `OPENAI_*` variable.
 
 ## Compiled lock md example
 
-Decision 174: provider, endpoint host, model, seed and sent parameters are recorded in the build record and manifest provenance `compilers` map. Locks contain only compiler name and version; compiler-hash uses only compiler version and prompt version.
+Decision 174: provider, endpoint host, model, seed and sent parameters are recorded in the build record and manifest provenance `compilers` map. Locks contain `vibe-version`: stable versions use major.minor (including 0.x); pre-releases use the full version. Exact matches are required (decision 176).
 
 ````markdown
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 ````
 
 `model-snapshot` is the **provider-reported** model id (`modelReported`), not the user input; if it differs from `LLM_MODEL` (e.g. the provider resolved an alias) it is an error. `sent-params` is the parameter set the adapter actually sent (Decision 58, §2A.8.6).
@@ -93,7 +92,7 @@ OPENAI_MODEL=gpt-4.1-2025-04-14
 ```
 
 - Undated OpenAI aliases (e.g. `gpt-4.1`) are floating and rejected; use a snapshot id (Decision 58 judges by provider documentation, not by the presence of a date).
-- The adapter writes the response's `system_fingerprint` to the compile report (not to `compiler-hash`).
+- The adapter writes the response's `system_fingerprint` to the compile report (not to `vibe-version`).
 
 ### Anthropic
 
@@ -161,7 +160,7 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 - **Sandbox**: the compiler's network egress is limited to the endpoint host; no tools, function calling or streaming; no secret other than `LLM_API_KEY` (§2A.7, §2A.8.6).
 - CI and production compiles require `https://` with a public host; loopback, private hosts or `LLM_ALLOW_PRIVATE_HOST=true` in CI are errors (§2A.8.4).
 - `LLM_ALLOW_PRIVATE_HOST=true` also permits named hosts that resolve to non-public addresses, such as fake-IP DNS proxies, for local development only. These compiles record `endpoint-private: true`, even for public-looking names. Public hostnames still require HTTPS. CI and production refuse this flag.
-- For local testing of private-endpoint locks, use `vibe validate --deploy --dev` and `vibe manifest --dev`. Manifest signatures and other validation checks still apply. Both flags are refused in CI and production. Dev manifests are signed with `build_mode: "dev"` and `vibe serve` accepts them only in development (including `--memory`); release manifests cannot contain private-endpoint locks.
+- For local testing of private-endpoint locks, use `vibe build`. Manifest signatures and other validation checks still apply. CI and release builds reject private-endpoint locks. Dev manifests are signed with `build_mode: "dev"` and `vibe serve` accepts them only in development (including `--memory`); release manifests cannot contain private-endpoint locks.
 - Changing provider, endpoint host or model is a **major** change: all locks recompile and natural/security-touching locks need re-approval. Changing only the base URL path is not major, but the CI determinism check must still pass (§2A.8.7).
 
 ## Spec gaps
@@ -173,14 +172,14 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 
 ## Compile is all-or-nothing; LLM output cache
 
-`vibe compile` replaces the official `*.lock.md` files only when **every** source compiles. Any failure leaves all locks on disk unchanged and exits non-zero. The replacement stages each lock in a fsynced temp file, swaps them in, and rolls back if a rename fails.
+`vibe build` replaces the official `*.lock.md` files only when **every** source compiles. Any failure leaves all locks on disk unchanged and exits non-zero. The replacement stages each lock in a fsynced temp file, swaps them in, and rolls back if a rename fails.
 
-Each source's successful LLM output is cached in `.vibe/cache/llm/<key>.md`, so a rerun after a partial failure does not call the LLM again for those files. The key is a SHA-256 over the system prompt (incl. prompt version), the LLM input (source plus dependency context), provider, endpoint host, model, seed, sent parameters and compiler hash; any change is a cache miss. Cached output goes through the same normalization and checks as fresh output, and `vibe validate` checks the written locks as usual. `.vibe/` is gitignored; delete `.vibe/cache/` to force fresh LLM calls.
+Each source's successful LLM output is cached in `.vibe/cache/llm/<key>.md`, so a rerun after a partial failure does not call the LLM again for those files. The key is a SHA-256 over the system prompt (incl. vibe version stamp), the LLM input (source plus dependency context), provider, endpoint host, model, seed, sent parameters and vibe version stamp; any change is a cache miss. Cached output goes through the same normalization and checks as fresh output, and `vibe build --check` builds in memory and checks deploy policy without writing files. `.vibe/` is gitignored; delete `.vibe/cache/` to force fresh LLM calls.
 
 ## Interrupted writes
 
 Locks are swapped in one step. The plan is kept in `.vibe/lock-journal.json`
-until the swap finishes; if `vibe compile` is killed part way, the next run
+until the swap finishes; if `vibe build` is killed part way, the next run
 restores the previous locks (or finishes a swap that already reached its
 commit point) and removes leftover `.tmp-*` / `.bak-*` files. LLM output is
 cached in `.vibe/cache` only after the source passes every check.

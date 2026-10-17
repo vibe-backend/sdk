@@ -2,7 +2,7 @@
 
 ## 用途
 
-compiler 使用 LLM 把自然語言 source `.md` 轉為 lock md（§2.1、§2A.6）。初始化專案和執行 compile 需要 LLM provider、endpoint、key 和固定的 model（§2A.8、Decision 57）。endpoint **只在 deploy／compile 時**使用；validator、manifest 編譯和 runtime 都不使用它，runtime 亦絕不會取得任何 LLM key（§2A.8.1、§2A.8.5）。
+compiler 使用 LLM 把自然語言 source `.md` 轉為 lock md（§2.1、§2A.6）。互動建立 source 同重新產生過時自然語言 lock 需要 LLM provider、endpoint、key 和固定的 model（§2A.8、Decision 57）。endpoint **只在 deploy／compile 時**使用；fresh-lock build 嘅驗證同 dev manifest 輸出唔會呼叫 LLM，runtime 都不使用它，runtime 亦絕不會取得任何 LLM key（§2A.8.1、§2A.8.5）。
 
 ## 自然語言 source 範例
 
@@ -16,7 +16,7 @@ compiler 使用 LLM 把自然語言 source `.md` 轉為 lock md（§2.1、§2A.6
 | `LLM_MODEL` | 是 | provider 文件列為**非浮動**的 model id／snapshot id（Decision 58） |
 | `LLM_TIMEOUT` | 否 | 預設 60s，上限 300s |
 | `LLM_MAX_RETRIES` | 否 | 網絡重試次數，預設 2，上限 5 |
-| `LLM_SEED` | 否 | 只在 model 支援 seed 時傳送；預設 `0`；記喺 build-record `compilers`，唔計入 `compiler-hash`（決定 174） |
+| `LLM_SEED` | 否 | 只在 model 支援 seed 時傳送；預設 `0`；記喺 build-record `compilers`，唔計入 `vibe-version`（決定 174） |
 | `LLM_ALLOW_PRIVATE_HOST` | 否 | 預設 `false`；只限本地開發 |
 
 `OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL` 是只在 `LLM_PROVIDER=openai` 時接受的**別名**。`LLM_*` 優先；兩者都設定而值不同屬錯誤。配合其他 provider 設定任何 `OPENAI_*` 也屬錯誤（§2A.8.3）。
@@ -47,18 +47,17 @@ GitHub Actions（取自 §2A.8.8；`vibe@0.1.0` 是規格中示意性、暫定�
     LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
     LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
     LLM_MODEL: ${{ vars.LLM_MODEL }}
-  run: npx --yes vibe@0.1.0 compile --check-determinism
+  run: npx --yes vibe@0.1.0 build --check-determinism
 ```
 
 Fork PR 沒有 secrets，因此只執行 validator，不重新編譯（§2A.8.5）。deploy job 不可設定任何 `LLM_*` 或 `OPENAI_*` 變數。
 
 ## 編譯後的 lock md 範例
 
-決定 174：provider、endpoint host、model、seed 同 sent parameters 記喺 build record 同 manifest provenance 嘅 `compilers` map。Lock compiler 只留 name 同 version；compiler-hash 只計 compiler version 同 prompt version。
+決定 174：provider、endpoint host、model、seed 同 sent parameters 記喺 build record 同 manifest provenance 嘅 `compilers` map。Lock 只記 `vibe-version`：正式版（包括 0.x）用 major.minor，pre-release 用完整版本，必須完全一致（決定 176）。
 
 ````markdown
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 ````
 
 `model-snapshot` 是 **provider 回報**的 model id（`modelReported`），而非用戶輸入；若與 `LLM_MODEL` 不同（例如 provider 解析了別名）屬錯誤。`sent-params` 是 adapter 實際送出的參數集（Decision 58、§2A.8.6）。
@@ -87,7 +86,7 @@ OPENAI_MODEL=gpt-4.1-2025-04-14
 ```
 
 - 沒有日期的 OpenAI 別名（例如 `gpt-4.1`）是浮動的，會被拒絕；請使用 snapshot id（Decision 58 以 provider 文件判斷，而非看有沒有日期）。
-- adapter 把回應的 `system_fingerprint` 寫入 compile 報告（不寫入 `compiler-hash`）。
+- adapter 把回應的 `system_fingerprint` 寫入 compile 報告（不寫入 `vibe-version`）。
 
 ### Anthropic
 
@@ -155,7 +154,7 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 - **Sandbox**：compiler 的對外網絡只限 endpoint host；沒有 tools、function calling 或 streaming；除 `LLM_API_KEY` 外沒有其他 secret（§2A.7、§2A.8.6）。
 - CI 和 production 編譯必須用公開 host 的 `https://`；在 CI 使用 loopback、私有 host 或 `LLM_ALLOW_PRIVATE_HOST=true` 屬錯誤（§2A.8.4）。
 - `LLM_ALLOW_PRIVATE_HOST=true` 亦適用於解析至非公開地址的網域名稱，例如 fake-IP DNS 代理；只限本地開發。即使名稱看似公開，編譯結果亦會記錄 `endpoint-private: true`。 公開網域名稱仍須使用 HTTPS；CI 和 production 拒絕此旗標。
-- 本地測試私有 endpoint 編譯的 lock，可用 `vibe validate --deploy --dev` 和 `vibe manifest --dev`。Manifest 簽署和其他驗證檢查維持不變；CI 和 production 拒絕這些旗標。 Dev manifest 的簽署內容包含 `build_mode: "dev"`，`vibe serve` 只在開發環境接受 （可配合 `--memory`）；release manifest 不接受私有 endpoint lock。
+- 本地測試私有 endpoint 編譯的 lock，可用 `vibe build`。Manifest 簽署和其他驗證檢查維持不變；CI 同 release build 拒絕 private-endpoint lock。 Dev manifest 的簽署內容包含 `build_mode: "dev"`，`vibe serve` 只在開發環境接受 （可配合 `--memory`）；release manifest 不接受私有 endpoint lock。
 - 更換 provider、endpoint host 或 model 屬 **major** 變更：所有 lock 重新編譯，涉及自然語言／安全的 lock 需要重新審批。只改 base URL 的 path 不屬 major，但 CI 確定性檢查仍須通過（§2A.8.7）。
 
 ## 規格缺口

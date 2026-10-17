@@ -31,8 +31,7 @@ source-hash: sha256:3b90...d4
 source-type: natural
 dependencies:
   - { id: user, kind: model, hash: sha256:aa41...0f }
-compiler: { name: md-logic, version: 2.0.0 }
-compiler-hash: sha256:c0de...77
+vibe-version: 0.1
 status: approved
 approval-mode: manual
 approved-by: [jack@example, mei@example]

@@ -1,3 +1,4 @@
+//! Compile prompt text lives in compile.rs and prompt_guide.rs, including translation and repairs.
 //! Lock grammar and canonical examples sent to the compile LLM (#37).
 //!
 //! Every example here is checked by tests: it must parse, follow

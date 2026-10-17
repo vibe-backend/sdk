@@ -46,8 +46,8 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 ## 3. Required status checks
 
 - 而家已經有：`vibe secret-scan --fail-on-find`。
-- `vibe compile --check`：喺 CI 由 source build 一次，驗證結果同決定 114 policy（唔同 commit 咗嘅 lock 比較，因為 lock 唔 commit；spec 決定 117）。
-- 而家已經有：`vibe validate`。
+- `vibe build --check`：喺 CI 由 source build 一次，驗證結果同決定 114 policy（唔同 commit 咗嘅 lock 比較，因為 lock 唔 commit；spec 決定 117）。
+- 而家已經有：`vibe build --check`。
 - `main` 建議用 **ruleset**（唔好用舊式 branch protection）開 pull request rule 嘅 **Require approval of the most recent reviewable push**。
 - Merge queue：SDK 冇限制（原本 `--release-approval` 嘅限制已撤回）。
 - 建議喺 ruleset 嘅 **Require status checks to pass** 入面開 **Require branches to be up to date before merging**（`strict_required_status_checks_policy`，最少要有一個 required status check 先生效）。

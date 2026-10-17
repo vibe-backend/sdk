@@ -1157,7 +1157,7 @@ pub fn check_expr(input: &str) -> Result<(), String> {
 }
 
 /// Evaluates a `when`. An unparseable condition is never "false": it fails
-/// closed (the step's `fail` fires), and `vibe validate` rejects it first.
+/// closed (the step's `fail` fires), and `vibe build` rejects it first.
 pub(crate) fn when_matches(expr: &str, vars: &Map<String, Value>) -> bool {
     let parsed = match parse_when(expr) {
         Ok(parsed) => parsed,

@@ -413,10 +413,7 @@ pub async fn run(
     } else {
         io.write("Nothing written.");
     }
-    let public = crate::compile::parse_source_frontmatter(&a.source)?
-        .iter()
-        .any(|(k, v)| k == "public" && v == "true");
     io.write("Limits go in frontmatter (timeout, body, provider); prose limits are ignored.");
-    io.write(&format!("Next: vibe compile, vibe manifest --dev, vibe serve --memory, then curl http://127.0.0.1:8080/{}/{}/{}{feature}", a.definition, a.version, if public { "dev/" } else { "" }, feature=a.feature));
+    io.write("Next: vibe build");
     Ok(())
 }

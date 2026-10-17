@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use vibe::compile::{compile_project, CompileOptions};
+use vibe::compile::{regenerate_project, CompileOptions};
 use vibe::llm::{HttpAdapter, LlmConfig};
 
 const NESTED: &str =
@@ -64,7 +64,7 @@ async fn format_retries_stop_at_the_call_budget() {
         api_style: "chat".into(),
     };
     let adapter = HttpAdapter::new(config.clone()).unwrap();
-    let Err(report) = compile_project(&CompileOptions {
+    let Err(report) = regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),

@@ -616,7 +616,7 @@ fn turnstile_config(
 }
 
 /// Whether the environment configures a challenge verifier, without building
-/// a client (for `vibe validate`).
+/// a client (for `vibe build`).
 pub fn configured_in_env() -> Result<bool, String> {
     let get = |name: &str| std::env::var(name).ok();
     let provider = get("VIBE_CHALLENGE_PROVIDER")

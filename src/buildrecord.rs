@@ -1,5 +1,5 @@
-//! Build record: `vibe compile` writes the SHA-256 of every lock it produced
-//! to `.vibe/build-record.json`. Deploy validation and `vibe manifest`
+//! Build record: `vibe build` writes the SHA-256 of every lock it produced
+//! to `.vibe/build-record.json`. Deploy validation and `vibe build`
 //! require each lock to match it byte for byte, so a lock edited after the
 //! build (natural-language locks included, which cannot be recompiled
 //! offline) is refused.
@@ -69,7 +69,7 @@ pub fn check(loaded: &LoadedProject, report: &mut Report) {
     let Some(raw) = &loaded.build_record else {
         report.push(Diag::error(
             PATH,
-            "no build record; locks must come from `vibe compile` (or the CI build)",
+            "no build record; locks must come from `vibe build` (or the CI build)",
         ));
         return;
     };
@@ -78,7 +78,7 @@ pub fn check(loaded: &LoadedProject, report: &mut Report) {
         _ => {
             report.push(Diag::error(
                 PATH,
-                "build record cannot be read; run `vibe compile`",
+                "build record cannot be read; run `vibe build`",
             ));
             return;
         }
@@ -90,11 +90,11 @@ pub fn check(loaded: &LoadedProject, report: &mut Report) {
             Some(hash) if *hash == lock_hash(text) => {}
             Some(_) => report.push(Diag::error(
                 &rel,
-                "lock differs from what `vibe compile` wrote (hand-edited?); run `vibe compile`",
+                "lock differs from what `vibe build` wrote (hand-edited?); run `vibe build`",
             )),
             None => report.push(Diag::error(
                 &rel,
-                "lock is not in the build record; run `vibe compile`",
+                "lock is not in the build record; run `vibe build`",
             )),
         }
     }

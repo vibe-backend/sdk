@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use vibe::compile::{compile_project, CompileOptions};
+use vibe::compile::{regenerate_project, CompileOptions};
 use vibe::llm::{FakeAdapter, LlmConfig, LlmRequest};
 
 const GOOD: &str = "## Table\n- provider: main\n- table: products\n## Fields\n| name | type | rules | system |\n| --- | --- | --- | --- |\n| sku | string | required, unique, max: 40 | no |\n## CRUD\n| method | options |\n| --- | --- |\n| get | - |\n## Policies\n(none)\n";
@@ -63,7 +63,7 @@ async fn grammar_error_is_repaired_with_validator_feedback() {
         },
     };
     let config = config();
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),
@@ -94,7 +94,7 @@ async fn repair_attempts_are_bounded() {
         },
     };
     let config = config();
-    let err = compile_project(&CompileOptions {
+    let err = regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),
@@ -116,7 +116,7 @@ async fn model_prompt_example_passes_the_validator() {
         vibe::prompt_guide::MODEL_EXAMPLE,
     )
     .unwrap();
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -181,7 +181,7 @@ async fn validate_feedback_repairs_api_steps() {
             }
         },
     };
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config()),
@@ -203,7 +203,7 @@ async fn invalid_api_exhausts_shared_retry_budget_without_writes() {
             Ok(invalid_api())
         },
     };
-    let err = compile_project(&CompileOptions {
+    let err = regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config()),
@@ -250,7 +250,7 @@ async fn cached_lock_failing_validate_is_recompiled() {
         llm_config: Some(&config),
         check: false,
     };
-    compile_project(&opts)
+    regenerate_project(&opts)
         .await
         .unwrap_or_else(|err| panic!("{err}"));
     let cache: Vec<_> = fs::read_dir(root.join(".vibe/cache/llm"))
@@ -259,7 +259,7 @@ async fn cached_lock_failing_validate_is_recompiled() {
         .collect();
     assert_eq!(cache.len(), 1);
     fs::write(&cache[0], invalid_api()).unwrap();
-    compile_project(&opts)
+    regenerate_project(&opts)
         .await
         .unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -288,7 +288,7 @@ async fn structured_limits_pins_and_slug_normalization() {
             llm_config: None,
             check: false,
         };
-        let error = compile_project(&opts).await.err().unwrap().to_string();
+        let error = regenerate_project(&opts).await.err().unwrap().to_string();
         for (key, value, resolved) in [
             ("provider", "other", "main"),
             ("timeout", "5s", "10s"),
@@ -310,7 +310,7 @@ async fn structured_limits_pins_and_slug_normalization() {
             format!("---\ntimeout: 5s\nbody: 4KB\n---\n{body}"),
         )
         .unwrap();
-        compile_project(&opts)
+        regenerate_project(&opts)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         let lock = fs::read_to_string(root.join("api/catalog/v1/hello/hello.lock.md")).unwrap();

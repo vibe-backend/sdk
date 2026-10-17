@@ -1,7 +1,7 @@
 use std::fs;
 use std::time::Duration;
 
-use vibe::compile::{compile_project, CompileOptions};
+use vibe::compile::{regenerate_project, CompileOptions};
 use vibe::llm::{FakeAdapter, LlmConfig, LlmRequest};
 use vibe::lock::{parse_lock, SourceType};
 use vibe::validate::{validate_project, ValidateOptions};
@@ -46,7 +46,7 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
     )
     .unwrap();
 
-    let failed = compile_project(&CompileOptions {
+    let failed = regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -71,7 +71,7 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
     let malformed = FakeAdapter {
         responder: |_: &LlmRequest| Ok("BODY-MARKER-7f3a Bearer sk-test-value".into()),
     };
-    let errors = compile_project(&CompileOptions {
+    let errors = regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&malformed),
         llm_config: Some(&config),
@@ -94,7 +94,7 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
             Ok(format!("```markdown\n{SECTIONS}\n```"))
         },
     };
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),
@@ -109,7 +109,7 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
         provider.meta.compiler,
         vibe::lock::CompilerStamp::deterministic()
     );
-    let check = compile_project(&CompileOptions {
+    let check = regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),
@@ -117,7 +117,7 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
     })
     .await
     .err()
-    .expect("compile --check applies the release deploy policy");
+    .expect("build --check applies the release deploy policy");
     assert!(check
         .to_string()
         .contains("private endpoint cannot be deployed"));
@@ -257,7 +257,7 @@ async fn natural_language_lock_with_tautological_where_cannot_deploy() {
             Ok(format!("```markdown\n{body}\n```"))
         },
     };
-    let compiled = compile_project(&CompileOptions {
+    let compiled = regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),
@@ -326,7 +326,7 @@ async fn structured_locks_ignore_llm_config_and_check_consistently() {
         api_style: "chat".into(),
     };
     for (check, config) in [(false, Some(&config)), (true, Some(&config)), (true, None)] {
-        compile_project(&CompileOptions {
+        regenerate_project(&CompileOptions {
             root: &root,
             llm: None,
             llm_config: config,
@@ -471,7 +471,7 @@ async fn compile_auth_feature_output(
         send_sampling: true,
         api_style: "chat".into(),
     };
-    let result = compile_project(&CompileOptions {
+    let result = regenerate_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
         llm_config: Some(&config),
@@ -701,7 +701,7 @@ async fn decision_165_cache_free_locks_and_audit_provenance() {
         };
         for _ in 0..3 {
             let _ = fs::remove_dir_all(root.join(".vibe/cache"));
-            let output = compile_project(&CompileOptions {
+            let output = regenerate_project(&CompileOptions {
                 root: &root,
                 llm: Some(&adapter),
                 llm_config: Some(&config),
@@ -746,13 +746,13 @@ async fn decision_165_cache_free_locks_and_audit_provenance() {
             deploy: false,
         });
         let report = result.unwrap_or_else(|report| report);
-        assert_eq!(report.to_string().matches("lock contains a `translation` field, which is no longer written (decision 165); run `vibe compile` to refresh it").count(), 1);
+        assert_eq!(report.to_string().matches("lock contains a `translation` field, which is no longer written (decision 165); run `vibe build` to refresh it").count(), 1);
         // The old prompt's compiler hash must be stale under prompt-6.
         fs::write(
             root.join(rel),
             std::str::from_utf8(&before)
                 .unwrap()
-                .replace(&doc.meta.compiler_hash, "sha256:old-prompt-hash"),
+                .replace(&doc.meta.vibe_version, "sha256:old-prompt-hash"),
         )
         .unwrap();
         let result = validate_project(&ValidateOptions {
@@ -763,7 +763,7 @@ async fn decision_165_cache_free_locks_and_audit_provenance() {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("compiler-hash does not match"));
+            .contains("regenerate it with `vibe build`"));
         fs::write(root.join(rel), &before).unwrap();
         let source = root.join("api/catalog/v1/greet/greet.md");
         fs::write(
@@ -804,7 +804,7 @@ async fn decision_165_cache_free_locks_and_audit_provenance() {
         for send_sampling in [true, false] {
             config.send_sampling = send_sampling;
             let _ = fs::remove_dir_all(root.join(".vibe/cache"));
-            let out = compile_project(&CompileOptions {
+            let out = regenerate_project(&CompileOptions {
                 root: &root,
                 llm: Some(&multi),
                 llm_config: Some(&config),
@@ -877,7 +877,7 @@ async fn decision_167_block_snap_and_validate() {
         let mut before = None;
         for _ in 0..count {
             fs::remove_dir_all(root.join(".vibe/cache")).ok();
-            compile_project(&CompileOptions {
+            regenerate_project(&CompileOptions {
                 root: &root,
                 llm: Some(&adapter),
                 llm_config: Some(&config),
@@ -921,7 +921,7 @@ async fn decision_167_block_snap_and_validate() {
         .unwrap_err()
         .to_string();
         assert!(
-            error.contains("source-lines `8-11` must equal `8-12`; run `vibe compile`"),
+            error.contains("source-lines `8-11` must equal `8-12`; run `vibe build`"),
             "{error}"
         );
         assert!(error.contains("s1 respond"), "{error}");

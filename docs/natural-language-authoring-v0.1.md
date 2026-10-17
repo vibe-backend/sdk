@@ -24,7 +24,7 @@ Release 0.1 定義一條給不懂後端的使用者使用的最小安全流程�
 
 本規格以 2026-10-15 的 `main`（`413ccd6`）及當時 GitHub issues／PR 為基準：
 
-- 現有 SDK 已有 `vibe compile`、`vibe validate`、`vibe manifest`、LLM adapter、結構化 lock、secret／危險輸入掃描及 signed manifest；README 明確規定 runtime 不解讀自然語言。
+- 現有 SDK 已有 `vibe build`、`vibe build --release`、LLM adapter、結構化 lock、secret／危險輸入掃描及 signed manifest；README 明確規定 runtime 不解讀自然語言。
 - `spec-v1.7.md` 是現行定稿；`spec-v1.8.md` 是草稿，已另行規劃 `vibe dev`、`vibe build`、manifest/release hardening、租戶隔離、權限、效能與 auth 等議題。本文件引用而不複製這些規則。
 - v1.8 草稿決定 77–80 移除 `vibe approve` 與 lock 人手安全簽核；因此本文件的「確認」只表示**同意把預覽過的 plan 寫入工作目錄**，不構成安全批准，不取代 code review、CI 或 release environment approval。
 - issue #94 已記錄繁體中文 source 可造成欄位錯位、錯誤 auth、虛構 constraint 等問題。0.1 因此禁止直接接受任意 LLM markdown，先要求固定 plan schema，再由 deterministic renderer 產生 source。
@@ -62,7 +62,7 @@ No project files were changed. Run `vibe apply <user-cache>/vibe/plans/<project-
 $ vibe apply <user-cache>/vibe/plans/<project-id>/7d1b….json
 [同一份 canonical preview]
 Write these changes? [y/N] y
-Applied atomically. Next: `vibe compile && vibe validate`.
+Applied atomically. Next: `vibe build`.
 ```
 
 必要行為：
@@ -251,7 +251,7 @@ pub struct AuthoringPlan {
 
 - 在每一個 write/rename/fsync fault injection point 中斷，結果只可為完整舊狀態或完整新狀態。
 - user cancel、provider timeout、malformed JSON、validator error、disk full 都不可留下看似可發布的 lock/manifest。
-- apply 先在隔離 staging project 執行現行 `vibe compile` 與 `vibe validate`，兩者成功後才 commit source；基於 v1.8 branch 時可改用其無 manifest staging mode。commit 後以 `--check`／read-only 等價模式重驗，不可寫 lock/manifest。
+- apply 先在隔離 staging project 執行現行 `vibe build`，成功後才 commit source；基於 v1.8 branch 時可改用其無 manifest staging mode。commit 後以 `--check`／read-only 等價模式重驗，不可寫 lock/manifest。
 
 ### 8.4 UX acceptance
 

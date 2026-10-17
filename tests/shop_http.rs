@@ -8,7 +8,7 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tower::ServiceExt;
-use vibe::compile::{compile_project, CompileOptions};
+use vibe::compile::{regenerate_project, CompileOptions};
 use vibe::manifest::manifest_from_project;
 use vibe::runtime::{hash_api_secret, router, AppState, AuthConfig, MemoryExec, Slug, StoredKey};
 use vibe::sign;
@@ -27,7 +27,7 @@ Q0UxBzbmJ2wI9FMVJLw4XEhuIJFqIdA/P6b6ozSNGyOUZK7OjIfGKtpNYw==\n\
 #[tokio::test]
 async fn shop_compiles_and_serves_catalog_and_cart() {
     let root = copy_shop();
-    let compiled = compile_project(&CompileOptions {
+    let compiled = regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -37,7 +37,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     .unwrap_or_else(|err| panic!("{err}"));
     assert!(compiled.files.len() > 10);
 
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -716,7 +716,7 @@ async fn owner_key_id_is_rejected_outside_users() {
         text.replace("- owner-key: user_id", "- owner-key: id"),
     )
     .unwrap();
-    let report = compile_project(&CompileOptions {
+    let report = regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -738,7 +738,7 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
     let source = root.join("models/cart-item/cart-item.md");
     let text = fs::read_to_string(&source).unwrap();
     fs::write(&source, text.replace("- ownership: role(admin)\n", "")).unwrap();
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -808,7 +808,7 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
 
 async fn compiled_shop() -> PathBuf {
     let root = copy_shop();
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -893,7 +893,7 @@ async fn manifest_output_is_relative_to_the_current_directory() {
     let cwd = std::env::temp_dir().join(format!("vibe-cwd-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&cwd).unwrap();
     let out = dev_command()
-        .args(["manifest", "--dev", "--project"])
+        .args(["build", "--project"])
         .arg(&root)
         .args(["-o", "out.json"])
         .current_dir(&cwd)
@@ -945,7 +945,7 @@ async fn deploy_validate_rejects_a_hand_edited_lock() {
 }
 
 #[tokio::test]
-async fn manifest_refuses_a_hand_edited_lock_and_writes_nothing() {
+async fn manifest_refuses_a_hand_edited_lock_but_build_repairs_it() {
     let root = compiled_shop().await;
     tamper_product_lock(&root);
     let key = sign::generate_key();
@@ -953,14 +953,14 @@ async fn manifest_refuses_a_hand_edited_lock_and_writes_nothing() {
     assert!(err.contains("hand-edited"), "{err}");
     let out = root.join("out/manifest.json");
     let status = dev_command()
-        .args(["manifest", "--dev", "--project"])
+        .args(["build", "--project"])
         .arg(&root)
         .arg("-o")
         .arg(&out)
         .status()
         .unwrap();
-    assert!(!status.success());
-    assert!(!out.exists(), "no partial manifest");
+    assert!(status.success());
+    assert!(out.exists());
 }
 
 #[tokio::test]
@@ -968,10 +968,17 @@ async fn manifest_refuses_locks_that_fail_validation() {
     let root = compiled_shop().await;
     let lock = root.join("api/catalog/v1/get-product/get-product.lock.md");
     let text = fs::read_to_string(&lock).unwrap();
-    fs::write(&lock, text.replace("name: md-logic", "name: hand-edited")).unwrap();
+    fs::write(
+        &lock,
+        text.replace(
+            &format!("vibe-version: {}", vibe::lock::lock_stamp()),
+            "vibe-version: 99.0",
+        ),
+    )
+    .unwrap();
     let key = sign::generate_key();
     let err = manifest_from_project(&root, &key).unwrap_err().to_string();
-    assert!(err.contains("compiler name is not md-logic"), "{err}");
+    assert!(err.contains("regenerate it with `vibe build`"), "{err}");
 }
 
 #[tokio::test]
@@ -1041,12 +1048,14 @@ async fn legacy_rejected_or_pending_locks_are_ignored_with_one_warning() {
         )
         .unwrap();
         rerecord(&root);
-        for args in [
-            vec!["validate", "--project", "."],
-            vec!["validate", "--deploy", "--dev", "--project", "."],
-        ] {
-            let (ok, out) = vibe_cli(&root, &args, &[]);
-            assert!(ok, "{status}: {out}");
+        for deploy in [false, true] {
+            let report = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+                root: &root,
+                deploy,
+                dev: true,
+            })
+            .unwrap();
+            let out = report.to_string();
             let lines: Vec<&str> = out
                 .lines()
                 .filter(|line| line.contains("get-product.lock.md"))
@@ -1057,7 +1066,7 @@ async fn legacy_rejected_or_pending_locks_are_ignored_with_one_warning() {
                 "{out}"
             );
         }
-        let (ok, out) = vibe_cli(&root, &["manifest", "--dev", "--project", "."], &[]);
+        let (ok, out) = vibe_cli(&root, &["build", "--project", "."], &[]);
         assert!(ok, "{status}: {out}");
     }
 }
@@ -1151,7 +1160,7 @@ fn vibe_cli(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> (bool, String)
 #[tokio::test]
 async fn manifest_dev_creates_a_key_and_keygen_refuses_overwrite() {
     let root = compiled_shop().await;
-    let (ok, out) = vibe_cli(&root, &["manifest", "--dev", "--project", "."], &[]);
+    let (ok, out) = vibe_cli(&root, &["build", "--project", "."], &[]);
     assert!(ok, "{out}");
     assert!(root.join(".vibe/signing.key").exists());
     #[cfg(unix)]
@@ -1167,7 +1176,7 @@ async fn manifest_dev_creates_a_key_and_keygen_refuses_overwrite() {
             fs::Permissions::from_mode(0o644),
         )
         .unwrap();
-        let (ok, out) = vibe_cli(&root, &["manifest", "--dev", "--project", "."], &[]);
+        let (ok, out) = vibe_cli(&root, &["build", "--project", "."], &[]);
         assert!(!ok);
         assert!(out.contains("must be mode 0600"), "{out}");
     }
@@ -1176,16 +1185,17 @@ async fn manifest_dev_creates_a_key_and_keygen_refuses_overwrite() {
 }
 
 #[tokio::test]
-async fn manifest_defaults_to_release() {
+async fn build_defaults_to_dev_and_release_is_explicit() {
     let root = compiled_shop().await;
-    let (ok, out) = vibe_cli(&root, &["manifest", "--project", "."], &[]);
-    let (release_ok, release_out) =
-        vibe_cli(&root, &["manifest", "--release", "--project", "."], &[]);
-    assert!(!ok, "{out}");
-    assert_eq!(ok, release_ok);
-    assert_eq!(out, release_out);
-    assert!(!root.join(".vibe/signing.key").exists());
-    let (ok, out) = vibe_cli(&root, &["manifest", "--dev", "--release"], &[]);
+    let (ok, out) = vibe_cli(&root, &["build", "--project", "."], &[]);
+    assert!(ok, "{out}");
+    let manifest: vibe::manifest::Manifest =
+        serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest.build_mode, Some(vibe::manifest::BuildMode::Dev));
+    assert!(!manifest.signature.is_empty());
+    let (ok, out) = vibe_cli(&root, &["build", "--release", "--project", "."], &[]);
+    assert!(!ok && out.contains("--release-version"), "{out}");
+    let (ok, out) = vibe_cli(&root, &["build", "--check", "--release"], &[]);
     assert!(!ok && out.contains("cannot be used with"), "{out}");
 }
 
@@ -1194,10 +1204,7 @@ async fn approve_is_gone() {
     let root = copy_shop();
     let (ok, out) = vibe_cli(&root, &["approve", "--reviewer", "a@x"], &[]);
     assert!(!ok);
-    assert!(
-        out.contains("has been removed in spec v1.8 (decision 77)"),
-        "{out}"
-    );
+    assert!(out.contains("was removed: use `vibe build`"), "{out}");
 }
 
 #[tokio::test]
@@ -1206,7 +1213,7 @@ async fn release_build_needs_a_version_and_a_full_commit() {
     let (ok, out) = vibe_cli(
         &root,
         &[
-            "manifest",
+            "build",
             "--project",
             ".",
             "--release",
@@ -1220,7 +1227,7 @@ async fn release_build_needs_a_version_and_a_full_commit() {
     let (ok, out) = vibe_cli(
         &root,
         &[
-            "manifest",
+            "build",
             "--project",
             ".",
             "--release",
@@ -1263,7 +1270,7 @@ async fn release_build_ignores_lock_files_in_the_repo() {
     let (ok, out) = vibe_cli(
         &root,
         &[
-            "manifest",
+            "build",
             "--project",
             ".",
             "--release",
@@ -1288,10 +1295,10 @@ async fn release_build_ignores_lock_files_in_the_repo() {
     assert!(!serde_json::to_string(&release.models)
         .unwrap()
         .contains("100000"));
-    // The same old lock cannot reach a dev manifest either.
+    // A dev build deterministically repairs the old structured lock.
     sign::create_dev_key(&root).unwrap();
-    let (ok, out) = vibe_cli(&root, &["manifest", "--dev", "--project", "."], &[]);
-    assert!(!ok, "{out}");
+    let (ok, out) = vibe_cli(&root, &["build", "--project", "."], &[]);
+    assert!(ok, "{out}");
 }
 
 #[tokio::test]
@@ -1305,7 +1312,7 @@ async fn release_build_never_reads_the_project_env_file() {
     let (ok, out) = vibe_cli(
         &root,
         &[
-            "manifest",
+            "build",
             "--project",
             ".",
             "--release",
@@ -1328,7 +1335,7 @@ async fn release_build_refuses_a_non_allowlisted_llm_host() {
     let (ok, out) = vibe_cli(
         &root,
         &[
-            "manifest",
+            "build",
             "--project",
             ".",
             "--release",
@@ -1373,7 +1380,7 @@ async fn release_build_is_immune_to_lock_edits_during_the_build() {
         .await
         .unwrap_or_else(|err| panic!("{err}"));
     // Mid-build: drop a hand-edited lock (and a forged record) on disk.
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -1470,7 +1477,7 @@ async fn production_runs_only_release_manifests() {
 async fn production_serve_ignores_the_project_public_key() {
     let root = compiled_shop().await;
     sign::create_dev_key(&root).unwrap();
-    let (ok, out) = vibe_cli(&root, &["manifest", "--dev", "--project", "."], &[]);
+    let (ok, out) = vibe_cli(&root, &["build", "--project", "."], &[]);
     assert!(ok, "{out}");
     let (ok, out) = vibe_cli(
         &root,
@@ -1486,7 +1493,7 @@ async fn production_serve_ignores_the_project_public_key() {
     );
     assert!(!ok);
     assert!(
-        out.contains("this manifest was built with --dev and is refused"),
+        out.contains("this development manifest (`vibe build`) is refused"),
         "{out}"
     );
     // With a release version set, the dev manifest is still refused.
@@ -1505,7 +1512,7 @@ async fn production_serve_ignores_the_project_public_key() {
     );
     assert!(!ok);
     assert!(
-        out.contains("this manifest was built with --dev and is refused"),
+        out.contains("this development manifest (`vibe build`) is refused"),
         "{out}"
     );
 }
@@ -1526,7 +1533,7 @@ async fn auth_mode_change_is_high_risk_and_keeps_the_inherited_roles() {
         "- mode: api-key",
         "- mode: api-key\n- roles: [staff, customer]",
     );
-    let err = compile_project(&CompileOptions {
+    let err = regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -1583,7 +1590,7 @@ async fn auth_roles_merge_every_parent_auth_block() {
         "- mode: api-key",
         "- mode: jwt\n- roles: [staff, admin, customer]",
     );
-    let err = compile_project(&CompileOptions {
+    let err = regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -1633,7 +1640,7 @@ async fn route_jwt_overrides_end_to_end() {
             ),
         )
         .unwrap();
-        let compiled = compile_project(&CompileOptions {
+        let compiled = regenerate_project(&CompileOptions {
             root: &root,
             llm: None,
             llm_config: None,
@@ -1779,7 +1786,7 @@ async fn private_endpoint_deployment_requires_signed_dev_mode() {
     use vibe::validate::{validate_project, ValidateOptions};
 
     let root = copy_shop();
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -1828,23 +1835,6 @@ async fn private_endpoint_deployment_requires_signed_dev_mode() {
                 .contains("private endpoint cannot be deployed"));
         }
     }
-    for dev in [false, true] {
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vibe"));
-        command
-            .env_clear()
-            .env("VIBE_ENV", "development")
-            .args(["validate", "--deploy", "--project"])
-            .arg(&root);
-        if dev {
-            command.arg("--dev");
-        }
-        let output = command.output().unwrap();
-        let err = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.success(), dev, "{err}");
-        if !dev {
-            assert!(err.contains("private endpoint cannot be deployed"), "{err}");
-        }
-    }
     assert!(manifest_from_project(&root, &key).is_err());
     let manifest =
         manifest_from_project_with_mode(&root, &key, true).unwrap_or_else(|e| panic!("{e}"));
@@ -1869,7 +1859,7 @@ async fn private_endpoint_deployment_requires_signed_dev_mode() {
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
-        err.contains("this manifest was built with --dev and is refused when VIBE_ENV is"),
+        err.contains("this development manifest (`vibe build`) is refused when VIBE_ENV is"),
         "{err}"
     );
 
@@ -1892,7 +1882,7 @@ async fn private_endpoint_deployment_requires_signed_dev_mode() {
 async fn memory_dev_default_and_live_slug_reload() {
     let root = copy_shop();
     fs::remove_file(root.join("slugs.example.json")).unwrap();
-    compile_project(&CompileOptions {
+    regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
@@ -1954,7 +1944,7 @@ async fn memory_dev_default_and_live_slug_reload() {
 async fn missing_definition_suggests_scaffold() {
     let root = copy_shop();
     fs::remove_file(root.join("api/shop/_definition.md")).unwrap();
-    let error = compile_project(&CompileOptions {
+    let error = regenerate_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
