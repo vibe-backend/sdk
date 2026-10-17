@@ -45,7 +45,39 @@ pub fn setup_with_resolver(
     env: HashMap<String, String>,
     resolve: impl Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
 ) -> Result<llm::LlmConfig, String> {
-    match llm::load_llm_config(&env, false) {
+    if let Ok(config) = llm::load_llm_config(&env, false) {
+        io.write(&llm::redact(
+            &format!(
+                "Using LLM {} {} from environment/.env",
+                config.provider, config.model
+            ),
+            &[&config.api_key],
+        ));
+        for (key, value) in &env {
+            if key.starts_with("LLM_") && std::env::var_os(key).is_none() {
+                std::env::set_var(key, value);
+            }
+        }
+        return Ok(config);
+    }
+    let existing = match fs::read(project.join(".env")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut combined = env.clone();
+    for line in String::from_utf8_lossy(&existing).lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            combined
+                .entry(key.to_string())
+                .or_insert_with(|| value.to_string());
+        }
+    }
+    match llm::load_llm_config(&combined, false) {
         Ok(config) => {
             io.write(&llm::redact(
                 &format!(
@@ -54,6 +86,11 @@ pub fn setup_with_resolver(
                 ),
                 &[&config.api_key],
             ));
+            for (key, value) in &combined {
+                if key.starts_with("LLM_") && std::env::var_os(key).is_none() {
+                    std::env::set_var(key, value);
+                }
+            }
             return Ok(config);
         }
         Err(report) => {
@@ -63,7 +100,7 @@ pub fn setup_with_resolver(
             });
             let secrets: Vec<_> = ["LLM_API_KEY", "OPENAI_API_KEY"]
                 .iter()
-                .filter_map(|k| env.get(*k).map(String::as_str))
+                .filter_map(|k| combined.get(*k).map(String::as_str))
                 .collect();
             let message = llm::redact(&errors(report), &secrets);
             if !missing_only {
@@ -72,31 +109,41 @@ pub fn setup_with_resolver(
         }
     }
     let mut values = HashMap::new();
-    let provider = line(io, "Provider (openai/anthropic/gemini) [openai]: ")?;
-    let provider = if provider.trim().is_empty() {
-        "openai"
+    let fresh = !combined.contains_key("LLM_PROVIDER");
+    let provider = if fresh {
+        let answer = line(io, "Provider (openai/anthropic/gemini) [openai]: ")?;
+        let provider = if answer.trim().is_empty() {
+            "openai"
+        } else {
+            answer.trim()
+        };
+        values.insert("LLM_PROVIDER".to_string(), provider.to_string());
+        provider.to_string()
     } else {
-        provider.trim()
+        combined["LLM_PROVIDER"].trim().to_string()
     };
-    if !matches!(provider, "openai" | "anthropic" | "gemini") {
+    if !matches!(provider.as_str(), "openai" | "anthropic" | "gemini") {
         return Err("Invalid provider".into());
     }
-    values.insert("LLM_PROVIDER".to_string(), provider.to_string());
-    let base = line(
-        io,
-        &format!("Base URL [{}]: ", llm::default_base_url(provider)),
-    )?;
-    if !base.trim().is_empty() {
-        values.insert("LLM_BASE_URL".into(), base.trim().into());
-    }
-    loop {
-        let model = line(io, "Model: ")?;
-        if !model.trim().is_empty() {
-            values.insert("LLM_MODEL".into(), model.trim().into());
-            break;
+    if fresh && !combined.contains_key("LLM_BASE_URL") {
+        let base = line(
+            io,
+            &format!("Base URL [{}]: ", llm::default_base_url(&provider)),
+        )?;
+        if !base.trim().is_empty() {
+            values.insert("LLM_BASE_URL".into(), base.trim().into());
         }
     }
-    if provider == "openai" {
+    if !combined.contains_key("LLM_MODEL") {
+        loop {
+            let model = line(io, "Model: ")?;
+            if !model.trim().is_empty() {
+                values.insert("LLM_MODEL".into(), model.trim().into());
+                break;
+            }
+        }
+    }
+    if fresh && provider == "openai" && !combined.contains_key("LLM_API_STYLE") {
         let style = line(io, "API style (chat/responses) [chat]: ")?;
         match style.trim() {
             "" | "chat" => {}
@@ -106,18 +153,22 @@ pub fn setup_with_resolver(
             _ => return Err("Invalid API style".into()),
         }
     }
-    let key = io.read_secret("API key: ").ok_or("Input ended")?;
-    if key.contains(['\n', '\r']) {
-        return Err("Invalid API key".into());
+    if !combined.contains_key("LLM_API_KEY") {
+        let key = io.read_secret("API key: ").ok_or("Input ended")?;
+        if key.contains(['\n', '\r']) {
+            return Err("Invalid API key".into());
+        }
+        values.insert("LLM_API_KEY".into(), key);
     }
-    values.insert("LLM_API_KEY".into(), key.clone());
-    let mut combined = env;
     combined.extend(values.clone());
+    let key = combined.get("LLM_API_KEY").cloned().unwrap_or_default();
     let mut config = match llm::load_llm_config(&combined, false) {
         Ok(c) => c,
         Err(report) => {
             let message = llm::redact(&errors(report), &[&key]);
-            if !(message.contains("LLM_ALLOW_PRIVATE_HOST") || message.contains("private")) {
+            if combined.contains_key("LLM_ALLOW_PRIVATE_HOST")
+                || !(message.contains("LLM_ALLOW_PRIVATE_HOST") || message.contains("private"))
+            {
                 return Err(message);
             }
             if !yes(&line(io, "The endpoint resolves to a private or local address. Allow it for local development only (LLM_ALLOW_PRIVATE_HOST=true)? [y/N]: ")?) { return Err(message); }
@@ -144,35 +195,37 @@ pub fn setup_with_resolver(
         }
     }
     fs::create_dir_all(project).map_err(|e| e.to_string())?;
-    let mut options = fs::OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(project.join(".env"))
-        .map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
+    if !values.is_empty() {
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(project.join(".env"))
             .map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
+        }
+        let mut settings: Vec<_> = values.iter().collect();
+        settings.sort_by_key(|(k, _)| *k);
+        let mut text = String::new();
+        if !existing.is_empty() && !existing.ends_with(b"\n") {
+            text.push('\n');
+        }
+        text.push_str("# vibe LLM settings\n");
+        for (k, v) in settings {
+            text.push_str(&format!("{k}={v}\n"));
+        }
+        file.write_all(text.as_bytes())
+            .map_err(|_| "Cannot write .env".to_string())?;
+        io.write("wrote .env (LLM settings)");
     }
-    let mut settings: Vec<_> = values.iter().collect();
-    settings.sort_by_key(|(k, _)| *k);
-    let existing = fs::read(project.join(".env")).map_err(|e| e.to_string())?;
-    let mut text = String::new();
-    if !existing.is_empty() && !existing.ends_with(b"\n") {
-        text.push('\n');
-    }
-    text.push_str("# vibe LLM settings\n");
-    for (k, v) in settings {
-        text.push_str(&format!("{k}={v}\n"));
-    }
-    file.write_all(text.as_bytes())
-        .map_err(|_| "Cannot write .env".to_string())?;
     let ignore = project.join(".gitignore");
     let existing = fs::read_to_string(&ignore).unwrap_or_default();
     if !existing
@@ -189,10 +242,11 @@ pub fn setup_with_resolver(
         }
         file.write_all(b".env\n").map_err(|e| e.to_string())?;
     }
-    for (k, v) in values {
-        std::env::set_var(k, v);
+    for (k, v) in combined {
+        if k.starts_with("LLM_") && std::env::var_os(&k).is_none() {
+            std::env::set_var(k, v);
+        }
     }
-    io.write("wrote .env (LLM settings; the key is stored only there)");
     io.write(".gitignore contains .env");
     Ok(config)
 }

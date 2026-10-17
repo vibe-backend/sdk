@@ -5,6 +5,9 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Interactive setup (decision 157):** Fill only missing `.env` keys, preserve existing values, avoid duplicates, and prompt only for missing keys.
+- **Structured Limits errors (decision 163):** Conflicts name the field, source and resolved values, and explain how to pin the value in frontmatter or delete the Limits line.
+
 - **Limits pins:** API feature frontmatter supports timeout, body and provider. Timeout/body resolve pins → version defaults → definition defaults → built-ins; provider resolves pin → definition provider default → main. Compile, validate and interactive generation check values; prose limits are ignored and prompts explain frontmatter pins. Body sizes accept case-insensitive b/kb/mb units everywhere; previously a lowercase value such as `64kb` built a manifest with a zero body limit.
 - **Breaking: structured Limits:** Structured API features now use the same canonical Limits and path.slug rules. Conflicting source Limits fail compile; move those values into frontmatter or remove them.
 - **Compile prompt version:** Bumped to prompt-5 (locks recompile). Every compile prompt, guide or example change must bump PROMPT_VERSION; a recorded SHA-256 test guards the rule.

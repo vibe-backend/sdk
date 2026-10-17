@@ -111,29 +111,60 @@ fn setup_and_existing_config() {
     assert!(!default_text.contains("LLM_API_STYLE"));
     assert!(!defaults.output.contains("super-secret-key"));
     for _ in 0..2 {
-        let mut io = Script::new(&[
-            "",
-            "https://api.openai.com/v1",
-            "",
-            "gpt-4o-2024-08-06",
-            "responses",
-            "super-secret-key",
-        ]);
+        let mut io = Script::default();
         interactive::setup_with_resolver(&p, &mut io, HashMap::new(), |_, _| {
             Ok(vec!["93.184.216.34:443".parse().unwrap()])
         })
         .unwrap();
+        assert!(!io.output.contains("API key:"));
+        assert!(!io.output.contains("Provider"));
+        assert!(!io.output.contains("wrote .env"));
         assert!(!io.output.contains("super-secret-key"));
     }
     let text = fs::read_to_string(p.join(".env")).unwrap();
-    for s in [
-        "LLM_PROVIDER=openai",
-        "LLM_MODEL=gpt-4o-2024-08-06",
-        "LLM_API_KEY=super-secret-key",
-        "LLM_API_STYLE=responses",
-        "LLM_BASE_URL=https://api.openai.com/v1",
-    ] {
-        assert!(text.contains(s));
+    assert_eq!(text, default_text);
+    for key in names {
+        assert!(
+            text.lines()
+                .filter(|line| line.starts_with(&format!("{key}=")))
+                .count()
+                <= 1
+        );
+    }
+    // Only the missing key is requested; existing model and original bytes win.
+    for model in ["gpt-4o-2024-08-06", "existing-model"] {
+        let project = root();
+        let original = format!("# mine\nLLM_PROVIDER=openai\nLLM_MODEL={model}\n");
+        fs::write(project.join(".env"), &original).unwrap();
+        let mut io = Script::new(&["partial-secret"]);
+        let config = interactive::setup_with_resolver(&project, &mut io, HashMap::new(), |_, _| {
+            Ok(vec!["93.184.216.34:443".parse().unwrap()])
+        })
+        .unwrap();
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.model, model);
+        assert!(io.output.contains("API key:"));
+        for prompt in [
+            "Provider",
+            "Base URL",
+            "Model:",
+            "API style",
+            "partial-secret",
+        ] {
+            assert!(!io.output.contains(prompt));
+        }
+        assert!(io.lines.is_empty());
+        let text = fs::read_to_string(project.join(".env")).unwrap();
+        assert!(text.starts_with(&original));
+        for key in ["LLM_PROVIDER", "LLM_MODEL", "LLM_API_KEY"] {
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.starts_with(&format!("{key}=")))
+                    .count(),
+                1
+            );
+        }
+        fs::remove_dir_all(project).unwrap();
     }
     assert_eq!(
         fs::read_to_string(p.join(".gitignore"))
@@ -158,6 +189,35 @@ fn setup_and_existing_config() {
     .unwrap();
     assert!(io.output.contains("Using LLM openai"));
     assert!(!io.output.contains("API key:"));
+    // Process-supplied values are never copied into .env; append preserves a
+    // missing final newline and the first occurrence of an existing key.
+    let project = root();
+    let original = "# mine\nLLM_PROVIDER=openai\nLLM_MODEL=first-model\nLLM_MODEL=second-model";
+    fs::write(project.join(".env"), original).unwrap();
+    let supplied = HashMap::from([("LLM_API_KEY".into(), "process-secret".into())]);
+    let mut io = Script::default();
+    let config = interactive::setup_with_resolver(&project, &mut io, supplied, |_, _| {
+        panic!("usable config must skip DNS lookup")
+    })
+    .unwrap();
+    assert_eq!(config.model, "first-model");
+    assert_eq!(fs::read_to_string(project.join(".env")).unwrap(), original);
+    assert!(!io.output.contains("wrote .env"));
+    assert!(!io.output.contains("process-secret"));
+    fs::write(
+        project.join(".env"),
+        "# mine\nLLM_PROVIDER=openai\nLLM_MODEL=first-model",
+    )
+    .unwrap();
+    let mut io = Script::new(&["new-secret"]);
+    interactive::setup_with_resolver(&project, &mut io, HashMap::new(), |_, _| {
+        Ok(vec!["93.184.216.34:443".parse().unwrap()])
+    })
+    .unwrap();
+    assert!(fs::read_to_string(project.join(".env"))
+        .unwrap()
+        .starts_with("# mine\nLLM_PROVIDER=openai\nLLM_MODEL=first-model\n# vibe LLM settings\n"));
+    fs::remove_dir_all(project).unwrap();
     // Keep setup cases in this test because setup mutates process variables.
     for (base, port, response) in [
         ("https://proxy.example.com/v1", 443, "y"),
