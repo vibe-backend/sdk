@@ -776,7 +776,7 @@ jobs:
 - 所有指令嘅 `--project` 預設係目前目錄（cwd）；只有 project 唔喺 cwd 先要寫（決定 81）。
 - 冇 `vibe approve`（決定 77）；舊 workflow 用到會報「指令已移除」並提示用 `vibe build`。
 - 同現有 CLI（`4239c95`）嘅對照：`vibe compile`、`vibe validate`、`vibe manifest` 保留做低階指令，`vibe build` 係佢哋嘅組合；`vibe compile --check` 只喺本地／CI 驗證 build 結果同決定 114 policy，唔同 commit 咗嘅 lock 比較（決定 117）；`vibe validate --deploy` 唔再檢查確認同 lock 簽名（決定 77、79）；`vibe serve --memory` 保留，改用 2C.4 嘅 in-memory 執行器。
-- `vibe new <definition>/<version>/<feature>` 產生最少嘅 `_definition.md`、`_version.md`、`providers/main.md` 同一個 public hello world feature，唔會覆蓋現有檔案。
+- `vibe`（冇參數、喺 terminal）進入互動模式（`vibe>`）：第一次用會問 LLM provider、base URL、model 同用戶自己嘅 API key（輸入時遮住，唔會顯示），寫入 project `.env`（確保喺 `.gitignore`，同決定 57、2A.8.3 一致）；之後用自然語言描述要做嘅 API，CLI 用設定好嘅 LLM 產生 feature source，`_definition.md`、`_version.md`、`providers/main.md` 用固定範本；寫入之前列出檔案同要用戶確認，唔會覆蓋現有檔案。非 terminal（例如 CI）執行 `vibe` 只顯示 help。
 - `vibe serve --memory` 嘅預設 slug `dev`（tenant `devtenant`）喺 development `--memory` 一律可用，就算 slug 檔有其他 slug，slug 檔改咗唔使重啟就生效；production 同非 `--memory` 不變。
 - README 快速開始（決定 82）：
 

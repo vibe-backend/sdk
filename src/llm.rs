@@ -729,7 +729,7 @@ pub fn check_release_endpoint(config: &LlmConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn default_base_url(provider: &str) -> &'static str {
+pub fn default_base_url(provider: &str) -> &'static str {
     match provider {
         ANTHROPIC => "https://api.anthropic.com",
         GEMINI => "https://generativelanguage.googleapis.com/v1beta",

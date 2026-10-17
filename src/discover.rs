@@ -123,7 +123,24 @@ fn classify(root: &Path, path: &Path) -> Result<SourceFile, Diag> {
     let parts: Vec<&str> = rel.split('/').collect();
     let text = fs::read_to_string(path)
         .map_err(|err| Diag::error(&rel, format!("cannot read source: {err}")))?;
-    let classified = match parts.as_slice() {
+    let classified = classify_parts(&rel, &parts)?;
+    Ok(SourceFile {
+        rel,
+        abs: path.to_path_buf(),
+        kind: classified.kind,
+        scope: classified.scope,
+        id: classified.id,
+        text,
+        schema: None,
+    })
+}
+
+pub(crate) fn check_source_path(rel: &str) -> Result<(), Diag> {
+    classify_parts(rel, &rel.split('/').collect::<Vec<_>>()).map(|_| ())
+}
+
+fn classify_parts(rel: &str, parts: &[&str]) -> Result<Classified, Diag> {
+    let classified = match parts {
         ["providers", file] => simple_file(KindHint::NoneScope, file, "providers")?,
         ["pipelines", file] => simple_file(KindHint::PipelineWrap, file, "pipelines")?,
         ["migrations", provider, file] => classify_migration(provider, file)?,
@@ -136,20 +153,12 @@ fn classify(root: &Path, path: &Path) -> Result<SourceFile, Diag> {
         }
         _ => {
             return Err(Diag::error(
-                &rel,
+                rel,
                 "path does not match providers, pipelines, migrations, models, or api/{definition}/{version}/{feature}",
             ));
         }
     };
-    Ok(SourceFile {
-        rel,
-        abs: path.to_path_buf(),
-        kind: classified.kind,
-        scope: classified.scope,
-        id: classified.id,
-        text,
-        schema: None,
-    })
+    Ok(classified)
 }
 
 struct Classified {

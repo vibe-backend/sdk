@@ -1591,9 +1591,8 @@ fn normalize_feature(
         diags.push(Diag::error(
             &source.rel,
             format!(
-                "missing api/{def_id}.md; expected minimal content:\n{}\nCreate sources with `vibe new {}`",
-                crate::scaffold::definition_content(definition),
-                source.id
+                "missing api/{def_id}.md; expected minimal content:\n{}\nRun `vibe` (interactive) in the project directory to create them",
+                crate::scaffold::definition_content(definition)
             ),
         ));
     }
@@ -1601,9 +1600,8 @@ fn normalize_feature(
         diags.push(Diag::error(
             &source.rel,
             format!(
-                "missing api/{ver_id}.md; expected minimal content:\n{}\nCreate sources with `vibe new {}`",
-                crate::scaffold::version_content(definition, version),
-                source.id
+                "missing api/{ver_id}.md; expected minimal content:\n{}\nRun `vibe` (interactive) in the project directory to create them",
+                crate::scaffold::version_content(definition, version)
             ),
         ));
     }
