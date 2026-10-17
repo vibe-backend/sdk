@@ -776,6 +776,8 @@ jobs:
 - 所有指令嘅 `--project` 預設係目前目錄（cwd）；只有 project 唔喺 cwd 先要寫（決定 81）。
 - 冇 `vibe approve`（決定 77）；舊 workflow 用到會報「指令已移除」並提示用 `vibe build`。
 - 同現有 CLI（`4239c95`）嘅對照：`vibe compile`、`vibe validate`、`vibe manifest` 保留做低階指令，`vibe build` 係佢哋嘅組合；`vibe compile --check` 只喺本地／CI 驗證 build 結果同決定 114 policy，唔同 commit 咗嘅 lock 比較（決定 117）；`vibe validate --deploy` 唔再檢查確認同 lock 簽名（決定 77、79）；`vibe serve --memory` 保留，改用 2C.4 嘅 in-memory 執行器。
+- `vibe new <definition>/<version>/<feature>` 產生最少嘅 `_definition.md`、`_version.md`、`providers/main.md` 同一個 public hello world feature，唔會覆蓋現有檔案。
+- `vibe serve --memory` 喺 development 冇設定任何 slug 時用預設 slug `dev`（tenant `devtenant`），slug 檔改咗唔使重啟就生效；production 同非 `--memory` 不變。
 - README 快速開始（決定 82）：
 
   ```bash

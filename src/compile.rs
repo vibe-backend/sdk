@@ -1505,10 +1505,24 @@ fn normalize_feature(
     let def = docs.get(&def_id);
     let ver = docs.get(&ver_id);
     if def.is_none() {
-        diags.push(Diag::error(&source.rel, format!("missing {def_id}")));
+        diags.push(Diag::error(
+            &source.rel,
+            format!(
+                "missing api/{def_id}.md; expected minimal content:\n{}\nCreate sources with `vibe new {}`",
+                crate::scaffold::definition_content(definition),
+                source.id
+            ),
+        ));
     }
     if ver.is_none() {
-        diags.push(Diag::error(&source.rel, format!("missing {ver_id}")));
+        diags.push(Diag::error(
+            &source.rel,
+            format!(
+                "missing api/{ver_id}.md; expected minimal content:\n{}\nCreate sources with `vibe new {}`",
+                crate::scaffold::version_content(definition, version),
+                source.id
+            ),
+        ));
     }
     if !diags.is_empty() {
         return Err(diags);

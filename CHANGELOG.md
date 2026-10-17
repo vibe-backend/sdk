@@ -5,6 +5,10 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Hello world scaffold:** `vibe new <definition>/<version>/<feature>` creates minimal explicit sources without overwriting existing files.
+- **Missing API sources:** Compile errors show the missing `_definition.md` / `_version.md` path, minimal content, and a `vibe new` hint.
+- **Memory development slugs:** `serve --memory` in development defaults to slug `dev` (tenant `devtenant`) when none are configured and reloads changed slug files without restart. Other serving modes are unchanged.
+
 - **API expressions:** Support JSON string/number literals, reserved true/false/null words and quoted object keys (no arrays). API `respond value` evaluates expressions; empty or `transform.out` evaluates Transform out, with failures returning 500 INTERNAL without fallback. Missing or `(none)` Transform defaults to in = {} and out = result, including `- in: (none)` / `- out: (none)`. Validation and manifest building reject statically failing expressions and empty Transform bullets.
 
 - **Refresh rotation upgrade:** Run `vibe migrate` before `vibe serve` after upgrading. Reservation columns are added per tenant by migration. A request presenting a token while an earlier request for it is in progress returns a retryable 503 `TX_CONFLICT` without clearing cookies; after it completes, a presentation within the 10-second grace window follows the grace rule, and later presentations are treated as reuse and revoke the family; database/pool timeouts return 504 `TX_TIMEOUT`. Reservations without a committed child are cleared, leaving the presented token current and allowing a retry.
