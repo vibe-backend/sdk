@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
-[ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo '::error::usage: check-tag-version.sh <tag> [Cargo.toml]' >&2; exit 1; }
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+ echo '::error::usage: check-tag-version.sh <tag> [Cargo.toml]' >&2
+ exit 1
+fi
 tag=${1#v}
 manifest=${2:-Cargo.toml}
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import tomllib' 2>/dev/null; then

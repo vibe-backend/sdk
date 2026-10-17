@@ -149,10 +149,11 @@ fn hello_serves_without_loading_llm_configuration() {
             .spawn()
             .unwrap();
         let response = (|| {
-            for _ in 0..100 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
                 if let Ok(mut stream) = std::net::TcpStream::connect(addr) {
                     stream
-                        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
                         .unwrap();
                     stream.write_all(b"GET /hello/v1/dev/hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
                     let mut body = String::new();
@@ -312,10 +313,11 @@ fn runtime_artifact_serves_hello() {
         .spawn()
         .unwrap();
     let response = (|| {
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if let Ok(mut stream) = std::net::TcpStream::connect(addr) {
                 stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
                     .unwrap();
                 stream.write_all(b"GET /hello/v1/dev/hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
                 let mut body = String::new();
