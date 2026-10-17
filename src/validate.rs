@@ -1128,7 +1128,15 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
     if let Some(steps) = find_section(&doc.sections, "Steps") {
         for block in &steps.blocks {
             let op = block_val(block, "op");
-            if !matches!(op.as_str(), "method" | "validate" | "transform" | "respond") {
+            if op == "transform" {
+                report.push(
+                    Diag::error(file, "api step op `transform` was removed; delete this step and put the request/response mapping in `## Transform` (`- in: <expr>` / `- out: <expr>`)")
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                );
+                continue;
+            }
+            if !matches!(op.as_str(), "method" | "validate" | "respond") {
                 report.push(
                     Diag::error(file, format!("api step op {op} is not allowed"))
                         .at_step(&block.heading)
@@ -1900,7 +1908,6 @@ pub(crate) fn api_step_problems(block: &crate::lock::Block, op: &str) -> Vec<Str
         "method" => &["target", "args", "out"],
         "validate" => &["when", "fail"],
         "respond" => &["value", "status"],
-        "transform" => &[],
         _ => return Vec::new(),
     };
     let mut out = Vec::new();
@@ -2256,6 +2263,25 @@ mod tests {
             let mut report = Report::new();
             check_feature(&d, "hello", &mut report);
             assert!(!report.errors().any(|e| e.message.contains("transform")));
+        }
+    }
+
+    #[test]
+    fn removed_api_transform_step_has_one_actionable_error() {
+        for keys in ["", "- in: req.body\n- out: input\n- target: bad@v1\n"] {
+            let doc = parsed_doc(
+                Kind::Api,
+                Some(Scope::Feature),
+                "hello/v1/get",
+                &format!("## Route\n- method: GET\n- path: /hello/v1/get\n## Request\n(none)\n## Response\n(none)\n## Steps\n### s1\n- op: transform\n{keys}"),
+            );
+            let mut report = Report::new();
+            check_feature(&doc, "hello.lock.md", &mut report);
+            let errors: Vec<_> = report.errors().collect();
+            assert_eq!(errors.len(), 1, "{report}");
+            assert_eq!(errors[0].section, "Steps");
+            assert_eq!(errors[0].step, "s1");
+            assert_eq!(errors[0].message, "api step op `transform` was removed; delete this step and put the request/response mapping in `## Transform` (`- in: <expr>` / `- out: <expr>`)");
         }
     }
 

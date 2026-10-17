@@ -370,6 +370,20 @@ async fn compile_auth_feature(
     std::path::PathBuf,
     Result<vibe::compile::CompileOutput, vibe::diag::Report>,
 ) {
+    compile_auth_feature_output(auth, prose, emitted_auth, inherited_auth, true, None).await
+}
+
+async fn compile_auth_feature_output(
+    auth: &str,
+    prose: &str,
+    emitted_auth: &str,
+    inherited_auth: bool,
+    public: bool,
+    output: Option<&str>,
+) -> (
+    std::path::PathBuf,
+    Result<vibe::compile::CompileOutput, vibe::diag::Report>,
+) {
     let root = std::env::temp_dir().join(format!("vibe-auth-removal-{}", uuid::Uuid::new_v4()));
     for dir in ["providers", "api/catalog/v1/greet"] {
         fs::create_dir_all(root.join(dir)).unwrap();
@@ -396,7 +410,7 @@ async fn compile_auth_feature(
     .unwrap();
     fs::write(
         root.join("api/catalog/v1/greet/greet.md"),
-        format!("---\npublic: true\nwrites: false\nauth: {auth}\n---\n# greet\n{prose}\n"),
+        format!("---\npublic: {public}\nwrites: false\nauth: {auth}\n---\n# greet\n{prose}\n"),
     )
     .unwrap();
     let body = format!(
@@ -426,13 +440,14 @@ async fn compile_auth_feature(
 (none)
 "
     );
+    let body = output.unwrap_or(&body);
     let adapter = FakeAdapter {
         responder: |request: &LlmRequest| {
             if request.system == vibe::compile::TRANSLATE_PROMPT {
                 // Translation cannot provide support or override the original prose.
                 Ok("A greeting route.".into())
             } else {
-                Ok(body.clone())
+                Ok(body.to_string())
             }
         },
     };
@@ -582,5 +597,50 @@ async fn auth_double_negations_still_warn_and_retain_the_requirement() {
         assert!(text.contains("mode: jwt"), "{text}");
         assert!(!text.contains("### -auth"), "{text}");
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn optional_api_parts_normalize_deterministically() {
+    for slug in [true, false] {
+        let path = if slug {
+            "/catalog/v1/{slug}/greet"
+        } else {
+            "/catalog/v1/greet"
+        };
+        let mut locks = Vec::new();
+        for (limits, rows) in [
+            ("- provider: main", "| query.message | string | - | no |\n| path.slug | string | | yes |"),
+            ("- body: 64kb\n- timeout: 3s\n- provider: main", "| path.slug | uuid | min: 1 | no |\n| query.message | string | - | no |\n| path.slug | string | - | no |"),
+        ] {
+            let body = format!(
+                "## Route\n- method: GET\n- path: {path}\n## Access\n- public: {slug}\n- public-writes: false\n{tenant}## Pipelines\n(none)\n## Limits\n{limits}\n## Request\n| field | type | rules | required |\n| --- | --- | --- | --- |\n{rows}\n## Response\n- status: 200\n## Steps\n### s1 respond\n- op: respond\n- value: {{message: \"hello\"}}\n- source-lines: 7\n## Errors\n(none)\n",
+                tenant = if slug { "- tenant: path.slug\n" } else { "" },
+            );
+            let (root, result) = compile_auth_feature_output(
+                if slug { "none" } else { "jwt" }, "A greeting route.", "(none)", true, slug, Some(&body),
+            ).await;
+            result.unwrap_or_else(|err| panic!("{err}"));
+            let bytes = fs::read(root.join("api/catalog/v1/greet/greet.lock.md")).unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            if slug {
+                assert!(text.contains("| path.slug | string | - | yes |"));
+            }
+            let doc = parse_lock(text).unwrap();
+            let limits = vibe::lock::find_section(&doc.sections, "Limits").unwrap();
+            assert_eq!(
+                limits.bullets.iter().map(|b| (b.key.as_str(), b.value.as_str())).collect::<Vec<_>>(),
+                vec![("provider", "main"), ("timeout", "10s"), ("body", "1MB")],
+            );
+            let table = vibe::lock::find_section(&doc.sections, "Request").unwrap().table.as_ref().unwrap();
+            let mut expected = vec![vec!["query.message", "string", "", "no"]];
+            if slug {
+                expected.insert(0, vec!["path.slug", "string", "", "yes"]);
+            }
+            assert_eq!(table.rows, expected);
+            locks.push(bytes);
+            fs::remove_dir_all(root).unwrap();
+        }
+        assert_eq!(locks[0], locks[1]);
     }
 }

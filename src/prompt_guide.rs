@@ -59,7 +59,7 @@ API FEATURE KEYS:
 - ## Request table header exactly `| field | type | rules | required |`; field is path.x, query.x, body.x or header.x; required yes|no.
 - ## Response: status.
 - ## Transform: optional in ({ k: req.body.x }) and out (expression).
-- ## Steps ops: method (target, args, out), validate (when, fail), respond (value, status), transform.
+- ## Steps ops: method (target, args, out), validate (when, fail), respond (value, status). There is no transform step; request/response mapping goes in ## Transform.
 - ## Errors table header exactly `| status | code | from |`.
 ";
 

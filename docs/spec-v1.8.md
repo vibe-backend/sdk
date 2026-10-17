@@ -388,7 +388,7 @@ project/
 | `## Request` | 欄位宣告；未宣告嘅欄位一律拒絕，回 422 |
 | `## Response` | 狀態碼同 schema |
 | `## Transform` | 可省略（等同 `(none)`）；request → method input、method output → response 嘅映射；處理唔同 api version 嘅差異 |
-| `## Steps` | 有序步驟；api 層只准 `method`、`validate`、`transform`、`respond` 四種 op，**唔准 `query` 或者 `call`** |
+| `## Steps` | 有序步驟；api 層只准 `method`、`validate`、`respond` 三種 op，**唔准 `query` 或者 `call`** |
 | `## Errors` | 業務錯誤碼對應狀態碼 |
 
 ### 2.3a 跨來源請求 CORS（決定 103，已確認（產品經理 2026-10-14），issue #84）
@@ -506,6 +506,11 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 
 ### 2A.2 通用 section 規則
 
+產品經理決定（2026-10-17）：自然語言 api feature 嘅以下 optional 部分由 code 用固定決定性規則正規化，永遠唔由 model 揀；忽略 model 喺呢啲部分嘅輸出，確保同一 source 編譯出 byte-identical lock。結構化 source 保留現有行為。
+
+- `## Limits` 一律丟棄 model 原有內容，固定依次寫三個 bullet：`provider` 用 source frontmatter 指定值，否則用 `_definition` 嘅 `## Providers default`，再否則 `main`；`timeout` 同 `body` 依次用 `_version` 嘅 `## Defaults`、`_definition` 嘅 `## Defaults`，再否則分別用 `10s` 同 `1MB`。
+- 正規化後嘅 Route path 有 `{slug}` segment，就先移除 Request 所有 model 寫嘅 `path.slug` row，再喺第一個 data row 加且只加 `| path.slug | string | - | yes |`；其他 row 保留次序。Request 係 `(none)` 或冇 table 時，建立 header `| field | type | rules | required |` 嘅 table。Route 冇 `{slug}` segment 就移除所有 `path.slug` row；移除後冇 row 就寫 `(none)`。
+
 - section 用 `##` 標題，名稱同次序按 kind 固定（見 2A.3）；唔准有額外 section，缺 section 用 `(none)` 表示；api feature 可以省略 `## Transform`，等同 `(none)`，compile 會喺 lock 嘅固定位置補返。
 - 每個 step 用 `### s{n} {op}` 做標題，下面用 `- key: value` 列點，key 次序固定：`op`、（op 專用參數）、`out`、`source-lines`。
 - 變數參照一律用 `input.x`、`ctx.x`、`req.x`、或者之前 step 嘅 `out` 名；唔准參照未定義變數。Transform `in` 只可以用 `req`、`ctx`；step 同 Transform `out` 可以用 `input`、`req`、`ctx` 同之前 step 嘅 `out`；method 用 `input`、`ctx` 同之前 step 嘅 `out`。
@@ -534,9 +539,11 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 
 ### 2A.4 op 白名單
 
+產品經理決定（2026-10-17）：冇 key 嘅 `transform` step op 已移除；而家仲係 pre-1.0，唔設 deprecation period。validate 會拒絕佢，提示刪除呢個 step，改用 `## Transform`（`- in:`／`- out:`）寫 request／response 映射。
+
 | 層 | 准用 op |
 | --- | --- |
-| api feature | `method`、`validate`、`transform`、`respond` |
+| api feature | `method`、`validate`、`respond` |
 | method | `query`、`validate`、`call`、`method`、`respond`、`verify-password`、`hash-password`、`random-token`、`hash-token`、`sign-jwt`（`random-token` 同 `hash-token` 規則見決定 52，已確認；`sign-jwt` 只准喺 `## Signature` 標咗 `capabilities: [sign-token]` 嘅 method 入面用，唔靠 method 名推斷） |
 | pipeline | `verify-jwt`、`verify-api-key`、`rate-limit-check`、`audit`、`validate`、`inject-ctx`、`method`；平台內置 pipeline 專用：`refresh-rotate`、`refresh-revoke`（用戶自訂 pipeline 唔准用） |
 | migration | `ddl`、`backfill`、`verify`（只喺 migration lock，見 2B） |
@@ -2483,7 +2490,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 
 ### 10.4 api feature 內容（error）
 
-- `## Steps` 用咗 `method`、`validate`、`transform`、`respond` 以外嘅 op（包括 `query` 或者 `call`）。
+- `## Steps` 用咗 `method`、`validate`、`respond` 以外嘅 op（包括 `query` 或者 `call`）。
 - 缺少 `## Request` 或者 `## Response`；`## Transform` 參照未宣告嘅 request 欄位或者 method output 冇嘅欄位。
 - timeout 或者 limits 超過平台上限。
 - `## Errors` 嘅狀態碼同 RFC 語意唔一致。
@@ -3417,7 +3424,7 @@ source 用自然語言描述輸入、輸出、錯誤同做法。編譯成 lock �
 
 - model 係「係咩」：欄位、表、provider、CRUD 宣告。
 - method 係「點做」：一個 method 只做一件事，所有 query 同對外 call 都喺呢度。
-- api 係「對外」：路由、pipeline、Request、Response、Transform；Steps 只准 `method`、`validate`、`transform`、`respond`。
+- api 係「對外」：路由、pipeline、Request、Response、Transform；Steps 只准 `method`、`validate`、`respond`。
 - method 可以用 `method` op 呼叫其他 method 組合；部署時建立呼叫圖，有循環就報 error，深度上限 3 層（由 api 或者 pipeline 算起）。
 - 單一職責：每個 method 最多 1 個寫入 sql，而且最多只寫一張表；超出出 warning，建議拆開（決定 12）。
 
