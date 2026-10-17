@@ -132,3 +132,137 @@ async fn model_prompt_example_passes_the_validator() {
     .unwrap_or_else(|err| panic!("{err}"));
     assert!(!report.has_errors());
 }
+
+const API_GOOD: &str = "## Route\n- method: GET\n- path: /catalog/v1/hello\n## Access\n- public: false\n## Pipelines\n(none)\n## Limits\n- provider: main\n## Request\n(none)\n## Response\n- status: 200\n## Transform\n(none)\n## Steps\n### s1 respond\n- op: respond\n- value: { message: \"hello world\" }\n- source-lines: 3\n## Errors\n(none)\n";
+
+fn api_project() -> std::path::PathBuf {
+    let root = project();
+    fs::remove_dir_all(root.join("models")).unwrap();
+    fs::create_dir_all(root.join("api/catalog/v1/hello")).unwrap();
+    fs::write(
+        root.join("api/catalog/_definition.md"),
+        include_str!("fixtures/shop/api/catalog/_definition.md"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("api/catalog/v1/_version.md"),
+        include_str!("fixtures/shop/api/catalog/v1/_version.md"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("api/catalog/v1/hello/hello.md"),
+        "# hello\n\nReturn a hello world message.\n",
+    )
+    .unwrap();
+    root
+}
+
+fn invalid_api() -> String {
+    API_GOOD.replace("### s1 respond", "### s0 transform\n- op: transform\n- in: req.body\n- out: input\n- source-lines: 3\n### s1 respond")
+}
+
+#[tokio::test]
+async fn validate_feedback_repairs_api_steps() {
+    let root = api_project();
+    let calls = AtomicUsize::new(0);
+    let adapter = FakeAdapter {
+        responder: |request: &LlmRequest| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(invalid_api())
+            } else {
+                assert!(
+                    request.input.contains("unknown key `in`"),
+                    "{}",
+                    request.input
+                );
+                Ok(API_GOOD.into())
+            }
+        },
+    };
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&config()),
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn invalid_api_exhausts_shared_retry_budget_without_writes() {
+    let root = api_project();
+    let calls = AtomicUsize::new(0);
+    let adapter = FakeAdapter {
+        responder: |_: &LlmRequest| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(invalid_api())
+        },
+    };
+    let err = compile_project(&CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&config()),
+        check: false,
+    })
+    .await
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(err.contains("does not pass validate"), "{err}");
+    assert!(err.contains("unknown key `in`"), "{err}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1 + vibe::prompt_guide::format_retries().unwrap() as usize
+    );
+    assert!(!root.join("providers/main.lock.md").exists());
+    assert!(!root.join("api/catalog/v1/hello/hello.lock.md").exists());
+    assert!(!root.join(vibe::buildrecord::PATH).exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn api_system_prompt_explains_expression_scopes() {
+    let prompt =
+        vibe::compile::system_prompt(vibe::lock::Kind::Api, Some(vibe::lock::Scope::Feature));
+    assert!(prompt.contains("do not emit a transform step"));
+    assert!(prompt.contains("Transform in roots: req, ctx only"));
+}
+
+#[tokio::test]
+async fn cached_lock_failing_validate_is_recompiled() {
+    let root = api_project();
+    let calls = AtomicUsize::new(0);
+    let adapter = FakeAdapter {
+        responder: |_: &LlmRequest| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(API_GOOD.into())
+        },
+    };
+    let config = config();
+    let opts = CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&config),
+        check: false,
+    };
+    compile_project(&opts)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+    let cache: Vec<_> = fs::read_dir(root.join(".vibe/cache/llm"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(cache.len(), 1);
+    fs::write(&cache[0], invalid_api()).unwrap();
+    compile_project(&opts)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(!fs::read_to_string(&cache[0])
+        .unwrap()
+        .contains("op: transform"));
+    fs::remove_dir_all(root).unwrap();
+}

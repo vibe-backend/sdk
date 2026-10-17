@@ -508,7 +508,7 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 
 - section 用 `##` 標題，名稱同次序按 kind 固定（見 2A.3）；唔准有額外 section，缺 section 用 `(none)` 表示；api feature 可以省略 `## Transform`，等同 `(none)`，compile 會喺 lock 嘅固定位置補返。
 - 每個 step 用 `### s{n} {op}` 做標題，下面用 `- key: value` 列點，key 次序固定：`op`、（op 專用參數）、`out`、`source-lines`。
-- 變數參照一律用 `input.x`、`ctx.x`、`req.x`、或者之前 step 嘅 `out` 名；唔准參照未定義變數。
+- 變數參照一律用 `input.x`、`ctx.x`、`req.x`、或者之前 step 嘅 `out` 名；唔准參照未定義變數。Transform `in` 只可以用 `req`、`ctx`；step 同 Transform `out` 可以用 `input`、`req`、`ctx` 同之前 step 嘅 `out`；method 用 `input`、`ctx` 同之前 step 嘅 `out`。
 - sql 一律寫喺 inline code 入面，用 `$1`、`$2` 參數，`params` 列出對應來源；唔准字串拼接。
 - `source-lines` 指返 source `.md` 嘅行數，方便 review 對照。
 
@@ -777,7 +777,7 @@ jobs:
 - 冇 `vibe approve`（決定 77）；舊 workflow 用到會報「指令已移除」並提示用 `vibe build`。
 - 同現有 CLI（`4239c95`）嘅對照：`vibe compile`、`vibe validate`、`vibe manifest` 保留做低階指令，`vibe build` 係佢哋嘅組合；`vibe compile --check` 只喺本地／CI 驗證 build 結果同決定 114 policy，唔同 commit 咗嘅 lock 比較（決定 117）；`vibe validate --deploy` 唔再檢查確認同 lock 簽名（決定 77、79）；`vibe serve --memory` 保留，改用 2C.4 嘅 in-memory 執行器。
 - `vibe new <definition>/<version>/<feature>` 產生最少嘅 `_definition.md`、`_version.md`、`providers/main.md` 同一個 public hello world feature，唔會覆蓋現有檔案。
-- `vibe serve --memory` 喺 development 冇設定任何 slug 時用預設 slug `dev`（tenant `devtenant`），slug 檔改咗唔使重啟就生效；production 同非 `--memory` 不變。
+- `vibe serve --memory` 嘅預設 slug `dev`（tenant `devtenant`）喺 development `--memory` 一律可用，就算 slug 檔有其他 slug，slug 檔改咗唔使重啟就生效；production 同非 `--memory` 不變。
 - README 快速開始（決定 82）：
 
   ```bash

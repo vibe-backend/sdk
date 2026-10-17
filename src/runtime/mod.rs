@@ -15,8 +15,8 @@ mod sql;
 
 pub use challenge::{ChallengeContext, ChallengeError, ChallengeVerifier, TurnstileVerifier};
 pub use crud::{
-    check_expr, check_when, parse_ownership, run_method, when_problem, CallCtx, CallResult, Caller,
-    MethodFail, Ownership,
+    check_expr, check_when, expression_roots, parse_ownership, run_method, when_problem, CallCtx,
+    CallResult, Caller, MethodFail, Ownership,
 };
 pub use exec::{
     etag, role_allows, ExecError, MemoryExec, PgExec, PgOptions, PgSession, QueryExec,

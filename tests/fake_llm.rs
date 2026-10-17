@@ -204,6 +204,7 @@ const METHOD: &str = r#"## Signature
 ### s1
 
 - op: query
+- writes: true
 - sql: UPDATE products SET sku = 'x' WHERE id = $1
 - params: [input.id]
 - scope: pk
@@ -564,8 +565,13 @@ async fn auth_double_negations_still_warn_and_retain_the_requirement() {
         "not without auth",
         "not no auth",
     ] {
-        let (root, result) =
-            compile_auth_feature("jwt", phrase, "### auth\n- mode: jwt", true).await;
+        let (root, result) = compile_auth_feature(
+            "jwt",
+            phrase,
+            "### auth\n- mode: jwt\n- roles: [staff]",
+            true,
+        )
+        .await;
         let out = result.unwrap_or_else(|err| panic!("{phrase}: {err}"));
         assert!(
             out.report.to_string().contains("ambiguous negation"),

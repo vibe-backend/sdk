@@ -156,7 +156,12 @@ fn check_recompile(
     }
 }
 
-fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, report: &mut Report) {
+pub(crate) fn check_lock(
+    doc: &LockDoc,
+    source: &SourceFile,
+    opts: &ValidateOptions<'_>,
+    report: &mut Report,
+) {
     let file = lock_rel(&source.rel);
     if doc.meta.lock_version != LOCK_VERSION {
         report.push(Diag::error(&file, "unsupported lock-version"));
@@ -247,6 +252,7 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
         }
     }
     check_sections(doc, &file, report);
+    check_variable_roots(doc, &file, report);
     if !doc.meta.legacy_fields.is_empty() {
         let fields: Vec<String> = doc
             .meta
@@ -1754,6 +1760,138 @@ fn bad_number_rule(rules: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Check expression variable roots against the names available in each scope.
+fn check_variable_roots(doc: &LockDoc, file: &str, report: &mut Report) {
+    let api = doc.meta.kind == Kind::Api && doc.meta.scope == Some(Scope::Feature);
+    if !api && doc.meta.kind != Kind::Method {
+        return;
+    }
+    let mut allowed: std::collections::BTreeSet<String> = if api {
+        ["ctx", "req"].as_slice()
+    } else {
+        ["ctx", "input"].as_slice()
+    }
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let check = |expr: &str,
+                 when: bool,
+                 location: &str,
+                 allowed: &std::collections::BTreeSet<String>,
+                 report: &mut Report| {
+        if expr.trim().is_empty() || expr.trim() == "(none)" {
+            return;
+        }
+        if let Ok(roots) = crate::runtime::expression_roots(expr, when) {
+            for root in roots.difference(allowed) {
+                report.push(Diag::error(
+                    file,
+                    format!(
+                        "unknown variable `{root}` in {location}; defined here: {}",
+                        allowed.iter().cloned().collect::<Vec<_>>().join(", ")
+                    ),
+                ));
+            }
+        }
+    };
+    let transform = find_section(&doc.sections, "Transform");
+    if api {
+        if let Some(expr) = transform.and_then(|s| s.get("in")) {
+            check(expr, false, "Transform in", &allowed, report);
+        }
+        allowed.insert("input".into());
+    }
+    let mut response_allowed = allowed.clone();
+    if let Some(steps) = find_section(&doc.sections, "Steps") {
+        for block in &steps.blocks {
+            let op = block_val(block, "op");
+            let name = block
+                .heading
+                .split_whitespace()
+                .next()
+                .unwrap_or(&block.heading);
+            let keys: &[&str] = match op.as_str() {
+                "method" | "call" => &["args"],
+                "respond" => &["value"],
+                "validate" => &["when"],
+                "verify-password" => &["hash", "plain"],
+                "hash-password" => &["plain"],
+                "hash-token" => &["value"],
+                _ => &[],
+            };
+            for key in keys {
+                let expr = block_val(block, key);
+                if (*key == "args" && expr == "transform.in")
+                    || (api && *key == "value" && expr == "transform.out")
+                {
+                    continue;
+                }
+                check(
+                    &expr,
+                    *key == "when",
+                    &format!("step {name} {op} {key}"),
+                    &allowed,
+                    report,
+                );
+            }
+            if op == "query" {
+                if let Ok(items) = crate::lock::parse_string_list(&block_val(block, "params")) {
+                    for expr in items {
+                        check(
+                            &expr,
+                            false,
+                            &format!("step {name} query params"),
+                            &allowed,
+                            report,
+                        );
+                    }
+                }
+            }
+            if op == "sign-jwt" {
+                if let Ok(items) = crate::lock::parse_inline_map(&block_val(block, "claims")) {
+                    for (_, expr) in items {
+                        check(
+                            &expr,
+                            false,
+                            &format!("step {name} sign-jwt claims"),
+                            &allowed,
+                            report,
+                        );
+                    }
+                }
+            }
+            if op == "respond" {
+                response_allowed = allowed.clone();
+            }
+            if (!api
+                && matches!(
+                    op.as_str(),
+                    "method"
+                        | "query"
+                        | "verify-password"
+                        | "hash-password"
+                        | "random-token"
+                        | "hash-token"
+                        | "sign-jwt"
+                ))
+                || (api && op == "method")
+            {
+                let out = block_val(block, "out");
+                if !out.is_empty() && out != "(none)" {
+                    allowed.insert(out);
+                }
+            }
+        }
+    }
+    if api {
+        if let Some(expr) = transform.and_then(|s| s.get("out")) {
+            if expr.trim() != "result" {
+                check(expr, false, "Transform out", &response_allowed, report);
+            }
+        }
+    }
+}
+
 /// What the runtime would fail on for an API feature step: unknown keys
 /// (e.g. `method:` instead of `target:`), a missing target, expressions it
 /// cannot parse, a validate step without `when`/`fail`, a bad status.
@@ -2033,6 +2171,54 @@ mod tests {
                 none: false,
             }],
         }
+    }
+
+    #[test]
+    fn variable_roots_follow_runtime_scopes() {
+        let mut lock = doc(
+            Kind::Api,
+            Some(Scope::Feature),
+            "catalog/v1/hello",
+            "Steps",
+            vec![
+                block(
+                    "s1 method",
+                    &[
+                        ("op", "method"),
+                        ("args", "{ x: input.x, y: req.body, z: ctx.user.sub }"),
+                        ("out", "row"),
+                    ],
+                ),
+                block("s2 respond", &[("op", "respond"), ("value", "foo.bar")]),
+            ],
+        );
+        lock.sections.push(Section {
+            name: "Transform".into(),
+            bullets: vec![
+                Bullet {
+                    key: "in".into(),
+                    value: "input.query.message".into(),
+                },
+                Bullet {
+                    key: "out".into(),
+                    value: "row".into(),
+                },
+            ],
+            table: None,
+            blocks: vec![],
+            none: false,
+        });
+        let mut report = Report::new();
+        check_variable_roots(&lock, "hello.lock.md", &mut report);
+        let errors: Vec<_> = report.errors().map(|d| d.message.clone()).collect();
+        assert_eq!(errors, vec!["unknown variable `input` in Transform in; defined here: ctx, req", "unknown variable `foo` in step s2 respond value; defined here: ctx, input, req, row"]);
+        lock.sections[0].blocks[1].bullets[1].value =
+            "{ value: row, literal: \"foo.bar\", ok: true, count: 2, nothing: null }".into();
+        lock.sections[1].bullets[0].value =
+            "{ value: req.query.message, user: ctx.user.sub }".into();
+        let mut report = Report::new();
+        check_variable_roots(&lock, "hello.lock.md", &mut report);
+        assert!(!report.has_errors(), "{report}");
     }
 
     #[test]

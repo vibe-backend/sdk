@@ -42,7 +42,7 @@ vibe serve --memory
 curl http://127.0.0.1:8080/hello/v1/dev/hello
 ```
 
-`vibe new` never overwrites existing files. Natural-language sources need the LLM variables from `.env.example` for `vibe compile`. In development, `serve --memory` uses slug `dev` when no slugs are configured and picks up `vibe slug add` without restart (once a slug file exists, only its slugs are served). `vibe manifest --dev` runs the same deploy checks as `vibe validate --deploy --dev`.
+`vibe new` never overwrites existing files. Natural-language sources need the LLM variables from `.env.example` for `vibe compile`. In development, `serve --memory` always serves slug `dev`, even when other slugs are configured, and picks up `vibe slug add` without restart. `vibe manifest --dev` runs the same deploy checks as `vibe validate --deploy --dev`.
 
 ## Run a project
 
