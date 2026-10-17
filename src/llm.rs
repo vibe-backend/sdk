@@ -748,7 +748,7 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
     let mut text = text.to_string();
     let mut ranges = Vec::new();
     static KEYS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?i)(?:\b[a-z0-9_-]*(?:password|passwd|pwd|secret|token|api[ _-]?key|database_url|private_key|credentials?|passphrase|authorization|auth|set-cookie|cookie|session)[a-z0-9_-]*|密碼|密码|口令|憑證)[ 	"']*[:=][ 	]*|\bbearer[ 	]+"#).expect("redaction keys")
+        regex::Regex::new(r#"(?i)(?:\b(?:[a-z0-9]+[_-])*(?:password|passwd|pwd|secret|token|api[ _-]?key|database_url|private_key|credentials?|passphrase|authorization|auth|set-cookie|cookie|session)(?:[_-][a-z0-9]+)*\b|密碼|密码|口令|憑證)[ 	"']*[:=][ 	]*|\bbearer[ 	]+"#).expect("redaction keys")
     });
     static TOKENS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"[a-zA-Z][a-zA-Z0-9+.-]*://[^\r\n"'<>]*@[^\s"'<>]*|\b(?:sk-|xai-|github_pat_|gh[pousr]_)[A-Za-z0-9_-]+|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bxox[abprs]-[A-Za-z0-9-]+|\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"#).expect("redaction tokens")
@@ -783,7 +783,21 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
         while let Some(found) = KEYS.find_at(&readable, cursor) {
             let key = readable[found.start()..found.end()]
                 .trim_end_matches([' ', '\t', ':', '=', '\'', '"']);
-            if matches!(key, "PWD" | "OLDPWD") {
+            let value_text = readable[found.end()..].trim_start();
+            let auth_setting = key.eq_ignore_ascii_case("auth")
+                && [
+                    "required", "optional", "enabled", "disabled", "true", "false",
+                ]
+                .iter()
+                .any(|setting| {
+                    value_text.strip_prefix(setting).is_some_and(|rest| {
+                        rest.is_empty()
+                            || rest.starts_with(|c: char| {
+                                c.is_whitespace() || matches!(c, ';' | ',' | '}' | ']')
+                            })
+                    })
+                });
+            if matches!(key, "PWD" | "OLDPWD") || auth_setting {
                 cursor = found.end();
                 continue;
             }
@@ -849,8 +863,11 @@ fn redaction_end(text: &str, start: usize, value: usize, header: bool) -> usize 
     if header {
         return line_end;
     }
-    let first_line = text[value..line_end].trim();
-    if first_line.is_empty() || first_line.starts_with(['|', '>']) {
+    let first_line = text[value..line_end]
+        .split_once('#')
+        .map_or(&text[value..line_end], |(value, _)| value)
+        .trim();
+    {
         let line_start = text[..start].rfind('\n').map_or(0, |n| n + 1);
         let indent = text[line_start..]
             .chars()
@@ -868,14 +885,20 @@ fn redaction_end(text: &str, start: usize, value: usize, header: bool) -> usize 
             }
             end = next_end;
         }
-        return end;
+        if end > line_end || first_line.is_empty() || first_line.starts_with(['|', '>']) {
+            return end;
+        }
     }
     if tail.starts_with(['\\', '%', '&']) {
         return text.len();
     }
     let mut quote = None;
     let mut escaped = false;
+    let mut entity_end = 0;
     for (index, ch) in tail.char_indices() {
+        if index < entity_end {
+            continue;
+        }
         if escaped {
             escaped = false;
             continue;
@@ -892,11 +915,30 @@ fn redaction_end(text: &str, start: usize, value: usize, header: bool) -> usize 
             }
         } else if index == 0 && matches!(ch, '\'' | '"') {
             quote = Some(ch);
+        } else if ch == '&' && html_entity_len(&tail[index..]).is_some() {
+            entity_end = index + html_entity_len(&tail[index..]).expect("entity length");
         } else if ch == '\n' || matches!(ch, ';' | ',' | '}' | ']' | '&') {
             return value + index;
         }
     }
     text.len()
+}
+
+fn html_entity_len(text: &str) -> Option<usize> {
+    let end = text.find(';')?;
+    let entity = text.get(1..end)?;
+    let valid = if let Some(number) = entity
+        .strip_prefix("#x")
+        .or_else(|| entity.strip_prefix("#X"))
+    {
+        !number.is_empty() && number.bytes().all(|b| b.is_ascii_hexdigit())
+    } else if let Some(number) = entity.strip_prefix('#') {
+        !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+    } else {
+        entity.starts_with(|c: char| c.is_ascii_alphabetic())
+            && entity.bytes().all(|b| b.is_ascii_alphanumeric())
+    };
+    valid.then_some(end + 1)
 }
 
 fn readable_redaction_view(
@@ -1603,6 +1645,49 @@ pub fn runtime_llm_env_present() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_value_after_comment_only_line() {
+        for first in ["", "# comment", "first", "\"first\""] {
+            let input = format!("  password: {first}\n    second\n    third\n  message: retained");
+            assert_eq!(redact(&input, &[]), "  [redacted]\n  message: retained");
+        }
+    }
+
+    #[test]
+    fn html_entity_inside_value() {
+        for entity in ["&amp;", "&#61;", "&#x3d;", "&copy;", "&semi;"] {
+            let input = format!("password=abc{entity}def&message=retained");
+            assert_eq!(redact(&input, &[]), "[redacted]&message=retained");
+        }
+        assert_eq!(
+            redact("password=abc&message=retained", &[]),
+            "[redacted]&message=retained"
+        );
+    }
+
+    #[test]
+    fn key_word_boundaries() {
+        for input in [
+            "author: name",
+            "max_tokens: 100",
+            "auth: required",
+            "auth: optional",
+            "tokenizer: value",
+        ] {
+            assert_eq!(redact(input, &[]), input);
+        }
+        for key in [
+            "auth_token",
+            "x-auth",
+            "api_key",
+            "APP_DATABASE_URL",
+            "password",
+            "authorization",
+        ] {
+            assert_eq!(redact(&format!("{key}: value"), &[]), "[redacted]");
+        }
+    }
 
     #[test]
     fn redact_fullwidth_colon() {
