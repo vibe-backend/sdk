@@ -238,6 +238,108 @@ fn is_date_or_latest(rest: &str) -> bool {
     }
 }
 
+// Known diagnostic values. Display matching deliberately never uses Variant:
+// arbitrary variant suffixes can contain provider-controlled free text.
+fn known_model(provider: &str, model: &str) -> String {
+    const OTHER_MODELS: &[(&str, &str)] = &[
+        (OPENAI, "gpt-5"),
+        (OPENAI, "gpt-5-mini"),
+        (OPENAI, "gpt-5-nano"),
+        (OPENAI, "gpt-4.1-mini"),
+        (OPENAI, "gpt-4.1-nano"),
+        (OPENAI, "gpt-4o-mini"),
+        (OPENAI, "o3"),
+        (OPENAI, "o3-mini"),
+        (OPENAI, "o4-mini"),
+        (GEMINI, "gemini-2.5-pro"),
+        (GEMINI, "gemini-2.5-flash"),
+        (GEMINI, "gemini-2.5-flash-lite"),
+        (GEMINI, "gemini-2.0-flash"),
+        (GEMINI, "gemini-3-pro-preview"),
+        (ANTHROPIC, "claude-opus-4-7"),
+    ];
+    let model = model.to_ascii_lowercase();
+    if model.len() <= 64
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+        && (SAMPLING_REGISTRY.iter().any(|(p, id, _, _, _)| {
+            *p == provider
+                && model
+                    .strip_prefix(id)
+                    .is_some_and(|rest| rest.is_empty() || is_date_or_latest(rest))
+        }) || OTHER_MODELS
+            .iter()
+            .any(|(p, id)| *p == provider && *id == model))
+    {
+        model
+    } else {
+        "unknown".into()
+    }
+}
+
+// Documented OpenAI codes/types, Anthropic types and Gemini statuses only.
+fn known_error_code(value: &Value) -> &'static str {
+    const CODES: &[&str] = &[
+        "invalid_api_key",
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "insufficient_quota",
+        "rate_limit_exceeded",
+        "model_not_found",
+        "context_length_exceeded",
+        "server_error",
+        "unsupported_parameter",
+        "unsupported_value",
+        "invalid_value",
+        "billing_hard_limit_reached",
+        "tokens",
+        "requests",
+        "not_found_error",
+        "api_error",
+        "overloaded_error",
+        "request_too_large",
+        "rate_limit_error",
+        "billing_error",
+        "timeout_error",
+        "INVALID_ARGUMENT",
+        "FAILED_PRECONDITION",
+        "PERMISSION_DENIED",
+        "NOT_FOUND",
+        "RESOURCE_EXHAUSTED",
+        "INTERNAL",
+        "UNAVAILABLE",
+        "DEADLINE_EXCEEDED",
+        "UNAUTHENTICATED",
+        "CANCELLED",
+    ];
+    CODES
+        .iter()
+        .copied()
+        .find(|code| Some(*code) == value.as_str())
+        .unwrap_or("unknown")
+}
+
+fn error_code(value: &Value) -> Option<&Value> {
+    let error = value.get("error")?;
+    let fields = ["code", "type", "status"].map(|field| error.get(field));
+    fields
+        .iter()
+        .flatten()
+        .copied()
+        .find(|value| value.is_string())
+        .or_else(|| fields.into_iter().flatten().find(|value| !value.is_null()))
+}
+
+fn known_incomplete_reason(value: &Value) -> &'static str {
+    match value.as_str() {
+        Some("max_output_tokens") => "max_output_tokens",
+        Some("content_filter") => "content_filter",
+        _ => "unknown",
+    }
+}
+
 fn id_matches(model: &str, id: &str, suffix: Suffix) -> bool {
     let Some(rest) = model.strip_prefix(id) else {
         return false;
@@ -1131,7 +1233,7 @@ fn error_chain(error: &(dyn std::error::Error + 'static), api_key: &str) -> Stri
 
 /// Explains a failed or non-JSON LLM response. JSON or empty 401/403 responses blame the key;
 /// HTML (or a 404) hints at the base URL. Only the masked URL and response
-/// classification are included; response body text is never included.
+/// classification and allowlisted error codes are included; response body text is never included.
 pub fn describe_failure(
     url: &str,
     status: u16,
@@ -1164,7 +1266,12 @@ pub fn describe_failure(
     } else {
         ""
     };
-    mask_secrets(&format!("{lead}{hint}. URL: {shown_url}"), api_key)
+    let code = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| error_code(&value).map(known_error_code))
+        .map(|code| format!("; provider error code: {code}"))
+        .unwrap_or_default();
+    mask_secrets(&format!("{lead}{hint}. URL: {shown_url}{code}"), api_key)
 }
 
 impl HttpAdapter {
@@ -1401,7 +1508,14 @@ impl HttpAdapter {
         if let Some(reported) = &parsed.model_reported {
             if reported != &request.model && !reported.is_empty() {
                 return Err(CallError {
-                    message: "provider reported an unexpected model".into(),
+                    message: mask_secrets(
+                        &format!(
+                            "provider reported an unexpected model (expected {}, got {})",
+                            known_model(&self.config.provider, &request.model),
+                            known_model(&self.config.provider, reported),
+                        ),
+                        &self.config.api_key,
+                    ),
                     retryable: false,
                     retry_after: None,
                 });
@@ -1587,13 +1701,25 @@ pub fn parse_openai_responses(value: &Value) -> Result<LlmResponse, String> {
 }
 
 /// Like [`parse_openai_responses`]; diagnostics never include provider body text.
-pub fn parse_openai_responses_masked(value: &Value, _api_key: &str) -> Result<LlmResponse, String> {
+pub fn parse_openai_responses_masked(value: &Value, api_key: &str) -> Result<LlmResponse, String> {
     let status = value["status"].as_str().unwrap_or("");
     if status == "incomplete" {
-        return Err("openai responses output is incomplete".into());
+        return Err(mask_secrets(
+            &format!(
+                "openai responses output is incomplete (reason: {})",
+                known_incomplete_reason(&value["incomplete_details"]["reason"])
+            ),
+            api_key,
+        ));
     }
     if matches!(status, "failed" | "error") || !value["error"].is_null() {
-        return Err("openai responses returned an error".into());
+        let code = error_code(value)
+            .map(|code| format!(" (code: {})", known_error_code(code)))
+            .unwrap_or_default();
+        return Err(mask_secrets(
+            &format!("openai responses returned an error{code}"),
+            api_key,
+        ));
     }
     let text = if let Some(text) = value["output_text"].as_str() {
         text.to_string()
@@ -2559,8 +2685,19 @@ mod responses_tests {
         use axum::{http::StatusCode, routing::post, Router};
         let key = "sk-private-test-key";
         let marker = "BODY-MARKER-7f3a";
-        for provider in [OPENAI, ANTHROPIC, GEMINI] {
+        for (provider, style, code_field) in [
+            (OPENAI, "chat", "code"),
+            (OPENAI, "responses", "code"),
+            (ANTHROPIC, "chat", "type"),
+            (GEMINI, "chat", "status"),
+        ] {
+            let structured = json!({"type": "error", "error": {
+                code_field: marker,
+                "message": format!("{marker} Authorization: Bearer {key} x-api-key: {key} x-goog-api-key: {key}")
+            }}).to_string();
             for (status, body) in [
+                (400, structured.clone()),
+                (200, structured),
                 (401, format!(r#"{{"error":"{marker} Bearer {key}"}}"#)),
                 (403, format!("<html>{marker} Bearer {key}</html>")),
                 (500, format!("{marker} Bearer {key}")),
@@ -2579,6 +2716,7 @@ mod responses_tests {
                 let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
                 let mut config = responses_config("test-model");
                 config.provider = provider.into();
+                config.api_style = style.into();
                 config.api_key = key.into();
                 config.base_url = format!("http://{addr}/v1");
                 config.endpoint_private = true;
@@ -2592,11 +2730,54 @@ mod responses_tests {
                     budget: None,
                 };
                 let err = adapter.compile(&request).await.unwrap_err();
-                for secret in [key, &format!("Bearer {key}"), marker] {
+                for secret in [
+                    key,
+                    "Bearer",
+                    "Authorization",
+                    "x-api-key",
+                    "x-goog-api-key",
+                    marker,
+                ] {
                     assert!(!err.contains(secret), "{err}");
                 }
                 server.abort();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn model_mismatch_displays_only_known_models() {
+        use axum::{routing::post, Router};
+        for (reported, expected) in [
+            ("gpt-4o", "expected gpt-4.1, got gpt-4o"),
+            ("gpt-4o-SECRETMARKER", "expected gpt-4.1, got unknown"),
+        ] {
+            let body = json!({"status": "completed", "model": reported, "output_text": "ok"});
+            let app = Router::new().route(
+                "/v1/responses",
+                post(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut config = responses_config("gpt-4.1");
+            config.base_url = format!("http://{addr}/v1");
+            let adapter = HttpAdapter::new(config).unwrap();
+            let request = LlmRequest {
+                system: "s".into(),
+                input: "i".into(),
+                model: "gpt-4.1".into(),
+                seed: 7,
+                timeout: Duration::from_secs(5),
+                budget: None,
+            };
+            let message = adapter.compile(&request).await.unwrap_err();
+            server.abort();
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("SECRETMARKER"), "{message}");
         }
     }
 
@@ -2677,7 +2858,7 @@ mod responses_tests {
         }))
         .unwrap_err();
         assert!(
-            err.contains("incomplete") && !err.contains("max_output_tokens"),
+            err.contains("incomplete") && err.contains("max_output_tokens"),
             "{err}"
         );
         for value in [
@@ -2919,5 +3100,148 @@ mod transport_policy_tests {
         assert!(!message.contains("test-key"));
         assert!(!message.contains("Bearer test-key"));
         assert!(!message.contains("BODY-MARKER-7f3a"));
+    }
+}
+
+#[cfg(test)]
+mod known_value_tests {
+    use super::*;
+
+    #[test]
+    fn models_use_strict_display_allowlist() {
+        for (provider, model) in [
+            (OPENAI, "GPT-4.1"),
+            (OPENAI, "gpt-4.1-2026-01-01"),
+            (ANTHROPIC, "claude-sonnet-4-6-latest"),
+            (GEMINI, "gemini-2.5-pro"),
+        ] {
+            assert_eq!(known_model(provider, model), model.to_ascii_lowercase());
+        }
+        for model in [
+            "gpt-4.1-SECRETMARKER",
+            "gpt-4.1-hello world",
+            "gpt-4.1-ä",
+            &"a".repeat(65),
+        ] {
+            assert_eq!(known_model(OPENAI, model), "unknown");
+        }
+        assert_eq!(known_model(GEMINI, "gpt-4.1"), "unknown");
+    }
+
+    #[test]
+    fn provider_codes_are_known_or_unknown_without_body_text() {
+        let key = "sk-private-test-key";
+        let marker = "BODY-SECRETMARKER";
+        // OpenAI chat and Responses, Anthropic and Gemini error envelopes.
+        for (field, code) in [
+            ("code", "invalid_api_key"),
+            ("code", "server_error"),
+            ("type", "authentication_error"),
+            ("status", "PERMISSION_DENIED"),
+        ] {
+            for value in [
+                json!(code),
+                json!(marker),
+                json!("custom_code_xyz"),
+                json!(42),
+                Value::Null,
+            ] {
+                let body = json!({"type": "error", "error": {field: value,
+                    "message": format!("{marker} Authorization: Bearer {key} x-api-key: private-header x-goog-api-key: private-google")}});
+                let expected = if value == json!(code) {
+                    code
+                } else {
+                    "unknown"
+                };
+                let message = describe_failure(
+                    "https://example.com/v1",
+                    400,
+                    "application/json",
+                    &serde_json::to_vec(&body).unwrap(),
+                    key,
+                );
+                let response_message = parse_openai_responses_masked(&body, key).unwrap_err();
+                if value.is_null() {
+                    assert!(!message.contains("provider error code"), "{message}");
+                    assert!(!response_message.contains("code:"), "{response_message}");
+                } else {
+                    assert!(
+                        message.contains(&format!("provider error code: {expected}")),
+                        "{message}"
+                    );
+                    assert!(response_message.contains(&format!("code: {expected}")));
+                }
+                for message in [message, response_message] {
+                    for forbidden in [
+                        marker,
+                        key,
+                        "Bearer",
+                        "Authorization",
+                        "x-api-key",
+                        "x-goog-api-key",
+                        "private-header",
+                        "private-google",
+                        "custom_code_xyz",
+                    ] {
+                        assert!(!message.contains(forbidden), "{message}");
+                    }
+                }
+            }
+        }
+        for (body, expected) in [
+            (
+                json!({"error": {"code": 429, "message": "quota exceeded", "status": "RESOURCE_EXHAUSTED"}}),
+                "RESOURCE_EXHAUSTED",
+            ),
+            (
+                json!({"error": {"code": null, "type": "insufficient_quota", "message": "quota exceeded"}}),
+                "insufficient_quota",
+            ),
+        ] {
+            assert_eq!(error_code(&body).map(known_error_code), Some(expected));
+            let message = describe_failure(
+                "https://example.com",
+                429,
+                "application/json",
+                &serde_json::to_vec(&body).unwrap(),
+                key,
+            );
+            assert!(
+                message.contains(&format!("provider error code: {expected}")),
+                "{message}"
+            );
+            let message = parse_openai_responses_masked(&body, key).unwrap_err();
+            assert!(message.contains(&format!("code: {expected}")), "{message}");
+        }
+        let fallback = json!({"error": {"type": "rate_limit_error"}});
+        assert_eq!(
+            error_code(&fallback).map(known_error_code),
+            Some("rate_limit_error")
+        );
+        assert!(
+            !describe_failure("https://example.com", 400, "", b"{}", key)
+                .contains("provider error code")
+        );
+        assert_eq!(known_error_code(&json!("Server_Error")), "unknown");
+    }
+
+    #[test]
+    fn incomplete_reasons_and_final_masking() {
+        for (reason, expected) in [
+            ("max_output_tokens", "max_output_tokens"),
+            ("content_filter", "content_filter"),
+            ("SECRETMARKER", "unknown"),
+        ] {
+            let body = json!({"status": "incomplete", "incomplete_details": {"reason": reason}});
+            let message = parse_openai_responses_masked(&body, "test-key").unwrap_err();
+            assert_eq!(
+                message,
+                format!("openai responses output is incomplete (reason: {expected})")
+            );
+        }
+        let body = json!({"status": "failed", "error": {"code": "server_error"}});
+        assert!(!parse_openai_responses_masked(&body, "server_error")
+            .unwrap_err()
+            .contains("server_error"));
     }
 }
