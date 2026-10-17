@@ -45,6 +45,7 @@ pub fn setup_with_resolver(
     env: HashMap<String, String>,
     resolve: impl Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
 ) -> Result<llm::LlmConfig, String> {
+    let env = llm::merge_dotenv("", &env);
     if let Ok(config) = llm::load_llm_config(&env, false) {
         io.write(&llm::redact(
             &format!(
@@ -54,7 +55,7 @@ pub fn setup_with_resolver(
             &[&config.api_key],
         ));
         for (key, value) in &env {
-            if key.starts_with("LLM_") && std::env::var_os(key).is_none() {
+            if key.starts_with("LLM_") && std::env::var(key).map_or(true, |v| v.trim().is_empty()) {
                 std::env::set_var(key, value);
             }
         }
@@ -65,18 +66,7 @@ pub fn setup_with_resolver(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(error.to_string()),
     };
-    let mut combined = env.clone();
-    for line in String::from_utf8_lossy(&existing).lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            combined
-                .entry(key.to_string())
-                .or_insert_with(|| value.to_string());
-        }
-    }
+    let mut combined = llm::merge_dotenv(&String::from_utf8_lossy(&existing), &env);
     match llm::load_llm_config(&combined, false) {
         Ok(config) => {
             io.write(&llm::redact(
@@ -87,7 +77,9 @@ pub fn setup_with_resolver(
                 &[&config.api_key],
             ));
             for (key, value) in &combined {
-                if key.starts_with("LLM_") && std::env::var_os(key).is_none() {
+                if key.starts_with("LLM_")
+                    && std::env::var(key).map_or(true, |v| v.trim().is_empty())
+                {
                     std::env::set_var(key, value);
                 }
             }
@@ -243,7 +235,7 @@ pub fn setup_with_resolver(
         file.write_all(b".env\n").map_err(|e| e.to_string())?;
     }
     for (k, v) in combined {
-        if k.starts_with("LLM_") && std::env::var_os(&k).is_none() {
+        if k.starts_with("LLM_") && std::env::var(&k).map_or(true, |v| v.trim().is_empty()) {
             std::env::set_var(k, v);
         }
     }
