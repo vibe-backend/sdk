@@ -30,7 +30,6 @@ pub struct CompileOutput {
 pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, Report> {
     let sources = discover::discover(opts.root)?;
     let mut report = Report::new();
-    let stamp = stamp_from(opts.llm_config);
     let mut docs: HashMap<String, LockDoc> = HashMap::new();
     let mut ordered: Vec<String> = Vec::new();
 
@@ -51,6 +50,7 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
             continue;
         }
         let structured = is_structured_source(&source.combined_text());
+        let stamp = stamp_from(if structured { None } else { opts.llm_config });
         if !structured && opts.llm.is_none() {
             report.push(Diag::error(
                 &source.rel,
@@ -1365,6 +1365,7 @@ mod prompt_tests {
             panic!("compile: {:?}", report.diags);
         }
         let vopts = crate::validate::ValidateOptions {
+            dev: false,
             root: &dir,
             deploy: false,
             verify_key: None,

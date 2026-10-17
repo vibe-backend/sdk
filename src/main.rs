@@ -39,6 +39,9 @@ enum Command {
         /// Also require approval and a valid signature.
         #[arg(long)]
         deploy: bool,
+        /// Allow private-endpoint locks for local development.
+        #[arg(long)]
+        dev: bool,
     },
     /// Record local approval and sign locks.
     ///
@@ -61,6 +64,9 @@ enum Command {
         /// Output path, relative to the current directory (like `serve --manifest`).
         #[arg(long, short, default_value = "manifest.json")]
         output: PathBuf,
+        /// Build a manifest for local development.
+        #[arg(long)]
+        dev: bool,
     },
     /// Serve HTTP from a signed manifest.
     Serve {
@@ -151,14 +157,22 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Compile { project, check } => cmd_compile(&project, check).await,
-        Command::Validate { project, deploy } => cmd_validate(&project, deploy),
+        Command::Validate {
+            project,
+            deploy,
+            dev,
+        } => cmd_validate(&project, deploy, dev),
         Command::Approve {
             project,
             reviewers,
             reason,
             approval_ref,
         } => cmd_approve(&project, &reviewers, &reason, &approval_ref),
-        Command::Manifest { project, output } => cmd_manifest(&project, &output),
+        Command::Manifest {
+            project,
+            output,
+            dev,
+        } => cmd_manifest(&project, &output, dev),
         Command::Serve {
             manifest,
             project,
@@ -266,7 +280,8 @@ async fn cmd_compile(project: &Path, check: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
+fn cmd_validate(project: &Path, deploy: bool, dev: bool) -> Result<(), String> {
+    check_dev_mode(dev)?;
     // A missing key is one more finding, not a reason to stop before
     // reporting everything else.
     let mut key_problem = None;
@@ -285,6 +300,7 @@ fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
         None
     };
     let result = validate_project(&ValidateOptions {
+        dev,
         root: project,
         deploy,
         verify_key: key.as_ref(),
@@ -354,9 +370,11 @@ fn cmd_approve(
     Ok(())
 }
 
-fn cmd_manifest(project: &Path, output: &Path) -> Result<(), String> {
+fn cmd_manifest(project: &Path, output: &Path, dev: bool) -> Result<(), String> {
+    check_dev_mode(dev)?;
     let key = sign::load_or_create(project).map_err(|err| err.to_string())?;
-    let manifest = manifest::manifest_from_project(project, &key).map_err(|err| err.to_string())?;
+    let manifest = manifest::manifest_from_project_with_mode(project, &key, dev)
+        .map_err(|err| err.to_string())?;
     // Relative to the current directory, like `vibe serve --manifest` (#31).
     let path = output.to_path_buf();
     manifest::write_manifest(&path, &manifest).map_err(|err| err.to_string())?;
@@ -397,6 +415,12 @@ async fn cmd_serve(
     let mut auth = auth_from_env(run_env)?;
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
+    if manifest.build_mode == Some(manifest::BuildMode::Dev) && !run_env.is_dev() {
+        return Err(format!(
+            "this manifest was built with --dev and is refused when VIBE_ENV is {:?}",
+            std::env::var("VIBE_ENV").unwrap_or_default()
+        ));
+    }
     for route in &manifest.routes {
         if let Some(problem) = route
             .refresh
@@ -690,6 +714,13 @@ fn load_dotenv(project: &Path) {
             std::env::set_var(key, value);
         }
     }
+}
+
+fn check_dev_mode(dev: bool) -> Result<(), String> {
+    if dev && ci_or_prod() {
+        return Err("--dev is for local development and is refused in CI and production".into());
+    }
+    Ok(())
 }
 
 fn ci_or_prod() -> bool {

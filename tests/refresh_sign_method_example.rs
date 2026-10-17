@@ -48,6 +48,7 @@ async fn compile(root: &Path, check: bool) -> Result<(), String> {
 
 fn validate(root: &Path) -> Result<(), String> {
     validate_project(&ValidateOptions {
+        dev: false,
         root,
         deploy: false,
         verify_key: None,

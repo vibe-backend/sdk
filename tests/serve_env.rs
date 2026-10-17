@@ -261,3 +261,67 @@ fn development_allows_after_failures_challenge_lock() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn dev_flags_are_refused_in_ci_and_production() {
+    for env in ["CI", "GITHUB_ACTIONS", "VIBE_ENV"] {
+        for args in [
+            vec!["validate", "--deploy", "--dev"],
+            vec!["manifest", "--dev"],
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_vibe"))
+                .env_clear()
+                .env(
+                    env,
+                    if env == "VIBE_ENV" {
+                        "production"
+                    } else {
+                        "true"
+                    },
+                )
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("--dev is for local development and is refused in CI and production"));
+        }
+    }
+}
+
+#[test]
+fn signed_dev_manifest_starts_with_memory_in_development() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let root = std::env::temp_dir().join(format!("vibe-dev-serve-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let key = vibe::sign::load_or_create(&root).unwrap();
+    let manifest = vibe::manifest::manifest_from_project_with_mode(&root, &key, true).unwrap();
+    let path = root.join("dev.json");
+    vibe::manifest::write_manifest(&path, &manifest).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vibe"))
+        .env_clear()
+        .env("VIBE_ENV", "development")
+        .args(["serve", "--memory", "--addr", "127.0.0.1:0", "--project"])
+        .arg(&root)
+        .arg("--manifest")
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        sender.send(BufReader::new(stdout).lines().next()).unwrap();
+    });
+    let line = receiver.recv_timeout(std::time::Duration::from_secs(10));
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        matches!(line, Ok(Some(Ok(ref line))) if line.contains("listening on")),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

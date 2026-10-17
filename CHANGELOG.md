@@ -25,6 +25,8 @@ added only when the corresponding PR is merged to `main`.
 
 ### Fixed
 
+- **Local LLM endpoints:** Private-host opt-in also covers DNS answers from fake-IP proxies. Transport errors include masked causes, requests send a SDK User-Agent, and non-JSON authorization failures identify possible proxy blocks. `validate --deploy --dev` and `manifest --dev` support local testing of private-endpoint locks; signed dev manifests are refused outside development. Structured locks use deterministic compiler stamps.
+
 - **Refresh 家族限流（決定 147，文件更新）：** 超過上限會要求重新登入。
 
 - **EC signing keys checked at load (#257):** ES256 private keys (PEM and DER) are now checked when they are loaded: PKCS#8 and SEC1 PEMs (PKCS#8 for DER) must name P-256, included public points must lie on the curve, the encoding must cover the input exactly (no trailing data) and the private scalar must be in `1..n-1`. Such keys are refused at startup instead of being accepted or failing at the first signature.

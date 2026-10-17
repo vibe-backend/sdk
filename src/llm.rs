@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::diag::{Diag, Report};
 
 pub const OPENAI: &str = "openai";
+const USER_AGENT: &str = concat!("vibe-sdk/", env!("CARGO_PKG_VERSION"));
 pub const ANTHROPIC: &str = "anthropic";
 pub const GEMINI: &str = "gemini";
 
@@ -599,7 +600,7 @@ fn classify_endpoint(
     if private && parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err("LLM_BASE_URL scheme must be http or https".into());
     }
-    Ok((host, private))
+    Ok((host, private || allow_private))
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -705,7 +706,7 @@ pub struct HttpAdapter {
 /// `describe_failure` and transport-error paths so secrets are never printed.
 pub fn mask_secrets(text: &str, api_key: &str) -> String {
     let mut out = text.to_string();
-    if api_key.len() >= 4 {
+    if !api_key.is_empty() {
         out = out.replace(api_key, "***");
     }
     // Query, fragment, and `;`-separated params: key / api_key / token / …
@@ -718,7 +719,25 @@ pub fn mask_secrets(text: &str, api_key: &str) -> String {
     KEY_PARAM.replace_all(&out, "${1}***").into_owned()
 }
 
-/// Explains a failed or non-JSON LLM response. Only 401/403 blame the key;
+/// Formats transport causes before masking secrets in the complete message.
+fn error_chain(error: &(dyn std::error::Error + 'static), api_key: &str) -> String {
+    let mut parts = Vec::new();
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        let text = cause.to_string();
+        if !parts.contains(&text) {
+            parts.push(text);
+        }
+        current = cause.source();
+    }
+    let mut message = parts.join(": ");
+    if message.contains("resolves to non-public address") {
+        message.push_str("; if this host is a local proxy (for example a fake-IP DNS setup), set LLM_ALLOW_PRIVATE_HOST=true for local development; it is refused in CI and production");
+    }
+    mask_secrets(&message, api_key)
+}
+
+/// Explains a failed or non-JSON LLM response. JSON or empty 401/403 responses blame the key;
 /// HTML (or a 404) hints at the base URL. The request URL and a short body
 /// excerpt are included, with the API key and secret query values masked.
 pub fn describe_failure(
@@ -744,7 +763,10 @@ pub fn describe_failure(
             .to_ascii_lowercase()
             .starts_with("<html");
     let lead = match status {
-        401 | 403 => format!("LLM_API_KEY was rejected (http {status})"),
+        401 | 403 if body.is_empty() || serde_json::from_slice::<Value>(body).is_ok() => {
+            format!("LLM_API_KEY was rejected (http {status})")
+        }
+        401 | 403 => format!("LLM endpoint or a proxy in front of it refused the request (http {status}); the response is not JSON, so this is probably not an API key problem"),
         404 => format!("LLM endpoint not found (http {status})"),
         429 => format!("LLM rate limit or quota exceeded (http {status})"),
         400 => format!("LLM request rejected (http {status}); check LLM_MODEL and the provider"),
@@ -757,12 +779,16 @@ pub fn describe_failure(
     } else {
         ""
     };
-    format!("{lead}{hint}. URL: {shown_url}. Response: {excerpt}")
+    mask_secrets(
+        &format!("{lead}{hint}. URL: {shown_url}. Response: {excerpt}"),
+        api_key,
+    )
 }
 
 impl HttpAdapter {
     pub fn new(config: LlmConfig) -> Result<Self, String> {
         let mut builder = Client::builder()
+            .user_agent(USER_AGENT)
             .timeout(config.timeout)
             // A redirect could lead to a host the endpoint check never saw.
             .redirect(reqwest::redirect::Policy::none());
@@ -771,9 +797,12 @@ impl HttpAdapter {
             // rebinding); every resolved address is checked before connecting.
             builder = crate::netguard::guard_client(builder);
         }
-        let client = builder
-            .build()
-            .map_err(|err| format!("http client: {err}"))?;
+        let client = builder.build().map_err(|err| {
+            mask_secrets(
+                &format!("http client: {}", error_chain(&err, &config.api_key)),
+                &config.api_key,
+            )
+        })?;
         Ok(Self { config, client })
     }
 }
@@ -833,7 +862,13 @@ impl HttpAdapter {
             builder = builder.header(key, value);
         }
         let response = builder.send().await.map_err(|err| CallError {
-            message: mask_secrets(&format!("LLM request failed: {err}"), &self.config.api_key),
+            message: mask_secrets(
+                &format!(
+                    "LLM request failed: {}",
+                    error_chain(&err, &self.config.api_key)
+                ),
+                &self.config.api_key,
+            ),
             retryable: true,
         })?;
         let status = response.status();
@@ -844,7 +879,13 @@ impl HttpAdapter {
             .unwrap_or("")
             .to_string();
         let bytes = response.bytes().await.map_err(|err| CallError {
-            message: mask_secrets(&format!("LLM response body: {err}"), &self.config.api_key),
+            message: mask_secrets(
+                &format!(
+                    "LLM response body: {}",
+                    error_chain(&err, &self.config.api_key)
+                ),
+                &self.config.api_key,
+            ),
             retryable: true,
         })?;
         if !status.is_success() {
@@ -1622,7 +1663,11 @@ mod responses_tests {
             let body = format!("{{\"error\":{{\"message\":\"bad key {key}\"}}}}");
             let app = Router::new().route(
                 "/v1/responses",
-                post(move || {
+                post(move |headers: axum::http::HeaderMap| {
+                    assert_eq!(
+                        headers.get("user-agent").unwrap(),
+                        concat!("vibe-sdk/", env!("CARGO_PKG_VERSION"))
+                    );
                     let body = body.clone();
                     async move { (StatusCode::from_u16(status).unwrap(), body) }
                 }),
@@ -1846,5 +1891,110 @@ mod responses_tests {
         );
         assert!(load_llm_config(&env("bogus", "openai"), false).is_err());
         assert!(load_llm_config(&env("responses", "gemini"), false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod transport_policy_tests {
+    use super::*;
+
+    #[test]
+    fn user_agent_identifies_sdk_version() {
+        assert_eq!(
+            USER_AGENT,
+            format!("vibe-sdk/{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reqwest_dns_error_exposes_the_refusal_chain() {
+        let resolver = crate::netguard::PublicOnlyResolver::with_lookup(|_| {
+            Box::pin(async { Ok(vec!["198.18.0.5:0".parse().unwrap()]) })
+        });
+        let client = crate::netguard::guard_client_with(Client::builder(), resolver)
+            .build()
+            .unwrap();
+        let error = client
+            .get("https://proxy.example.com/v1?key=test-key")
+            .send()
+            .await
+            .unwrap_err();
+        let message = error_chain(&error, "test-key");
+        assert!(message.contains("198.18.0.5"), "{message}");
+        assert!(message.contains("198.18.0.0/15"), "{message}");
+        assert!(
+            message.contains("; if this host is a local proxy (for example a fake-IP DNS setup), set LLM_ALLOW_PRIVATE_HOST=true for local development; it is refused in CI and production"),
+            "{message}"
+        );
+        assert!(!message.contains("test-key"));
+    }
+
+    #[test]
+    fn error_chain_includes_causes_and_masks_keys() {
+        #[derive(Debug)]
+        struct Cause(&'static str, Option<Box<Cause>>);
+        impl std::fmt::Display for Cause {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Cause {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as _)
+            }
+        }
+        let cause = Cause(
+            "request failed",
+            Some(Box::new(Cause(
+                "request failed",
+                Some(Box::new(Cause("DNS failed sk-secret", None))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&cause, "sk-secret"),
+            "request failed: DNS failed ***"
+        );
+    }
+
+    #[test]
+    fn private_opt_in_marks_public_names_and_remains_local_only() {
+        for restricted in [false, true] {
+            let env = HashMap::from([
+                ("LLM_API_KEY".into(), "test-key".into()),
+                ("LLM_MODEL".into(), "test-model".into()),
+                ("LLM_BASE_URL".into(), "https://proxy.example.com/v1".into()),
+                ("LLM_ALLOW_PRIVATE_HOST".into(), "true".into()),
+            ]);
+            let config = load_llm_config(&env, restricted);
+            if restricted {
+                assert!(config.is_err());
+            } else {
+                assert!(config.unwrap().endpoint_private);
+            }
+        }
+        assert!(
+            !classify_endpoint("https://proxy.example.com", false, false)
+                .unwrap()
+                .1
+        );
+        assert!(classify_endpoint("http://proxy.example.com", true, false).is_err());
+    }
+
+    #[test]
+    fn auth_errors_distinguish_non_json_responses() {
+        for body in [b"{}".as_slice(), b""] {
+            let message = describe_failure("https://api.example.com", 403, "", body, "test-key");
+            assert!(message.contains("LLM_API_KEY was rejected"));
+        }
+        let message = describe_failure(
+            "https://api.example.com",
+            403,
+            "text/html",
+            b"<html>test-key</html>",
+            "test-key",
+        );
+        assert!(message.contains("probably not an API key problem"));
+        assert!(message.contains("LLM_BASE_URL"));
+        assert!(!message.contains("test-key"));
     }
 }
