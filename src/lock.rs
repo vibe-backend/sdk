@@ -8,7 +8,7 @@ pub const COMPILER_NAME: &str = "md-logic";
 pub const COMPILER_VERSION: &str = "0.1.0";
 // Every compile prompt text change (system, guide, examples) must bump PROMPT_VERSION:
 // it feeds compiler-hash and the LLM cache key.
-pub const PROMPT_VERSION: &str = "prompt-7";
+pub const PROMPT_VERSION: &str = "prompt-8";
 pub const LOCK_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,7 +287,7 @@ pub fn section_order(kind: Kind, scope: Option<Scope>) -> &'static [&'static str
     match kind {
         Kind::Provider => &["Connection", "Isolation", "Access", "Limits", "Migrations"],
         Kind::Pipeline => &["Parameters", "Order", "Steps"],
-        Kind::Model => &["Table", "Fields", "CRUD", "Policies"],
+        Kind::Model => &["Table", "Fields", "Constraints", "CRUD", "Policies"],
         Kind::Method => &["Signature", "Calls", "Steps"],
         Kind::Migration => &["Target", "Up", "Verify", "Data"],
         Kind::Api => match scope {
@@ -534,7 +534,18 @@ pub fn parse_lock(text: &str) -> Result<LockDoc, String> {
 }
 
 pub fn parse_sections(text: &str) -> Result<Vec<Section>, String> {
-    let text = strip_frontmatter_block(text);
+    let normalized = text
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with(['|', '｜']) {
+                line.replace('｜', "|")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = strip_frontmatter_block(&normalized);
     let mut sections: Vec<Section> = Vec::new();
     let mut current: Option<Section> = None;
     let mut in_block = false;
@@ -987,7 +998,18 @@ pub fn find_section_mut<'a>(sections: &'a mut [Section], name: &str) -> Option<&
 
 /// True when every content line is a heading, list, table row, or `(none)`.
 pub fn is_structured_source(text: &str) -> bool {
-    let text = strip_frontmatter_block(text);
+    let normalized = text
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with(['|', '｜']) {
+                line.replace('｜', "|")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = strip_frontmatter_block(&normalized);
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {

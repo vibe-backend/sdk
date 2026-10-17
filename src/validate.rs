@@ -284,6 +284,9 @@ pub(crate) fn check_lock(
     {
         order.retain(|name| *name != "Transform");
     }
+    if doc.meta.kind == Kind::Model && find_section(&doc.sections, "Constraints").is_none() {
+        order.retain(|name| *name != "Constraints");
+    }
     let names: Vec<&str> = doc
         .sections
         .iter()
@@ -513,6 +516,31 @@ fn check_dependencies(
 }
 
 fn check_sections(doc: &LockDoc, file: &str, report: &mut Report) {
+    for section in &doc.sections {
+        if matches!(section.name.as_str(), "Fields" | "Request") {
+            if let Some(table) = &section.table {
+                if let Some(index) = table.headers.iter().position(|h| h == "rules") {
+                    for row in &table.rows {
+                        for rule in crate::lock::split_top_level(
+                            row.get(index).map(String::as_str).unwrap_or(""),
+                        ) {
+                            if let Some((key, _)) = rule.split_once(':') {
+                                if let Some(replacement) = crate::zh::alias(key.trim()) {
+                                    report.push(Diag::error(file, format!("rule alias {} is not allowed in locks; use {replacement}:", key.trim())).at_section(&section.name));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if doc.meta.kind == Kind::Model {
+        if let Err(error) = crate::zh::constraints(doc) {
+            report.push(Diag::error(file, error).at_section("Constraints"));
+        }
+    }
+
     match doc.meta.kind {
         Kind::Provider => check_provider(doc, file, report),
         Kind::Model => check_model(doc, file, report),
@@ -1639,6 +1667,32 @@ fn check_calls(docs: &HashMap<String, LockDoc>, report: &mut Report) {
 }
 
 fn check_migrations(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    for model in docs.values().filter(|doc| doc.meta.kind == Kind::Model) {
+        let Ok(constraints) = crate::zh::constraints(model) else {
+            continue;
+        };
+        let table_section = find_section(&model.sections, "Table");
+        let table = table_section.and_then(|s| s.get("table")).unwrap_or("");
+        let provider = table_section.and_then(|s| s.get("provider")).unwrap_or("");
+        for columns in constraints {
+            let mut expected = vec!["tenant_id".to_string()];
+            expected.extend(columns.clone());
+            let found = docs
+                .values()
+                .filter(|d| {
+                    d.meta.kind == Kind::Migration
+                        && find_section(&d.sections, "Target").and_then(|s| s.get("provider"))
+                            == Some(provider)
+                })
+                .filter_map(|d| find_section(&d.sections, "Up"))
+                .flat_map(|s| &s.blocks)
+                .any(|b| crate::zh::unique_index_of(&block_val(b, "sql"), table, &expected));
+            if !found {
+                report.push(Diag::error(lock_rel(&model.meta.source), format!("model {} Constraints [{}] requires matching unique index on {table} ({}) on provider {provider}", model.meta.id, columns.join(", "), expected.join(", "))).at_section("Constraints"));
+            }
+        }
+    }
+
     let mut by_provider: HashMap<String, Vec<u32>> = HashMap::new();
     for doc in docs.values() {
         if doc.meta.kind != Kind::Migration {

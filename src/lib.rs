@@ -37,3 +37,5 @@ pub use manifest::{manifest_from_project, read_manifest, write_manifest, Manifes
 pub use validate::{validate_project, ValidateOptions};
 
 pub mod interactive;
+
+pub(crate) mod zh;

@@ -13,6 +13,7 @@ pub type Row = Map<String, Value>;
 pub enum ExecError {
     NotFound,
     Conflict,
+    UniqueViolation,
     Precondition,
     Timeout,
     IssuanceFailed,
@@ -27,6 +28,8 @@ pub trait RefreshIssuer: Send + Sync {
 
 #[async_trait]
 pub trait QueryExec: Send + Sync {
+    fn configure_models(&self, _models: &[crate::manifest::ModelSpec]) {}
+
     async fn execute(&self, tenant_id: &str, role: &str, stmt: Stmt)
         -> Result<Vec<Row>, ExecError>;
 
@@ -183,6 +186,7 @@ const REFRESH_TABLE: &str = "_platform_refresh_tokens";
 #[derive(Default)]
 pub struct MemoryExec {
     tables: Mutex<BTreeMap<String, Vec<Row>>>,
+    unique: Mutex<BTreeMap<String, Vec<Vec<String>>>>,
     refresh_gate: tokio::sync::Mutex<()>,
     /// Test stub for `query` steps (the memory executor runs no SQL).
     query_stub: Mutex<Option<String>>,
@@ -191,6 +195,38 @@ pub struct MemoryExec {
 impl MemoryExec {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn check_unique(
+        &self,
+        table: &str,
+        rows: &[Row],
+        candidate: &Row,
+        exclude: Option<&str>,
+    ) -> Result<(), ExecError> {
+        if candidate.get("deleted_at").is_some_and(|v| !v.is_null()) {
+            return Ok(());
+        }
+        let unique = self
+            .unique
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        for columns in unique.get(table).into_iter().flatten() {
+            if columns
+                .iter()
+                .any(|c| candidate.get(c).is_none_or(Value::is_null))
+            {
+                continue;
+            }
+            if rows.iter().any(|row| {
+                row.get("deleted_at").is_none_or(Value::is_null)
+                    && exclude.is_none_or(|id| row.get("id").and_then(Value::as_str) != Some(id))
+                    && columns.iter().all(|c| row.get(c) == candidate.get(c))
+            }) {
+                return Err(ExecError::UniqueViolation);
+            }
+        }
+        Ok(())
     }
 
     /// Tests only: every `query` step returns one row `{column: <first
@@ -211,6 +247,22 @@ impl MemoryExec {
 
 #[async_trait]
 impl QueryExec for MemoryExec {
+    fn configure_models(&self, models: &[crate::manifest::ModelSpec]) {
+        if let Ok(mut unique) = self.unique.lock() {
+            for model in models {
+                let mut groups = model.constraints.clone();
+                groups.extend(
+                    model
+                        .fields
+                        .iter()
+                        .filter(|f| f.unique || f.primary)
+                        .map(|f| vec![f.name.clone()]),
+                );
+                unique.insert(model.table.clone(), groups);
+            }
+        }
+    }
+
     async fn raw(
         &self,
         _tenant_id: &str,
@@ -490,6 +542,7 @@ impl QueryExec for MemoryExec {
                     row.insert(col.name.clone(), value.clone());
                 }
                 row.insert("tenant_id".into(), Value::String(tenant_id.into()));
+                self.check_unique(&table, rows, &row, None)?;
                 rows.push(row.clone());
                 Ok(vec![project(&row, &returning)])
             }
@@ -553,19 +606,25 @@ impl QueryExec for MemoryExec {
             } => {
                 let key = key(tenant_id, &table);
                 let rows = tables.get_mut(&key).ok_or(ExecError::NotFound)?;
-                let row = rows
-                    .iter_mut()
-                    .find(|row| {
+                let index = rows
+                    .iter()
+                    .position(|row| {
                         row.get("id").and_then(Value::as_str) == Some(id.as_str())
                             && row.get("deleted_at").is_none_or(Value::is_null)
                             && owner_matches(row, owner.as_ref())
                     })
                     .ok_or(ExecError::NotFound)?;
-                if row.get("updated_at").and_then(Value::as_str)
+                if rows[index].get("updated_at").and_then(Value::as_str)
                     != Some(expected_updated_at.as_str())
                 {
                     return Err(ExecError::Precondition);
                 }
+                let mut candidate = rows[index].clone();
+                for (col, value) in &sets {
+                    candidate.insert(col.name.clone(), value.clone());
+                }
+                self.check_unique(&table, rows, &candidate, Some(&id))?;
+                let row = &mut rows[index];
                 for (col, value) in sets {
                     row.insert(col.name, value);
                 }
@@ -1195,10 +1254,7 @@ impl QueryExec for PgExec {
             .client()
             .await
             .map_err(|err| ExecError::Message(format!("database unavailable: {err}")))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|err| ExecError::Message(pg_error(err)))?;
+        let tx = client.transaction().await.map_err(map_pg)?;
         let schema = format!("\"t_{tenant_id}\"");
         tx.query(
             "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), \
@@ -1210,13 +1266,11 @@ impl QueryExec for PgExec {
             ],
         )
         .await
-        .map_err(|err| ExecError::Message(pg_error(err)))?;
+        .map_err(map_pg)?;
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p as _).collect();
         let rows = tx.query(&sql, &refs).await.map_err(map_pg)?;
-        tx.commit()
-            .await
-            .map_err(|err| ExecError::Message(pg_error(err)))?;
+        tx.commit().await.map_err(map_pg)?;
         if rows.is_empty() {
             return match stmt {
                 Stmt::SoftDelete { .. } => Err(ExecError::NotFound),
@@ -1228,9 +1282,7 @@ impl QueryExec for PgExec {
         for row in rows {
             let mut mapped = Map::new();
             for (idx, col) in returning.iter().enumerate() {
-                let text: Option<String> = row
-                    .try_get(idx)
-                    .map_err(|err| ExecError::Message(pg_error(err)))?;
+                let text: Option<String> = row.try_get(idx).map_err(map_pg)?;
                 mapped.insert(col.name.clone(), parse_cell(text, &col.ty));
             }
             out.push(mapped);
@@ -1703,14 +1755,11 @@ impl PgExec {
             deadpool_postgres::PoolError::Timeout(_) => ExecError::Timeout,
             other => ExecError::Message(pool_error(other)),
         })?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|err| ExecError::Message(err.to_string()))?;
+        let tx = client.transaction().await.map_err(map_pg)?;
         if !writes {
             tx.batch_execute("SET TRANSACTION READ ONLY")
                 .await
-                .map_err(|err| ExecError::Message(err.to_string()))?;
+                .map_err(map_pg)?;
         }
         let schema = format!("\"t_{tenant_id}\"");
         tx.query(
@@ -1721,7 +1770,7 @@ impl PgExec {
             ],
         )
         .await
-        .map_err(|err| ExecError::Message(err.to_string()))?;
+        .map_err(map_pg)?;
         if let Some(role) = role {
             // `role` is one of QUERY_ROLES (checked by the caller).
             tx.batch_execute(&format!("SET LOCAL ROLE {role}"))
@@ -1751,9 +1800,7 @@ impl PgExec {
             tx.execute(body, &refs).await.map_err(map_pg)?;
             Vec::new()
         };
-        tx.commit()
-            .await
-            .map_err(|err| ExecError::Message(err.to_string()))?;
+        tx.commit().await.map_err(map_pg)?;
         rows.iter()
             .map(|row| {
                 let text: String = row.get(0);
@@ -1801,7 +1848,9 @@ fn map_pg(err: tokio_postgres::Error) -> ExecError {
     let code = err.code().map(|code| code.code());
     if matches!(code, Some("57014" | "55P03")) {
         ExecError::Timeout
-    } else if matches!(code, Some("23505" | "40001" | "40P01")) {
+    } else if code == Some("23505") {
+        ExecError::UniqueViolation
+    } else if matches!(code, Some("40001" | "40P01")) {
         ExecError::Conflict
     } else {
         ExecError::Message(pg_error(err))
@@ -2092,12 +2141,120 @@ mod reservation_tests {
             let mapped = map_pg(error);
             match code {
                 "57014" | "55P03" => assert!(matches!(mapped, ExecError::Timeout)),
-                "23505" | "40001" | "40P01" => assert!(matches!(mapped, ExecError::Conflict)),
+                "23505" => assert!(matches!(mapped, ExecError::UniqueViolation)),
+                "40001" | "40P01" => assert!(matches!(mapped, ExecError::Conflict)),
                 _ => assert!(matches!(mapped, ExecError::Message(_))),
             }
         }
         admin
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn memory_unique_is_atomic_tenant_scoped_and_soft_delete_aware() {
+        let exec = MemoryExec::new();
+        exec.unique.lock().unwrap().insert(
+            "things".into(),
+            vec![vec!["email".into()], vec!["a".into(), "b".into()]],
+        );
+        async fn insert(
+            exec: &MemoryExec,
+            tenant: &str,
+            id: &str,
+            email: Value,
+            a: &str,
+            b: &str,
+        ) -> Result<Vec<Row>, ExecError> {
+            let values = [
+                ("id", Value::from(id)),
+                ("email", email),
+                ("a", Value::from(a)),
+                ("b", Value::from(b)),
+                ("updated_at", Value::from("v1")),
+            ]
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    Col {
+                        name: name.into(),
+                        ty: "string".into(),
+                    },
+                    value,
+                )
+            })
+            .collect();
+            exec.execute(
+                tenant,
+                "app_rw",
+                Stmt::Insert {
+                    table: "things".into(),
+                    values,
+                    returning: vec![],
+                },
+            )
+            .await
+        }
+        insert(&exec, "one", "1", "private-email".into(), "a", "b")
+            .await
+            .unwrap();
+        assert!(matches!(
+            insert(&exec, "one", "2", "private-email".into(), "different", "b").await,
+            Err(ExecError::UniqueViolation)
+        ));
+        assert!(matches!(
+            insert(&exec, "one", "2", "other-email".into(), "a", "b").await,
+            Err(ExecError::UniqueViolation)
+        ));
+        insert(&exec, "two", "1", "private-email".into(), "a", "b")
+            .await
+            .unwrap();
+        insert(&exec, "one", "2", Value::Null, "c", "b")
+            .await
+            .unwrap();
+        insert(&exec, "one", "3", Value::Null, "d", "b")
+            .await
+            .unwrap();
+        let update = Stmt::Update {
+            table: "things".into(),
+            id: "2".into(),
+            sets: vec![(
+                Col {
+                    name: "email".into(),
+                    ty: "string".into(),
+                },
+                "private-email".into(),
+            )],
+            expected_updated_at: "v1".into(),
+            touched_at: "v2".into(),
+            returning: vec![],
+            owner: None,
+        };
+        assert!(matches!(
+            exec.execute("one", "app_rw", update).await,
+            Err(ExecError::UniqueViolation)
+        ));
+        {
+            let tables = exec.tables.lock().unwrap();
+            assert!(tables[&key("one", "things")]
+                .iter()
+                .find(|r| r["id"] == "2")
+                .unwrap()["email"]
+                .is_null());
+        }
+        exec.execute(
+            "one",
+            "app_rw",
+            Stmt::SoftDelete {
+                table: "things".into(),
+                id: "1".into(),
+                touched_at: "v2".into(),
+                owner: None,
+            },
+        )
+        .await
+        .unwrap();
+        insert(&exec, "one", "4", "private-email".into(), "a", "b")
             .await
             .unwrap();
     }
