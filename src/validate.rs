@@ -65,9 +65,11 @@ pub fn validate_project(opts: &ValidateOptions<'_>) -> Result<Report, Report> {
     check_orphans(opts.root, &sources, &mut report);
     check_routes(&docs, &mut report);
     check_calls(&docs, &mut report);
+    check_refresh_sign_methods(&docs, &mut report);
     check_targets(&docs, &mut report);
     check_migrations(&docs, &mut report);
     check_feature_method_writes(&docs, &mut report);
+    check_method_inherited_writes(&docs, &mut report);
     let env_roles_claim = std::env::var("VIBE_JWT_ROLES_CLAIM").ok();
     check_claims_vs_roles_claims(&docs, env_roles_claim.as_deref(), &mut report);
     check_security_items_enriched(&docs, &source_by_id, opts, &mut report);
@@ -385,11 +387,33 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
     if let Some(steps) = find_section(&doc.sections, "Steps") {
         for block in &steps.blocks {
             let sql = block_val(block, "sql");
-            if crate::security::sql_writes(sql.trim_matches('`'))
-                && block_val(block, "writes") != "true"
-            {
-                report.push(
+            let sql_writes = crate::security::sql_writes(sql.trim_matches('`'));
+            match crate::manifest::parse_writes(&block.bullets) {
+                Err(err) => report.push(
+                    Diag::error(file, err)
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                ),
+                // `op: method` steps may inherit writes from the callee; that
+                // is checked once all locks are loaded (check_method_inherited_writes).
+                Ok(Some(true)) if !sql_writes && block_val(block, "op") != "method" => report.push(
+                    Diag::error(
+                        file,
+                        "step is marked `writes: true` but its SQL does not write",
+                    )
+                    .at_step(&block.heading)
+                    .at_section("Steps"),
+                ),
+                Ok(marked) if sql_writes && marked != Some(true) => report.push(
                     Diag::error(file, "step SQL writes but is not marked `writes: true`")
+                        .at_step(&block.heading)
+                        .at_section("Steps"),
+                ),
+                _ => {}
+            }
+            if let Err(err) = crate::manifest::parse_status(&block.bullets) {
+                report.push(
+                    Diag::error(file, err)
                         .at_step(&block.heading)
                         .at_section("Steps"),
                 );
@@ -410,13 +434,22 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
     let caps = find_section(&doc.sections, "Signature")
         .and_then(|section| section.get("capabilities"))
         .unwrap_or("");
-    let writes = find_section(&doc.sections, "Signature").and_then(|section| section.get("writes"))
-        == Some("true");
+    let writes = match find_section(&doc.sections, "Signature") {
+        Some(sig) => match crate::manifest::parse_writes(&sig.bullets) {
+            Ok(w) => w.unwrap_or(false),
+            Err(err) => {
+                report.push(Diag::error(file, err).at_section("Signature"));
+                return;
+            }
+        },
+        None => false,
+    };
     let Some(steps) = find_section(&doc.sections, "Steps") else {
         report.push(Diag::error(file, "method is missing steps").at_section("Steps"));
         return;
     };
     let mut saw_write = false;
+    let calls_method = steps.blocks.iter().any(|b| block_val(b, "op") == "method");
     for block in &steps.blocks {
         let op = block_val(block, "op");
         if !matches!(
@@ -441,7 +474,11 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
         // #77 ops (query, verify-password, hash-password, random-token,
         // hash-token, sign-jwt) keep their own checks below.
         if matches!(op.as_str(), "method" | "validate" | "respond") {
-            for problem in api_step_problems(block, &op) {
+            // Inside a method, `op: method` may mark an inherited write.
+            for problem in api_step_problems(block, &op)
+                .into_iter()
+                .filter(|p| !(op == "method" && p.starts_with("unknown key `writes`")))
+            {
                 report.push(
                     Diag::error(file, problem)
                         .at_step(&block.heading)
@@ -457,7 +494,8 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                 );
             }
             let alg = block_val(block, "alg");
-            if !matches!(alg.as_str(), "ES256" | "RS256") {
+            // Omitted alg defaults to ES256 (decision 139).
+            if !matches!(alg.as_str(), "" | "ES256" | "RS256") {
                 report.push(
                     Diag::error(file, "sign-jwt alg must be ES256 or RS256")
                         .at_step(&block.heading),
@@ -477,11 +515,17 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                     .at_step(&block.heading),
                 );
             }
-            if !matches!(block_val(block, "issue-refresh").as_str(), "" | "none") {
+            let issue_refresh = block_val(block, "issue-refresh");
+            if !matches!(
+                issue_refresh.as_str(),
+                "" | "none" | "platform-decided" | "new-family"
+            ) {
                 report.push(
                     Diag::error(
                         file,
-                        "sign-jwt issue-refresh is not supported by this runtime yet",
+                        format!(
+                            "sign-jwt issue-refresh must be none, platform-decided or new-family (got `{issue_refresh}`)"
+                        ),
                     )
                     .at_step(&block.heading),
                 );
@@ -524,9 +568,6 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                 }
             }
         }
-        if block_val(block, "writes") == "true" {
-            saw_write = true;
-        }
         if op == "query" {
             let sql = block_val(block, "sql").trim_matches('`').to_string();
             // Structural checks from the parse tree (sqlguard).
@@ -566,19 +607,84 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
         report
             .push(Diag::error(file, "writes: false but a step writes SQL").at_section("Signature"));
     }
-    if writes && !saw_write {
-        // Also count explicit writes: true steps without detectable SQL verbs.
-        let marked = steps
-            .blocks
-            .iter()
-            .any(|b| block_val(b, "writes") == "true");
-        if !marked {
+    // With `op: method` steps the write may be inherited from a callee;
+    // check_method_inherited_writes decides once all locks are loaded.
+    if writes && !saw_write && !calls_method {
+        report
+            .push(Diag::error(file, "writes: true but no step writes SQL").at_section("Signature"));
+    }
+}
+
+/// Writes propagate up through `op: method`: a method that calls a writing
+/// method writes too, so its Signature must say `writes: true`.
+fn check_method_inherited_writes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    let mut ids: Vec<&String> = docs.keys().collect();
+    ids.sort();
+    for id in ids {
+        let doc = &docs[id];
+        if doc.meta.kind != Kind::Method {
+            continue;
+        }
+        let Some(steps) = find_section(&doc.sections, "Steps") else {
+            continue;
+        };
+        if !steps.blocks.iter().any(|b| block_val(b, "op") == "method") {
+            continue;
+        }
+        let file = lock_rel(&doc.meta.source);
+        let Ok(declared) = find_section(&doc.sections, "Signature")
+            .map(|sig| crate::manifest::parse_writes(&sig.bullets))
+            .unwrap_or(Ok(None))
+        else {
+            continue; // reported by check_method
+        };
+        let declared = declared.unwrap_or(false);
+        let mut any_write = false;
+        let mut sql_write = false;
+        for block in &steps.blocks {
+            let sql = block_val(block, "sql");
+            if crate::security::sql_writes(sql.trim_matches('`')) {
+                any_write = true;
+                sql_write = true;
+            }
+            if block_val(block, "op") != "method" {
+                continue;
+            }
+            let callee = block_val(block, "target");
+            let inherited = !callee.is_empty() && security::known_method_writes(docs, &callee);
+            any_write |= inherited;
+            match crate::manifest::parse_writes(&block.bullets) {
+                Ok(Some(true)) if !inherited => report.push(
+                    Diag::error(
+                        &file,
+                        format!(
+                            "step is marked `writes: true` but method `{callee}` does not write"
+                        ),
+                    )
+                    .at_step(&block.heading)
+                    .at_section("Steps"),
+                ),
+                Ok(Some(false)) if inherited => report.push(
+                    Diag::error(
+                        &file,
+                        format!("step calls write method `{callee}` but is marked `writes: false`"),
+                    )
+                    .at_step(&block.heading)
+                    .at_section("Steps"),
+                ),
+                _ => {}
+            }
+        }
+        // SQL-only mismatches are already reported by check_method.
+        if !declared && any_write && !sql_write {
             report.push(
-                Diag::error(
-                    file,
-                    "writes: true but no step writes SQL or sets writes: true",
-                )
-                .at_section("Signature"),
+                Diag::error(&file, "writes: false but a called method writes")
+                    .at_section("Signature"),
+            );
+        }
+        if declared && !any_write {
+            report.push(
+                Diag::error(&file, "writes: true but no step writes SQL").at_section("Signature"),
             );
         }
     }
@@ -637,6 +743,29 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
             .find_map(|block| block.bullets.iter().find(|b| b.key == "mode"))
             .map(|b| b.value.clone())
             .unwrap_or_else(|| "jwt".into());
+        let mut refresh = None;
+        let mut revoke = None;
+        for block in &pipes.blocks {
+            let name = pipeline_name(&block.heading);
+            let parsed = match name.as_str() {
+                "token-refresh" => crate::manifest::parse_refresh_block(&block.bullets)
+                    .map(|spec| refresh = Some(spec)),
+                "token-revoke" => crate::manifest::parse_revoke_block(&block.bullets)
+                    .map(|spec| revoke = Some(spec)),
+                _ => Ok(()),
+            };
+            if let Err(err) = parsed {
+                report.push(Diag::error(file, err).at_step(&block.heading));
+            }
+        }
+        if let Err(err) = crate::manifest::check_refresh_route(
+            refresh.as_ref(),
+            revoke.as_ref(),
+            public,
+            auth_removed,
+        ) {
+            report.push(Diag::error(file, err).at_section("Pipelines"));
+        }
         let mut declared_rates = Vec::new();
         for block in &pipes.blocks {
             if pipeline_name(&block.heading) == "rate-limit" {
@@ -686,7 +815,11 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
                         .at_section("Pipelines"),
                     );
                 }
-                if let Some(key) = block.bullets.iter().find(|b| b.key == "key") {
+                if let Some(key) = block
+                    .bullets
+                    .iter()
+                    .find(|b| b.key == "key" && !(b.value == "family" && refresh.is_some()))
+                {
                     if let Err(err) =
                         crate::manifest::check_rate_key(&key.value, auth_removed, &auth_mode)
                     {
@@ -966,6 +1099,57 @@ fn check_routes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
                 &doc.meta.source,
                 format!("route {key} duplicates {prev}"),
             ));
+        }
+    }
+}
+
+/// Every `token-refresh` `sign-method` must name a method with a `sign-jwt`
+/// step (a typo would otherwise only surface as a failing refresh call).
+fn check_refresh_sign_methods(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    for doc in docs.values() {
+        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+            continue;
+        }
+        let Some(pipes) = find_section(&doc.sections, "Pipelines") else {
+            continue;
+        };
+        for block in &pipes.blocks {
+            if pipeline_name(&block.heading) != "token-refresh" {
+                continue;
+            }
+            let target = block_val(block, "sign-method");
+            let Some((object, method)) = target.split_once('.') else {
+                if !target.is_empty() {
+                    report.push(
+                        Diag::error(
+                            &doc.meta.source,
+                            format!("token-refresh sign-method `{target}` is not a known method"),
+                        )
+                        .at_step(&block.heading),
+                    );
+                }
+                continue;
+            };
+            let id = format!("{object}/methods/{method}");
+            let problem = match docs.get(&id) {
+                None => Some(format!(
+                    "token-refresh sign-method `{target}` is not a known method"
+                )),
+                Some(m) => {
+                    let signs = find_section(&m.sections, "Steps").is_some_and(|steps| {
+                        steps
+                            .blocks
+                            .iter()
+                            .any(|b| block_val(b, "op") == "sign-jwt")
+                    });
+                    (!signs).then(|| {
+                        format!("token-refresh sign-method `{target}` has no sign-jwt step")
+                    })
+                }
+            };
+            if let Some(problem) = problem {
+                report.push(Diag::error(&doc.meta.source, problem).at_step(&block.heading));
+            }
         }
     }
 }
@@ -1563,6 +1747,138 @@ fn lock_rel(source_rel: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock::{Block, Bullet, Meta, Section};
+
+    fn block(heading: &str, pairs: &[(&str, &str)]) -> Block {
+        Block {
+            heading: heading.into(),
+            bullets: pairs
+                .iter()
+                .map(|(k, v)| Bullet {
+                    key: (*k).into(),
+                    value: (*v).into(),
+                })
+                .collect(),
+        }
+    }
+
+    fn doc(
+        kind: Kind,
+        scope: Option<Scope>,
+        id: &str,
+        section: &str,
+        blocks: Vec<Block>,
+    ) -> LockDoc {
+        LockDoc {
+            meta: Meta::pending(kind, scope, id, format!("{id}.md")),
+            sections: vec![Section {
+                name: section.into(),
+                bullets: Vec::new(),
+                table: None,
+                blocks,
+                none: false,
+            }],
+        }
+    }
+
+    fn sign_method(issue_refresh: &str) -> LockDoc {
+        doc(
+            Kind::Method,
+            None,
+            "user/methods/sign-token",
+            "Steps",
+            vec![block(
+                "### s1",
+                &[
+                    ("op", "sign-jwt"),
+                    ("key-ref", "secret:JWT_SIGNING_KEY"),
+                    ("issue-refresh", issue_refresh),
+                    ("source-lines", "3-9"),
+                ],
+            )],
+        )
+    }
+
+    #[test]
+    fn sign_jwt_issue_refresh_is_supported() {
+        for mode in ["platform-decided", "new-family", "none"] {
+            let mut report = Report::new();
+            check_method(&sign_method(mode), "m", &mut report);
+            assert!(
+                !report
+                    .diags
+                    .iter()
+                    .any(|d| d.message.contains("issue-refresh")),
+                "{mode}: {:?}",
+                report.diags
+            );
+        }
+        let mut report = Report::new();
+        check_method(&sign_method("rotate"), "m", &mut report);
+        assert!(report.errors().any(|d| d.message.contains("issue-refresh")));
+    }
+
+    #[test]
+    fn token_refresh_sign_method_must_exist_and_sign() {
+        let route = |target: &str| {
+            doc(
+                Kind::Api,
+                Some(Scope::Feature),
+                "auth/refresh",
+                "Pipelines",
+                vec![block(
+                    "### token-refresh",
+                    &[("sign-method", target), ("source-lines", "1-4")],
+                )],
+            )
+        };
+        let mut docs = HashMap::new();
+        docs.insert(
+            "user/methods/sign-token".into(),
+            sign_method("platform-decided"),
+        );
+        docs.insert("auth/refresh".into(), route("user.sign-token"));
+        let mut report = Report::new();
+        check_refresh_sign_methods(&docs, &mut report);
+        assert!(!report.has_errors(), "{:?}", report.diags);
+        docs.insert("auth/refresh".into(), route("user.sign-tokn"));
+        let mut report = Report::new();
+        check_refresh_sign_methods(&docs, &mut report);
+        assert!(
+            report
+                .errors()
+                .any(|d| d.message.contains("not a known method")),
+            "{:?}",
+            report.diags
+        );
+    }
+
+    #[test]
+    fn sign_jwt_alg_may_be_omitted_but_not_unknown() {
+        // Decision 139 (#226): an omitted alg means ES256.
+        let body = |alg: &str| {
+            format!(
+                "## Signature\n- input: {{email: string}}\n- output: {{t: string}}\n- writes: false\n- capabilities: [sign-token]\n\n## Steps\n\n### s1\n\n- op: sign-jwt\n{alg}- key-ref: VIBE_JWT_PRIVATE_KEY\n- out: t\n"
+            )
+        };
+        let alg_errors = |text: String| {
+            let lock = LockDoc {
+                meta: Meta::pending(Kind::Method, None, "user/methods/issue", "issue.md"),
+                sections: crate::lock::parse_sections(&text).unwrap(),
+            };
+            let mut report = Report::new();
+            check_method(&lock, "issue.md", &mut report);
+            report
+                .errors()
+                .filter(|d| d.message.contains("alg must be"))
+                .count()
+        };
+        assert_eq!(alg_errors(body("")), 0);
+        assert_eq!(alg_errors(body("- alg: ES256\n")), 0);
+        assert_eq!(alg_errors(body("- alg: RS256\n")), 0);
+        assert_eq!(alg_errors(body("- alg: HS256\n")), 1);
+        assert_eq!(alg_errors(body("- alg: none\n")), 1);
+    }
 
     #[test]
     fn delete_sql_is_rejected() {
@@ -1576,7 +1892,7 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("WHERE")));
     }
 
-    fn doc(kind: Kind, scope: Option<Scope>, id: &str, body: &str) -> LockDoc {
+    fn parsed_doc(kind: Kind, scope: Option<Scope>, id: &str, body: &str) -> LockDoc {
         LockDoc {
             meta: crate::lock::Meta::pending(kind, scope, id, format!("{id}.md")),
             sections: crate::lock::parse_sections(body).unwrap(),
@@ -1585,10 +1901,13 @@ mod tests {
 
     fn target_docs() -> HashMap<String, LockDoc> {
         let mut docs = HashMap::new();
-        docs.insert("product".into(), doc(Kind::Model, None, "product", ""));
+        docs.insert(
+            "product".into(),
+            parsed_doc(Kind::Model, None, "product", ""),
+        );
         docs.insert(
             "product/methods/publish".into(),
-            doc(Kind::Method, None, "product/methods/publish", ""),
+            parsed_doc(Kind::Method, None, "product/methods/publish", ""),
         );
         docs
     }
@@ -1629,7 +1948,7 @@ mod tests {
         let body = "## Steps\n### s1\n- op: method\n- target: product.nonexistent\n";
         docs.insert(
             "catalog/v1/x".into(),
-            doc(Kind::Api, Some(Scope::Feature), "api/catalog/v1/x/x", body),
+            parsed_doc(Kind::Api, Some(Scope::Feature), "api/catalog/v1/x/x", body),
         );
         let mut report = Report::new();
         check_targets(&docs, &mut report);
@@ -1649,7 +1968,7 @@ mod tests {
             let body = format!("## Calls\n- methods: {list}\n");
             docs.insert(
                 "product/methods/x".into(),
-                doc(Kind::Method, None, "product/methods/x", &body),
+                parsed_doc(Kind::Method, None, "product/methods/x", &body),
             );
             let mut report = Report::new();
             check_targets(&docs, &mut report);
@@ -1669,7 +1988,7 @@ mod tests {
         let body = "## Signature\n- writes: false\n## Calls\n- methods: [product.ghost]\n## Steps\n### s1 method\n- op: method\n- target: nope.get\n- out: r\n### s2 call\n- op: call\n- target: https://example.com/hook\n";
         docs.insert(
             "product/methods/caller".into(),
-            doc(Kind::Method, None, "models/product/methods/caller", body),
+            parsed_doc(Kind::Method, None, "models/product/methods/caller", body),
         );
         let mut report = Report::new();
         check_targets(&docs, &mut report);
@@ -1679,10 +1998,239 @@ mod tests {
         assert!(!msgs.iter().any(|m| m.contains("example.com")), "{msgs:?}");
     }
 
+    const WRITER: &str = "## Signature\n- writes: true\n## Steps\n### s1 query\n- op: query\n- sql: `INSERT INTO product (name) VALUES ($1)`\n- params: [input.name]\n- writes: true\n";
+    const READER: &str = "## Signature\n- writes: false\n## Steps\n### s1 query\n- op: query\n- sql: `SELECT id FROM product WHERE id = $1`\n- params: [input.id]\n";
+
+    fn wrapper(sig: &str, target: &str, step_writes: Option<&str>) -> String {
+        let marker = step_writes
+            .map(|w| format!("- writes: {w}\n"))
+            .unwrap_or_default();
+        format!("## Signature\n- writes: {sig}\n## Steps\n### s1 method\n- op: method\n- target: {target}\n- out: r\n{marker}")
+    }
+
+    fn inherited_errors(methods: &[(&str, String)]) -> Vec<String> {
+        let mut docs = HashMap::new();
+        let mut report = Report::new();
+        for (name, body) in methods {
+            let id = format!("models/product/methods/{name}");
+            let d = parsed_doc(Kind::Method, None, &id, body);
+            check_method(&d, "x.lock.md", &mut report);
+            docs.insert(format!("product/methods/{name}"), d);
+        }
+        check_method_inherited_writes(&docs, &mut report);
+        report.errors().map(|d| d.message.clone()).collect()
+    }
+
+    #[test]
+    fn wrapper_inherits_writes_from_called_method() {
+        let ok = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("wrap", wrapper("true", "product.save", Some("true"))),
+        ]);
+        assert!(ok.is_empty(), "{ok:?}");
+        let unmarked_step = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("wrap", wrapper("true", "product.save", None)),
+        ]);
+        assert!(unmarked_step.is_empty(), "{unmarked_step:?}");
+    }
+
+    #[test]
+    fn wrapper_marked_writes_false_fails() {
+        let msgs = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("wrap", wrapper("false", "product.save", None)),
+        ]);
+        assert!(
+            msgs.iter()
+                .any(|m| m == "writes: false but a called method writes"),
+            "{msgs:?}"
+        );
+        let msgs = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("wrap", wrapper("true", "product.save", Some("false"))),
+        ]);
+        assert!(
+            msgs.iter().any(|m| m.contains("marked `writes: false`")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn wrapper_of_read_method_cannot_claim_writes() {
+        let msgs = inherited_errors(&[
+            ("get", READER.into()),
+            ("wrap", wrapper("true", "product.get", Some("true"))),
+        ]);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("`product.get` does not write")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m == "writes: true but no step writes SQL"),
+            "{msgs:?}"
+        );
+        let ok = inherited_errors(&[
+            ("get", READER.into()),
+            ("wrap", wrapper("false", "product.get", None)),
+        ]);
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn writes_inherit_through_multiple_levels() {
+        let ok = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("mid", wrapper("true", "product.save", None)),
+            ("top", wrapper("true", "product.mid", None)),
+        ]);
+        assert!(ok.is_empty(), "{ok:?}");
+        let msgs = inherited_errors(&[
+            ("save", WRITER.into()),
+            ("mid", wrapper("true", "product.save", None)),
+            ("top", wrapper("false", "product.mid", None)),
+        ]);
+        assert_eq!(
+            msgs,
+            vec!["writes: false but a called method writes"],
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_writes_terminate_on_cycles() {
+        let msgs = inherited_errors(&[
+            ("a", wrapper("false", "product.b", None)),
+            ("b", wrapper("false", "product.a", None)),
+        ]);
+        assert!(!msgs.iter().any(|m| m.contains("writes")), "{msgs:?}");
+        let mut docs = HashMap::new();
+        for (name, body) in [
+            ("a", wrapper("false", "product.b", None)),
+            (
+                "b",
+                format!(
+                    "{}### s2 method\n- op: method\n- target: product.save\n- out: q\n",
+                    wrapper("false", "product.a", None)
+                ),
+            ),
+            ("save", WRITER.to_string()),
+        ] {
+            let id = format!("models/product/methods/{name}");
+            docs.insert(
+                format!("product/methods/{name}"),
+                parsed_doc(Kind::Method, None, &id, &body),
+            );
+        }
+        assert!(crate::security::method_doc_writes(&docs, "product.a"));
+        assert!(crate::security::known_method_writes(&docs, "product.b"));
+    }
+
+    #[test]
+    fn unknown_method_targets_fail_validation_and_count_as_writes() {
+        let mut docs = HashMap::new();
+        docs.insert(
+            "product/methods/wrap".to_string(),
+            parsed_doc(
+                Kind::Method,
+                None,
+                "models/product/methods/wrap",
+                &wrapper("false", "product.missing", None),
+            ),
+        );
+        docs.insert(
+            "product".to_string(),
+            parsed_doc(Kind::Model, None, "models/product", "## Fields\n"),
+        );
+        // Validation rejects the unknown target...
+        assert!(check_method_target("product.missing", &docs).is_err());
+        assert!(check_method_target("nothing.here", &docs).is_err());
+        // ...and risk grading never treats it as read-only.
+        for target in ["product.missing", "nothing.here", "no-dot", "product.wrap"] {
+            assert!(
+                crate::security::method_doc_writes(&docs, target),
+                "{target} must count as a write for risk"
+            );
+        }
+        // Read-only CRUD on an existing model is not a write; write CRUD is.
+        assert!(!crate::security::method_doc_writes(&docs, "product.get"));
+        assert!(!crate::security::method_doc_writes(&docs, "product.list"));
+        assert!(crate::security::method_doc_writes(&docs, "product.create"));
+        // Validation-side inheritance ignores unresolved targets (reported above).
+        assert!(!crate::security::known_method_writes(
+            &docs,
+            "product.missing"
+        ));
+    }
+
+    fn method_errors(body: &str) -> Vec<String> {
+        let d = parsed_doc(Kind::Method, None, "models/product/methods/x", body);
+        let mut report = Report::new();
+        check_method(&d, "x.lock.md", &mut report);
+        report.errors().map(|d| d.message.clone()).collect()
+    }
+
+    #[test]
+    fn writes_must_match_what_the_steps_do() {
+        let select = "### s1 query\n- op: query\n- sql: `select id from t where id = $1`\n- params: [input.id]\n";
+        let insert = "### s1 query\n- op: query\n- sql: `insert into t (a) values ($1)`\n- params: [input.a]\n";
+        // A read step marked as writing.
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: true\n## Steps\n{select}- writes: true\n"
+        ));
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("marked `writes: true` but its SQL does not write")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m == "writes: true but no step writes SQL"),
+            "{msgs:?}"
+        );
+        // A write step without the marker, and a Signature without writes.
+        let msgs = method_errors(&format!("## Signature\n- errors: []\n## Steps\n{insert}"));
+        assert!(
+            msgs.iter().any(|m| m.contains("not marked `writes: true`")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("writes: false but a step writes SQL")),
+            "{msgs:?}"
+        );
+        // Malformed or duplicate values.
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: yes\n## Steps\n{insert}- writes: true\n"
+        ));
+        assert!(
+            msgs.iter().any(|m| m.contains("invalid writes `yes`")),
+            "{msgs:?}"
+        );
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: true\n## Steps\n{insert}- writes: true\n- writes: false\n"
+        ));
+        assert!(
+            msgs.iter().any(|m| m.contains("duplicate `writes`")),
+            "{msgs:?}"
+        );
+        // Consistent locks pass.
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: true\n## Steps\n{insert}- writes: true\n- scope: pk\n"
+        ));
+        assert!(!msgs.iter().any(|m| m.contains("writes")), "{msgs:?}");
+        let msgs = method_errors(&format!(
+            "## Signature\n- writes: false\n## Steps\n{select}- writes: false\n"
+        ));
+        assert!(!msgs.iter().any(|m| m.contains("writes")), "{msgs:?}");
+    }
+
     #[test]
     fn method_lock_steps_get_step_grammar_checks() {
         let body = "## Signature\n- writes: false\n## Calls\n- methods: []\n## Steps\n### s1 method\n- op: method\n- method: product.get\n- out: r\n### s2 validate\n- op: validate\n- when: `r == null`\n### s3 respond\n- op: respond\n- value: r\n- status: 999\n";
-        let d = doc(Kind::Method, None, "models/product/methods/x", body);
+        let d = parsed_doc(Kind::Method, None, "models/product/methods/x", body);
         let mut report = Report::new();
         check_method(&d, "x.lock.md", &mut report);
         let msgs: Vec<&str> = report.errors().map(|d| d.message.as_str()).collect();
@@ -1704,7 +2252,7 @@ mod tests {
         ] {
             let prompt = crate::compile::system_prompt(kind, scope);
             let body = prompt.split_once("LOCK BODY:\n").expect("example").1;
-            let lock = doc(kind, scope, id, body);
+            let lock = parsed_doc(kind, scope, id, body);
             let names: Vec<&str> = lock.sections.iter().map(|s| s.name.as_str()).collect();
             assert_eq!(names, section_order(kind, scope), "{id}");
             let mut report = Report::new();

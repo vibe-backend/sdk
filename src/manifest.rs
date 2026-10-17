@@ -49,17 +49,50 @@ pub struct AuditStamp {
 }
 
 impl AuditStamp {
+    /// Reject malformed CI identifiers before they can be signed.
+    pub fn validate(&self) -> Result<(), Report> {
+        // SemVer 2.0.0 with the release workflow's `v` prefix.
+        let tag_pattern = regex::Regex::new(
+            r"\Av(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z",
+        ).expect("release tag regex");
+        if self
+            .tag
+            .as_ref()
+            .is_some_and(|tag| !tag_pattern.is_match(tag))
+        {
+            return Err(single(
+                "audit tag (GITHUB_REF_NAME) must be v<semver>".into(),
+            ));
+        }
+        if self.commit.as_ref().is_some_and(|sha| {
+            sha.len() != 40
+                || !sha
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err(single(
+                "audit commit (GITHUB_SHA) must be exactly 40 lowercase hex characters".into(),
+            ));
+        }
+        if self
+            .run_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(single(
+                "audit run_id (GITHUB_RUN_ID) must be non-empty decimal digits".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Build a stamp from the given environment lookup and lock set.
     pub fn collect(
         docs: &HashMap<String, LockDoc>,
         env: &dyn Fn(&str) -> Option<String>,
         built_at: chrono::DateTime<chrono::Utc>,
     ) -> Self {
-        let get = |name: &str| {
-            env(name)
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        };
+        let get = |name: &str| env(name).filter(|value| !value.is_empty());
         let tag = match get("GITHUB_REF_TYPE").as_deref() {
             Some("tag") => get("GITHUB_REF_NAME"),
             _ => None,
@@ -116,6 +149,209 @@ pub struct RouteSpec {
     pub challenge_when: String,
     pub deprecated: bool,
     pub sunset: String,
+    /// `### token-refresh` pipeline: this route rotates refresh tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<RefreshSpec>,
+    /// `### token-revoke` pipeline: revoke refresh tokens before the steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoke: Option<RevokeSpec>,
+}
+
+/// Platform refresh-token rotation (spec 4A.1).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RefreshSpec {
+    /// Method that signs the new access token (needs `sign-token`).
+    pub sign_method: String,
+    pub refresh_ttl_s: i64,
+    pub idle_ttl_s: i64,
+    pub reuse_grace_s: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RevokeSpec {
+    /// `family` (the presented refresh token's family) or `all` (every
+    /// family of the caller).
+    pub scope: String,
+}
+
+pub const MAX_REFRESH_TTL_S: i64 = 30 * 86_400;
+pub const MAX_IDLE_TTL_S: i64 = 7 * 86_400;
+/// Spec §4A.1 (decision 61): `reuse-grace` defaults to 10s and is at most 10s.
+pub const DEFAULT_REUSE_GRACE_S: i64 = 10;
+pub const MAX_REUSE_GRACE_S: i64 = 10;
+
+/// Startup check of a manifest's token-refresh settings (a manifest built by
+/// an older compiler may carry values outside the current limits).
+pub fn refresh_spec_problem(route: &str, spec: &RefreshSpec) -> Option<String> {
+    let checks = [
+        ("refresh-ttl", spec.refresh_ttl_s, MAX_REFRESH_TTL_S),
+        ("idle-ttl", spec.idle_ttl_s, MAX_IDLE_TTL_S),
+        ("reuse-grace", spec.reuse_grace_s, MAX_REUSE_GRACE_S),
+    ];
+    checks.iter().find_map(|(name, value, max)| {
+        (!(1..=*max).contains(value)).then(|| {
+            format!("route {route}: token-refresh {name} is {value}s; it must be between 1s and {max}s (spec §4A.1); recompile the lock")
+        })
+    })
+}
+
+fn bullet<'a>(bullets: &'a [crate::lock::Bullet], key: &str) -> Option<&'a str> {
+    bullets
+        .iter()
+        .find(|b| b.key == key)
+        .map(|b| b.value.trim())
+}
+
+fn secs(raw: Option<&str>, default: i64, max: i64, name: &str) -> Result<i64, String> {
+    let Some(raw) = raw else { return Ok(default) };
+    let raw = raw.trim();
+    let (number, unit) = [
+        ("ms", 1u128),
+        ("s", 1000),
+        ("m", 60_000),
+        ("h", 3_600_000),
+        ("d", 86_400_000),
+    ]
+    .into_iter()
+    .find_map(|(suffix, unit)| raw.strip_suffix(suffix).map(|n| (n.trim(), unit)))
+    .unwrap_or((raw, 1000));
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(format!("token-refresh {name}: bad duration `{raw}`"));
+    }
+    // Multiply decimal digits before converting to whole seconds.
+    let mut digits = Vec::new();
+    let mut carry = 0;
+    for digit in whole.bytes().chain(fraction.bytes()).rev() {
+        carry += u128::from(digit - b'0') * unit;
+        digits.push((carry % 10) as u8 + b'0');
+        carry /= 10;
+    }
+    while carry > 0 {
+        digits.push((carry % 10) as u8 + b'0');
+        carry /= 10;
+    }
+    while digits.len() <= fraction.len() {
+        digits.push(b'0');
+    }
+    digits.reverse();
+    let split = digits.len() - fraction.len();
+    let ms = std::str::from_utf8(&digits[..split])
+        .ok()
+        .and_then(|n| n.parse::<u128>().ok());
+    let fractional = digits[split..].iter().any(|b| *b != b'0');
+    let cap = max as u128 * 1000;
+    let Some(ms) = ms.filter(|ms| *ms >= 1000 && (*ms < cap || (*ms == cap && !fractional))) else {
+        return Err(format!(
+            "token-refresh {name} must be between 1s and {max}s"
+        ));
+    };
+    let s = (ms / 1000) as i64;
+    Ok(s)
+}
+
+/// Parses a `### token-refresh` block.
+pub fn parse_refresh_block(bullets: &[crate::lock::Bullet]) -> Result<RefreshSpec, String> {
+    let sign_method = bullet(bullets, "sign-method").unwrap_or("").to_string();
+    if sign_method.is_empty() {
+        return Err("token-refresh needs sign-method".into());
+    }
+    match bullet(bullets, "transport") {
+        None | Some("body") => {}
+        Some(other) => {
+            return Err(format!(
+                "token-refresh transport `{other}` is not supported by this runtime (only body)"
+            ))
+        }
+    }
+    for b in bullets {
+        // `source-lines` is metadata the compiler adds to every block.
+        if b.key == "source-lines" {
+            continue;
+        }
+        if ![
+            "sign-method",
+            "refresh-ttl",
+            "idle-ttl",
+            "reuse-grace",
+            "transport",
+        ]
+        .contains(&b.key.as_str())
+        {
+            return Err(format!("unknown token-refresh option `{}`", b.key));
+        }
+    }
+    Ok(RefreshSpec {
+        sign_method,
+        refresh_ttl_s: secs(
+            bullet(bullets, "refresh-ttl"),
+            MAX_REFRESH_TTL_S,
+            MAX_REFRESH_TTL_S,
+            "refresh-ttl",
+        )?,
+        idle_ttl_s: secs(
+            bullet(bullets, "idle-ttl"),
+            MAX_IDLE_TTL_S,
+            MAX_IDLE_TTL_S,
+            "idle-ttl",
+        )?,
+        reuse_grace_s: secs(
+            bullet(bullets, "reuse-grace"),
+            DEFAULT_REUSE_GRACE_S,
+            MAX_REUSE_GRACE_S,
+            "reuse-grace",
+        )?,
+    })
+}
+
+/// Checks that a `token-refresh` `sign-method` names an existing method
+/// with a `sign-jwt` step. A typo here must fail the build, not every
+/// refresh call at runtime.
+pub fn refresh_sign_method_problem(sign_method: &str, methods: &[MethodSpec]) -> Option<String> {
+    match methods.iter().find(|m| m.target == sign_method) {
+        None => Some(format!(
+            "token-refresh sign-method `{sign_method}` is not a known method"
+        )),
+        Some(m) if !m.steps.iter().any(|s| s.op == "sign-jwt") => Some(format!(
+            "token-refresh sign-method `{sign_method}` has no sign-jwt step"
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Parses a `### token-revoke` block.
+pub fn parse_revoke_block(bullets: &[crate::lock::Bullet]) -> Result<RevokeSpec, String> {
+    let scope = bullet(bullets, "scope").unwrap_or("family");
+    if scope != "family" && scope != "all" {
+        return Err(format!(
+            "token-revoke scope must be family or all (got `{scope}`)"
+        ));
+    }
+    Ok(RevokeSpec {
+        scope: scope.to_string(),
+    })
+}
+
+/// Route-shape rules for the refresh pipelines.
+pub fn check_refresh_route(
+    refresh: Option<&RefreshSpec>,
+    revoke: Option<&RevokeSpec>,
+    public: bool,
+    auth_removed: bool,
+) -> Result<(), String> {
+    if refresh.is_some() && revoke.is_some() {
+        return Err("a route cannot have both token-refresh and token-revoke".into());
+    }
+    if refresh.is_some() && !(public && auth_removed) {
+        return Err("token-refresh routes must be public with auth removed (the refresh token is the credential)".into());
+    }
+    if revoke.is_some() && auth_removed {
+        return Err("token-revoke needs auth".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -180,16 +416,11 @@ pub fn check_rate_key(key: &str, auth_removed: bool, auth_mode: &str) -> Result<
             Err("rate-limit key `api-key` needs `auth: { mode: api-key }`".into())
         }
         "api-key" => Ok(()),
-        "family" => Err(
-            "rate-limit key `family` is only for token-refresh, which is not implemented yet (see #26)"
-                .into(),
-        ),
+        "family" => Err("rate-limit key `family` is only allowed on token-refresh routes".into()),
         _ => match key.strip_prefix("input.") {
             Some(field)
                 if !field.is_empty()
-                    && field
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                    && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
             {
                 Ok(())
             }
@@ -317,11 +548,9 @@ pub fn manifest_from_project(root: &Path, signing_key: &SigningKey) -> Result<Ma
     })?;
     let docs = load_docs(root)?;
     let mut manifest = build_manifest(&docs)?;
-    manifest.audit = Some(AuditStamp::collect(
-        &docs,
-        &|name| std::env::var(name).ok(),
-        chrono::Utc::now(),
-    ));
+    let audit = AuditStamp::collect(&docs, &|name| std::env::var(name).ok(), chrono::Utc::now());
+    audit.validate()?;
+    manifest.audit = Some(audit);
     manifest.signature = String::new();
     let bytes =
         serde_json::to_vec(&manifest).map_err(|err| single(format!("manifest json: {err}")))?;
@@ -394,6 +623,13 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
                 crud_model: model.id.clone(),
                 crud_action: action.clone(),
             });
+        }
+    }
+    for route in &routes {
+        if let Some(spec) = &route.refresh {
+            if let Some(err) = refresh_sign_method_problem(&spec.sign_method, &methods) {
+                report.push(Diag::error(&route.feature_id, err).at_section("Pipelines"));
+            }
         }
     }
     if report.has_errors() {
@@ -531,6 +767,48 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
     }
 }
 
+/// The single value of `key` in `bullets`. A repeated key is an error.
+pub(crate) fn single_value<'a>(
+    bullets: &'a [crate::lock::Bullet],
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    let mut found = bullets.iter().filter(|b| b.key == key);
+    let first = found.next().map(|b| b.value.as_str());
+    if found.next().is_some() {
+        return Err(format!("duplicate `{key}`"));
+    }
+    Ok(first)
+}
+
+/// Strict `writes`: absent is `None`; present must be exactly `true` or
+/// `false` and appear once.
+pub(crate) fn parse_writes(bullets: &[crate::lock::Bullet]) -> Result<Option<bool>, String> {
+    match single_value(bullets, "writes")?.map(str::trim) {
+        None => Ok(None),
+        Some("true") => Ok(Some(true)),
+        Some("false") => Ok(Some(false)),
+        Some(other) => Err(format!(
+            "invalid writes `{other}`: expected `true` or `false`"
+        )),
+    }
+}
+
+/// Strict step `status`: absent is `None`; present must be a plain decimal
+/// HTTP status (100-599) and appear once.
+pub(crate) fn parse_status(bullets: &[crate::lock::Bullet]) -> Result<Option<u16>, String> {
+    let Some(raw) = single_value(bullets, "status")? else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    let valid = !raw.is_empty() && raw.len() == 3 && raw.bytes().all(|b| b.is_ascii_digit());
+    match raw.parse::<u16>() {
+        Ok(code) if valid && (100..600).contains(&code) => Ok(Some(code)),
+        _ => Err(format!(
+            "invalid status `{raw}`: expected an HTTP status (100-599)"
+        )),
+    }
+}
+
 fn method_from(doc: &LockDoc) -> Result<MethodSpec, Diag> {
     let target = doc
         .meta
@@ -539,7 +817,12 @@ fn method_from(doc: &LockDoc) -> Result<MethodSpec, Diag> {
         .map(|(object, method)| format!("{object}.{method}"))
         .unwrap_or_else(|| doc.meta.id.clone());
     let signature = find_section(&doc.sections, "Signature");
-    let writes = signature.and_then(|s| s.get("writes")) == Some("true");
+    let writes = match signature {
+        Some(sig) => parse_writes(&sig.bullets)
+            .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Signature"))?
+            .unwrap_or(false),
+        None => false,
+    };
     let mut errors = Vec::new();
     if let Some(raw) = signature.and_then(|s| s.get("errors")) {
         errors = crate::lock::parse_string_list(raw).map_err(|err| {
@@ -604,9 +887,23 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
     let mut jwt_aud = String::new();
     let mut jwks_uri = String::new();
     let mut rates = Vec::new();
+    let mut refresh = None;
+    let mut revoke = None;
     if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
         for block in &pipes.blocks {
             let name = pipeline_name(&block.heading);
+            if name == "token-refresh" {
+                refresh = Some(
+                    parse_refresh_block(&block.bullets)
+                        .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?,
+                );
+            }
+            if name == "token-revoke" {
+                revoke = Some(
+                    parse_revoke_block(&block.bullets)
+                        .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?,
+                );
+            }
             if name == "-auth"
                 || (name == "auth"
                     && block
@@ -684,12 +981,17 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
             }
         }
     }
+    check_refresh_route(refresh.as_ref(), revoke.as_ref(), public, auth_removed)
+        .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
     if let Some(problem) =
         jwt_override_problem(&jwt_iss, &jwt_aud, &jwks_uri, auth_removed, &auth_mode)
     {
         return Err(Diag::error(&doc.meta.id, problem).at_section("Pipelines"));
     }
     for rate in &rates {
+        if rate.key == "family" && refresh.is_some() {
+            continue;
+        }
         check_rate_key(&rate.key, auth_removed, &auth_mode)
             .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
     }
@@ -738,6 +1040,8 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         challenge_when,
         deprecated,
         sunset,
+        refresh,
+        revoke,
     })
 }
 
@@ -831,21 +1135,30 @@ fn steps_from(section: Option<&crate::lock::Section>, file: &str) -> Result<Vec<
                 Diag::error(file, format!("invalid params: {err}")).at_section("Steps")
             })?;
         }
+        let step_err = |err: String| {
+            Diag::error(file, err)
+                .at_step(&block.heading)
+                .at_section("Steps")
+        };
+        let status = parse_status(&block.bullets)
+            .map_err(step_err)?
+            .unwrap_or(if op == "respond" { 200 } else { 0 });
+        let writes = parse_writes(&block.bullets)
+            .map_err(step_err)?
+            .unwrap_or(false);
         steps.push(StepSpec {
             id,
             op: op.clone(),
             target: get("target"),
             args: get("args"),
             value: get("value"),
-            status: get("status")
-                .parse()
-                .unwrap_or(if op == "respond" { 200 } else { 0 }),
+            status,
             sql: get("sql").trim_matches('`').trim().to_string(),
             params,
             out: get("out"),
             fail: get("fail"),
             when_expr: get("when"),
-            writes: get("writes") == "true",
+            writes,
             table: get("table"),
             opts: block
                 .bullets
@@ -1167,9 +1480,10 @@ mod roles_list_tests {
 
 #[cfg(test)]
 mod malformed_list_tests {
-    use super::{method_from, steps_from};
+    use super::{method_from, route_from, steps_from, MethodSpec};
     use crate::diag::Level;
-    use crate::lock::{parse_sections, Kind, LockDoc, Meta};
+    use crate::lock::{parse_sections, Kind, LockDoc, Meta, Scope};
+    use std::collections::HashMap;
 
     fn method_doc(body: &str) -> LockDoc {
         LockDoc {
@@ -1208,6 +1522,80 @@ mod malformed_list_tests {
     }
 
     #[test]
+    fn writes_must_be_exactly_true_or_false() {
+        for bad in ["TRUE", "yes", "1", "", "true, false"] {
+            let doc = method_doc(&format!("## Signature\n\n- writes: {bad}\n"));
+            let err = method_from(&doc).unwrap_err();
+            assert!(err.message.contains("invalid writes"), "{bad:?}: {err:?}");
+        }
+        let doc = method_doc("## Signature\n\n- writes: false\n- writes: true\n");
+        assert!(method_from(&doc)
+            .unwrap_err()
+            .message
+            .contains("duplicate `writes`"));
+        let doc = method_doc(
+            "## Signature\n\n- writes: false\n\n## Steps\n\n### s1\n\n- op: query\n- writes: True\n",
+        );
+        assert!(method_from(&doc)
+            .unwrap_err()
+            .message
+            .contains("invalid writes"));
+        let doc = method_doc("## Steps\n\n### s1\n\n- op: query\n- writes: true\n- writes: true\n");
+        assert!(method_from(&doc)
+            .unwrap_err()
+            .message
+            .contains("duplicate `writes`"));
+    }
+
+    #[test]
+    fn status_must_be_an_http_status() {
+        for bad in ["abc", "", "99", "600", "+200", "200.0", "0200", "2 00"] {
+            let doc = method_doc(&format!(
+                "## Steps\n\n### s1\n\n- op: respond\n- status: {bad}\n"
+            ));
+            let err = method_from(&doc).unwrap_err();
+            assert!(err.message.contains("invalid status"), "{bad:?}: {err:?}");
+        }
+        let doc = method_doc("## Steps\n\n### s1\n\n- op: respond\n- status: 201\n- status: 200\n");
+        assert!(method_from(&doc)
+            .unwrap_err()
+            .message
+            .contains("duplicate `status`"));
+        let doc = method_doc("## Steps\n\n### s1\n\n- op: respond\n");
+        assert_eq!(method_from(&doc).unwrap().steps[0].status, 200);
+    }
+
+    #[test]
+    fn valid_method_round_trip() {
+        let doc = method_doc(
+            "## Signature\n\n- writes: true\n- errors: [NOT_FOUND, TAKEN]\n- capabilities: [sign-token]\n\n## Steps\n\n### s1 query\n\n- op: query\n- sql: `INSERT INTO t (a, b) VALUES ($1, $2)`\n- params: [input.a, input.b]\n- writes: true\n\n### s2 respond\n\n- op: respond\n- status: 201\n",
+        );
+        let method = method_from(&doc).unwrap();
+        assert!(method.writes);
+        assert_eq!(method.errors, vec!["NOT_FOUND", "TAKEN"]);
+        assert_eq!(method.capabilities, vec!["sign-token"]);
+        assert_eq!(method.steps[0].params, vec!["input.a", "input.b"]);
+        assert!(method.steps[0].writes);
+        assert_eq!(method.steps[1].status, 201);
+        let json = serde_json::to_string(&method).unwrap();
+        let back: MethodSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn malformed_params_in_an_api_route_is_a_build_error() {
+        let doc = LockDoc {
+            meta: Meta::pending(Kind::Api, Some(Scope::Feature), "shop/api/x", "shop/api/x.md"),
+            sections: parse_sections(
+                "## Route\n\n- method: GET\n- path: /x\n\n## Steps\n\n### s1\n\n- op: respond\n- params: a, b\n",
+            )
+            .unwrap(),
+        };
+        let err = route_from(&doc, &HashMap::new()).unwrap_err();
+        assert!(err.message.contains("invalid params"), "{err:?}");
+    }
+
+    #[test]
     fn absent_lists_stay_empty() {
         let doc = LockDoc {
             meta: Meta::pending(Kind::Method, None, "shop/methods/ok", "shop/methods/ok.md"),
@@ -1238,10 +1626,9 @@ mod rate_key_tests {
         assert!(check_rate_key("user", true, "jwt").is_err());
         let family = check_rate_key("family", false, "jwt").unwrap_err();
         assert!(
-            family.contains("family is only for token-refresh")
-                || family.contains("`family` is only for token-refresh")
+            family.contains("only allowed on token-refresh routes"),
+            "{family}"
         );
-        assert!(family.contains("not implemented") && family.contains("#26"));
         for bad in ["per-hour", "per-day", "burst"] {
             assert!(super::check_rate_params(["key", bad]).is_err(), "{bad}");
         }
@@ -1291,12 +1678,79 @@ mod audit_tests {
     }
 
     #[test]
+    fn stamp_identifier_formats() {
+        let mut stamp = AuditStamp::collect(&docs(), &|_| None, at());
+        assert!(stamp.validate().is_ok());
+        for tag in ["v0.0.0", "v1.8.0", "v1.2.3-rc.1+build.42"] {
+            stamp.tag = Some(tag.into());
+            assert!(stamp.validate().is_ok(), "{tag}");
+        }
+        for (field, values) in [
+            (
+                "tag",
+                vec![
+                    "",
+                    "1.2.3",
+                    "v1",
+                    "v01.2.3",
+                    "v1.2.3-01",
+                    "v1.2.3\n",
+                    " v1.2.3",
+                ],
+            ),
+            (
+                "commit",
+                vec![
+                    "",
+                    "abc123",
+                    "ABCDEF0123456789abcdef0123456789abcdef0123",
+                    "0123456789abcdef0123456789abcdef012345678",
+                    "g123456789abcdef0123456789abcdef01234567",
+                ],
+            ),
+            ("run_id", vec!["", " 42", "42\n", "+42", "4.2", "１２"]),
+        ] {
+            for value in values {
+                let mut candidate = AuditStamp::collect(&docs(), &|_| None, at());
+                match field {
+                    "tag" => candidate.tag = Some(value.into()),
+                    "commit" => candidate.commit = Some(value.into()),
+                    "run_id" => candidate.run_id = Some(value.into()),
+                    _ => unreachable!(),
+                }
+                let error = candidate.validate().unwrap_err().to_string();
+                assert!(error.contains(field), "{field}: {value:?}: {error}");
+            }
+        }
+        stamp.commit = Some("0123456789abcdef0123456789abcdef01234567".into());
+        stamp.run_id = Some("0042".into());
+        assert!(stamp.validate().is_ok());
+    }
+
+    #[test]
+    fn stamp_empty_ci_identifiers_are_absent() {
+        let env = |name: &str| {
+            match name {
+                "GITHUB_REF_TYPE" => Some("tag"),
+                "GITHUB_SHA" | "GITHUB_RUN_ID" | "GITHUB_REF_NAME" => Some(""),
+                _ => None,
+            }
+            .map(String::from)
+        };
+        let stamp = AuditStamp::collect(&docs(), &env, at());
+        assert_eq!(stamp.commit, None);
+        assert_eq!(stamp.run_id, None);
+        assert_eq!(stamp.tag, None);
+        assert!(stamp.validate().is_ok());
+    }
+
+    #[test]
     fn stamp_from_tag_build() {
         let env = |name: &str| {
             match name {
                 "GITHUB_REF_TYPE" => Some("tag"),
                 "GITHUB_REF_NAME" => Some("v1.8.0"),
-                "GITHUB_SHA" => Some("abc123"),
+                "GITHUB_SHA" => Some("0123456789abcdef0123456789abcdef01234567"),
                 "GITHUB_RUN_ID" => Some("42"),
                 "VIBE_LLM_API_KEY" => Some("must-not-appear"),
                 _ => None,
@@ -1305,7 +1759,10 @@ mod audit_tests {
         };
         let stamp = AuditStamp::collect(&docs(), &env, at());
         assert_eq!(stamp.tag.as_deref(), Some("v1.8.0"));
-        assert_eq!(stamp.commit.as_deref(), Some("abc123"));
+        assert_eq!(
+            stamp.commit.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
         assert_eq!(stamp.run_id.as_deref(), Some("42"));
         assert_eq!(stamp.compiler_hashes, vec!["h1", "h2"]);
         assert_eq!(stamp.built_at, "2026-10-16T04:00:00Z");
@@ -1345,7 +1802,11 @@ mod audit_tests {
         write_manifest(&path, &manifest).unwrap();
         assert!(read_manifest(&path, &key.verifying_key()).is_ok());
 
-        manifest.audit = Some(AuditStamp::collect(&docs(), &|_| None, at()));
+        let mut audit = AuditStamp::collect(&docs(), &|_| None, at());
+        audit.tag = Some("v1.8.0".into());
+        audit.commit = Some("0123456789abcdef0123456789abcdef01234567".into());
+        audit.run_id = Some("42".into());
+        manifest.audit = Some(audit);
         manifest.signature.clear();
         let bytes = serde_json::to_vec(&manifest).unwrap();
         manifest.signature = sign::sign_bytes(&bytes, &key);
@@ -1353,6 +1814,25 @@ mod audit_tests {
         let read = read_manifest(&path, &key.verifying_key()).unwrap();
         assert_eq!(read.audit, manifest.audit);
 
+        let original = manifest.clone();
+        for field in ["tag", "commit", "run_id", "compiler_hashes", "built_at"] {
+            let mut changed = original.clone();
+            let audit = changed.audit.as_mut().unwrap();
+            match field {
+                "tag" => audit.tag = Some("v2.0.0".into()),
+                "commit" => audit.commit = Some("a".repeat(40)),
+                "run_id" => audit.run_id = Some("123".into()),
+                "compiler_hashes" => audit.compiler_hashes.push("h3".into()),
+                "built_at" => audit.built_at = "2026-10-17T04:00:00Z".into(),
+                _ => unreachable!(),
+            }
+            write_manifest(&path, &changed).unwrap();
+            assert!(
+                read_manifest(&path, &key.verifying_key()).is_err(),
+                "{field}"
+            );
+        }
+        write_manifest(&path, &original).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         fs::write(
             &path,
@@ -1361,5 +1841,59 @@ mod audit_tests {
         .unwrap();
         assert!(read_manifest(&path, &key.verifying_key()).is_err());
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    #[test]
+    fn token_refresh_accepts_compiler_source_lines() {
+        let bullets = vec![
+            crate::lock::Bullet {
+                key: "sign-method".into(),
+                value: "user.sign-token".into(),
+            },
+            crate::lock::Bullet {
+                key: "source-lines".into(),
+                value: "12-18".into(),
+            },
+        ];
+        let spec = parse_refresh_block(&bullets).expect("source-lines is metadata");
+        assert_eq!(spec.sign_method, "user.sign-token");
+    }
+
+    #[test]
+    fn token_refresh_sign_method_typo_is_a_build_error() {
+        let method = |steps: Vec<StepSpec>| MethodSpec {
+            target: "user.sign-token".into(),
+            writes: false,
+            input: Vec::new(),
+            errors: Vec::new(),
+            capabilities: vec!["sign-token".into()],
+            steps,
+            crud_model: String::new(),
+            crud_action: String::new(),
+        };
+        let sign: StepSpec = serde_json::from_value(serde_json::json!({
+            "id": "s", "op": "sign-jwt", "target": "", "args": "", "value": "", "status": 0,
+            "sql": "", "params": [], "out": "", "fail": "", "when_expr": "", "writes": false,
+            "table": "", "opts": {}
+        }))
+        .unwrap();
+        let methods = vec![method(vec![sign])];
+        assert_eq!(
+            refresh_sign_method_problem("user.sign-token", &methods),
+            None
+        );
+        assert!(refresh_sign_method_problem("user.sign-tokn", &methods)
+            .unwrap()
+            .contains("not a known method"));
+        assert!(
+            refresh_sign_method_problem("user.sign-token", &[method(Vec::new())])
+                .unwrap()
+                .contains("no sign-jwt step")
+        );
     }
 }
