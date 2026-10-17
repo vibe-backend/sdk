@@ -1324,7 +1324,7 @@ async fn replay_store_quotas_hold_across_instances() {
 async fn replay_store_fails_closed_when_unusable() {
     let s = require_pg!(setup().await);
     let store = PgReplayStore::new(replay_pool(&s).await, IP_SECRET);
-    // The startup check `vibe serve` runs: a tenant without the table.
+    // The startup check `vibe run` runs: a tenant without the table.
     let err = store
         .check(&["nomigrate0001".to_string()])
         .await

@@ -228,7 +228,7 @@ pub const STORE_STATUS_SQL: &str = "SELECT \
       AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql') \
       AND p.prosrc = $2)";
 
-/// Startup check run by `vibe serve` as the runtime role: for every tenant,
+/// Startup check run by `vibe run` as the runtime role: for every tenant,
 /// the refresh table grants exactly SELECT, INSERT and column UPDATE on
 /// [`UPDATABLE_COLUMNS`] (no DELETE), and the guard trigger is in place.
 /// Any problem refuses to start (fail closed).

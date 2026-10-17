@@ -1481,7 +1481,17 @@ async fn production_serve_ignores_the_project_public_key() {
     assert!(ok, "{out}");
     let (ok, out) = vibe_cli(
         &root,
-        &["serve", "--project", ".", "--addr", "127.0.0.1:0"],
+        &[
+            "run",
+            "--db",
+            "postgres",
+            "--artifact",
+            "manifest.json",
+            "--project",
+            ".",
+            "--addr",
+            "127.0.0.1:0",
+        ],
         &[
             ("VIBE_ENV", "production"),
             (
@@ -1499,7 +1509,17 @@ async fn production_serve_ignores_the_project_public_key() {
     // With a release version set, the dev manifest is still refused.
     let (ok, out) = vibe_cli(
         &root,
-        &["serve", "--project", ".", "--addr", "127.0.0.1:0"],
+        &[
+            "run",
+            "--db",
+            "postgres",
+            "--artifact",
+            "manifest.json",
+            "--project",
+            ".",
+            "--addr",
+            "127.0.0.1:0",
+        ],
         &[
             ("VIBE_ENV", "production"),
             (
@@ -1850,9 +1870,9 @@ async fn private_endpoint_deployment_requires_signed_dev_mode() {
             "VIBE_API_KEY_PEPPER",
             "test-production-pepper-at-least-32-bytes",
         )
-        .args(["serve", "--project"])
+        .args(["run", "--db", "postgres", "--project"])
         .arg(&root)
-        .arg("--manifest")
+        .arg("--artifact")
         .arg(&path)
         .output()
         .unwrap();

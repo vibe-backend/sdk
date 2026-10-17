@@ -108,7 +108,7 @@ impl Drop for PendingGuard {
     }
 }
 
-/// Which replay store `vibe serve` uses (`VIBE_CHALLENGE_REPLAY_STORE`).
+/// Which replay store `vibe run` uses (`VIBE_CHALLENGE_REPLAY_STORE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreKind {
     Memory,
@@ -284,7 +284,7 @@ impl PgReplayStore {
         ])
     }
 
-    /// Startup check run by `vibe serve`: every listed tenant has the table,
+    /// Startup check run by `vibe run`: every listed tenant has the table,
     /// usable by this role, and the role cannot DELETE, UPDATE or TRUNCATE it.
     pub async fn check(&self, tenants: &[String]) -> Result<(), String> {
         let client = self

@@ -156,11 +156,11 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 
 - **Never commit the key**: not in repo, source, lock, manifest, logs, deploy reports, PR comments or error messages; errors may only say "`LLM_API_KEY` is invalid or missing" (§2A.8.5). CI secret-scans repo, locks, manifest, deploy reports and CI logs and fails the build on a suspected key.
 - `.env` must be gitignored; removing it from `.gitignore` or changing CI secret usage is CODEOWNERS-protected (§2A.8.5, §9B).
-- Outside development, runtime environments must contain no `LLM_*` or `OPENAI_*` variables; in development, serve warns and removes them before startup (§2A.8.5).
+- Outside development, runtime environments must contain no `LLM_*` or `OPENAI_*` variables; in development, `vibe run` warns and removes them before startup (§2A.8.5).
 - **Sandbox**: the compiler's network egress is limited to the endpoint host; no tools, function calling or streaming; no secret other than `LLM_API_KEY` (§2A.7, §2A.8.6).
 - CI and production compiles require `https://` with a public host; loopback, private hosts or `LLM_ALLOW_PRIVATE_HOST=true` in CI are errors (§2A.8.4).
 - `LLM_ALLOW_PRIVATE_HOST=true` also permits named hosts that resolve to non-public addresses, such as fake-IP DNS proxies, for local development only. These compiles record `endpoint-private: true`, even for public-looking names. Public hostnames still require HTTPS. CI and production refuse this flag.
-- For local testing of private-endpoint locks, use `vibe build`. Manifest signatures and other validation checks still apply. CI and release builds reject private-endpoint locks. Dev manifests are signed with `build_mode: "dev"` and `vibe serve` accepts them only in development (including `--memory`); release manifests cannot contain private-endpoint locks.
+- For local testing of private-endpoint locks, use `vibe build`. Manifest signatures and other validation checks still apply. CI and release builds reject private-endpoint locks. Dev manifests are signed with `build_mode: "dev"` and `vibe run` accepts them only in development (including `--db memory`); release manifests cannot contain private-endpoint locks.
 - Changing provider, endpoint host or model is a **major** change: all locks recompile and natural/security-touching locks need re-approval. Changing only the base URL path is not major, but the CI determinism check must still pass (§2A.8.7).
 
 ## Spec gaps
@@ -183,3 +183,22 @@ until the swap finishes; if `vibe build` is killed part way, the next run
 restores the previous locks (or finishes a swap that already reached its
 commit point) and removes leftover `.tmp-*` / `.bak-*` files. LLM output is
 cached in `.vibe/cache` only after the source passes every check.
+
+## Keyless test builds and key files
+
+`LLM_PROVIDER=fake` is a deterministic, network-free provider for keyless CI test
+builds. It supports public GET constant JSON object API responses (default:
+`{"message":"hello world"}`), including English or Chinese hello sources without
+explicit GET/public words. It rejects writes/authentication, models and methods;
+translation returns its input unchanged. It is not a general LLM replacement.
+Test builds carry `test_build` only in `.vibe/build-record.json` and manifest
+provenance, never in locks (decision 174). `vibe run` refuses them without
+`--allow-test-build` and always refuses them outside development.
+`vibe build --release` always refuses the fake provider.
+
+`LLM_API_KEY_FILE` reads an API key from a file, for example a BuildKit secret at
+`/run/secrets/llm_api_key`. Trailing newlines are trimmed (surrounding whitespace
+is trimmed too). Precedence is `LLM_API_KEY` > `VIBE_LLM_API_KEY` (release builds)
+then `LLM_API_KEY_FILE`. Keys are never printed. Keep compile-time LLM variables out
+of runtime environments; development removes them before starting handlers,
+and other environments reject them.

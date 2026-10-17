@@ -5,6 +5,8 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Breaking (decision 177):** `vibe run` serves a project (validates locks, builds the dev manifest in memory, memory store on 127.0.0.1:8080; `--db postgres`; never calls the LLM; stale or wrong-version locks ask for `vibe build`) or a build artifact (`--artifact`). `vibe serve` is removed and prints a hint. `LLM_PROVIDER=fake` makes keyless test builds, marked `test_build` in the build record and manifest provenance only; `vibe run` needs `--allow-test-build` for them and `vibe build --release` refuses them. `LLM_API_KEY_FILE` reads the key from a file (`LLM_API_KEY` wins).
+
 - **Breaking (decision 175):** CLI command set is `vibe`, `vibe build` (and `vibe run` in the next release). `vibe compile` is renamed `vibe build`; `vibe validate`, `vibe manifest` and `vibe new` are removed and print a hint (`vibe build`, `vibe build --release`, `vibe`). `vibe build` refreshes locks (no LLM call when every lock is fresh), validates and writes a dev manifest; `vibe build --release` replaces `vibe manifest --release`; `vibe build --check` replaces `vibe compile --check`. `vibe serve` is hidden and temporary until `vibe run`.
 - **Breaking (decision 176):** Lock format: `PROMPT_VERSION`, `compiler:` and `compiler-hash:` are replaced by `vibe-version:` (major.minor for releases, full version for `-rc.N` pre-releases, exact match). Locks with another version, including old prompt-N locks, are rejected by build validation and serve; run `vibe build` to regenerate them. Manifest provenance `compiler_hash` is now `vibe_version`. Compile prompts change only in minor versions; CI (`scripts/ci/check-prompt-version.py`) enforces this from 1.0.0 on.
 

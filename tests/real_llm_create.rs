@@ -237,7 +237,7 @@ async fn real_model_create_zh_and_en() {
         drop(listener);
         let mut server = Server(
             command(root)
-                .args(["serve", "--memory", "--addr", &addr.to_string()])
+                .args(["run", "--db", "memory", "--addr", &addr.to_string()])
                 .stdout(Stdio::from(
                     fs::File::create(root.join("server.stdout")).unwrap(),
                 ))

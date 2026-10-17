@@ -56,7 +56,7 @@ Which store is used, when a verifier is configured:
 | Production | `postgres` | `postgres` | refused at startup |
 | Development / CI | error at startup (choose explicitly) | `postgres` | in-memory |
 
-- Production always uses the PostgreSQL store. `vibe serve` refuses to
+- Production always uses the PostgreSQL store. `vibe run` refuses to
   start if `VIBE_CHALLENGE_REPLAY_STORE=memory` is set (with or without a
   verifier), or if a configured tenant's table is missing, not usable by the
   runtime role, or grants it DELETE, UPDATE or TRUNCATE.
@@ -77,12 +77,12 @@ Which store is used, when a verifier is configured:
 - Client IPs are stored as HMAC-SHA256 under a per-tenant key derived from
   `VIBE_API_KEY_PEPPER`; tokens as SHA-256 of the token.
 - `memory` is an explicit opt-in for a single development or CI process. It
-  is the only choice with `--memory`.
+  is the only choice with `--db memory`.
 - Any store error (database unreachable, timeout, missing table) answers
   503 `CHALLENGE_UNAVAILABLE`. If a verified token cannot be recorded, it is
   not accepted.
 - `vibe build` applies the same rules to the variables (the table is
-  checked by `vibe serve`).
+  checked by `vibe run`).
 
 Turnstile's own single-use check (`timeout-or-duplicate`) applies in addition.
 
@@ -107,13 +107,13 @@ Implementation status: not yet aligned with spec decisions 131, 134 and 135 (fol
 - A full replay cache or store returns 503 today; the spec requires 429 with the computed `Retry-After`, the `replay_store_full` metric and the alert (decision 134). Not yet implemented, follow-up issue #204.
 - Per-network-prefix cap (decision 134): in each tenant's replay store, each IPv4 /24 or IPv6 /48 may hold at most 16 entries by default (matching decision 137: 16 unverified reservations per IP); over the cap the request gets 429 `CHALLENGE_RATE_LIMITED` (internal reason `replay_prefix_cap`). The alert `challenge_replay_store_high_usage` fires when replay store utilization exceeds 80%; the alert `challenge_replay_store_full` fires when the store is full (metric reason `replay_store_full`). Not yet implemented, follow-up issue #204.
 
-In production (`VIBE_ENV`), `vibe serve` refuses to start and `vibe build --release`
+In production (`VIBE_ENV`), `vibe run` refuses to start and `vibe build --release`
 fails if any route uses `challenge ... when: always` and no verifier is configured.
 
 Only public routes with `when: always` are verified. A challenge declared with
 `when: after-failures` (for example on login routes) or on a non-public
 (authenticated) route is not verified yet. Such challenges are temporarily
-unsupported in production: `vibe serve` and `vibe build --release` refuse
+unsupported in production: `vibe run` and `vibe build --release` refuse
 these routes even when a verifier is configured (#199), until verified
 challenges on these routes are implemented (#201). Development and CI still accept them. Runtime verification for those
 modes is tracked in #201.
@@ -137,7 +137,7 @@ Every bound request must carry a fresh nonce in the `X-Vibe-Request-Nonce` heade
 - Encoded as base64url with no padding: exactly 22 characters.
 - Single use: never reuse a nonce, including on a retry. A retry needs a new
   nonce and a new challenge.
-- Send the nonce only in the `X-Vibe-Request-Nonce` header to the vibe server.
+- Send the nonce only in the `X-Vibe-Request-Nonce` header to the runtime.
   The protocol puts only the digest in `cdata`, never the nonce, so `cdata` alone
   can't be used to recover low-entropy bodies (such as login forms).
 - Nonces are unique per tenant (key `(tenant_id, nonce)`). Each request uses one

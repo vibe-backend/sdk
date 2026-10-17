@@ -29,8 +29,7 @@ Locks are build output. They are not committed (`*.lock.md` is in
    `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<version>`,
    issuer `https://token.actions.githubusercontent.com` and the commit
    (fail closed), then deploys the same files to staging and then production.
-4. **Run.** `vibe serve` is a temporary hidden run step; the next release adds
-   `vibe run`. Outside development, `vibe serve` / `vibe migrate` accept only
+4. **Run.** `vibe run --artifact manifest.json` runs the build artifact. Outside development, `vibe run` / `vibe migrate` accept only
    `build_mode: release` manifests with a Sigstore bundle
    (`<manifest>.sigstore.json`, or `VIBE_MANIFEST_BUNDLE`) for the deployed
    version `VIBE_RELEASE_VERSION`. They check that the certificate identity

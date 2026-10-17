@@ -22,6 +22,8 @@ const VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct BuildRecord {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub test_build: bool,
     pub version: u32,
     /// Lock path (relative to the project) -> `sha256:<hex>` of its text.
     pub locks: BTreeMap<String, String>,
@@ -56,6 +58,7 @@ pub fn write_with_compilers(
     compilers: BTreeMap<String, crate::lock::LlmStamp>,
 ) -> Result<(), String> {
     let record = BuildRecord {
+        test_build: compilers.values().any(|s| s.llm_provider == "fake"),
         compilers,
         version: VERSION,
         locks,

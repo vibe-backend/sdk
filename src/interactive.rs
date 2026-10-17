@@ -145,7 +145,8 @@ pub fn setup_with_resolver(
             _ => return Err("Invalid API style".into()),
         }
     }
-    if !combined.contains_key("LLM_API_KEY") {
+    llm::resolve_api_key_file(&mut combined)?;
+    if !combined.contains_key("LLM_API_KEY") && provider != "fake" {
         let key = io.read_secret("API key: ").ok_or("Input ended")?;
         if key.contains(['\n', '\r']) {
             return Err("Invalid API key".into());
@@ -414,6 +415,15 @@ pub async fn run(
         io.write("Nothing written.");
     }
     io.write("Limits go in frontmatter (timeout, body, provider); prose limits are ignored.");
-    io.write("Next: vibe build");
+    let public = crate::compile::parse_source_frontmatter(&a.source)?
+        .iter()
+        .any(|(k, v)| k == "public" && v == "true");
+    io.write(&format!(
+        "Next: vibe build, then vibe run, then curl http://127.0.0.1:8080/{}/{}/{}{feature}",
+        a.definition,
+        a.version,
+        if public { "dev/" } else { "" },
+        feature = a.feature
+    ));
     Ok(())
 }

@@ -28,11 +28,16 @@ fn command_surface() {
         .unwrap();
     let help = String::from_utf8_lossy(&help.stdout);
     for removed in ["serve", "compile", "validate", "manifest"] {
-        assert!(!help.contains(removed), "{help}");
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("{removed} "))),
+            "{help}"
+        );
     }
     assert!(Command::new(env!("CARGO_BIN_EXE_vibe"))
         .env_clear()
-        .args(["serve", "--help"])
+        .args(["run", "--help"])
         .output()
         .unwrap()
         .status
@@ -263,9 +268,9 @@ async fn old_and_wrong_stamps_are_rejected_by_validation_and_runtime() {
         vibe::manifest::write_manifest(&manifest_path, &manifest).unwrap();
         let out = Command::new(env!("CARGO_BIN_EXE_vibe"))
             .env_clear()
-            .args(["serve", "--memory", "--project"])
+            .args(["run", "--db", "memory", "--project"])
             .arg(&dir)
-            .arg("--manifest")
+            .arg("--artifact")
             .arg(&manifest_path)
             .output()
             .unwrap();
