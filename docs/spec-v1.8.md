@@ -18,7 +18,7 @@
 
 ### v1.8（草稿，2026-10-14）
 
-- 補編決定 150–167（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
+- 補編決定 150–168（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 compiler-hash 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory`）
 - 新增 `vibe build`：一個指令做晒編譯、驗證同 manifest（類似 `nest build`），冇 reviewer 步驟（審核由 Git 平台設定負責，決定 76，見 2C.3）。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext）
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
@@ -225,7 +225,7 @@
 | 104 | `Idempotency-Key`（issue #85）：POST／PATCH api 可以喺 lock 開 `## Idempotency`；public endpoint 唔准開；key 範圍 `(tenant, subject, route, key)`；request hash 同成功回應喺同一個 request transaction（決定 99）寫入；同 key 唔同 body 回 422 `IDEMPOTENCY_KEY_REUSED`；處理中租約（`lease` 預設 30s，一定大過 transaction 上限 10s）有效時先回 409 `IDEMPOTENCY_IN_PROGRESS`，租約過期（例如 crash）當未開始、重試可以接手；過期紀錄由 runtime 按 TTL 清理（平台系統表，唔受決定 13 限制）；ttl 預設 24h；失敗回應唔儲存。平台照樣唔自動重試（決定 100）。 | 已確認（產品經理 2026-10-14） | 2.3b、8 |
 | 105 | PATCH（issue #86）：route method 加 `PATCH`（修訂 0.1、2.3 嘅 GET／POST／PUT／DELETE）；語意係 JSON Merge Patch（RFC 7396），只限宣告欄位；`null` 只可以清 nullable 欄位；唔可以改嘅欄位回 422；內置 CRUD `update`（`partial: true`）用 PATCH、`partial: false` 用 PUT；CRUD update 照樣一定要 `If-Match`（決定 48），自訂 PATCH 可以選擇要唔要。 | 已確認（產品經理 2026-10-14） | 0.1、2.3、2.3c、12.9 |
 | 106 | Cursor 分頁同區間篩選（issue #87）：CRUD `list` 可以揀 `pagination: cursor`（offset 照樣係預設，決定 14）；cursor 係簽名嘅不透明值，綁定 sort、filter 同租戶；排序一定加主鍵做 tiebreaker；`page-size` 預設 20，`max-page-size` 同 offset 一樣跟決定 71（平台上限 500），冇另外嘅 100 上限；`range` 篩選只准宣告咗而且有 index 嘅欄位，運算子 `gte`／`gt`／`lte`／`lt`；編譯時驗證；cursor 同 sort／filter 唔對應回 400 `INVALID_CURSOR`。 | 已確認（產品經理 2026-10-14） | 12.9 |
-| 107 | 多欄唯一鍵：model lock 加 `## Constraints`（`- unique: [col_a, col_b]`，平台自動喺前面加 `tenant_id`）；一定要有對應 migration 建 unique index；衝突回 409 `UNIQUE_VIOLATION`，唔回顯欄位值。 | 已確認（產品經理 2026-10-14） | 12.2、8 |
+| 107 | 多欄唯一鍵：model lock 加 `## Constraints`（`- unique: [col_a, col_b]`，平台自動喺前面加 `tenant_id`）；一定要有對應 migration 建 unique index；衝突回 409 `UNIQUE_VIOLATION`，唔回顯欄位值。（決定 168：實作細節見 12.2） | 已確認（產品經理 2026-10-14） | 12.2、8 |
 | 108 | 翻譯階段（issue #37）：非 ASCII source 按 `translate-1` 翻譯，只供語意一致性檢查；安全關鍵字一律檢查中文及英文原文，譯文不能補足。原文保留作 lock、hash、編譯 prompt 及 cache key。否定及 code 規則見 2.1a。此規則取代 #37 的 English-only／不處理中文否定決定。翻譯失敗即編譯失敗，沒有 fallback。翻譯 cache key 包含 source-hash、provider、model、prompt 版本及實際參數。 | 已確認（產品經理 2026-10-16） | 2.1a、2A.7 |
 | 109 | Lock 記錄翻譯資料（審計用，唔計入 `source-hash`）：`translation: { prompt-version, llm-provider, model-snapshot, hash }`。（決定 165：translation stamp 改記喺 build record 同 manifest provenance，lock 唔再有） | 已確認（產品經理 2026-10-14） | 2A.1、2.1a |
 | 110 | 高風險 release build 唔可以用翻譯 cache，一定重新翻譯。 | 已確認（產品經理 2026-10-14） | 2.1a、2C.3 |
@@ -284,7 +284,7 @@
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
-### 0.14 v1.8 2026-10-17 決定（決定 150–167，產品經理已批准 2026-10-17）
+### 0.14 v1.8 2026-10-17 決定（決定 150–168，產品經理已批准 2026-10-17）
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
@@ -306,6 +306,7 @@
 | 165 | 同一 source、同一 `PROMPT_VERSION` 同同一結構，一定產生 byte-identical lock；lock 唔可以包含任何每次 run 都可能改變嘅欄位。Translation stamp 改記喺 build record 同 manifest provenance，唔再寫入 lock。 | 已批准（產品經理 2026-10-17） | 2A.1、2.1a |
 | 166 | `vibe dev` 唔喺 1.0，延至 vNext；1.0 本地開發流程係互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory` → curl。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.2 |
 | 167 | `source-lines` 由 compiler 計，model 引用嘅範圍 snap 去所在 markdown block（段落、list、table、fenced code、heading、frontmatter）嘅 union；無效或者超出範圍用 body 全部 block 範圍做 fallback；validate 要求 block 對齊。已知問題：model 引用另一段落時 lock 仍然可能唔同；唔阻 rc。 | 已批准（產品經理 2026-10-17） | 2A.2、2A.4 |
+| 168 | Fields 按 header 名（包括中文同必填欄）對應；全形 pipe 同 min/max 長度別名正規化，lock 唔准留別名；所有路徑（包括 method query 同 memory）嘅 SQLSTATE 23505 都回 409 `UNIQUE_VIOLATION`，永遠唔重試，唔影響 40001／40P01 嘅 `TX_CONFLICT`。PROMPT_VERSION 改為 prompt-8。 | 已批准（產品經理 2026-10-17） | 2A.2、12.2、8 |
 
 ## 1. 目錄同命名
 
@@ -543,7 +544,7 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 - 每個 step 用 `### s{n} {op}` 做標題，下面用 `- key: value` 列點，key 次序固定：`op`、（op 專用參數）、`out`、`source-lines`。
 - 變數參照一律用 `input.x`、`ctx.x`、`req.x`、或者之前 step 嘅 `out` 名；唔准參照未定義變數。Transform `in` 只可以用 `req`、`ctx`；step 同 Transform `out` 可以用 `input`、`req`、`ctx` 同之前 step 嘅 `out`；method 用 `input`、`ctx` 同之前 step 嘅 `out`。
 - sql 一律寫喺 inline code 入面，用 `$1`、`$2` 參數，`params` 列出對應來源；唔准字串拼接。
-- `source-lines` 係 compiler 計出嘅 enclosing markdown block 範圍，方便 review 對照；model 引用只係 hint。行數由 1 開始，以 compile prompt 顯示行號嘅完整 `source.combined_text()` 為準，包括 frontmatter 同附加 schema 部分；自然語言、structured source 同 validate 都用同一份文字。
+- `source-lines` 係 compiler 計出嘅 enclosing markdown block 範圍，方便 review 對照；model 引用只係 hint。行數由 1 開始，以 compile prompt 送出嘅完整 `source.combined_text()` 為準（prompt 本身唔顯示行號），包括 frontmatter 同附加 schema 部分；自然語言、structured source 同 validate 都用同一份文字。
 - Block 定義（決定 167）：第 1 行係 `---` 時，由第 1 行到 closing `---`（包括兩端）係一個 frontmatter block。其餘文字逐行分 block：trim start 後以至少三個連續 backtick 或 `~` 開頭就開 fenced code block，去到下一行 trim start 後以同一字元、至少同樣長度 marker 開頭嘅行為止（包括兩條 fence 同中間空行）；冇 closing fence 就去到文字結尾。Fence 即使緊貼其他非空行都獨立成 block。Fence／frontmatter 外，符合 `^#{1,6}(\s|$)` 嘅 ATX heading 每行獨立成 block。其餘連續非空行嘅最大範圍係一個 block，涵蓋段落、list 同 table；空行分隔 block，所以 loose list 項目之間有空行就係幾個 block。`<!-- schema.md -->` 等 HTML comment 當普通行。空行本身唔屬任何 block。
 - Snap：引用接受 ASCII 數字 `N` 或 `A-B`（`-` 兩邊可有空格），要求 `1 <= A <= B`。結果由第一個同引用相交嘅 block 開始，到最後一個相交 block 結尾，包含中間空行。只引用空行就揀最近嘅下一個 block；後面冇 block 就揀前一個。開始仍然喺文字內、結尾超出最後一行，就先 clamp 結尾再 snap。缺少、無法解析、倒轉、0、整段超出最後一行，或者文字冇 body block，都用固定 fallback：由 body 第一個到最後一個 block（排除 frontmatter）；body 冇 block 就用 frontmatter；完全冇 block 就用 `1-1`。結果永遠寫 `A-B`，單行亦一樣；只係 provenance metadata，唔發 warning，亦唔係 compile error。
 - `vibe validate` 對有 source 文字嘅 lock，逐個 `source-lines` 檢查值係咪等於同一 snap function 嘅結果，即必須已經 block 對齊同用 canonical `A-B`；唔一致就報 error，列明 lock、section／step、原值同預期值，提示行 `vibe compile`。
@@ -553,13 +554,17 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 - api feature 嘅 `respond value` 留空或者係 `transform.out` 時，會 evaluate Transform out；其他值當 expression evaluate。runtime evaluation 失敗會回 `500 INTERNAL`，唔會 fallback；validate 會拒絕靜態可確定會失敗嘅 expression。
 - 缺少 Transform、整個 section 係 `(none)`、或者 `- in: (none)`／`- out: (none)`，對應預設係 in = `{}`、out = `result`；空白 bullet（例如 `- in:`）會報 `empty expression`，validate 同 manifest 都會拒絕。
 
+- B5（決定 168）：Fields canonical header 係 `| name | type | rules | system |`，按 trim、唔分英文大小寫嘅 header 對應，唔按位置。name 接受 name／欄位／欄位名／名稱／字段；type 接受 type／類型／型別／类型；rules 接受 rules／規則／约束／約束／规则；system 接受 system／系統／系统；required 接受 required／必填／必須／必需。name 同 type 必須有；system 缺省係 no。未知或者重複 header 報 error。required 真值 yes／true／y／是／必填／✓／✔／required 加現有 `required` rule（唔重複）；假值 no／false／n／否／唔係／-／空白唔加，其他值報 error。原本 canonical 表唔改。
+- B6（決定 168）：自然語言模型輸出同 structured source 解析表之前，只喺 trim 後以 `|` 或者 `｜` 開頭嘅行將全形 `｜` 轉 ASCII `|`，包括 cell 入面嘅 literal `｜`。同一行逐字替換，唔改行號；source-hash 仍然 hash 原文。
+- B7（決定 168）：Fields 同 API Request rules 嘅 max_length／maxLength／max-length／max_len／maxlen／max_chars 正規化做 `max:`；對應 min_length／minLength／min-length／min_len／minlen／min_chars 做 `min:`。唔包括 max_size／min_size。別名同 canonical 同值就去重，唔同值報 compile error；validate 拒絕 lock 留低任何呢啲別名，指出別名同替代 key。以上規則兩種 source 都適用。
+
 ### 2A.3 各 kind 嘅固定 section
 
 | kind | section（按次序） |
 | --- | --- |
 | provider | `## Connection`、`## Isolation`、`## Access`、`## Limits`、`## Migrations` |
 | pipeline | `## Parameters`、`## Order`、`## Steps` |
-| model | `## Table`、`## Fields`、`## CRUD`、`## Policies` |
+| model | `## Table`、`## Fields`、`## Constraints`（可省略）、`## CRUD`、`## Policies` |
 | method | `## Signature`、`## Calls`、`## Steps` |
 | migration | `## Target`、`## Up`、`## Verify`、`## Data` |
 | api（scope: definition） | `## Providers`、`## Pipelines`、`## Defaults` |
@@ -2376,6 +2381,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 - 唔支援跨 request、跨 DB 或者分散式 transaction；需要跨 request 嘅流程用 outbox 之類非同步做法。
 - 外部副作用（例如寄 email）一律用 transactional outbox：outbox 列喺同一個 transaction 寫入，commit 之後先處理；commit 之前永遠唔做；rollback 連 outbox 列一齊丟棄。
 - 超時預設（決定 100）：`statement_timeout` 5s、transaction 總時間 10s、`idle_in_transaction_session_timeout` 5s。超時即 rollback，回 504 `TX_TIMEOUT`。
+- 唯一鍵：SQLSTATE `23505` 一律回 409 `UNIQUE_VIOLATION`，唔回顯欄位值，永遠唔重試（12.2）。
 - 衝突：deadlock（SQLSTATE `40P01`）同 serialization failure（`40001`）rollback，回 503 `TX_CONFLICT`，body 帶 `retryable: true`，header `Retry-After: 1`。
 - 平台永遠唔會自動重試非冪等寫入；client 要自己決定重試（建議用 idempotency key）。
 
@@ -3420,6 +3426,7 @@ source 用自然語言描述欄位，例如「email 係唯一嘅合法 email」�
 | --- | --- |
 | `type` | uuid、string、string[]、integer、number、boolean、timestamp、password、json |
 | `primary`、`unique`、`default` | 約束同預設值（`gen`、`now`） |
+| `required`、`nullable` | 必填同可為 NULL；必填 header 真值正規化成現有 `required` rule |
 | `format`、`min`、`max` | 驗證規則 |
 | `sensitive` | 敏感欄位（見 12.9） |
 
@@ -3433,8 +3440,10 @@ source 用自然語言描述欄位，例如「email 係唯一嘅合法 email」�
   ```
 
   - 平台自動喺前面加 `tenant_id`（即係 `(tenant_id, order_id, product_id)`）；列出嘅欄位一定要喺 `## Fields`，唔可以係 `sensitive` 或者 `password`。
-  - 一定要有 migration lock 建對應嘅 unique index，驗證器比對，冇就 error。
-  - 違反時回 409 `UNIQUE_VIOLATION`；message 只講邊個約束，唔回顯欄位值。單欄 `unique` 一樣用呢個錯誤碼（除非 lock 宣告咗業務錯誤碼，例如 `EMAIL_TAKEN`）。
+  - `## Constraints` 可省略；有就緊接 `## Fields`，喺 CRUD 之前。Structured source 可以直接寫。空 list、單欄（請用 Fields unique）、tenant_id、重複欄位、重複 entry（包括調轉次序）、未知 key、唔存在嘅欄位全部報 error。Entries 按 canonical list 字串排序，欄位保留宣告次序。
+  - 一定要有同 provider 嘅 migration lock 建對應 unique index，欄位必須依序完全等於 `(tenant_id, col_a, col_b)`，冇就 error，指出 model、欄位同預期 index。驗證只接受 `CREATE UNIQUE INDEX [IF NOT EXISTS] name ON table [USING btree] (cols)`；table 必須無 schema qualification（用 model 自己 schema 嘅 search_path），cols 只准普通欄位，可用雙引號。WHERE 只准冇，或者剛好 `WHERE deleted_at IS NULL`。其他 predicate、AND、expression、INCLUDE、WITH、非 btree、NULLS NOT DISTINCT 同其他未支援語法（包括 ALTER TABLE／CREATE TABLE 入面嘅 UNIQUE）一律唔可以當證據，fail closed。
+  - 所有路徑（CRUD create／update、method `query`、`serve --memory`）違反時回 409 `UNIQUE_VIOLATION`；message 只講邊個約束，唔回顯欄位值。單欄 `unique` 一樣用呢個錯誤碼（除非 lock 宣告咗業務錯誤碼，例如 `EMAIL_TAKEN`）。
+  - Memory executor 按租戶原子檢查 Fields unique 同 Constraints；有 deleted_at 就忽略已 soft delete 嘅列，NULL 唔互相衝突。SQLSTATE 23505 用獨立 UniqueViolation，永遠唔進入 retry；40001／40P01 保留 Conflict／TX_CONFLICT。冇 DB constraint 名時用 generic message，唔包含重複值。
 - `type: password` 嘅欄位：
   - 寫入時一律用 argon2id hash，參數見 4A.2（決定 46）。
   - 永遠唔可以喺 SELECT 結果、method 輸出、回應或者 log 出現，只可以用 `verify-password` step 比對。

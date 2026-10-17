@@ -158,6 +158,7 @@ pub struct AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    state.exec.configure_models(&state.manifest.models);
     super::ops::warm_up();
     Router::new().fallback(handle).with_state(state)
 }
@@ -1745,6 +1746,14 @@ fn invalid_refresh(request_id: &str, reason: &'static str) -> HttpResponse {
 }
 
 fn refresh_unavailable(request_id: &str, err: &ExecError) -> HttpResponse {
+    if matches!(err, ExecError::UniqueViolation) {
+        return json_response(
+            StatusCode::CONFLICT,
+            json!({"error": {"code": "UNIQUE_VIOLATION", "message": "unique constraint violated", "request_id": request_id}}),
+            request_id,
+            &[],
+        );
+    }
     json_response(
         if matches!(err, ExecError::Timeout) {
             StatusCode::GATEWAY_TIMEOUT
@@ -1896,6 +1905,7 @@ impl super::exec::RefreshIssuer for HttpRefreshIssuer<'_> {
         .await;
         match result {
             Ok(result) if result.value.get("access_token").is_some() => Ok(result.value),
+            Err(err) if err.code == "UNIQUE_VIOLATION" => Err(ExecError::UniqueViolation),
             Err(err) if err.code == "TX_TIMEOUT" => Err(ExecError::Timeout),
             Err(err) if matches!(err.code.as_str(), "TX_CONFLICT" | "CONFLICT") => {
                 Err(ExecError::Conflict)
@@ -2108,6 +2118,19 @@ impl AuthError {
 }
 
 fn fail_response(route: &RouteSpec, fail: MethodFail, request_id: &str) -> HttpResponse {
+    if fail.code == "TX_CONFLICT" {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": {
+                "code": fail.code,
+                "message": public_message(&fail),
+                "request_id": request_id,
+                "retryable": true,
+            }}),
+            request_id,
+            &[("retry-after".into(), "1".into())],
+        );
+    }
     let mut status = platform_status(&fail.code);
     if let Some(mapped) = route.errors.iter().find(|err| err.code == fail.code) {
         status = StatusCode::from_u16(mapped.status).unwrap_or(status);
@@ -2139,10 +2162,12 @@ fn platform_status(code: &str) -> StatusCode {
         "PRECONDITION_REQUIRED" => StatusCode::PRECONDITION_REQUIRED,
         "PRECONDITION_FAILED" => StatusCode::PRECONDITION_FAILED,
         "NOT_FOUND" => StatusCode::NOT_FOUND,
-        "CONFLICT" => StatusCode::CONFLICT,
+        "CONFLICT" | "UNIQUE_VIOLATION" => StatusCode::CONFLICT,
         "FORBIDDEN" => StatusCode::FORBIDDEN,
         "UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
         "BAD_REQUEST" => StatusCode::BAD_REQUEST,
+        "TX_TIMEOUT" => StatusCode::GATEWAY_TIMEOUT,
+        "TX_CONFLICT" => StatusCode::SERVICE_UNAVAILABLE,
         "SERVICE_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -3043,6 +3068,33 @@ mod request_validation_tests {
         serde_json::from_value(value).unwrap()
     }
 
+    #[tokio::test]
+    async fn method_fail_conflicts_advertise_retry_only_for_transaction_conflicts() {
+        let route = route(vec![]);
+        for (code, status) in [
+            ("TX_CONFLICT", StatusCode::SERVICE_UNAVAILABLE),
+            ("UNIQUE_VIOLATION", StatusCode::CONFLICT),
+        ] {
+            let response = fail_response(&route, MethodFail::code(code, "conflict"), "request");
+            assert_eq!(response.status(), status);
+            if code == "TX_CONFLICT" {
+                assert_eq!(response.headers()["retry-after"], "1");
+            } else {
+                assert!(!response.headers().contains_key("retry-after"));
+            }
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"]["code"], code);
+            if code == "TX_CONFLICT" {
+                assert_eq!(value["error"]["retryable"], true);
+            } else {
+                assert!(value["error"].get("retryable").is_none());
+            }
+        }
+    }
+
     fn check(route: &RouteSpec, body: Value, headers: &[(&str, &str)]) -> Result<(), MethodFail> {
         let headers = headers
             .iter()
@@ -3245,5 +3297,17 @@ mod refresh_response_tests {
             assert_eq!(value["error"]["code"], code);
             assert_eq!(value["error"]["retryable"], true);
         }
+    }
+    #[tokio::test]
+    async fn unique_violation_response_never_advertises_retry() {
+        let response = refresh_unavailable("request", &ExecError::UniqueViolation);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(!response.headers().contains_key("retry-after"));
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "UNIQUE_VIOLATION");
+        assert!(value["error"].get("retryable").is_none());
     }
 }

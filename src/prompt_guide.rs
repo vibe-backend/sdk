@@ -22,7 +22,7 @@ MODEL KEYS:
 - ## Fields table header is exactly `| name | type | rules | system |`. One row per user field; do NOT add id, tenant_id, created_at, updated_at, deleted_at, erased_at (the platform adds them). system is `no`.
 - type is one of: uuid, string, string[], integer, number, boolean, timestamp, password, json, bytes.
 - rules is a comma-separated list from: required, nullable, unique, primary, default: <value|gen|now>, format: email, min: <int>, max: <int>, enum: [a, b], sensitive, untrusted, personal: <standard|sensitive>, public-writable. For strings min/max are character lengths (\"at most 80 characters\" is `max: 80`; there is no max_length/min_length/maxLength key). For integers/numbers min/max are values.
-- `unique` is per column only. A uniqueness over several columns together cannot be expressed in Fields: do NOT mark each column unique; leave the columns without `unique` (it needs a migration with a composite unique index). TODO(D107): spec decision 107 adds a `## Constraints` section (`- unique: [col_a, col_b]`); switch this rule to emit it once the lock grammar supports it.
+- `unique` in Fields is per column only. A uniqueness over several columns together goes in an optional `## Constraints` section immediately after Fields: `- unique: [col_a, col_b]`. do NOT mark each column unique. The platform prepends tenant_id; a matching unique index migration is required.
 - ## CRUD table header is exactly `| method | options |`; rows only for actions the source asks for: create, get, list, update, delete. list options: page-size: N, max-page-size: N (<= 500), sort: [fields], filter: [fields]. update options: optimistic-lock: if-match. delete options: soft: true. No options: `-`.
 - ## Policies: write `(none)`; the platform generates RLS and grants.
 ";
@@ -249,7 +249,14 @@ mod tests {
         let body = example(&system_prompt(Kind::Model, None), "MODEL LOCK BODY:\n");
         let sections = parse_sections(&body).unwrap();
         let names: Vec<&str> = sections.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, section_order(Kind::Model, None));
+        assert_eq!(
+            names,
+            section_order(Kind::Model, None)
+                .iter()
+                .copied()
+                .filter(|name| *name != "Constraints")
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

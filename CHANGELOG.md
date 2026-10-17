@@ -5,6 +5,9 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Breaking:** Single-column and multi-column unique violations return 409 `UNIQUE_VIOLATION` (was `CONFLICT`) on every path, including method `query` and `serve --memory`; they are never retried. Serialization and deadlock failures on CRUD and method query paths now return 503 TX_CONFLICT (retryable, Retry-After: 1) per decision 100, instead of 409 CONFLICT.
+- **Decision 107:** Model `## Constraints` supports multi-column unique keys; validation requires a matching unique index migration under fail-closed rules.
+- **Decision 168:** Fields map by header, including Chinese headers and 必填; full-width pipes and min/max length aliases normalize deterministically, and aliases are rejected in lock rules. PROMPT_VERSION is prompt-8.
 - **Lock-format semantics (decision 167):** `source-lines` is computed by the compiler: the model's cited range is snapped to the enclosing markdown block(s) (paragraph, list, table, fenced code including its fence lines, heading, frontmatter); invalid or out-of-range citations fall back to the whole source body; values are always `A-B`. `vibe validate` rejects non-aligned values. PROMPT_VERSION bumped to prompt-7, so locks recompile. Known issue: if the model cites a different paragraph, the lock can still differ.
 - **Spec decision 166:** `vibe dev` is deferred to vNext; spec §2C.2, README and docs describe the 1.0 flow (interactive `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory` → curl).
 - **Lock-format change (decision 165):** Bumped PROMPT_VERSION to prompt-6. Locks no longer write run-varying translation stamps; per-lock stamps live in the backward-compatible build record and optional manifest provenance, preserving D109 audit links. Old locks parse and discard `translation:` and validate warns once per lock to recompile.

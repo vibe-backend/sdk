@@ -449,6 +449,8 @@ pub struct ModelSpec {
     pub provider: String,
     pub table: String,
     pub fields: Vec<FieldSpec>,
+    #[serde(default)]
+    pub constraints: Vec<Vec<String>>,
     pub crud: Vec<String>,
     pub list: ListOpts,
     pub sensitive_output: Vec<String>,
@@ -772,7 +774,7 @@ pub fn build_manifest_with_mode(
                 input: Vec::new(),
                 errors: vec![
                     "NOT_FOUND".into(),
-                    "CONFLICT".into(),
+                    "UNIQUE_VIOLATION".into(),
                     "PRECONDITION_FAILED".into(),
                 ],
                 capabilities: Vec::new(),
@@ -896,6 +898,7 @@ fn model_from(doc: &LockDoc) -> ModelSpec {
         provider,
         table,
         fields,
+        constraints: crate::zh::constraints(doc).unwrap_or_default(),
         crud,
         list,
         sensitive_output,

@@ -130,21 +130,28 @@ pub async fn query(
     let rows = exec
         .raw(ctx.tenant_id, role, writes, &step.sql, params)
         .await
-        .map_err(|err| match err {
-            ExecError::Message(msg) if msg.contains("--memory") => internal(msg),
-            // SQLSTATE 23505 (unique violation), mapped in exec.
-            ExecError::Conflict => MethodFail::code("CONFLICT", "already exists"),
-            ExecError::Timeout => MethodFail::code("TX_TIMEOUT", "transaction timed out"),
-            other => {
-                tracing::warn!(error = ?other, "query step failed");
-                internal("query failed")
-            }
-        })?;
+        .map_err(query_error)?;
     Ok(rows
         .into_iter()
         .next()
         .map(Value::Object)
         .unwrap_or(Value::Null))
+}
+
+fn query_error(err: ExecError) -> MethodFail {
+    match err {
+        ExecError::Message(msg) if msg.contains("--memory") => internal(msg),
+        // SQLSTATE 23505 (unique violation), mapped in exec.
+        ExecError::UniqueViolation => {
+            MethodFail::code("UNIQUE_VIOLATION", "unique constraint violated")
+        }
+        ExecError::Conflict => MethodFail::code("TX_CONFLICT", "transaction conflict"),
+        ExecError::Timeout => MethodFail::code("TX_TIMEOUT", "transaction timed out"),
+        other => {
+            tracing::warn!(error = ?other, "query step failed");
+            internal("query failed")
+        }
+    }
 }
 
 /// Longest password accepted anywhere (spec §4A.2 floor: 12..=256).
@@ -408,6 +415,9 @@ pub async fn sign_jwt(
         .map_err(|err| match err {
             ExecError::Timeout => MethodFail::code("TX_TIMEOUT", "transaction timed out"),
             ExecError::Conflict => MethodFail::code("TX_CONFLICT", "transaction conflict"),
+            ExecError::UniqueViolation => {
+                MethodFail::code("UNIQUE_VIOLATION", "unique constraint violated")
+            }
             other => {
                 tracing::warn!(error = ?other, "sign-jwt roles lookup failed");
                 internal("sign-jwt roles lookup failed")
@@ -613,4 +623,16 @@ pub fn load_signing_keys(
         }
     }
     Ok(keys)
+}
+
+#[cfg(test)]
+mod query_error_tests {
+    use super::*;
+    #[test]
+    fn unique_is_not_a_retryable_transaction_conflict() {
+        let unique = query_error(ExecError::UniqueViolation);
+        assert_eq!(unique.code, "UNIQUE_VIOLATION");
+        assert_eq!(unique.message, "unique constraint violated");
+        assert_eq!(query_error(ExecError::Conflict).code, "TX_CONFLICT");
+    }
 }

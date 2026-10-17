@@ -1342,6 +1342,42 @@ fn normalize(
     source: &SourceFile,
     docs: &HashMap<String, LockDoc>,
 ) -> Result<(), Vec<Diag>> {
+    for section in &mut doc.sections {
+        if matches!(section.name.as_str(), "Fields" | "Request") {
+            if let Some(table) = &mut section.table {
+                let index = if section.name == "Fields" {
+                    crate::zh::map_fields(table).map_err(|e| vec![Diag::error(&source.rel, e)])?;
+                    Some(2)
+                } else {
+                    table
+                        .headers
+                        .iter()
+                        .position(|h| h.eq_ignore_ascii_case("rules"))
+                };
+                if let Some(index) = index {
+                    for row in &mut table.rows {
+                        if let Some(rules) = row.get_mut(index) {
+                            *rules = crate::zh::normalize_rules(rules)
+                                .map_err(|e| vec![Diag::error(&source.rel, e)])?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if source.kind == Kind::Model && find_section(&doc.sections, "Constraints").is_some() {
+        let entries = crate::zh::constraints(doc).map_err(|e| vec![Diag::error(&source.rel, e)])?;
+        if let Some(section) = find_section_mut(&mut doc.sections, "Constraints") {
+            section.bullets = entries
+                .into_iter()
+                .map(|columns| Bullet {
+                    key: "unique".into(),
+                    value: format!("[{}]", columns.join(", ")),
+                })
+                .collect();
+            section.bullets.sort_by(|a, b| a.value.cmp(&b.value));
+        }
+    }
     match source.kind {
         Kind::Provider => normalize_provider(doc, source),
         Kind::Model => normalize_model(doc, source),
@@ -1779,6 +1815,9 @@ fn normalize_feature(
     ensure_transform(doc);
     let order = crate::lock::section_order(Kind::Api, Some(Scope::Feature));
     for name in order {
+        if *name == "Constraints" && find_section(&doc.sections, name).is_none() {
+            continue;
+        }
         if find_section(&doc.sections, name).is_none() {
             diags.push(
                 Diag::error(&source.rel, format!("missing section {name}")).at_section(*name),
@@ -1909,6 +1948,9 @@ fn reorder(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Diag>> {
     ensure_transform(doc);
     let order = crate::lock::section_order(source.kind, source.scope);
     for name in order {
+        if *name == "Constraints" && find_section(&doc.sections, name).is_none() {
+            continue;
+        }
         if find_section(&doc.sections, name).is_none() {
             return Err(vec![Diag::error(
                 &source.rel,
@@ -2966,8 +3008,8 @@ mod prompt_tests {
         assert_eq!(
             (crate::lock::PROMPT_VERSION, actual.as_str()),
             (
-                "prompt-7",
-                "3ff6e67cbc20d568ced8c98971648a342a3a98c714887c73cfd95c85a6dea807"
+                "prompt-8",
+                "7232d3d5eb6cfca565efe0dbe3aca15d29cd3443c642368ceb63ce06358456b6"
             ),
             "compile prompt changed: bump PROMPT_VERSION and update the recorded hash"
         );
