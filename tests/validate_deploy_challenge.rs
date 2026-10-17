@@ -22,6 +22,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 }
 
 fn validate_cli(project: &Path, deploy: bool, envs: &[(&str, &str)]) -> (bool, String) {
+    fs::write(project.join(".gitignore"), ".env\n").unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibe"));
     cmd.arg("build")
         .arg("--project")

@@ -3,14 +3,14 @@
 //! [`ReplayCache`](super::challenge::ReplayCache) keeps the state in process
 //! memory and suits a single instance. [`PgReplayStore`] keeps it in a table
 //! inside each tenant's own schema (`t_<tenant>.vibe_challenge_replay`,
-//! created by that tenant's `vibe migrate`, `tenant_id` under FORCE RLS), so a
+//! created by that tenant's automatic tenant migration, `tenant_id` under FORCE RLS), so a
 //! token, the per-IP and per-tenant quotas and the per-tenant capacity hold
 //! across instances. No object is shared between tenants.
 //!
 //! The runtime role only has SELECT and INSERT on the table: the table is an
 //! append-only log. A reservation is a `pending` row; settling it appends a
 //! `verified`, `rejected` or `released` row. Reads ignore expired rows, and
-//! only the owner role deletes them (during `vibe migrate`), so the runtime
+//! only the owner role deletes them (during automatic tenant migration), so the runtime
 //! cannot remove or shorten a live verified row. Every store error is
 //! reported as [`ChallengeError::Unavailable`]: the request fails closed.
 
@@ -26,7 +26,7 @@ use super::challenge::{
     TOKEN_LIFETIME,
 };
 
-/// Table in each tenant schema (created by `vibe migrate`).
+/// Table in each tenant schema (created by automatic tenant migration).
 pub const REPLAY_TABLE: &str = "vibe_challenge_replay";
 /// Live rows allowed per tenant.
 const DEFAULT_CAPACITY: i64 = 10_000;
@@ -255,7 +255,7 @@ impl PgReplayStore {
         self
     }
 
-    /// DDL for one tenant's table, run inside that tenant's `vibe migrate`
+    /// DDL for one tenant's table, run inside that tenant's automatic tenant migration
     /// as the owner role (before the schema's RLS pass, which adds ENABLE +
     /// FORCE RLS and the tenant policy). The runtime role gets SELECT and
     /// INSERT only. Also removes expired rows (as the owner).
@@ -302,17 +302,17 @@ impl PgReplayStore {
                 )
                 .await
                 .map_err(|err| {
-                    format!("challenge replay table {t} is not usable ({err}); run `vibe migrate` for this tenant")
+                    format!("challenge replay table {t} is not usable ({err}); restart `vibe run --db postgres` with VIBE_MIGRATE_DATABASE_URL set for this tenant")
                 })?;
             let (usable, too_much): (bool, bool) = (row.get(0), row.get(1));
             if !usable {
                 return Err(format!(
-                    "challenge replay table {t} is not readable and writable by this role; run `vibe migrate` for this tenant"
+                    "challenge replay table {t} is not readable and writable by this role; restart `vibe run --db postgres` with VIBE_MIGRATE_DATABASE_URL set for this tenant"
                 ));
             }
             if too_much {
                 return Err(format!(
-                    "challenge replay table {t} grants DELETE, UPDATE or TRUNCATE to this role; run `vibe migrate` to reset its grants"
+                    "challenge replay table {t} grants DELETE, UPDATE or TRUNCATE to this role; restart `vibe run --db postgres` with VIBE_MIGRATE_DATABASE_URL set to reset its grants"
                 ));
             }
         }

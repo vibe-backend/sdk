@@ -5,7 +5,7 @@
 `scripts/vibe-install.sh` installs the binary from `vibe-backend/sdk` GitHub Releases on Linux (x86_64/aarch64) and macOS (x86_64/arm64). On Windows, download the release zip directly; this POSIX shell manager does not support Windows.
 
 The default **vibe-sdk** installs `vibe` for interactive development, builds,
-`vibe run` and auxiliary commands. **vibe-runtime** installs `vibe-runtime` for
+and `vibe run` (the three SDK commands are `vibe`, `vibe build`, `vibe run`). **vibe-runtime** installs `vibe-runtime` for
 deployment: it runs artifacts only, with no LLM client, build or interactive code.
 `vibe-runtime run --artifact <dir>` and bare `vibe-runtime` accept the same flags;
 artifact defaults to `.`, with `--addr`, `--db` / `VIBE_DB`, and

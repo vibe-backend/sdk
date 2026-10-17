@@ -26,6 +26,7 @@ Release 0.1 定義一條給不懂後端的使用者使用的最小安全流程�
 
 - 現有 SDK 已有 `vibe build`、`vibe build --release`、LLM adapter、結構化 lock、secret／危險輸入掃描及 signed manifest；README 明確規定 runtime 不解讀自然語言。
 - `spec-v1.7.md` 是現行定稿；`spec-v1.8.md` 是草稿，已另行規劃 `vibe dev`、`vibe build`、manifest/release hardening、租戶隔離、權限、效能與 auth 等議題。本文件引用而不複製這些規則。
+- 決定 179：SDK 只保留 `vibe`、`vibe build`、`vibe run`；build 自動建 dev key、檢查 slug／停用檔、掃描 secret，PostgreSQL run 啟動時自動套用 pending migration，詳見 [runtime configuration](runtime-config.md#automatic-migrations-decision-179)。
 - v1.8 草稿決定 77–80 移除 `vibe approve` 與 lock 人手安全簽核；因此本文件的「確認」只表示**同意把預覽過的 plan 寫入工作目錄**，不構成安全批准，不取代 code review、CI 或 release environment approval。
 - issue #94 已記錄繁體中文 source 可造成欄位錯位、錯誤 auth、虛構 constraint 等問題。0.1 因此禁止直接接受任意 LLM markdown，先要求固定 plan schema，再由 deterministic renderer 產生 source。
 - 尚未合併的 v1.8 implementation branches／PR 可能改動 CLI；0.1 使用獨立 `vibe plan`／`vibe apply` 邊界，並在第 10 節定義相容方式。

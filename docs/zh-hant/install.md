@@ -4,7 +4,7 @@
 
 `scripts/vibe-install.sh` 從 `vibe-backend/sdk` GitHub Releases 安裝 binary，支援 Linux（x86_64/aarch64）與 macOS（x86_64/arm64）。Windows 請直接下載 release zip；此 POSIX shell 管理器不支援 Windows。
 
-預設 **vibe-sdk** 安裝做 `vibe`，用嚟互動開發、build、`vibe run` 同輔助指令。
+預設 **vibe-sdk** 安裝做 `vibe`，只有互動 `vibe`、`vibe build`、`vibe run` 三個指令（決定 179）。
 **vibe-runtime** 安裝做 `vibe-runtime`，部署時只跑 artifact，冇 LLM client、build
 同互動 code。`vibe-runtime run --artifact <dir>` 或者冇 subcommand 都接受同一組 flags；
 artifact 預設 `.`，支援 `--addr`、`--db`／`VIBE_DB` 同 `--allow-test-build`（只限開發）。

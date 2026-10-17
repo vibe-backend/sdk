@@ -285,6 +285,7 @@ fn signed_dev_manifest_starts_with_memory_in_development() {
     use std::process::Stdio;
     let root = std::env::temp_dir().join(format!("vibe-dev-serve-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join(".gitignore"), ".env\n").unwrap();
     let compiled = Command::new(env!("CARGO_BIN_EXE_vibe"))
         .env_clear()
         .args(["build", "--project"])

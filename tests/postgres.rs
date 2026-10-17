@@ -116,6 +116,12 @@ async fn setup_exclusive() -> Option<Setup> {
 async fn setup_with(admin_url: String, guard: Guard) -> Option<Setup> {
     let _guard = SETUP.lock().await;
     let admin = connect(&admin_url).await;
+    // Every test has its own owner role; the exclusive CORRUPTION guard
+    // isolates this shared platform schema as well as tenant DDL.
+    admin
+        .batch_execute("DROP SCHEMA IF EXISTS vibe_platform CASCADE")
+        .await
+        .unwrap();
     let s = suffix();
     let owner = format!("own_{s}");
     let app = format!("app_{s}");
@@ -1329,7 +1335,10 @@ async fn replay_store_fails_closed_when_unusable() {
         .check(&["nomigrate0001".to_string()])
         .await
         .unwrap_err();
-    assert!(err.contains("run `vibe migrate`"), "{err}");
+    assert!(
+        err.contains("restart `vibe run --db postgres` with VIBE_MIGRATE_DATABASE_URL set"),
+        "{err}"
+    );
     assert!(is_unavailable(
         store
             .reserve(&token_key("x"), None, Some("nomigrate0001"))
@@ -1362,4 +1371,336 @@ async fn sslmode_require_fails_against_server_without_tls() {
             .await;
         panic!("sslmode=require must not connect to a server without TLS (ssl: {ssl:?})");
     }
+}
+
+#[tokio::test]
+async fn automatic_migration_tracking_planning_and_upgrade() {
+    use vibe::run::apply_migrations;
+    use vibe::runtime::migrate::migration_digest;
+    let s = require_pg!(setup().await);
+    let owner = PgExec::connect(&url_as(&s.admin_url, &s.owner))
+        .await
+        .unwrap();
+    let serving = PgExec::connect(&url_as(&s.admin_url, &s.app))
+        .await
+        .unwrap();
+    let tenants = vec![format!("pa{}", suffix()), format!("pb{}", suffix())];
+    let mut m = manifest();
+    s.admin
+        .batch_execute("DROP TABLE vibe_platform.applied_migrations")
+        .await
+        .unwrap();
+    let missing = apply_migrations(None, &serving, &m, &tenants, &s.app, false)
+        .await
+        .unwrap_err();
+    assert!(missing.contains("VIBE_MIGRATE_DATABASE_URL"), "{missing}");
+    let first = apply_migrations(Some(&owner), &serving, &m, &tenants, &s.app, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.iter().filter(|s| s.starts_with("applied ")).count(),
+        2
+    );
+    let rows = owner
+        .query_texts(
+            "SELECT sha256 FROM vibe_platform.applied_migrations WHERE tenant_id = $1",
+            &tenants[0],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![migration_digest(&m.migrations[0].statements)]);
+    serving.check_runtime_role().await.unwrap();
+    let privileges = owner.query_texts("SELECT has_table_privilege($1, 'vibe_platform.applied_migrations', 'SELECT')::text || '|' || has_table_privilege($1, 'vibe_platform.applied_migrations', 'INSERT,UPDATE,DELETE,TRUNCATE')::text || '|' || has_schema_privilege($1, 'vibe_platform', 'CREATE')::text", &s.app).await.unwrap();
+    assert_eq!(privileges, vec!["true|false|false"]);
+    let again = apply_migrations(Some(&owner), &serving, &m, &tenants, &s.app, false)
+        .await
+        .unwrap();
+    assert!(!again.iter().any(|s| s.starts_with("applied ")));
+    assert!(again.iter().any(|s| s.contains("up to date")));
+    assert!(
+        apply_migrations(None, &serving, &m, &tenants, &s.app, false)
+            .await
+            .is_ok()
+    );
+    let mut next = m.migrations[0].clone();
+    next.id = "0003-add".into();
+    next.statements = vec!["ALTER TABLE audit_notes ADD COLUMN x text".into()];
+    m.migrations.push(next);
+    let err = apply_migrations(None, &serving, &m, &tenants, &s.app, false)
+        .await
+        .unwrap_err();
+    assert!(err.contains("VIBE_MIGRATE_DATABASE_URL"), "{err}");
+    let appended = apply_migrations(Some(&owner), &serving, &m, &tenants, &s.app, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        appended
+            .iter()
+            .filter(|s| s.starts_with("applied "))
+            .count(),
+        2
+    );
+    assert!(appended
+        .iter()
+        .filter(|s| s.starts_with("applied "))
+        .all(|s| s == "applied 0003-add"));
+    let mut safe = m.migrations[0].clone();
+    safe.id = "00035-safe".into();
+    safe.statements = vec!["ALTER TABLE audit_notes ADD COLUMN pending text".into()];
+    m.migrations.push(safe);
+    let mut drop = m.migrations[0].clone();
+    drop.id = "0004-drop".into();
+    drop.statements = vec!["ALTER TABLE audit_notes DROP COLUMN note".into()];
+    m.migrations.push(drop);
+    let err = apply_migrations(Some(&owner), &serving, &m, &tenants, &s.app, false)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("0004-drop") && err.contains("--allow-destructive-migrations"),
+        "{err}"
+    );
+    for tenant in &tenants {
+        assert_eq!(owner.query_texts("SELECT count(*)::text FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'audit_notes' AND column_name = 'pending'", &format!("t_{tenant}")).await.unwrap(), vec!["0"]);
+        let count = owner.query_texts("SELECT count(*)::text FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'audit_notes' AND column_name = 'note'", &format!("t_{tenant}")).await.unwrap();
+        assert_eq!(count, vec!["1"]);
+        assert_eq!(owner.query_texts("SELECT count(*)::text FROM vibe_platform.applied_migrations WHERE tenant_id = $1 AND migration_id = '0004-drop'", tenant).await.unwrap(), vec!["0"]);
+    }
+    apply_migrations(Some(&owner), &serving, &m, &tenants, &s.app, true)
+        .await
+        .unwrap();
+    for tenant in &tenants {
+        assert_eq!(owner.query_texts("SELECT destructive::text FROM vibe_platform.applied_migrations WHERE tenant_id = $1 AND migration_id = '0004-drop'", tenant).await.unwrap(), vec!["true"]);
+    }
+    m.migrations[0]
+        .statements
+        .push("COMMENT ON TABLE audit_notes IS 'changed'".into());
+    for connection in [Some(&owner), None] {
+        let err = apply_migrations(connection, &serving, &m, &tenants, &s.app, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("different SQL") && err.contains("append-only"),
+            "{err}"
+        );
+    }
+    let mut removed = manifest();
+    removed.migrations.clear();
+    let warning = apply_migrations(Some(&owner), &serving, &removed, &tenants, &s.app, false)
+        .await
+        .unwrap();
+    assert!(warning
+        .iter()
+        .any(|s| s.contains("no longer in the manifest")));
+    // Simulate an old deployment that applied non-idempotent SQL but recorded nothing.
+    let mut legacy = manifest();
+    legacy.migrations[0]
+        .statements
+        .push("ALTER TABLE audit_notes ADD COLUMN x text".into());
+    let tenant = format!("pc{}", suffix());
+    migrate_tenant(&owner, &legacy, &tenant, &s.app)
+        .await
+        .unwrap();
+    owner
+        .batch(&[format!(
+            "DELETE FROM vibe_platform.applied_migrations WHERE tenant_id = '{tenant}'"
+        )])
+        .await
+        .unwrap();
+    let err = apply_migrations(
+        Some(&owner),
+        &serving,
+        &legacy,
+        std::slice::from_ref(&tenant),
+        &s.app,
+        false,
+    )
+    .await
+    .unwrap_err();
+    let sha = migration_digest(&legacy.migrations[0].statements);
+    let insert = format!("INSERT INTO vibe_platform.applied_migrations (tenant_id, migration_id, sha256, destructive) VALUES ('{tenant}', '{}', '{sha}', false);", legacy.migrations[0].id);
+    assert!(err.contains(&insert), "{err}");
+    owner.batch(&[insert]).await.unwrap();
+    apply_migrations(Some(&owner), &serving, &legacy, &[tenant], &s.app, false)
+        .await
+        .unwrap();
+}
+
+/// Exercise the deployed binary using a minimal development artifact signed
+/// with the same canonical serialization as the project build helper.
+#[tokio::test]
+async fn runtime_binary_automatically_migrates_and_refuses_destructive_sql() {
+    use std::{
+        fs,
+        process::{Child, Command, Stdio},
+        time::{Duration, Instant},
+    };
+    struct Running(Child);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let s = require_pg!(setup().await);
+    let tenant = format!("pd{}", suffix());
+    let root = std::env::temp_dir().join(format!("vibe-pg-artifact-{}", suffix()));
+    fs::create_dir_all(&root).unwrap();
+    let key = vibe::sign::create_dev_key(&root).unwrap();
+    fs::write(
+        root.join(".vibe/slugs.json"),
+        serde_json::to_vec(&json!({"test": {"tenant_id": tenant}})).unwrap(),
+    )
+    .unwrap();
+    let mut m = manifest();
+    m.build_mode = Some(vibe::manifest::BuildMode::Dev);
+    let write = |manifest: &mut Manifest| {
+        manifest.signature.clear();
+        manifest.signature = vibe::sign::sign_bytes(&serde_json::to_vec(manifest).unwrap(), &key);
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(manifest).unwrap(),
+        )
+        .unwrap();
+    };
+    write(&mut m);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let spawn = || {
+        Running(
+            Command::new(env!("CARGO_BIN_EXE_vibe-runtime"))
+                .env_clear()
+                .current_dir(&root)
+                .env("VIBE_ENV", "development")
+                .env("VIBE_DATABASE_URL", url_as(&s.admin_url, &s.app))
+                .env("VIBE_MIGRATE_DATABASE_URL", url_as(&s.admin_url, &s.owner))
+                .args([
+                    "run",
+                    "--artifact",
+                    ".",
+                    "--db",
+                    "postgres",
+                    "--addr",
+                    &addr.to_string(),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let mut child = spawn();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if child.0.try_wait().unwrap().is_some() {
+            use std::io::Read;
+            let mut error = String::new();
+            child
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut error)
+                .unwrap();
+            panic!("runtime exited before listening: {error}");
+        }
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "runtime startup exceeded 60s");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let rows: i64 = s
+        .admin
+        .query_one(
+            "SELECT count(*) FROM vibe_platform.applied_migrations WHERE tenant_id = $1",
+            &[&tenant],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 1);
+    drop(child);
+    let mut destructive = m.migrations[0].clone();
+    destructive.id = "0003-destructive".into();
+    destructive.statements = vec!["ALTER TABLE audit_notes DROP COLUMN note".into()];
+    m.migrations.push(destructive);
+    write(&mut m);
+    let mut child = spawn();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "runtime refusal exceeded 60s");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    use std::io::Read;
+    let mut error = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+    assert!(!status.success());
+    assert!(
+        error.contains("refusing to apply destructive migration 0003-destructive")
+            && error.contains("--allow-destructive-migrations"),
+        "{error}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_startups_apply_a_tenant_migration_once() {
+    use vibe::run::apply_migrations;
+    let s = require_pg!(setup().await);
+    let owner_url = url_as(&s.admin_url, &s.owner);
+    let first = PgExec::connect(&owner_url).await.unwrap();
+    let second = PgExec::connect(&owner_url).await.unwrap();
+    let serving = PgExec::connect(&url_as(&s.admin_url, &s.app))
+        .await
+        .unwrap();
+    // Exercise tracking creation as well as two fresh-tenant transactions.
+    s.admin
+        .batch_execute("DROP SCHEMA vibe_platform CASCADE")
+        .await
+        .unwrap();
+    let tenants = vec![format!("con{}", suffix())];
+    let mut m = manifest();
+    // No IF NOT EXISTS: applying this SQL twice must fail.
+    m.migrations[0].statements = vec![
+        "CREATE TABLE concurrent_notes (tenant_id text, note text)".into(),
+        // Keep the transaction open so the other startup waits for this
+        // tenant, then must read the newly committed tracking record.
+        format!(
+            "INSERT INTO concurrent_notes SELECT '{}', pg_sleep(0.1)::text",
+            tenants[0]
+        ),
+    ];
+    let (a, b) = tokio::join!(
+        apply_migrations(Some(&first), &serving, &m, &tenants, &s.app, false),
+        apply_migrations(Some(&second), &serving, &m, &tenants, &s.app, false),
+    );
+    let logs = [a.unwrap(), b.unwrap()];
+    let expected = format!("applied {}", m.migrations[0].id);
+    assert_eq!(
+        logs.iter()
+            .flatten()
+            .filter(|line| **line == expected)
+            .count(),
+        1
+    );
+    assert_eq!(
+        first
+            .query_texts(
+                "SELECT count(*)::text FROM vibe_platform.applied_migrations WHERE tenant_id = $1",
+                &tenants[0],
+            )
+            .await
+            .unwrap(),
+        vec!["1"]
+    );
 }

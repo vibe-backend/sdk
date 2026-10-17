@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::http::Slug;
 
@@ -11,7 +11,7 @@ pub struct SlugLoad {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct SlugFile {
     tenant_id: String,
     #[serde(default = "yes")]
@@ -47,24 +47,30 @@ pub fn load_project_slugs(project: &Path, allow_example: bool) -> Result<SlugLoa
             warnings,
         });
     };
-    let text = fs::read_to_string(&path).map_err(|err| err.to_string())?;
-    let raw: HashMap<String, SlugFile> =
-        serde_json::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))?;
-    let mut warnings = Vec::new();
+    let mut loaded = load_slug_file(&path)?;
     if fallback {
-        warnings.push(format!(
+        loaded.warnings.push(format!(
             "using {} because .vibe/slugs.json is missing",
             path.display()
         ));
     }
+    Ok(loaded)
+}
+
+/// Parse one slug configuration file using the runtime rules.
+pub fn load_slug_file(path: &Path) -> Result<SlugLoad, String> {
+    let text = fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let raw: HashMap<String, SlugFile> =
+        serde_json::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))?;
     let mut slugs = HashMap::new();
     for (slug, entry) in raw {
         if !valid_slug(&slug) {
-            return Err(format!("invalid slug {slug}"));
+            return Err(format!("{}: invalid slug {slug}", path.display()));
         }
         if !valid_tenant(&entry.tenant_id) {
             return Err(format!(
-                "tenant id {} must match ^[a-z0-9]{{8,32}}$",
+                "{}: tenant id {} must match ^[a-z0-9]{{8,32}}$",
+                path.display(),
                 entry.tenant_id
             ));
         }
@@ -77,42 +83,10 @@ pub fn load_project_slugs(project: &Path, allow_example: bool) -> Result<SlugLoa
             },
         );
     }
-    Ok(SlugLoad { slugs, warnings })
-}
-
-pub fn add_slug(
-    project: &Path,
-    slug: &str,
-    tenant_id: &str,
-    public_write: bool,
-) -> Result<(), String> {
-    if !valid_slug(slug) {
-        return Err(
-            "slug must be lowercase letters, digits, and single hyphens, 1-63 characters".into(),
-        );
-    }
-    if !valid_tenant(tenant_id) {
-        return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
-    }
-    let dir = project.join(".vibe");
-    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    let path = dir.join("slugs.json");
-    let mut raw: HashMap<String, SlugFile> = if path.exists() {
-        let text = fs::read_to_string(&path).map_err(|err| err.to_string())?;
-        serde_json::from_str(&text).map_err(|err| err.to_string())?
-    } else {
-        HashMap::new()
-    };
-    raw.insert(
-        slug.to_string(),
-        SlugFile {
-            tenant_id: tenant_id.to_string(),
-            public_access: true,
-            public_write,
-        },
-    );
-    let text = serde_json::to_string_pretty(&raw).map_err(|err| err.to_string())?;
-    fs::write(path, text + "\n").map_err(|err| err.to_string())
+    Ok(SlugLoad {
+        slugs,
+        warnings: Vec::new(),
+    })
 }
 
 pub(super) fn valid_slug(slug: &str) -> bool {

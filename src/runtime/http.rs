@@ -545,7 +545,14 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             }
             _ => {
                 let message = if state.dev_hints && unknown {
-                    format!("Not found. Unknown slug `{slug}`; run `vibe slug add {slug} --tenant <id>` or copy slugs.example.json to .vibe/slugs.json{}", if state.dev_slugs.is_some() { "; `vibe slug add` is picked up without restart under `run --db memory`" } else { "" })
+                    format!(
+                        "Not found. Unknown slug `{slug}`; add it to .vibe/slugs.json{}",
+                        if state.dev_slugs.is_some() {
+                            "; changes to .vibe/slugs.json are picked up without restart under `vibe run --db memory`"
+                        } else {
+                            ""
+                        }
+                    )
                 } else {
                     "Not found".into()
                 };

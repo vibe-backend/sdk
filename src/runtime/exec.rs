@@ -348,7 +348,7 @@ impl QueryExec for MemoryExec {
             .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
         let rows = tables.entry(key(tenant_id, REFRESH_TABLE)).or_default();
         let now = chrono::Utc::now().timestamp();
-        // Bounded cleanup of finished families (PostgreSQL: `vibe migrate`).
+        // Bounded cleanup of finished families (PostgreSQL: automatic tenant migration).
         super::refresh::memory_cleanup(rows, now, super::refresh::CLEANUP_BATCH as usize);
         Ok(super::refresh::memory_issue(
             rows, tenant_id, user_id, token_hash, policy, now,
@@ -750,13 +750,13 @@ impl RoleStatus {
         }
         if !self.unprotected_relations.is_empty() {
             out.push(format!(
-                "can access tenant relation(s) without ENABLE + FORCE ROW LEVEL SECURITY ({}); re-run `vibe migrate` or enable RLS on them",
+                "can access tenant relation(s) without ENABLE + FORCE ROW LEVEL SECURITY ({}); restart `vibe run --db postgres` with VIBE_MIGRATE_DATABASE_URL set or enable RLS on them",
                 self.unprotected_relations.join(", ")
             ));
         }
         if !self.foreign_policies.is_empty() {
             out.push(format!(
-                "tenant table(s) carry policies other than the canonical tenant_isolation ({}); permissive policies are OR-combined and would let rows leak across tenants; drop them and re-run `vibe migrate`",
+                "tenant table(s) carry policies other than the canonical tenant_isolation ({}); permissive policies are OR-combined and would let rows leak across tenants; drop them and restart `vibe run --db postgres` with VIBE_MIGRATE_DATABASE_URL set",
                 self.foreign_policies.join(", ")
             ));
         }
@@ -1092,7 +1092,7 @@ impl PgExec {
         self.check_role_separation_for(None).await
     }
 
-    /// As `check_role_separation`, for a named role (`vibe migrate` checks
+    /// As `check_role_separation`, for a named role (automatic tenant migration checks
     /// the runtime role it grants to); `None` means the connected role.
     pub async fn check_role_separation_for(&self, role: Option<&str>) -> Result<(), String> {
         let client = self.client().await?;
@@ -1142,7 +1142,7 @@ impl PgExec {
             Ok(())
         } else {
             Err(format!(
-                "refusing to serve: database role `{}` {}; connect with a non-owner role without BYPASSRLS (use VIBE_MIGRATE_DATABASE_URL for `vibe migrate`)",
+                "refusing to serve: database role `{}` {}; connect with a non-owner role without BYPASSRLS (use VIBE_MIGRATE_DATABASE_URL for automatic tenant migration)",
                 status.name,
                 problems.join(", ")
             ))

@@ -45,7 +45,7 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 
 ## 3. Required status checks
 
-- 而家已經有：`vibe secret-scan --fail-on-find`。
+- 每次 `vibe build` 都會掃描 secret；有發現就失敗（決定 179）。
 - `vibe build --check`：喺 CI 由 source build 一次，驗證結果同決定 114 policy（唔同 commit 咗嘅 lock 比較，因為 lock 唔 commit；spec 決定 117）。
 - 而家已經有：`vibe build --check`。
 - `main` 建議用 **ruleset**（唔好用舊式 branch protection）開 pull request rule 嘅 **Require approval of the most recent reviewable push**。

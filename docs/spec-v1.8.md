@@ -18,7 +18,7 @@
 
 ### v1.8（草稿，2026-10-14）
 
-- 補編決定 150–178（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
+- 補編決定 150–179（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 vibe-version 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe build` → `vibe run`（決定 177））
 - `vibe build` 係官方 build 指令：預設更新過時 lock、驗證同寫 dev manifest；`--release` 做 release 打包，`--check` 唔寫檔（決定 175）。
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
@@ -239,7 +239,7 @@
 | 118 | Build once, promote：release job 只喺 `v*` tag build 一次，同一個 artifact 原封不動 promote 去各環境，唔重新 build；部署器用 `gh attestation verify --source-ref refs/tags/v<version>` 驗證。PR CI build 只係非權威預覽，結果唔可以部署。LLM key：release 用 `release` environment secret `VIBE_LLM_API_KEY`，PR 預覽用 `VIBE_LLM_API_KEY_PREVIEW`，兩條分開。Artifact 入面要有審計戳記（tag、commit SHA、workflow run id、compiler-hash、build 時間），唔包含任何 key。閘門：臨時方案 (i) 下任何有寫權限嘅人都可以開 `v*` tag，所以 tag 唔係真正閘門；唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118（`--release-approval` 已撤回）。將來目標係方案 (iii)：專用 release App 係唯一可以開 `v*` tag 嘅 actor，並開啟 `prevent_self_review`。兩條 LLM secret 由 Jack 本人建立。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 已確認（產品經理 2026-10-14） | 2A.8、2C.3b |
 | 119 | Manifest 簽名改用 Sigstore keyless（Jack 決定，取代 KMS）：release manifest 由 release workflow 喺 `release` environment 用 GitHub OIDC 身份經 Sigstore（Fulcio 證書）簽，簽名一定要記錄喺 Rekor transparency log。驗證時證書身份一定要完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`（只接受完全相等，唔可以寬鬆配對 `refs/tags/v*`；如果工具一定要用 regex，只可以用完全錨定、正確轉義、寫死部署版本嘅式，例如 `^https://github\.com/vibe-backend/sdk/\.github/workflows/release\.yml@refs/tags/v1\.8\.0$`），commit SHA 同 GitHub-hosted runner 都要對，同決定 113 attestation 一致；issuer pin 死 `https://token.actions.githubusercontent.com`；冇 Rekor inclusion 證明即拒絕。驗證離線做：Rekor inclusion proof／SET 隨 Sigstore bundle 一齊交付；trust root（`trusted_root.json`：Fulcio CA、Rekor 公鑰、CT log key）由 Sigstore TUF repository 取得，release 時 pin 一份入 runtime binary，見 2C.3b。Keyless 身份只證明邊個 workflow 同 tag 產生呢個 build，唔證明邊個批准；佢唔會加多一個人，因為任何 `j113203` agent 都可以開 tag 再自己批准。冇任何長期簽名 key 或者 KMS，冇自管簽名 key 輪換（Sigstore trust root 輪換見 2C.3b）。Environment secret（例如簽名 secret）只可以用喺 dev／test，永遠唔用嚟簽 release。剩餘風險：臨時方案 (i) 下 tag 身份唔係閘門，唯一人手批准閘門係 Jack 批准 `release` environment；自動閘門仍然係決定 113／114／118；trust root 更新都係經同一個 `release` environment 出，同一個帳戶可以自己批准，冇額外嘅人把關。 | 已確認（產品經理 2026-10-14） | 2C.2、2C.3、2C.3b、9B、9C |
 | 120 | Email 正規化（issue #106）：v1 唔合併 plus addressing，`a+x@` 同 `a@` 係兩個唔同地址；local part 入面嘅點（`.`）照樣保留，`a.b@` 同 `ab@` 係兩個唔同地址。Local part：先做 Unicode NFC（唔係 NFKC），再 trim，再 lowercase。Domain：用 IDNA UTS #46 轉做 punycode，再 lowercase；IDNA 轉換失敗回 422 `VALIDATION_FAILED`。唯一 index、查找同發送全部用正規化後嘅值；login、註冊、邀請、驗證、重發同 rate-limit 全部先正規化再儲存同查找（12.11）。v1 只儲存正規化後嘅值，唔另外保留原本地址做顯示。現有資料遷移：migration 先偵測正規化後衝突（只差大小寫或者 Unicode 形式嘅重複地址）；有任何衝突就 fail closed 停止，唔自動合併；衝突報告只列 user id，任何公開 log 都唔出現完整 email；由人手按 12.11 嘅處理程序解決之後先重新跑。 | 已確認（產品經理 2026-10-16） | 4.3、9、12.11 |
-| 129 | 租戶 role 細節（補充決定 97，SDK #147）：(1) Runtime role 係 `tenant_<id>_rw`、`tenant_<id>_public_reader`、`tenant_<id>_public_writer`；`<id>` 係系統產生、只有 `[a-z0-9_]` 嘅不透明 id，永遠唔用用戶提供嘅名；role 名超過 63 bytes 即拒絕，永遠唔截斷。(2) 連線池每個（租戶、role）5 條，每個租戶最多 15 條；另有全 process 上限，預設 200，可以設定（設定名 `VIBE_DB_POOL_MAX_TOTAL`（已確認（產品經理 2026-10-16）））。三個上限（每個（租戶、role）5 條、每個租戶 15 條、全 process）任何一個滿咗，都即刻回 503 `DB_POOL_EXHAUSTED` 加 `Retry-After`（值 `1`（已確認（產品經理 2026-10-16））），並發 metric（名 `vibe_db_pool_exhausted_total{scope="role"\|"tenant"\|"process"}`（已確認（產品經理 2026-10-16）））；永遠唔排隊等 timeout，包括每個（租戶、role）同每個租戶上限。(3) `VIBE_TENANT_DB_SECRETS` JSON 檔只限開發同測試，權限一定 0600，永遠唔 commit、唔寫 log；production 憑證來源係 secret manager，經每個租戶 role 嘅環境變數參照注入（同 #147 實作一致），process 只讀參照、唔落地成檔；production 見到呢個檔就拒絕啟動（fail closed）。Owner role（`tenant_<id>_owner`）憑證：平台只喺每次 migrate 開始時由 secret manager 發一次性密碼，migrate 完成即作廢並將 role 設返 `NOLOGIN`；即係每次 migrate 都輪換，runtime 永遠攞唔到。(4) 閒置連線池 5 分鐘後關閉（v1 固定，冇環境變數設定）；呢點阻 GA，唔阻 v1 preview。(5) Migration role 係 `tenant_<id>_owner`，擁有該租戶 schema 同表，只畀 migrate 用。決定 27 嘅例外（已確認（產品經理 2026-10-16））：PostgreSQL owner 天生可以 TRUNCATE／DROP 同重新授權，冇辦法靠收權限禁止，所以 owner 係決定 27 嘅受控例外，條件見 2B「Owner role 條件」：migration parser 用正面白名單、migrate 單一 transaction、finally 由獨立平台 admin 連線收回登入、定期檢查、runtime 連線池永遠唔以 owner 登入；runtime role 唔係 owner，每張表都要 `FORCE ROW LEVEL SECURITY`；migrate 兩樣都檢查，缺任何一樣就失敗。(6) 編譯器輸出每個租戶常數 policy（`TO tenant_<id>_rw`），唔用 `current_setting('app.tenant_id')`；部署時比較編譯出嚟嘅 policy 同 DB 實際安裝嘅 policy，唔一致即 fail closed。 實作狀態（對照 #147 @8066b69）：#147 已包括三層連線池上限即時 503、`VIBE_DB_POOL_MAX_TOTAL`、`vibe_db_pool_exhausted_total{scope}`、production 拒絕 `VIBE_TENANT_DB_SECRETS`、一次性 owner 密碼、`pg_policies` 比對、migrate 拆做主 transaction 加 commit 後 concurrent index 步驟、finally 由獨立 admin 連線將 owner 設返 `NOLOGIN`、定期 owner 檢查（`vibe check-owners`）、連線池拒絕 owner role、parser 白名單（2B.3，#206）、INVALID index 只 drop 平台紀錄嘅（#207）、閒置連線池固定 5 分鐘關閉（v1 冇環境變數設定，#165）。受控 membership 例外（已確認（產品經理 2026-10-16））：每個租戶剛好一行 membership `tenant_<id>_rw` ← `tenant_<id>_owner`，`ADMIN FALSE`、`INHERIT FALSE`、`SET TRUE`（PostgreSQL 16+），反方向同其他任何 membership 令啟動失敗；owner migrate 以外 `NOLOGIN` 加定期偏差檢查；必須測試跨租戶、INHERIT、ADMIN OPTION 三種失敗情況——未實作，#246（#147 啟動檢查要調整）。另外嘅 lock 驗證器加固由 #147 進行中。未完成：backfill 同 replay 清理按租戶設定 RLS context、參數化同分批——未實作，#233。未完成：v1 要求 PostgreSQL 16 或以上（架構師決定 2026-10-16），16 以下 `vibe migrate`／`vibe run` 啟動時 fail closed 並報明確錯誤，冇 fallback——未實作（code 仲未檢查版本），#254。 | 已確認（產品經理 2026-10-16）；owner `SET ROLE` 剩餘風險已接受（產品經理 2026-10-16） | 7.1、7.1a、9C |
+| 129 | 租戶 role 細節（補充決定 97，SDK #147）：(1) Runtime role 係 `tenant_<id>_rw`、`tenant_<id>_public_reader`、`tenant_<id>_public_writer`；`<id>` 係系統產生、只有 `[a-z0-9_]` 嘅不透明 id，永遠唔用用戶提供嘅名；role 名超過 63 bytes 即拒絕，永遠唔截斷。(2) 連線池每個（租戶、role）5 條，每個租戶最多 15 條；另有全 process 上限，預設 200，可以設定（設定名 `VIBE_DB_POOL_MAX_TOTAL`（已確認（產品經理 2026-10-16）））。三個上限（每個（租戶、role）5 條、每個租戶 15 條、全 process）任何一個滿咗，都即刻回 503 `DB_POOL_EXHAUSTED` 加 `Retry-After`（值 `1`（已確認（產品經理 2026-10-16））），並發 metric（名 `vibe_db_pool_exhausted_total{scope="role"\|"tenant"\|"process"}`（已確認（產品經理 2026-10-16）））；永遠唔排隊等 timeout，包括每個（租戶、role）同每個租戶上限。(3) `VIBE_TENANT_DB_SECRETS` JSON 檔只限開發同測試，權限一定 0600，永遠唔 commit、唔寫 log；production 憑證來源係 secret manager，經每個租戶 role 嘅環境變數參照注入（同 #147 實作一致），process 只讀參照、唔落地成檔；production 見到呢個檔就拒絕啟動（fail closed）。Owner role（`tenant_<id>_owner`）憑證：平台只喺每次 migrate 開始時由 secret manager 發一次性密碼，migrate 完成即作廢並將 role 設返 `NOLOGIN`；即係每次 migrate 都輪換，runtime 永遠攞唔到。(4) 閒置連線池 5 分鐘後關閉（v1 固定，冇環境變數設定）；呢點阻 GA，唔阻 v1 preview。(5) Migration role 係 `tenant_<id>_owner`，擁有該租戶 schema 同表，只畀 migrate 用。決定 27 嘅例外（已確認（產品經理 2026-10-16））：PostgreSQL owner 天生可以 TRUNCATE／DROP 同重新授權，冇辦法靠收權限禁止，所以 owner 係決定 27 嘅受控例外，條件見 2B「Owner role 條件」：migration parser 用正面白名單、migrate 單一 transaction、finally 由獨立平台 admin 連線收回登入、定期檢查、runtime 連線池永遠唔以 owner 登入；runtime role 唔係 owner，每張表都要 `FORCE ROW LEVEL SECURITY`；migrate 兩樣都檢查，缺任何一樣就失敗。(6) 編譯器輸出每個租戶常數 policy（`TO tenant_<id>_rw`），唔用 `current_setting('app.tenant_id')`；部署時比較編譯出嚟嘅 policy 同 DB 實際安裝嘅 policy，唔一致即 fail closed。 實作狀態（對照 #147 @8066b69）：#147 已包括三層連線池上限即時 503、`VIBE_DB_POOL_MAX_TOTAL`、`vibe_db_pool_exhausted_total{scope}`、production 拒絕 `VIBE_TENANT_DB_SECRETS`、一次性 owner 密碼、`pg_policies` 比對、migrate 拆做主 transaction 加 commit 後 concurrent index 步驟、finally 由獨立 admin 連線將 owner 設返 `NOLOGIN`、定期 owner 檢查（`vibe check-owners`）、連線池拒絕 owner role、parser 白名單（2B.3，#206）、INVALID index 只 drop 平台紀錄嘅（#207）、閒置連線池固定 5 分鐘關閉（v1 冇環境變數設定，#165）。受控 membership 例外（已確認（產品經理 2026-10-16））：每個租戶剛好一行 membership `tenant_<id>_rw` ← `tenant_<id>_owner`，`ADMIN FALSE`、`INHERIT FALSE`、`SET TRUE`（PostgreSQL 16+），反方向同其他任何 membership 令啟動失敗；owner migrate 以外 `NOLOGIN` 加定期偏差檢查；必須測試跨租戶、INHERIT、ADMIN OPTION 三種失敗情況——未實作，#246（#147 啟動檢查要調整）。另外嘅 lock 驗證器加固由 #147 進行中。未完成：backfill 同 replay 清理按租戶設定 RLS context、參數化同分批——未實作，#233。未完成：v1 要求 PostgreSQL 16 或以上（架構師決定 2026-10-16），16 以下 `vibe run --db postgres`／`vibe-runtime run --db postgres` 啟動時（決定 179） fail closed 並報明確錯誤，冇 fallback——未實作（code 仲未檢查版本），#254。 | 已確認（產品經理 2026-10-16）；owner `SET ROLE` 剩餘風險已接受（產品經理 2026-10-16） | 7.1、7.1a、9C |
 | 130 | IP 限流計數鍵同驅逐（SDK #132，v1 blocker；修訂 #73 嘅限流設計）：(1) 網段 slot 上限（跟 #73）：上限係每個網段可以開嘅**新計數器 slot** 數目，唔係 request 次數。計數前 IPv4-mapped IPv6（`::ffff:a.b.c.d`）一律先轉做 IPv4（同 #182 一致）。IPv4 每個（`tenant_id`、/24）最多 10 個新 slot；IPv6 每個（`tenant_id`、/48）最多 10 個，另加每個（`tenant_id`、/32）最多 50 個。Request 次數限流照舊用 4.3 嘅滑動窗口同數字。(2) 平台層：另有一個跨租戶網段 slot 計數器，鍵係 /24 同 /48，預設上限係租戶 slot 上限 ×5（單位同樣係新計數器 slot），倍數用 `VIBE_RATE_PLATFORM_FACTOR` 設定（預設 5，最大 100（已確認（產品經理 2026-10-16）））；兩層都通過先放行；平台層亦保證每個租戶 64 slot 保底。拒絕回 429 加 `Retry-After`，回應永遠唔講係邊一層觸發。(3) 驅逐：固定窗口長度 60 秒，只用喺本決定嘅網段 slot 計數同佢嘅 LRU 驅逐（4.3 request 限流仍然係滑動窗口）；LRU 有上限，先驅逐已過期嘅項目；每個租戶有自己嘅計數器 slot 上限；slot 滿而冇過期項目就 fail closed，回 429 並記 metric；永遠唔驅逐仲喺窗口內嘅計數器。Metric：拒絕記 metric（名 `vibe_rate_limit_slot_refused_total{layer="tenant"\|"platform", reason="network_cap"\|"table_full"\|"tenant_budget_exhausted"\|"prefix_cap_exceeded"}`（已確認（產品經理 2026-10-16））；`layer` 只喺內部 metric 出現，回應唔講）。Slot 表（同 #182 新設計（已確認（產品經理 2026-10-16）））：租戶表：每個租戶有自己一個 4,096 slot 嘅表，滿咗只拒絕嗰個租戶；全部租戶總預算 = `VIBE_RATE_EXPECTED_TENANTS`（預設 256，範圍 1–4096）× 4,096；用緊少過 64 個 slot 嘅租戶一定放行。平台表：IPv4 按 /24、IPv6 按 /32 分開嘅表，每個最多 4,096 項。平台表保證每個租戶嘅 64 slot 保底：平台總量 = 租戶總預算 + 租戶數 × 64，預設 1,064,960（256 × 4,096 + 256 × 64），所以就算好多租戶填滿平台表，新租戶都唔會冇 slot 可用。多 instance 部署一定要用共用儲存（#157）。#73 嘅 shard 內 owner／reserve 上限（每個網段 100 個 bucket、較闊網段 1,000 個、最後 1,000 個保留 slot）照舊保留，喺本決定之外再疊加（已確認（產品經理 2026-10-16））。Test IP 覆寫由環境變數 `VIBE_HONOR_TEST_IP=true` 開啟，只喺 debug build 生效；release build 唔理 `x-vibe-test-ip` header，而且設定咗 `VIBE_HONOR_TEST_IP=true` 時 `vibe run`／router 拒絕啟動（fail closed）。剩餘風險：(a) 固定窗口邊界前後，網段新 slot 數目最多可以去到上限 ×2（已接受）；(b) 平台層令一個租戶嘅流量可以用埋同一 /24 或者 /48 其他租戶嘅額度（已接受）；(c) 平台總量只有保底以上嘅部分係跨租戶共用；共用部分喺一個窗口內用晒嘅話，保底以上嘅新 slot 會被拒絕，保底照樣保證（已確認（產品經理 2026-10-16））；(d) 同時滿咗嘅租戶多過 `VIBE_RATE_EXPECTED_TENANTS`，就只有用緊少過 64 個 slot 嘅租戶可以開新 slot（已確認（產品經理 2026-10-16））；呢個情況一定記 metric reason `tenant_budget_exhausted`（已確認（產品經理 2026-10-16））並發 WARN 告警（每分鐘最多一次），唔可以靜默拒絕；(e) 最差情況每個表大約 300 MB 記憶體（估計，未實測）（已確認（產品經理 2026-10-16））；唔可以靠呢個估計：v1 一定要有硬記憶體上限 `VIBE_RATE_TABLE_MEMORY_MAX_BYTES`（預設 268435456，即 256 MiB，限 limiter 全部 slot 表合計；名同預設已確認（產品經理 2026-10-16）；預設刻意細過單一表最差估計（大約 300 MB），滿載時 limiter 會先到 `table_full`（fail closed），#195 實測後再調整預設），超過即以 reason `table_full` fail closed。記憶體上限預先保留保底份額：租戶數 × 64 × 3 KiB（每個保底 slot 一個租戶計數器、一個平台計數器同一個 bucket），256 個租戶即 48 MiB，最多佔上限一半。保底以內嘅增長對照完整上限檢查；其他增長對照「上限減保留」檢查，超過即 `table_full`。#195 實測：每個 slot 大約 481 B，上限按每個 slot 1 KiB 估算；**GA blocker：記憶體實測（#195）**；(f) 活躍租戶多過 `VIBE_RATE_EXPECTED_TENANTS` 時，就算喺保底以內嘅請求都可能撞到硬記憶體上限，以 `table_full` fail closed（已接受（產品經理 2026-10-16））；接受條件：活躍租戶超過 `VIBE_RATE_EXPECTED_TENANTS` 嘅 80% 就發告警 `rate_limit_active_tenants_high`；保底以內嘅 `table_full` 拒絕要喺 `vibe_rate_limit_slot_refused_total{reason="table_full"}` 用 `within_floor` label 分辨（或者只寫入內部 log），永遠唔出現喺任何回應；#195 實測要一併驗證呢個風險同保底記憶體預留嘅大小；營運調整見 4.3；(g) 一個 IPv6 /32 入面活躍 /48 太多、超過該 /32 嘅平台表上限時，嗰個 /32 自己嘅用戶會 fail closed（已確認（產品經理 2026-10-16））；呢個情況一定記 metric reason `prefix_cap_exceeded`（reason 名已確認（產品經理 2026-10-16））並發 WARN 告警（每分鐘最多一次），唔可以靜默拒絕。 實作狀態（對照 #182 @679e128（2026-10-16 核對））：#182 實作每租戶 4,096 slot 表、`VIBE_RATE_EXPECTED_TENANTS`、64 slot 保底（平台表同記憶體保留，保底以內增長對照完整上限）、平台 /24、/32 表（預設總量 1,064,960）、`VIBE_RATE_PLATFORM_FACTOR`、IPv4-mapped 轉 IPv4、四個 reason、每分鐘最多一次嘅 WARN 告警、`VIBE_RATE_TABLE_MEMORY_MAX_BYTES` 硬上限（#210、#211），同埋 release build 唔理 test IP header。未完成：告警 `rate_limit_active_tenants_high`——#182 未實作，#234；`within_floor` 分辨——#182 未實作，#235；release build 設定 `VIBE_HONOR_TEST_IP=true` 時拒絕啟動——#182 已實作（自 @c12736c 由環境變數讀取，有測試），#230 喺 #182 merge 之後由 maintainer 關閉。記憶體實測見 #195（GA blocker）。 | 已確認（產品經理 2026-10-16） | 4.3、4A.3、7.2 |
 | 139 | `sign-jwt` 簽名算法政策（issue #198）：v1 只支援 ES256 同 RS256，預設 ES256；RS256 用嚟同第三方／JWKS 互通。RS256 key 最少 2048 bit，喺 `vibe validate --deploy`／部署同 `vibe run` 啟動時檢查，唔夠就 fail closed（拒絕啟動，永遠唔會降級或者改用其他 alg）。驗證端只接受設定好嘅一個 alg；`alg` header 係其他值一律拒絕，包括 `none`、HS*，同埋 ES256／RS256 之中另一個（唔准混用）。EdDSA 留到 vNext。實作狀態：部分未實作，見 4.1a。 （決定 175：指令改為 `vibe build`） | 已確認（產品經理 2026-10-16） | 4.1、4.1a、12.6 |
 
@@ -284,7 +284,7 @@
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
-### 0.14 v1.8 2026-10-17 決定（決定 150–178，產品經理已批准 2026-10-17）
+### 0.14 v1.8 2026-10-17 決定（決定 150–179，產品經理已批准 2026-10-17）
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
@@ -316,7 +316,8 @@
 | 175 | 指令集只有 `vibe`（互動，TTY）、`vibe build` 同 `vibe run`（下一個 PR 加入）。`vibe build` 預設 dev build：產生／更新過時 lock（全部 lock 都係最新就唔叫 LLM，CI 冇 LLM key 都得）、自動驗證（等同舊 `vibe validate --deploy --dev`）、輸出 dev manifest；`vibe build --release` 取代 `vibe manifest --release`，保留所有 release 檢查：拒絕 private endpoint、唔准浮動 model alias、一定要記錄 provider；`vibe build --check` 喺記憶體 build 同跑決定 114 policy，唔寫檔。`vibe compile` 改名 `vibe build`；`vibe validate`、`vibe manifest`、`vibe new` 刪除，舊指令提示新指令並以非零退出。`vibe serve` 暫時保留做隱藏指令，`vibe run` 取代後刪除。（決定 177：`vibe serve` 已刪除，改用 `vibe run`）舊 `--labels`、`-o` 擴充同 10.10 部署報告構想延至 vNext，放喺 `vibe build --release` 之下。取代決定 164，亦更新決定 76、82、102、154、166 引用舊指令嘅部分。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.2、2C.3 |
 | 176 | lock 用 `vibe-version`，正式版（包括 0.x）記 major.minor（例如 `0.1`、`1.0`），pre-release 記完整版本（例如 `1.0.0-rc.2`），必須完全一致。版本唔啱（包括舊 `prompt-N` lock）喺 build 驗證同 serve／runtime 載入都係 error，提示用 `vibe build` 重新產生；source 冇改但版本唔同亦當過時。取消獨立 `PROMPT_VERSION`，compile prompt 只可以喺 minor（或者 major）版本改，patch 唔准改。CI `scripts/ci/check-prompt-version.py` 檢查 `src/compile_prompt.sha256`（system、translation、repair prompt 指紋）同 `src/prompt_guide.rs`（grammar、guides、examples、repair input）；PR 改咗呢啲檔而 Cargo.toml major.minor 冇高過 base branch 就 fail。Cargo.toml 係 pre-release 或者 1.0.0 之前跳過。 決定 165 嘅 byte-identical 保證改為「同一 source、同一 vibe 版本戳記同同一結構」。取代決定 162 同所有提及 `PROMPT_VERSION` 嘅舊決定（18、64、165、172、174 嘅相關部分）；`vibe-version` 取代 `compiler:` 同 `compiler-hash:`，即決定 174 嘅 compiler-hash 變成 vibe lock 版本戳記；manifest provenance `compiler_hash` 改為 `vibe_version`。 | 已批准（產品經理 2026-10-17） | 2A.1、2A.6、2C.3、10.1 |
 | 177 | `vibe run` 讀 project lock，喺記憶體做 dev manifest，預設 in-memory store、`127.0.0.1:8080`；`--db postgres`／`VIBE_DB` 用現有 PG 設定。Lock 缺少、過時或版本唔啱就 error 提示 `vibe build`，永遠唔叫 LLM。`--artifact` 跑 `vibe build -o` 或者 release artifact；run 邏輯係 library（`src/run.rs`），下一個 PR 嘅 `vibe-runtime` binary 會用。刪除 `vibe serve`，提示 `vibe run`，exit 2。`LLM_PROVIDER=fake` 做 keyless 測試 build：只喺 build record 同 manifest provenance 標 `test_build`，lock 唔標（決定 174）；`vibe run` 冇 `--allow-test-build` 拒絕、非 development 一律拒絕，`vibe build --release` 永遠拒絕 fake。`LLM_API_KEY_FILE` 讀 key，trim 尾部換行，`LLM_API_KEY` 優先，key 永遠唔顯示。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.2、2C.3、2A.8 |
-| 178 | 同一份 code 出兩個 binary（Cargo feature `sdk`，預設開）：`vibe-sdk`（安裝做 `vibe`，開發同 CI build 用：互動 `vibe`、`vibe build`、`vibe run`，同 PR D 之前嘅輔助指令）同 `vibe-runtime`（部署用，`--no-default-features` build，冇 LLM client、build／compile 同互動 TTY code；`vibe-runtime run` 或者冇 subcommand 跑 `--artifact`（預設目前目錄）嘅 manifest，flags `--addr`、`--db`／`VIBE_DB`、`--allow-test-build`，跟決定 176 lock 版本規則同決定 177 test build 規則）。CI 證明 runtime binary 冇 sdk feature 同 sdk-only 字串；release asset `vibe-sdk-<target>`／`vibe-runtime-<target>`，SHA256SUMS 同 build provenance attestation 覆蓋兩個，Sigstore／attestation 檢查不變；release workflow 喺 build 之前檢查 tag（去咗 v）等於 Cargo.toml version。`vibe-install.sh` 用 `--runtime`／`VIBE_INSTALL_BINARY=runtime` 揀 runtime（預設 sdk），兩者驗證一樣嚴格，rc.2 之前嘅 release 只有 sdk 舊名 asset。版本升到 `1.0.0-rc.2`，lock 戳記係 `1.0.0-rc.2`。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.3b、2C.3d、10.1、14 |
+| 178 | 同一份 code 出兩個 binary（Cargo feature `sdk`，預設開）：`vibe-sdk`（安裝做 `vibe`，開發同 CI build 用：互動 `vibe`、`vibe build`、`vibe run`，冇其他輔助指令（決定 179））同 `vibe-runtime`（部署用，`--no-default-features` build，冇 LLM client、build／compile 同互動 TTY code；`vibe-runtime run` 或者冇 subcommand 跑 `--artifact`（預設目前目錄）嘅 manifest，flags `--addr`、`--db`／`VIBE_DB`、`--allow-test-build`，跟決定 176 lock 版本規則同決定 177 test build 規則）。CI 證明 runtime binary 冇 sdk feature 同 sdk-only 字串；release asset `vibe-sdk-<target>`／`vibe-runtime-<target>`，SHA256SUMS 同 build provenance attestation 覆蓋兩個，Sigstore／attestation 檢查不變；release workflow 喺 build 之前檢查 tag（去咗 v）等於 Cargo.toml version。`vibe-install.sh` 用 `--runtime`／`VIBE_INSTALL_BINARY=runtime` 揀 runtime（預設 sdk），兩者驗證一樣嚴格，rc.2 之前嘅 release 只有 sdk 舊名 asset。版本升到 `1.0.0-rc.2`，lock 戳記係 `1.0.0-rc.2`。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.3b、2C.3d、10.1、14 |
+| 179 | vibe-sdk 只剩 `vibe`、`vibe build`、`vibe run`；`migrate`、`keygen`、`slug`、`secret-scan`、`endpoint`、`approve` 刪除，印提示並 exit 2。keygen → build 自動建 dev key，release 唔使 key；slug → `.vibe/slugs.json`，build 檢查同列出；secret-scan → 每次 build，有發現就失敗；endpoint → `.vibe/disabled.txt`，build 檢查同列出；migrate → `vibe run --db postgres`／`vibe-runtime run --db postgres` 啟動時自動套用 pending migration（`vibe_platform.applied_migrations`、sha256、append-only、advisory lock），破壞性 migration 一律拒絕，要 `--allow-destructive-migrations` 先套用。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.3、2C.3e、9A、10、14 |
 
 ## 1. 目錄同命名
 
@@ -818,7 +819,7 @@ jobs:
           echo "<SHA256SUMS 入面嘅值>  vibe.tar.gz" | sha256sum --check
           tar -xzf vibe.tar.gz && install -m 755 vibe "$HOME/.local/bin/vibe"
       - name: Secret scan
-        run: vibe secret-scan --fail-on-find
+        run: vibe build --check # includes secret scanning (decision 179)
       - name: Recompile and compare locks
         if: github.event.pull_request.head.repo.fork != true
         env:
@@ -842,7 +843,7 @@ jobs:
 
 - 所有指令嘅 `--project` 預設係目前目錄（cwd）；只有 project 唔喺 cwd 先要寫（決定 81）。
 - 冇 `vibe approve`（決定 77）；舊 workflow 用到會報「指令已移除」並提示用 `vibe build --release`。
-- 指令集係互動 `vibe`、`vibe build` 同 `vibe run`（決定 177）。
+- 指令集只剩互動 `vibe`、`vibe build` 同 `vibe run`（決定 179）；舊 `migrate`、`keygen`、`slug`、`secret-scan`、`endpoint`、`approve` 指令印新流程提示並 exit 2。
 - `vibe`（冇參數、喺 terminal）進入互動模式（`vibe>`）：第一次用會問 LLM provider、base URL、model 同用戶自己嘅 API key（輸入時遮住，唔會顯示），寫入 project `.env`（確保喺 `.gitignore`，同決定 57、2A.8.3 一致）；之後用自然語言描述要做嘅 API，CLI 用設定好嘅 LLM 產生 feature source，`_definition.md`、`_version.md`、`providers/main.md` 用固定範本；寫入之前列出檔案同要用戶確認，唔會覆蓋現有檔案。非 terminal（例如 CI）執行 `vibe` 只顯示 help。
 - `vibe run` 嘅預設 slug `dev`（tenant `devtenant`）喺 development `--db memory` 一律可用，就算 slug 檔有其他 slug，slug 檔改咗唔使重啟就生效；production 同非 `--db memory` 不變。
 - README 快速開始（決定 82）：
@@ -874,6 +875,19 @@ jobs:
 - 選項：`--project` 揀 project；`-o`／`--output` 指定 manifest（預設 `manifest.json`，相對目前工作目錄）；`--release-version` 或 `v*` tag 指定 release 版本；`--commit` 或 CI／Git 資訊指定 commit。`--release` 同 `--check` 唔可以一齊用。
 - Dev manifest 用本機 `.vibe/signing.key` 簽，首次自動建立（0600），只准 development 載入。驗證同 manifest 使用同一份記憶體輸入；驗證失敗唔輸出部分結果。高風險項目列出但唔阻 release；CODEOWNERS 仍然係 source PR 合併條件，SDK 唔檢查。
 - **vNext**：`--labels`、`-o` 擴充同 10.10 部署報告構想放喺 `vibe build --release` 之下；現有 `-o` manifest 輸出已支援。`vibe run` 見決定 177。
+
+決定 179：每次 `vibe build` 都會掃描 secret，有發現就失敗；dev build
+自動建 `.vibe/signing.key`（0600）同 `.vibe/signing.pub`，release 唔使 key。
+Slug 直接改 `.vibe/slugs.json`，build 檢查同列出，例如：
+
+```json
+{"acme": {"tenant_id": "acme0001", "public_access": true, "public_write": false}}
+```
+
+`tenant_id` 要符合 `[a-z0-9]{8,32}`；`public_access` 預設 true，
+`public_write` 預設 false。停用 endpoint 直接改 `.vibe/disabled.txt`，
+每行 `<feature-id><TAB><reason>`；build 檢查同列出。Runtime 只喺啟動時讀
+停用檔，改完要重啟先生效；刪走嗰行就重新啟用。Build 亦會警告破壞性 migration。
 
 ### 2C.3a `--release-approval`（已撤回，產品經理 2026-10-16）
 
@@ -984,6 +998,33 @@ Cargo.toml version。Installer 預設 sdk，`--runtime`／`VIBE_INSTALL_BINARY=r
 rc.2 之前 SDK 可以用舊名 `vibe-<target>.tar.gz`，runtime 冇 fallback。
 兩者都維持 2C.3b 嘅 checksum、Sigstore 身份同 attestation flags，唔放寬任何驗證。
 
+### 2C.3e 自動 migration（決定 179）
+
+`vibe run --db postgres`／`vibe-runtime run --db postgres` 喺啟動時自動套用
+pending migration。`VIBE_MIGRATE_DATABASE_URL` 用 owner role；真正 serving
+用 `VIBE_DATABASE_URL` 非 owner role。`VIBE_RUNTIME_DB_ROLE` 可選，預設
+serving 連線嘅 `current_user`。租戶係 `.vibe/slugs.json` 入面嘅 tenant id
+加 `VIBE_TENANTS`（逗號分隔）嘅聯集。
+
+每個租戶、migration id 記錄喺 `vibe_platform.applied_migrations`，sha256 係
+statements 用 `"\n;\n"` 連接後嘅 SHA-256。Migration 只可以追加：已套用 id
+改咗 SQL 一律拒絕，要另加新 migration。Tracking 建立用固定 advisory lock；
+每個租戶 transaction 喺 BEGIN 後即攞
+`pg_advisory_xact_lock(hashtextextended('vibe_migrate:' || tenant, 0))`，
+攞鎖後先讀記錄；REPEATABLE READ 嘅 snapshot 亦一定喺上一個 migrator commit
+之後先建立。兩個 instance 同時啟動會串行處理同一租戶，唔會重複套用。
+
+破壞性 migration 一律拒絕，error 指出 migration id：DROP（DROP INDEX 除外）、
+DROP COLUMN、改 type、rename、TRUNCATE、DELETE，同所有無法分類嘅 SQL
+（例如 DO block）。`vibe build` 會警告。真係要套用就先 backup，啟動一次加
+`--allow-destructive-migrations`，完成後移除旗標再重啟。
+
+冇 `VIBE_MIGRATE_DATABASE_URL` 而仲有 pending migration 就拒絕啟動；全部
+已套用就照常啟動，所以完成 migration 後 owner 憑證可以唔留喺 serving process。
+由已移除嘅 `vibe migrate` 升級時，如果租戶 schema 已存在但冇記錄，migration
+失敗嘅 error 會印出確實嘅 INSERT；先確認 SQL 以前已套用，先用 owner role
+執行嗰個 INSERT 記錄，再重啟，唔可以記錄未套用嘅 SQL。
+
 ### 2C.4 In-memory 執行器（決定 74，已確認（產品經理 2026-10-14））
 
 適用：`vibe run`（vNext `vibe dev`，決定 166）。
@@ -1050,7 +1091,7 @@ rc.2 之前 SDK 可以用舊名 `vibe-<target>.tar.gz`，runtime 冇 fallback。
   - 呢個 membership 係 7.1 migration role membership 限制同 `vibe run`「租戶 role 唔可以有成員」檢查嘅受控例外（已確認（產品經理 2026-10-16）），只限同一租戶嘅 owner → `tenant_<id>_rw`（`NOINHERIT`）。條件：(1) 啟動檢查用正面條件寫：每個租戶剛好有一行 membership，`tenant_<id>_rw` ← `tenant_<id>_owner`（同一個 `<id>`），選項係 `ADMIN FALSE`、`INHERIT FALSE`、`SET TRUE`（PostgreSQL 16 或以上）；反方向同其他任何 membership（包括跨租戶、額外或者連鎖／間接）一律拒絕，啟動失敗。(2) Owner 喺 migrate 以外照舊 `NOLOGIN`，有定期偏差檢查（決定 129）。(3) 必須測試：owner 做其他租戶 rw 嘅成員、INHERIT、有 ADMIN OPTION，三種情況啟動都失敗。實作狀態：未實作，#147 嘅啟動檢查要調整，#246。決定 97（runtime 連線 role 同租戶 role 之間冇 membership）唔變。
   - 權限（已確認（產品經理 2026-10-16））：backfill 只可以做 `tenant_<id>_rw` 本身已經准做嘅嘢，永遠唔為 backfill 加 grant。權限唔夠就令該租戶 backfill 失敗（寫審計），改動交返產品經理決定。
   - Grant（PostgreSQL 16 或以上）：`GRANT tenant_<id>_rw TO tenant_<id>_owner WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`。
-  - PostgreSQL 版本（架構師決定 2026-10-16）：v1 要求 PostgreSQL 16 或以上。16 以下表達唔到上面嘅 grant 選項，所以 `vibe migrate` 同 `vibe run` 啟動時一律 fail closed，報明確錯誤（要求 PostgreSQL 16+），冇任何 fallback。實作狀態：未實作（code 仲未檢查版本），#254 跟進（包括最低版本測試）。
+  - PostgreSQL 版本（架構師決定 2026-10-16）：v1 要求 PostgreSQL 16 或以上。16 以下表達唔到上面嘅 grant 選項，所以 `vibe run --db postgres`／`vibe-runtime run --db postgres` 啟動時（決定 179）一律 fail closed，報明確錯誤（要求 PostgreSQL 16+），冇任何 fallback。實作狀態：未實作（code 仲未檢查版本），#254 跟進（包括最低版本測試）。
   - Batch transaction：一定用明確嘅 `BEGIN` 開始；batch 入面禁止 savepoint；owner 連線永遠唔加入任何共用連線池。
   - 條件：(1) 只有 migrate runner 可以發 `SET ROLE`；用戶寫嘅 migration SQL 唔可以用 `SET ROLE`、`RESET ROLE`、`SET SESSION AUTHORIZATION` 或者改 GUC，決定 129 白名單 parser（2B.3、Owner role 條件第 1 點）一律拒絕。(2) 每個 batch UPDATE 之前同之後都核對 `current_user` 等於處理緊嗰個租戶嘅 `tenant_<id>_rw`、`session_user` 等於 `tenant_<id>_owner`，任何唔一致即中止（fail closed）；FORCE RLS 同部署時 policy 比對全程有效。(3) #193 replay 清理用同一個做法。(4) 必須測試：用租戶 A context 跑嘅 backfill 對租戶 B 改動零行。
   - 實作狀態：未實作，#233（#147 @8066b69 而家以 owner 跑一條冇參數化、冇分批嘅 `UPDATE … WHERE`，喺 FORCE RLS 下睇唔到任何行）。
@@ -1250,7 +1291,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
   4. 每個舊 token 最多重發一次。超過寬限期、或者 `grace_reissued_at` 已經有值（寬限期內第二次再用）、或者家族已撤銷、或者子 token 已經再被輪換過，一律當重用：撤銷成個家族。
   5. 可選：平台可以額外比對 client 指紋（例如 User-Agent hash）先准重發；v1 唔要求。
 - 登出：revoke 當前家族；「全部裝置登出」revoke 該用戶所有家族。
-- 清理（#95）：revoke 一律用 UPDATE；成個家族絕對壽命完咗超過 1 日之後，`vibe migrate`（table owner）會分批 DELETE 嗰個家族嘅所有列（每批 1000 列，每次最多 100 批）。生效中嘅家族永遠唔會被清理，所以重用偵測唔受影響。
+- 清理（#95）：revoke 一律用 UPDATE；成個家族絕對壽命完咗超過 1 日之後，`vibe run --db postgres` 啟動 migration（決定 179）（table owner）會分批 DELETE 嗰個家族嘅所有列（每批 1000 列，每次最多 100 批）。生效中嘅家族永遠唔會被清理，所以重用偵測唔受影響。
 - refresh 流程由平台內置 `token-refresh` pipeline 實現，用 `method` op 呼叫標咗 `capabilities: [sign-token]` 嘅 model method 簽新 access token。
 - 簽發：`sign-jwt` op 嘅 `issue-refresh` 參數決定係咪同時發 refresh token：`new-family`（登入）、`rotate`（refresh，由 `token-refresh` pipeline 注入）、`none`；由平台按呼叫來源決定，method 唔可以自己揀 `rotate`。
 
@@ -1344,7 +1385,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 
 - INSERT：login（`issue-refresh: new-family`）喺插入家族第一條 token 嘅同一個 transaction 入面插入（`revoked_at` = null）。
 - 家族撤銷：每次成個家族撤銷（上面 `revoke_reason` 除咗 `grace-reissue` 之外嘅所有原因），SDK 喺 UPDATE `_platform_refresh_tokens.revoked_at` 嘅同一個 transaction 入面 `UPDATE _platform_refresh_families SET revoked_at = now() WHERE family_id = … AND revoked_at IS NULL`，所以兩張表一齊 commit 或者一齊 rollback。寬限期重發唔會寫呢欄。
-- 欄位層 UPDATE grant（runtime role）：只有 `last_refreshed_at` 同 `revoked_at`；冇 DELETE（家族紀錄跟 `_platform_refresh_tokens` 一樣由 `vibe migrate` 嘅過期清理批次刪除）。
+- 欄位層 UPDATE grant（runtime role）：只有 `last_refreshed_at` 同 `revoked_at`；冇 DELETE（家族紀錄跟 `_platform_refresh_tokens` 一樣由 `vibe run --db postgres` 啟動 migration（決定 179）嘅過期清理批次刪除）。
 - Guard trigger `_platform_refresh_family_guard`（同 #95 單向規則一致）：identity 欄位（`family_id`、`tenant_id`、`user_id`、`created_at`）唔可以改；`last_refreshed_at` 唔可以改做 null 或者早過舊值；`revoked_at` 單向，只可以由 null 改做有值（已經有值之後唔可以改值、唔可以改返 null）；家族行嘅 `revoked_at`（`OLD.revoked_at`）有值之後，`last_refreshed_at` 唔可以再改（家族撤銷係最終狀態）。凍結只睇家族行自己嘅 `revoked_at`，唔睇個別 token：寬限期重發撤銷單一 child（`_platform_refresh_tokens.revoked_at` 有值、`revoke_reason: grace-reissue`）唔計，所以唔會凍結。
 - 查法：`select last_refreshed_at from _platform_refresh_families where family_id = …`（平台內部／admin 用；用戶 lock 唔可以 query 平台表）。
 
@@ -1495,12 +1536,12 @@ error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-re
 **最後 refresh 時間（家族層面 `last_refreshed_at`，平台寫入）：**
 
 - 語意：「呢個 session（家族）最後幾時 refresh 成功」。以家族為單位，唔寫喺個別 token 行：舊（被出示嘅）token 行喺輪換時已經設 `used_at`，再加一個欄位幾乎重複；寫喺家族一行，查一個 session 只使讀一行。
-- 新表 `_platform_refresh_families`（見 4A.1「Refresh token 儲存」）由 `vibe migrate` 用 `CREATE TABLE IF NOT EXISTS` 建立，連同 grant 同 guard trigger；現有家族由 migrate 補一行（`last_refreshed_at` = 家族入面最遲嘅 `used_at`，冇就用最早 `issued_at`；`revoked_at` = 家族入面 `revoke_reason` 唔係 `grace-reissue` 嘅 token 最早嘅 `revoked_at`，冇就 null；`ON CONFLICT DO NOTHING`，可以重複行）。
+- 新表 `_platform_refresh_families`（見 4A.1「Refresh token 儲存」）由 `vibe run --db postgres` 啟動 migration（決定 179）用 `CREATE TABLE IF NOT EXISTS` 建立，連同 grant 同 guard trigger；現有家族由 migrate 補一行（`last_refreshed_at` = 家族入面最遲嘅 `used_at`，冇就用最早 `issued_at`；`revoked_at` = 家族入面 `revoke_reason` 唔係 `grace-reissue` 嘅 token 最早嘅 `revoked_at`，冇就 null；`ON CONFLICT DO NOTHING`，可以重複行）。
 - SDK 喺輪換確認（finalize）嘅同一個 transaction 入面，`UPDATE _platform_refresh_families SET last_refreshed_at = greatest(last_refreshed_at, now()) WHERE family_id = …`；寬限期重發（決定 61）都喺佢嘅 finalize transaction 入面同樣更新。所以佢同輪換一齊 commit 或者一齊 rollback，用戶 method 唔使寫。
 - 寬限期重發時，撤銷嘅只係遺失嘅舊 child（`_platform_refresh_tokens` 嗰行 `revoke_reason: grace-reissue`），唔係成個家族，唔會設 `_platform_refresh_families.revoked_at`；trigger 只睇家族行嘅 `revoked_at`，所以唔會撞到「家族撤銷之後唔可以改」；而且新值一定唔早過舊值（同決定 61 一致）。成個家族撤銷（例如重用偵測、`logout`）會喺同一個 transaction 設家族行 `revoked_at`，之後 `last_refreshed_at` 就凍結。
 - 欄位層 UPDATE grant：`_platform_refresh_families` 只有 `last_refreshed_at` 同 `revoked_at`；`_platform_refresh_tokens` 嘅 grant 列表唔變（同 #95 一樣）。
 - 同 #95 已批准嘅單向 guard trigger 一致：`last_refreshed_at` 只可以向前（唔可以係 null 或者早過舊值）；`revoked_at` 只可以由 null 改做有值；家族行 `revoked_at` 有值之後 `last_refreshed_at` 唔可以再改（單一 child 嘅 `grace-reissue` 撤銷唔計）；identity 欄位唔可以改。`vibe run` 啟動時檢查兩張表嘅 grant 同 trigger，唔符合就拒絕啟動（fail closed）。
-- 升級次序：因為新表、grant 同 trigger 都由 `vibe migrate` 建立，而 `vibe run` 啟動檢查會要求佢哋存在，升級之後一定要先對每個租戶行 `vibe migrate`，之後先 `vibe run`。
+- 升級次序：因為新表、grant 同 trigger 都由 `vibe run --db postgres` 啟動 migration（決定 179）建立，而 `vibe run` 啟動檢查會要求佢哋存在，升級之後設定 `VIBE_MIGRATE_DATABASE_URL`，用 `vibe run --db postgres` 啟動，自動為設定好嘅租戶套用 migration（決定 179）。
 
 **範例：唯讀 sign-method 加獨立寫入 method：**
 
@@ -1781,10 +1822,10 @@ Client 流程：`POST …/refresh` 成功攞到新 access token 之後，再 `PO
 3. 唯讀 `sign-method` 照常通過；同一個 method 用喺 login（`issue-refresh: new-family`）唔受影響。
 4. 上面範例（fixture `tests/fixtures/refresh-session`：唯讀 `user.sign-token` 做 sign-method，加 `user.record-session` 同 `api/auth/v1/session`）通過 `vibe build` 同 `vibe build --release`：`tests/refresh_sign_method_example.rs` 嘅 `refresh_session_example_passes_validate_and_build`（已經喺 CI 行）。同一個檔案嘅 `refresh_session_example_writing_sign_method_is_rejected`（sign-method 加一個寫入 step，要報 `REFRESH_SIGN_METHOD_WRITES`）暫時 `#[ignore]`，由決定 149 嘅 code PR 啟用。
 5. DB 兜底：繞過靜態檢查（測試專用 manifest）令 refresh 期間 `sign-method` 執行寫入 SQL，PostgreSQL 以 `25006` 拒絕，回 500 `INTERNAL`、輪換冇 finalize、舊 token 仍然 current、冇寫入殘留；login 路徑唔套用 READ ONLY。
-6. `_platform_refresh_families.last_refreshed_at`／`revoked_at`：login 插入家族行（`revoked_at` null）；輪換同寬限期重發都喺 finalize transaction 更新 `last_refreshed_at`；finalize rollback 時唔變；寬限期重發（只撤銷舊 child，`grace-reissue`）唔設家族 `revoked_at`，而且照樣可以更新 `last_refreshed_at`（包括家族入面已經有 `grace-reissue` 撤銷嘅 token 之後）；成個家族撤銷（重用偵測、`logout`、`logout-all` 等）喺同一個 transaction 設家族 `revoked_at`，rollback 時兩張表都唔變；trigger 拒絕 `last_refreshed_at` 改細、改做 null、改 identity 欄位、`revoked_at` 改值或者改返 null，同家族 `revoked_at` 有值之後再改 `last_refreshed_at`；`_platform_refresh_tokens` 嘅 grant 列表冇變；serve 啟動檢查兩張表嘅 grant 同 trigger；`vibe migrate` 為現有家族補行而且可以重複行。
+6. `_platform_refresh_families.last_refreshed_at`／`revoked_at`：login 插入家族行（`revoked_at` null）；輪換同寬限期重發都喺 finalize transaction 更新 `last_refreshed_at`；finalize rollback 時唔變；寬限期重發（只撤銷舊 child，`grace-reissue`）唔設家族 `revoked_at`，而且照樣可以更新 `last_refreshed_at`（包括家族入面已經有 `grace-reissue` 撤銷嘅 token 之後）；成個家族撤銷（重用偵測、`logout`、`logout-all` 等）喺同一個 transaction 設家族 `revoked_at`，rollback 時兩張表都唔變；trigger 拒絕 `last_refreshed_at` 改細、改做 null、改 identity 欄位、`revoked_at` 改值或者改返 null，同家族 `revoked_at` 有值之後再改 `last_refreshed_at`；`_platform_refresh_tokens` 嘅 grant 列表冇變；serve 啟動檢查兩張表嘅 grant 同 trigger；`vibe run --db postgres` 啟動 migration（決定 179）為現有家族補行而且可以重複行。
 7. 現有 `tests/refresh_tokens.rs` 用緊會寫入嘅 sign-method（`app_with_issuance_control(_, true)`、`rejected_tokens_do_not_run_sign_method_writes`），實作決定 149 時要改寫做上面第 1、2 同 5 項嘅「靜態拒絕」同「READ ONLY 兜底」測試。
 
-**遷移（breaking）：** 現有有寫入嘅 `sign-method` 要拆開：(1) 「最後 refresh 時間」之類嘅資料唔使再寫，改用平台嘅家族層面 `_platform_refresh_families.last_refreshed_at`；(2) 其他業務寫入搬去一個普通寫入 method，由 client 喺 refresh 成功之後另外呼叫（見上面範例）；`token-refresh` route 冇「refresh 之後」嘅 step，唔可以喺 refresh endpoint 入面做。`sign-method` 只保留讀取同 `sign-jwt`，`## Signature` 設 `writes: false`，再重新 build。升級 SDK 之後，一定要先對每個租戶行 `vibe migrate`（建立 `_platform_refresh_families`、grant 同 trigger），之後先 `vibe run`；否則 serve 啟動檢查會拒絕啟動。
+**遷移（breaking）：** 現有有寫入嘅 `sign-method` 要拆開：(1) 「最後 refresh 時間」之類嘅資料唔使再寫，改用平台嘅家族層面 `_platform_refresh_families.last_refreshed_at`；(2) 其他業務寫入搬去一個普通寫入 method，由 client 喺 refresh 成功之後另外呼叫（見上面範例）；`token-refresh` route 冇「refresh 之後」嘅 step，唔可以喺 refresh endpoint 入面做。`sign-method` 只保留讀取同 `sign-jwt`，`## Signature` 設 `writes: false`，再重新 build。升級 SDK 之後，設定 `VIBE_MIGRATE_DATABASE_URL`，用 `vibe run --db postgres` 啟動，自動建立 `_platform_refresh_families`、grant 同 trigger，再做 serving 檢查（決定 179）；缺少 owner 憑證而有 pending migration 就拒絕啟動。
 
 **#270：** 決定 149 實作 merge 之後，#270 可以 close。選項 B 延後到 vNext。
 
@@ -1859,7 +1900,7 @@ migration 放喺 ./migrations/main/。
 - RLS policy 由編譯器按租戶產生常數 policy，`TO tenant_<id>_rw`（同其他租戶 role），租戶 id 係常數，唔用 `current_setting('app.tenant_id')`；部署時比較編譯出嚟嘅 policy 同 DB 實際安裝嘅 policy，唔一致即 fail closed（決定 129）；`app.tenant_id` GUC 只可以用嚟 log 同診斷，**永遠唔會出現喺任何 policy 或者權限判斷**；租戶邊界係租戶 `LOGIN` role 加佢自己 schema（決定 97）。冇切換到租戶 role 嘅話，query 會因為冇權限直接報錯，唔會回空結果。
 - `search_path` 由平台固定產生：schema 模式係 `t_{tenant_id}`，唔包括 `public`；`public` schema 嘅 CREATE 權限要收走。
 - 連線 role 唔可以係表嘅 owner，亦唔可以有 `BYPASSRLS`。
-  - SDK 實作（決定 97）：冇共用 runtime role。每個租戶有自己嘅 migration role `tenant_<id>_owner`（擁有自己 schema，只畀 migrate 用，只以 `NOINHERIT` 做自己租戶嘅 `tenant_<id>_rw` 成員（2B backfill／決定 129 嘅受控例外，見 7.1），唔係任何其他 role 嘅成員；決定 129），`vibe migrate` 用佢喺該租戶 schema 跑 migration，再將 `SELECT`、`INSERT`、`UPDATE` 逐張表授權畀該租戶嘅 `LOGIN` role（`tenant_<id>_rw` 等），收走 `CREATE`；唔用 `ALTER DEFAULT PRIVILEGES` 跨租戶授權。跑完 migration 之後，schema 入面每張表都會 `ENABLE` + `FORCE ROW LEVEL SECURITY` 同埋加 `TO` 該租戶 role、寫死租戶 id 常數嘅 policy；冇 `tenant_id` 欄嘅表、view、materialized view 或 foreign table 會令 migrate 失敗；migrate 亦檢查 runtime role 唔係 owner 同每張表有 `FORCE ROW LEVEL SECURITY`，缺任何一樣即失敗（決定 129）。`vibe run` 為每個（租戶、role 類別）用租戶 `LOGIN` role 開連線池，啟動時檢查每個租戶 role：係 superuser、有 `BYPASSRLS`、係任何其他 role 嘅成員或者有其他 role 係佢成員（唯一受控例外見下）、擁有任何 schema、relation、function 或 type、又或者可以存取其他租戶 schema 或者冇 `ENABLE` + `FORCE ROW LEVEL SECURITY` 嘅 relation，就拒絕啟動。
+  - SDK 實作（決定 97）：冇共用 runtime role。每個租戶有自己嘅 migration role `tenant_<id>_owner`（擁有自己 schema，只畀 migrate 用，只以 `NOINHERIT` 做自己租戶嘅 `tenant_<id>_rw` 成員（2B backfill／決定 129 嘅受控例外，見 7.1），唔係任何其他 role 嘅成員；決定 129），`vibe run --db postgres` 啟動 migration（決定 179）用佢喺該租戶 schema 跑 migration，再將 `SELECT`、`INSERT`、`UPDATE` 逐張表授權畀該租戶嘅 `LOGIN` role（`tenant_<id>_rw` 等），收走 `CREATE`；唔用 `ALTER DEFAULT PRIVILEGES` 跨租戶授權。跑完 migration 之後，schema 入面每張表都會 `ENABLE` + `FORCE ROW LEVEL SECURITY` 同埋加 `TO` 該租戶 role、寫死租戶 id 常數嘅 policy；冇 `tenant_id` 欄嘅表、view、materialized view 或 foreign table 會令 migrate 失敗；migrate 亦檢查 runtime role 唔係 owner 同每張表有 `FORCE ROW LEVEL SECURITY`，缺任何一樣即失敗（決定 129）。`vibe run` 為每個（租戶、role 類別）用租戶 `LOGIN` role 開連線池，啟動時檢查每個租戶 role：係 superuser、有 `BYPASSRLS`、係任何其他 role 嘅成員或者有其他 role 係佢成員（唯一受控例外見下）、擁有任何 schema、relation、function 或 type、又或者可以存取其他租戶 schema 或者冇 `ENABLE` + `FORCE ROW LEVEL SECURITY` 嘅 relation，就拒絕啟動。
 - 所有 runtime DB role 類別（`app_rw`、`public_reader`、`public_writer`；每個係**每個租戶各自一個** role 類別，例如 `tenant_<id>_rw`，見下面租戶身份）都冇 `DELETE`、`TRUNCATE`、DDL 權限（決定 27）。
 - 平台專用 role（用戶 lock 唔可以用）：
 
@@ -1925,7 +1966,7 @@ migration 放喺 ./migrations/main/。
     - 建立資料（有 INSERT）嘅 public endpoint：一定要 `type: captcha` 或者 `pow`，`when: always`（v1 只支援 `captcha`，`pow` 係 build error，見 7.2a 決定 131）。
     - login 類 endpoint：一定要 `{ type: captcha, when: after-failures, after-failures: 3 }`（跟 4A.3）。
     - 其他冇 INSERT 嘅 public 寫入：可以 `type: none`。
-    - Challenge token 單次使用狀態（#157，產品決定）：production 有設定 verifier 時一律用 PostgreSQL replay store；表喺每個租戶自己 schema（`t_<tenant>.vibe_challenge_replay`，有 `tenant_id`、ENABLE + FORCE RLS，owner role 擁有，由該租戶嘅 `vibe migrate` 建立），冇跨租戶共用表（決定 97）。runtime role 只有 SELECT、INSERT，冇 DELETE／UPDATE（決定 27）：預留同結果都係追加記錄，讀取忽略過期記錄，過期記錄只由 owner role 喺 `vibe migrate` 刪除。Fail closed 唔依賴清理：清理冇做或者延遲，只會令 store 較早滿，滿咗按決定 134 回 429，永遠唔會放行未記錄 replay 嘅 request（見 #193）。容量上限同 quota 按租戶計；client IP 用每租戶 key 嘅 HMAC 儲存。表唔存在、用唔到或者 runtime role 權限多過 SELECT／INSERT 就拒絕啟動；production 設 `VIBE_CHALLENGE_REPLAY_STORE=memory` 亦拒絕啟動。dev／CI 一定要明確揀 `memory` 或者 `postgres`，冇預設值。v1 captcha provider 係 Cloudflare Turnstile。
+    - Challenge token 單次使用狀態（#157，產品決定）：production 有設定 verifier 時一律用 PostgreSQL replay store；表喺每個租戶自己 schema（`t_<tenant>.vibe_challenge_replay`，有 `tenant_id`、ENABLE + FORCE RLS，owner role 擁有，由該租戶嘅 `vibe run --db postgres` 啟動 migration（決定 179）建立），冇跨租戶共用表（決定 97）。runtime role 只有 SELECT、INSERT，冇 DELETE／UPDATE（決定 27）：預留同結果都係追加記錄，讀取忽略過期記錄，過期記錄只由 owner role 喺 `vibe run --db postgres` 啟動 migration（決定 179）刪除。Fail closed 唔依賴清理：清理冇做或者延遲，只會令 store 較早滿，滿咗按決定 134 回 429，永遠唔會放行未記錄 replay 嘅 request（見 #193）。容量上限同 quota 按租戶計；client IP 用每租戶 key 嘅 HMAC 儲存。表唔存在、用唔到或者 runtime role 權限多過 SELECT／INSERT 就拒絕啟動；production 設 `VIBE_CHALLENGE_REPLAY_STORE=memory` 亦拒絕啟動。dev／CI 一定要明確揀 `memory` 或者 `postgres`，冇預設值。v1 captcha provider 係 Cloudflare Turnstile。
   - **註冊（password 寫入）**（決定 47）：public 路徑寫 password 類型欄位只准一種方式：
     - method 標 `capabilities: [set-password]`（高風險安全項目），而且寫入 password 欄位嘅值一定係同一 method 內 `hash-password` op 嘅輸出；直接用 request 值寫 password 欄位一律 error。
     - api lock `## Access` 寫 `password-write: allow`，`writable-columns` 明確列出 password 欄位。
@@ -2486,16 +2527,16 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 
 ## 9A. 緊急 Kill Switch
 
-- 用途：發現漏洞、濫用或者錯誤邏輯時，即時停用個別 endpoint，唔使重新部署（決定 31）。
+- 用途：發現漏洞、濫用或者錯誤邏輯時停用個別 endpoint。SDK 檔案流程要重啟（決定 179）；下面即時推送係平台控制面設計（決定 31）。
 - 邊個可以觸發：project owner、maintainer，同平台 on-call 安全團隊；租戶 admin 只可以停用自己租戶嘅 public endpoint（只影響自己租戶）。
-- 點觸發：平台 UI 或者 CLI `endpoint disable {definition}/{version}/{feature} --reason "..."`；一定要寫原因。
+- SDK 本機流程（決定 179）：直接改 `.vibe/disabled.txt`，每行 `<feature-id><TAB><reason>`，一定要寫原因；`vibe build` 檢查同列出，重啟 runtime 生效。冇 endpoint CLI。平台 UI 控制面屬於下面嘅平台設計。
 - 範圍：可以按 endpoint（全部租戶）、按 endpoint + 租戶、或者按 definition 成批停用。
 - 效果：
   - SLA：p99 30 秒內全部 runtime instance 生效（經平台控制面推送，唔改 manifest）；超過 SLA 會觸發平台告警（決定 40）。
   - 被停用嘅 endpoint 一律回 503，錯誤 code `ENDPOINT_DISABLED`，可以帶 `Retry-After`；唔會執行任何 pipeline 或者 method。
   - public endpoint 被停用時同樣回 503（唔會洩露租戶係咪存在，因為所有租戶都一樣）。
 - 審計：觸發、恢復、觸發人、原因、範圍全部寫入審計記錄，並通知 owner 同 maintainer。
-- 恢復：同樣權限嘅人喺 UI／CLI 恢復，寫原因；重新部署唔會自動恢復已停用嘅 endpoint。
+- 恢復：SDK 刪走 `.vibe/disabled.txt` 嗰行並重啟（決定 179）；平台 UI 恢復要同樣權限、寫原因。
 - 部署報告列出所有停用緊嘅 endpoint。
 
 ## 9B. 供應鏈同設定保護
@@ -2537,6 +2578,8 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 ## 10. 部署驗證（全部喺 lock 層檢查；每個 error 都會報 lock 檔名、section、step id、對應 source 行數同原因）
 
 ### 10.1 Lock 完整性（error）
+
+決定 179：檢查一律經 `vibe build`，包括每次 secret scan（有發現即失敗）、slug 同停用檔格式；破壞性 migration 喺 build 只警告，喺 PostgreSQL run 啟動時預設拒絕，改過已套用 SQL 亦拒絕（2C.3e）。
 
 決定 178：目前版本 `1.0.0-rc.2` 嘅 lock 戳記係 `1.0.0-rc.2`；兩個 binary 都跟決定 176 完全一致規則。
 
@@ -4635,7 +4678,7 @@ security-items:
 
 ## 14. 後續版本
 
-決定 178 嘅雙 binary 屬於本版；PR D 之前嘅輔助指令照舊留喺 `vibe-sdk`，唔喺今次改動。
+決定 178 嘅雙 binary 同決定 179 嘅三指令流程都屬於本版：SDK 只有 `vibe`、`vibe build`、`vibe run`。舊輔助指令已刪除，印提示並 exit 2；build 負責 dev key、slug／停用檔檢查同 secret scan，PostgreSQL run 負責啟動 migration（2C.3e），唔係 vNext。
 
 - 排程、queue、webhook 入口。
 - 線上（唔凍結寫入）嘅 schema 升級去 database 遷移。

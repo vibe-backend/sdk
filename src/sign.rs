@@ -37,7 +37,7 @@ fn decode_key(hex_key: &str, what: &str) -> Result<Zeroizing<[u8; 32]>, String> 
     Ok(out)
 }
 
-/// `vibe keygen`: creates a development key pair in `<dir>/.vibe`. The private
+/// Creates a development key pair in `<dir>/.vibe`. The private
 /// key is created with mode 0600 and an existing key is never overwritten.
 pub fn create_dev_key(dir: &std::path::Path) -> Result<SigningKey, String> {
     let vibe = dir.join(".vibe");
@@ -71,9 +71,8 @@ pub fn load_dev_key(dir: &std::path::Path) -> Result<SigningKey, String> {
     let path = dir.join(".vibe").join(DEV_KEY);
     let meta = std::fs::metadata(&path).map_err(|_| {
         format!(
-            "no signing key at {}; run `vibe keygen --project {}` for a development key",
-            path.display(),
-            dir.display()
+            "no development signing key at {}; run `vibe build` in the project to create one",
+            path.display()
         )
     })?;
     #[cfg(unix)]
@@ -92,17 +91,30 @@ pub fn load_dev_key(dir: &std::path::Path) -> Result<SigningKey, String> {
 /// Development public key from `<dir>/.vibe/signing.pub`. Only for
 /// development; production must use [`pinned_public_key`].
 pub fn load_dev_public(dir: &std::path::Path) -> Result<VerifyingKey, String> {
-    let text =
-        std::fs::read_to_string(dir.join(".vibe").join(DEV_PUB)).map_err(|err| err.to_string())?;
+    let path = dir.join(".vibe").join(DEV_PUB);
+    let text = std::fs::read_to_string(&path).map_err(|_| format!("dev manifest needs the development public key {}; copy .vibe/signing.pub from the project that ran `vibe build` (next to the artifact, or pass --project <dir>)", path.display()))?;
     VerifyingKey::from_bytes(&*decode_key(&text, "public key")?).map_err(|err| err.to_string())
 }
 
 /// Load the local development key, creating it on first use.
 pub fn load_or_create(dir: &std::path::Path) -> Result<SigningKey, String> {
     if dir.join(".vibe/signing.key").exists() {
-        load_dev_key(dir)
+        let key = load_dev_key(dir)?;
+        let path = dir.join(".vibe").join(DEV_PUB);
+        let expected = hex::encode(key.verifying_key().to_bytes());
+        if std::fs::read_to_string(&path)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            != Some(expected.as_str())
+        {
+            std::fs::write(path, expected).map_err(|err| err.to_string())?;
+        }
+        Ok(key)
     } else {
-        create_dev_key(dir)
+        let key = create_dev_key(dir)?;
+        eprintln!("created development signing key .vibe/signing.key (keep it private; .vibe/signing.pub verifies dev manifests)");
+        Ok(key)
     }
 }
 

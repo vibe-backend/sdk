@@ -10,6 +10,7 @@ fn project() -> PathBuf {
         "---\npublic: true\nauth: removed\n---\n# Hello\n\nA public GET endpoint returning {\"message\":\"hello world\"}.\n",
     )
     .unwrap();
+    fs::write(root.join(".gitignore"), ".env\n").unwrap();
     fs::create_dir_all(root.join("providers")).unwrap();
     fs::write(
         root.join("providers/main.md"),
@@ -211,6 +212,7 @@ fn prepared_hello_router_without_socket() {
                 source: vibe::run::RunSource::Project,
                 addr: "127.0.0.1:8080".into(),
                 db: vibe::run::DbChoice::Memory,
+                allow_destructive_migrations: false,
                 allow_test_build: true,
             })
             .await
