@@ -934,7 +934,8 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         request: request_fields(find_section(&doc.sections, "Request")),
         transform_in: transform
             .and_then(|s| s.get("in"))
-            .unwrap_or("")
+            .filter(|expr| !matches!(expr.trim(), "" | "(none)"))
+            .unwrap_or("{}")
             .to_string(),
         transform_out: transform
             .and_then(|s| s.get("out"))
@@ -1608,5 +1609,117 @@ mod refresh_tests {
                 .unwrap()
                 .contains("no sign-jwt step")
         );
+    }
+}
+
+#[cfg(test)]
+mod constant_response_tests {
+    use super::*;
+    use crate::runtime::{router, AppState, AuthConfig, MemoryExec, Slug};
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn public_constant_response_without_transform() {
+        for transform in [
+            "",
+            "## Transform
+",
+            "## Transform
+
+(none)
+",
+        ] {
+            for (value, expected, status) in [
+                (
+                    r#"{"message": "hello world"}"#,
+                    r#"{"message":"hello world"}"#,
+                    StatusCode::OK,
+                ),
+                ("", "null", StatusCode::OK),
+                ("transform.out", "null", StatusCode::OK),
+                ("input", "{}", StatusCode::OK),
+                ("{message: }", "", StatusCode::INTERNAL_SERVER_ERROR),
+            ] {
+                let body = format!(
+                    "## Route
+- method: GET
+- path: /hello/v1/{{slug}}/greet
+
+## Access
+- public: true
+
+## Pipelines
+### -auth
+
+{transform}
+## Steps
+### reply
+- op: respond
+- value: {value}
+- status: 200
+"
+                );
+                let doc = LockDoc {
+                    meta: crate::lock::Meta::pending(
+                        Kind::Api,
+                        Some(Scope::Feature),
+                        "api/hello/v1/greet/greet",
+                        "hello.md",
+                    ),
+                    sections: crate::lock::parse_sections(&body).unwrap(),
+                };
+                let route = route_from(&doc, &HashMap::new()).unwrap();
+                assert_eq!(route.transform_in, "{}");
+                let manifest = Manifest {
+                    manifest_version: MANIFEST_VERSION,
+                    routes: vec![route],
+                    models: vec![],
+                    methods: vec![],
+                    migrations: vec![],
+                    signature: String::new(),
+                };
+                let state = Arc::new(AppState {
+                    manifest,
+                    exec: Arc::new(MemoryExec::new()),
+                    auth: AuthConfig::anonymous(),
+                    slugs: HashMap::from([(
+                        "testslug".into(),
+                        Slug {
+                            tenant_id: "tenant0001".into(),
+                            public_access: true,
+                            public_write: false,
+                        },
+                    )]),
+                    rates: Mutex::new(Default::default()),
+                    quotas: Mutex::new(Default::default()),
+                    disabled: Default::default(),
+                    min_override_ms: Some(0),
+                    honor_test_ip: true,
+                    trusted_proxies: vec![],
+                    dev_hints: true,
+                    challenge: None,
+                });
+                let response = router(state)
+                    .oneshot(
+                        Request::builder()
+                            .uri("/hello/v1/testslug/greet")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status, "{transform:?} {value}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                if status == StatusCode::OK {
+                    assert_eq!(body.as_ref(), expected.as_bytes());
+                } else {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert!(body.to_string().contains("INTERNAL"));
+                }
+            }
+        }
     }
 }

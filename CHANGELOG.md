@@ -5,6 +5,8 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **API expressions:** Support string, number, boolean and null literals and quoted object keys. API features honor `respond value`; missing, empty or `(none)` Transform input becomes `{}` instead of returning 422. Validation rejects empty or malformed expressions.
+
 - **Refresh rotation upgrade:** Run `vibe migrate` before `vibe serve` after upgrading. Reservation columns are added per tenant by migration. A request presenting a token while an earlier request for it is in progress returns a retryable 503 `TX_CONFLICT` without clearing cookies; after it completes, a presentation within the 10-second grace window follows the grace rule, and later presentations are treated as reuse and revoke the family; database/pool timeouts return 504 `TX_TIMEOUT`. Reservations without a committed child are cleared, leaving the presented token current and allowing a retry.
 
 ### Upcoming (advance notice)

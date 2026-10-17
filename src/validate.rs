@@ -891,9 +891,10 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
         }
     }
     if let Some(transform) = find_section(&doc.sections, "Transform") {
-        for key in ["in", "out"] {
-            if let Some(expr) = transform.get(key) {
-                if let Err(err) = crate::runtime::check_expr(expr) {
+        for bullet in &transform.bullets {
+            let key = bullet.key.as_str();
+            if matches!(key, "in" | "out") {
+                if let Err(err) = crate::runtime::check_expr(&bullet.value) {
                     report.push(
                         Diag::error(file, format!("transform {key}: {err}"))
                             .at_section("Transform"),
@@ -1779,6 +1780,73 @@ mod tests {
                 none: false,
             }],
         }
+    }
+
+    #[test]
+    fn literal_responses_and_malformed_transforms() {
+        for (expr, valid) in [
+            (r#"{"message": "hello world"}"#, true),
+            ("{message: }", false),
+        ] {
+            let step = block("s1", &[("op", "respond"), ("value", expr)]);
+            assert_eq!(api_step_problems(&step, "respond").is_empty(), valid);
+        }
+        for key in ["in", "out"] {
+            for expr in ["", "{a: }", "[1]"] {
+                let body = format!(
+                    "## Route\n- method: GET\n- path: /hello/v1/greet\n\n## Transform\n- {key}: {expr}\n"
+                );
+                let doc = parsed_doc(Kind::Api, Some(Scope::Feature), "hello/v1/get", &body);
+                let mut report = Report::new();
+                check_feature(&doc, "hello.lock.md", &mut report);
+                assert!(
+                    report
+                        .errors()
+                        .any(|d| d.message.contains(&format!("transform {key}:"))),
+                    "{expr}: {:?}",
+                    report.diags
+                );
+            }
+        }
+        for (expr, valid) in [
+            (r#"{"message": "hello world"}"#, true),
+            ("{message: }", false),
+        ] {
+            let body = format!(
+                "## Route\n- method: GET\n- path: /hello/v1/greet\n\n## Request\n(none)\n\n## Response\n(none)\n\n## Steps\n### reply\n- op: respond\n- value: {expr}\n"
+            );
+            let doc = parsed_doc(Kind::Api, Some(Scope::Feature), "hello/v1/get", &body);
+            let mut report = Report::new();
+            check_feature(&doc, "hello.lock.md", &mut report);
+            assert_eq!(
+                report.errors().any(|d| d.message.contains("value:")),
+                !valid,
+                "{:?}",
+                report.diags
+            );
+            if valid {
+                assert_eq!(report.errors().count(), 0, "{:?}", report.diags);
+            }
+        }
+    }
+
+    #[test]
+    fn sign_jwt_rejects_literal_subject() {
+        let body = "## Signature\n- capabilities: [sign-token]\n- writes: false\n\n## Steps\n### read\n- op: query\n- out: user\n\n### sign\n- op: sign-jwt\n- key-ref: JWT_KEY\n- claims: {sub: \"admin\"}\n";
+        let doc = parsed_doc(Kind::Method, None, "user/methods/sign", body);
+        let mut report = Report::new();
+        check_method(&doc, "sign.lock.md", &mut report);
+        assert!(
+            report
+                .errors()
+                .any(|d| d.message.contains("sub must be a field")),
+            "{:?}",
+            report.diags
+        );
+        // The runtime calls this same guard before evaluating the subject.
+        assert!(crate::runtime::sub_source_problem(r#""admin""#, &["user".into()]).is_some());
+        assert!(crate::runtime::sub_source_problem(r#""user.id""#, &["user".into()]).is_some());
+        assert!(crate::runtime::sub_source_problem("user.id", &["user".into()]).is_none());
     }
 
     fn sign_method(issue_refresh: &str) -> LockDoc {
