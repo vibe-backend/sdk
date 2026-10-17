@@ -352,6 +352,30 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     .await;
     assert_eq!(updated.status, StatusCode::OK);
     assert_eq!(updated.json["name"], "Apricot");
+    let new_etag = updated.headers.get("etag").unwrap().to_string();
+    assert_ne!(new_etag, etag, "a successful update must change the ETag");
+
+    // The ETag from before the update is now stale: 412, and nothing changes.
+    let stale = send(
+        &app,
+        "PUT",
+        &format!("/catalog/v1/products/{id}"),
+        Some(format!(
+            "If-Match: {etag}\nAuthorization: Bearer {staff_token}"
+        )),
+        Some(json!({"name": "Overwritten"})),
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+    let after_stale = send(
+        &app,
+        "GET",
+        &format!("/catalog/v1/shopslug1/products/{id}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(after_stale.json["name"], "Apricot");
 
     let removed = send(
         &app,
