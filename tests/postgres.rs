@@ -1767,7 +1767,9 @@ fn outcome(
         Err(ExecError::NotFound) => "not_found".into(),
         Err(ExecError::Precondition) => "precondition".into(),
         Err(ExecError::Conflict) => "conflict".into(),
-        Err(ExecError::Message(_)) => "error".into(),
+        Err(ExecError::Message(_) | ExecError::Timeout | ExecError::IssuanceFailed) => {
+            "error".into()
+        }
         Err(ExecError::PoolExhausted) => "exhausted".into(),
     }
 }

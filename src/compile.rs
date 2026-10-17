@@ -296,6 +296,7 @@ verify-password {{ hash: expr, plain: expr, missing-user: dummy-hash, out }} giv
 hash-password {{ plain: expr, out }}. random-token {{ out }} gives {{ value, hash }} (32 bytes; store hash, a bytea). \
 hash-token {{ value: expr, normalize: email (optional), out }}. \
 sign-jwt {{ alg: ES256|RS256, key-ref: ENV_NAME, claims: {{ sub: expr, ... }}, custom-claims: [names], ttl: <=1h, out }} needs capabilities: [sign-token]; roles come from users.roles, never from claims; output {{ access_token, token_type, expires_in, expires_at }}. \
+sign-jwt issue-refresh: platform-decided only when an api route has a token-refresh pipeline {{ sign-method, refresh-ttl, idle-ttl, reuse-grace, transport: body }} (public, auth removed); a token-revoke pipeline {{ scope: family|all }} needs auth. \
 Expressions can read input.*, earlier step outputs, and ctx.user.sub, ctx.user.roles, ctx.user.tenant. \
 SQL must be a single parameterized statement using $1, $2. \
 Never emit DELETE, TRUNCATE, GRANT, REVOKE, or DDL outside a migration. \

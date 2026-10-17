@@ -63,7 +63,7 @@ fn table_problem(name: &ObjectName) -> Option<String> {
     if !(plain_name(&value) && (ident.quote_style.is_none() || plain_name(&ident.value))) {
         return Some(format!("table {name} must be a plain lowercase name"));
     }
-    if reserved_name(&value) || value == "only" {
+    if reserved_name(&value) || value.starts_with("vibe_") || value == "only" {
         return Some(format!("table {name} is not allowed"));
     }
     None
@@ -776,6 +776,8 @@ mod tests {
             "select 1 as x) , d as (delete from users returning id) select row_to_json(d)::text from d --",
             "select id from users) select 1 from q union select 1 from (select 1",
             "select * from _platform_refresh_tokens",
+            "select * from vibe_challenge_replay",
+            "select * from vibe_refresh_tokens",
         ] {
             assert!(wrapped_problem(&wrap_for_rows(sql)).is_some(), "accepted: {sql}");
         }

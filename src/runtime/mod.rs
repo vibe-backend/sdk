@@ -1,6 +1,7 @@
 pub mod allowlist;
 pub mod challenge;
 mod crud;
+pub mod eckey;
 mod exec;
 pub mod grants;
 mod http;
@@ -10,7 +11,9 @@ mod memory;
 pub mod migrate;
 mod ops;
 mod pools;
+pub mod refresh;
 pub mod replay;
+pub mod rsakey;
 mod slugs;
 mod sql;
 
@@ -21,13 +24,17 @@ pub use crud::{
 };
 pub use exec::{
     check_server_version, etag, role_allows, ExecError, PgExec, PgOptions, PgSession, QueryExec,
-    RoleStatus, Row, MIN_SERVER_VERSION_NUM,
+    RefreshIssuer, RoleStatus, Row, MIN_SERVER_VERSION_NUM,
 };
 pub use http::{
-    detect_jwt_alg, hash_api_secret, load_api_keys, resolve_pepper, router, ApiKeyFile, AppState,
-    AuthConfig, RunEnv, SigningKey, Slug, StoredKey, REQUEST_TYPES,
+    check_static_jwt_key, detect_jwt_alg, hash_api_secret, load_api_keys, refresh_rejections,
+    resolve_pepper, router, static_jwt_alg, ApiKeyFile, AppState, AuthConfig, RunEnv, SigningKey,
+    Slug, StoredKey, REQUEST_TYPES,
 };
-pub use ops::{custom_claim_problem, load_signing_keys, sub_source_problem};
+pub use ops::{
+    custom_claim_problem, ec_signing_key_from_der, ec_signing_key_from_pem, load_signing_keys,
+    sub_source_problem,
+};
 
 /// argon2id hash with the platform floor (for seeding test data).
 pub fn hash_password_for_tests(plain: &str) -> String {
@@ -51,3 +58,19 @@ pub use sql::{
     bootstrap_statements, policy_parts, quote as sql_quote, quote as quote_ident, render_policy,
     rls_statements, tenant_schema_statements, Col, PolicyParts, Sort, Stmt, POLICY_TEMPLATE,
 };
+
+/// Render process counters for an internal metrics collector.
+pub fn internal_metrics() -> String {
+    let mut output = format!(
+        "vibe_rate_limit_saturation_refusals_total {}\n",
+        saturation_refusals()
+    );
+    let mut rejections: Vec<_> = refresh_rejections().into_iter().collect();
+    rejections.sort_unstable_by_key(|(reason, _)| *reason);
+    for (reason, count) in rejections {
+        output.push_str(&format!(
+            "vibe_refresh_rejections_total{{reason=\"{reason}\"}} {count}\n"
+        ));
+    }
+    output
+}

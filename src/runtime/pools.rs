@@ -620,6 +620,112 @@ impl TenantPools {
 
 #[async_trait]
 impl QueryExec for TenantPools {
+    async fn raw(
+        &self,
+        tenant_id: &str,
+        role: &str,
+        writes: bool,
+        sql: &str,
+        params: Vec<Option<String>>,
+    ) -> Result<Vec<Row>, ExecError> {
+        let _permits = self.acquire(tenant_id, role).map_err(|scope| {
+            scope.counter().fetch_add(1, Ordering::Relaxed);
+            ExecError::PoolExhausted
+        })?;
+        let pool = self
+            .pool(tenant_id, role)
+            .await
+            .map_err(ExecError::Message)?;
+        pool.raw(tenant_id, role, writes, sql, params).await
+    }
+
+    async fn refresh_issue(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        token_hash: &str,
+        policy: super::refresh::RefreshPolicy,
+    ) -> Result<String, ExecError> {
+        let _permits = self.acquire(tenant_id, "app_rw").map_err(|scope| {
+            scope.counter().fetch_add(1, Ordering::Relaxed);
+            ExecError::PoolExhausted
+        })?;
+        let pool = self
+            .pool(tenant_id, "app_rw")
+            .await
+            .map_err(ExecError::Message)?;
+        pool.refresh_issue(tenant_id, user_id, token_hash, policy)
+            .await
+    }
+
+    async fn refresh_family(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        let _permits = self.acquire(tenant_id, "app_rw").map_err(|scope| {
+            scope.counter().fetch_add(1, Ordering::Relaxed);
+            ExecError::PoolExhausted
+        })?;
+        let pool = self
+            .pool(tenant_id, "app_rw")
+            .await
+            .map_err(ExecError::Message)?;
+        pool.refresh_family(tenant_id, token_hash).await
+    }
+
+    async fn refresh_subject(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        let _permits = self.acquire(tenant_id, "app_rw").map_err(|scope| {
+            scope.counter().fetch_add(1, Ordering::Relaxed);
+            ExecError::PoolExhausted
+        })?;
+        let pool = self
+            .pool(tenant_id, "app_rw")
+            .await
+            .map_err(ExecError::Message)?;
+        pool.refresh_subject(tenant_id, token_hash).await
+    }
+
+    async fn refresh_revoke(
+        &self,
+        tenant_id: &str,
+        target: super::refresh::RevokeTarget<'_>,
+    ) -> Result<u64, ExecError> {
+        let _permits = self.acquire(tenant_id, "app_rw").map_err(|scope| {
+            scope.counter().fetch_add(1, Ordering::Relaxed);
+            ExecError::PoolExhausted
+        })?;
+        let pool = self
+            .pool(tenant_id, "app_rw")
+            .await
+            .map_err(ExecError::Message)?;
+        pool.refresh_revoke(tenant_id, target).await
+    }
+
+    async fn refresh_rotate_authorized(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: super::refresh::RefreshPolicy,
+        issuer: Option<&dyn super::exec::RefreshIssuer>,
+    ) -> Result<(super::refresh::Rotated, Option<serde_json::Value>), ExecError> {
+        let _permits = self.acquire(tenant_id, "app_rw").map_err(|scope| {
+            scope.counter().fetch_add(1, Ordering::Relaxed);
+            ExecError::PoolExhausted
+        })?;
+        let pool = self
+            .pool(tenant_id, "app_rw")
+            .await
+            .map_err(ExecError::Message)?;
+        pool.refresh_rotate_authorized(tenant_id, token_hash, new_hash, policy, issuer)
+            .await
+    }
+
     async fn user_roles(
         &self,
         tenant_id: &str,

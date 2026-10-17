@@ -35,6 +35,30 @@ The runtime refuses to start when `LLM_*` or `OPENAI_*` is set. Public catalog r
 
 Per-IP rate limits and public-write quotas use the TCP peer address. Set `VIBE_TRUSTED_PROXIES` (comma-separated IPs or CIDR blocks, e.g. `10.0.0.0/8,2001:db8::/32`) behind a load balancer. `X-Forwarded-For` is honoured only from those proxies, and the rightmost hop that is not a trusted proxy counts. Hops may carry a port (`1.2.3.4:5678`, `[2001:db8::1]:443`), and IPv4-mapped IPv6 addresses count as IPv4. IPv6 clients are limited per /64. Rate and quota state is kept per route and key type with a fixed capacity; when a shard is full, its least recently used bucket is evicted, so flooding never blocks other clients. Buckets at their limit stay until their one-minute window ends, so each client network (an IPv4 address or an IPv6 /48) may create at most 100 active buckets per route and key type, and each wider network (IPv4 /24, IPv6 /32) at most 1,000; past that, only that network gets 429 for new keys. The last 1,000 of a shard's 10,000 slots are reserved for small clients: for IPv4, fewer than 5 buckets per address and fewer than 10 per /24; for IPv6, fewer than 10 new keys per /48 and fewer than 50 in total per /32. New clients usually still get in after heavy clients use up the rest, but this is a mitigation, not a guarantee. Clients sharing one address (CGNAT, or a proxy when `VIBE_TRUSTED_PROXIES` is unset) share that address's 100. A distributed client can still fill a shard and lock out new clients on that route, for example about 100 IPv4 /24s with 2 addresses each, or a few dozen IPv6 /32s (on top of the networks that fill the non-reserve slots); see [docs/release-hardening.md](release-hardening.md). Use load-balancer or CDN rate limiting as well. Saturated shards are logged as warnings.
 
+## Refresh tokens
+
+**Endpoint.** A route whose lock has a `### token-refresh` pipeline is the refresh endpoint. It must be public (no auth block) and takes `POST {"refresh_token": "..."}` (`transport: body`). A success returns `{access_token, token_type, expires_in, expires_at, refresh_token, refresh_expires_in}`; the returned `refresh_token` replaces the one sent, which stops working. Logout routes (`token-revoke`, `scope: family | all`) revoke the presented token's family or every family of the caller. Logout does not revoke access tokens already issued (they expire after their `ttl`, at most 1 h).
+
+**Policy settings** (bullets of the `token-refresh` pipeline):
+
+| Setting | Default | Limit | Meaning |
+| --- | --- | --- | --- |
+| `sign-method` | required | — | Method with a `sign-jwt` step that signs the new access token (`capabilities: [sign-token]`). |
+| `refresh-ttl` | 30d | ≤ 30d | Family lifetime, counted from login. No token of the family works after it. |
+| `idle-ttl` | 7d | ≤ 7d | An unused token expires this long after it was issued. |
+| `reuse-grace` | 10s | 1s–10s | Window for one retry of the previous token (see below). |
+| `transport` | `body` | `body` | Where the token travels. |
+
+The manifest parser enforces these bounds before conversion to whole seconds, including rejecting `10.001s` and `10001ms`; this is not a database trigger check. Values outside these limits (for example `reuse-grace: 11s` or `0s`) fail `vibe validate` and the build, and `vibe serve` refuses to start with a manifest that carries one (spec §4A.1).
+
+`refresh_expires_in` is the smaller of `idle-ttl` and what is left of the family lifetime. Rate limits: 30 requests per minute per IP (429) and 10 per minute per family; a `rate-limit` with `key: family` can only lower the family limit. Exceeding the per-refresh-family limit requires signing in again.
+
+**Grace behaviour.** Every use rotates the token. Presenting a token that was already used normally revokes the whole family (also after the token expired). The exception: within `reuse-grace` of its first use, while the child it produced has not been used yet and the family is not revoked, the old token is reissued once. The unused child is revoked, a new child is issued in the same family, and the family lifetime is unchanged. A second retry, a retry after the window, or a retry after the child was used revokes the family. On PostgreSQL, rotation, reissue and revocation take a family lock, so concurrent retries resolve to exactly one reissue.
+
+**Errors.** Unknown, expired, revoked and replayed tokens, and a missing or malformed body, all return the same 401 `INVALID_REFRESH_TOKEN`, padded to 300 ms. Refresh work has a 300 ms deadline measured from request start, and every refresh response uses the same request-start padding floor (at least 300 ms). Work that exceeds the deadline returns 503 `SERVICE_UNAVAILABLE`. If the token store cannot be read (for example the connection pool is exhausted) the refresh fails closed with 503 `SERVICE_UNAVAILABLE` and `Retry-After: 1`; the token is not consumed and can be retried.
+
+**Storage and cleanup.** Only an HMAC of each token (key derived from `VIBE_API_KEY_PEPPER`) is stored, in `t_<tenant>._platform_refresh_tokens`, created by `vibe migrate` when a refresh route exists. The table has ENABLE + FORCE row level security with the same `tenant_isolation` policy as other tenant tables. App query roles (`public_reader`, `public_writer`, `app_rw`, `PUBLIC`) have no access; the runtime role gets SELECT and INSERT, and UPDATE only on the rotation and revocation columns (`used_at`, `replaced_by`, `grace_reissued_at`, `revoked_at`, `revoke_reason`); never DELETE, TRUNCATE or table-wide UPDATE. A `BEFORE UPDATE` trigger (`_platform_refresh_guard`) applies to every role, including the owner: `id`, `tenant_id`, `family_id`, `user_id`, `token_hash`, `parent_id`, `created_at` and the expiry columns never change, `used_at` is set once, and once `revoked_at` is set neither it nor `revoke_reason` can change (a revoked family cannot be restored). `vibe serve` checks these grants and the trigger for every tenant at startup and refuses to start on any difference (missing grant, extra column UPDATE, any DELETE, missing or disabled trigger); re-run `vibe migrate` to restore them. App SQL cannot name `_platform_*` or `vibe_*` tables. Revocation is an UPDATE. Rows are removed only by platform maintenance (`vibe migrate`, running as the tenant's table owner with a one-time migration credential), never by the runtime role: families whose lifetime ended more than one day ago are deleted, 1000 rows per batch and at most 100 batches per run, so a large backlog is cleared over several runs. Live families are never touched, so cleanup does not affect reuse detection. Run `vibe migrate` regularly (for example daily) to keep the table small. Policy decision (PM, #95): the runtime role reaches the table through the tenant's runtime login (`tenant_<id>_rw` once per-tenant roles land in #147; until then `VIBE_RUNTIME_DB_ROLE`), with the grants, trigger and startup check above. A dedicated refresh-store role is deferred to vNext (#250). The `--memory` executor removes finished families in bounded batches when a new family is issued.
+
 ## Upgrading tenant roles
 
 `vibe serve` and `vibe migrate` require PostgreSQL 16 or later; on older
@@ -53,6 +77,7 @@ existing deployment:
    owner's, for example from a legacy shared role:
    `REVOKE ALL ON t_<id>.vibe_challenge_replay FROM app_rw;`.
 4. Run `vibe migrate` for each tenant. It resets the replay table grants to
-   exactly `SELECT, INSERT` for `tenant_<id>_rw`.
+   exactly `SELECT, INSERT, DELETE` for `tenant_<id>_rw`; the permanent
+   restrictive DELETE policy permits only that tenant’s expired rows.
 5. Start `vibe serve`. It checks every tenant's memberships and replay table
    grants at startup and refuses to start on any difference.

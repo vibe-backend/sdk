@@ -40,6 +40,7 @@ const STANDARD_POLICY: &str = super::sql::POLICY_TEMPLATE;
 pub struct MemoryExec {
     tables: Mutex<BTreeMap<String, Vec<Row>>>,
     models: BTreeMap<String, MemTable>,
+    refresh: super::exec::PlainMemoryExec,
     /// Set by [`MemoryExec::new`]: an unchecked store for platform
     /// operation tests (no model grants).
     plain: Option<super::exec::PlainMemoryExec>,
@@ -64,6 +65,7 @@ impl MemoryExec {
     pub fn empty() -> Self {
         Self {
             tables: Mutex::default(),
+            refresh: super::exec::PlainMemoryExec::new(),
             models: BTreeMap::new(),
             plain: None,
         }
@@ -75,8 +77,15 @@ impl MemoryExec {
     pub fn new() -> Self {
         Self {
             tables: Mutex::default(),
+            refresh: super::exec::PlainMemoryExec::new(),
             models: BTreeMap::new(),
             plain: Some(super::exec::PlainMemoryExec::new()),
+        }
+    }
+
+    pub fn stub_queries(&self, column: &str) {
+        if let Some(plain) = &self.plain {
+            plain.stub_queries(column);
         }
     }
 
@@ -126,6 +135,7 @@ impl MemoryExec {
         }
         Ok(Self {
             tables: Mutex::default(),
+            refresh: super::exec::PlainMemoryExec::new(),
             models,
             plain: None,
         })
@@ -139,6 +149,85 @@ fn denied(table: &str) -> ExecError {
 
 #[async_trait]
 impl QueryExec for MemoryExec {
+    async fn refresh_issue(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        token_hash: &str,
+        policy: super::refresh::RefreshPolicy,
+    ) -> Result<String, ExecError> {
+        self.plain
+            .as_ref()
+            .unwrap_or(&self.refresh)
+            .refresh_issue(tenant_id, user_id, token_hash, policy)
+            .await
+    }
+
+    async fn refresh_family(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        self.plain
+            .as_ref()
+            .unwrap_or(&self.refresh)
+            .refresh_family(tenant_id, token_hash)
+            .await
+    }
+
+    async fn refresh_subject(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+    ) -> Result<Option<String>, ExecError> {
+        self.plain
+            .as_ref()
+            .unwrap_or(&self.refresh)
+            .refresh_subject(tenant_id, token_hash)
+            .await
+    }
+
+    async fn refresh_revoke(
+        &self,
+        tenant_id: &str,
+        target: super::refresh::RevokeTarget<'_>,
+    ) -> Result<u64, ExecError> {
+        self.plain
+            .as_ref()
+            .unwrap_or(&self.refresh)
+            .refresh_revoke(tenant_id, target)
+            .await
+    }
+
+    async fn refresh_rotate_authorized(
+        &self,
+        tenant_id: &str,
+        token_hash: &str,
+        new_hash: &str,
+        policy: super::refresh::RefreshPolicy,
+        issuer: Option<&dyn super::exec::RefreshIssuer>,
+    ) -> Result<(super::refresh::Rotated, Option<Value>), ExecError> {
+        self.plain
+            .as_ref()
+            .unwrap_or(&self.refresh)
+            .refresh_rotate_authorized(tenant_id, token_hash, new_hash, policy, issuer)
+            .await
+    }
+
+    async fn raw(
+        &self,
+        tenant_id: &str,
+        role: &str,
+        writes: bool,
+        sql: &str,
+        params: Vec<Option<String>>,
+    ) -> Result<Vec<Row>, ExecError> {
+        if let Some(plain) = &self.plain {
+            return plain.raw(tenant_id, role, writes, sql, params).await;
+        }
+        Err(ExecError::Message(MEMORY_UNSUPPORTED_SQL.into()))
+    }
+
     async fn user_roles(
         &self,
         tenant_id: &str,

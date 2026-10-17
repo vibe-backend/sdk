@@ -29,6 +29,9 @@ pub struct CallCtx<'a> {
     pub tenant_id: &'a str,
     pub role: &'a str,
     pub caller: Caller<'a>,
+    /// Set by the refresh route: the already-stored rotated refresh token
+    /// that `sign-jwt issue-refresh` hands back instead of a new family.
+    pub refresh_token: Option<&'a str>,
 }
 
 pub async fn run_method(
@@ -888,9 +891,12 @@ fn int_field(input: &Value, key: &str) -> Option<i64> {
 
 fn db(err: ExecError) -> MethodFail {
     match err {
+        ExecError::Timeout => MethodFail::code("TX_TIMEOUT", "transaction timed out"),
         ExecError::NotFound => MethodFail::code("NOT_FOUND", "not found"),
         ExecError::Conflict => MethodFail::code("CONFLICT", "conflict"),
         ExecError::Precondition => MethodFail::code("PRECONDITION_FAILED", "precondition failed"),
+        ExecError::IssuanceFailed => MethodFail::code("INTERNAL", "refresh issuance failed"),
+
         ExecError::Denied(message) => {
             // The role lacks a table/column privilege or hit the tenant
             // policy. The client gets a stable 403; the details stay in logs.

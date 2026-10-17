@@ -431,6 +431,24 @@ async fn migrate_in_tx(
         exec.batch(&tenant_schema_statements(tenant)?).await?;
         log.push(format!("bootstrapped {schema}.{}", model.table));
     }
+    if manifest.routes.iter().any(|r| r.refresh.is_some()) {
+        exec.batch(&super::refresh::table_statements(&schema)?)
+            .await?;
+        exec.batch(&super::refresh::cleanup_statements(&schema)?)
+            .await?;
+        // Replace the legacy GUC policy with the same constant tenant policy as models.
+        exec.batch(&rls_statements(tenant, "_platform_refresh_tokens")?)
+            .await?;
+        let runtime_role = super::grants::tenant_role(tenant, "app_rw")?;
+        exec.batch(&super::refresh::runtime_grant_statements(
+            &schema,
+            &runtime_role,
+        )?)
+        .await?;
+        log.push(format!(
+            "bootstrapped {schema}._platform_refresh_tokens (finished families cleaned up)"
+        ));
+    }
     // An index left INVALID by a failed concurrent build is dropped and
     // rebuilt (spec §2B), with an audit entry.
     log.extend(drop_invalid_indexes(exec, &schema, recorded, &mut deferred).await?);
@@ -800,13 +818,13 @@ pub async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<Stri
 /// tenant id in SQL expression `tenant` (see `sql::rls_statements`).
 pub fn canonical_policy_sql(p: &str, tenant: &str) -> String {
     format!(
-        "({p}.polpermissive AND {p}.polcmd = '*' \
+        "COALESCE(({p}.polpermissive AND {p}.polcmd = '*' \
          AND cardinality({p}.polroles) = 3 \
          AND (SELECT count(*) FROM pg_roles WHERE oid = ANY({p}.polroles) AND rolname IN ( \
            'tenant_' || {tenant} || '_rw', 'tenant_' || {tenant} || '_public_reader', \
            'tenant_' || {tenant} || '_public_writer')) = 3 \
          AND pg_get_expr({p}.polqual, {p}.polrelid) = format('(tenant_id = %L::text)', {tenant}) \
-         AND pg_get_expr({p}.polwithcheck, {p}.polrelid) = format('(tenant_id = %L::text)', {tenant}))"
+         AND pg_get_expr({p}.polwithcheck, {p}.polrelid) = format('(tenant_id = %L::text)', {tenant})), false)"
     )
 }
 

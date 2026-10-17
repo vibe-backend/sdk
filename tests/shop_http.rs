@@ -692,6 +692,30 @@ struct Exhausted;
 
 #[async_trait::async_trait]
 impl vibe::runtime::QueryExec for Exhausted {
+    async fn refresh_issue(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: vibe::runtime::refresh::RefreshPolicy,
+    ) -> Result<String, vibe::runtime::ExecError> {
+        Err(vibe::runtime::ExecError::PoolExhausted)
+    }
+    async fn refresh_revoke(
+        &self,
+        _: &str,
+        _: vibe::runtime::refresh::RevokeTarget<'_>,
+    ) -> Result<u64, vibe::runtime::ExecError> {
+        Err(vibe::runtime::ExecError::PoolExhausted)
+    }
+    async fn refresh_family(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<String>, vibe::runtime::ExecError> {
+        Err(vibe::runtime::ExecError::PoolExhausted)
+    }
+
     async fn execute(
         &self,
         _tenant_id: &str,
