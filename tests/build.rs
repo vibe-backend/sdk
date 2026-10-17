@@ -50,6 +50,7 @@ fn command_surface() {
 async fn fresh_locks_work_in_ci_without_llm_and_stale_locks_regenerate() {
     let dir = std::env::temp_dir().join(format!("vibe-build-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(dir.join("models/product")).unwrap();
+    fs::write(dir.join(".gitignore"), ".env\n").unwrap();
     fs::create_dir_all(dir.join("providers")).unwrap();
     fs::write(
         dir.join("providers/main.md"),

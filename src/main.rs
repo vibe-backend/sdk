@@ -45,16 +45,6 @@ enum Command {
         #[arg(long)]
         commit: Option<String>,
     },
-    /// Create a development signing key (.vibe/signing.key, mode 0600).
-    Keygen {
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
-    #[command(hide = true)]
-    Approve {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
     /// Run a project or a signed artifact.
     Run {
         #[arg(long, default_value = ".")]
@@ -67,62 +57,6 @@ enum Command {
         db: Option<String>,
         #[arg(long)]
         allow_test_build: bool,
-    },
-    /// Create tenant tables from model locks. Development bootstrap, not a production migration.
-    Migrate {
-        #[arg(long, default_value = "manifest.json")]
-        manifest: PathBuf,
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        #[arg(long)]
-        tenant: String,
-    },
-    /// Register a public slug for a tenant.
-    Slug {
-        #[command(subcommand)]
-        action: SlugAction,
-    },
-    /// Scan the tree for credential material.
-    SecretScan {
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        #[arg(long)]
-        fail_on_find: bool,
-    },
-    /// Disable an endpoint without redeploying.
-    Endpoint {
-        #[command(subcommand)]
-        action: EndpointAction,
-    },
-}
-
-#[derive(Subcommand)]
-enum SlugAction {
-    /// Write `.vibe/slugs.json`. High-risk public routes resolve `{slug}` from this file.
-    Add {
-        slug: String,
-        #[arg(long)]
-        tenant: String,
-        #[arg(long)]
-        public_write: bool,
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
-}
-
-#[derive(Subcommand)]
-enum EndpointAction {
-    Disable {
-        feature: String,
-        #[arg(long)]
-        reason: String,
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
-    Enable {
-        feature: String,
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
     },
 }
 
@@ -162,91 +96,45 @@ async fn run(cli: Cli) -> Result<(), String> {
         return vibe::interactive::run(project, &mut io, &config, adapter.as_ref()).await;
     };
     match command {
-        Command::Build { project, check, release, output, release_version, commit } => {
-            if release { cmd_manifest(&project, &output, true, release_version, commit).await }
-            else {
+        Command::Build {
+            project,
+            check,
+            release,
+            output,
+            release_version,
+            commit,
+        } => {
+            check_build_inputs(&project)?;
+            if release {
+                cmd_manifest(&project, &output, true, release_version, commit).await
+            } else {
                 cmd_build(&project, check).await?;
-                if check { return Ok(()); }
+                if check {
+                    return Ok(());
+                }
                 cmd_validate(&project, true, !ci_or_prod())?;
                 cmd_manifest(&project, &output, false, release_version, commit).await
             }
-        },
-        Command::Approve { .. } => Err("`vibe approve` was removed: use `vibe build`; review happens on the source pull request.".into()),
-        Command::Keygen { project } => {
-            sign::create_dev_key(&project)?;
-            println!("wrote {}", project.join(".vibe/signing.key").display());
-            Ok(())
         }
-        Command::Run { project, artifact, addr, db, allow_test_build } => {
-            let db = vibe::run::DbChoice::from_arg_or_env(db.as_deref())?;
-            vibe::run::run(vibe::run::RunOptions { project, source: artifact.map(vibe::run::RunSource::Artifact).unwrap_or(vibe::run::RunSource::Project), addr, db, allow_test_build }).await
-        },
-        Command::Migrate {
-            manifest,
+        Command::Run {
             project,
-            tenant,
-        } => cmd_migrate(&manifest, &project, &tenant).await,
-        Command::Slug { action } => match action {
-            SlugAction::Add {
-                slug,
-                tenant,
-                public_write,
-                project,
-            } => {
-                vibe::runtime::add_slug(&project, &slug, &tenant, public_write)?;
-                println!("added slug {slug} for tenant {tenant}");
-                Ok(())
-            }
-        },
-        Command::SecretScan {
-            project,
-            fail_on_find,
+            artifact,
+            addr,
+            db,
+            allow_test_build,
         } => {
-            let report = secret_scan(&project);
-            print_report(&report);
-            if fail_on_find && report.has_errors() {
-                Err("secret scan found a problem".into())
-            } else {
-                Ok(())
-            }
-        }
-        Command::Endpoint { action } => match action {
-            EndpointAction::Disable {
-                feature,
-                reason,
+            let db = vibe::run::DbChoice::from_arg_or_env(db.as_deref())?;
+            vibe::run::run(vibe::run::RunOptions {
                 project,
-            } => {
-                if reason.trim().is_empty() {
-                    return Err("a reason is required".into());
-                }
-                let path = project.join(".vibe").join("disabled.txt");
-                fs::create_dir_all(project.join(".vibe")).map_err(|err| err.to_string())?;
-                let mut current = fs::read_to_string(&path).unwrap_or_default();
-                if !current
-                    .lines()
-                    .any(|line| line.split('\t').next() == Some(feature.as_str()))
-                {
-                    current.push_str(&feature);
-                    current.push('\t');
-                    current.push_str(&reason.replace(['\n', '\t'], " "));
-                    current.push('\n');
-                    fs::write(&path, current).map_err(|err| err.to_string())?;
-                }
-                println!("disabled {feature}");
-                Ok(())
-            }
-            EndpointAction::Enable { feature, project } => {
-                let path = project.join(".vibe").join("disabled.txt");
-                let current = fs::read_to_string(&path).unwrap_or_default();
-                let kept: Vec<_> = current
-                    .lines()
-                    .filter(|line| line.split('\t').next() != Some(feature.as_str()))
-                    .collect();
-                fs::write(&path, kept.join("\n") + "\n").map_err(|err| err.to_string())?;
-                println!("enabled {feature}");
-                Ok(())
-            }
-        },
+                source: artifact
+                    .map(vibe::run::RunSource::Artifact)
+                    .unwrap_or(vibe::run::RunSource::Project),
+                addr,
+                db,
+                allow_test_build,
+            })
+            .await
+        }
     }
 }
 
@@ -294,6 +182,12 @@ pub fn removed_command_hint(name: &str) -> Option<&'static str> {
         "validate" => Some("`vibe validate` was removed: use `vibe build` (it validates automatically; add `--release` for release packaging)"),
         "manifest" => Some("`vibe manifest` was removed: use `vibe build` (it validates automatically; add `--release` for release packaging)"),
         "new" => Some("`vibe new` was removed: run `vibe` with no arguments in a terminal"),
+        "migrate" => Some("`vibe migrate` was removed: migrations run automatically in `vibe run --db postgres`"),
+        "keygen" => Some("`vibe keygen` was removed: `vibe build` creates the development signing key (.vibe/signing.key) automatically; release builds need no key (the release workflow signs with Sigstore keyless)"),
+        "slug" => Some("`vibe slug` was removed: add public slugs to .vibe/slugs.json (`vibe build` checks the file and lists the slugs)"),
+        "secret-scan" => Some("`vibe secret-scan` was removed: `vibe build` runs the secret scan and fails on findings"),
+        "endpoint" => Some("`vibe endpoint` was removed: list disabled features in .vibe/disabled.txt (one `<feature-id><TAB><reason>` per line; `vibe build` checks it)"),
+        "approve" => Some("`vibe approve` was removed: use `vibe build`; review happens on the source pull request"),
         _ => None,
     }
 }
@@ -427,6 +321,7 @@ fn print_high_risk(manifest: &manifest::Manifest) {
     }
 }
 
+#[allow(dead_code)]
 async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Result<(), String> {
     if !tenant
         .chars()
@@ -567,6 +462,74 @@ impl Drop for EchoGuard {
     }
 }
 
+fn check_build_inputs(project: &Path) -> Result<(), String> {
+    let report = secret_scan(project);
+    print_report(&report);
+    if report.has_errors() {
+        return Err("secret scan found a problem".into());
+    }
+    let runtime = vibe::runtime::load_project_slugs(project, false)?;
+    let example_path = project.join("slugs.example.json");
+    let example = if example_path.exists() {
+        Some(vibe::runtime::load_slug_file(&example_path)?)
+    } else {
+        None
+    };
+    let selected = if project.join(".vibe/slugs.json").exists() {
+        &runtime
+    } else if let Some(example) = &example {
+        println!("slugs from slugs.example.json (dev/memory only)");
+        example
+    } else {
+        &runtime
+    };
+    let mut slugs: Vec<_> = selected.slugs.iter().collect();
+    slugs.sort_by_key(|(slug, _)| *slug);
+    for (slug, entry) in slugs {
+        println!(
+            "slug {slug} -> tenant {} (public write: {})",
+            entry.tenant_id,
+            if entry.public_write { "yes" } else { "no" }
+        );
+    }
+    let sources = vibe::discover::discover(project).map_err(|e| e.to_string())?;
+    if runtime.slugs.is_empty()
+        && sources.iter().any(|source| {
+            source.text.contains("{slug}")
+                || fs::read_to_string(project.join(source.lock_rel()))
+                    .is_ok_and(|text| text.contains("{slug}"))
+        })
+    {
+        eprintln!("warning: public routes use {{slug}} but .vibe/slugs.json has no slugs; add one, e.g. {{\"<slug>\": {{\"tenant_id\": \"<8-32 lowercase letters or digits>\", \"public_write\": false}}}}; slugs.example.json is used only by `vibe run --db memory`");
+    }
+    let path = project.join(".vibe/disabled.txt");
+    if path.exists() {
+        let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        for (index, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let n = index + 1;
+            let (id, reason) = line
+                .split_once('\t')
+                .filter(|(id, reason)| !id.trim().is_empty() && !reason.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        ".vibe/disabled.txt line {n}: expected <feature-id><TAB><non-empty reason>"
+                    )
+                })?;
+            if !sources
+                .iter()
+                .any(|source| source.scope == Some(vibe::lock::Scope::Feature) && source.id == id)
+            {
+                eprintln!("warning: .vibe/disabled.txt line {n}: unknown feature {id}");
+            }
+            println!("disabled feature {id}: {reason}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -578,7 +541,7 @@ mod tests {
         assert!(super::removed_command_hint("new")
             .unwrap()
             .contains("no arguments in a terminal"));
-        for command in ["build", "run", "keygen"] {
+        for command in ["build", "run"] {
             assert!(super::removed_command_hint(command).is_none());
         }
     }

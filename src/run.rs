@@ -22,7 +22,15 @@ pub fn load_manifest(
 ) -> Result<manifest::Manifest, String> {
     if run_env.is_dev() {
         eprintln!("warning: verifying the manifest with the development key in .vibe/signing.pub");
-        let key = sign::load_dev_public(project)?;
+        let artifact_dir = manifest_path.parent().unwrap_or(Path::new("."));
+        let key_dir = if project.join(".vibe/signing.pub").exists() {
+            project
+        } else if artifact_dir.join(".vibe/signing.pub").exists() {
+            artifact_dir
+        } else {
+            project
+        };
+        let key = sign::load_dev_public(key_dir)?;
         return read_manifest(manifest_path, &key).map_err(|err| err.to_string());
     }
     let mode: manifest::Manifest =
@@ -283,7 +291,7 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
             .any(|route| route.public && route.path.contains("{slug}"))
     {
         eprintln!(
-            "warning: public routes use {{slug}} but no tenants are configured; copy slugs.example.json to .vibe/slugs.json or run `vibe slug add <slug> --tenant <id>`"
+            "warning: public routes use {{slug}} but no tenants are configured; add public slugs to .vibe/slugs.json (slugs.example.json is used only by `vibe run --db memory`)"
         );
     }
     // #118: refuse `challenge_when: always` in production until a verifier

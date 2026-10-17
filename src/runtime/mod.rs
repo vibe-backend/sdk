@@ -39,7 +39,7 @@ pub fn hash_password_for_tests(plain: &str) -> String {
 }
 pub use limiter::{saturation_refusals, ProxyNet, QuotaBuckets, RateBuckets};
 pub use migrate::migrate_tenant;
-pub use slugs::{add_slug, apply_dev_default, load_project_slugs, DevSlugs, SlugLoad};
+pub use slugs::{apply_dev_default, load_project_slugs, load_slug_file, DevSlugs, SlugLoad};
 pub use sql::{
     bootstrap_statements, quote as quote_ident, quote as sql_quote, runtime_grant_statements,
     runtime_schema_statements, Col,

@@ -251,7 +251,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     assert!(missing_slug.json["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("vibe slug add"));
+        .contains(".vibe/slugs.json"));
     let hidden = send(&app, "GET", "/catalog/v1/hidden000/products", None, None).await;
     assert_eq!(hidden.status, StatusCode::NOT_FOUND);
     assert_eq!(hidden.json["error"]["message"], "Not found");
@@ -587,6 +587,7 @@ fn copy_shop() -> PathBuf {
     let root = std::env::temp_dir().join(format!("vibe-shop-{}", uuid::Uuid::new_v4()));
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shop");
     copy_dir(&src, &root);
+    fs::write(root.join(".gitignore"), ".env\n").unwrap();
     root
 }
 
@@ -1160,11 +1161,27 @@ fn vibe_cli(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> (bool, String)
 }
 
 #[tokio::test]
-async fn manifest_dev_creates_a_key_and_keygen_refuses_overwrite() {
+async fn build_creates_and_repairs_development_key_pair() {
     let root = compiled_shop().await;
     let (ok, out) = vibe_cli(&root, &["build", "--project", "."], &[]);
     assert!(ok, "{out}");
-    assert!(root.join(".vibe/signing.key").exists());
+    assert!(out.contains("created development signing key .vibe/signing.key (keep it private; .vibe/signing.pub verifies dev manifests)"));
+    let original = fs::read(root.join(".vibe/signing.key")).unwrap();
+    for public in [None, Some("mismatched")] {
+        if let Some(text) = public {
+            fs::write(root.join(".vibe/signing.pub"), text).unwrap();
+        } else {
+            fs::remove_file(root.join(".vibe/signing.pub")).unwrap();
+        }
+        let (ok, out) = vibe_cli(&root, &["build", "--project", "."], &[]);
+        assert!(ok, "{out}");
+        assert!(!out.contains("created development signing key"));
+        assert!(original == fs::read(root.join(".vibe/signing.key")).unwrap());
+        assert_eq!(
+            sign::load_dev_public(&root).unwrap(),
+            sign::load_dev_key(&root).unwrap().verifying_key()
+        );
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1182,8 +1199,6 @@ async fn manifest_dev_creates_a_key_and_keygen_refuses_overwrite() {
         assert!(!ok);
         assert!(out.contains("must be mode 0600"), "{out}");
     }
-    let (ok, out) = vibe_cli(&root, &["keygen", "--project", "."], &[]);
-    assert!(!ok && out.contains("not overwriting"), "{out}");
 }
 
 #[tokio::test]
@@ -1304,7 +1319,7 @@ async fn release_build_ignores_lock_files_in_the_repo() {
 }
 
 #[tokio::test]
-async fn release_build_never_reads_the_project_env_file() {
+async fn release_build_scans_but_never_loads_the_project_env_file() {
     let root = compiled_shop().await;
     fs::write(
         root.join(".env"),
@@ -1327,7 +1342,7 @@ async fn release_build_never_reads_the_project_env_file() {
         ],
         &[],
     );
-    assert!(ok, "{out}");
+    assert!(!ok && out.contains(".env must not be committed"), "{out}");
     assert!(!out.contains("attacker.example"), "{out}");
 }
 
@@ -1943,7 +1958,12 @@ async fn memory_dev_default_and_live_slug_reload() {
         app.clone().oneshot(get("dev")).await.unwrap().status(),
         StatusCode::OK
     );
-    vibe::runtime::add_slug(&root, "newslug", "tenant0001", false).unwrap();
+    fs::create_dir_all(root.join(".vibe")).unwrap();
+    fs::write(
+        root.join(".vibe/slugs.json"),
+        r#"{"newslug":{"tenant_id":"tenant0001","public_write":false}}"#,
+    )
+    .unwrap();
     assert_eq!(
         app.clone().oneshot(get("newslug")).await.unwrap().status(),
         StatusCode::OK
@@ -1978,5 +1998,28 @@ async fn missing_definition_suggests_scaffold() {
     .to_string();
     assert!(error.contains("api/shop/_definition.md"), "{error}");
     assert!(error.contains("Run `vibe` (interactive)"), "{error}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn build_recognizes_disabled_route_feature_ids() {
+    let root = compiled_shop().await;
+    let (ok, out) = vibe_cli(&root, &["build"], &[]);
+    assert!(ok, "{out}");
+    let manifest: vibe::manifest::Manifest =
+        serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    let id = &manifest.routes[0].feature_id;
+    fs::write(
+        root.join(".vibe/disabled.txt"),
+        format!("{id}\tmaintenance\n"),
+    )
+    .unwrap();
+    let (ok, out) = vibe_cli(&root, &["build"], &[]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(&format!("disabled feature {id}: maintenance")),
+        "{out}"
+    );
+    assert!(!out.contains("unknown feature"), "{out}");
     fs::remove_dir_all(root).unwrap();
 }

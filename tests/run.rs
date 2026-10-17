@@ -10,6 +10,7 @@ fn project() -> PathBuf {
         "---\npublic: true\nauth: removed\n---\n# Hello\n\nA public GET endpoint returning {\"message\":\"hello world\"}.\n",
     )
     .unwrap();
+    fs::write(root.join(".gitignore"), ".env\n").unwrap();
     fs::create_dir_all(root.join("providers")).unwrap();
     fs::write(
         root.join("providers/main.md"),

@@ -299,7 +299,7 @@ async fn compile_docs(
         if !structured && opts.llm.is_none() {
             report.push(Diag::error(
                 &source.rel,
-                "natural-language source needs an LLM adapter (set LLM_API_KEY and LLM_MODEL)",
+                "natural-language source needs an LLM adapter (set LLM_PROVIDER, LLM_MODEL and LLM_API_KEY or LLM_API_KEY_FILE in the build environment)",
             ));
             continue;
         }
