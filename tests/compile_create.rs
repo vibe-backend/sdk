@@ -558,3 +558,58 @@ async fn missing_list_is_repaired_and_constants_are_preserved() {
         }
     }
 }
+
+#[tokio::test]
+async fn validate_rejects_source_writes_false_with_create_step() {
+    let root = project();
+    source(&root, GOOD);
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    let path = root.join("api/catalog/v1/example-create/example-create.md");
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!("---\nwrites: false\n---\n{text}")).unwrap();
+    let err = validate_project(&ValidateOptions {
+        root: &root,
+        dev: true,
+        deploy: false,
+    })
+    .expect_err("source writes conflict with create step");
+    assert!(
+        err.to_string()
+            .contains("calls product.create, which writes"),
+        "{err}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn validate_rejects_hand_edited_lock_unknown_errors_code() {
+    let root = project();
+    source(&root, GOOD);
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    let path = root.join("api/catalog/v1/example-create/example-create.lock.md");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("## Errors\n(none)"), "{text}");
+    fs::write(&path, text.replace("## Errors\n(none)", "## Errors\n| status | code | from |\n| --- | --- | --- |\n| 409 | INVENTED | INVENTED |" )).unwrap();
+    let err = validate_project(&ValidateOptions {
+        root: &root,
+        dev: true,
+        deploy: false,
+    })
+    .expect_err("hand-edited unknown Errors code");
+    assert!(err.to_string().contains("unknown Errors code"), "{err}");
+    fs::remove_dir_all(root).unwrap();
+}
