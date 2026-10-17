@@ -19,10 +19,11 @@ use subtle::ConstantTimeEq;
 use crate::manifest::{Manifest, RouteSpec};
 
 use super::crud::{self, MethodFail};
-use super::exec::QueryExec;
+use super::exec::{ExecError, QueryExec};
 use super::limiter::{
     ip_bucket, owner_of, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision,
 };
+use super::refresh::{RevokeTarget, Rotated};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -378,6 +379,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     let request_id = uuid::Uuid::new_v4().to_string();
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
+
     if path == "/health" {
         return json_response(StatusCode::OK, json!({"status": "ok"}), &request_id, &[]);
     }
@@ -398,7 +400,11 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             "METHOD_NOT_ALLOWED",
             "Method not allowed",
             &request_id,
-            &[("allow", allowed.as_str())],
+            &[
+                ("allow", allowed.as_str()),
+                ("cache-control", "no-store"),
+                ("pragma", "no-cache"),
+            ],
         );
     };
     if state.disabled.contains(&found.route.feature_id) {
@@ -624,6 +630,35 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
     }
+    // Refresh routes answer every bad or missing token with the same 401,
+    // so they run before request-table validation (which would give 422).
+    if let Some(spec) = &found.route.refresh {
+        let mut response = refresh_response(
+            &state,
+            found.route,
+            spec,
+            &principal.tenant_id,
+            &ip,
+            &body,
+            &request_id,
+        )
+        .await;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            if let Some(slug) = found
+                .params
+                .get("slug")
+                .filter(|slug| super::slugs::valid_slug(slug))
+            {
+                let cookie = format!(
+                    "__Host-vibe_rt_{slug}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict"
+                );
+                if let Ok(value) = cookie.parse() {
+                    response.headers_mut().insert(header::SET_COOKIE, value);
+                }
+            }
+        }
+        return finish(found.route, &state, started, response).await;
+    }
     // Validate only after authentication and authorization, so unauthenticated
     // callers cannot probe the request schema of protected endpoints.
     if let Err(fail) = validate_request(found.route, &body, &query, &found.params, &headers) {
@@ -634,6 +669,15 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             fail_response(found.route, fail, &request_id),
         )
         .await;
+    }
+    if let Some(spec) = &found.route.revoke {
+        if let Err(response) = revoke_tokens(&state, spec, &principal, &body, &request_id).await {
+            return finish(found.route, &state, started, response).await;
+        }
+        if found.route.steps.is_empty() {
+            let response = empty_response(StatusCode::NO_CONTENT, &request_id, &[]);
+            return finish(found.route, &state, started, response).await;
+        }
     }
     if found.route.public_writes && quota_exhausted(&state, &principal.tenant_id, &ip) {
         let retry = seconds_until_utc_midnight().to_string();
@@ -698,6 +742,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                 subject: &principal.subject,
                 roles: &principal.roles,
             },
+            refresh_token: None,
         }),
     );
     let input = match crud::eval_expr(&found.route.transform_in, &vars) {
@@ -765,6 +810,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                             subject: &principal.subject,
                             roles: &principal.roles,
                         },
+                        refresh_token: None,
                     },
                     1,
                 )
@@ -880,8 +926,16 @@ async fn finish(
     route: &RouteSpec,
     state: &AppState,
     started: Instant,
-    response: HttpResponse,
+    mut response: HttpResponse,
 ) -> HttpResponse {
+    if route.refresh.is_some() || route.revoke.is_some() {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+        response
+            .headers_mut()
+            .insert(header::PRAGMA, "no-cache".parse().unwrap());
+    }
     let min_ms = state.min_override_ms.unwrap_or(if route.public {
         // Login-class endpoints (a verify-password step) pad to 500 ms so
         // timing does not reveal whether the account exists.
@@ -893,6 +947,12 @@ async fn finish(
     } else {
         0
     });
+    // All refresh paths share a minimum response time.
+    let min_ms = if route.refresh.is_some() {
+        min_ms.max(REFRESH_MIN_RESPONSE_MS)
+    } else {
+        min_ms
+    };
     let elapsed = started.elapsed();
     if min_ms > 0 {
         let min = Duration::from_millis(min_ms);
@@ -1216,20 +1276,12 @@ async fn authenticate(
             .key(&kid)
             .await
             .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
-        if found.alg != auth.alg {
-            // Decision 139: only the configured alg; other keys are unused.
-            return Err(AuthError::unauthorized("Bearer"));
-        }
         (found.alg, found.key)
     } else if let Some(jwks) = &auth.jwks {
         let found = jwks
             .key(&kid)
             .await
             .ok_or_else(|| AuthError::unauthorized("Bearer"))?;
-        if found.alg != auth.alg {
-            // Decision 139: only the configured alg; other keys are unused.
-            return Err(AuthError::unauthorized("Bearer"));
-        }
         (found.alg, found.key)
     } else {
         if auth.public_pem.is_empty() || kid != auth.kid {
@@ -1244,7 +1296,7 @@ async fn authenticate(
         .map_err(|_| AuthError::unauthorized("Bearer"))?;
         (auth.alg, key)
     };
-    if jwt_header.alg != alg {
+    if alg != auth.alg || jwt_header.alg != alg {
         return Err(AuthError::unauthorized("Bearer"));
     }
     let iss = if route.jwt_iss.is_empty() {
@@ -1576,9 +1628,11 @@ fn rate_limited(
     if route.rates.is_empty() {
         return None;
     }
+    // `family` limits are applied by the refresh handler once the family is known.
     let checks: Vec<(String, String, u32)> = route
         .rates
         .iter()
+        .filter(|rate| rate.key != "family")
         .enumerate()
         .map(|(index, rate)| {
             let (shard, key) =
@@ -1594,6 +1648,261 @@ fn rate_limited(
         RateDecision::Allow => None,
         RateDecision::Limited(wait) => Some(wait.to_string()),
     }
+}
+
+fn limit_check(state: &AppState, checks: &[(String, String, u32)], owner: &str) -> Option<String> {
+    let Ok(mut rates) = state.rates.lock() else {
+        return Some("1".into());
+    };
+    match rates.check(checks, owner, Instant::now()) {
+        RateDecision::Allow => None,
+        RateDecision::Limited(wait) => Some(wait.to_string()),
+    }
+}
+
+/// Platform ceilings for refresh routes (decision 72).
+// Bound database lookup, rotation and signing together; pad early results to
+// the same deadline in finish, including rate-limit and unknown-token paths.
+const REFRESH_MIN_RESPONSE_MS: u64 = 300;
+const REFRESH_IP_PER_MINUTE: u32 = 30;
+const REFRESH_FAMILY_PER_MINUTE: u32 = 10;
+
+static REFRESH_REJECTIONS: std::sync::LazyLock<Mutex<HashMap<&'static str, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Snapshot for internal metrics collectors, alongside saturation_refusals.
+pub fn refresh_rejections() -> HashMap<&'static str, u64> {
+    REFRESH_REJECTIONS
+        .lock()
+        .map(|counts| counts.clone())
+        .unwrap_or_default()
+}
+
+fn log_id_hash(value: &str) -> String {
+    let digest = <Sha256 as sha2::Digest>::digest(value.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn invalid_refresh(request_id: &str, reason: &'static str) -> HttpResponse {
+    if let Ok(mut counts) = REFRESH_REJECTIONS.lock() {
+        *counts.entry(reason).or_default() += 1;
+    }
+    json_response(
+        StatusCode::UNAUTHORIZED,
+        serde_json::json!({"error": {"code": "INVALID_REFRESH_TOKEN", "message": "Invalid refresh token"}}),
+        request_id,
+        &[],
+    )
+}
+
+fn refresh_unavailable(request_id: &str, err: &ExecError) -> HttpResponse {
+    json_response(
+        if matches!(err, ExecError::Timeout) {
+            StatusCode::GATEWAY_TIMEOUT
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        json!({"error": {
+            "code": if matches!(err, ExecError::Timeout) { "TX_TIMEOUT" } else { "TX_CONFLICT" },
+            "message": "Token refresh is temporarily unavailable; try again later",
+            "request_id": request_id,
+            "retryable": true,
+        }}),
+        request_id,
+        &[
+            ("retry-after".into(), "1".into()),
+            ("cache-control".into(), "no-store".into()),
+            ("pragma".into(), "no-cache".into()),
+        ],
+    )
+}
+
+fn rate_limited_response(request_id: &str, retry: &str) -> HttpResponse {
+    error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "RATE_LIMITED",
+        "Too many requests",
+        request_id,
+        &[("retry-after", retry)],
+    )
+}
+
+/// `token-refresh`: validate, prepare issuance, and commit rotation.
+async fn refresh_response(
+    state: &AppState,
+    route: &RouteSpec,
+    spec: &crate::manifest::RefreshSpec,
+    tenant: &str,
+    ip: &str,
+    body: &Value,
+    request_id: &str,
+) -> HttpResponse {
+    let ip_check = [(
+        format!("{}:refresh-ip", route.feature_id),
+        ip.to_string(),
+        REFRESH_IP_PER_MINUTE,
+    )];
+    let owner = owner_of(ip);
+    if let Some(retry) = limit_check(state, &ip_check, &owner) {
+        return rate_limited_response(request_id, &retry);
+    }
+    let Some(token) = body
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty() && t.len() <= 256)
+    else {
+        return invalid_refresh(request_id, "invalid");
+    };
+    let hash = super::ops::refresh_hash(&state.auth.pepper, token);
+    // The family lookup must succeed before rotating: a store error fails
+    // closed with a retryable 503 instead of skipping the family limit. The
+    // presented token is not consumed, so the client can retry it.
+    let family = match state.exec.refresh_family(tenant, &hash).await {
+        Ok(family) => family,
+        Err(err) => {
+            tracing::error!(%request_id, tenant_hash = %log_id_hash(tenant), error = ?err, "refresh family lookup failed; failing closed");
+            return refresh_unavailable(request_id, &err);
+        }
+    };
+    if let Some(family) = family {
+        let per_minute = route
+            .rates
+            .iter()
+            .filter(|r| r.key == "family")
+            .map(|r| r.per_minute)
+            .min()
+            .unwrap_or(REFRESH_FAMILY_PER_MINUTE)
+            .min(REFRESH_FAMILY_PER_MINUTE);
+        let family_check = [(
+            format!("{}:family", route.feature_id),
+            family.clone(),
+            per_minute,
+        )];
+        // Known tokens, including revoked children, reach rotation when allowed.
+        if limit_check(state, &family_check, &owner).is_some() {
+            tracing::warn!(tenant_hash = %log_id_hash(tenant), family_hash = %log_id_hash(&family), "refresh family rate limit reached");
+            return invalid_refresh(request_id, "family_limit");
+        }
+    } else {
+        return invalid_refresh(request_id, "unknown");
+    }
+    let (new_token, new_hash) = super::ops::new_refresh_token(&state.auth.pepper);
+    let policy = super::ops::policy_of(spec);
+    let issuer = HttpRefreshIssuer {
+        state,
+        spec,
+        tenant,
+        new_token: &new_token,
+    };
+    match state
+        .exec
+        .refresh_rotate_authorized(tenant, &hash, &new_hash, policy, Some(&issuer))
+        .await
+    {
+        Ok((Rotated::Ok { expires_in, .. }, Some(mut value))) => {
+            value["refresh_token"] = Value::String(new_token);
+            value["refresh_expires_in"] = Value::from(expires_in);
+            json_response(StatusCode::OK, value, request_id, &[])
+        }
+        Ok((Rotated::Reuse { family_id }, _)) => {
+            tracing::warn!(tenant_hash = %log_id_hash(tenant), family_hash = %log_id_hash(&family_id), "refresh token reuse detected; family revoked");
+            invalid_refresh(request_id, "invalid")
+        }
+        Ok(_) => invalid_refresh(request_id, "invalid"),
+        Err(err) => {
+            tracing::error!(%request_id, error = ?err, "refresh rotation failed");
+            refresh_unavailable(request_id, &err)
+        }
+    }
+}
+
+struct HttpRefreshIssuer<'a> {
+    state: &'a AppState,
+    spec: &'a crate::manifest::RefreshSpec,
+    tenant: &'a str,
+    new_token: &'a str,
+}
+
+#[async_trait::async_trait]
+impl super::exec::RefreshIssuer for HttpRefreshIssuer<'_> {
+    async fn issue(&self, user_id: &str) -> Result<Value, super::exec::ExecError> {
+        let input = json!({ "user_id": user_id });
+        let result = crud::run_method(
+            &self.state.manifest,
+            self.state.exec.as_ref(),
+            &self.spec.sign_method,
+            &input,
+            crud::CallCtx {
+                auth: &self.state.auth,
+                tenant_id: self.tenant,
+                role: "public_reader",
+                caller: crud::Caller {
+                    subject: user_id,
+                    roles: &[],
+                },
+                refresh_token: Some(self.new_token),
+            },
+            1,
+        )
+        .await;
+        match result {
+            Ok(result) if result.value.get("access_token").is_some() => Ok(result.value),
+            Err(err) if err.code == "TX_TIMEOUT" => Err(ExecError::Timeout),
+            Err(err) if matches!(err.code.as_str(), "TX_CONFLICT" | "CONFLICT") => {
+                Err(ExecError::Conflict)
+            }
+            _ => Err(ExecError::IssuanceFailed),
+        }
+    }
+}
+
+/// `token-revoke`: `family` revokes the presented token's family (only the
+/// caller's own); `all` revokes every family of the caller.
+async fn revoke_tokens(
+    state: &AppState,
+    spec: &crate::manifest::RevokeSpec,
+    principal: &Principal,
+    body: &Value,
+    request_id: &str,
+) -> Result<(), HttpResponse> {
+    let hash;
+    let target = if spec.scope == "all" {
+        RevokeTarget::User(&principal.subject)
+    } else {
+        let Some(token) = body.get("refresh_token").and_then(Value::as_str) else {
+            return Err(error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "VALIDATION_FAILED",
+                "refresh_token is required",
+                request_id,
+                &[],
+            ));
+        };
+        hash = super::ops::refresh_hash(&state.auth.pepper, token);
+        RevokeTarget::FamilyOf {
+            hash: &hash,
+            user: &principal.subject,
+        }
+    };
+    // Unknown tokens revoke nothing; the response is the same either way.
+    if let Err(err) = state
+        .exec
+        .refresh_revoke(&principal.tenant_id, target)
+        .await
+    {
+        tracing::error!(%request_id, error = ?err, "refresh revoke failed");
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "Internal error",
+            request_id,
+            &[],
+        ));
+    }
+    Ok(())
 }
 
 fn seconds_until_utc_midnight() -> i64 {
@@ -2830,5 +3139,65 @@ mod crypto_kats {
             mac,
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+    }
+}
+
+#[cfg(test)]
+mod refresh_response_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejection_responses_match_with_the_same_request_id() {
+        let invalid = invalid_refresh("request", "invalid");
+        let capped = invalid_refresh("request", "family_limit");
+        assert_eq!(invalid.status(), capped.status());
+        assert_eq!(invalid.headers(), capped.headers());
+        assert_eq!(invalid.headers()["x-request-id"], "request");
+        let invalid = axum::body::to_bytes(invalid.into_body(), 4096)
+            .await
+            .unwrap();
+        let capped = axum::body::to_bytes(capped.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(invalid, capped);
+    }
+
+    #[tokio::test]
+    async fn refresh_error_codes_reflect_the_store_error() {
+        for (error, code) in [
+            (ExecError::Conflict, "TX_CONFLICT"),
+            (
+                ExecError::Message("40001 serialization failure".into()),
+                "TX_CONFLICT",
+            ),
+            (
+                ExecError::Message("40P01 deadlock detected".into()),
+                "TX_CONFLICT",
+            ),
+            (
+                ExecError::Message("57014 timeout text".into()),
+                "TX_CONFLICT",
+            ),
+            (ExecError::Timeout, "TX_TIMEOUT"),
+        ] {
+            let response = refresh_unavailable("request", &error);
+            assert_eq!(
+                response.status(),
+                if code == "TX_TIMEOUT" {
+                    StatusCode::GATEWAY_TIMEOUT
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            );
+            assert_eq!(response.headers()["retry-after"], "1");
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert!(!response.headers().contains_key("set-cookie"));
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"]["code"], code);
+            assert_eq!(value["error"]["retryable"], true);
+        }
     }
 }
