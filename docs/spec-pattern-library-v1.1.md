@@ -98,7 +98,7 @@ pub trait Pattern {
 - 簽名（MUST）：撤回清單用同決定 158 一樣嘅 pinned signer 身份（issuer + SAN）簽，用 Sigstore bundle 離線驗證；驗證失敗即拒絕呢份清單。
 - 內容：`version`（單調遞增整數）、`expires-at`、撤回咗嘅 `id@version` 列表同原因。
 - 防回滾（MUST）：compile 記住本地 cache 已驗證嘅最高 `version`；收到 `version` 更細嘅清單一律拒絕，照用 cache 嗰份。
-- 到期（MUST）：清單過咗 `expires-at`，compile 警告，但照用本地最新一份已驗證嘅清單；唔會因為離線或者攞唔到新清單就全部失敗。完全冇任何已驗證清單（例如第一次用、冇 cache）嘅處理：compile 失敗（fail closed）。
+- 到期（MUST）：清單過咗 `expires-at`，compile 警告，但照用本地最新一份已驗證嘅清單；唔會因為離線或者攞唔到新清單就全部失敗。完全冇任何已驗證清單（例如第一次用、冇 cache）嘅處理：**待產品經理確認**。選項：A compile 失敗（fail closed）；B 用 core release 內嵌嘅一份已簽清單做初始值。建議：B 做初始值，冇內嵌清單時先用 A。
 - 套用：lock 解析出嚟嘅任何 `id@version` 喺清單入面即 compile error，錯誤訊息列出原因同建議版本。本地 cache／mirror 都一樣檢查（決定 160）。
 - 必須有嘅測試：(1) 回滾：較舊 `version` 嘅已簽清單被拒絕，照用 cache 版本；(2) 到期：過期清單發警告但撤回照樣生效；(3) 簽名身份唔對嘅清單被拒絕；(4) 被撤回嘅版本 compile 失敗；(5) 離線 mirror 同樣套用撤回清單。
 
