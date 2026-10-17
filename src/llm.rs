@@ -476,10 +476,38 @@ where
     }
 }
 
+/// Merge dotenv lines without replacing existing values. Empty LLM/OpenAI
+/// settings are missing; other keys retain first-occurrence semantics.
+pub fn merge_dotenv(text: &str, env: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut merged = env.clone();
+    merged.retain(|key, value| !is_llm_setting(key) || !value.trim().is_empty());
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            if is_llm_setting(key) && value.trim().is_empty() {
+                continue;
+            }
+            merged
+                .entry(key.to_string())
+                .or_insert_with(|| value.to_string());
+        }
+    }
+    merged
+}
+
+fn is_llm_setting(key: &str) -> bool {
+    key.starts_with("LLM_") || key.starts_with("OPENAI_")
+}
+
 pub fn load_llm_config(
     env: &HashMap<String, String>,
     ci_or_prod: bool,
 ) -> Result<LlmConfig, Report> {
+    let nonempty = merge_dotenv("", env);
+    let env = &nonempty;
     let mut report = Report::new();
     let provider = env
         .get("LLM_PROVIDER")
@@ -1795,8 +1823,11 @@ fn parse_gemini(value: &Value) -> Result<LlmResponse, String> {
     })
 }
 
+/// Collect process environment entries, skipping keys or values that are not valid UTF-8.
 pub fn env_map_from_process() -> HashMap<String, String> {
-    std::env::vars().collect()
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
 }
 
 /// Names only, including empty and non-Unicode values.

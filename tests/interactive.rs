@@ -85,7 +85,29 @@ fn nonterminal_help_and_removed_new() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("unrecognized subcommand"));
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("`vibe new` was removed"));
+    assert!(error.contains("run `vibe` with no arguments"));
+    let out = Command::new(env!("CARGO_BIN_EXE_vibe"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains(
+        "Running vibe with no arguments in a terminal starts interactive setup and generation."
+    ));
+    assert!(!help
+        .lines()
+        .any(|l| l.trim_start().starts_with("new ") || l.trim_start().starts_with("approve ")));
+    let out = Command::new(env!("CARGO_BIN_EXE_vibe"))
+        .args(["manifest", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(!help.lines().next().unwrap().contains("signed"));
+    assert!(help.contains("unsigned"));
+    assert!(help.contains("Sigstore keyless"));
+    assert!(help.contains("local dev key"));
 }
 #[test]
 fn setup_and_existing_config() {
@@ -120,6 +142,32 @@ fn setup_and_existing_config() {
         assert!(!io.output.contains("Provider"));
         assert!(!io.output.contains("wrote .env"));
         assert!(!io.output.contains("super-secret-key"));
+    }
+    for blank in ["", "   "] {
+        let project = root();
+        let original = format!("LLM_PROVIDER=openai\nLLM_MODEL=m\nLLM_API_KEY={blank}\n");
+        fs::write(project.join(".env"), &original).unwrap();
+        let mut io = Script::new(&["replacement-secret"]);
+        let config = interactive::setup_with_resolver(&project, &mut io, HashMap::new(), |_, _| {
+            Ok(vec!["93.184.216.34:443".parse().unwrap()])
+        })
+        .unwrap();
+        assert_eq!(config.api_key, "replacement-secret");
+        assert!(io.lines.is_empty());
+        assert!(io.output.contains("API key:"));
+        for prompt in [
+            "Provider",
+            "Model:",
+            "Base URL",
+            "API style",
+            "replacement-secret",
+        ] {
+            assert!(!io.output.contains(prompt));
+        }
+        let bytes = fs::read(project.join(".env")).unwrap();
+        assert!(bytes.starts_with(original.as_bytes()));
+        assert!(String::from_utf8(bytes).unwrap()[original.len()..]
+            .contains("LLM_API_KEY=replacement-secret\n"));
     }
     let text = fs::read_to_string(p.join(".env")).unwrap();
     assert_eq!(text, default_text);
@@ -416,4 +464,39 @@ async fn kebab_names_are_repaired_or_write_nothing() {
         }
         fs::remove_dir_all(p).unwrap();
     }
+}
+
+#[test]
+fn dotenv_empty_llm_values_and_precedence() {
+    let text = "LLM_API_KEY=\nLLM_API_KEY=   \nLLM_API_KEY=real\nOTHER=\nOTHER=second\nOPENAI_MODEL=  \nOPENAI_MODEL=m\n";
+    let merged = llm::merge_dotenv(text, &HashMap::new());
+    assert_eq!(merged["LLM_API_KEY"], "real");
+    assert_eq!(merged["OPENAI_MODEL"], "m");
+    assert_eq!(merged["OTHER"], "");
+    for value in ["", "  ", "process"] {
+        let current = HashMap::from([("LLM_API_KEY".into(), value.into())]);
+        let merged = llm::merge_dotenv(text, &current);
+        assert_eq!(
+            merged["LLM_API_KEY"],
+            if value.trim().is_empty() {
+                "real"
+            } else {
+                "process"
+            }
+        );
+    }
+    let mut settings = env();
+    for key in [
+        "LLM_TIMEOUT",
+        "LLM_MAX_RETRIES",
+        "LLM_SEED",
+        "LLM_BASE_URL",
+        "LLM_API_STYLE",
+        "LLM_ALLOW_PRIVATE_HOST",
+        "LLM_PROVIDER",
+        "OPENAI_API_KEY",
+    ] {
+        settings.insert(key.into(), "   ".into());
+    }
+    assert!(llm::load_llm_config(&settings, false).is_ok());
 }

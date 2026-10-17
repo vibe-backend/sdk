@@ -1,6 +1,6 @@
 # PR review 指引（草稿，配合 spec v1.8 決定 29、37、83、89、96）
 
-v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9C）。人手 review 改由 Git 平台負責；以下係建議設定（以 GitHub rulesets 為例）；SDK 唔檢查呢啲設定。`vibe build --release-approval` 已撤回（產品經理 2026-10-16）。標「計劃中」嘅指令係 v1.8 設計，未實作。
+v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9C）。人手 review 改由 Git 平台負責；以下係建議設定（以 GitHub rulesets 為例）；SDK 唔檢查呢啲設定。`--release-approval` 已撤回（產品經理 2026-10-16）。標 vNext 嘅指令唔喺 1.0（決定 164）。
 
 ## 1. Ruleset（`main`）
 
@@ -40,7 +40,7 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 
 - CODEOWNERS 入面嘅用戶或者 team 一定要對 repo 有 **write** 權限，否則 GitHub 唔會當佢係 code owner，required review 會失效。
 - `.compiler/injection-allowlist` 喺 `/.compiler/` 之下，一定受保護（決定 37）。
-- 計劃中：`vibe build` release 模式會檢查 CODEOWNERS 覆蓋晒以上路徑，冇就失敗（決定 93）。
+- vNext（決定 164）：`vibe build` 計劃功能唔喺 1.0；CODEOWNERS 覆蓋由 Git 平台把關，SDK 唔檢查（決定 93、115）。
 - Lock 係 build 輸出，**唔 commit**（`*.lock.md` 加入 `.gitignore`，spec 決定 117）。Review 重點係 source 嘅 frontmatter 高風險宣告（`writes`、`public`、`auth`、`secrets`，決定 112）；產生嘅 SQL 由決定 114 policy 檢查，release summary 列出變化。
 
 ## 3. Required status checks
@@ -58,7 +58,7 @@ v1.8 起，`vibe` SDK 唔再要求喺 lock 入面記錄人手確認（見 spec 9
 
 GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自訂 required status check：
 
-1. CI 按佢由 source build 出嚟嘅 lock 嘅 `security-items` 自動加 `security:high` 或者 `security:medium` label（計劃中：`vibe build --labels` 輸出建議 label）。
+1. CI 按佢由 source build 出嚟嘅 lock 嘅 `security-items` 自動加 `security:high` 或者 `security:medium` label（vNext（決定 164）：`vibe build --labels` 輸出建議 label）。
 2. 另一個 workflow（例如 `high-risk-approvals`）喺 `pull_request`、`pull_request_review` 同 `labeled` 事件觸發，讀 PR 嘅 label 同 review；有 `security:high` 但少過 2 個非作者、針對最新 commit 嘅 approval，就 fail。
 3. 將 `high-risk-approvals` 設為 required status check。
 
@@ -78,7 +78,7 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
 - 改 CODEOWNERS（`.github/`、root、`docs/` 任何一個）一律當高風險；release 時真正批准係 `release` environment（Jack）。
 - CODEOWNERS 用 team（`@org/team`）嘅話，release workflow 要用 GitHub App installation token（organization Members: read，其他只讀），`GITHUB_TOKEN` 查唔到 team 成員；冇就失敗。
 - Machine user（普通帳戶做自動化）SDK 分唔到係唔係真人，唔好畀佢哋 write 權限或者 CODEOWNERS 身份。
-- `vibe build --release-approval` 已撤回（產品經理 2026-10-16，spec 2C.3a）；高風險 release 冇額外 SDK 檢查。
+- `--release-approval` 已撤回（產品經理 2026-10-16，spec 2C.3a）；高風險 release 冇額外 SDK 檢查。
 - Release workflow 嘅 token 權限：
 
   ```yaml

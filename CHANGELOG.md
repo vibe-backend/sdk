@@ -5,6 +5,9 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Spec decision 164:** `vibe manifest` is the official build command (release by default, `--dev` for development); `vibe build` is deferred to vNext. Removed stand-in wording.
+- **Empty LLM settings:** Interactive setup and the `.env` loader treat empty or whitespace-only LLM/OpenAI values as unset. Later non-empty lines win, and empty process variables do not block `.env` values; existing file content is preserved.
+- **CLI help:** Describes interactive `vibe`; removed `vibe new` points to `vibe`. Manifest help describes unsigned release output, workflow Sigstore signing and the local dev key.
 - **Interactive setup (decision 157):** Fill only missing `.env` keys, preserve existing values, avoid duplicates, and prompt only for missing keys.
 - **Structured Limits errors (decision 163):** Conflicts name the field, source and resolved values, and explain how to pin the value in frontmatter or delete the Limits line.
 

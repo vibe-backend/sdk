@@ -39,7 +39,7 @@ jobs:
         run: |
           set -o pipefail
           {
-            echo '## vibe build preview (not a deploy artifact)'
+            echo '## vibe manifest preview (not a deploy artifact)'
             echo '```'
             LLM_API_KEY="$VIBE_LLM_API_KEY" vibe compile --check --project . 2>&1
             echo '```'

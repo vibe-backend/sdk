@@ -16,7 +16,11 @@ use vibe::sign;
 use vibe::validate::{validate_project, ValidateOptions};
 
 #[derive(Parser)]
-#[command(name = "vibe", about = "Compile and serve a markdown-driven backend")]
+#[command(
+    name = "vibe",
+    about = "Compile and serve a markdown-driven backend",
+    after_help = "Running vibe with no arguments in a terminal starts interactive setup and generation."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -43,7 +47,10 @@ enum Command {
         #[arg(long)]
         dev: bool,
     },
-    /// Build a signed manifest from validated locks.
+    /// Build a manifest from validated locks: release by default.
+    ///
+    /// Release output is unsigned; the release workflow signs it with Sigstore keyless.
+    /// Use --dev to sign with the local dev key.
     Manifest {
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -73,6 +80,11 @@ enum Command {
     },
     #[command(hide = true)]
     Approve {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(hide = true)]
+    New {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -177,7 +189,8 @@ async fn run(cli: Cli) -> Result<(), String> {
     };
     match command {
         Command::Compile { project, check } => cmd_compile(&project, check).await,
-        Command::Approve { .. } => Err("`vibe approve` has been removed in spec v1.8 (decision 77): review happens on the source pull request. Use `vibe validate --deploy --dev` and `vibe manifest --dev` locally (the equivalent of `vibe build --dev` until `vibe build` is available).".into()),
+        Command::New { .. } => Err("`vibe new` was removed; run `vibe` with no arguments in a terminal for interactive setup and generation".into()),
+        Command::Approve { .. } => Err("`vibe approve` has been removed in spec v1.8 (decision 77): review happens on the source pull request. Use `vibe validate --deploy --dev` and `vibe manifest --dev` locally.".into()),
         Command::Validate { project, deploy, dev } => cmd_validate(&project, deploy, dev),
         Command::Manifest {
             project,
@@ -818,15 +831,9 @@ fn load_dotenv(project: &Path) {
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if std::env::var(key).is_err() {
+    let current = llm::env_map_from_process();
+    for (key, value) in llm::merge_dotenv(&text, &current) {
+        if current.get(&key) != Some(&value) {
             std::env::set_var(key, value);
         }
     }
