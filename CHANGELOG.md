@@ -9,6 +9,8 @@ added only when the corresponding PR is merged to `main`.
 
 - **Refresh rotation upgrade:** Run `vibe migrate` before `vibe serve` after upgrading. Reservation columns are added per tenant by migration. A request presenting a token while an earlier request for it is in progress returns a retryable 503 `TX_CONFLICT` without clearing cookies; after it completes, a presentation within the 10-second grace window follows the grace rule, and later presentations are treated as reuse and revoke the family; database/pool timeouts return 504 `TX_TIMEOUT`. Reservations without a committed child are cleared, leaving the presented token current and allowing a retry.
 
+- **LLM error details:** Error messages show provider error codes, Responses API incomplete reasons and expected/reported model names only when they are known allowlisted values; other values appear as `unknown`. Provider message text and response bodies are still never shown.
+
 ### Upcoming (advance notice)
 
 - **Refresh 家族限流（決定 147，文件更新）：** 超過上限會要求重新登入。

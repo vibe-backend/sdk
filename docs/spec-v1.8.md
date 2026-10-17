@@ -666,7 +666,7 @@ v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`（決定 57�
 
 #### 2A.8.5 Key 保護
 
-- Key 永遠唔可以出現喺 repo、source、lock、manifest、log、部署報告、PR 留言或者錯誤訊息；錯誤訊息可以講「`LLM_API_KEY` 無效或者缺少」，亦可以提供 network／DNS／TLS 原因、HTTP status 同 endpoint host／URL（secret query 值一定要遮蔽），但永遠唔可以包含 key、request headers 或者 response body。
+- Key 永遠唔可以出現喺 repo、source、lock、manifest、log、部署報告、PR 留言或者錯誤訊息；錯誤訊息可以講「`LLM_API_KEY` 無效或者缺少」，亦可以提供 network／DNS／TLS 原因、HTTP status 同 endpoint host／URL（secret query 值一定要遮蔽），但永遠唔可以包含 key、request headers 或者 response body。錯誤訊息可以顯示硬編碼允許清單入面嘅已知值（model 名、provider error code、Responses API incomplete reason）；唔喺清單入面嘅值一律顯示做 `unknown`，自由文字同 response body 永遠唔會顯示。
 - 編譯器同 CLI 輸出 log 前會遮蔽 key（同第 9 節 token／secret 規則一致）。
 - CI 用 secret scanning 掃 repo、lock、manifest、部署報告同 CI log；發現疑似 key（包括 `LLM_API_KEY`／`OPENAI_API_KEY` 嘅實際值）即刻 fail build。
 - CI 用 GitHub Actions secrets 提供變數：release job 用 `release` environment secret `VIBE_LLM_API_KEY`；PR CI 用另一條 `VIBE_LLM_API_KEY_PREVIEW`（決定 118）。fork 嚟嘅 PR 攞唔到 secret，只跑驗證器，唔編譯。
