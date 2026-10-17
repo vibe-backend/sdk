@@ -157,9 +157,11 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 
 - **Never commit the key**: not in repo, source, lock, manifest, logs, deploy reports, PR comments or error messages; errors may only say "`LLM_API_KEY` is invalid or missing" (§2A.8.5). CI secret-scans repo, locks, manifest, deploy reports and CI logs and fails the build on a suspected key.
 - `.env` must be gitignored; removing it from `.gitignore` or changing CI secret usage is CODEOWNERS-protected (§2A.8.5, §9B).
-- Runtime must not have any `LLM_*` or `OPENAI_*` variable; deployment fails if it does (§2A.8.5).
+- Outside development, runtime environments must contain no `LLM_*` or `OPENAI_*` variables; in development, serve warns and removes them before startup (§2A.8.5).
 - **Sandbox**: the compiler's network egress is limited to the endpoint host; no tools, function calling or streaming; no secret other than `LLM_API_KEY` (§2A.7, §2A.8.6).
 - CI and production compiles require `https://` with a public host; loopback, private hosts or `LLM_ALLOW_PRIVATE_HOST=true` in CI are errors (§2A.8.4).
+- `LLM_ALLOW_PRIVATE_HOST=true` also permits named hosts that resolve to non-public addresses, such as fake-IP DNS proxies, for local development only. These compiles record `endpoint-private: true`, even for public-looking names. Public hostnames still require HTTPS. CI and production refuse this flag.
+- For local testing of private-endpoint locks, use `vibe validate --deploy --dev` and `vibe manifest --dev`. Approval, signatures and other checks still apply. Both flags are refused in CI and production. Dev manifests are signed with `build_mode: "dev"` and `vibe serve` accepts them only in development (including `--memory`); release manifests cannot contain private-endpoint locks.
 - Changing provider, endpoint host or model is a **major** change: all locks recompile and natural/security-touching locks need re-approval. Changing only the base URL path is not major, but the CI determinism check must still pass (§2A.8.7).
 
 ## Spec gaps

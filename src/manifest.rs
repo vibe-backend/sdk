@@ -17,8 +17,17 @@ use crate::validate::{self, ValidateOptions};
 pub const MANIFEST_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildMode {
+    Dev,
+    Release,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
     pub manifest_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_mode: Option<BuildMode>,
     pub routes: Vec<RouteSpec>,
     pub models: Vec<ModelSpec>,
     pub methods: Vec<MethodSpec>,
@@ -452,14 +461,23 @@ pub struct MigrationSpec {
 }
 
 pub fn manifest_from_project(root: &Path, signing_key: &SigningKey) -> Result<Manifest, Report> {
+    manifest_from_project_with_mode(root, signing_key, false)
+}
+
+pub fn manifest_from_project_with_mode(
+    root: &Path,
+    signing_key: &SigningKey,
+    dev: bool,
+) -> Result<Manifest, Report> {
     let verify = signing_key.verifying_key();
     validate::validate_project(&ValidateOptions {
+        dev,
         root,
         deploy: true,
         verify_key: Some(&verify),
     })?;
     let docs = load_docs(root)?;
-    let mut manifest = build_manifest(&docs)?;
+    let mut manifest = build_manifest_with_mode(&docs, dev)?;
     manifest.signature = String::new();
     let bytes =
         serde_json::to_vec(&manifest).map_err(|err| single(format!("manifest json: {err}")))?;
@@ -490,6 +508,18 @@ pub fn read_manifest(path: &Path, key: &VerifyingKey) -> Result<Manifest, Report
 }
 
 pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Report> {
+    build_manifest_with_mode(docs, false)
+}
+
+pub fn build_manifest_with_mode(
+    docs: &HashMap<String, LockDoc>,
+    dev: bool,
+) -> Result<Manifest, Report> {
+    if !dev && docs.values().any(|doc| doc.meta.compiler.endpoint_private) {
+        return Err(single(
+            "locks compiled against a private endpoint cannot be deployed".into(),
+        ));
+    }
     let mut report = Report::new();
     let mut models = Vec::new();
     let mut methods = Vec::new();
@@ -546,6 +576,7 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
     }
     Ok(Manifest {
         manifest_version: MANIFEST_VERSION,
+        build_mode: dev.then_some(BuildMode::Dev),
         routes,
         models,
         methods,
@@ -909,6 +940,20 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         .map(validate::parse_bytes)
         .unwrap_or(1_048_576);
     let transform = find_section(&doc.sections, "Transform");
+    let transform_expr = |key: &str, default: &str| -> Result<String, Diag> {
+        let expr = transform.and_then(|s| s.get(key)).unwrap_or(default);
+        let expr = if expr.trim() == "(none)" {
+            default
+        } else {
+            expr
+        };
+        crate::runtime::check_expr(expr).map_err(|err| {
+            Diag::error(&doc.meta.id, format!("transform {key}: {err}")).at_section("Transform")
+        })?;
+        Ok(expr.to_string())
+    };
+    let transform_in = transform_expr("in", "{}")?;
+    let transform_out = transform_expr("out", "result")?;
     let (challenge_type, challenge_when) =
         parse_challenge(access.and_then(|s| s.get("challenge")).unwrap_or(""));
     let min_response_ms = access
@@ -932,14 +977,8 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         rates,
         body_limit,
         request: request_fields(find_section(&doc.sections, "Request")),
-        transform_in: transform
-            .and_then(|s| s.get("in"))
-            .unwrap_or("")
-            .to_string(),
-        transform_out: transform
-            .and_then(|s| s.get("out"))
-            .unwrap_or("result")
-            .to_string(),
+        transform_in,
+        transform_out,
         steps: steps_from(find_section(&doc.sections, "Steps"), &doc.meta.id)?,
         errors: error_rows(find_section(&doc.sections, "Errors")),
         min_response_ms,
@@ -1031,6 +1070,26 @@ fn steps_from(section: Option<&crate::lock::Section>, file: &str) -> Result<Vec<
                 .unwrap_or_default()
         };
         let op = get("op");
+        let expression_key = match op.as_str() {
+            "method" if !get("args").is_empty() => Some("args"),
+            "respond" if !get("value").is_empty() => Some("value"),
+            _ => None,
+        };
+        if let Some(key) = expression_key {
+            crate::runtime::check_expr(&get(key)).map_err(|err| {
+                Diag::error(file, format!("{key}: {err}"))
+                    .at_step(&block.heading)
+                    .at_section("Steps")
+            })?;
+        }
+        if let Some(problem) = validate::op_expression_problems(block, &op)
+            .into_iter()
+            .next()
+        {
+            return Err(Diag::error(file, problem)
+                .at_step(&block.heading)
+                .at_section("Steps"));
+        }
         let id = block
             .heading
             .split_whitespace()
@@ -1608,5 +1667,157 @@ mod refresh_tests {
                 .unwrap()
                 .contains("no sign-jwt step")
         );
+    }
+}
+
+#[cfg(test)]
+mod constant_response_tests {
+    use super::*;
+    use crate::runtime::{router, AppState, AuthConfig, MemoryExec, Slug};
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    #[test]
+    fn malformed_transform_bullets_cannot_build() {
+        for key in ["in", "out"] {
+            for expr in ["", "{a: }"] {
+                let doc = LockDoc {
+                    meta: crate::lock::Meta::pending(Kind::Api, Some(Scope::Feature), "hello", "hello.md"),
+                    sections: crate::lock::parse_sections(&format!("## Route\n- method: GET\n- path: /hello\n## Access\n- public: true\n## Pipelines\n### -auth\n## Transform\n- {key}: {expr}\n")).unwrap(),
+                };
+                let err = route_from(&doc, &HashMap::new()).unwrap_err();
+                assert!(
+                    err.message.contains(&format!("transform {key}:")),
+                    "{err:?}"
+                );
+                if expr.is_empty() {
+                    assert!(err.message.contains("empty expression"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn public_constant_response_without_transform() {
+        for transform in [
+            "",
+            "## Transform
+",
+            "## Transform
+
+(none)
+",
+            "## Transform\n- in: (none)\n- out: (none)\n",
+        ] {
+            for (value, expected, status) in [
+                (
+                    r#"{"message": "hello world"}"#,
+                    r#"{"message":"hello world"}"#,
+                    StatusCode::OK,
+                ),
+                ("", "null", StatusCode::OK),
+                ("transform.out", "null", StatusCode::OK),
+                ("input", "{}", StatusCode::OK),
+                ("{message: }", "", StatusCode::INTERNAL_SERVER_ERROR),
+            ] {
+                let body = format!(
+                    "## Route
+- method: GET
+- path: /hello/v1/{{slug}}/greet
+
+## Access
+- public: true
+
+## Pipelines
+### -auth
+
+{transform}
+## Steps
+### reply
+- op: respond
+- value: {value}
+- status: 200
+"
+                );
+                let doc = LockDoc {
+                    meta: crate::lock::Meta::pending(
+                        Kind::Api,
+                        Some(Scope::Feature),
+                        "api/hello/v1/greet/greet",
+                        "hello.md",
+                    ),
+                    sections: crate::lock::parse_sections(&body).unwrap(),
+                };
+                let mut build_doc = doc.clone();
+                if status == StatusCode::INTERNAL_SERVER_ERROR {
+                    assert!(route_from(&doc, &HashMap::new()).is_err());
+                    build_doc
+                        .sections
+                        .iter_mut()
+                        .find(|s| s.name == "Steps")
+                        .unwrap()
+                        .blocks[0]
+                        .bullets
+                        .iter_mut()
+                        .find(|b| b.key == "value")
+                        .unwrap()
+                        .value = "transform.out".into();
+                }
+                let mut route = route_from(&build_doc, &HashMap::new()).unwrap();
+                if status == StatusCode::INTERNAL_SERVER_ERROR {
+                    route.transform_out = "{message: }".into();
+                }
+                assert_eq!(route.transform_in, "{}");
+                let manifest = Manifest {
+                    build_mode: None,
+                    manifest_version: MANIFEST_VERSION,
+                    routes: vec![route],
+                    models: vec![],
+                    methods: vec![],
+                    migrations: vec![],
+                    signature: String::new(),
+                };
+                let state = Arc::new(AppState {
+                    manifest,
+                    exec: Arc::new(MemoryExec::new()),
+                    auth: AuthConfig::anonymous(),
+                    slugs: HashMap::from([(
+                        "testslug".into(),
+                        Slug {
+                            tenant_id: "tenant0001".into(),
+                            public_access: true,
+                            public_write: false,
+                        },
+                    )]),
+                    rates: Mutex::new(Default::default()),
+                    quotas: Mutex::new(Default::default()),
+                    disabled: Default::default(),
+                    min_override_ms: Some(0),
+                    honor_test_ip: true,
+                    trusted_proxies: vec![],
+                    dev_hints: true,
+                    challenge: None,
+                });
+                let response = router(state)
+                    .oneshot(
+                        Request::builder()
+                            .uri("/hello/v1/testslug/greet")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status, "{transform:?} {value}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                if status == StatusCode::OK {
+                    assert_eq!(body.as_ref(), expected.as_bytes());
+                } else {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert!(body.to_string().contains("INTERNAL"));
+                }
+            }
+        }
     }
 }

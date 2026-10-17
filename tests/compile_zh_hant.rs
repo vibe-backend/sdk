@@ -218,6 +218,7 @@ async fn zh_hant_sample_shop_compiles_and_validates() {
         .iter()
         .any(|i| i.item == "write-sql"));
     validate_project(&ValidateOptions {
+        dev: false,
         root: &root,
         deploy: false,
         verify_key: None,
@@ -358,6 +359,7 @@ async fn chinese_left_in_translation_is_not_an_error() {
     .unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(out.files.len(), 7, "{:?}", out.files);
     validate_project(&ValidateOptions {
+        dev: false,
         root: &root,
         deploy: false,
         verify_key: None,

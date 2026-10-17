@@ -30,7 +30,6 @@ pub struct CompileOutput {
 pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, Report> {
     let sources = discover::discover(opts.root)?;
     let mut report = Report::new();
-    let stamp = stamp_from(opts.llm_config);
     let mut docs: HashMap<String, LockDoc> = HashMap::new();
     let mut ordered: Vec<String> = Vec::new();
     // Translation audit text, never used to authorize security claims.
@@ -79,6 +78,7 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
             continue;
         }
         let structured = is_structured_source(&source.combined_text());
+        let stamp = stamp_from(if structured { None } else { opts.llm_config });
         if !structured && opts.llm.is_none() {
             report.push(Diag::error(
                 &source.rel,
@@ -213,9 +213,12 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                 continue;
             }
         };
+        // Same extraction as `vibe validate` (check_security_items_enriched):
+        // a feature that calls a writing method gets write-sql too.
+        let mut items = security::extract_items(&docs[id]);
+        security::enrich_feature_writes(&docs[id], &docs, &mut items);
         let doc = docs.get_mut(id).expect("doc inserted");
         doc.meta.dependencies = deps;
-        let mut items = security::extract_items(doc);
         if doc
             .meta
             .security_items
@@ -1386,6 +1389,9 @@ fn normalize_feature(
         def.and_then(|doc| find_section(&doc.sections, "Pipelines")),
         ver.and_then(|doc| find_section(&doc.sections, "Pipelines")),
         own.as_ref(),
+        source_frontmatter(&source.text).iter().any(|(key, value)| {
+            key == "auth" && matches!(value.as_str(), "none" | "removed" | "false" | "off")
+        }),
     );
     if let Some(section) = find_section_mut(&mut doc.sections, "Pipelines") {
         *section = merged;
@@ -1462,6 +1468,7 @@ fn normalize_feature(
             none: false,
         });
     }
+    ensure_transform(doc);
     let order = crate::lock::section_order(Kind::Api, Some(Scope::Feature));
     for name in order {
         if find_section(&doc.sections, name).is_none() {
@@ -1485,7 +1492,12 @@ fn inherited_default(def: Option<&LockDoc>, ver: Option<&LockDoc>, key: &str) ->
     from(ver).or_else(|| from(def))
 }
 
-fn merge_pipelines(def: Option<&Section>, ver: Option<&Section>, own: Option<&Section>) -> Section {
+fn merge_pipelines(
+    def: Option<&Section>,
+    ver: Option<&Section>,
+    own: Option<&Section>,
+    disable_auth: bool,
+) -> Section {
     let mut blocks: Vec<Block> = Vec::new();
     let mut removed_auth = false;
     for source in [def, ver, own].into_iter().flatten() {
@@ -1518,6 +1530,21 @@ fn merge_pipelines(def: Option<&Section>, ver: Option<&Section>, own: Option<&Se
             }
         }
     }
+    // The source declaration wins over inherited and model-emitted auth.
+    if disable_auth {
+        blocks.retain(|block| !matches!(pipeline_name(&block.heading).as_str(), "auth" | "-auth"));
+        blocks.insert(
+            0,
+            Block {
+                heading: "-auth".into(),
+                bullets: vec![Bullet {
+                    key: "removed".into(),
+                    value: "true".into(),
+                }],
+            },
+        );
+        removed_auth = true;
+    }
     let has_auth = blocks
         .iter()
         .any(|block| pipeline_name(&block.heading) == "auth");
@@ -1535,7 +1562,11 @@ fn merge_pipelines(def: Option<&Section>, ver: Option<&Section>, own: Option<&Se
     }
     for (index, block) in blocks.iter_mut().enumerate() {
         let name = pipeline_name(&block.heading);
-        block.heading = format!("p{} {name}", index + 1);
+        block.heading = if disable_auth && name == "-auth" {
+            name
+        } else {
+            format!("p{} {name}", index + 1)
+        };
     }
     let none = blocks.is_empty();
     Section {
@@ -1551,7 +1582,23 @@ fn ensure_order(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Diag>>
     reorder(doc, source)
 }
 
+fn ensure_transform(doc: &mut LockDoc) {
+    if doc.meta.kind == Kind::Api
+        && doc.meta.scope == Some(Scope::Feature)
+        && find_section(&doc.sections, "Transform").is_none()
+    {
+        doc.sections.push(Section {
+            name: "Transform".into(),
+            bullets: Vec::new(),
+            table: None,
+            blocks: Vec::new(),
+            none: true,
+        });
+    }
+}
+
 fn reorder(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Diag>> {
+    ensure_transform(doc);
     let order = crate::lock::section_order(source.kind, source.scope);
     for name in order {
         if find_section(&doc.sections, name).is_none() {
@@ -1742,7 +1789,7 @@ fn semantic_check(
         ("public", &["public", "公開"][..]),
         (
             "auth",
-            &["login", "auth", "authentication", "登入", "驗證"][..],
+            &["login", "log in", "auth", "authentication", "登入", "驗證"][..],
         ),
         ("writes", WRITE_WORDS),
         ("secrets", SECRET_WORDS),
@@ -2076,6 +2123,7 @@ const SECURITY_TERMS: &[&str] = &[
     "private",
     "公開",
     "login",
+    "log in",
     "auth",
     "authentication",
     "登入",
@@ -2107,6 +2155,22 @@ fn keyword_reading(text: &str, word: &str) -> (bool, bool, bool) {
     (affirmed, ambiguous, negative)
 }
 
+// Fixed auth-removal wording, matched only within the same clause and without
+// another preceding negator. In particular, "not without auth" stays ambiguous.
+const AUTH_REMOVAL_PHRASES: &[&str] = &[
+    "唔需要登入",
+    "不需要登入",
+    "免登入",
+    "移除 auth",
+    "唔使 auth",
+    "no auth",
+    "remove auth",
+    "auth removed",
+    "no login required",
+    "does not require login",
+    "without auth",
+];
+
 /// Returns requirement presence, ambiguity, direct negation, and unambiguous affirmation.
 fn keyword_occurrences(text: &str, word: &str) -> (bool, bool, bool, bool) {
     static NEGATOR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -2127,6 +2191,34 @@ fn keyword_occurrences(text: &str, word: &str) -> (bool, bool, bool, bool) {
             || word.ends_with(|c: char| c.is_ascii_alphanumeric())
                 && text[end..].chars().next().is_some_and(boundary)
         {
+            continue;
+        }
+        if matches!(word, "auth" | "authentication" | "login" | "登入" | "驗證")
+            && AUTH_REMOVAL_PHRASES.iter().any(|phrase| {
+                text.match_indices(phrase).any(|(start, matched)| {
+                    let finish = start + matched.len();
+                    let boundary = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+                    if start > at
+                        || finish < end
+                        || matched.starts_with(|c: char| c.is_ascii_alphanumeric())
+                            && text[..start].chars().next_back().is_some_and(boundary)
+                        || matched.ends_with(|c: char| c.is_ascii_alphanumeric())
+                            && text[finish..].chars().next().is_some_and(boundary)
+                    {
+                        return false;
+                    }
+                    let prefix = text[..start]
+                        .rsplit([
+                            ',', '.', ';', ':', '!', '?', '、', '，', '。', '；', '：', '！', '？',
+                            '\n', '\r', '\u{1e}',
+                        ])
+                        .next()
+                        .unwrap_or("");
+                    !NEGATOR.is_match(prefix)
+                })
+            })
+        {
+            negative = true;
             continue;
         }
         // A requirement followed by negation is not a direct prefix negation.
@@ -2488,7 +2580,7 @@ mod pipeline_tests {
             ],
             none: false,
         };
-        let merged = merge_pipelines(None, None, Some(&own));
+        let merged = merge_pipelines(None, None, Some(&own), false);
         let rates: Vec<_> = merged
             .blocks
             .iter()
@@ -2658,6 +2750,9 @@ mod prompt_tests {
             )
             .unwrap();
         }
+        let api = dir.join("api/catalog/v1/example-get/example-get.md");
+        let text = std::fs::read_to_string(&api).unwrap();
+        std::fs::write(&api, text.replace("## Transform\n", "")).unwrap();
         let opts = super::CompileOptions {
             root: &dir,
             llm: None,
@@ -2667,7 +2762,24 @@ mod prompt_tests {
         if let Err(report) = super::compile_project(&opts).await {
             panic!("compile: {:?}", report.diags);
         }
+        let lock_path = api.with_extension("lock.md");
+        let lock_text = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(lock_text.contains("## Transform\n(none)"), "{lock_text}");
+        let mut lock = parse_lock(&lock_text).unwrap();
+        crate::manifest::build_manifest(&std::collections::HashMap::from([(
+            lock.meta.id.clone(),
+            lock.clone(),
+        )]))
+        .unwrap();
+        lock.sections.retain(|s| s.name != "Transform");
+        crate::manifest::build_manifest(&std::collections::HashMap::from([(
+            lock.meta.id.clone(),
+            lock.clone(),
+        )]))
+        .unwrap();
+        std::fs::write(&lock_path, crate::lock::render_lock(&lock)).unwrap();
         let report = match crate::validate::validate_project(&crate::validate::ValidateOptions {
+            dev: false,
             root: &dir,
             deploy: false,
             verify_key: None,
@@ -2870,17 +2982,16 @@ mod security_tests {
     }
 
     #[test]
-    fn does_not_require_login_is_confirmed_via_auth_frontmatter() {
+    fn recognized_login_removal_conflicts_with_required_auth() {
         let text = "---\npublic: false\nauth: jwt\n---\ndoes not require login";
         let (doc, sources) = feature(text, PRIVATE);
         let mut report = Report::new();
         semantic_check(&doc, &sources, &HashMap::new(), &mut report);
-        assert!(!report.has_errors(), "{report}");
-        assert!(report
-            .to_string()
-            .contains("confirm with the structured `auth`"));
+        assert!(report.has_errors(), "{report}");
+        assert!(report.to_string().contains("conflicts with source wording"));
+        assert!(!report.to_string().contains("ambiguous negation"));
         assert!(keyword_reading("login not required", "login").1);
-        assert!(keyword_reading("唔需要登入", "登入").1);
+        assert_eq!(keyword_reading("唔需要登入", "登入"), (false, false, true));
         for text in ["不得不公開", "唔可以唔公開", "不能不公開", "非公開不可"]
         {
             assert_eq!(keyword_reading(text, "公開"), (true, true, false), "{text}");

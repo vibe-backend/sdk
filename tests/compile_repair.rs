@@ -125,6 +125,7 @@ async fn model_prompt_example_passes_the_validator() {
     .await
     .unwrap_or_else(|err| panic!("{err}"));
     let report = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+        dev: false,
         root: &root,
         deploy: false,
         verify_key: None,

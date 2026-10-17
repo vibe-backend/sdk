@@ -261,3 +261,146 @@ fn development_allows_after_failures_challenge_lock() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn dev_flags_are_refused_in_ci_and_production() {
+    for env in ["CI", "GITHUB_ACTIONS", "VIBE_ENV"] {
+        for args in [
+            vec!["validate", "--deploy", "--dev"],
+            vec!["manifest", "--dev"],
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_vibe"))
+                .env_clear()
+                .env(
+                    env,
+                    if env == "VIBE_ENV" {
+                        "production"
+                    } else {
+                        "true"
+                    },
+                )
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("--dev is for local development and is refused in CI and production"));
+        }
+    }
+}
+
+#[test]
+fn signed_dev_manifest_starts_with_memory_in_development() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let root = std::env::temp_dir().join(format!("vibe-dev-serve-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let key = vibe::sign::load_or_create(&root).unwrap();
+    let manifest = vibe::manifest::manifest_from_project_with_mode(&root, &key, true).unwrap();
+    let path = root.join("dev.json");
+    vibe::manifest::write_manifest(&path, &manifest).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    std::fs::write(root.join(".env"), "OPENAI_API_KEY=dotenv-private-value\n").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vibe"))
+        .env_clear()
+        .env("VIBE_ENV", "development")
+        .env("LLM_API_KEY", "private-key-value")
+        .env("LLM_BASE_URL", "https://private-url-value.example")
+        .args(["serve", "--memory", "--addr", &addr, "--project"])
+        .arg(&root)
+        .arg("--manifest")
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        sender.send(BufReader::new(stdout).lines().next()).unwrap();
+    });
+    let line = receiver.recv_timeout(std::time::Duration::from_secs(10));
+    let served = if line.is_ok() {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response.starts_with("HTTP/1.1 ")
+    } else {
+        false
+    };
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(served);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning: removing compile-time variables"));
+    for name in ["LLM_API_KEY", "LLM_BASE_URL", "OPENAI_API_KEY"] {
+        assert!(stderr.contains(name), "{stderr}");
+    }
+    for value in [
+        "private-key-value",
+        "private-url-value",
+        "dotenv-private-value",
+    ] {
+        assert!(!stderr.contains(value), "{stderr}");
+    }
+
+    assert!(
+        matches!(line, Ok(Some(Ok(ref line))) if line.contains("listening on")),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn production_and_unset_postgres_refuse_llm_env() {
+    for envs in [
+        vec![
+            ("VIBE_ENV", "production"),
+            ("LLM_API_KEY", "private-key-value"),
+        ],
+        vec![("LLM_API_KEY", "private-key-value")],
+    ] {
+        let (ok, err) = serve(&envs, false);
+        assert!(!ok);
+        assert!(
+            err.contains("runtime environment must not contain LLM_API_KEY"),
+            "{err}"
+        );
+        assert!(!err.contains("private-key-value"));
+    }
+}
+
+// Run environment mutation in a dedicated process, isolated from parallel tests.
+#[test]
+fn strip_removes_runtime_credentials() {
+    if std::env::var_os("VIBE_STRIP_TEST_CHILD").is_some() {
+        let names = vibe::llm::strip_runtime_llm_env();
+        assert_eq!(names.len(), 3);
+        for name in ["LLM_API_KEY", "LLM_BASE_URL", "OPENAI_API_KEY"] {
+            assert!(std::env::var_os(name).is_none());
+        }
+        assert_eq!(std::env::var("KEEP_ME").unwrap(), "retained");
+        return;
+    }
+    let status = Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("VIBE_STRIP_TEST_CHILD", "1")
+        .env("LLM_API_KEY", "secret")
+        .env("LLM_BASE_URL", "")
+        .env("OPENAI_API_KEY", "secret")
+        .env("KEEP_ME", "retained")
+        .args(["--exact", "strip_removes_runtime_credentials"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}

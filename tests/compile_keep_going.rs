@@ -120,6 +120,7 @@ async fn any_failure_leaves_official_locks_untouched_and_caches_successes() {
     }
     // Cached output still goes through the full validator.
     validate_project(&ValidateOptions {
+        dev: false,
         root: &root,
         deploy: false,
         verify_key: None,

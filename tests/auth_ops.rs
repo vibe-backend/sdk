@@ -1196,6 +1196,8 @@ async fn sign_jwt_sub_follows_the_claims_source_rules() {
         "{ sub: input.sub }",
         "{ sub: ctx.user.sub }",
         "{ sub: 'u1' }",
+        r#"{ sub: "admin" }"#,
+        r#"{ sub: "u.id" }"#,
     ] {
         let m = method_manifest(&["sign-token"], sign_steps(json!({"claims": claims})));
         let err = run(&m, &users(), json!({"sub": "u1"})).await.unwrap_err();
