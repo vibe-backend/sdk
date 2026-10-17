@@ -35,6 +35,7 @@
 - Challenge provider（issue #160，已確認（產品經理 2026-10-16））：決定 131–138，v1 用 Cloudflare Turnstile（server 端 siteverify、production 共用 Postgres replay store（#177）、`type: pow` build error、fail closed、錯誤碼、secret 處理、同限流組合、固定數值、已認證 endpoint opt-in、provider 抽象），見 0.12、7.2a。
 - Challenge 綁定 request digest（決定 140，issue #156）：已確認（產品經理 2026-10-16），token 經 Turnstile `cdata` 綁定 request digest（完整長度，涵蓋 method、path、query、body、`Content-Type`、`If-Match`；包括 login route），session 綁定留到 vNext；`bind: none` v1 出 warning，下一個 minor 起新 public INSERT route 禁用（#245）；未實作（見 0.12、7.2b）；演算法修正（per-request nonce、query raw `+` 無效）已確認（產品經理 2026-10-16）。檢查次序同 nonce／token 單一交易（#258）已確認（產品經理 2026-10-16 12:44 HKT）。
 - Refresh cookie 補充（issue #78，已確認（產品經理 2026-10-16））：決定 141–148（cookie 模式 login、對外錯誤一致、`Max-Age`、CSRF 次序、cookie logout、access token 預設 TTL、錯誤碼、向後相容），喺決定 6、45、60、61、65、72、101 之上補充，見 0.11、4A.1b；實作狀態見 4A.1b。
+- 決定 150–168（pattern library，v1.1 草稿）喺 [`spec-pattern-library-v1.1.md`](spec-pattern-library-v1.1.md)，唔阻擋 v1 blocker；新決定編號唔好同呢段撞。
 
 ### v1.7（定稿）
 
