@@ -1597,10 +1597,10 @@ error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-re
 (none)
 ```
 
-`api/auth/v1/session/session.md`（要 JWT；呼叫 `user.record-session`）
+`api/auth/v1/session/session.md`（要 JWT；呼叫 `user.record-session`。標題要提到寫入：compile 嘅 semantic check 要求有 `write-sql` 嘅 source 提到 write／update 等字）
 
 ```markdown
-# session
+# session (writes users.last_device through user.record-session)
 
 ## Route
 

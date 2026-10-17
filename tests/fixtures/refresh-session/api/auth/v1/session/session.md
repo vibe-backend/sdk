@@ -1,4 +1,4 @@
-# session
+# session (writes users.last_device through user.record-session)
 
 ## Route
 
