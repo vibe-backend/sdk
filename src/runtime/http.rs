@@ -1327,6 +1327,11 @@ fn verify_jwt(
     validation.validate_nbf = true;
     let data = jsonwebtoken::decode::<Claims>(token, key, &validation)
         .map_err(|_| AuthError::unauthorized("Bearer"))?;
+    // A token issued in the future would otherwise pass the lifetime check
+    // below with an `exp` far ahead; refuse it beyond the same leeway.
+    if data.claims.iat > chrono::Utc::now().timestamp() + 60 {
+        return Err(AuthError::unauthorized("Bearer"));
+    }
     if data.claims.exp.saturating_sub(data.claims.iat) > 3600 {
         return Err(AuthError::unauthorized("Bearer"));
     }
@@ -2780,6 +2785,84 @@ Q0UxBzbmJ2wI9FMVJLw4XEhuIJFqIdA/P6b6ozSNGyOUZK7OjIfGKtpNYw==\n\
             jsonwebtoken::encode(&hs, &claims, &EncodingKey::from_secret(b"not-the-jwks-key"))
                 .unwrap();
         assert!(authenticate(&auth, &r, &bearer(&hs_token)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn jwt_rejects_bad_time_claims_unsigned_and_overlong_tokens() {
+        use base64::Engine as _;
+        let auth = jwks_auth();
+        let r = route(json!({}));
+        let now = chrono::Utc::now().timestamp();
+        // Baseline: the helper token is accepted, so each rejection below is
+        // caused by the one claim it changes.
+        assert!(authenticate(&auth, &r, &bearer(&token("k1", json!({}))))
+            .await
+            .is_ok());
+        // Small clock skew stays inside the leeway.
+        assert!(
+            authenticate(&auth, &r, &bearer(&token("k1", json!({"nbf": now + 30}))))
+                .await
+                .is_ok()
+        );
+        for (why, extra) in [
+            (
+                "nbf in the future",
+                json!({"nbf": now + 600, "exp": now + 1200}),
+            ),
+            (
+                "expired beyond leeway",
+                json!({"iat": now - 900, "nbf": now - 900, "exp": now - 61}),
+            ),
+            (
+                "lifetime over one hour",
+                json!({"iat": now - 60, "nbf": now - 60, "exp": now + 3600}),
+            ),
+            (
+                "iat in the future",
+                json!({"iat": now + 3000, "nbf": null, "exp": now + 3600}),
+            ),
+            ("missing exp", json!({"exp": null})),
+            ("missing iat", json!({"iat": null})),
+            ("missing sub", json!({"sub": null})),
+            ("missing tenant", json!({"tenant_id": null})),
+            ("missing aud", json!({"aud": null})),
+            ("missing iss", json!({"iss": null})),
+        ] {
+            let mut t = token("k1", extra);
+            // `null` in the patch means "drop the claim": re-encode without it.
+            let parts: Vec<&str> = t.split('.').collect();
+            let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let mut claims: Value =
+                serde_json::from_slice(&engine.decode(parts[1]).unwrap()).unwrap();
+            let had_null = claims.as_object().unwrap().values().any(|v| v.is_null());
+            if had_null {
+                claims.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+                let mut header = Header::new(Algorithm::ES256);
+                header.kid = Some("k1".into());
+                t = jsonwebtoken::encode(
+                    &header,
+                    &claims,
+                    &EncodingKey::from_ec_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+                )
+                .unwrap();
+            }
+            assert!(
+                authenticate(&auth, &r, &bearer(&t)).await.is_err(),
+                "{why} must be rejected"
+            );
+        }
+        // Unsigned token (alg none) and a token with its signature stripped.
+        let good = token("k1", json!({}));
+        let parts: Vec<&str> = good.split('.').collect();
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let none_header = engine.encode(br#"{"alg":"none","kid":"k1","typ":"JWT"}"#);
+        for t in [
+            format!("{none_header}.{}.", parts[1]),
+            format!("{}.{}.", parts[0], parts[1]),
+            format!("{}.{}", parts[0], parts[1]),
+        ] {
+            assert!(authenticate(&auth, &r, &bearer(&t)).await.is_err());
+        }
     }
 
     #[tokio::test]
