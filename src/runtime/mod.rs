@@ -60,3 +60,29 @@ pub fn internal_metrics() -> String {
     }
     output
 }
+
+/// Platform error codes that may reach API clients.
+pub const RUNTIME_ERROR_CODES: &[&str] = &[
+    "BAD_REQUEST",
+    "CHALLENGE_FAILED",
+    "CHALLENGE_REQUIRED",
+    "CHALLENGE_UNAVAILABLE",
+    "ENDPOINT_DISABLED",
+    "FORBIDDEN",
+    "INTERNAL",
+    "INVALID_REFRESH_TOKEN",
+    "METHOD_NOT_ALLOWED",
+    "NOT_FOUND",
+    "PAYLOAD_TOO_LARGE",
+    "PRECONDITION_FAILED",
+    "PRECONDITION_REQUIRED",
+    "RATE_LIMITED",
+    "SERVICE_UNAVAILABLE",
+    "TX_CONFLICT",
+    "TX_TIMEOUT",
+    "UNAUTHORIZED",
+    "UNIQUE_VIOLATION",
+    "UNSUPPORTED_MEDIA_TYPE",
+    "VALIDATION_FAILED",
+    "WEAK_PASSWORD",
+];

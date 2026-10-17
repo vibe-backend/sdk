@@ -266,8 +266,8 @@ signature: MEYCIQ...
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 422 | VALIDATION_FAILED | platform |
-| 429 | QUOTA_EXCEEDED | platform |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
+| 429 | RATE_LIMITED | RATE_LIMITED |
 ````
 
 `api/auth/v1/verify-email/verify-email.lock.md`（只列 `## Access` 和 `## Errors`；安全項目 `public`、`auth-removed`、`public-writes`、`password-write`、`verification-write`，均為高風險，剛好是每個 PR 5 項的上限）
@@ -291,10 +291,10 @@ signature: MEYCIQ...
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 422 | WEAK_PASSWORD | user.complete-verification |
-| 422 | INVALID_TOKEN | user.complete-verification |
-| 422 | VALIDATION_FAILED | platform |
-| 429 | QUOTA_EXCEEDED | platform |
+| 422 | WEAK_PASSWORD | WEAK_PASSWORD |
+| 422 | INVALID_TOKEN | INVALID_TOKEN |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
+| 429 | RATE_LIMITED | RATE_LIMITED |
 ````
 
 它的 pipelines 為 `-auth`、按 `ip` 每分鐘 10 次的 `rate-limit`、按 `tenant` 每分鐘 120 次的 `rate-limit`，以及 `redact: [req.body.token, req.body.password]` 的 `audit-log`；body 上限 2KB；成功回 204（§12.11.7）。

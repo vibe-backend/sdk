@@ -15,6 +15,22 @@ use crate::lock::{
 use crate::scan;
 use crate::security::{self, pipeline_name};
 
+static SAMPLING_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn sampling_warning(
+    config: &LlmConfig,
+    warned: &std::sync::atomic::AtomicBool,
+) -> Option<&'static str> {
+    let warning = if !config.send_sampling {
+        "LLM_SEND_SAMPLING=0; sampling parameters were not sent"
+    } else if !crate::llm::sampling_registered(&config.provider, &config.model) {
+        "model is not in the capability table; sampling parameters were not sent"
+    } else {
+        return None;
+    };
+    (!warned.swap(true, std::sync::atomic::Ordering::Relaxed)).then_some(warning)
+}
+
 pub struct CompileOptions<'a> {
     pub root: &'a Path,
     pub llm: Option<&'a dyn LlmAdapter>,
@@ -164,8 +180,6 @@ async fn compile_docs(
     let mut ranked = sources.to_vec();
     ranked.sort_by_key(|source| (rank(source), source.rel.clone()));
 
-    // One warning per compile invocation (one invocation per CLI run).
-    let mut sampling_warned = false;
     for source in &ranked {
         // One budget per source: compile, format re-prompts and translation.
         budget.begin_source();
@@ -199,21 +213,8 @@ async fn compile_docs(
         }
         if !structured {
             if let Some(config) = opts.llm_config {
-                if !config.send_sampling && !sampling_warned {
-                    sampling_warned = true;
-                    report.push(Diag::warning(
-                        &source.rel,
-                        "LLM_SEND_SAMPLING=0; sampling parameters were not sent",
-                    ));
-                } else if config.send_sampling
-                    && !sampling_warned
-                    && !crate::llm::sampling_registered(&config.provider, &config.model)
-                {
-                    sampling_warned = true;
-                    report.push(Diag::warning(
-                        &source.rel,
-                        "model is not in the capability table; sampling parameters were not sent",
-                    ));
+                if let Some(warning) = sampling_warning(config, &SAMPLING_WARNED) {
+                    report.push(Diag::warning(&source.rel, warning));
                 }
             }
         }
@@ -364,6 +365,9 @@ async fn compile_docs(
         doc.meta.security_items = items;
         let before = report.errors().count();
         semantic_check(&docs[id], &ranked, &english, &mut report);
+        if let Some(source) = ranked.iter().find(|s| s.id == *id) {
+            crate::validate::check_feature_contract(&docs[id], source, &docs, &mut report);
+        }
         if report.errors().count() > before {
             failed.insert(id.clone());
         } else if let Some((key, text)) = pending_cache.remove(id) {
@@ -604,6 +608,7 @@ fn checked_llm_sections(
             dev: false,
             deploy: false,
         },
+        docs,
         &mut report,
     );
     if report.has_errors() {
@@ -1156,7 +1161,7 @@ pub fn system_prompt(kind: Kind, scope: Option<Scope>) -> String {
     // Examples follow lock::section_order exactly; every step has source-lines.
     let example = match (kind, scope) {
         (Kind::Method, _) => "\n\nEXAMPLE METHOD LOCK BODY:\n## Signature\n- target: product.create\n- writes: true\n- errors: [NOT_FOUND]\n- capabilities: []\n## Calls\n- methods: []\n## Steps\n### s1 query\n- op: query\n- writes: true\n- sql: `INSERT INTO products (id, tenant_id, name) VALUES ($1, $2, $3)`\n- params: [input.id, ctx.user.tenant, input.name]\n- scope: rls\n- out: row\n- source-lines: 3-4\n### s2 respond\n- op: respond\n- value: row\n- source-lines: 5\n",
-        (Kind::Api, Some(Scope::Feature)) => "\n\nEXAMPLE API FEATURE LOCK BODY:\n## Route\n- method: GET\n- path: /catalog/v1/products/{id}\n## Access\n- public: false\n## Pipelines\n### auth\n- mode: jwt\n### rate-limit\n- per-minute: 600\n- key: user\n## Limits\n- provider: main\n- timeout: 10s\n- body: 1MB\n## Request\n| field | type | rules | required |\n| --- | --- | --- | --- |\n| path.id | uuid | - | yes |\n## Response\n- status: 200\n## Transform\n## Steps\n### s1 method\n- op: method\n- target: product.get\n- args: { id: req.path.id }\n- out: row\n- source-lines: 3\n### s2 respond\n- op: respond\n- value: row\n- source-lines: 4\n## Errors\n| status | code | from |\n| --- | --- | --- |\n| 404 | NOT_FOUND | product.get |\n",
+        (Kind::Api, Some(Scope::Feature)) => "\n\nEXAMPLE API FEATURE LOCK BODY:\n## Route\n- method: GET\n- path: /catalog/v1/products/{id}\n## Access\n- public: false\n## Pipelines\n### auth\n- mode: jwt\n### rate-limit\n- per-minute: 600\n- key: user\n## Limits\n- provider: main\n- timeout: 10s\n- body: 1MB\n## Request\n| field | type | rules | required |\n| --- | --- | --- | --- |\n| path.id | uuid | - | yes |\n## Response\n- status: 200\n## Transform\n## Steps\n### s1 method\n- op: method\n- target: product.get\n- args: { id: req.path.id }\n- out: row\n- source-lines: 3\n### s2 respond\n- op: respond\n- value: row\n- source-lines: 4\n## Errors\n| status | code | from |\n| --- | --- | --- |\n| 404 | NOT_FOUND | NOT_FOUND |\n",
         _ => "\n\nPrefer existing method targets from DEPENDENCIES (object.action).\n",
     };
     format!(
@@ -1411,7 +1416,40 @@ fn normalize_provider(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<
     Ok(())
 }
 
+fn plural_table(id: &str) -> String {
+    if id.ends_with('s') {
+        id.to_string()
+    } else if ["x", "z", "ch", "sh"].iter().any(|end| id.ends_with(end)) {
+        format!("{id}es")
+    } else if id.ends_with('y')
+        && id
+            .as_bytes()
+            .iter()
+            .rev()
+            .nth(1)
+            .is_some_and(|c| c.is_ascii_alphabetic() && !b"aeiou".contains(c))
+    {
+        format!("{}ies", &id[..id.len() - 1])
+    } else {
+        format!("{id}s")
+    }
+}
+
 fn normalize_model(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Diag>> {
+    if !is_structured_source(&source.combined_text()) {
+        let id = doc.meta.id.replace('-', "_");
+        let plural = plural_table(&id);
+        if let Some(section) = find_section_mut(&mut doc.sections, "Table") {
+            for bullet in &mut section.bullets {
+                if bullet.key == "table"
+                    && (bullet.value.eq_ignore_ascii_case(&id)
+                        || bullet.value.eq_ignore_ascii_case(&plural))
+                {
+                    bullet.value = plural.clone();
+                }
+            }
+        }
+    }
     let mut diags = Vec::new();
     let fields = find_section(&doc.sections, "Fields").and_then(|section| section.table.clone());
     let Some(table) = fields else {
@@ -1651,6 +1689,7 @@ fn normalize_feature(
     source: &SourceFile,
     docs: &HashMap<String, LockDoc>,
 ) -> Result<(), Vec<Diag>> {
+    normalize_transform(doc, source)?;
     normalize_errors(&mut doc.sections);
     let mut parts = source.id.split('/');
     let definition = parts.next().unwrap_or("");
@@ -2250,9 +2289,50 @@ const AUTH_REMOVAL_WORDS: &[&str] = &[
     "取消驗證",
 ];
 
-const WRITE_WORDS: &[&str] = &[
-    "write", "insert", "update", "create", "delete", "save", "add", "store", "record", "寫入",
-    "新增", "更新", "刪除", "儲存", "加入", "記錄",
+pub(crate) const WRITE_WORDS: &[&str] = &[
+    "write",
+    "insert",
+    "update",
+    "create",
+    "delete",
+    "save",
+    "add",
+    "store",
+    "record",
+    "寫入",
+    "新增",
+    "更新",
+    "刪除",
+    "儲存",
+    "加入",
+    "記錄",
+    "created",
+    "creates",
+    "creating",
+    "inserted",
+    "inserts",
+    "inserting",
+    "updated",
+    "updates",
+    "updating",
+    "deleted",
+    "deletes",
+    "deleting",
+    "saved",
+    "saves",
+    "saving",
+    "added",
+    "adds",
+    "adding",
+    "stored",
+    "stores",
+    "storing",
+    "recorded",
+    "recording",
+    "writes",
+    "writing",
+    "written",
+    "wrote",
 ];
 
 const SECRET_WORDS: &[&str] = &[
@@ -2308,6 +2388,7 @@ fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
 
 /// #37 point 5 (PM-approved; D16 amendment pending in the next spec PR):
 /// natural-language sources must declare high-risk fields in frontmatter.
+/// Decision 169 exempts feature writes, which are checked from method steps.
 /// Fails closed when a declaration disagrees with the lock or the source
 /// text, or when nothing is declared but either shows the behavior.
 fn declaration_check(doc: &LockDoc, source: &SourceFile, english: &str) -> Vec<Diag> {
@@ -2329,7 +2410,6 @@ fn declaration_check(doc: &LockDoc, source: &SourceFile, english: &str) -> Vec<D
                 says(AUTH_REMOVAL_WORDS),
                 "removed",
             ));
-            checks.push(("writes", has_item("write-sql"), false, "true"));
         }
         Kind::Method => {
             let writes = find_section(&doc.sections, "Signature").and_then(|s| s.get("writes"))
@@ -2527,6 +2607,8 @@ const AUTH_REMOVAL_PHRASES: &[&str] = &[
     "no auth",
     "remove auth",
     "auth removed",
+    "auth is removed",
+    "auth removes",
     "no login required",
     "does not require login",
     "without auth",
@@ -3008,8 +3090,8 @@ mod prompt_tests {
         assert_eq!(
             (crate::lock::PROMPT_VERSION, actual.as_str()),
             (
-                "prompt-8",
-                "7232d3d5eb6cfca565efe0dbe3aca15d29cd3443c642368ceb63ce06358456b6"
+                "prompt-9",
+                "47af3b4c401cfa2fe58ddf3acb4d7c4366f420949a8e86e9af35e15451b1006d"
             ),
             "compile prompt changed: bump PROMPT_VERSION and update the recorded hash"
         );
@@ -3017,6 +3099,17 @@ mod prompt_tests {
 
     #[test]
     fn examples_follow_section_order_and_have_source_lines() {
+        for body in [
+            crate::prompt_guide::FEATURE_CREATE_EXAMPLE.to_string(),
+            crate::prompt_guide::feature_list_example(),
+        ] {
+            let heads: Vec<&str> = body.lines().filter_map(|l| l.strip_prefix("## ")).collect();
+            assert_eq!(heads, section_order(Kind::Api, Some(Scope::Feature)));
+            assert_eq!(
+                body.matches("- source-lines:").count(),
+                body.matches("\n### s").count()
+            );
+        }
         for (kind, scope) in [(Kind::Method, None), (Kind::Api, Some(Scope::Feature))] {
             let prompt = system_prompt(kind, scope);
             let body = prompt.split("LOCK BODY:\n").nth(1).expect("example");
@@ -3317,6 +3410,22 @@ mod security_tests {
 
     const PUBLIC: &str = "## Access\n- public: true\n## Pipelines\n### -auth\n- removed: true\n";
     const PRIVATE: &str = "## Access\n- public: false\n## Pipelines\n### auth\n- mode: jwt\n";
+
+    #[test]
+    fn model_created_inflection_permits_write_sql() {
+        for prose in ["Products can be created and listed.", "A product has sku (required, maximum 40 characters) and name (required, maximum 120 characters). Products can be created and listed."] {
+            let (mut doc, mut sources) = feature(prose, "## CRUD\n| method |\n| --- |\n| create |\n");
+            doc.meta.kind = Kind::Model;
+            doc.meta.scope = None;
+            sources[0].kind = Kind::Model;
+            sources[0].scope = None;
+            doc.meta.security_items = security::extract_items(&doc);
+            assert!(doc.meta.security_items.iter().any(|s| s.item == "write-sql"));
+            let mut report = Report::new();
+            semantic_check(&doc, &sources, &HashMap::new(), &mut report);
+            assert!(!report.has_errors(), "{report}");
+        }
+    }
 
     #[test]
     fn structured_auth_confirms_cantonese_removal_and_ambiguity() {
@@ -3865,5 +3974,273 @@ mod stamp_tests {
         let stamp = stamp_from(Some(&config));
         assert_eq!(stamp.llm_provider, "openai");
         assert_eq!(stamp.sent_params.get("seed").map(String::as_str), Some("7"));
+    }
+}
+
+pub(crate) fn write_source_prose(text: &str) -> String {
+    let mut text = strip_source_frontmatter(text).to_lowercase();
+    for phrase in AUTH_REMOVAL_WORDS
+        .iter()
+        .chain(AUTH_REMOVAL_PHRASES)
+        .copied()
+        .chain(["移除auth"])
+    {
+        text = text.replace(phrase, "");
+    }
+    security_prose(&text).unwrap_or_default()
+}
+
+fn normalize_transform(doc: &mut LockDoc, source: &SourceFile) -> Result<(), Vec<Diag>> {
+    let fields: Vec<String> = find_section(&doc.sections, "Request")
+        .and_then(|s| s.table.as_ref())
+        .map(|t| t.rows.iter().filter_map(|r| r.first().cloned()).collect())
+        .unwrap_or_default();
+    let out = find_section(&doc.sections, "Transform")
+        .and_then(|s| s.get("out"))
+        .map(canonical_expression);
+    if let Some(steps) = find_section_mut(&mut doc.sections, "Steps") {
+        for block in &mut steps.blocks {
+            if block
+                .bullets
+                .iter()
+                .any(|b| b.key == "op" && b.value == "respond")
+            {
+                for bullet in &mut block.bullets {
+                    if bullet.key == "value"
+                        && out
+                            .as_ref()
+                            .is_some_and(|out| canonical_expression(&bullet.value) == *out)
+                    {
+                        bullet.value = "transform.out".into();
+                    }
+                }
+            }
+        }
+    }
+    let Some(section) = find_section_mut(&mut doc.sections, "Transform") else {
+        return Ok(());
+    };
+    for bullet in &mut section.bullets {
+        if bullet.key == "out" {
+            bullet.value = canonical_expression(&bullet.value);
+        }
+        if bullet.key != "in" {
+            continue;
+        }
+        let raw = bullet.value.trim();
+        if !raw.starts_with('{') || !raw.ends_with('}') {
+            continue;
+        }
+        let parsed = transform_entries(raw);
+        let Ok(mut entries) = parsed else {
+            continue;
+        };
+        let mut keys = std::collections::HashSet::new();
+        for (key, value) in &mut entries {
+            if !keys.insert(key.clone()) {
+                return Err(vec![Diag::error(
+                    &source.rel,
+                    format!("duplicate Transform in key `{key}`"),
+                )]);
+            }
+            *value = canonical_expression(value);
+        }
+        let rank = |key: &str, value: &str| {
+            fields
+                .iter()
+                .position(|f| f.rsplit('.').next() == Some(key) || value == format!("req.{f}"))
+                .unwrap_or(usize::MAX)
+        };
+        entries.sort_by(|(a, av), (b, bv)| rank(a, av).cmp(&rank(b, bv)).then(a.cmp(b)));
+        bullet.value = format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|(k, v)| format!(
+                    "{}: {v}",
+                    if k.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                    {
+                        k.clone()
+                    } else {
+                        serde_json::to_string(k).expect("object key")
+                    }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn canonical_expression(value: &str) -> String {
+    let mut out = String::new();
+    let mut quote = None;
+    let mut escape = false;
+    let mut space = false;
+    for c in value.trim().chars() {
+        if let Some(q) = quote {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == q {
+                quote = None;
+            }
+        } else if c.is_whitespace() {
+            space = true;
+        } else {
+            if space && !out.is_empty() && !out.ends_with('.') && c != '.' {
+                out.push(' ');
+            }
+            space = false;
+            out.push(c);
+            if matches!(c, '\'' | '"') {
+                quote = Some(c);
+            }
+        }
+    }
+    out
+}
+
+fn transform_entries(raw: &str) -> Result<Vec<(String, String)>, ()> {
+    let inner = raw
+        .strip_prefix('{')
+        .and_then(|v| v.strip_suffix('}'))
+        .ok_or(())?;
+    let mut quote = None;
+    let mut escape = false;
+    let mut stack = Vec::new();
+    let mut start = 0;
+    let mut parts = Vec::new();
+    for (i, c) in inner.char_indices() {
+        if let Some(q) = quote {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '{' | '[' | '(' => stack.push(c),
+            '}' | ']' | ')' => {
+                let expected = match c {
+                    '}' => '{',
+                    ']' => '[',
+                    _ => '(',
+                };
+                if stack.pop() != Some(expected) {
+                    return Err(());
+                }
+            }
+            ',' if stack.is_empty() => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() || !stack.is_empty() {
+        return Err(());
+    }
+    if !inner[start..].trim().is_empty() {
+        parts.push(&inner[start..]);
+    }
+    parts
+        .into_iter()
+        .map(|part| {
+            let part = part.trim();
+            let (key, value) = if part.starts_with('"') {
+                let mut stream = serde_json::Deserializer::from_str(part).into_iter::<String>();
+                let key = stream.next().ok_or(())?.map_err(|_| ())?;
+                let value = part[stream.byte_offset()..]
+                    .trim()
+                    .strip_prefix(':')
+                    .ok_or(())?;
+                (key, value)
+            } else {
+                let (key, value) = part.split_once(':').ok_or(())?;
+                let key = key.trim();
+                if key.is_empty()
+                    || !key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                {
+                    return Err(());
+                }
+                (key.to_string(), value)
+            };
+            if value.trim().is_empty() {
+                return Err(());
+            }
+            Ok((key, value.trim().to_string()))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod transform_canonical_tests {
+    #[test]
+    fn object_scanner_preserves_nested_values_and_strings() {
+        let entries =
+            super::transform_entries(r#"{"display:name": "a, b: c . d", other: {k: req.body.x},}"#)
+                .unwrap();
+        assert_eq!(
+            entries,
+            [
+                ("display:name".into(), r#""a, b: c . d""#.into()),
+                ("other".into(), "{k: req.body.x}".into())
+            ]
+        );
+        assert_eq!(
+            super::canonical_expression(r#" req . body . name "#),
+            "req.body.name"
+        );
+        assert_eq!(
+            super::canonical_expression(r#" "keep  spaces . here" "#),
+            r#""keep  spaces . here""#
+        );
+        for value in ["{a: {x: 1}", "{a: 1,,}", "{a:}", "{a: [)}"] {
+            assert!(super::transform_entries(value).is_err(), "{value}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sampling_warning_tests {
+    #[test]
+    fn warnings_share_one_gate_across_disabled_and_unknown_sampling() {
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        let mut config = crate::llm::LlmConfig {
+            provider: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "test-placeholder".into(),
+            model: "unregistered-model".into(),
+            timeout: std::time::Duration::from_secs(1),
+            max_retries: 0,
+            seed: 0,
+            endpoint_host: "api.openai.com".into(),
+            endpoint_private: false,
+            send_sampling: true,
+            api_style: "chat".into(),
+        };
+        assert!(super::sampling_warning(&config, &warned)
+            .unwrap()
+            .contains("capability table"));
+        config.send_sampling = false;
+        assert_eq!(super::sampling_warning(&config, &warned), None);
+        assert_eq!(super::sampling_warning(&config, &warned), None);
+        // A separate test seam starts fresh without touching the process gate.
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        assert!(super::sampling_warning(&config, &warned)
+            .unwrap()
+            .contains("LLM_SEND_SAMPLING=0"));
+        config.send_sampling = true;
+        assert_eq!(super::sampling_warning(&config, &warned), None);
     }
 }

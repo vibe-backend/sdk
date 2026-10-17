@@ -772,11 +772,10 @@ pub fn build_manifest_with_mode(
                 target,
                 writes: matches!(action.as_str(), "create" | "update" | "delete"),
                 input: Vec::new(),
-                errors: vec![
-                    "NOT_FOUND".into(),
-                    "UNIQUE_VIOLATION".into(),
-                    "PRECONDITION_FAILED".into(),
-                ],
+                errors: CRUD_ERROR_CODES
+                    .iter()
+                    .map(|code| code.to_string())
+                    .collect(),
                 capabilities: Vec::new(),
                 steps: Vec::new(),
                 crud_model: model.id.clone(),
@@ -2040,3 +2039,6 @@ mod constant_response_tests {
         }
     }
 }
+
+/// Errors declared by the generated model CRUD methods.
+pub const CRUD_ERROR_CODES: &[&str] = &["NOT_FOUND", "UNIQUE_VIOLATION", "PRECONDITION_FAILED"];

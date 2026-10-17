@@ -135,8 +135,8 @@ signature: MEUCIG...
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 409 | EMAIL_TAKEN | user.register |
-| 422 | VALIDATION_FAILED | platform |
+| 409 | EMAIL_TAKEN | EMAIL_TAKEN |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ````
 
 > ⚠️ 規格本身 §11.4 的 lock 只有 `user.register` 一個 step，但它的 source 寫明「再用 user.invite 寄邀請信」。省略邀請 step 的 lock 會比 source **少**；本頁加上 `s2`，令 lock 與 source 及 Decision 69 一致。`user.invite` 的輸入（`{ id }`）和 `key: user` 限流鍵僅作示意，見規格缺口。

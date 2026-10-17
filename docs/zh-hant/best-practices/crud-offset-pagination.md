@@ -137,7 +137,7 @@ Validation failure returns 422.
 ## Errors
 | status | code | from |
 |---|---|---|
-| 422 | VALIDATION_FAILED | platform |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ````
 
 ## 安全考量

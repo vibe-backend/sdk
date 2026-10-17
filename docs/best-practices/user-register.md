@@ -266,8 +266,8 @@ signature: MEYCIQ...
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 422 | VALIDATION_FAILED | platform |
-| 429 | QUOTA_EXCEEDED | platform |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
+| 429 | RATE_LIMITED | RATE_LIMITED |
 ````
 
 `api/auth/v1/verify-email/verify-email.lock.md` (`## Access` and `## Errors` only; security items `public`, `auth-removed`, `public-writes`, `password-write`, `verification-write`, all high risk, which is exactly the 5-item PR cap)
@@ -291,10 +291,10 @@ signature: MEYCIQ...
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 422 | WEAK_PASSWORD | user.complete-verification |
-| 422 | INVALID_TOKEN | user.complete-verification |
-| 422 | VALIDATION_FAILED | platform |
-| 429 | QUOTA_EXCEEDED | platform |
+| 422 | WEAK_PASSWORD | WEAK_PASSWORD |
+| 422 | INVALID_TOKEN | INVALID_TOKEN |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
+| 429 | RATE_LIMITED | RATE_LIMITED |
 ````
 
 Its pipelines are `-auth`, `rate-limit` 10/min by `ip`, `rate-limit` 120/min by `tenant`, and `audit-log` with `redact: [req.body.token, req.body.password]`; body limit 2KB; success is 204 (§12.11.7).

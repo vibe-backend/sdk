@@ -137,7 +137,7 @@ The injected `user.list` method has its own platform-generated, signed lock (`id
 ## Errors
 | status | code | from |
 |---|---|---|
-| 422 | VALIDATION_FAILED | platform |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ````
 
 ## Security considerations

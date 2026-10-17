@@ -18,7 +18,7 @@
 
 ### v1.8（草稿，2026-10-14）
 
-- 補編決定 150–168（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
+- 補編決定 150–173（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 compiler-hash 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory`）
 - 新增 `vibe build`：一個指令做晒編譯、驗證同 manifest（類似 `nest build`），冇 reviewer 步驟（審核由 Git 平台設定負責，決定 76，見 2C.3）。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext）
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
@@ -284,7 +284,7 @@
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
-### 0.14 v1.8 2026-10-17 決定（決定 150–168，產品經理已批准 2026-10-17）
+### 0.14 v1.8 2026-10-17 決定（決定 150–173，產品經理已批准 2026-10-17）
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
@@ -307,6 +307,11 @@
 | 166 | `vibe dev` 唔喺 1.0，延至 vNext；1.0 本地開發流程係互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory` → curl。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.2 |
 | 167 | `source-lines` 由 compiler 計，model 引用嘅範圍 snap 去所在 markdown block（段落、list、table、fenced code、heading、frontmatter）嘅 union；無效或者超出範圍用 body 全部 block 範圍做 fallback；validate 要求 block 對齊。已知問題：model 引用另一段落時 lock 仍然可能唔同；唔阻 rc。 | 已批准（產品經理 2026-10-17） | 2A.2、2A.4 |
 | 168 | Fields 按 header 名（包括中文同必填欄）對應；全形 pipe 同 min/max 長度別名正規化，lock 唔准留別名；所有路徑（包括 method query 同 memory）嘅 SQLSTATE 23505 都回 409 `UNIQUE_VIOLATION`，永遠唔重試，唔影響 40001／40P01 嘅 `TX_CONFLICT`。PROMPT_VERSION 改為 prompt-8。 | 已批准（產品經理 2026-10-17） | 2A.2、12.2、8 |
+| 169 | Feature 嘅 writes 由 method steps（CRUD、Signature、SQL 同遞迴呼叫）推導；唔使宣告 writes，false 同寫入 step 衝突就報錯，true 冇寫入 step 要 repair。Method 規則照舊。 | 已批准（產品經理 2026-10-17） | 2.2、2A.4 |
+| 170 | 自然語言 POST／PUT／PATCH／DELETE 明確要求新增、更新或刪除記錄，英文動詞嘅常見屈折形式（例如 created／creating、updated／updating、deleted／deleting、listed／listing）都計；必須有對應 model.create／update／delete method step 同 respond；唔准 Steps (none)。排除否定、code、移除 auth 同 writes: false。自然語言 feature 冇 method step 又冇 literal constant response 就報錯；GET 肯定要求讀取時提示單一 model.list／帶 {id} 用 model.get。 | 已批准（產品經理 2026-10-17） | 2A.4、2A.6 |
+| 171 | Errors 嘅 code 同 from 只准 runtime 公開錯誤碼、被呼叫 method Signature errors／model CRUD errors，同本 feature validate fail；未知碼列出排序後嘅允許清單並 repair，structured 都適用。CRUD 唯一衝突用 UNIQUE_VIOLATION。 | 已批准（產品經理 2026-10-17） | 2A.4、2A.6、8、12.2 |
+| 172 | Transform in 平面 object 按 Request row 次序排 key（同名或 req.field 對應），其餘按 byte 字典序；冒號後一個空格、逗號後一個空格，expression 字串外空白正規化（包括 req.body.x），重複 key 報錯，唔能解析就保留原值。structured 同自然語言都適用；Transform out expression 同 respond value 相同就寫 transform.out。自然語言 model table 若等於 id_snake 或固定英文複數（不分大小寫），一律寫複數，其餘保留。 | 已批准（產品經理 2026-10-17） | 2A.4、2A.6 |
+| 173 | 未知 capability model 同 LLM_SEND_SAMPLING=0 嘅 sampling warning 合計每個 process 最多一次，跨 compile、repair 同 keep-going 共用。 | 已批准（產品經理 2026-10-17） | 2A.8.2 |
 
 ## 1. 目錄同命名
 
@@ -382,9 +387,11 @@ project/
 
 ### 2.2 Source 寫法建議
 
+決定 169 修訂高風險宣告規則：只有 api feature 嘅 `writes` 唔再必填，compile 同 validate 由 `op: method` steps 推導 `write-sql`，包括 model CRUD create／update／delete、Signature `writes: true`、寫入 SQL 同遞迴呼叫寫入 method。`writes: false` 同寫入 step 衝突就報錯，指出 step 同 target；`writes: true` 但冇寫入 step 就提示加 `<model>.create|update|delete`。Method 嘅宣告規則照舊。
+
 - 每個 source 用 `#` 標題寫名，之後用段落或者列點描述。
 - 建議用以下小標題幫編譯器理解（唔強制）：`## 用途`、`## 輸入`、`## 輸出`、`## 做法`、`## 錯誤`、`## 權限`。
-- 安全相關嘅設定（公開、剔走 auth、寫入、改 provider、放寬限流、簽 token）可以用自然語言寫（決定 16），但 `## Limits` 嘅 `timeout`、`body`、`provider` 只用 frontmatter pin 同繼承預設，prose limits 唔會用（決定 160；rate-limit pipeline 唔受影響）；但**高風險欄位一定要喺 frontmatter 宣告**（決定 112）：`writes`、`public`（同 `public-writes`）、`auth`、用到嘅 secret（`secrets`）。冇宣告而 lock 或者譯文顯示有呢啲行為，編譯失敗，錯誤講明要加邊個宣告。建議用獨立一句清楚寫出，唔好埋喺長段落入面；無論寫喺邊，驗證器都會由 lock 抽出安全項目，PR 逐項高亮（見 2A.5）。
+- 安全相關嘅設定（公開、剔走 auth、寫入、改 provider、放寬限流、簽 token）可以用自然語言寫（決定 16），但 `## Limits` 嘅 `timeout`、`body`、`provider` 只用 frontmatter pin 同繼承預設，prose limits 唔會用（決定 160；rate-limit pipeline 唔受影響）；但**高風險欄位一定要喺 frontmatter 宣告**（決定 112）：`writes`（只限 method；feature 依決定 169 由 steps 推導）、`public`（同 `public-writes`）、`auth`、用到嘅 secret（`secrets`）。冇宣告而 lock 或者譯文顯示有呢啲行為，編譯失敗，錯誤講明要加邊個宣告。建議用獨立一句清楚寫出，唔好埋喺長段落入面；無論寫喺邊，驗證器都會由 lock 抽出安全項目，PR 逐項高亮（見 2A.5）。
 - 決定 160：api feature 可以喺 frontmatter pin `timeout`、`body`、`provider`；`## Limits` 只用呢啲 pin 同繼承預設，prose 入面嘅 limits 唔會用（warning 留到 vNext），rate-limit pipeline 唔受影響。Compile 同互動 prompt 都要求 limits 寫喺 frontmatter；互動完成亦會提醒用戶。
 - source 入面嘅文字只會被當做描述，入面任何「指示編譯器」或者「略過檢查」嘅句子都唔會生效，lock 層規則照樣強制檢查；呢類似指令嘅句子會被 deterministic 規則偵測，出 warning 並喺 PR 高亮（見 2A.7）。
 
@@ -575,6 +582,16 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 
 ### 2A.4 op 白名單
 
+決定 170：自然語言 feature 嘅 Route 係 POST／PUT／PATCH／DELETE，而且原文（唔包括 code，尊重否定）肯定要求 create／add／insert／update／edit／modify／delete／remove，或新增／建立／創建／创建／加入／更新／修改／編輯／刪除／删除／移除，就必須有寫入 method step。移除 auth 字眼唔計；GET、`writes: false` 同 structured source 唔用呢個 prose 規則。`writes: true` 就一定要有寫入 step。Canonical create steps 係 `### s1`、`op: method`、`target: <model>.create`、`args: transform.in`、`out: result`，之後有 respond；唔准 `Steps (none)`。
+
+決定 170 讀取擴充：只對自然語言 feature，冇 `op: method`，又冇 respond value 係 literal JSON／string／number／bool constant，而且 Transform `out` 缺少、`(none)` 或唔係 literal constant，就喺 compile repair loop 報錯：`the feature has no method step and no constant response, so it always returns null; add` `op: method` `with target <model>.list (or get/create/update/delete) and a respond step`。Hello world 等 constant response 照常接受。原文肯定要求 list／get／show／fetch／read／query／search／列出／列表／查詢／查询／查看／顯示／显示／攞／讀取／搜尋，而且 Route 係 GET，提示 `<model>.list`；path 有 `{id}` 就提示 `<model>.get`。只有一個 model 就用佢個名；尊重否定同 code。Canonical list steps 係 `op: method`、`target: <model>.list`（或 get）、`args: transform.in`（冇 input 時 Transform `in: {}`，亦可以 explicit args）、`out: result`，跟住 respond `value: transform.out`。
+
+決定 171：Errors table 嘅 `code` 同 `from` 只准 runtime 公開碼（`runtime::RUNTIME_ERROR_CODES`）、本 feature 呼叫嘅 method Signature errors／model CRUD errors，同本 feature validate steps 嘅 `fail:` 碼。未知碼會報錯，列出排序後嘅允許清單；structured 都適用。Callee 未編譯就只用已知碼，唔額外因為 callee 未知而 fail closed；target 解決檢查照舊。冇自訂 mapping 用 `(none)`；CRUD 唯一衝突用 `UNIQUE_VIOLATION`。
+
+決定 172：Transform `in` 平面 object 按 Request row 次序排 key（同名 `body.k`／`query.k`／`path.k`／`header.k`，或者 expression 剛好係 `req.<field>`）；其餘 key 按 byte 字典序。輸出 `{k: expr, k2: expr2}`，冒號後一個空格、逗號後一個空格；expression 字串外空白正規化，包括 `req.body.x`。空 object 係 `{}`，重複 key 報錯；唔能解析就保留 trimmed 原值。自然語言同 structured 都適用，唔改語意。Transform `out` 本身亦用 canonical_expression 正規化；respond step `value` 同 Transform `out` 經 canonical_expression 後相等，就一律寫 `transform.out`，自然語言同 structured 都適用。
+
+決定 172 model table 擴充：只對自然語言 model，`id_snake` 係 model id 將 `-` 換成 `_`。固定英文 plural 規則：已經以 `s` 結尾就保留（視為複數）；否則以 `x`、`z`、`ch`、`sh` 結尾加 `es`；consonant + `y` 換成 `ies`；其餘加 `s`。Model 答案嘅 `Table` `table` 若同 `id_snake` 或 plural(id_snake) 不分大小寫相等，compiler 一律寫 plural(id_snake)；其他 table 名保留（視為 source 指定）。Structured source 唔改 table，包括現有 `email_outbox` 範例。
+
 決定 158：冇 key 嘅 `transform` step op 已移除；而家仲係 pre-1.0，唔設 deprecation period。validate 會拒絕佢，提示刪除呢個 step，改用 `## Transform`（`- in:`／`- out:`）寫 request／response 映射。
 
 | 層 | 准用 op |
@@ -623,6 +640,8 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 
 ### 2A.6 重新編譯規則
 
+決定 169–172：compile prompt 版本係 `prompt-9`；prompt 提供 canonical create feature 同 runtime 允許錯誤碼清單。Repair loop 喺 model 仲答緊時檢查 writes 宣告、缺少寫入／讀取 step、冇 constant response 同未知 Errors 碼，提示加返 method step 或改用已知碼。
+
 - 決定 162：每次改 compile prompt 文字（system prompt、prompt guide、examples）一定要 bump `PROMPT_VERSION`；佢計入 compiler-hash 同 LLM cache key。今次係 `prompt-5`，舊 lock 要重新編譯；hash 測試記錄版本同所有 kind／scope 嘅 prompt SHA-256，改 prompt 後要一齊更新。
 
 - 只有 `source-hash` 或者任何 `dependencies` hash 變咗先會重新編譯；source 改咗但正規化 hash 唔變就唔會重新編譯。
@@ -670,6 +689,7 @@ v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`（決定 57�
   - Anthropic：較新 model（Opus 4.6 之後）只接受 `temperature: 1`、拒絕 `top_k`、`top_p` 只接受 ≥ 0.99；就算 `temperature: 0` 都唔保證決定性；冇 seed。
   - OpenAI（`openai` adapter 規則）：
     - `temperature`／`top_p` 只喺 capability 表列明支援、而且 adapter 同時送 `reasoning_effort: "none"` 嘅 model 先送（例如 GPT-5.1、GPT-5.2）；唔支援 `none` 嘅 reasoning model（例如較舊 GPT-5、GPT-6 Astra、GPT-6.1 Sol）唔送任何 sampling 參數。
+    - 決定 173：未知 capability model 同 `LLM_SEND_SAMPLING=0` 嘅 sampling warning 合計每個 process 最多一次；跨 compile、repair 同 keep-going 共用。
     - capability 表冇列出嘅 model（包括所有 OpenAI-compatible 本地 API 嘅 model，除非表有登記），一律唔送任何 sampling 參數（`temperature`、`top_p`、`seed`、`reasoning_effort` 都唔送）。
     - `seed`：OpenAI API reference（Create chat completion，<https://platform.openai.com/docs/api-reference/chat/create>）寫明 "This feature is in Beta"、系統只會 "make a best effort to sample deterministically"、"Determinism is not guaranteed"，並建議用 `system_fingerprint` 監察 backend 變動。所以 `seed` 只當 best-effort，冇決定性保證；adapter 將回應嘅 `system_fingerprint` 寫入編譯報告（唔計入 compiler-hash）。
   - Gemini：`generationConfig.temperature`、`topP`、`topK`、`seed` 都接受，但 `seed` 只係 best-effort。
@@ -2387,6 +2407,8 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 
 ## 8. 狀態碼同錯誤
 
+決定 171：runtime 公開錯誤碼清單係 `BAD_REQUEST`、`CHALLENGE_FAILED`、`CHALLENGE_REQUIRED`、`CHALLENGE_UNAVAILABLE`、`ENDPOINT_DISABLED`、`FORBIDDEN`、`INTERNAL`、`INVALID_REFRESH_TOKEN`、`METHOD_NOT_ALLOWED`、`NOT_FOUND`、`PAYLOAD_TOO_LARGE`、`PRECONDITION_FAILED`、`PRECONDITION_REQUIRED`、`RATE_LIMITED`、`SERVICE_UNAVAILABLE`、`TX_CONFLICT`、`TX_TIMEOUT`、`UNAUTHORIZED`、`UNIQUE_VIOLATION`、`UNSUPPORTED_MEDIA_TYPE`、`VALIDATION_FAILED`、`WEAK_PASSWORD`。Feature Errors 嘅 `code` 同 `from` 可以用呢個清單，加上被呼叫 method／CRUD 宣告同本 feature validate fail 碼；未知碼係 validate error。
+
 | 狀態碼 | 用途 |
 | --- | --- |
 | 200 | 成功 |
@@ -2890,9 +2912,9 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" 
 ## Errors
 | status | code | from |
 |---|---|---|
-| 409 | EMAIL_TAKEN | user.register |
-| 409 | ALREADY_ACTIVE | user.invite |
-| 422 | VALIDATION_FAILED | platform |
+| 409 | EMAIL_TAKEN | EMAIL_TAKEN |
+| 409 | ALREADY_ACTIVE | ALREADY_ACTIVE |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 | 503 | INVITE_NOT_QUEUED | user.invite（outbox 冇寫入，transaction rollback） |
 ````
 
@@ -3140,8 +3162,8 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 寄邀請" }]
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 409 | ALREADY_ACTIVE | user.invite |
-| 422 | VALIDATION_FAILED | platform |
+| 409 | ALREADY_ACTIVE | ALREADY_ACTIVE |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 | 503 | INVITE_NOT_QUEUED | user.invite（outbox 冇寫入，transaction rollback） |
 ````
 
@@ -3207,7 +3229,7 @@ v2 嘅 name 欄位叫 display_name。
 ## Errors
 | status | code | from |
 |---|---|---|
-| 404 | NOT_FOUND | user.get |
+| 404 | NOT_FOUND | NOT_FOUND |
 ````
 
 - 呢個例子示範決定 2：`user.get` 只有一個版本，v2 嘅 `display_name` 改名由 api 層 `## Transform` 處理。
@@ -3298,7 +3320,7 @@ query 要有 region（2 個字元）。
 ## Errors
 | status | code | from |
 |---|---|---|
-| 404 | NOT_FOUND | region.find-by-code |
+| 404 | NOT_FOUND | NOT_FOUND |
 ````
 
 ### 11.7 Public 建立資料：`api/catalog/v1/submit-review/submit-review.md`（路由 `POST /catalog/v1/{slug}/reviews`）
@@ -3388,9 +3410,9 @@ body：item_id（uuid）、rating（1 至 5）、comment（1 至 500 字）。
 ## Errors
 | status | code | from |
 |---|---|---|
-| 404 | NOT_FOUND | review.submit |
-| 422 | VALIDATION_FAILED | platform |
-| 429 | QUOTA_EXCEEDED | platform |
+| 404 | NOT_FOUND | NOT_FOUND |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
+| 429 | RATE_LIMITED | RATE_LIMITED |
 ````
 
 - body 有 `tenant_id`、`id` 或者 `created_by` 會即刻 422；`tenant_id` 由平台按 slug 注入。
@@ -3486,7 +3508,7 @@ api source 寫「用 user.login 驗證帳戶密碼」，編譯成：
 ````
 
 - `target` 只可以係 `{object}.{method}`，部署時靜態綁定，唔可以由 request 決定，冇版本後綴。
-- method 拋出嘅錯誤，喺 api lock 嘅 `## Errors` 對應狀態碼（例如 `| 401 | INVALID_CREDENTIALS | user.login |`）；冇對應嘅錯誤一律回 500 INTERNAL。
+- method 拋出嘅錯誤，喺 api lock 嘅 `## Errors` 對應狀態碼（例如 `| 401 | INVALID_CREDENTIALS | INVALID_CREDENTIALS |`）；冇對應嘅錯誤一律回 500 INTERNAL。
 - 唔同 api version call 同一個 method，差異由各自 `## Transform` 處理。
 - 呼叫深度上限 3 層，唔准循環呼叫。
 
@@ -3876,8 +3898,8 @@ security-items:
 ## Errors
 | status | code | from |
 |---|---|---|
-| 401 | INVALID_CREDENTIALS | user.login |
-| 422 | VALIDATION_FAILED | platform |
+| 401 | INVALID_CREDENTIALS | INVALID_CREDENTIALS |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ````
 
 - PR review 會逐項高亮：`public: true`、`-auth`、`public-writes: true`（以上高風險；v1.8 起係資訊性高亮，review 要求由 rulesets（分支規則） 決定）、新增寫入 sql（`user.login` s4，中風險）。
@@ -4421,8 +4443,8 @@ security-items:
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 422 | VALIDATION_FAILED | platform |
-| 429 | QUOTA_EXCEEDED | platform |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
+| 429 | RATE_LIMITED | RATE_LIMITED |
 ````
 
 - 冇 `hash-password`，所以唔觸發 `cost: high` 減半：限流就係 IP 每分鐘 5 次、租戶每分鐘 60 次。
@@ -4543,11 +4565,11 @@ security-items:
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 422 | WEAK_PASSWORD | user.complete-verification |
-| 422 | BREACHED_PASSWORD | user.complete-verification |
-| 422 | INVALID_TOKEN | user.complete-verification |
-| 422 | VALIDATION_FAILED | platform |
-| 429 | QUOTA_EXCEEDED | platform |
+| 422 | WEAK_PASSWORD | WEAK_PASSWORD |
+| 422 | BREACHED_PASSWORD | BREACHED_PASSWORD |
+| 422 | INVALID_TOKEN | INVALID_TOKEN |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
+| 429 | RATE_LIMITED | RATE_LIMITED |
 ````
 
 - `cost: high`（`hash-password`）令實際限流減半：IP 每分鐘 5 次、租戶每分鐘 60 次（決定 25、39）。

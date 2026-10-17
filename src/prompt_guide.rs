@@ -60,6 +60,9 @@ API FEATURE KEYS:
 - ## Response: status.
 - ## Transform: optional in ({ k: req.body.x }) and out (expression).
 - ## Steps ops: method (target, args, out), validate (when, fail), respond (value, status). There is no transform step; request/response mapping goes in ## Transform.
+- A source creating/updating/deleting a model record MUST include ### s1 with op: method, target: <model>.create|update|delete (model object name), args: transform.in, out: result, followed by a respond step. Never emit Steps (none) for these features.
+- A feature that lists or reads records of a model MUST include `- op: method`, `- target: <model>.list` (or get), `- args: transform.in` (Transform in `{}` when there is no input) or explicit args, `- out: result`, then respond with `value: transform.out`. Never emit Steps (none) for model reads.
+- Errors codes and from must be platform runtime codes or errors declared by called method Signature errors or own validate fail codes. Use (none) when there are no custom mappings.
 - ## Errors table header exactly `| status | code | from |`.
 ";
 
@@ -97,7 +100,15 @@ pub fn guide(kind: Kind, scope: Option<Scope>) -> String {
             out.push_str(METHOD_KEYS);
             out.push_str(AUTH_OP_KEYS);
         }
-        (Kind::Api, Some(Scope::Feature) | None) => out.push_str(API_KEYS),
+        (Kind::Api, Some(Scope::Feature) | None) => {
+            out.push_str(API_KEYS);
+            out.push_str("Allowed runtime errors: ");
+            out.push_str(&crate::runtime::RUNTIME_ERROR_CODES.join(", "));
+            out.push_str("\nEXAMPLE CREATE FEATURE:\n");
+            out.push_str(FEATURE_CREATE_EXAMPLE);
+            out.push_str("\nEXAMPLE LIST FEATURE:\n");
+            out.push_str(&feature_list_example());
+        }
         _ => {}
     }
     out
@@ -268,4 +279,54 @@ mod tests {
         let long = "x".repeat(MAX_PREVIOUS_BYTES * 2);
         assert!(repair_input("IN", &long, &[]).len() < MAX_PREVIOUS_BYTES + 1024);
     }
+}
+
+/// Canonical authenticated create feature.
+pub const FEATURE_CREATE_EXAMPLE: &str = r"## Route
+- method: POST
+- path: /catalog/v1/example-products
+## Access
+- public: false
+## Pipelines
+### auth
+- mode: jwt
+## Limits
+(none)
+## Request
+| field | type | rules | required |
+| --- | --- | --- | --- |
+| body.sku | string | max: 40 | yes |
+| body.name | string | max: 80 | yes |
+## Response
+- status: 201
+## Transform
+- in: {sku: req.body.sku, name: req.body.name}
+- out: result
+## Steps
+### s1
+- op: method
+- target: product.create
+- args: transform.in
+- out: result
+- source-lines: 1-1
+### s2
+- op: respond
+- value: transform.out
+- status: 201
+- source-lines: 1-1
+## Errors
+(none)
+";
+
+/// Canonical no-input model list feature.
+pub fn feature_list_example() -> String {
+    FEATURE_CREATE_EXAMPLE
+        .replace("method: POST", "method: GET")
+        .replace("status: 201", "status: 200")
+        .replace("product.create", "product.list")
+        .replace("{sku: req.body.sku, name: req.body.name}", "{}")
+        .replace(
+            "| body.sku | string | max: 40 | yes |\n| body.name | string | max: 80 | yes |\n",
+            "",
+        )
 }

@@ -85,14 +85,14 @@ fn extract_feature(sections: &[Section], items: &mut Vec<SecurityItem>) {
     if let Some(steps) = find_section(sections, "Steps") {
         for block in &steps.blocks {
             let target = block_value(block, "target");
-            if target_looks_like_write(&target) {
+            if block_value(block, "op") == "method" && target_looks_like_write(&target) {
                 push(items, "write-sql", Risk::Medium);
             }
         }
     }
 }
 
-fn target_looks_like_write(target: &str) -> bool {
+pub(crate) fn target_looks_like_write(target: &str) -> bool {
     let Some((_, method)) = target.rsplit_once('.') else {
         return false;
     };
@@ -129,7 +129,7 @@ pub fn enrich_feature_writes(
     };
     for block in &steps.blocks {
         let target = block_value(block, "target");
-        if target.is_empty() {
+        if block_value(block, "op") != "method" || target.is_empty() {
             continue;
         }
         if method_doc_writes(docs, &target) {

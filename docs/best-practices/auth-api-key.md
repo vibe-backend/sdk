@@ -99,7 +99,7 @@ List orders with order.list and return 200 with items, page, page_size and has_m
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 422 | VALIDATION_FAILED | platform |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ````
 
 ## Security considerations

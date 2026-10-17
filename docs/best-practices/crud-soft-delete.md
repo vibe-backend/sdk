@@ -120,7 +120,7 @@ Note the grants: no runtime role ever has `DELETE` (§7.1).
 ## Errors
 | status | code | from |
 |---|---|---|
-| 404 | NOT_FOUND | note.delete |
+| 404 | NOT_FOUND | NOT_FOUND |
 ````
 
 If you write a custom deletion method, it must be an `UPDATE` that also enforces ownership, for example:

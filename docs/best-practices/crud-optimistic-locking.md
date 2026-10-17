@@ -97,10 +97,10 @@ User not found returns 404 NOT_FOUND. Missing If-Match returns 428 PRECONDITION_
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 404 | NOT_FOUND | user.update |
-| 412 | PRECONDITION_FAILED | user.update |
-| 428 | PRECONDITION_REQUIRED | user.update |
-| 422 | VALIDATION_FAILED | platform |
+| 404 | NOT_FOUND | NOT_FOUND |
+| 412 | PRECONDITION_FAILED | PRECONDITION_FAILED |
+| 428 | PRECONDITION_REQUIRED | PRECONDITION_REQUIRED |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ````
 
 ## Security considerations
