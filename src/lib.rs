@@ -19,6 +19,7 @@ pub mod manifest;
 pub mod netguard;
 pub mod prompt_guide;
 pub mod runtime;
+pub mod scaffold;
 pub mod scan;
 pub mod secret;
 pub mod security;

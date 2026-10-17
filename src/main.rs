@@ -23,6 +23,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Scaffold a public hello world feature without overwriting sources.
+    New {
+        path: String,
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
     /// Compile source markdown into lock files.
     Compile {
         #[arg(long, default_value = ".")]
@@ -163,6 +169,12 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
+        Command::New { path, project } => {
+            for message in vibe::scaffold::create(&project, &path)? {
+                println!("{message}");
+            }
+            Ok(())
+        },
         Command::Compile { project, check } => cmd_compile(&project, check).await,
         Command::Approve { .. } => Err("`vibe approve` has been removed in spec v1.8 (decision 77): review happens on the source pull request. Use `vibe validate --deploy --dev` and `vibe manifest --dev` locally (the equivalent of `vibe build --dev` until `vibe build` is available).".into()),
         Command::Validate { project, deploy, dev } => cmd_validate(&project, deploy, dev),
@@ -559,7 +571,11 @@ async fn cmd_serve(
         pg_pool = Some(pg.pool());
         Arc::new(pg)
     };
-    let loaded = vibe::runtime::load_project_slugs(project, memory)?;
+    let mut loaded = vibe::runtime::load_project_slugs(project, memory)?;
+    let reload_slugs = memory && run_env.is_dev();
+    if vibe::runtime::apply_dev_default(&mut loaded.slugs, memory, run_env.is_dev()) {
+        eprintln!("dev: no slugs configured; using slug `dev` (tenant devtenant) for public routes, e.g. /<def>/<ver>/dev/...");
+    }
     if let (Some(pool), true) = (
         &pg_pool,
         manifest.routes.iter().any(|r| r.refresh.is_some()),
@@ -635,6 +651,8 @@ async fn cmd_serve(
         manifest,
         exec,
         auth,
+        dev_slugs: reload_slugs
+            .then(|| vibe::runtime::DevSlugs::new(project, loaded.slugs.clone())),
         slugs: loaded.slugs,
         rates: std::sync::Mutex::new(Default::default()),
         quotas: std::sync::Mutex::new(Default::default()),

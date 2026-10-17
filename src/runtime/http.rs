@@ -131,6 +131,7 @@ impl AuthConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct Slug {
     pub tenant_id: String,
     pub public_access: bool,
@@ -142,6 +143,7 @@ pub struct AppState {
     pub exec: Arc<dyn QueryExec>,
     pub auth: AuthConfig,
     pub slugs: HashMap<String, Slug>,
+    pub dev_slugs: Option<super::slugs::DevSlugs>,
     pub rates: Mutex<RateBuckets>,
     pub quotas: Mutex<QuotaBuckets>,
     pub disabled: HashSet<String>,
@@ -524,7 +526,12 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     };
     let principal = if found.route.public && found.route.auth_removed {
         let slug = found.params.get("slug").cloned().unwrap_or_default();
-        match state.slugs.get(&slug) {
+        let entry = match &state.dev_slugs {
+            Some(slugs) => slugs.lookup(&slug),
+            None => state.slugs.get(&slug).cloned(),
+        };
+        let unknown = entry.is_none();
+        match entry {
             Some(entry)
                 if entry.public_access && (!found.route.public_writes || entry.public_write) =>
             {
@@ -536,9 +543,8 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                 }
             }
             _ => {
-                let unknown = !state.slugs.contains_key(&slug);
                 let message = if state.dev_hints && unknown {
-                    format!("Not found. Unknown slug `{slug}`; run `vibe slug add {slug} --tenant <id>` or copy slugs.example.json to .vibe/slugs.json")
+                    format!("Not found. Unknown slug `{slug}`; run `vibe slug add {slug} --tenant <id>` or copy slugs.example.json to .vibe/slugs.json{}", if state.dev_slugs.is_some() { "; `vibe slug add` is picked up without restart under `serve --memory`" } else { "" })
                 } else {
                     "Not found".into()
                 };

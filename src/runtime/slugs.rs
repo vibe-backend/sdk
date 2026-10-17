@@ -195,3 +195,100 @@ mod tests {
             .any(|warning| warning.contains("slugs.example.json")));
     }
 }
+
+/// Apply the convenience slug only for the development memory executor.
+pub fn apply_dev_default(slugs: &mut HashMap<String, Slug>, memory: bool, dev: bool) -> bool {
+    if !memory || !dev || !slugs.is_empty() {
+        return false;
+    }
+    slugs.insert(
+        "dev".into(),
+        Slug {
+            tenant_id: "devtenant".into(),
+            public_access: true,
+            public_write: false,
+        },
+    );
+    true
+}
+
+/// Request-driven reload, enabled only by the development memory server.
+pub struct DevSlugs {
+    project: std::path::PathBuf,
+    state: std::sync::Mutex<DevSlugState>,
+}
+
+struct DevSlugState {
+    stamps: [Option<std::time::SystemTime>; 2],
+    checked: std::time::Instant,
+    slugs: HashMap<String, Slug>,
+}
+
+impl DevSlugs {
+    pub fn new(project: &Path, slugs: HashMap<String, Slug>) -> Self {
+        Self {
+            project: project.into(),
+            state: std::sync::Mutex::new(DevSlugState {
+                stamps: Self::stamps(project),
+                checked: std::time::Instant::now(),
+                slugs,
+            }),
+        }
+    }
+
+    fn stamps(project: &Path) -> [Option<std::time::SystemTime>; 2] {
+        [".vibe/slugs.json", "slugs.example.json"].map(|p| {
+            fs::metadata(project.join(p))
+                .and_then(|m| m.modified())
+                .ok()
+        })
+    }
+
+    pub fn lookup(&self, slug: &str) -> Option<Slug> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.slugs.contains_key(slug)
+            || state.checked.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            state.checked = std::time::Instant::now();
+            let stamps = Self::stamps(&self.project);
+            if stamps != state.stamps {
+                state.stamps = stamps;
+                match load_project_slugs(&self.project, true) {
+                    Ok(mut loaded) => {
+                        apply_dev_default(&mut loaded.slugs, true, true);
+                        state.slugs = loaded.slugs;
+                        for warning in loaded.warnings {
+                            eprintln!("warning: {warning}");
+                        }
+                        let path = if self.project.join(".vibe/slugs.json").exists() {
+                            ".vibe/slugs.json"
+                        } else {
+                            "slugs.example.json"
+                        };
+                        eprintln!("reloaded slugs from {}", self.project.join(path).display());
+                    }
+                    Err(error) => eprintln!("warning: cannot reload slugs: {error}"),
+                }
+            }
+        }
+        state.slugs.get(slug).cloned()
+    }
+}
+
+#[cfg(test)]
+mod dev_tests {
+    use super::*;
+    #[test]
+    fn default_requires_memory_and_development_and_empty_map() {
+        for (memory, dev) in [(false, false), (false, true), (true, false)] {
+            let mut slugs = HashMap::new();
+            assert!(!apply_dev_default(&mut slugs, memory, dev));
+            assert!(slugs.is_empty());
+        }
+        let mut slugs = HashMap::new();
+        assert!(apply_dev_default(&mut slugs, true, true));
+        assert!(valid_tenant(&slugs["dev"].tenant_id));
+        assert!(!slugs["dev"].public_write);
+        assert!(!apply_dev_default(&mut slugs, true, true));
+    }
+}

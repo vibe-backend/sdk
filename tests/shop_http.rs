@@ -106,6 +106,7 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
         manifest,
         exec: Arc::new(MemoryExec::new()),
         auth,
+        dev_slugs: None,
         slugs,
         rates: std::sync::Mutex::new(Default::default()),
         quotas: std::sync::Mutex::new(Default::default()),
@@ -706,6 +707,7 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
         manifest,
         exec: Arc::new(MemoryExec::new()),
         auth,
+        dev_slugs: None,
         slugs: std::collections::HashMap::new(),
         rates: std::sync::Mutex::new(Default::default()),
         quotas: std::sync::Mutex::new(Default::default()),
@@ -1631,6 +1633,7 @@ async fn route_jwt_overrides_end_to_end() {
         manifest,
         exec: Arc::new(MemoryExec::new()),
         auth,
+        dev_slugs: None,
         slugs: std::collections::HashMap::new(),
         rates: std::sync::Mutex::new(Default::default()),
         quotas: std::sync::Mutex::new(Default::default()),
@@ -1817,4 +1820,81 @@ async fn private_endpoint_deployment_requires_signed_dev_mode() {
     release.signature = sign::sign_bytes(&serde_json::to_vec(&release).unwrap(), &key);
     write_manifest(&path, &release).unwrap();
     assert!(read_manifest(&path, &verify).unwrap().build_mode.is_none());
+}
+
+#[tokio::test]
+async fn memory_dev_default_and_live_slug_reload() {
+    let root = copy_shop();
+    fs::remove_file(root.join("slugs.example.json")).unwrap();
+    compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .unwrap();
+    let key = sign::create_dev_key(&root).unwrap();
+    let manifest = manifest_from_project(&root, &key).unwrap();
+    let mut slugs = vibe::runtime::load_project_slugs(&root, true)
+        .unwrap()
+        .slugs;
+    assert!(vibe::runtime::apply_dev_default(&mut slugs, true, true));
+    let app = router(Arc::new(AppState {
+        manifest,
+        exec: Arc::new(MemoryExec::new()),
+        auth: AuthConfig::anonymous(),
+        dev_slugs: Some(vibe::runtime::DevSlugs::new(&root, slugs.clone())),
+        slugs,
+        rates: Default::default(),
+        quotas: Default::default(),
+        disabled: Default::default(),
+        min_override_ms: Some(0),
+        honor_test_ip: false,
+        trusted_proxies: vec![],
+        dev_hints: true,
+        challenge: None,
+    }));
+    let get = |slug: &str| {
+        Request::builder()
+            .uri(format!("/catalog/v1/{slug}/products"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone().oneshot(get("dev")).await.unwrap().status(),
+        StatusCode::OK
+    );
+    vibe::runtime::add_slug(&root, "newslug", "tenant0001", false).unwrap();
+    assert_eq!(
+        app.clone().oneshot(get("newslug")).await.unwrap().status(),
+        StatusCode::OK
+    );
+    fs::write(root.join(".vibe/slugs.json"), "broken").unwrap();
+    // A miss forces the changed-file check; errors retain the last valid map.
+    app.clone().oneshot(get("missing")).await.unwrap();
+    assert_eq!(
+        app.oneshot(get("newslug")).await.unwrap().status(),
+        StatusCode::OK
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn missing_definition_suggests_scaffold() {
+    let root = copy_shop();
+    fs::remove_file(root.join("api/shop/_definition.md")).unwrap();
+    let error = compile_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(error.contains("api/shop/_definition.md"), "{error}");
+    assert!(error.contains("vibe new"), "{error}");
+    fs::remove_dir_all(root).unwrap();
 }

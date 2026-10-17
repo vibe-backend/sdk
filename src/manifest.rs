@@ -1974,6 +1974,7 @@ mod constant_response_tests {
                     manifest,
                     exec: Arc::new(MemoryExec::new()),
                     auth: AuthConfig::anonymous(),
+                    dev_slugs: None,
                     slugs: HashMap::from([(
                         "testslug".into(),
                         Slug {
