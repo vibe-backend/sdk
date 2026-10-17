@@ -2,7 +2,7 @@
 
 - **Status:** Proposed (draft, not yet reviewed). The PM hard rules below were set by the PM on 2026-10-17 09:59 HKT; the §9 points were approved by the PM on 2026-10-17 10:08 HKT (decisions 158–163). This ADR feeds the v1.1 spec and does not block any v1 blocker.
 - **Date:** 2026-10-17
-- **Spec:** [`../spec-pattern-library-v1.1.md`](../spec-pattern-library-v1.1.md) (decisions 150–167)
+- **Spec:** [`../spec-pattern-library-v1.1.md`](../spec-pattern-library-v1.1.md) (decisions 150–168)
 - **Related:** decisions 79, 113, 117, 118, 119 (provenance, lock as build output, Sigstore keyless), 149 (read-only sign-method); PRs #147, #95.
 
 This ADR describes defensive design only.
@@ -36,7 +36,12 @@ The compiler turns natural-language Markdown into a lock and then into an execut
 
 - Pattern IR rules (D166): the core MUST enforce RLS and `owner-key` on every pattern IR, a pattern MUST NOT choose or switch DB roles (the executor decides), and a secret MUST only be sent to a host declared in `egress:`. Violations are compile errors.
 - `use:` (D167) is a structured endpoint frontmatter field, consistent with #92.
-- Pending PM: committed `patterns.md` pins (D164, P8); endpoint `egress:` and `secrets:` fields (D165, P9).
+
+## PM decisions (2026-10-17 10:21 HKT)
+
+1. Pins MUST live in a committed `patterns.md` (exact version + sha256); a mismatch MUST fail closed; `use:` MUST only choose a declared version (D164).
+2. Endpoint `egress:` and `secrets:` are added in v1.1 and count as empty in v1; a pattern's egress and secrets MUST be a subset of the endpoint's; `egress:` MUST list explicit hosts, and a wildcard is a validate error (D165).
+3. With no local verified withdrawal list, compile MUST start from the signed list built into the core release, and MUST fail closed only when no built-in list exists (D168).
 
 ## Consequences
 

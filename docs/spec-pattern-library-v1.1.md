@@ -24,10 +24,11 @@
 | 161 | Pattern 版本撤回清單（P5）：用同決定 158 一樣嘅 pinned signer 身份簽；有版本號同到期時間；比 cache 版本舊嘅清單一律拒絕（防回滾）；到期之後警告，但照用本地最新一份已驗證嘅清單，唔會因為離線就全部失敗。 | 已確認（產品經理 2026-10-17） | 6.1、9 |
 | 162 | IR schema 相容（P6）：core 只接受同一 major 嘅 IR schema；唔同 major 即 compile error。 | 已確認（產品經理 2026-10-17） | 4、9 |
 | 163 | Builtin 同 registry 並存（P7）：business pattern 拆出之後，builtin 版本保留一個 minor release 再移除；同時存在時一樣要用 `use:` 明確揀（決定 154）。 | 已確認（產品經理 2026-10-17） | 5、9 |
-| 164 | 項目層 pin 宣告（P8）：因為 lock 唔 commit（決定 117），pin 唔可以只放 lock。會 commit 嘅 `patterns.md` frontmatter `patterns:` 記錄每個 registry pattern 嘅 `id@確實版本` 同 `sha256`；build 只解析呢度宣告嘅版本，lock 照記錄，build 檢查兩者一致，唔一致即 fail closed。 | 草稿，待產品經理確認 | 5.1、9 |
-| 165 | Endpoint `egress:`（允許 host）同 `secrets:`（名）frontmatter 欄位（P9），畀決定 153 子集規則對應；唔影響 v1。 | 草稿，待產品經理確認 | 3.1、9 |
+| 164 | 項目層 pin 宣告（P8）：因為 lock 唔 commit（決定 117），pin 唔可以只放 lock。會 commit 嘅 `patterns.md` frontmatter `patterns:` 一定要記錄每個 registry pattern 嘅 `id@確實版本` 同 `sha256`；build 只解析呢度宣告嘅版本，lock 照記錄，build 檢查兩者一致，唔一致即 fail closed。`use:` 只可以揀 `patterns.md` 已宣告嘅版本，否則 compile error。 | 已確認（產品經理 2026-10-17） | 5.1、9 |
+| 165 | Endpoint `egress:`（允許 host）同 `secrets:`（名）frontmatter 欄位（P9）：v1.1 加入，v1 一律當空。Pattern 要求嘅 egress／secrets 一定要係 endpoint 宣告嘅子集（同決定 153）；`egress:` 只接受明確 host，唔准 `*` wildcard（validate error）。 | 已確認（產品經理 2026-10-17） | 3.1、9 |
 | 166 | Business pattern IR 嘅 core 強制規則：core 對所有 pattern IR 一律強制 RLS 同 `owner-key`（決定 70、114）；pattern 唔可以揀或者切換 DB role（由 executor 決定）；secret 只可以送去 `egress:` 宣告嘅 host；違反即 compile error。 | 已確認（架構師決定 2026-10-17） | 4.1 |
 | 167 | `use:` 放 endpoint frontmatter（結構化，同 #92 frontmatter 優先一致），唔寫喺 prose；唔計入安全關鍵字檢查。 | 已確認（架構師決定 2026-10-17） | 5 |
+| 168 | 冇本地已驗證撤回清單（P10）：一定要用 core release 內嵌嘅已簽撤回清單做初始值；只有冇內嵌清單時先 fail closed。 | 已確認（產品經理 2026-10-17） | 6.1、9 |
 
 ## 1. 背景
 
@@ -63,11 +64,13 @@
 | `requires` | 對應 endpoint 宣告 | 狀態 |
 | --- | --- | --- |
 | `requires.db` | v1.8 現有：source frontmatter `writes`、`public`、`public-writes`、`auth`、`provider`（決定 112、#92）；lock `## Access`（`public`、`public-writes`、`tenant`）、`## Limits` 嘅 `provider`；method lock `## Signature` 嘅 `writes`；model lock `## Policies` 嘅 `grants` 同 `owner-key`（決定 70、114）。Pattern 要 `INSERT`／`UPDATE` 而 endpoint 冇 `writes: true`，或者要嘅 table／欄位唔喺 model grants，即 compile error | v1.8 已有 |
-| `requires.network` | 新加 endpoint frontmatter `egress: [host, …]`（完全相等 host，唔准 wildcard，預設冇）；同現有 `external-calls`（7.1）一致：`egress` 非空就一定要 `external-calls: allow` | 草稿（P9） |
-| `requires.secrets` | 新加 endpoint frontmatter `secrets: [NAME, …]`（只寫名）；一定要等於呢個 endpoint 經 method 用到嘅 `key-ref` 同 method frontmatter `secrets`（#92）嘅聯集 | 草稿（P9） |
+| `requires.network` | 新加 endpoint frontmatter `egress: [host, …]`（只接受明確 host、完全相等；`*` 或者任何 wildcard 係 validate error；預設冇）；同現有 `external-calls`（7.1）一致：`egress` 非空就一定要 `external-calls: allow` | 已確認（決定 165） |
+| `requires.secrets` | 新加 endpoint frontmatter `secrets: [NAME, …]`（只寫名）；一定要等於呢個 endpoint 經 method 用到嘅 `key-ref` 同 method frontmatter `secrets`（#92）嘅聯集 | 已確認（決定 165） |
 | `requires.pipelines` | lock `## Pipelines` | v1.8 已有 |
 
-- `egress:` 同 `secrets:` 屬 v1.1 草稿，唔影響 v1；v1 冇呢兩個欄位，`requires.network`／`requires.secrets` 一律當空（只准冇對外網絡、冇 secret 嘅 pattern）。
+- 子集（MUST）：pattern `requires.network` 嘅每個 host 一定喺 endpoint `egress:`，`requires.secrets` 嘅每個名一定喺 endpoint `secrets:`；超出即 compile error。
+- 必須有嘅測試：(1) `egress: ["*"]` 或者 `*.example.com` → validate error；(2) pattern 要求 `egress:` 以外嘅 host → compile error；(3) pattern 要求未宣告 secret → compile error；(4) v1 冇呢兩個欄位，要求任何 network／secret 嘅 pattern → compile error。
+- `egress:` 同 `secrets:` 喺 v1.1 加入（決定 165，MUST），唔影響 v1；v1 冇呢兩個欄位，`requires.network`／`requires.secrets` 一律當空（只准冇對外網絡、冇 secret 嘅 pattern）。
 
 ## 4. Rust trait（決定 152）
 
@@ -109,7 +112,7 @@ CRUD、upload、email 照舊屬 business pattern，但 core 對所有 pattern IR
 7. Builtin 同 registry 並存（決定 163，MUST）：拆出之後 builtin 保留一個 minor release 再移除；並存時照第 5 步要 `use:`。
 8. 錯誤訊息一定要列出 capability、所有候選 `id@version`，同修正方法（加 `use:`）。
 
-### 5.1 項目層 pin（決定 164，草稿，待產品經理確認）
+### 5.1 項目層 pin（決定 164，已確認（產品經理 2026-10-17））
 
 - 項目根目錄 `patterns.md`（會 commit）用 frontmatter 記錄：
 
@@ -121,7 +124,8 @@ patterns:
 - Build 只解析呢度宣告嘅 `id@version`；未宣告嘅 registry pattern 即 compile error。Builtin pattern 唔使 pin（跟 core 版本）。
 - Lock 照樣記錄 `patterns[]`；build 檢查 lock、pin 同下載 artifact 嘅 sha256 三者一致，唔一致即 fail closed。
 - 升級：用 `vibe patterns update <id>`（草稿）改 `patterns.md`，經 PR review merge。
-- 選項：A（建議）commit `patterns.md` pin；B `use:` 一定寫確實版本，唔准 range；C 只喺決定 118 release build 解析一次。
+- 一定要（MUST）：`use:` 只可以揀 `patterns.md` 已宣告嘅版本；range 冇包含任何已宣告版本，或者揀未宣告嘅 pattern，即 compile error。
+- 必須有嘅測試：(1) `use:` 揀 `patterns.md` 未宣告嘅版本 → compile error；(2) pin 嘅 `sha256` 同下載 artifact 唔一致 → fail closed；(3) lock 同 pin 唔一致 → fail closed；(4) 宣告咗嘅版本正常 build。
 
 ## 6. 來源驗證（決定 155）
 
@@ -139,9 +143,9 @@ patterns:
 - 簽名（MUST）：撤回清單用同決定 158 一樣嘅 pinned signer 身份（issuer + SAN）簽，用 Sigstore bundle 離線驗證；驗證失敗即拒絕呢份清單。
 - 內容：`version`（單調遞增整數）、`expires-at`、撤回咗嘅 `id@version` 列表同原因。
 - 防回滾（MUST）：compile 記住本地 cache 已驗證嘅最高 `version`；收到 `version` 更細嘅清單一律拒絕，照用 cache 嗰份。
-- 到期（MUST）：清單過咗 `expires-at`，compile 警告，但照用本地最新一份已驗證嘅清單；唔會因為離線或者攞唔到新清單就全部失敗。完全冇任何已驗證清單（例如第一次用、冇 cache）嘅處理：**待產品經理確認**。選項：A compile 失敗（fail closed）；B 用 core release 內嵌嘅一份已簽清單做初始值。建議：B 做初始值，冇內嵌清單時先用 A。
+- 到期（MUST）：清單過咗 `expires-at`，compile 警告，但照用本地最新一份已驗證嘅清單；唔會因為離線或者攞唔到新清單就全部失敗。完全冇本地已驗證清單（例如第一次用、冇 cache）（決定 168，MUST）：用 core release 內嵌嘅已簽清單做初始值（同樣驗證簽名同身份）；只有冇內嵌清單時先 fail closed。
 - 套用：lock 解析出嚟嘅任何 `id@version` 喺清單入面即 compile error，錯誤訊息列出原因同建議版本。本地 cache／mirror 都一樣檢查（決定 160）。
-- 必須有嘅測試：(1) 回滾：較舊 `version` 嘅已簽清單被拒絕，照用 cache 版本；(2) 到期：過期清單發警告但撤回照樣生效；(3) 簽名身份唔對嘅清單被拒絕；(4) 被撤回嘅版本 compile 失敗；(5) 離線 mirror 同樣套用撤回清單。
+- 必須有嘅測試：(1) 回滾：較舊 `version` 嘅已簽清單被拒絕，照用 cache 版本；(2) 到期：過期清單發警告但撤回照樣生效；(3) 簽名身份唔對嘅清單被拒絕；(4) 被撤回嘅版本 compile 失敗；(5) 離線 mirror 同樣套用撤回清單；(6) 第一次用、cache 空：用內嵌清單，撤回照樣生效；(7) 冇內嵌清單又冇 cache → fail closed。
 
 ## 7. Lock 欄位（決定 156）
 
@@ -172,13 +176,13 @@ patterns:
 | P6 | IR schema 相容 | 只接受同一 major（決定 162） |
 | P7 | Builtin 同 registry 並存 | Builtin 保留一個 minor release（決定 163） |
 
-### 9.1 待產品經理確認
+### 9.1 產品經理決定（2026-10-17 10:21 HKT）
 
-| # | 問題 | 選項 | 建議 |
-| --- | --- | --- | --- |
-| P8 | Pattern 版本 pin 放邊（決定 164） | A：commit `patterns.md`（`id@確實版本`＋`sha256`），lock 記錄並檢查一致；B：`use:` 只准確實版本；C：只喺 release build 解析一次 | A |
-| P9 | Endpoint `egress:`／`secrets:` 欄位（決定 165） | A：加入 endpoint frontmatter（v1.1 草稿）；B：只用現有 method 層 `secrets` 同 `external-calls`，network 一律禁止 | A |
-| — | 冇任何已驗證撤回清單（6.1） | A：fail closed；B：用 core 內嵌已簽清單做初始值 | B，冇內嵌清單時用 A |
+| # | 問題 | 決定 |
+| --- | --- | --- |
+| P8 | Pattern 版本 pin | commit `patterns.md`（`id@確實版本`＋`sha256`），唔一致 fail closed；`use:` 只可以揀已宣告版本（決定 164） |
+| P9 | Endpoint `egress:`／`secrets:` | v1.1 加入、v1 當空；pattern 要求一定係子集；`egress:` 唔准 wildcard（決定 165） |
+| P10 | 冇本地已驗證撤回清單 | 用 core 內嵌已簽清單；冇內嵌先 fail closed（決定 168） |
 
 ## 10. 主要風險同緩解
 
@@ -206,7 +210,7 @@ GET，path /products/v1。要 JWT。
 列出產品，每頁 20，最多 100，按 created_at 排序。
 ```
 
-`patterns.md`（項目根目錄，會 commit，決定 164 草稿）
+`patterns.md`（項目根目錄，會 commit，決定 164）
 
 ```markdown
 ---
