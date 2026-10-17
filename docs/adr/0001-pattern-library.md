@@ -1,8 +1,8 @@
 # ADR 0001: Best-practice pattern library
 
-- **Status:** Proposed (draft, not yet reviewed). The PM hard rules below were set by the PM on 2026-10-17 09:59 HKT; the open points in "Pending PM confirmation" are not decided.
+- **Status:** Proposed (draft, not yet reviewed). The PM hard rules below were set by the PM on 2026-10-17 09:59 HKT; the §9 points were approved by the PM on 2026-10-17 10:08 HKT (decisions 158–163). This ADR feeds the v1.1 spec and does not block any v1 blocker.
 - **Date:** 2026-10-17
-- **Spec:** [`../spec-pattern-library-v1.1.md`](../spec-pattern-library-v1.1.md) (decisions 150–157)
+- **Spec:** [`../spec-pattern-library-v1.1.md`](../spec-pattern-library-v1.1.md) (decisions 150–163)
 - **Related:** decisions 79, 113, 117, 118, 119 (provenance, lock as build output, Sigstore keyless), 149 (read-only sign-method); PRs #147, #95.
 
 This ADR describes defensive design only.
@@ -45,6 +45,11 @@ The compiler turns natural-language Markdown into a lock and then into an execut
 - **Score multiple matches and pick the best.** Rejected: not deterministic or reviewable (rule 3).
 - **Allow third-party security patterns.** Rejected: the security boundary must stay in the reviewed core (rule 2).
 
-## Pending PM confirmation
+## PM decisions (2026-10-17 10:08 HKT)
 
-See spec §9. Each item lists options and a recommendation.
+1. The registry MUST accept only packages signed by one official repo and its release workflow, with SAN refs limited to `refs/tags/v*`; third-party patterns wait for vNext (D158).
+2. The cached trust root MUST be updated with core releases, as in D119 (D159).
+3. Offline compile MUST use a pre-filled local cache or mirror whose packages pass full verification and the withdrawal-list check (D160).
+4. The withdrawal list MUST be signed by the same pinned identity, MUST carry a version and an expiry, and compile MUST reject a list older than the cached one; after expiry compile MUST warn and keep applying the latest verified list (D161).
+5. The core MUST accept only the same major IR schema version (D162).
+6. After a business pattern is split out, the builtin copy MUST stay for one minor release; while both exist, `use:` is required (D163).
