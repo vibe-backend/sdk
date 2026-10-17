@@ -279,7 +279,7 @@
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
-| 149 | `sign-method` 一律唯讀：`token-refresh` 嘅 `sign-method`，連同佢經 `op: method`（任何深度）呼叫嘅 method，都唔可以有寫入 step。`vibe validate`、`vibe build` 同 `vibe serve` 一律阻擋（錯誤碼 `REFRESH_SIGN_METHOD_WRITES`）；refresh 路徑上 `sign-method` 嘅所有 DB statement 再以 READ ONLY 執行做 DB 層兜底。「最後 refresh 時間」以家族為單位，由 SDK 喺輪換確認 transaction 入面寫 `_platform_refresh_families.last_refreshed_at`（只可以向前，家族撤銷之後唔可以改）；其他業務寫入搬去 client 喺 refresh 成功之後另外呼叫嘅普通寫入 method。v1.0 前嘅 breaking change。唔改決定 6、45、61、147 嘅對外行為同錯誤碼。 | 已確認（產品經理 2026-10-17） | 4A.1、4A.1c |
+| 149 | `sign-method` 一律唯讀：`token-refresh` 嘅 `sign-method`，連同佢經 `op: method`（任何深度）呼叫嘅 method，都唔可以有寫入 step。`vibe validate`、`vibe build` 同 `vibe serve` 一律阻擋（錯誤碼 `REFRESH_SIGN_METHOD_WRITES`）；refresh 路徑上 `sign-method` 嘅所有 DB statement 再以 READ ONLY 執行做 DB 層兜底。「最後 refresh 時間」以家族為單位，由 SDK 喺輪換確認 transaction 入面寫 `_platform_refresh_families.last_refreshed_at`（只可以向前，成個家族撤銷之後唔可以改；寬限期重發只撤銷單一 child，唔計）；其他業務寫入搬去 client 喺 refresh 成功之後另外呼叫嘅普通寫入 method。v1.0 前嘅 breaking change。唔改決定 6、45、61、147 嘅對外行為同錯誤碼。 | 已確認（產品經理 2026-10-17） | 4A.1、4A.1c |
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
@@ -1223,7 +1223,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 | `revoked_at` | timestamp | |
 | `revoke_reason` | string | `logout`、`logout-all`、`reuse-detected`、`grace-reissue`、`email-verified`、`erasure`、`admin` |
 
-- Revoke：一律 UPDATE `revoked_at` 同 `revoke_reason`（家族一次過），唔用 DELETE；過期紀錄唔刪除，冇個人資料（只有 hash 同 id），12.10 刪除時一併 revoke。
+- Revoke：一律 UPDATE `revoked_at` 同 `revoke_reason`（家族一次過；唯一例外係寬限期重發只撤銷遺失嘅舊 child，`revoke_reason: grace-reissue`，決定 61），唔用 DELETE；過期紀錄唔刪除，冇個人資料（只有 hash 同 id），12.10 刪除時一併 revoke。
 - 只有平台專用 `refresh_store` role 可以讀寫呢張表（見 7.1）。
 - 欄位層 UPDATE grant（runtime role）：`pending_rotation`、`pending_until`、`used_at`、`replaced_by`、`grace_reissued_at`、`revoked_at`、`revoke_reason`；其他欄位只由 INSERT 寫一次。Guard trigger：identity 欄位唔可以改、撤銷係最終狀態、`used_at` 只設一次。（呢張表冇「最後 refresh 時間」欄位：`used_at` 已經記低每個 token 幾時被輪換；家族層面嘅最後 refresh 時間喺下面 `_platform_refresh_families`，決定 149。）
 
@@ -1236,10 +1236,12 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 | `user_id` | uuid | subject |
 | `created_at` | timestamp | login（`new-family`）時寫 |
 | `last_refreshed_at` | timestamp | 家族最後一次 refresh 成功（輪換或者寬限期重發）嘅時間；login 時等於 `created_at` |
+| `revoked_at` | timestamp | 成個家族被撤銷嘅時間（`logout`、`logout-all`、`reuse-detected`、`email-verified`、`erasure`、`admin`）；生效中係 null。寬限期重發（`grace-reissue`）只撤銷單一 child，唔設呢欄 |
 
-- INSERT：login（`issue-refresh: new-family`）喺插入家族第一條 token 嘅同一個 transaction 入面插入。
-- 欄位層 UPDATE grant（runtime role）：只有 `last_refreshed_at`；冇 DELETE（家族紀錄跟 `_platform_refresh_tokens` 一樣由 `vibe migrate` 嘅過期清理批次刪除）。
-- Guard trigger `_platform_refresh_family_guard`（同 #95 單向規則一致）：identity 欄位（`family_id`、`tenant_id`、`user_id`、`created_at`）唔可以改；`last_refreshed_at` 唔可以改做 null 或者早過舊值；家族入面有任何 token `revoked_at` 有值（撤銷係成個家族一次過而且係最終狀態）之後，`last_refreshed_at` 唔可以再改。
+- INSERT：login（`issue-refresh: new-family`）喺插入家族第一條 token 嘅同一個 transaction 入面插入（`revoked_at` = null）。
+- 家族撤銷：每次成個家族撤銷（上面 `revoke_reason` 除咗 `grace-reissue` 之外嘅所有原因），SDK 喺 UPDATE `_platform_refresh_tokens.revoked_at` 嘅同一個 transaction 入面 `UPDATE _platform_refresh_families SET revoked_at = now() WHERE family_id = … AND revoked_at IS NULL`，所以兩張表一齊 commit 或者一齊 rollback。寬限期重發唔會寫呢欄。
+- 欄位層 UPDATE grant（runtime role）：只有 `last_refreshed_at` 同 `revoked_at`；冇 DELETE（家族紀錄跟 `_platform_refresh_tokens` 一樣由 `vibe migrate` 嘅過期清理批次刪除）。
+- Guard trigger `_platform_refresh_family_guard`（同 #95 單向規則一致）：identity 欄位（`family_id`、`tenant_id`、`user_id`、`created_at`）唔可以改；`last_refreshed_at` 唔可以改做 null 或者早過舊值；`revoked_at` 單向，只可以由 null 改做有值（已經有值之後唔可以改值、唔可以改返 null）；家族行嘅 `revoked_at`（`OLD.revoked_at`）有值之後，`last_refreshed_at` 唔可以再改（家族撤銷係最終狀態）。凍結只睇家族行自己嘅 `revoked_at`，唔睇個別 token：寬限期重發撤銷單一 child（`_platform_refresh_tokens.revoked_at` 有值、`revoke_reason: grace-reissue`）唔計，所以唔會凍結。
 - 查法：`select last_refreshed_at from _platform_refresh_families where family_id = …`（平台內部／admin 用；用戶 lock 唔可以 query 平台表）。
 
 ### 4A.1b Refresh cookie 補充細節（決定 141–148，issue #78，已確認（產品經理 2026-10-16））
@@ -1389,11 +1391,11 @@ error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-re
 **最後 refresh 時間（家族層面 `last_refreshed_at`，平台寫入）：**
 
 - 語意：「呢個 session（家族）最後幾時 refresh 成功」。以家族為單位，唔寫喺個別 token 行：舊（被出示嘅）token 行喺輪換時已經設 `used_at`，再加一個欄位幾乎重複；寫喺家族一行，查一個 session 只使讀一行。
-- 新表 `_platform_refresh_families`（見 4A.1「Refresh token 儲存」）由 `vibe migrate` 用 `CREATE TABLE IF NOT EXISTS` 建立，連同 grant 同 guard trigger；現有家族由 migrate 補一行（`last_refreshed_at` = 家族入面最遲嘅 `used_at`，冇就用最早 `issued_at`；`ON CONFLICT DO NOTHING`，可以重複行）。
+- 新表 `_platform_refresh_families`（見 4A.1「Refresh token 儲存」）由 `vibe migrate` 用 `CREATE TABLE IF NOT EXISTS` 建立，連同 grant 同 guard trigger；現有家族由 migrate 補一行（`last_refreshed_at` = 家族入面最遲嘅 `used_at`，冇就用最早 `issued_at`；`revoked_at` = 家族入面 `revoke_reason` 唔係 `grace-reissue` 嘅 token 最早嘅 `revoked_at`，冇就 null；`ON CONFLICT DO NOTHING`，可以重複行）。
 - SDK 喺輪換確認（finalize）嘅同一個 transaction 入面，`UPDATE _platform_refresh_families SET last_refreshed_at = greatest(last_refreshed_at, now()) WHERE family_id = …`；寬限期重發（決定 61）都喺佢嘅 finalize transaction 入面同樣更新。所以佢同輪換一齊 commit 或者一齊 rollback，用戶 method 唔使寫。
-- 寬限期重發時，撤銷嘅只係遺失嘅舊 child（`revoke_reason: grace-reissue`），唔係成個家族，所以唔會撞到「家族撤銷之後唔可以改」；而且新值一定唔早過舊值（同決定 61 一致）。重用偵測（撤銷成個家族）之後，`last_refreshed_at` 就凍結。
-- 欄位層 UPDATE grant：`_platform_refresh_families` 只有 `last_refreshed_at`；`_platform_refresh_tokens` 嘅 grant 列表唔變（同 #95 一樣）。
-- 同 #95 已批准嘅單向 guard trigger 一致：`last_refreshed_at` 只可以向前（唔可以係 null 或者早過舊值）；家族撤銷之後唔可以再改；identity 欄位唔可以改。`vibe serve` 啟動時檢查兩張表嘅 grant 同 trigger，唔符合就拒絕啟動（fail closed）。
+- 寬限期重發時，撤銷嘅只係遺失嘅舊 child（`_platform_refresh_tokens` 嗰行 `revoke_reason: grace-reissue`），唔係成個家族，唔會設 `_platform_refresh_families.revoked_at`；trigger 只睇家族行嘅 `revoked_at`，所以唔會撞到「家族撤銷之後唔可以改」；而且新值一定唔早過舊值（同決定 61 一致）。成個家族撤銷（例如重用偵測、`logout`）會喺同一個 transaction 設家族行 `revoked_at`，之後 `last_refreshed_at` 就凍結。
+- 欄位層 UPDATE grant：`_platform_refresh_families` 只有 `last_refreshed_at` 同 `revoked_at`；`_platform_refresh_tokens` 嘅 grant 列表唔變（同 #95 一樣）。
+- 同 #95 已批准嘅單向 guard trigger 一致：`last_refreshed_at` 只可以向前（唔可以係 null 或者早過舊值）；`revoked_at` 只可以由 null 改做有值；家族行 `revoked_at` 有值之後 `last_refreshed_at` 唔可以再改（單一 child 嘅 `grace-reissue` 撤銷唔計）；identity 欄位唔可以改。`vibe serve` 啟動時檢查兩張表嘅 grant 同 trigger，唔符合就拒絕啟動（fail closed）。
 - 升級次序：因為新表、grant 同 trigger 都由 `vibe migrate` 建立，而 `vibe serve` 啟動檢查會要求佢哋存在，升級之後一定要先對每個租戶行 `vibe migrate`，之後先 `vibe serve`。
 
 **範例：唯讀 sign-method 加獨立寫入 method：**
@@ -1669,7 +1671,7 @@ Client 流程：`POST …/refresh` 成功攞到新 access token 之後，再 `PO
 3. 唯讀 `sign-method` 照常通過；同一個 method 用喺 login（`issue-refresh: new-family`）唔受影響。
 4. 上面範例（fixture `tests/fixtures/refresh-session`：唯讀 `user.sign-token` 做 sign-method，加 `user.record-session` 同 `api/auth/v1/session`）通過 `vibe validate` 同 build（`vibe manifest`）：`tests/refresh_sign_method_example.rs` 嘅 `refresh_session_example_passes_validate_and_build`（已經喺 CI 行）。同一個檔案嘅 `refresh_session_example_writing_sign_method_is_rejected`（sign-method 加一個寫入 step，要報 `REFRESH_SIGN_METHOD_WRITES`）暫時 `#[ignore]`，由決定 149 嘅 code PR 啟用。
 5. DB 兜底：繞過靜態檢查（測試專用 manifest）令 refresh 期間 `sign-method` 執行寫入 SQL，PostgreSQL 以 `25006` 拒絕，回 500 `INTERNAL`、輪換冇 finalize、舊 token 仍然 current、冇寫入殘留；login 路徑唔套用 READ ONLY。
-6. `_platform_refresh_families.last_refreshed_at`：login 插入家族行；輪換同寬限期重發都喺 finalize transaction 更新；finalize rollback 時唔變；寬限期重發（只撤銷舊 child）照樣可以更新；trigger 拒絕改細、改做 null、改 identity 欄位，同家族撤銷（例如重用偵測）之後再改；`_platform_refresh_tokens` 嘅 grant 列表冇變；serve 啟動檢查兩張表嘅 grant 同 trigger；`vibe migrate` 為現有家族補行而且可以重複行。
+6. `_platform_refresh_families.last_refreshed_at`／`revoked_at`：login 插入家族行（`revoked_at` null）；輪換同寬限期重發都喺 finalize transaction 更新 `last_refreshed_at`；finalize rollback 時唔變；寬限期重發（只撤銷舊 child，`grace-reissue`）唔設家族 `revoked_at`，而且照樣可以更新 `last_refreshed_at`（包括家族入面已經有 `grace-reissue` 撤銷嘅 token 之後）；成個家族撤銷（重用偵測、`logout`、`logout-all` 等）喺同一個 transaction 設家族 `revoked_at`，rollback 時兩張表都唔變；trigger 拒絕 `last_refreshed_at` 改細、改做 null、改 identity 欄位、`revoked_at` 改值或者改返 null，同家族 `revoked_at` 有值之後再改 `last_refreshed_at`；`_platform_refresh_tokens` 嘅 grant 列表冇變；serve 啟動檢查兩張表嘅 grant 同 trigger；`vibe migrate` 為現有家族補行而且可以重複行。
 7. 現有 `tests/refresh_tokens.rs` 用緊會寫入嘅 sign-method（`app_with_issuance_control(_, true)`、`rejected_tokens_do_not_run_sign_method_writes`），實作決定 149 時要改寫做上面第 1、2 同 5 項嘅「靜態拒絕」同「READ ONLY 兜底」測試。
 
 **遷移（breaking）：** 現有有寫入嘅 `sign-method` 要拆開：(1) 「最後 refresh 時間」之類嘅資料唔使再寫，改用平台嘅家族層面 `_platform_refresh_families.last_refreshed_at`；(2) 其他業務寫入搬去一個普通寫入 method，由 client 喺 refresh 成功之後另外呼叫（見上面範例）；`token-refresh` route 冇「refresh 之後」嘅 step，唔可以喺 refresh endpoint 入面做。`sign-method` 只保留讀取同 `sign-jwt`，`## Signature` 設 `writes: false`，再重新 build。升級 SDK 之後，一定要先對每個租戶行 `vibe migrate`（建立 `_platform_refresh_families`、grant 同 trigger），之後先 `vibe serve`；否則 serve 啟動檢查會拒絕啟動。
@@ -1755,7 +1757,7 @@ migration 放喺 ./migrations/main/。
   | --- | --- | --- |
   | migration `tenant_<id>_owner`（每個租戶一個，決定 129） | 擁有自己租戶 schema 同表；只喺自己 schema 准用嘅 DDL（見 2B）；冇 BYPASSRLS，只以 `NOINHERIT` 做自己租戶嘅 `tenant_<id>_rw` 成員（2B backfill／決定 129 嘅受控例外，見 7.1），唔係任何其他 role 嘅成員。Owner 天生可以 TRUNCATE／DROP，係決定 27 嘅受控例外（已確認（產品經理 2026-10-16））：migrate 以外 `NOLOGIN`、一次性憑證、parser 正面白名單、單一 transaction、finally 收回登入、定期檢查、全程審計（見 2B「Owner role 條件」） | 只用嚟執行 migration；runtime 永遠唔用 |
   | `credential_rehash` | 只有 password 類型欄位嘅 UPDATE | 4A.2 rehash |
-  | `refresh_store` | `_platform_refresh_tokens` 同 `_platform_refresh_families` 嘅 SELECT、INSERT、UPDATE（後者只可以 UPDATE `last_refreshed_at`，決定 149） | 4A.1 |
+  | `refresh_store` | `_platform_refresh_tokens` 同 `_platform_refresh_families` 嘅 SELECT、INSERT、UPDATE（後者只可以 UPDATE `last_refreshed_at` 同 `revoked_at`，決定 149） | 4A.1 |
   | `erasure` | 個人欄位嘅 UPDATE | 12.10 |
   | `mail_worker` | `email_outbox` 嘅 SELECT、`UPDATE(sent_at)`；匿名化 job 用 `UPDATE(email, token, recipient_hash)` | 12.11 發送同 outbox 保留期（決定 54、63、68） |
 
