@@ -35,7 +35,7 @@
 - Challenge provider（issue #160，已確認（產品經理 2026-10-16））：決定 131–138，v1 用 Cloudflare Turnstile（server 端 siteverify、production 共用 Postgres replay store（#177）、`type: pow` build error、fail closed、錯誤碼、secret 處理、同限流組合、固定數值、已認證 endpoint opt-in、provider 抽象），見 0.12、7.2a。
 - Challenge 綁定 request digest（決定 140，issue #156）：已確認（產品經理 2026-10-16），token 經 Turnstile `cdata` 綁定 request digest（完整長度，涵蓋 method、path、query、body、`Content-Type`、`If-Match`；包括 login route），session 綁定留到 vNext；`bind: none` v1 出 warning，下一個 minor 起新 public INSERT route 禁用（#245）；未實作（見 0.12、7.2b）；演算法修正（per-request nonce、query raw `+` 無效）已確認（產品經理 2026-10-16）。檢查次序同 nonce／token 單一交易（#258）已確認（產品經理 2026-10-16 12:44 HKT）。
 - Refresh cookie 補充（issue #78，已確認（產品經理 2026-10-16））：決定 141–148（cookie 模式 login、對外錯誤一致、`Max-Age`、CSRF 次序、cookie logout、access token 預設 TTL、錯誤碼、向後相容），喺決定 6、45、60、61、65、72、101 之上補充，見 0.11、4A.1b；實作狀態見 4A.1b。
-- Refresh 簽發同輪換一致性（決定 149，issue #270，待產品經理確認）：`sign-method` 嘅寫入同 refresh 輪換 finalize 要一齊生效或者一齊唔生效，見 0.13、4A.1c。
+- Refresh 簽發同輪換一致性（決定 149，issue #270，產品經理已批准 2026-10-17）：`sign-method` 一律唯讀（validate、build、serve 靜態阻擋，serve 再用 `SET TRANSACTION READ ONLY` 兜底），解決 #270；見 0.13、4A.1c。
 
 ### v1.7（定稿）
 
@@ -273,13 +273,13 @@
 | 138 | Provider 抽象：runtime 經 `ChallengeVerifier` trait 驗證（輸入 token、client IP、預期 action；輸出 通過／失敗／不可用 三種，provider 細節唔外露；「失敗」對應 403，「不可用」對應 503）。之後加 hCaptcha 等 provider 只係新 implementation 同 `VIBE_CHALLENGE_PROVIDER` 新值，lock 語法、replay store 同錯誤碼唔變；未實作嘅值（例如 `hcaptcha`）啟動時拒絕。 | 已確認（產品經理 2026-10-16） | 7.2a |
 | 140 | Challenge token 綁定 request digest（issue #156）：所有 `type: captcha` route（包括 login 類 `when: after-failures`）嘅 token 經 Turnstile `cdata` 綁定 request digest：`rd1.` 加完整 43 字元 base64url（冇 padding）SHA-256，唔截短。Client 每個 request 用 CSPRNG 產生 128 bit nonce，只經 `X-Vibe-Request-Nonce`（剛好 22 字元 base64url）送畀 server，冇或者重用即 fail closed，nonce key `(tenant_id, nonce)`、每個 request 一個紀錄，計入決定 134 同 137 上限：超過決定 137 即 403 `CHALLENGE_FAILED`，超過決定 134 即 429 `CHALLENGE_RATE_LIMITED`（同決定 134 一致）；驗證失敗（包括 nonce 重用）一律 403；`cdata` 只放 digest（私隱）。Digest 一律涵蓋 nonce、method、正規化 path（包括 tenant slug）、正規化 query 同 raw body 嘅 SHA-256；header 只涵蓋 `Content-Type` 同 `If-Match`；唔包括 client IP。Query raw `+` 無效（空格 `%20`、`+` 送 `%2B`，client helper 自動做）；冇 Unicode 正規化；任何無效 canonical 輸入回現有 403 `CHALLENGE_FAILED`，reason 只入內部 log；log 永遠唔記錄 nonce 或者 body。Server 喺 JSON 解析之前重新計算，同 siteverify `cdata` constant-time 比較，唔一致或者冇即 403 `CHALLENGE_FAILED`（唔講邊部分唔一致），fail closed。Proxy rewrite path 會 fail closed（部署要求）。v1 准 `bind: none` 但出 warning；下一個 minor release 起新 public INSERT route 唔准用 `none`（#245）。前端喺表格完成、送出之前先做 challenge。Session 綁定留到 vNext。實作狀態：未實作，見 7.2b。 檢查次序同交易（#258，已確認（產品經理 2026-10-16 12:44 HKT））：格式錯 403 → store 唔可用 503 → 重用 403 → 決定 137 403 → 決定 134 429；先 nonce 後 token，同一個交易，失敗全部 rollback；兩個紀錄都計入上限（數值喺 #256 調整）。 | 已確認（產品經理 2026-10-16；演算法修正 2026-10-16 11:58 HKT） | 7.2b |
 
-### 0.13 v1.8 refresh 簽發一致性（決定 149，issue #270，待產品經理確認）
+### 0.13 v1.8 refresh 簽發一致性（決定 149，issue #270，產品經理已批准 2026-10-17）
 
-源自 #95 review：而家 `token-refresh` 先 commit 一個 reservation，再經另一條 connection 執行 `sign-method`（佢嘅寫入喺自己嘅 transaction commit），最後先 finalize 輪換。如果 finalize 失敗、超時或者 request 被取消，`sign-method` 嘅寫入已經生效，但 token 冇輪換（舊 token 仍然係 current，見決定 61），兩邊唔一致。只描述防禦設計。
+源自 #95 review：之前 `token-refresh` 先 commit 一個 reservation，再經另一條 connection 執行 `sign-method`（佢嘅寫入喺自己嘅 transaction commit），最後先 finalize 輪換；finalize 失敗、超時或者 request 被取消嘅話，`sign-method` 嘅寫入已經生效但 token 冇輪換。決定 149 令 `sign-method` 一律唯讀，所以冇任何寫入需要同輪換一齊 commit，解決 #270。只描述防禦設計。
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
-| 149 | Refresh 簽發一致性：一次 refresh 入面，`sign-method` 嘅所有持久寫入同輪換 finalize（子 token 寫入、舊 token `used_at`／`replaced_by`、reservation 清除）一定要一齊 commit 或者一齊 rollback；唔准出現「method 寫入生效但 token 冇輪換」或者相反嘅狀態。做法揀選見 4A.1c（選項 A／B／C）。唔改決定 6、45、61、147 嘅對外行為同錯誤碼。 | 待產品經理確認 | 4A.1、4A.1c |
+| 149 | `sign-method` 一律唯讀：`token-refresh` 嘅 `sign-method`，連同佢經 `op: method`（任何深度）呼叫嘅 method，都唔可以有寫入。`vibe validate`、`vibe build` 同 `vibe serve` 一律阻擋（錯誤碼 `REFRESH_SIGN_METHOD_WRITES`）；`vibe serve` 執行 `sign-method` 時再用 `SET TRANSACTION READ ONLY` 嘅 transaction 做 DB 層兜底。v1.0 前嘅 breaking change。唔改決定 6、45、61、147 嘅對外行為同錯誤碼。選項 B（喺輪換 transaction 入面執行有寫入嘅 method）延後到 vNext。 | 已確認（產品經理 2026-10-17） | 4A.1、4A.1c |
 
 ## 1. 目錄同命名
 
@@ -1344,24 +1344,39 @@ Logout（節錄）：
 - **main 未實作**：`token-refresh`／`token-revoke` pipeline、`_platform_refresh_tokens` 儲存同輪換；`sign-jwt issue-refresh` 除 `none` 以外一律 build／runtime error（`src/validate.rs`、`src/runtime/ops.rs`）；`rate-limit key: family` 被拒絕（`src/manifest.rs`）。Cookie transport（決定 101、141–148）全部未實作。
 - **進行中**：PR #95（Refs #26）實作 body transport 嘅 refresh、輪換、重用偵測同 revoke；cookie transport 明確唔包括。#95 用 `INVALID_REFRESH_TOKEN`，同決定 147 一致（產品經理 2026-10-16 確認兩種 transport 都用呢個名，冇別名）。
 
-### 4A.1c Refresh 簽發同輪換一致性（決定 149，issue #270，待產品經理確認）
+### 4A.1c Refresh `sign-method` 唯讀（決定 149，issue #270，產品經理已批准 2026-10-17）
 
-要求（不論揀邊個選項）：
+決定 149 解決 #270：`sign-method` 冇寫入，一次 refresh 只會有兩種結果：(1) 輪換成功；(2) 輪換失敗，舊 token 照決定 61 仍然係 current，client 可以重試。對外錯誤碼照決定 61、147，唔新增 HTTP 錯誤碼。
 
-- 一次 refresh 只會有兩種結果：(1) 輪換成功，`sign-method` 寫入同子 token 一齊生效；(2) 輪換失敗，`sign-method` 冇任何持久寫入，舊 token 照決定 61 仍然係 current，client 可以重試。
-- Finalize 失敗、DB／pool 超時、request 取消或者 process 中斷，結果一定係 (2)；對外錯誤碼照決定 61、147（503 `TX_CONFLICT`、504 `TX_TIMEOUT`），唔新增錯誤碼。
-- 唔可以為咗 atomic 而延長 family lock 嘅持有時間超過現有 `statement_timeout`／`lock_timeout`；pool 細（例如 size 1）都唔可以 deadlock（#95 review）。
-- 審計：失敗嘅 refresh 只寫 server log／審計，唔寫入 token 或者 secret 明文。
+**靜態檢查（validate、build、serve）：**
 
-選項（待產品經理確認）：
+- `token-refresh` 嘅 `sign-method` 所指嘅 method，`## Signature` 一定 `writes: false`，而且冇任何 `writes: true` step。
+- 間接寫入一樣阻擋：跟 #166 嘅繼承規則（10.8），經 `op: method`（任何深度）呼叫到有寫入嘅 method，`sign-method` 就算有寫入；`op: method` target 未知或者格式錯，當寫入處理（fail closed）。
+- `vibe validate` 同 `vibe validate --deploy` 報 error，`vibe build` 失敗，`vibe serve` 拒絕載入帶住呢類 manifest 嘅部署（啟動失敗）。
+- 錯誤碼 `REFRESH_SIGN_METHOD_WRITES`。訊息一定要講：邊個 lock 檔案、邊個 `sign-method`、邊個 method／step 寫入（間接寫入要列出 `op: method` 呼叫鏈），同埋點樣修正。範例：
 
-| 選項 | 做法 | 好處 | 代價 |
-| --- | --- | --- | --- |
-| A（建議） | `sign-method` 一定唔可以寫：`token-refresh` 引用嘅 method `## Signature` 一定 `writes: false`，而且（#166 繼承規則，10.8）經 `op: method` 呼叫嘅 method 都唔可以寫；否則 `vibe validate`／`vibe build` error，`vibe serve` 拒絕啟動。Method 唯讀，所以冇嘢要 atomic。 | 最簡單、靜態可驗證、唔使改 transaction 結構，亦解決 #95 review 第 2 點（無效 token 留低寫入）嘅根源。 | Breaking：現有有寫入嘅 sign-method 要拆開（例如「最後登入時間」改由平台審計記錄或者另一個 endpoint 處理）。 |
-| B | `sign-method` 喺輪換 transaction 同一條 connection 入面執行，寫入同 finalize 一齊 commit。 | Method 可以照寫。 | 要將 method 執行器改做共用 transaction；family lock 持有時間加長，要重新評估 timeout 同並發；實作同測試面大。 |
-| C | 補償：記錄 method 寫入，finalize 失敗時由平台反做。 | 唔使改 transaction 結構。 | 唔係真正 atomic；補償本身可以失敗，而且 method 寫入未必可逆；唔建議。 |
+```text
+error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-refresh sign-method `user.sign-token` writes
+  write: models/user/methods/touch-login.lock.md step s2 (writes: true), reached via user.sign-token -> op: method user.touch-login
+  fix: sign-methods must be read-only (decision 149). Move the write into a separate method called by the endpoint after the refresh succeeds, or remove it, then set `writes: false` in ## Signature.
+```
 
-建議：v1 揀 A（加 CHANGELOG Breaking 條目同 validate error 訊息）；如果之後有需要，vNext 再評估 B。揀定之前，實作唔好改現有行為。
+**DB 層兜底（serve）：**
+
+- `vibe serve` 喺 PostgreSQL 執行 `sign-method` 時，用獨立 transaction 並且第一句執行 `SET TRANSACTION READ ONLY`；即使靜態檢查漏咗，任何寫入都會被 DB 拒絕。
+- 呢種失敗當 `sign-method` 失敗：輪換唔 finalize，舊 token 仍然 current，對外照決定 147 回錯誤，server log 寫 error（唔寫 token 或者 secret 明文）。
+- 唔可以為咗呢個兜底延長 family lock 持有時間超過現有 `statement_timeout`／`lock_timeout`；pool 細（例如 size 1）都唔可以 deadlock（#95 review）。
+
+**必須有嘅測試：**
+
+1. 直接寫入：`sign-method` 有 `writes: true` step 或者 `## Signature` `writes: true`，validate、build、serve 都報 `REFRESH_SIGN_METHOD_WRITES`。
+2. 間接寫入：`sign-method` 經 `op: method`（包括兩層或以上）呼叫有寫入嘅 method，三者都報錯，訊息列出呼叫鏈；未知 target 都報錯。
+3. 唯讀 `sign-method` 照常通過。
+4. DB 兜底：繞過靜態檢查（測試專用 manifest）令 `sign-method` 執行寫入 SQL，PostgreSQL 拒絕寫入、輪換冇 finalize、舊 token 仍然 current、冇寫入殘留。
+
+**遷移（breaking）：** 現有有寫入嘅 `sign-method` 要拆開：將寫入（例如「最後 refresh 時間」）搬去 refresh 成功之後由 endpoint body 執行，或者搬去另一個由 endpoint 呼叫嘅 method；`sign-method` 只保留讀取同 `sign-jwt`，`## Signature` 設 `writes: false`，再重新 build。
+
+**#270：** 決定 149 實作 merge 之後，#270 可以 close。選項 B 延後到 vNext。
 
 ### 4A.2 密碼政策（決定 7）
 
