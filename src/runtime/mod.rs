@@ -19,8 +19,9 @@ pub use crud::{
     MethodFail, Ownership,
 };
 pub use exec::{
-    etag, role_allows, ExecError, MemoryExec, PgExec, PgOptions, PgSession, QueryExec,
-    RefreshIssuer, RoleStatus, Row,
+    check_server_version, check_server_version_from, etag, role_allows, ExecError, MemoryExec,
+    PgExec, PgOptions, PgSession, QueryExec, RefreshIssuer, RoleStatus, Row,
+    MIN_SERVER_VERSION_NUM,
 };
 pub use http::{
     check_static_jwt_key, detect_jwt_alg, hash_api_secret, load_api_keys, refresh_rejections,

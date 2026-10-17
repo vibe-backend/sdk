@@ -1363,3 +1363,40 @@ async fn sslmode_require_fails_against_server_without_tls() {
         panic!("sslmode=require must not connect to a server without TLS (ssl: {ssl:?})");
     }
 }
+
+#[tokio::test]
+async fn startup_checks_real_and_injected_server_versions() {
+    let admin_url = require_pg!(admin_url());
+    let admin = connect(&admin_url).await;
+    let row = admin
+        .query_one("SHOW server_version_num", &[])
+        .await
+        .unwrap();
+    let num: u32 = row.get::<_, &str>(0).parse().unwrap();
+    assert!(num >= vibe::runtime::MIN_SERVER_VERSION_NUM, "{num}");
+    // Exercise the same reported-version check used by PgExec::connect.
+    vibe::runtime::check_server_version_from(async {
+        let row = admin
+            .query_one("SHOW server_version_num", &[])
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(row.get::<_, String>(0))
+    })
+    .await
+    .unwrap();
+    let err = vibe::runtime::check_server_version_from(async { Ok("150000".into()) })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        "PostgreSQL 16 or later required (server_version_num is 150000)"
+    );
+    vibe::runtime::check_server_version_from(async { Ok("160000".into()) })
+        .await
+        .unwrap();
+    // PgExec::connect (used by `vibe migrate` and `vibe serve`) checks the version.
+    PgExec::connect(&admin_url).await.unwrap();
+    if let Ok(major) = std::env::var("VIBE_TEST_PG_MAJOR") {
+        assert_eq!(num / 10000, major.parse::<u32>().unwrap());
+    }
+}

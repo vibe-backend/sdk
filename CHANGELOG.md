@@ -32,6 +32,7 @@ added only when the corresponding PR is merged to `main`.
 
 ### Breaking
 
+- **PostgreSQL 16 required (#254, decision 129):** `vibe migrate` and `vibe serve` check `server_version_num` when they connect and refuse to start on PostgreSQL older than 16 ("PostgreSQL 16 or later required"), with no fallback. CI also runs the PostgreSQL integration tests on PostgreSQL 16.
 - **Refresh tokens (#95):** `reuse-grace` is tightened from accepting up to 60s to a maximum of 10s (default 10s, spec §4A.1). Configs above 10s (and 0) now fail `vibe validate` and the build, and `vibe serve` refuses to start with a manifest that carries one; set `reuse-grace` to 10s or less and recompile.
 
 - **JWT key policy (D139, #222 #224 #225 #226):** `vibe serve` refuses to start when an RS256 `sign-jwt` signing key or an RSA `VIBE_JWT_PUBLIC_KEY_PEM` is under 2048 bits, when an ES256 signing key or `VIBE_JWT_PUBLIC_KEY_PEM` is not a P-256 key (or its private scalar is outside `1..n-1`, or its encoding has trailing data), or when `VIBE_JWT_PUBLIC_KEY_PEM` does not match `VIBE_JWT_ALG` (these checks run in `vibe serve`, not `vibe validate --deploy`). JWKS keys are filtered by the configured alg (`VIBE_JWT_ALG`, default ES256) at parse time, and a kid that appears more than once in a JWKS is ignored; RS256 JWKS deployments must set `VIBE_JWT_ALG=RS256`. `sign-jwt` without `alg` now defaults to ES256.
