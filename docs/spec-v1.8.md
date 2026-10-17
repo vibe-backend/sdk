@@ -18,7 +18,7 @@
 
 ### v1.8（草稿，2026-10-14）
 
-- 補編決定 150–164（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
+- 補編決定 150–165（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 compiler-hash 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。
 - 新增 `vibe build`：一個指令做晒編譯、驗證同 manifest（類似 `nest build`），冇 reviewer 步驟（審核由 Git 平台設定負責，決定 76，見 2C.3）。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext）
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
@@ -227,7 +227,7 @@
 | 106 | Cursor 分頁同區間篩選（issue #87）：CRUD `list` 可以揀 `pagination: cursor`（offset 照樣係預設，決定 14）；cursor 係簽名嘅不透明值，綁定 sort、filter 同租戶；排序一定加主鍵做 tiebreaker；`page-size` 預設 20，`max-page-size` 同 offset 一樣跟決定 71（平台上限 500），冇另外嘅 100 上限；`range` 篩選只准宣告咗而且有 index 嘅欄位，運算子 `gte`／`gt`／`lte`／`lt`；編譯時驗證；cursor 同 sort／filter 唔對應回 400 `INVALID_CURSOR`。 | 已確認（產品經理 2026-10-14） | 12.9 |
 | 107 | 多欄唯一鍵：model lock 加 `## Constraints`（`- unique: [col_a, col_b]`，平台自動喺前面加 `tenant_id`）；一定要有對應 migration 建 unique index；衝突回 409 `UNIQUE_VIOLATION`，唔回顯欄位值。 | 已確認（產品經理 2026-10-14） | 12.2、8 |
 | 108 | 翻譯階段（issue #37）：非 ASCII source 按 `translate-1` 翻譯，只供語意一致性檢查；安全關鍵字一律檢查中文及英文原文，譯文不能補足。原文保留作 lock、hash、編譯 prompt 及 cache key。否定及 code 規則見 2.1a。此規則取代 #37 的 English-only／不處理中文否定決定。翻譯失敗即編譯失敗，沒有 fallback。翻譯 cache key 包含 source-hash、provider、model、prompt 版本及實際參數。 | 已確認（產品經理 2026-10-16） | 2.1a、2A.7 |
-| 109 | Lock 記錄翻譯資料（審計用，唔計入 `source-hash`）：`translation: { prompt-version, llm-provider, model-snapshot, hash }`。 | 已確認（產品經理 2026-10-14） | 2A.1、2.1a |
+| 109 | Lock 記錄翻譯資料（審計用，唔計入 `source-hash`）：`translation: { prompt-version, llm-provider, model-snapshot, hash }`。（決定 165：translation stamp 改記喺 build record 同 manifest provenance，lock 唔再有） | 已確認（產品經理 2026-10-14） | 2A.1、2.1a |
 | 110 | 高風險 release build 唔可以用翻譯 cache，一定重新翻譯。 | 已確認（產品經理 2026-10-14） | 2.1a、2C.3 |
 | 111 | 翻譯 call 計入 #92 P5 每次編譯 LLM call 上限；超過即編譯失敗。 | 已確認（產品經理 2026-10-14） | 2.1a |
 | 112 | 修訂決定 16：高風險欄位（寫入、公開、auth、secret）一定要喺 source frontmatter 宣告；宣告同譯文唔一致，或者偵測到未宣告嘅高風險行為，即 fail closed，錯誤訊息講明缺咗邊個宣告。關鍵字檢查係一致性檢查（縱深防禦），唔係唯一防線。api feature 唔再做寫入 sql 關鍵字檢查（由已檢查嘅 method lock 繼承）。 | 已確認（產品經理 2026-10-14） | 2.2、2.1a、2A.7 |
@@ -284,7 +284,7 @@
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
-### 0.14 v1.8 2026-10-17 決定（決定 150–164，產品經理已批准 2026-10-17）
+### 0.14 v1.8 2026-10-17 決定（決定 150–165，產品經理已批准 2026-10-17）
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
@@ -303,6 +303,7 @@
 | 162 | 每次改 compile prompt（system prompt、guide、examples）一定要 bump `PROMPT_VERSION`，佢計入 compiler-hash 同 LLM cache key。 | 已批准（產品經理 2026-10-17） | 2A.6 |
 | 163 | Structured source `## Limits` 有值同解析結果唔同就 compile error，錯誤講明欄位（provider／timeout／body）、source 寫嘅值、解析出嚟嘅值同修正方法（喺 frontmatter pin 或者刪除嗰行）。 | 已批准（產品經理 2026-10-17） | 2A.2 |
 | 164 | `vibe build` 唔喺 1.0：`vibe manifest`（預設 release；`--dev`、`--release`）係官方 build 指令；`vibe build`（`--labels`、`-o`、部署報告）延至 vNext。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.3 |
+| 165 | 同一 source、同一 `PROMPT_VERSION` 同同一結構，一定產生 byte-identical lock；lock 唔可以包含任何每次 run 都可能改變嘅欄位。Translation stamp 改記喺 build record 同 manifest provenance，唔再寫入 lock。 | 已批准（產品經理 2026-10-17） | 2A.1、2.1a |
 
 ## 1. 目錄同命名
 
@@ -367,12 +368,12 @@ project/
   - 直譯，唔解釋、唔補充、唔總結；保留識別字、數字同否定（例如「唔公開」一定譯做 not public）。
   - Source 放喺有分隔嘅 data-only `SOURCE` 區塊（同編譯 prompt 一樣嘅分隔方式），入面任何指示都唔會執行；冇工具、冇 function calling。
 - **用途限制**：譯文只用於語意一致性檢查。安全關鍵字只檢查中文及英文原文，不能由譯文補足。Lock、`source-hash`、編譯 prompt 及 cache key 用原文。以下規則取代 #37／決定 108 的 English-only 及不處理中文否定規則（產品經理 2026-10-16 確認）。
-- **否定**：唔、不、冇、無、毋、非及 not、no、never 只作用於短距離內最近的下一個安全關鍵字，不跨越 `, . ; : ! ? 、，。；：！？` 或換行，不以偶數／奇數抵銷。固定清單內的 auth 移除字眼（例如「唔需要登入」、「不需要登入」、「免登入」、「移除 auth」、「唔使 auth」、no auth、remove auth、no login required）算 auth 的直接否定；配合 frontmatter `auth: none` 時，compiler 會確定性寫入 `-auth`（宣告優先），但要求登入的字眼仍然構成衝突並係 compile error。只有無歧義的直接否定可讀作否定；中間有其他字詞或雙重否定（not … not、不得不、唔可以唔、不能不、非…不可）一律保留較嚴格的要求並發出 warning，請作者以 `auth` 等 structured frontmatter 確認。`不得不公開` 表示公開。Prose 不會自動降低保護；有 `auth/public/secrets/writes` 宣告時以宣告為準，明確的 prose 衝突為 compile error。
+- **否定**：唔、不、冇、無、毋、非及 not、no、never 只作用於短距離內最近的下一個安全關鍵字，不跨越 `, . ; : ! ? 、，。；：！？` 或換行，不以偶數／奇數抵銷。固定清單內的 auth 移除字眼（例如「唔需要驗證」、「唔使驗證」、「唔使登入」、「唔需要登入」、「不需要登入」、「免登入」、「移除 auth」、「唔使 auth」、no auth、remove auth、no login required）算 auth 的直接否定；配合 frontmatter `auth: none` 時，compiler 會確定性寫入 `-auth`（宣告優先），但要求登入的字眼仍然構成衝突並係 compile error。只有無歧義的直接否定可讀作否定；中間有其他字詞或雙重否定（not … not、不得不、唔可以唔、不能不、非…不可）一律保留較嚴格的要求並發出 warning，請作者以 `auth` 等 structured frontmatter 確認；如果該欄位已經喺 frontmatter 宣告，就當已確認，唔再發含糊否定 warning，明確衝突仍然係 error。`不得不公開` 表示公開。Prose 不會自動降低保護；有 `auth/public/secrets/writes` 宣告時以宣告為準，明確的 prose 衝突為 compile error。
 - **Code**：忽略行首最多三個空格後的至少三個反引號或波浪號 fence；結束 fence 必須同字元且長度不少於開始。行中 ``` 不開啟 fence。Inline code 的反引號 run 長度必須相同。未結束 fence 是 compile error，不能忽略其後內容；不確定時採取較嚴格的判讀。
 - **失敗**：翻譯 call 失敗、回應格式唔啱、或者譯文缺咗原文嘅識別字／數字，成次編譯失敗（#93 全部或者冇，冇 lock 會寫入）；冇 fallback，唔會略過檢查。
 - **Cache**：`.vibe/cache/translate/<sha256>`，key 係 `source-hash` + provider + model snapshot + translate prompt 版本 + 實際送出參數。**高風險 release build 唔可以用翻譯 cache**（決定 110），一定重新翻譯。
 - **Call 上限**：翻譯 call 計入 #92 P5 嘅每次編譯 LLM call 上限；超過即編譯失敗（決定 111）。
-- **審計**：lock frontmatter 記 `translation`（決定 109，見 2A.1）；唔計入 `source-hash`，亦唔計入 `compiler-hash`。
+- **審計**：translation stamp（prompt-version、llm-provider、model-snapshot、hash）按 lock path 記喺 `.vibe/build-record.json` 嘅 `translations` map 同 manifest provenance 嘅 optional `translations` map（決定 109、165）；lock 唔再有。譯文保留喺 `.vibe/audit/translations`，header 帶 hash；stamp 唔計入 `source-hash` 同 `compiler-hash`。
 - **高風險宣告**（決定 112）：frontmatter 宣告咗嘅高風險欄位同譯文（同 lock）唔一致，或者偵測到未宣告嘅高風險行為，一律 fail closed，錯誤訊息講明缺咗邊個宣告。關鍵字檢查係一致性檢查（縱深防禦），唔係唯一防線；真正嘅閘門係 frontmatter 宣告加 lock 層驗證。
 - **Api feature**：唔再對 api feature 做寫入 sql 關鍵字檢查；寫入由被呼叫、已經檢查過嘅 method lock（`writes`）繼承。
 
@@ -500,7 +501,6 @@ dependencies:                      # 所有依賴 source／lock 嘅 hash，按 i
 compiler: { name: md-logic, version: 2.0.0, model-snapshot: <provider 回報嘅 model id>, llm-provider: openai, endpoint-host: api.openai.com, endpoint-private: false, llm-seed: 0, sent-params: { temperature: 0, top_p: 1, seed: 0 } }
 compiler-hash: sha256:<見下面標準定義>
 build-mode: release                # release | dev；dev lock 唔可以部署（決定 75）
-translation: { prompt-version: translate-1, llm-provider: openai, model-snapshot: <...>, hash: sha256:<譯文 hash> }   # 只限有翻譯嘅 source；審計用，唔計入 source-hash（決定 109）
 security-items:                    # 驗證器 deterministic 抽出，資訊性（決定 78）
   - { item: public, risk: high, reason: "公開登入入口" }
 ---
@@ -520,7 +520,7 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
   8. `compiler.version`
 
   永遠唔記 key。2A.6、2A.8、10.1 提到 compiler-hash 一律指呢個定義。
-- `translation`：只喺 source 經過 2.1a 翻譯先有；記 translate prompt 版本、provider、model 同譯文 hash，只做審計，唔計入 `source-hash` 同 `compiler-hash`（決定 109）。
+- 決定 165：同一 source、同一 `PROMPT_VERSION` 同同一結構，一定產生 byte-identical lock；lock 唔可以包含任何每次 run 都可能改變嘅欄位。`translation` stamp 只記喺 build record 同 manifest provenance，唔寫入 lock。舊 lock 嘅 `translation:` 仍然讀得，parse 後忽略，render 唔再寫；validate 每個舊 lock 警告一次："lock contains a `translation` field, which is no longer written (decision 165); run `vibe compile` to refresh it"。Lock format 改動會將 `PROMPT_VERSION` 升到 `prompt-6`，令舊 lock 過時並重新編譯。
 - manifest JSON 用 snake_case：lock 嘅 `build-mode` 對應 manifest 嘅 `build_mode`（`dev`／`release`；冇呢個欄位當 `release`）。
 - `build-mode`：`vibe manifest` 寫 `release`，`vibe manifest --dev`／`vibe dev` 寫 `dev`；`dev` lock 永遠唔可以入 release manifest（決定 75）。
 - `security-items`：驗證器 deterministic 抽出嘅安全項目清單，`reason` 由驗證器按規則產生；資訊性，用嚟 PR 高亮同部署報告，唔需要確認人（決定 78）；冇安全項目就寫 `[]`。
@@ -533,6 +533,8 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 - `## Limits` 一律丟棄 model 原有內容，固定依次寫三個 bullet：`provider` 用 source frontmatter 指定值，否則用 `_definition` 嘅 `## Providers default`，再否則 `main`；`timeout` 同 `body` 依次用 source frontmatter pin、`_version` 嘅 `## Defaults`、`_definition` 嘅 `## Defaults`，再否則分別用 `10s` 同 `1MB`。
 - 決定 160：compile、validate 同互動生成一律檢查 pin；validate 亦檢查 lock Limits。`timeout` 要嚴格 duration（例如 `500ms`、`10s`），大過 0 而唔超過 30s；`body` 要嚴格 size（例如 `64kb`、`4KB`、`1MB`），大過 0 而唔超過 1MB；`provider` 要小寫 kebab-case。錯誤講明 key、壞值同有效例子。
 - 正規化後嘅 Route path 有 `{slug}` segment，就先移除 Request 所有 model 寫嘅 `path.slug` row，再喺第一個 data row 加且只加 `| path.slug | string | - | yes |`；其他 row 保留次序。Request 係 `(none)` 或冇 table 時，建立 header `| field | type | rules | required |` 嘅 table。Route 冇 `{slug}` segment 就移除所有 `path.slug` row；移除後冇 row 就寫 `(none)`。
+
+- B3（決定 165）：自然語言同 structured feature 嘅 `## Errors` 缺省、空白、只有 table header 同 separator 冇 data row、或者 `(none)`，一律正規化成 `(none)`；有真正 error row 就保留。冇自訂 error 唔發「feature has no Errors section」warning；手寫 lock 真係冇 Errors section，就由固定 section 結構檢查報 error，唔再加重複 warning。
 
 - section 用 `##` 標題，名稱同次序按 kind 固定（見 2A.3）；唔准有額外 section，缺 section 用 `(none)` 表示；api feature 可以省略 `## Transform`，等同 `(none)`，compile 會喺 lock 嘅固定位置補返。
 - 每個 step 用 `### s{n} {op}` 做標題，下面用 `- key: value` 列點，key 次序固定：`op`、（op 專用參數）、`out`、`source-lines`。
@@ -619,7 +621,7 @@ api 類 lock 嘅 frontmatter 要多一個 `scope: definition | version | feature
 - Golden corpus 由平台編譯器團隊維護，最少 500 個案例，覆蓋所有 kind 同所有安全項目；項目可以喺 `.golden/` 加自己嘅案例，一樣會參與比對（決定 35）。
 - Model snapshot 淘汰（決定 35）：平台承諾宣布淘汰後最少保留 12 個月；項目有 90 日遷移窗口，窗口內舊 lock 照常有效、照常可以部署；窗口完結前未遷移，部署會被封鎖（runtime 已部署嘅 manifest 照常運作）。
 - 編譯一定要盡量 deterministic：固定 prompt、固定 snapshot；`temperature`、`top_p`、`seed` 等參數只喺 model capability 支援時先送固定值（決定 58，見 2A.8.6），唔支援就唔送，唔可以強送。決定性只係盡力而為，只用嚟減少 release summary 入面嘅無謂變化；唔做重編比對，部署安全靠決定 113 attestation 同決定 114 policy（決定 117）。
-- 翻譯（2.1a，決定 108–111）：譯文同 `translation` 欄位唔計入 `source-hash` 同 `compiler-hash`，所以翻譯 prompt 或者翻譯 model 改咗唔會令 lock 過時；但編譯（包括 `vibe manifest` 同 CI 重編）一定會用當前設定重新做翻譯同一致性檢查，失敗即封鎖。
+- 翻譯（2.1a，決定 108–111）：譯文同 build record／manifest provenance 嘅 translation stamp 唔計入 `source-hash` 同 `compiler-hash`，所以翻譯 prompt 或者翻譯 model 改咗唔會令 lock 過時；但編譯（包括 `vibe manifest` 同 CI 重編）一定會用當前設定重新做翻譯同一致性檢查，失敗即封鎖。
 - **決定 113、117 修訂**：lock 係 build 輸出，唔 commit，所以冇「同 repo lock 比對」呢回事；`--check-determinism` 同重編比對唔再係部署條件。部署只接受 CI 由 source 重新 build、有 attestation 嘅 artifact（2C.3b）；`compile --check` 只驗證 build 結果同決定 114 policy。
 - 唔准手改 lock：要改就改 source 再重新編譯。Lock 冇簽名（決定 79），而且 lock 唔 commit（決定 117），部署只用 CI 由 source build 嘅 artifact（決定 113），所以手改嘅 lock 唔會去到部署。
 

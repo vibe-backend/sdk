@@ -64,10 +64,14 @@ pub async fn compile_in_memory(
     let (docs, ordered, report) = compile_docs(&sources, opts, &HashMap::new()).await?;
     let mut texts: HashMap<String, String> = HashMap::new();
     let mut record = std::collections::BTreeMap::new();
+    let mut translations = std::collections::BTreeMap::new();
     for id in &ordered {
         let doc = &docs[id];
         let rel = lock_rel(&doc.meta.source);
         let text = render_lock(doc);
+        if let Some(stamp) = &doc.meta.translation {
+            translations.insert(rel.clone(), stamp.clone());
+        }
         record.insert(rel.clone(), crate::buildrecord::lock_hash(&text));
         texts.insert(rel, text);
     }
@@ -80,6 +84,7 @@ pub async fn compile_in_memory(
         build_record: serde_json::to_string(&crate::buildrecord::BuildRecord {
             version: 1,
             locks: record,
+            translations,
         })
         .ok(),
     };
@@ -159,6 +164,8 @@ async fn compile_docs(
     let mut ranked = sources.to_vec();
     ranked.sort_by_key(|source| (rank(source), source.rel.clone()));
 
+    // One warning per compile invocation (one invocation per CLI run).
+    let mut sampling_warned = false;
     for source in &ranked {
         // One budget per source: compile, format re-prompts and translation.
         budget.begin_source();
@@ -192,12 +199,17 @@ async fn compile_docs(
         }
         if !structured {
             if let Some(config) = opts.llm_config {
-                if !config.send_sampling {
+                if !config.send_sampling && !sampling_warned {
+                    sampling_warned = true;
                     report.push(Diag::warning(
                         &source.rel,
                         "LLM_SEND_SAMPLING=0; sampling parameters were not sent",
                     ));
-                } else if !crate::llm::sampling_registered(&config.provider, &config.model) {
+                } else if config.send_sampling
+                    && !sampling_warned
+                    && !crate::llm::sampling_registered(&config.provider, &config.model)
+                {
+                    sampling_warned = true;
                     report.push(Diag::warning(
                         &source.rel,
                         "model is not in the capability table; sampling parameters were not sent",
@@ -276,8 +288,8 @@ async fn compile_docs(
         if !structured && needs_translation(&source.combined_text()) {
             match translate_source(opts, source, &budget).await {
                 Ok(text) => {
-                    // D109: the lock records only prompt version, provider/model
-                    // and the hash; the text goes to the release audit artifact.
+                    // D109/165: retain the stamp in memory for build record and
+                    // manifest provenance; only audit artifacts hold the text.
                     let hash = crate::hashutil::sha256_prefixed(text.as_bytes());
                     doc.meta.translation = Some(crate::lock::TranslationStamp {
                         prompt_version: TRANSLATE_PROMPT_VERSION.into(),
@@ -389,10 +401,14 @@ fn write_or_check(
     let mut files = Vec::new();
     let mut texts: HashMap<String, String> = HashMap::new();
     let mut record = std::collections::BTreeMap::new();
+    let mut translations = std::collections::BTreeMap::new();
     for id in ordered {
         let doc = &docs[id];
         let rel = lock_rel(&doc.meta.source);
         let text = render_lock(doc);
+        if let Some(stamp) = &doc.meta.translation {
+            translations.insert(rel.clone(), stamp.clone());
+        }
         record.insert(rel.clone(), crate::buildrecord::lock_hash(&text));
         texts.insert(rel.clone(), text);
         files.push(rel);
@@ -409,6 +425,7 @@ fn write_or_check(
             build_record: serde_json::to_string(&crate::buildrecord::BuildRecord {
                 version: 1,
                 locks: record,
+                translations,
             })
             .ok(),
         };
@@ -453,7 +470,9 @@ fn write_or_check(
             .collect();
         if let Err(err) = crate::lockcommit::commit_journaled(opts.root, &writes) {
             report.push(Diag::error("compile", format!("cannot write locks: {err}")));
-        } else if let Err(err) = crate::buildrecord::write(opts.root, record) {
+        } else if let Err(err) =
+            crate::buildrecord::write_with_translations(opts.root, record, translations)
+        {
             report.push(Diag::error(
                 crate::buildrecord::PATH,
                 format!("cannot write build record: {err}"),
@@ -1036,7 +1055,7 @@ pub const TRANSLATION_AUDIT_DIR: &str = ".vibe/audit/translations";
 /// TODO(D109/D117): the release audit artifact does not exist yet (not in
 /// #97). When the release job builds it, include every file under
 /// `TRANSLATION_AUDIT_DIR` so its digest is covered by the attestation, and
-/// check each file's sha256 against the lock's `translation.hash`.
+/// check each file's sha256 against the build record / manifest translation stamp.
 fn record_translation_for_audit(
     root: &std::path::Path,
     id: &str,
@@ -1574,11 +1593,29 @@ fn normalize_version(doc: &mut LockDoc) -> Result<(), Vec<Diag>> {
     Ok(())
 }
 
+/// All spellings of no custom errors share one canonical representation.
+fn normalize_errors(sections: &mut Vec<Section>) {
+    if let Some(errors) = find_section_mut(sections, "Errors") {
+        if errors.bullets.is_empty()
+            && errors.blocks.is_empty()
+            && errors
+                .table
+                .as_ref()
+                .is_none_or(|table| table.rows.is_empty())
+        {
+            *errors = Section::none("Errors");
+        }
+    } else {
+        sections.push(Section::none("Errors"));
+    }
+}
+
 fn normalize_feature(
     doc: &mut LockDoc,
     source: &SourceFile,
     docs: &HashMap<String, LockDoc>,
 ) -> Result<(), Vec<Diag>> {
+    normalize_errors(&mut doc.sections);
     let mut parts = source.id.split('/');
     let definition = parts.next().unwrap_or("");
     let version = parts.next().unwrap_or("");
@@ -2068,7 +2105,7 @@ fn semantic_check(
     ] {
         for word in words {
             let (_, ambiguous, negative, definite) = keyword_occurrences(&text, word);
-            if ambiguous {
+            if ambiguous && !front.iter().any(|(key, _)| key == field) {
                 report.push(Diag::warning(&doc.meta.source, format!(
                     "ambiguous negation near `{word}`; requirement retained; confirm with the structured `{field}` frontmatter field"
                 )));
@@ -2429,6 +2466,9 @@ fn keyword_reading(text: &str, word: &str) -> (bool, bool, bool) {
 // Fixed auth-removal wording, matched only within the same clause and without
 // another preceding negator. In particular, "not without auth" stays ambiguous.
 const AUTH_REMOVAL_PHRASES: &[&str] = &[
+    "唔需要驗證",
+    "唔使驗證",
+    "唔使登入",
     "唔需要登入",
     "不需要登入",
     "免登入",
@@ -2871,6 +2911,27 @@ mod prompt_tests {
     use std::collections::HashMap;
 
     #[test]
+    fn empty_errors_render_identically_and_real_rows_survive() {
+        let mut rendered = Vec::new();
+        for body in [
+            "",
+            "## Errors\n",
+            "## Errors\n(none)\n",
+            "## Errors\n| code | status |\n| --- | --- |\n",
+        ] {
+            let mut sections = crate::lock::parse_sections(body).unwrap();
+            super::normalize_errors(&mut sections);
+            rendered.push(crate::lock::render_sections(&sections));
+        }
+        assert!(rendered.iter().all(|text| text == "## Errors\n(none)\n"));
+        let body = "## Errors\n| code | status |\n| --- | --- |\n| MISSING | 404 |\n";
+        let mut sections = crate::lock::parse_sections(body).unwrap();
+        let before = sections.clone();
+        super::normalize_errors(&mut sections);
+        assert_eq!(sections, before);
+    }
+
+    #[test]
     fn compile_prompt_version_and_hash() {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
@@ -2897,8 +2958,8 @@ mod prompt_tests {
         assert_eq!(
             (crate::lock::PROMPT_VERSION, actual.as_str()),
             (
-                "prompt-5",
-                "d2adc5cd17ddefeaa4d6dfec31a8ac7e2abd7b2ef9f515a2b337d54620c10517"
+                "prompt-6",
+                "a76a7fcafca78423772a30255a4e058831f0a75afe1c504004cb00e2bf96ba94"
             ),
             "compile prompt changed: bump PROMPT_VERSION and update the recorded hash"
         );
@@ -3206,6 +3267,31 @@ mod security_tests {
 
     const PUBLIC: &str = "## Access\n- public: true\n## Pipelines\n### -auth\n- removed: true\n";
     const PRIVATE: &str = "## Access\n- public: false\n## Pipelines\n### auth\n- mode: jwt\n";
+
+    #[test]
+    fn structured_auth_confirms_cantonese_removal_and_ambiguity() {
+        for prose in [
+            "呢個 API 唔需要驗證",
+            "公開，唔使登入",
+            "唔使驗證",
+            "唔需要登入",
+        ] {
+            let public = prose.contains("公開");
+            let body = PUBLIC.replace("public: true", &format!("public: {public}"));
+            let (doc, sources) = feature(
+                &format!("---\nauth: none\npublic: {public}\n---\n{prose}"),
+                &body,
+            );
+            let mut report = Report::new();
+            semantic_check(&doc, &sources, &HashMap::new(), &mut report);
+            assert!(!report.has_errors(), "{report}");
+            assert!(
+                !report.to_string().contains("ambiguous negation"),
+                "{report}"
+            );
+        }
+        assert_ambiguous_requirement("驗證唔需要", "驗證", PRIVATE);
+    }
 
     #[test]
     fn separated_chinese_necessity_retains_requirement_and_warns() {

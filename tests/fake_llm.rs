@@ -346,6 +346,9 @@ async fn structured_locks_ignore_llm_config_and_check_consistently() {
 }
 
 const AUTH_REMOVAL_PROSE: &[&str] = &[
+    "呢個 API 唔需要驗證",
+    "唔使驗證",
+    "公開，唔使登入",
     "唔需要登入",
     "不需要登入",
     "免登入",
@@ -572,7 +575,7 @@ async fn login_requirements_and_required_frontmatter_still_reject_auth_removal()
 }
 
 #[tokio::test]
-async fn auth_double_negations_still_warn_and_retain_the_requirement() {
+async fn structured_auth_confirms_double_negations_and_retains_the_requirement() {
     for phrase in [
         "唔可以唔登入",
         "not without login",
@@ -589,7 +592,7 @@ async fn auth_double_negations_still_warn_and_retain_the_requirement() {
         .await;
         let out = result.unwrap_or_else(|err| panic!("{phrase}: {err}"));
         assert!(
-            out.report.to_string().contains("ambiguous negation"),
+            !out.report.to_string().contains("ambiguous negation"),
             "{phrase}: {}",
             out.report
         );
@@ -642,5 +645,177 @@ async fn optional_api_parts_normalize_deterministically() {
             fs::remove_dir_all(root).unwrap();
         }
         assert_eq!(locks[0], locks[1]);
+    }
+}
+
+#[tokio::test]
+async fn decision_165_cache_free_locks_and_audit_provenance() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for prose in [
+        "回傳 hello world，唔需要驗證",
+        "Return hello world, no auth",
+    ] {
+        let (root, result) = compile_auth_feature("none", prose, "(none)", false).await;
+        result.unwrap_or_else(|err| panic!("{err}"));
+        let rel = "api/catalog/v1/greet/greet.lock.md";
+        let before = fs::read(root.join(rel)).unwrap();
+        let doc = parse_lock(std::str::from_utf8(&before).unwrap()).unwrap();
+        let body = vibe::lock::render_sections(&doc.sections);
+        let calls = AtomicUsize::new(0);
+        let adapter = FakeAdapter {
+            responder: |request: &LlmRequest| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                if request.system == vibe::compile::TRANSLATE_PROMPT {
+                    Ok(format!(
+                        "Return hello world without authentication. Variant {call}."
+                    ))
+                } else {
+                    let errors = match call % 3 {
+                        0 => "",
+                        1 => "## Errors\n| code | status |\n| --- | --- |\n",
+                        _ => "## Errors\n(none)\n",
+                    };
+                    Ok(format!(
+                        "{}{errors}",
+                        body.split("## Errors").next().unwrap()
+                    ))
+                }
+            },
+        };
+        let mut config = LlmConfig {
+            provider: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "test-key".into(),
+            model: "gpt-test-2026-01-01".into(),
+            timeout: Duration::from_secs(1),
+            max_retries: 0,
+            seed: 0,
+            endpoint_host: "api.openai.com".into(),
+            endpoint_private: false,
+            send_sampling: true,
+            api_style: "chat".into(),
+        };
+        for _ in 0..3 {
+            let _ = fs::remove_dir_all(root.join(".vibe/cache"));
+            let output = compile_project(&CompileOptions {
+                root: &root,
+                llm: Some(&adapter),
+                llm_config: Some(&config),
+                check: false,
+            })
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+            assert!(!output.report.to_string().contains("no Errors section"));
+            assert_eq!(fs::read(root.join(rel)).unwrap(), before);
+        }
+        let record: vibe::buildrecord::BuildRecord =
+            serde_json::from_slice(&fs::read(root.join(vibe::buildrecord::PATH)).unwrap()).unwrap();
+        assert_eq!(record.translations.contains_key(rel), !prose.is_ascii());
+        let (loaded, _) = vibe::compile::compile_in_memory(&root, Some(&adapter), Some(&config))
+            .await
+            .unwrap();
+        let manifest = vibe::manifest::build_signed(
+            &root,
+            &loaded,
+            None,
+            &vibe::manifest::BuildInfo {
+                release: true,
+                version: "1.0.0".into(),
+                commit: "a".repeat(40),
+            },
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            manifest.provenance.translations.contains_key(rel),
+            !prose.is_ascii()
+        );
+        // Legacy fields are accepted and dropped, with exactly one actionable warning.
+        let old = std::str::from_utf8(&before).unwrap().replacen("security-items:", "translation: { prompt-version: translate-1, llm-provider: openai, model-snapshot: test, hash: sha256:0123 }\nsecurity-items:", 1);
+        fs::write(root.join(rel), &old).unwrap();
+        assert_eq!(
+            vibe::lock::render_lock(&parse_lock(&old).unwrap()).as_bytes(),
+            before
+        );
+        let result = validate_project(&ValidateOptions {
+            root: &root,
+            dev: true,
+            deploy: false,
+        });
+        let report = result.unwrap_or_else(|report| report);
+        assert_eq!(report.to_string().matches("lock contains a `translation` field, which is no longer written (decision 165); run `vibe compile` to refresh it").count(), 1);
+        // The old prompt's compiler hash must be stale under prompt-6.
+        fs::write(
+            root.join(rel),
+            std::str::from_utf8(&before)
+                .unwrap()
+                .replace(&doc.meta.compiler_hash, "sha256:old-prompt-hash"),
+        )
+        .unwrap();
+        let result = validate_project(&ValidateOptions {
+            root: &root,
+            dev: true,
+            deploy: false,
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("compiler-hash does not match"));
+        fs::write(root.join(rel), &before).unwrap();
+        let source = root.join("api/catalog/v1/greet/greet.md");
+        fs::write(
+            &source,
+            format!(
+                "{}\nChanged greeting text.\n",
+                fs::read_to_string(&source).unwrap()
+            ),
+        )
+        .unwrap();
+        let result = validate_project(&ValidateOptions {
+            root: &root,
+            dev: true,
+            deploy: false,
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("source-hash does not match"));
+        // Several natural-language files still yield a single sampling warning.
+        fs::create_dir_all(root.join("api/catalog/v1/other")).unwrap();
+        fs::write(
+            root.join("api/catalog/v1/other/other.md"),
+            "---\nauth: none\npublic: true\nwrites: false\n---\nAnother greeting, no auth.",
+        )
+        .unwrap();
+        let multi = FakeAdapter {
+            responder: |request: &LlmRequest| {
+                if request.system == vibe::compile::TRANSLATE_PROMPT {
+                    Ok("Return hello world without authentication.".into())
+                } else if request.input.contains("api/catalog/v1/other/other.md") {
+                    Ok(body.replace("/greet", "/other"))
+                } else {
+                    Ok(body.clone())
+                }
+            },
+        };
+        for send_sampling in [true, false] {
+            config.send_sampling = send_sampling;
+            let _ = fs::remove_dir_all(root.join(".vibe/cache"));
+            let out = compile_project(&CompileOptions {
+                root: &root,
+                llm: Some(&multi),
+                llm_config: Some(&config),
+                check: false,
+            })
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(
+                out.report
+                    .to_string()
+                    .matches("sampling parameters were not sent")
+                    .count(),
+                1
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }
