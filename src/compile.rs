@@ -139,9 +139,12 @@ pub async fn compile_project(opts: &CompileOptions<'_>) -> Result<CompileOutput,
                 continue;
             }
         };
+        // Same extraction as `vibe validate` (check_security_items_enriched):
+        // a feature that calls a writing method gets write-sql too.
+        let mut items = security::extract_items(&docs[id]);
+        security::enrich_feature_writes(&docs[id], &docs, &mut items);
         let doc = docs.get_mut(id).expect("doc inserted");
         doc.meta.dependencies = deps;
-        let mut items = security::extract_items(doc);
         if doc
             .meta
             .security_items
