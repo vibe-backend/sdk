@@ -1,6 +1,6 @@
 # ADR 0001: Best-practice pattern library
 
-- **Status:** Proposed (draft, not yet reviewed). The PM hard rules below were set by the PM on 2026-10-17 09:59 HKT; the §9 points were approved by the PM on 2026-10-17 10:08 HKT (decisions 158–163, [record](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228340971)); P8–P10 on 10:21 HKT ([record](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228450139)); P11–P12 on 10:30 HKT ([record](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228528480)). This ADR feeds the v1.1 spec and does not block any v1 blocker.
+- **Status:** Proposed (draft, not yet reviewed). The PM hard rules below were set by the PM on 2026-10-17 09:59 HKT ([record](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228840442)); the §9 points were approved by the PM on 2026-10-17 10:08 HKT (decisions 158–163, [record](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228340971)); P8–P10 on 10:21 HKT ([record](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228450139)); P11–P12 on 10:30 HKT ([record](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228528480)). This ADR feeds the v1.1 spec and does not block any v1 blocker.
 - **Date:** 2026-10-17
 - **Spec:** [`../spec-pattern-library-v1.1.md`](../spec-pattern-library-v1.1.md) (decisions 150–168)
 - **Related:** decisions 79, 113, 117, 118, 119 (provenance, lock as build output, Sigstore keyless), 149 (read-only sign-method); PRs #147, #95.
@@ -32,6 +32,8 @@ The compiler turns natural-language Markdown into a lock and then into an execut
 4. The signer identity MUST be pinned to an exact repo and workflow (issuer + SAN). Offline verification (bundle + cached trust root) MUST be supported so deploys still work when Sigstore/Rekor is down. Verification failure MUST fail closed. A `vibe serve` cold start MUST NOT download anything.
 5. The v1 internal refactor onto the same interface MUST wait until #147, #95 and the D149 implementation have merged, MUST be additive with no behaviour change, and MUST be scheduled at the end of the GA plan.
 
+- `use:` distinguishes sources by prefix: `builtin:<id>` selects a core pattern (not listed in `patterns.md`); a bare `<id>@<range>` selects a registry pattern declared in `patterns.md`.
+
 ## PM decisions (2026-10-17 10:30 HKT, [record](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228528480))
 
 - P11 / D166 (A): a business pattern MUST only output IR, MUST NOT choose the DB role, MUST NOT bypass the core RLS or `owner-key` checks, and MUST only send secrets to `egress:` hosts. Violations are compile errors.
@@ -41,7 +43,7 @@ The compiler turns natural-language Markdown into a lock and then into an execut
 
 1. Pins MUST live in a committed `patterns.md` (exact version + sha256); a mismatch MUST fail closed; `use:` MUST only choose a declared version (D164).
 2. Endpoint `egress:` and `secrets:` are added in v1.1 and count as empty in v1; a pattern's egress and secrets MUST be a subset of the endpoint's; `egress:` MUST list explicit hosts, and a wildcard is a validate error (D165).
-3. With no local verified withdrawal list, compile MUST start from the signed list built into the core release, and MUST fail closed only when no built-in list exists (D168).
+3. Superseded by the 11:05 HKT amendment ([record](https://github.com/vibe-backend/sdk/pull/274#issuecomment-6228842938)): compile MUST verify both the built-in and the cached withdrawal lists, discard any that fails verification, and use the one with the higher version; rollback protection and fail-closed rules are unchanged, and with no usable list compile MUST fail closed (D168).
 
 ## Consequences
 
