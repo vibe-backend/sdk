@@ -25,6 +25,7 @@ pub mod secret;
 pub mod security;
 pub mod sign;
 pub mod sigstore;
+pub mod source_lines;
 pub mod sqlguard;
 pub mod sqlpolicy;
 pub mod validate;

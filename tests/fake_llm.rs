@@ -819,3 +819,108 @@ async fn decision_165_cache_free_locks_and_audit_provenance() {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[tokio::test]
+async fn decision_167_block_snap_and_validate() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for (paragraph, count) in [
+        (
+            "提供公開端點，回傳 HTTP 狀態碼 `200`，以及固定嘅 JSON 回應：",
+            5,
+        ),
+        ("Return HTTP status 200 and this fixed JSON response:", 3),
+    ] {
+        let (root, result) =
+            compile_auth_feature("none", "A greeting route.", "(none)", false).await;
+        result.unwrap_or_else(|err| panic!("{err}"));
+        let rel = "api/catalog/v1/greet/greet.lock.md";
+        let original = parse_lock(&fs::read_to_string(root.join(rel)).unwrap()).unwrap();
+        let body = vibe::lock::render_sections(&original.sections);
+        let source = format!("---\npublic: true\nwrites: false\nauth: none\n---\n# Hello World API\n\n{paragraph}\n\n```json\n{{\"message\":\"hello world\"}}\n```\n");
+        fs::write(root.join("api/catalog/v1/greet/greet.md"), &source).unwrap();
+        let calls = AtomicUsize::new(0);
+        let translations = AtomicUsize::new(0);
+        let adapter = FakeAdapter {
+            responder: |request: &LlmRequest| {
+                if request.system == vibe::compile::TRANSLATE_PROMPT {
+                    let n = translations.fetch_add(1, Ordering::SeqCst);
+                    Ok(format!(
+                        "Return a public greeting. Translation variant {n}."
+                    ))
+                } else {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    let citation = ["8-12", "8-11", "8-10", "8 - 12", "8-11"][n % 5];
+                    Ok(body.replace(
+                        "- source-lines: 7-7",
+                        &format!("- source-lines: {citation}"),
+                    ))
+                }
+            },
+        };
+        let config = LlmConfig {
+            provider: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "test-key".into(),
+            model: "gpt-test-2026-01-01".into(),
+            timeout: Duration::from_secs(1),
+            max_retries: 0,
+            seed: 0,
+            endpoint_host: "api.openai.com".into(),
+            endpoint_private: false,
+            send_sampling: true,
+            api_style: "chat".into(),
+        };
+        let mut before = None;
+        for _ in 0..count {
+            fs::remove_dir_all(root.join(".vibe/cache")).ok();
+            compile_project(&CompileOptions {
+                root: &root,
+                llm: Some(&adapter),
+                llm_config: Some(&config),
+                check: false,
+            })
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+            let bytes = fs::read(root.join(rel)).unwrap();
+            assert!(std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("- source-lines: 8-12"));
+            if let Some(previous) = &before {
+                assert_eq!(&bytes, previous);
+            }
+            before = Some(bytes);
+            validate_project(&ValidateOptions {
+                root: &root,
+                dev: true,
+                deploy: false,
+            })
+            .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), count);
+        assert_eq!(
+            vibe::source_lines::snap_source_lines(&source, Some("9-12")),
+            "10-12"
+        );
+        assert_eq!(
+            vibe::source_lines::snap_source_lines(&source, Some("8")),
+            "8-8"
+        );
+        let text = String::from_utf8(before.unwrap())
+            .unwrap()
+            .replace("- source-lines: 8-12", "- source-lines: 8-11");
+        fs::write(root.join(rel), text).unwrap();
+        let error = validate_project(&ValidateOptions {
+            root: &root,
+            dev: true,
+            deploy: false,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("source-lines `8-11` must equal `8-12`; run `vibe compile`"),
+            "{error}"
+        );
+        assert!(error.contains("s1 respond"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+}

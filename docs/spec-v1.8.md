@@ -18,7 +18,7 @@
 
 ### v1.8（草稿，2026-10-14）
 
-- 補編決定 150–166（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
+- 補編決定 150–167（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 compiler-hash 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory`）
 - 新增 `vibe build`：一個指令做晒編譯、驗證同 manifest（類似 `nest build`），冇 reviewer 步驟（審核由 Git 平台設定負責，決定 76，見 2C.3）。（決定 164：v1 用 `vibe manifest`，`vibe build` 延至 vNext）
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
@@ -284,7 +284,7 @@
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
-### 0.14 v1.8 2026-10-17 決定（決定 150–166，產品經理已批准 2026-10-17）
+### 0.14 v1.8 2026-10-17 決定（決定 150–167，產品經理已批准 2026-10-17）
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
@@ -305,6 +305,7 @@
 | 164 | `vibe build` 唔喺 1.0：`vibe manifest`（預設 release；`--dev`、`--release`）係官方 build 指令；`vibe build`（`--labels`、`-o`、部署報告）延至 vNext。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.3 |
 | 165 | 同一 source、同一 `PROMPT_VERSION` 同同一結構，一定產生 byte-identical lock；lock 唔可以包含任何每次 run 都可能改變嘅欄位。Translation stamp 改記喺 build record 同 manifest provenance，唔再寫入 lock。 | 已批准（產品經理 2026-10-17） | 2A.1、2.1a |
 | 166 | `vibe dev` 唔喺 1.0，延至 vNext；1.0 本地開發流程係互動 `vibe` → `vibe compile` → `vibe manifest --dev` → `vibe serve --memory` → curl。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.2 |
+| 167 | `source-lines` 由 compiler 計，model 引用嘅範圍 snap 去所在 markdown block（段落、list、table、fenced code、heading、frontmatter）嘅 union；無效或者超出範圍用 body 全部 block 範圍做 fallback；validate 要求 block 對齊。已知問題：model 引用另一段落時 lock 仍然可能唔同；唔阻 rc。 | 已批准（產品經理 2026-10-17） | 2A.2、2A.4 |
 
 ## 1. 目錄同命名
 
@@ -536,12 +537,16 @@ security-items:                    # 驗證器 deterministic 抽出，資訊性�
 - 正規化後嘅 Route path 有 `{slug}` segment，就先移除 Request 所有 model 寫嘅 `path.slug` row，再喺第一個 data row 加且只加 `| path.slug | string | - | yes |`；其他 row 保留次序。Request 係 `(none)` 或冇 table 時，建立 header `| field | type | rules | required |` 嘅 table。Route 冇 `{slug}` segment 就移除所有 `path.slug` row；移除後冇 row 就寫 `(none)`。
 
 - B3（決定 165）：自然語言同 structured feature 嘅 `## Errors` 缺省、空白、只有 table header 同 separator 冇 data row、或者 `(none)`，一律正規化成 `(none)`；有真正 error row 就保留。冇自訂 error 唔發「feature has no Errors section」warning；手寫 lock 真係冇 Errors section，就由固定 section 結構檢查報 error，唔再加重複 warning。
+- B4（決定 167）：自然語言同 structured source 嘅所有 section block（包括 steps 同 `-auth` 等 pipeline）嘅 `source-lines` 都由 compiler 喺 validate／repair 之前按下面規則 snap；缺少引用用固定 fallback，唔發 warning，亦唔係 compile error。
 
 - section 用 `##` 標題，名稱同次序按 kind 固定（見 2A.3）；唔准有額外 section，缺 section 用 `(none)` 表示；api feature 可以省略 `## Transform`，等同 `(none)`，compile 會喺 lock 嘅固定位置補返。
 - 每個 step 用 `### s{n} {op}` 做標題，下面用 `- key: value` 列點，key 次序固定：`op`、（op 專用參數）、`out`、`source-lines`。
 - 變數參照一律用 `input.x`、`ctx.x`、`req.x`、或者之前 step 嘅 `out` 名；唔准參照未定義變數。Transform `in` 只可以用 `req`、`ctx`；step 同 Transform `out` 可以用 `input`、`req`、`ctx` 同之前 step 嘅 `out`；method 用 `input`、`ctx` 同之前 step 嘅 `out`。
 - sql 一律寫喺 inline code 入面，用 `$1`、`$2` 參數，`params` 列出對應來源；唔准字串拼接。
-- `source-lines` 指返 source `.md` 嘅行數，方便 review 對照。
+- `source-lines` 係 compiler 計出嘅 enclosing markdown block 範圍，方便 review 對照；model 引用只係 hint。行數由 1 開始，以 compile prompt 顯示行號嘅完整 `source.combined_text()` 為準，包括 frontmatter 同附加 schema 部分；自然語言、structured source 同 validate 都用同一份文字。
+- Block 定義（決定 167）：第 1 行係 `---` 時，由第 1 行到 closing `---`（包括兩端）係一個 frontmatter block。其餘文字逐行分 block：trim start 後以至少三個連續 backtick 或 `~` 開頭就開 fenced code block，去到下一行 trim start 後以同一字元、至少同樣長度 marker 開頭嘅行為止（包括兩條 fence 同中間空行）；冇 closing fence 就去到文字結尾。Fence 即使緊貼其他非空行都獨立成 block。Fence／frontmatter 外，符合 `^#{1,6}(\s|$)` 嘅 ATX heading 每行獨立成 block。其餘連續非空行嘅最大範圍係一個 block，涵蓋段落、list 同 table；空行分隔 block，所以 loose list 項目之間有空行就係幾個 block。`<!-- schema.md -->` 等 HTML comment 當普通行。空行本身唔屬任何 block。
+- Snap：引用接受 ASCII 數字 `N` 或 `A-B`（`-` 兩邊可有空格），要求 `1 <= A <= B`。結果由第一個同引用相交嘅 block 開始，到最後一個相交 block 結尾，包含中間空行。只引用空行就揀最近嘅下一個 block；後面冇 block 就揀前一個。開始仍然喺文字內、結尾超出最後一行，就先 clamp 結尾再 snap。缺少、無法解析、倒轉、0、整段超出最後一行，或者文字冇 body block，都用固定 fallback：由 body 第一個到最後一個 block（排除 frontmatter）；body 冇 block 就用 frontmatter；完全冇 block 就用 `1-1`。結果永遠寫 `A-B`，單行亦一樣；只係 provenance metadata，唔發 warning，亦唔係 compile error。
+- `vibe validate` 對有 source 文字嘅 lock，逐個 `source-lines` 檢查值係咪等於同一 snap function 嘅結果，即必須已經 block 對齊同用 canonical `A-B`；唔一致就報 error，列明 lock、section／step、原值同預期值，提示行 `vibe compile`。
 
 - expression 支援字面值：JSON 字串、數字、`true`／`false`／`null`；object key 可以加雙引號；暫時唔支援 array。
 - `true`／`false`／`null` 係保留字，唔可以做變數名。object 入面明確寫嘅 `null` 會保留；path 解析成 `null` 嘅欄位會省略。
@@ -1036,12 +1041,12 @@ security-items:
 ### s1 ddl
 - op: ddl
 - sql: `alter table users add column phone text null check (char_length(phone) <= 20)`
-- source-lines: 2-2
+- source-lines: 2-3
 
 ### s2 ddl
 - op: ddl
 - sql: `create unique index users_email_key on users (tenant_id, email)`
-- source-lines: 3-3
+- source-lines: 2-3
 
 ## Verify
 ### v1 verify
@@ -2720,13 +2725,13 @@ security-items: [{ item: rate-limit-new, risk: medium, reason: "登入防爆破"
 - op: rate-limit-check
 - key: ip
 - per-minute: params.ip-per-minute
-- source-lines: 2-2
+- source-lines: 2-4
 
 ### s2 rate-limit-check
 - op: rate-limit-check
 - key: input.email                 # 4.3：normalize 之後 HMAC，唔儲存明文
 - per-minute: params.account-per-minute
-- source-lines: 2-2
+- source-lines: 2-4
 
 ### s3 audit
 - op: audit
@@ -2734,7 +2739,7 @@ security-items: [{ item: rate-limit-new, risk: medium, reason: "登入防爆破"
 - fields: [req.ip]
 - hash: [req.body.email]           # 決定 68：記 HMAC，唔記明文 email
 - redact: [req.body.password]
-- source-lines: 4-4
+- source-lines: 2-4
 ````
 
 ### 11.3 api 定義同版本
@@ -2860,21 +2865,21 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" 
 - target: user.register
 - args: transform.in
 - out: u                           # u.created：true = 新建立，false = 重試（未接受邀請）
-- source-lines: 4-4
+- source-lines: 2-6
 
 ### s2 method
 - op: method
 - target: user.invite
 - args: { user_id: u.id }
 - out: (none)
-- source-lines: 4-4
+- source-lines: 2-6
 
 ### s3 respond
 - op: respond
 - status: 202   # 決定 95：邀請已入 outbox，invite_status = invite_pending
 - value: transform.out
 - location: /users/v2/{u.id}
-- source-lines: 5-5
+- source-lines: 2-6
 
 ## Errors
 | status | code | from |
@@ -2943,18 +2948,18 @@ security-items:
 - scope: pk                     # conflict target (tenant_id, email)；冇 UPDATE
 - columns: { insert: [email, name] }
 - out: u
-- source-lines: 3-4
+- source-lines: 2-6
 
 ### s2 validate
 - op: validate
 - when: `u.id == null`
 - fail: EMAIL_TAKEN
-- source-lines: 5-5
+- source-lines: 2-6
 
 ### s3 respond
 - op: respond
 - value: { id: u.id, email: u.email, name: u.name, created: u.created }
-- source-lines: 6-6
+- source-lines: 2-6
 ````
 
 - 一個 statement：CTE `ins` 做 `insert ... on conflict do nothing returning ..., true as created`；冇插入（email 已存在）就由第二段 SELECT 搵「未驗證、冇密碼、未刪除」嘅原有列，`created` 明確係 `false`；兩段都冇結果就 `EMAIL_TAKEN`（決定 85）。唔靠 `xmax` 呢類內部欄位，in-memory 執行器亦容易模擬。
@@ -3008,7 +3013,7 @@ security-items:
 - op: random-token
 - bytes: 32
 - out: it                       # it.value（sensitive）、it.hash
-- source-lines: 4-4
+- source-lines: 2-7
 
 ### s2 query
 - op: query
@@ -3020,25 +3025,25 @@ security-items:
 - scope: pk
 - columns: [email_verify_hash, email_verify_expires_at, email_verify_purpose]
 - out: upd
-- source-lines: 5-5
+- source-lines: 2-7
 
 ### s3 validate
 - op: validate
 - when: `upd.id == null`
 - fail: ALREADY_ACTIVE
-- source-lines: 4-4
+- source-lines: 2-7
 
 ### s4 method
 - op: method
 - target: email-outbox.enqueue
 - args: { user_id: upd.id, email: upd.email, token: it.value, purpose: invite }
 - out: (none)
-- source-lines: 6-6
+- source-lines: 2-7
 
 ### s5 respond
 - op: respond
 - value: {}
-- source-lines: 7-7
+- source-lines: 2-7
 ````
 
 - 用 `app_rw`（已認證 admin 路徑），唔係 public role。
@@ -3119,12 +3124,12 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 寄邀請" }]
 - target: user.invite
 - args: transform.in
 - out: (none)
-- source-lines: 3-3
+- source-lines: 1-3
 
 ### s2 respond
 - op: respond
 - status: 202   # 決定 95：invite_status = invite_pending
-- source-lines: 3-3
+- source-lines: 1-3
 
 ## Errors
 | status | code | from |
@@ -3648,12 +3653,12 @@ security-items:
 - ttl-cap: 1h
 - issue-refresh: platform-decided   # 登入 new-family；token-refresh rotate
 - out: token
-- source-lines: 1-5
+- source-lines: 1-6
 
 ### s2 respond
 - op: respond
 - value: { token: token.access, refresh_token: token.refresh }
-- source-lines: 4-4
+- source-lines: 2-6
 ````
 
 `models/user/methods/login.md`
@@ -3709,7 +3714,7 @@ security-items:
 - params: [input.email]
 - writes: false
 - out: u
-- source-lines: 7-7
+- source-lines: 6-10
 
 ### s2 verify-password
 - op: verify-password
@@ -3718,13 +3723,13 @@ security-items:
 - plain: input.password
 - missing-user: dummy-hash
 - out: ok
-- source-lines: 8-8
+- source-lines: 6-10
 
 ### s3 validate
 - op: validate
 - when: `ok != true`
 - fail: INVALID_CREDENTIALS
-- source-lines: 8-8
+- source-lines: 6-10
 
 ### s4 query
 - op: query
@@ -3736,19 +3741,19 @@ security-items:
 - scope: pk
 - columns: [last_login_at]
 - out: (none)
-- source-lines: 9-9
+- source-lines: 6-10
 
 ### s5 method
 - op: method
 - target: user.sign-token
 - args: { sub: u.id }
 - out: t
-- source-lines: 10-10
+- source-lines: 6-10
 
 ### s6 respond
 - op: respond
 - value: { user: { id: u.id, email: u.email, name: u.name, roles: u.roles }, token: t.token, refresh_token: t.refresh_token }
-- source-lines: 10-10
+- source-lines: 6-10
 ````
 
 - s4 係寫入，所以 `writes: true`；login 係 public endpoint，s4 用 `public_writer` 執行，grant 只有 `UPDATE(last_login_at)`（決定 4 令呢個情況變得可行）。
@@ -3851,13 +3856,13 @@ security-items:
 - target: user.login
 - args: transform.in
 - out: result
-- source-lines: 7-7
+- source-lines: 7-9
 
 ### s2 respond
 - op: respond
 - status: 200
 - value: transform.out
-- source-lines: 7-7
+- source-lines: 7-9
 
 ## Errors
 | status | code | from |
@@ -4102,7 +4107,7 @@ security-items:
 - value: input.email
 - normalize: email               # 決定 120 正規化，再 HMAC-SHA-256(pepper, ...)
 - out: rh
-- source-lines: 5-5
+- source-lines: 2-6
 
 ### s2 query
 - op: query
@@ -4113,12 +4118,12 @@ security-items:
 - writes: true
 - columns: [user_id, email, recipient_hash, template, token]
 - out: (none)
-- source-lines: 3-4
+- source-lines: 2-6
 
 ### s3 respond
 - op: respond
 - value: {}
-- source-lines: 5-5
+- source-lines: 2-6
 ````
 
 - 範本選擇寫喺單一參數化 INSERT 入面，唔使條件分支 step；三個範本 `verify-email`、`already-registered`、`invite` 都由同一個 `case` 覆蓋，兩種連結（驗證、邀請）都去同一個設定密碼頁，最後都係 `user.complete-verification`；`template` 由 Signature 嘅 `derived` 宣告，驗證器對比 SQL 嘅 `case` 同 `derived.rule` 一致（決定 66）。
@@ -4174,7 +4179,7 @@ security-items:
 - op: random-token
 - bytes: 32
 - out: vt                       # vt.value（sensitive，43 字 base64url）、vt.hash（bytes）
-- source-lines: 5-5
+- source-lines: 5-9
 
 ### s2 query
 - op: query
@@ -4186,19 +4191,19 @@ security-items:
 - scope: pk                     # conflict target (tenant_id, email) 係唯一鍵，DO UPDATE 最多影響一列
 - columns: { insert: [email, name, email_verify_hash, email_verify_expires_at, email_verify_purpose], update: [email_verify_hash, email_verify_expires_at, email_verify_purpose] }
 - out: ins                      # 新用戶或者未驗證用戶回 id；已驗證或者有未過期邀請 ins.id 係 null
-- source-lines: 6-6
+- source-lines: 5-9
 
 ### s3 method
 - op: method
 - target: email-outbox.enqueue
 - args: { user_id: ins.id, email: input.email, token: vt.value, purpose: register }
 - out: (none)
-- source-lines: 7-7
+- source-lines: 5-9
 
 ### s4 respond
 - op: respond
 - value: {}
-- source-lines: 8-8
+- source-lines: 5-9
 ````
 
 - 冇 `set-password` capability、冇 `hash-password` step：公開註冊永遠唔寫 password。
@@ -4260,13 +4265,13 @@ security-items:
 - plain: input.password
 - policy: platform-floor        # 最少 12 字元 + 長度唔合 fail WEAK_PASSWORD，洩漏 fail BREACHED_PASSWORD
 - out: pw
-- source-lines: 6-6
+- source-lines: 6-8
 
 ### s2 hash-token
 - op: hash-token
 - value: input.token
 - out: th
-- source-lines: 7-7
+- source-lines: 6-8
 
 ### s3 query
 - op: query
@@ -4279,18 +4284,18 @@ security-items:
 - columns: [password, email_verified_at, email_verify_hash, email_verify_expires_at, email_verify_purpose]
 - password-source: s1
 - out: upd
-- source-lines: 7-7
+- source-lines: 6-8
 
 ### s4 validate
 - op: validate
 - when: `upd.id == null`
 - fail: INVALID_TOKEN
-- source-lines: 7-7
+- source-lines: 6-8
 
 ### s5 respond
 - op: respond
 - value: {}
-- source-lines: 7-7
+- source-lines: 6-8
 ````
 
 - 一個 UPDATE 同時設 password 同 `email_verified_at`（決定 53、67、69）：冇「已驗證但冇密碼」或者「有密碼但未驗證」嘅中間狀態，所以決定 55 成立。
@@ -4396,13 +4401,13 @@ security-items:
 - target: user.self-register
 - args: transform.in
 - out: (none)
-- source-lines: 7-7
+- source-lines: 5-8
 
 ### s2 respond
 - op: respond
 - status: 202
 - value: transform.out
-- source-lines: 8-8
+- source-lines: 5-8
 
 ## Errors
 | status | code | from |
@@ -4519,12 +4524,12 @@ security-items:
 - target: user.complete-verification
 - args: transform.in
 - out: (none)
-- source-lines: 8-8
+- source-lines: 5-9
 
 ### s2 respond
 - op: respond
 - status: 204
-- source-lines: 8-8
+- source-lines: 5-9
 
 ## Errors
 | status | code | from |
