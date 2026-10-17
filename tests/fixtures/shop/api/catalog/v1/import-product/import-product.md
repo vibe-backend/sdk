@@ -57,5 +57,5 @@
 
 | status | code | from |
 | --- | --- | --- |
-| 409 | CONFLICT | CONFLICT |
+| 409 | UNIQUE_VIOLATION | UNIQUE_VIOLATION |
 | 422 | VALIDATION_FAILED | VALIDATION_FAILED |

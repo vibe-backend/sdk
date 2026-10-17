@@ -92,9 +92,9 @@ Create the review with review.submit; on success return 201 with id. If the item
 ## Errors
 | status | code | from |
 |---|---|---|
-| 404 | NOT_FOUND | review.submit |
-| 422 | VALIDATION_FAILED | platform |
-| 429 | QUOTA_EXCEEDED | platform |
+| 404 | NOT_FOUND | NOT_FOUND |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
+| 429 | RATE_LIMITED | RATE_LIMITED |
 ````
 
 `review.submit` 會透過 `item.get` 檢查貨品（跨物件的讀寫一律經該物件自己的 method），並執行一條參數化的 `INSERT INTO reviews (item_id, rating, comment) VALUES ($1, $2, $3)`；`comment` 在 `review` model 中標記為 `untrusted: true, max: 500`（§11.7）。

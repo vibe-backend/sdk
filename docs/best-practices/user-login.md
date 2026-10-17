@@ -197,8 +197,8 @@ signature: MEUCIQ...
 ## Errors
 | status | code | from |
 |---|---|---|
-| 401 | INVALID_CREDENTIALS | user.login |
-| 422 | VALIDATION_FAILED | platform |
+| 401 | INVALID_CREDENTIALS | INVALID_CREDENTIALS |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ````
 
 `INVALID_CREDENTIALS` above is the self-defined code from `user.login` (see the note before the method lock).

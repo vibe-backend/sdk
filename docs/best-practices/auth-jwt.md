@@ -135,8 +135,8 @@ signature: MEUCIG...
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 409 | EMAIL_TAKEN | user.register |
-| 422 | VALIDATION_FAILED | platform |
+| 409 | EMAIL_TAKEN | EMAIL_TAKEN |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ````
 
 > ⚠️ The spec's own §11.4 lock shows only the `user.register` step even though its source says "then send an invitation with user.invite". A lock that omits the invite step would contain **less** than the source says; this page adds `s2` so the lock matches the source and Decision 69. The `user.invite` input (`{ id }`) and the `key: user` rate-limit key are illustrative; see Spec gaps.

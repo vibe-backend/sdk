@@ -2165,7 +2165,16 @@ fn platform_status(code: &str) -> StatusCode {
         "CONFLICT" | "UNIQUE_VIOLATION" => StatusCode::CONFLICT,
         "FORBIDDEN" => StatusCode::FORBIDDEN,
         "UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
-        "BAD_REQUEST" => StatusCode::BAD_REQUEST,
+        "BAD_REQUEST" | "CHALLENGE_REQUIRED" => StatusCode::BAD_REQUEST,
+        "CHALLENGE_FAILED" => StatusCode::FORBIDDEN,
+        "CHALLENGE_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
+        "ENDPOINT_DISABLED" => StatusCode::SERVICE_UNAVAILABLE,
+        "INVALID_REFRESH_TOKEN" => StatusCode::UNAUTHORIZED,
+        "METHOD_NOT_ALLOWED" => StatusCode::METHOD_NOT_ALLOWED,
+        "PAYLOAD_TOO_LARGE" => StatusCode::PAYLOAD_TOO_LARGE,
+        "RATE_LIMITED" => StatusCode::TOO_MANY_REQUESTS,
+        "UNSUPPORTED_MEDIA_TYPE" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "INTERNAL" => StatusCode::INTERNAL_SERVER_ERROR,
         "TX_TIMEOUT" => StatusCode::GATEWAY_TIMEOUT,
         "TX_CONFLICT" => StatusCode::SERVICE_UNAVAILABLE,
         "SERVICE_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
@@ -3309,5 +3318,29 @@ mod refresh_response_tests {
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["error"]["code"], "UNIQUE_VIOLATION");
         assert!(value["error"].get("retryable").is_none());
+    }
+}
+
+#[cfg(test)]
+mod runtime_error_code_tests {
+    #[test]
+    fn public_codes_have_statuses_and_are_emitted() {
+        let sources = [
+            include_str!("http.rs"),
+            include_str!("crud.rs"),
+            include_str!("ops.rs"),
+        ];
+        for code in crate::runtime::RUNTIME_ERROR_CODES {
+            assert!(sources
+                .iter()
+                .any(|text| text.contains(&format!("\"{code}\""))));
+            if *code != "INTERNAL" {
+                assert_ne!(
+                    super::platform_status(code),
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "{code}"
+                );
+            }
+        }
     }
 }

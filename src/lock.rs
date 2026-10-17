@@ -8,7 +8,7 @@ pub const COMPILER_NAME: &str = "md-logic";
 pub const COMPILER_VERSION: &str = "0.1.0";
 // Every compile prompt text change (system, guide, examples) must bump PROMPT_VERSION:
 // it feeds compiler-hash and the LLM cache key.
-pub const PROMPT_VERSION: &str = "prompt-8";
+pub const PROMPT_VERSION: &str = "prompt-9";
 pub const LOCK_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -120,7 +120,7 @@ Note not found returns 404 NOT_FOUND.
 ## Errors
 | status | code | from |
 |---|---|---|
-| 404 | NOT_FOUND | note.delete |
+| 404 | NOT_FOUND | NOT_FOUND |
 ````
 
 如果你撰寫自訂的刪除 method，它必須是同時強制擁有權的 `UPDATE`，例如：

@@ -92,9 +92,9 @@ Create the review with review.submit; on success return 201 with id. If the item
 ## Errors
 | status | code | from |
 |---|---|---|
-| 404 | NOT_FOUND | review.submit |
-| 422 | VALIDATION_FAILED | platform |
-| 429 | QUOTA_EXCEEDED | platform |
+| 404 | NOT_FOUND | NOT_FOUND |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
+| 429 | RATE_LIMITED | RATE_LIMITED |
 ````
 
 `review.submit` checks the item via `item.get` (cross-object reads/writes go through that object's own method) and runs one parameterized `INSERT INTO reviews (item_id, rating, comment) VALUES ($1, $2, $3)`; `comment` is marked `untrusted: true, max: 500` in the `review` model (§11.7).

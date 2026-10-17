@@ -5,6 +5,11 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Breaking (decisions 169–170):** Feature writes derive from method steps; omitted declarations are allowed, false declarations reject writing steps, and true declarations or clear natural-language write routes require a writing method step. Natural-language features without a method step or constant response are rejected with model read hints.
+- **Breaking (decision 171):** Errors code/from mappings reject unknown codes; use runtime codes, called method errors, or local validation failures.
+- **Decision 172:** Canonicalize Transform in object order and spacing, Transform out and equivalent respond values, and natural-language model tables matching the model id or its simple plural; reject duplicate keys. Compile prompt is prompt-9.
+- **Decision 173:** Sampling warnings appear at most once per process across compile calls.
+- Fix shop create/import product error mappings to use UNIQUE_VIOLATION.
 - **Breaking:** Single-column and multi-column unique violations return 409 `UNIQUE_VIOLATION` (was `CONFLICT`) on every path, including method `query` and `serve --memory`; they are never retried. Serialization and deadlock failures on CRUD and method query paths now return 503 TX_CONFLICT (retryable, Retry-After: 1) per decision 100, instead of 409 CONFLICT.
 - **Decision 107:** Model `## Constraints` supports multi-column unique keys; validation requires a matching unique index migration under fail-closed rules.
 - **Decision 168:** Fields map by header, including Chinese headers and 必填; full-width pipes and min/max length aliases normalize deterministically, and aliases are rejected in lock rules. PROMPT_VERSION is prompt-8.

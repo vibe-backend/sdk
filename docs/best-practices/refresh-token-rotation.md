@@ -88,8 +88,8 @@ Return 204.
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 401 | INVALID_CREDENTIALS | token-refresh |
-| 422 | VALIDATION_FAILED | platform |
+| 401 | INVALID_CREDENTIALS | INVALID_CREDENTIALS |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ````
 
 `api/auth/v1/logout/logout.lock.md` (`## Pipelines` only)

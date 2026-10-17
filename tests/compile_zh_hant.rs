@@ -112,7 +112,7 @@ const FEATURE: &str = "## Route
 ## Errors
 | status | code | from |
 | --- | --- | --- |
-| 404 | PRODUCT_NOT_FOUND | cart-item.add |
+| 404 | PRODUCT_NOT_FOUND | PRODUCT_NOT_FOUND |
 | 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ";
 
@@ -309,28 +309,28 @@ async fn translation_failure_fails_the_compile() {
 }
 
 #[tokio::test]
-async fn missing_declaration_is_named() {
+async fn feature_writes_declaration_is_optional() {
     let root = fixture();
     let f = root.join("api/shop/v1/add-cart-item/add-cart-item.md");
     let text = fs::read_to_string(&f).unwrap();
     fs::write(&f, text.replace("writes: true\n", "")).unwrap();
     let adapter = FakeAdapter { responder };
-    let config = config();
-    let Err(report) = compile_project(&CompileOptions {
+    compile_project(&CompileOptions {
         root: &root,
         llm: Some(&adapter),
-        llm_config: Some(&config),
+        llm_config: Some(&config()),
         check: false,
     })
     .await
-    else {
-        panic!("must fail");
-    };
-    let text = report.to_string();
-    assert!(
-        text.contains("missing frontmatter declaration `writes: true`"),
-        "{text}"
-    );
+    .unwrap_or_else(|err| panic!("{err}"));
+    let lock =
+        vibe::lock::parse_lock(&fs::read_to_string(f.with_extension("lock.md")).unwrap()).unwrap();
+    assert!(lock
+        .meta
+        .security_items
+        .iter()
+        .any(|i| i.item == "write-sql"));
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn responder_keeps_chinese(request: &LlmRequest) -> Result<String, String> {

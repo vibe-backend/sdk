@@ -197,8 +197,8 @@ signature: MEUCIQ...
 ## Errors
 | status | code | from |
 |---|---|---|
-| 401 | INVALID_CREDENTIALS | user.login |
-| 422 | VALIDATION_FAILED | platform |
+| 401 | INVALID_CREDENTIALS | INVALID_CREDENTIALS |
+| 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ````
 
 上面的 `INVALID_CREDENTIALS` 就是 `user.login` 自行定義的錯誤碼（見 method lock 前的注意事項）。

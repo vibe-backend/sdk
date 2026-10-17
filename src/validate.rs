@@ -101,6 +101,17 @@ pub fn validate_loaded(
 ) -> (Result<Report, Report>, HashMap<String, LockDoc>) {
     let sources = &loaded.sources;
     let mut report = Report::new();
+    // Make all available callees visible to per-lock repair checks, regardless
+    // of discovery order. Use source ids, as the cross-lock checks do below.
+    let callees: HashMap<String, LockDoc> = sources
+        .iter()
+        .zip(&loaded.lock_texts)
+        .filter_map(|(source, text)| {
+            parse_lock(text.as_deref()?)
+                .ok()
+                .map(|doc| (source.id.clone(), doc))
+        })
+        .collect();
     let mut docs: HashMap<String, LockDoc> = HashMap::new();
     let mut source_by_id: HashMap<String, SourceFile> = HashMap::new();
 
@@ -137,7 +148,7 @@ pub fn validate_loaded(
                 continue;
             }
         };
-        check_lock(&doc, source, opts, &mut report);
+        check_lock(&doc, source, opts, &callees, &mut report);
         docs.insert(source.id.clone(), doc);
     }
     check_dependencies(&docs, sources, &mut report);
@@ -209,6 +220,7 @@ pub(crate) fn check_lock(
     doc: &LockDoc,
     source: &SourceFile,
     opts: &ValidateOptions<'_>,
+    docs: &HashMap<String, LockDoc>,
     report: &mut Report,
 ) {
     let file = lock_rel(&source.rel);
@@ -244,6 +256,7 @@ pub(crate) fn check_lock(
         report.push(Diag::error(&file, "source-hash does not match the source"));
     }
     let structured = crate::lock::is_structured_source(&source.combined_text());
+    check_feature_contract(doc, source, docs, report);
     if doc.meta.source_type == SourceType::Structured && !structured {
         report.push(Diag::error(
             &file,
@@ -3162,5 +3175,313 @@ mod limits_value_tests {
                 );
             }
         }
+    }
+}
+
+fn literal_response(value: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(value.trim()).is_ok()
+        || crate::runtime::expression_roots(value, false).is_ok_and(|roots| roots.is_empty())
+}
+
+pub(crate) fn check_feature_contract(
+    doc: &LockDoc,
+    source: &SourceFile,
+    docs: &HashMap<String, LockDoc>,
+    report: &mut Report,
+) {
+    if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+        return;
+    }
+    let front = crate::compile::parse_source_frontmatter(&source.text).unwrap_or_default();
+    let writes = front
+        .iter()
+        .find(|(k, _)| k == "writes")
+        .map(|(_, v)| v.as_str());
+    let mut allowed: std::collections::BTreeSet<String> = crate::runtime::RUNTIME_ERROR_CODES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut writing = None;
+    let mut has_method = false;
+    let mut constant_response = false;
+    if let Some(steps) = find_section(&doc.sections, "Steps") {
+        for block in &steps.blocks {
+            let get = |key: &str| {
+                block
+                    .bullets
+                    .iter()
+                    .find(|b| b.key == key)
+                    .map(|b| b.value.as_str())
+                    .unwrap_or("")
+            };
+            if get("op") == "respond" && literal_response(get("value")) {
+                constant_response = true;
+            }
+            if get("op") == "validate" {
+                allowed.insert(get("fail").to_string());
+            }
+            if get("op") != "method" {
+                continue;
+            }
+            has_method = true;
+            let target = get("target");
+            if crate::security::target_looks_like_write(target)
+                || crate::security::known_method_writes(docs, target)
+            {
+                writing = Some((block.heading.as_str(), target));
+            }
+            if let Some((object, method)) = target.split_once('.') {
+                if docs.get(object).is_some_and(|d| d.meta.kind == Kind::Model)
+                    && CRUD_ACTIONS.contains(&method)
+                {
+                    allowed.extend(
+                        crate::manifest::CRUD_ERROR_CODES
+                            .iter()
+                            .map(|code| code.to_string()),
+                    );
+                }
+                if let Some(callee) = docs.get(&format!("{object}/methods/{method}")) {
+                    if let Some(sig) = find_section(&callee.sections, "Signature") {
+                        if let Some(errors) = sig.get("errors") {
+                            allowed
+                                .extend(crate::lock::parse_string_list(errors).unwrap_or_default());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    constant_response |= find_section(&doc.sections, "Transform")
+        .and_then(|s| s.get("out"))
+        .is_some_and(literal_response);
+    if !has_method
+        && !constant_response
+        && !crate::lock::is_structured_source(&source.combined_text())
+    {
+        let route = find_section(&doc.sections, "Route");
+        let prose = crate::compile::write_source_prose(&source.combined_text());
+        let reads = [
+            "list",
+            "get",
+            "show",
+            "fetch",
+            "read",
+            "query",
+            "search",
+            "listed",
+            "lists",
+            "listing",
+            "gets",
+            "shows",
+            "shown",
+            "showing",
+            "fetched",
+            "fetches",
+            "fetching",
+            "reads",
+            "reading",
+            "queries",
+            "searched",
+            "searches",
+            "searching",
+            "列出",
+            "列表",
+            "查詢",
+            "查询",
+            "查看",
+            "顯示",
+            "显示",
+            "攞",
+            "讀取",
+            "搜尋",
+        ]
+        .iter()
+        .any(|w| crate::compile::affirms(&prose, w));
+        let mut target = "<model>.list".to_string();
+        if route.and_then(|s| s.get("method")) == Some("GET") && reads {
+            let models: Vec<_> = docs
+                .values()
+                .filter(|d| d.meta.kind == Kind::Model)
+                .collect();
+            let model = if models.len() == 1 {
+                models[0].meta.id.as_str()
+            } else {
+                "<model>"
+            };
+            let method = if route
+                .and_then(|s| s.get("path"))
+                .is_some_and(|p| p.contains("{id}"))
+            {
+                "get"
+            } else {
+                "list"
+            };
+            target = format!("{model}.{method}");
+        }
+        report.push(Diag::error(&source.rel, format!("the feature has no method step and no constant response, so it always returns null; add `op: method` with target {target} (or get/create/update/delete) and a respond step")));
+    }
+    if let Some((step, target)) = writing {
+        if writes == Some("false") {
+            report.push(Diag::error(
+                &source.rel,
+                format!("frontmatter `writes: false` but step {step} calls {target}, which writes"),
+            ));
+        }
+    } else if writes == Some("true") {
+        report.push(Diag::error(&source.rel, "frontmatter `writes: true` but no step calls a writing method; add an `op: method` step with target <model>.create|update|delete"));
+    } else if writes != Some("false") && !crate::lock::is_structured_source(&source.combined_text())
+    {
+        let route = find_section(&doc.sections, "Route")
+            .and_then(|s| s.get("method"))
+            .unwrap_or("");
+        let prose = crate::compile::write_source_prose(&source.combined_text());
+        if matches!(route, "POST" | "PUT" | "PATCH" | "DELETE")
+            && [
+                "edit", "edited", "edits", "modify", "modified", "modifies", "remove", "removed",
+                "removes", "removing", "新增", "建立", "創建", "创建", "加入", "更新", "修改",
+                "編輯", "刪除", "删除", "移除",
+            ]
+            .iter()
+            .chain(crate::compile::WRITE_WORDS)
+            .any(|w| crate::compile::affirms(&prose, w))
+        {
+            let models: Vec<_> = docs
+                .values()
+                .filter(|d| d.meta.kind == Kind::Model)
+                .collect();
+            let model = if models.len() == 1 {
+                models[0].meta.id.as_str()
+            } else {
+                "<model>"
+            };
+            report.push(Diag::error(&source.rel, format!("route {route} and the source describe a write, but no step calls a writing method; add `op: method` with target {model}.create (or update/delete)")));
+        }
+    }
+    if let Some(table) = find_section(&doc.sections, "Errors").and_then(|s| s.table.as_ref()) {
+        for row in &table.rows {
+            for code in row.iter().skip(1).take(2) {
+                if !allowed.contains(code) {
+                    report.push(Diag::error(
+                        &source.rel,
+                        format!(
+                            "unknown Errors code `{code}`; allowed codes: {}",
+                            allowed.iter().cloned().collect::<Vec<_>>().join(", ")
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod feature_contract_tests {
+    use super::*;
+
+    fn errors(prose: &str, route: &str, body: &str) -> String {
+        errors_with_out(prose, route, body, "\"ok\"")
+    }
+
+    fn errors_with_out(prose: &str, route: &str, body: &str, out: &str) -> String {
+        let source = SourceFile {
+            rel: "api/catalog/v1/create/create.md".into(),
+            abs: "/tmp/create.md".into(),
+            kind: Kind::Api,
+            scope: Some(Scope::Feature),
+            id: "catalog/v1/create".into(),
+            text: prose.into(),
+            schema: None,
+        };
+        let doc = LockDoc {
+            meta: crate::lock::Meta::pending(source.kind, source.scope, &source.id, &source.rel),
+            sections: crate::lock::parse_sections(&format!(
+                "## Route\n- method: {route}\n## Transform\n- out: {out}\n{body}"
+            ))
+            .unwrap(),
+        };
+        let mut report = Report::new();
+        check_feature_contract(&doc, &source, &HashMap::new(), &mut report);
+        report.to_string()
+    }
+
+    #[test]
+    fn english_inflections_give_write_and_read_hints() {
+        let prose = "Products can be created and listed.";
+        assert!(errors_with_out(prose, "POST", "", "(none)").contains("source describe a write"));
+        for word in [
+            "listed",
+            "lists",
+            "listing",
+            "gets",
+            "shows",
+            "shown",
+            "showing",
+            "fetched",
+            "fetches",
+            "fetching",
+            "reads",
+            "reading",
+            "queries",
+            "searched",
+            "searches",
+            "searching",
+        ] {
+            assert!(
+                errors_with_out(word, "GET\n- path: /products/{id}", "", "(none)")
+                    .contains("with target <model>.get"),
+                "{word}"
+            );
+        }
+        assert!(errors_with_out(prose, "GET", "", "(none)").contains("with target <model>.list"));
+        assert!(errors_with_out(prose, "GET", "", "(none)").contains("always returns null"));
+    }
+
+    #[test]
+    fn natural_write_detection_respects_method_negation_auth_and_code() {
+        for word in crate::compile::WRITE_WORDS.iter().copied().chain([
+            "create", "add", "insert", "update", "edit", "edited", "edits", "modify", "modified",
+            "modifies", "delete", "remove", "removed", "removes", "removing", "新增", "建立",
+            "創建", "创建", "加入", "更新", "修改", "編輯", "刪除", "删除", "移除",
+        ]) {
+            assert!(
+                errors(word, "POST", "").contains("no step calls a writing method"),
+                "{word}"
+            );
+            assert!(!errors(word, "GET", "").contains("no step calls"), "{word}");
+        }
+        for prose in [
+            "Login and refresh tokens.",
+            "remove auth",
+            "auth is removed",
+            "auth removed",
+            "auth removes",
+            "removes auth",
+            "without login",
+            "移除 auth",
+            "移除驗證",
+            "not create",
+            "不新增",
+            "`create`",
+            "```text\ncreate\n```",
+            "---\nwrites: false\n---\ncreate",
+            "## Route\n- method: POST\n## Steps\n(none)\n",
+        ] {
+            assert!(
+                !errors(prose, "POST", "").contains("no step calls"),
+                "{prose}"
+            );
+        }
+    }
+
+    #[test]
+    fn own_validate_fail_is_allowed_but_invented_from_is_rejected() {
+        let body = "## Steps\n### s1\n- op: validate\n- when: `req.body.name is empty`\n- fail: BAD_NAME\n## Errors\n| status | code | from |\n| --- | --- | --- |\n| 422 | BAD_NAME | BAD_NAME |\n";
+        assert!(errors("Check name.", "POST", body).is_empty());
+        assert!(errors(
+            "Check name.",
+            "POST",
+            &body.replace("| BAD_NAME | BAD_NAME |", "| BAD_NAME | INVENTED |")
+        )
+        .contains("unknown Errors code `INVENTED`"));
     }
 }
