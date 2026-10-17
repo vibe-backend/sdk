@@ -25,6 +25,7 @@ static PARAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$([1-9][0-9]*)").
 pub struct ValidateOptions<'a> {
     pub root: &'a Path,
     pub deploy: bool,
+    pub dev: bool,
 }
 
 /// Sources plus the exact lock text read for each (None when missing).
@@ -98,6 +99,7 @@ pub fn validate_loaded(
     check_orphans(opts.root, sources, &mut report);
     check_routes(&docs, &mut report);
     check_calls(&docs, &mut report);
+    check_refresh_sign_methods(&docs, &mut report);
     check_targets(&docs, &mut report);
     check_migrations(&docs, &mut report);
     check_feature_method_writes(&docs, &mut report);
@@ -200,13 +202,19 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
     {
         report.push(Diag::error(&file, "model snapshot is a floating alias"));
     }
-    if opts.deploy && doc.meta.compiler.endpoint_private {
+    if opts.deploy && !opts.dev && doc.meta.compiler.endpoint_private {
         report.push(Diag::error(
             &file,
             "locks compiled against a private endpoint cannot be deployed",
         ));
     }
-    let order = section_order(doc.meta.kind, doc.meta.scope);
+    let mut order = section_order(doc.meta.kind, doc.meta.scope).to_vec();
+    if doc.meta.kind == Kind::Api
+        && doc.meta.scope == Some(Scope::Feature)
+        && find_section(&doc.sections, "Transform").is_none()
+    {
+        order.retain(|name| *name != "Transform");
+    }
     let names: Vec<&str> = doc
         .sections
         .iter()
@@ -253,14 +261,6 @@ fn check_lock(doc: &LockDoc, source: &SourceFile, opts: &ValidateOptions<'_>, re
                 fields.join(", ")
             ),
         ));
-    }
-    if let Some(status) = &doc.meta.legacy_status {
-        if opts.deploy && status != "approved" {
-            report.push(Diag::error(
-                &file,
-                format!("lock has legacy `status: {status}`; it cannot be deployed until it is recompiled from a reviewed source"),
-            ));
-        }
     }
 }
 
@@ -735,6 +735,13 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                 );
             }
         }
+        for problem in op_expression_problems(block, &op) {
+            report.push(
+                Diag::error(file, problem)
+                    .at_step(&block.heading)
+                    .at_section("Steps"),
+            );
+        }
         if op == "sign-jwt" {
             if !caps.contains("sign-token") {
                 report.push(
@@ -743,7 +750,8 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                 );
             }
             let alg = block_val(block, "alg");
-            if !matches!(alg.as_str(), "ES256" | "RS256") {
+            // Omitted alg defaults to ES256 (decision 139).
+            if !matches!(alg.as_str(), "" | "ES256" | "RS256") {
                 report.push(
                     Diag::error(file, "sign-jwt alg must be ES256 or RS256")
                         .at_step(&block.heading),
@@ -763,11 +771,17 @@ fn check_method(doc: &LockDoc, file: &str, report: &mut Report) {
                     .at_step(&block.heading),
                 );
             }
-            if !matches!(block_val(block, "issue-refresh").as_str(), "" | "none") {
+            let issue_refresh = block_val(block, "issue-refresh");
+            if !matches!(
+                issue_refresh.as_str(),
+                "" | "none" | "platform-decided" | "new-family"
+            ) {
                 report.push(
                     Diag::error(
                         file,
-                        "sign-jwt issue-refresh is not supported by this runtime yet",
+                        format!(
+                            "sign-jwt issue-refresh must be none, platform-decided or new-family (got `{issue_refresh}`)"
+                        ),
                     )
                     .at_step(&block.heading),
                 );
@@ -985,6 +999,29 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
             .find_map(|block| block.bullets.iter().find(|b| b.key == "mode"))
             .map(|b| b.value.clone())
             .unwrap_or_else(|| "jwt".into());
+        let mut refresh = None;
+        let mut revoke = None;
+        for block in &pipes.blocks {
+            let name = pipeline_name(&block.heading);
+            let parsed = match name.as_str() {
+                "token-refresh" => crate::manifest::parse_refresh_block(&block.bullets)
+                    .map(|spec| refresh = Some(spec)),
+                "token-revoke" => crate::manifest::parse_revoke_block(&block.bullets)
+                    .map(|spec| revoke = Some(spec)),
+                _ => Ok(()),
+            };
+            if let Err(err) = parsed {
+                report.push(Diag::error(file, err).at_step(&block.heading));
+            }
+        }
+        if let Err(err) = crate::manifest::check_refresh_route(
+            refresh.as_ref(),
+            revoke.as_ref(),
+            public,
+            auth_removed,
+        ) {
+            report.push(Diag::error(file, err).at_section("Pipelines"));
+        }
         let mut declared_rates = Vec::new();
         for block in &pipes.blocks {
             if pipeline_name(&block.heading) == "rate-limit" {
@@ -1034,7 +1071,11 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
                         .at_section("Pipelines"),
                     );
                 }
-                if let Some(key) = block.bullets.iter().find(|b| b.key == "key") {
+                if let Some(key) = block
+                    .bullets
+                    .iter()
+                    .find(|b| b.key == "key" && !(b.value == "family" && refresh.is_some()))
+                {
                     if let Err(err) =
                         crate::manifest::check_rate_key(&key.value, auth_removed, &auth_mode)
                     {
@@ -1106,9 +1147,10 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
         }
     }
     if let Some(transform) = find_section(&doc.sections, "Transform") {
-        for key in ["in", "out"] {
-            if let Some(expr) = transform.get(key) {
-                if let Err(err) = crate::runtime::check_expr(expr) {
+        for bullet in &transform.bullets {
+            let key = bullet.key.as_str();
+            if matches!(key, "in" | "out") && bullet.value.trim() != "(none)" {
+                if let Err(err) = crate::runtime::check_expr(&bullet.value) {
                     report.push(
                         Diag::error(file, format!("transform {key}: {err}"))
                             .at_section("Transform"),
@@ -1314,6 +1356,57 @@ fn check_routes(docs: &HashMap<String, LockDoc>, report: &mut Report) {
                 &doc.meta.source,
                 format!("route {key} duplicates {prev}"),
             ));
+        }
+    }
+}
+
+/// Every `token-refresh` `sign-method` must name a method with a `sign-jwt`
+/// step (a typo would otherwise only surface as a failing refresh call).
+fn check_refresh_sign_methods(docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    for doc in docs.values() {
+        if doc.meta.kind != Kind::Api || doc.meta.scope != Some(Scope::Feature) {
+            continue;
+        }
+        let Some(pipes) = find_section(&doc.sections, "Pipelines") else {
+            continue;
+        };
+        for block in &pipes.blocks {
+            if pipeline_name(&block.heading) != "token-refresh" {
+                continue;
+            }
+            let target = block_val(block, "sign-method");
+            let Some((object, method)) = target.split_once('.') else {
+                if !target.is_empty() {
+                    report.push(
+                        Diag::error(
+                            &doc.meta.source,
+                            format!("token-refresh sign-method `{target}` is not a known method"),
+                        )
+                        .at_step(&block.heading),
+                    );
+                }
+                continue;
+            };
+            let id = format!("{object}/methods/{method}");
+            let problem = match docs.get(&id) {
+                None => Some(format!(
+                    "token-refresh sign-method `{target}` is not a known method"
+                )),
+                Some(m) => {
+                    let signs = find_section(&m.sections, "Steps").is_some_and(|steps| {
+                        steps
+                            .blocks
+                            .iter()
+                            .any(|b| block_val(b, "op") == "sign-jwt")
+                    });
+                    (!signs).then(|| {
+                        format!("token-refresh sign-method `{target}` has no sign-jwt step")
+                    })
+                }
+            };
+            if let Some(problem) = problem {
+                report.push(Diag::error(&doc.meta.source, problem).at_step(&block.heading));
+            }
         }
     }
 }
@@ -1664,7 +1757,7 @@ fn bad_number_rule(rules: &str, key: &str) -> Option<String> {
 /// What the runtime would fail on for an API feature step: unknown keys
 /// (e.g. `method:` instead of `target:`), a missing target, expressions it
 /// cannot parse, a validate step without `when`/`fail`, a bad status.
-fn api_step_problems(block: &crate::lock::Block, op: &str) -> Vec<String> {
+pub(crate) fn api_step_problems(block: &crate::lock::Block, op: &str) -> Vec<String> {
     let allowed: &[&str] = match op {
         "method" => &["target", "args", "out"],
         "validate" => &["when", "fail"],
@@ -1725,6 +1818,45 @@ fn api_step_problems(block: &crate::lock::Block, op: &str) -> Vec<String> {
         _ => {}
     }
     out
+}
+
+/// Expression inputs evaluated by runtime::ops (including map/list entries).
+pub(crate) fn op_expression_problems(block: &crate::lock::Block, op: &str) -> Vec<String> {
+    let mut expressions = Vec::new();
+    let mut problems = Vec::new();
+    let keys: &[&str] = match op {
+        "verify-password" => &["hash", "plain"],
+        "hash-password" => &["plain"],
+        "hash-token" => &["value"],
+        _ => &[],
+    };
+    for key in keys {
+        expressions.push((key.to_string(), block_val(block, key)));
+    }
+    if op == "query" {
+        let raw = block_val(block, "params");
+        if !raw.is_empty() {
+            match crate::lock::parse_string_list(&raw) {
+                Ok(items) => expressions.extend(items.into_iter().map(|v| ("params".into(), v))),
+                Err(err) => problems.push(format!("params: {err}")),
+            }
+        }
+    }
+    if op == "sign-jwt" {
+        let raw = block_val(block, "claims");
+        if !raw.trim().is_empty() {
+            match crate::lock::parse_inline_map(&raw) {
+                Ok(items) => expressions.extend(items),
+                Err(err) => problems.push(format!("claims: {err}")),
+            }
+        }
+    }
+    for (key, expr) in expressions {
+        if let Err(err) = crate::runtime::check_expr(&expr) {
+            problems.push(format!("{key}: {err}"));
+        }
+    }
+    problems
 }
 
 fn block_val(block: &crate::lock::Block, key: &str) -> String {
@@ -1869,6 +2001,243 @@ fn lock_rel(source_rel: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock::{Block, Bullet, Meta, Section};
+
+    fn block(heading: &str, pairs: &[(&str, &str)]) -> Block {
+        Block {
+            heading: heading.into(),
+            bullets: pairs
+                .iter()
+                .map(|(k, v)| Bullet {
+                    key: (*k).into(),
+                    value: (*v).into(),
+                })
+                .collect(),
+        }
+    }
+
+    fn doc(
+        kind: Kind,
+        scope: Option<Scope>,
+        id: &str,
+        section: &str,
+        blocks: Vec<Block>,
+    ) -> LockDoc {
+        LockDoc {
+            meta: Meta::pending(kind, scope, id, format!("{id}.md")),
+            sections: vec![Section {
+                name: section.into(),
+                bullets: Vec::new(),
+                table: None,
+                blocks,
+                none: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn method_expression_inputs_fail_validation() {
+        for (op, key) in [
+            ("respond", "value"),
+            ("method", "args"),
+            ("hash-password", "plain"),
+            ("verify-password", "hash"),
+            ("hash-token", "value"),
+            ("query", "params"),
+            ("sign-jwt", "claims"),
+        ] {
+            let expr = match key {
+                "params" => "[{a: }]",
+                "claims" => "{sub: {a: }}",
+                _ => "{a: }",
+            };
+            let body = format!("## Signature\n- writes: false\n## Steps\n### s1\n- op: {op}\n- target: product.get\n- {key}: {expr}\n");
+            assert!(
+                method_errors(&body).iter().any(|e| e.contains("expression")
+                    || e.contains("object")
+                    || e.contains("expected a name")),
+                "{op}: {:?}",
+                method_errors(&body)
+            );
+        }
+        for key in ["in", "out"] {
+            let d = parsed_doc(
+                Kind::Api,
+                Some(Scope::Feature),
+                "hello/v1/get",
+                &format!("## Transform\n- {key}: (none)\n"),
+            );
+            let mut report = Report::new();
+            check_feature(&d, "hello", &mut report);
+            assert!(!report.errors().any(|e| e.message.contains("transform")));
+        }
+    }
+
+    #[test]
+    fn literal_responses_and_malformed_transforms() {
+        for (expr, valid) in [
+            (r#"{"message": "hello world"}"#, true),
+            ("{message: }", false),
+        ] {
+            let step = block("s1", &[("op", "respond"), ("value", expr)]);
+            assert_eq!(api_step_problems(&step, "respond").is_empty(), valid);
+        }
+        for key in ["in", "out"] {
+            for expr in ["", "{a: }", "[1]"] {
+                let body = format!(
+                    "## Route\n- method: GET\n- path: /hello/v1/greet\n\n## Transform\n- {key}: {expr}\n"
+                );
+                let doc = parsed_doc(Kind::Api, Some(Scope::Feature), "hello/v1/get", &body);
+                let mut report = Report::new();
+                check_feature(&doc, "hello.lock.md", &mut report);
+                assert!(
+                    report
+                        .errors()
+                        .any(|d| d.message.contains(&format!("transform {key}:"))),
+                    "{expr}: {:?}",
+                    report.diags
+                );
+            }
+        }
+        for (expr, valid) in [
+            (r#"{"message": "hello world"}"#, true),
+            ("{message: }", false),
+        ] {
+            let body = format!(
+                "## Route\n- method: GET\n- path: /hello/v1/greet\n\n## Request\n(none)\n\n## Response\n(none)\n\n## Steps\n### reply\n- op: respond\n- value: {expr}\n"
+            );
+            let doc = parsed_doc(Kind::Api, Some(Scope::Feature), "hello/v1/get", &body);
+            let mut report = Report::new();
+            check_feature(&doc, "hello.lock.md", &mut report);
+            assert_eq!(
+                report.errors().any(|d| d.message.contains("value:")),
+                !valid,
+                "{:?}",
+                report.diags
+            );
+            if valid {
+                assert_eq!(report.errors().count(), 0, "{:?}", report.diags);
+            }
+        }
+    }
+
+    #[test]
+    fn sign_jwt_rejects_literal_subject() {
+        let body = "## Signature\n- capabilities: [sign-token]\n- writes: false\n\n## Steps\n### read\n- op: query\n- out: user\n\n### sign\n- op: sign-jwt\n- key-ref: JWT_KEY\n- claims: {sub: \"admin\"}\n";
+        let doc = parsed_doc(Kind::Method, None, "user/methods/sign", body);
+        let mut report = Report::new();
+        check_method(&doc, "sign.lock.md", &mut report);
+        assert!(
+            report
+                .errors()
+                .any(|d| d.message.contains("sub must be a field")),
+            "{:?}",
+            report.diags
+        );
+        // The runtime calls this same guard before evaluating the subject.
+        assert!(crate::runtime::sub_source_problem(r#""admin""#, &["user".into()]).is_some());
+        assert!(crate::runtime::sub_source_problem(r#""user.id""#, &["user".into()]).is_some());
+        assert!(crate::runtime::sub_source_problem("user.id", &["user".into()]).is_none());
+    }
+
+    fn sign_method(issue_refresh: &str) -> LockDoc {
+        doc(
+            Kind::Method,
+            None,
+            "user/methods/sign-token",
+            "Steps",
+            vec![block(
+                "### s1",
+                &[
+                    ("op", "sign-jwt"),
+                    ("key-ref", "secret:JWT_SIGNING_KEY"),
+                    ("issue-refresh", issue_refresh),
+                    ("source-lines", "3-9"),
+                ],
+            )],
+        )
+    }
+
+    #[test]
+    fn sign_jwt_issue_refresh_is_supported() {
+        for mode in ["platform-decided", "new-family", "none"] {
+            let mut report = Report::new();
+            check_method(&sign_method(mode), "m", &mut report);
+            assert!(
+                !report
+                    .diags
+                    .iter()
+                    .any(|d| d.message.contains("issue-refresh")),
+                "{mode}: {:?}",
+                report.diags
+            );
+        }
+        let mut report = Report::new();
+        check_method(&sign_method("rotate"), "m", &mut report);
+        assert!(report.errors().any(|d| d.message.contains("issue-refresh")));
+    }
+
+    #[test]
+    fn token_refresh_sign_method_must_exist_and_sign() {
+        let route = |target: &str| {
+            doc(
+                Kind::Api,
+                Some(Scope::Feature),
+                "auth/refresh",
+                "Pipelines",
+                vec![block(
+                    "### token-refresh",
+                    &[("sign-method", target), ("source-lines", "1-4")],
+                )],
+            )
+        };
+        let mut docs = HashMap::new();
+        docs.insert(
+            "user/methods/sign-token".into(),
+            sign_method("platform-decided"),
+        );
+        docs.insert("auth/refresh".into(), route("user.sign-token"));
+        let mut report = Report::new();
+        check_refresh_sign_methods(&docs, &mut report);
+        assert!(!report.has_errors(), "{:?}", report.diags);
+        docs.insert("auth/refresh".into(), route("user.sign-tokn"));
+        let mut report = Report::new();
+        check_refresh_sign_methods(&docs, &mut report);
+        assert!(
+            report
+                .errors()
+                .any(|d| d.message.contains("not a known method")),
+            "{:?}",
+            report.diags
+        );
+    }
+
+    #[test]
+    fn sign_jwt_alg_may_be_omitted_but_not_unknown() {
+        // Decision 139 (#226): an omitted alg means ES256.
+        let body = |alg: &str| {
+            format!(
+                "## Signature\n- input: {{email: string}}\n- output: {{t: string}}\n- writes: false\n- capabilities: [sign-token]\n\n## Steps\n\n### s1\n\n- op: sign-jwt\n{alg}- key-ref: VIBE_JWT_PRIVATE_KEY\n- out: t\n"
+            )
+        };
+        let alg_errors = |text: String| {
+            let lock = LockDoc {
+                meta: Meta::pending(Kind::Method, None, "user/methods/issue", "issue.md"),
+                sections: crate::lock::parse_sections(&text).unwrap(),
+            };
+            let mut report = Report::new();
+            check_method(&lock, "issue.md", &mut report);
+            report
+                .errors()
+                .filter(|d| d.message.contains("alg must be"))
+                .count()
+        };
+        assert_eq!(alg_errors(body("")), 0);
+        assert_eq!(alg_errors(body("- alg: ES256\n")), 0);
+        assert_eq!(alg_errors(body("- alg: RS256\n")), 0);
+        assert_eq!(alg_errors(body("- alg: HS256\n")), 1);
+        assert_eq!(alg_errors(body("- alg: none\n")), 1);
+    }
 
     #[test]
     fn delete_sql_is_rejected() {
@@ -1882,7 +2251,7 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("WHERE")));
     }
 
-    fn doc(kind: Kind, scope: Option<Scope>, id: &str, body: &str) -> LockDoc {
+    fn parsed_doc(kind: Kind, scope: Option<Scope>, id: &str, body: &str) -> LockDoc {
         LockDoc {
             meta: crate::lock::Meta::pending(kind, scope, id, format!("{id}.md")),
             sections: crate::lock::parse_sections(body).unwrap(),
@@ -1891,10 +2260,13 @@ mod tests {
 
     fn target_docs() -> HashMap<String, LockDoc> {
         let mut docs = HashMap::new();
-        docs.insert("product".into(), doc(Kind::Model, None, "product", ""));
+        docs.insert(
+            "product".into(),
+            parsed_doc(Kind::Model, None, "product", ""),
+        );
         docs.insert(
             "product/methods/publish".into(),
-            doc(Kind::Method, None, "product/methods/publish", ""),
+            parsed_doc(Kind::Method, None, "product/methods/publish", ""),
         );
         docs
     }
@@ -1935,7 +2307,7 @@ mod tests {
         let body = "## Steps\n### s1\n- op: method\n- target: product.nonexistent\n";
         docs.insert(
             "catalog/v1/x".into(),
-            doc(Kind::Api, Some(Scope::Feature), "api/catalog/v1/x/x", body),
+            parsed_doc(Kind::Api, Some(Scope::Feature), "api/catalog/v1/x/x", body),
         );
         let mut report = Report::new();
         check_targets(&docs, &mut report);
@@ -1955,7 +2327,7 @@ mod tests {
             let body = format!("## Calls\n- methods: {list}\n");
             docs.insert(
                 "product/methods/x".into(),
-                doc(Kind::Method, None, "product/methods/x", &body),
+                parsed_doc(Kind::Method, None, "product/methods/x", &body),
             );
             let mut report = Report::new();
             check_targets(&docs, &mut report);
@@ -1975,7 +2347,7 @@ mod tests {
         let body = "## Signature\n- writes: false\n## Calls\n- methods: [product.ghost]\n## Steps\n### s1 method\n- op: method\n- target: nope.get\n- out: r\n### s2 call\n- op: call\n- target: https://example.com/hook\n";
         docs.insert(
             "product/methods/caller".into(),
-            doc(Kind::Method, None, "models/product/methods/caller", body),
+            parsed_doc(Kind::Method, None, "models/product/methods/caller", body),
         );
         let mut report = Report::new();
         check_targets(&docs, &mut report);
@@ -2000,7 +2372,7 @@ mod tests {
         let mut report = Report::new();
         for (name, body) in methods {
             let id = format!("models/product/methods/{name}");
-            let d = doc(Kind::Method, None, &id, body);
+            let d = parsed_doc(Kind::Method, None, &id, body);
             check_method(&d, "x.lock.md", &mut report);
             docs.insert(format!("product/methods/{name}"), d);
         }
@@ -2108,7 +2480,7 @@ mod tests {
             let id = format!("models/product/methods/{name}");
             docs.insert(
                 format!("product/methods/{name}"),
-                doc(Kind::Method, None, &id, &body),
+                parsed_doc(Kind::Method, None, &id, &body),
             );
         }
         assert!(crate::security::method_doc_writes(&docs, "product.a"));
@@ -2120,7 +2492,7 @@ mod tests {
         let mut docs = HashMap::new();
         docs.insert(
             "product/methods/wrap".to_string(),
-            doc(
+            parsed_doc(
                 Kind::Method,
                 None,
                 "models/product/methods/wrap",
@@ -2129,7 +2501,7 @@ mod tests {
         );
         docs.insert(
             "product".to_string(),
-            doc(Kind::Model, None, "models/product", "## Fields\n"),
+            parsed_doc(Kind::Model, None, "models/product", "## Fields\n"),
         );
         // Validation rejects the unknown target...
         assert!(check_method_target("product.missing", &docs).is_err());
@@ -2153,7 +2525,7 @@ mod tests {
     }
 
     fn method_errors(body: &str) -> Vec<String> {
-        let d = doc(Kind::Method, None, "models/product/methods/x", body);
+        let d = parsed_doc(Kind::Method, None, "models/product/methods/x", body);
         let mut report = Report::new();
         check_method(&d, "x.lock.md", &mut report);
         report.errors().map(|d| d.message.clone()).collect()
@@ -2217,7 +2589,7 @@ mod tests {
     #[test]
     fn method_lock_steps_get_step_grammar_checks() {
         let body = "## Signature\n- writes: false\n## Calls\n- methods: []\n## Steps\n### s1 method\n- op: method\n- method: product.get\n- out: r\n### s2 validate\n- op: validate\n- when: `r == null`\n### s3 respond\n- op: respond\n- value: r\n- status: 999\n";
-        let d = doc(Kind::Method, None, "models/product/methods/x", body);
+        let d = parsed_doc(Kind::Method, None, "models/product/methods/x", body);
         let mut report = Report::new();
         check_method(&d, "x.lock.md", &mut report);
         let msgs: Vec<&str> = report.errors().map(|d| d.message.as_str()).collect();
@@ -2239,7 +2611,7 @@ mod tests {
         ] {
             let prompt = crate::compile::system_prompt(kind, scope);
             let body = prompt.split_once("LOCK BODY:\n").expect("example").1;
-            let lock = doc(kind, scope, id, body);
+            let lock = parsed_doc(kind, scope, id, body);
             let names: Vec<&str> = lock.sections.iter().map(|s| s.name.as_str()).collect();
             assert_eq!(names, section_order(kind, scope), "{id}");
             let mut report = Report::new();

@@ -38,6 +38,9 @@ enum Command {
         /// Also apply deploy-only checks (e.g. no locks compiled against a private LLM endpoint).
         #[arg(long)]
         deploy: bool,
+        /// Allow private-endpoint locks for local development.
+        #[arg(long)]
+        dev: bool,
     },
     /// Build a signed manifest from validated locks.
     Manifest {
@@ -52,6 +55,9 @@ enum Command {
         /// items are listed only.
         #[arg(long)]
         release: bool,
+        /// Sign for local development only.
+        #[arg(long, conflicts_with = "release")]
+        dev: bool,
         /// Release version without `v` (default: GITHUB_REF_NAME of a `v*` tag).
         #[arg(long)]
         release_version: Option<String>,
@@ -63,6 +69,11 @@ enum Command {
     Keygen {
         #[arg(long, default_value = ".")]
         project: PathBuf,
+    },
+    #[command(hide = true)]
+    Approve {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Serve HTTP from a signed manifest.
     Serve {
@@ -153,14 +164,16 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Compile { project, check } => cmd_compile(&project, check).await,
-        Command::Validate { project, deploy } => cmd_validate(&project, deploy),
+        Command::Approve { .. } => Err("`vibe approve` has been removed in spec v1.8 (decision 77): review happens on the source pull request. Use `vibe validate --deploy --dev` and `vibe manifest --dev` locally (the equivalent of `vibe build --dev` until `vibe build` is available).".into()),
+        Command::Validate { project, deploy, dev } => cmd_validate(&project, deploy, dev),
         Command::Manifest {
             project,
             output,
             release,
+            dev,
             release_version,
             commit,
-        } => cmd_manifest(&project, &output, release, release_version, commit).await,
+        } => cmd_manifest(&project, &output, release, dev, release_version, commit).await,
         Command::Keygen { project } => {
             sign::create_dev_key(&project)?;
             println!("wrote {}", project.join(".vibe/signing.key").display());
@@ -277,8 +290,10 @@ async fn cmd_compile(project: &Path, check: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_validate(project: &Path, deploy: bool) -> Result<(), String> {
+fn cmd_validate(project: &Path, deploy: bool, dev: bool) -> Result<(), String> {
+    check_dev_mode(dev)?;
     let report = validate_project(&ValidateOptions {
+        dev,
         root: project,
         deploy,
     })
@@ -306,15 +321,20 @@ async fn cmd_manifest(
     project: &Path,
     output: &Path,
     release: bool,
+    dev: bool,
     release_version: Option<String>,
     commit: Option<String>,
 ) -> Result<(), String> {
+    check_dev_mode(dev)?;
+    if !dev && !release {
+        return Err("use --dev for local development or --release in the release workflow".into());
+    }
     // Release manifests are signed by the release workflow with Sigstore
     // keyless (decisions 92, 119); no key is ever loaded for them.
     let key = if release {
         None
     } else {
-        Some(sign::load_dev_key(project)?)
+        Some(sign::load_or_create(project)?)
     };
     let version = if release {
         release_version
@@ -417,6 +437,15 @@ fn load_manifest(
         let key = sign::load_dev_public(project)?;
         return read_manifest(manifest_path, &key).map_err(|err| err.to_string());
     }
+    let mode: manifest::Manifest =
+        serde_json::from_slice(&fs::read(manifest_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if mode.build_mode == Some(manifest::BuildMode::Dev) {
+        return Err(format!(
+            "this manifest was built with --dev and is refused when VIBE_ENV is {:?}",
+            std::env::var("VIBE_ENV").unwrap_or_default()
+        ));
+    }
     let version = std::env::var("VIBE_RELEASE_VERSION").map_err(|_| {
         "VIBE_RELEASE_VERSION (the deployed version, e.g. 1.8.0) is required to verify the release manifest's Sigstore identity; the project's .vibe/signing.pub is not trusted outside development".to_string()
     })?;
@@ -436,7 +465,7 @@ fn check_deployable(
 ) -> Result<(), String> {
     let provenance = &manifest.provenance;
     tracing::info!(
-        build_mode = %provenance.build_mode,
+        build_mode = ?manifest.build_mode,
         commit = %provenance.commit,
         locks = provenance.locks.len(),
         high_risk = provenance.high_risk().len(),
@@ -451,11 +480,23 @@ async fn cmd_serve(
     addr: &str,
     memory: bool,
 ) -> Result<(), String> {
-    if let Some(name) = llm::runtime_llm_env_present() {
-        return Err(format!("runtime environment must not contain {name}"));
-    }
+    load_dotenv(project);
     let run_env =
         vibe::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), memory);
+    if let Some(name) = llm::runtime_llm_env_present() {
+        if !run_env.is_dev() {
+            return Err(format!("runtime environment must not contain {name}"));
+        }
+        let names = llm::strip_runtime_llm_env();
+        eprintln!(
+            "warning: removing compile-time variables from runtime environment: {}",
+            names
+                .iter()
+                .map(|key| key.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     if memory && !run_env.is_dev() {
         return Err(format!(
             "--memory is a development executor and is refused when VIBE_ENV is {:?}; use PostgreSQL",
@@ -478,6 +519,15 @@ async fn cmd_serve(
     let mut auth = auth_from_env(run_env)?;
     let manifest = load_manifest(manifest_path, project, run_env)?;
     check_deployable(&manifest, run_env)?;
+    for route in &manifest.routes {
+        if let Some(problem) = route
+            .refresh
+            .as_ref()
+            .and_then(|spec| vibe::manifest::refresh_spec_problem(&route.feature_id, spec))
+        {
+            return Err(problem);
+        }
+    }
     // `sign-jwt` key-refs name environment variables holding private PEMs.
     auth.signing_keys =
         vibe::runtime::load_signing_keys(&manifest, &|name| std::env::var(name).ok(), &auth.kid)?;
@@ -512,6 +562,19 @@ async fn cmd_serve(
         Arc::new(pg)
     };
     let loaded = vibe::runtime::load_project_slugs(project, memory)?;
+    if let (Some(pool), true) = (
+        &pg_pool,
+        manifest.routes.iter().any(|r| r.refresh.is_some()),
+    ) {
+        let mut tenants: Vec<String> = loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
+        tenants.sort();
+        tenants.dedup();
+        let client = pool
+            .get()
+            .await
+            .map_err(|err| format!("refresh token store check: {err}"))?;
+        vibe::runtime::refresh::check_store(&client, &tenants).await?;
+    }
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
@@ -619,6 +682,23 @@ async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Resu
     for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant, &runtime_role).await? {
         println!("{line}");
     }
+    // Last: the revoke is table-level (on `_platform_refresh_tokens` only).
+    // `GRANT ... ON ALL TABLES IN SCHEMA` in a migration expands to per-table
+    // grants when it runs, so revoking afterwards removes those as well.
+    exec.check_role_separation_for(Some(&runtime_role)).await?;
+    if manifest.routes.iter().any(|r| r.refresh.is_some()) {
+        let schema = format!("t_{tenant}");
+        exec.batch(&vibe::runtime::refresh::table_statements(&schema)?)
+            .await?;
+        exec.batch(&vibe::runtime::refresh::runtime_grant_statements(
+            &schema,
+            &runtime_role,
+        )?)
+        .await?;
+        exec.batch(&vibe::runtime::refresh::cleanup_statements(&schema)?)
+            .await?;
+        println!("bootstrapped {schema}._platform_refresh_tokens (finished families cleaned up)");
+    }
     Ok(())
 }
 
@@ -626,19 +706,12 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
     let mut auth = AuthConfig::anonymous();
     if let Ok(pem) = std::env::var("VIBE_JWT_PUBLIC_KEY_PEM") {
         auth.public_pem = pem.replace("\\n", "\n");
-        auth.alg = vibe::runtime::detect_jwt_alg(&auth.public_pem)?;
     }
-    if let Ok(alg) = std::env::var("VIBE_JWT_ALG") {
-        auth.alg = match alg.trim().to_ascii_uppercase().as_str() {
-            "ES256" => jsonwebtoken::Algorithm::ES256,
-            "RS256" => jsonwebtoken::Algorithm::RS256,
-            other => {
-                return Err(format!(
-                    "VIBE_JWT_ALG `{other}`: only ES256 and RS256 are supported"
-                ));
-            }
-        };
-    }
+    let alg_env = std::env::var("VIBE_JWT_ALG").ok();
+    auth.alg = vibe::runtime::static_jwt_alg(
+        (!auth.public_pem.is_empty()).then_some(auth.public_pem.as_str()),
+        alg_env.as_deref(),
+    )?;
     if let Ok(iss) = std::env::var("VIBE_JWT_ISS") {
         auth.iss = iss;
     }
@@ -685,9 +758,9 @@ fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
             return Err("VIBE_JWT_ALLOW_PRIVATE_HOST is only allowed in development".into());
         }
         let source = vibe::runtime::jwks::HttpsJwks::with_policy(&uri, allow_private)?;
-        auth.jwks = Some(std::sync::Arc::new(vibe::runtime::jwks::JwksCache::new(
-            std::sync::Arc::new(source),
-        )));
+        auth.jwks = Some(std::sync::Arc::new(
+            vibe::runtime::jwks::JwksCache::with_alg(std::sync::Arc::new(source), auth.alg),
+        ));
     }
     if let Ok(path) = std::env::var("VIBE_API_KEYS_FILE") {
         auth.api_keys_file = Some(std::sync::Arc::new(vibe::runtime::ApiKeyFile::open(
@@ -740,6 +813,13 @@ fn load_dotenv(project: &Path) {
             std::env::set_var(key, value);
         }
     }
+}
+
+fn check_dev_mode(dev: bool) -> Result<(), String> {
+    if dev && ci_or_prod() {
+        return Err("--dev is for local development and is refused in CI and production".into());
+    }
+    Ok(())
 }
 
 fn ci_or_prod() -> bool {

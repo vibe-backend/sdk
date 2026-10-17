@@ -47,6 +47,7 @@ async fn problems(claims: &str, custom: &str) -> String {
         return err.to_string();
     }
     match validate_project(&ValidateOptions {
+        dev: false,
         root: &root,
         deploy: false,
     }) {

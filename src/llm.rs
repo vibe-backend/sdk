@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::diag::{Diag, Report};
 
 pub const OPENAI: &str = "openai";
+const USER_AGENT: &str = concat!("vibe-sdk/", env!("CARGO_PKG_VERSION"));
 pub const ANTHROPIC: &str = "anthropic";
 pub const GEMINI: &str = "gemini";
 
@@ -35,6 +36,9 @@ pub struct LlmRequest {
     pub model: String,
     pub seed: u64,
     pub timeout: Duration,
+    /// Shared per-source / per-run cap on attempts and time (#83).
+    /// `None` shares the process-wide environment-configured bound, including retries.
+    pub budget: Option<std::sync::Arc<crate::llm_budget::CallBudget>>,
 }
 
 #[derive(Clone, Debug)]
@@ -234,6 +238,108 @@ fn is_date_or_latest(rest: &str) -> bool {
     }
 }
 
+// Known diagnostic values. Display matching deliberately never uses Variant:
+// arbitrary variant suffixes can contain provider-controlled free text.
+fn known_model(provider: &str, model: &str) -> String {
+    const OTHER_MODELS: &[(&str, &str)] = &[
+        (OPENAI, "gpt-5"),
+        (OPENAI, "gpt-5-mini"),
+        (OPENAI, "gpt-5-nano"),
+        (OPENAI, "gpt-4.1-mini"),
+        (OPENAI, "gpt-4.1-nano"),
+        (OPENAI, "gpt-4o-mini"),
+        (OPENAI, "o3"),
+        (OPENAI, "o3-mini"),
+        (OPENAI, "o4-mini"),
+        (GEMINI, "gemini-2.5-pro"),
+        (GEMINI, "gemini-2.5-flash"),
+        (GEMINI, "gemini-2.5-flash-lite"),
+        (GEMINI, "gemini-2.0-flash"),
+        (GEMINI, "gemini-3-pro-preview"),
+        (ANTHROPIC, "claude-opus-4-7"),
+    ];
+    let model = model.to_ascii_lowercase();
+    if model.len() <= 64
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+        && (SAMPLING_REGISTRY.iter().any(|(p, id, _, _, _)| {
+            *p == provider
+                && model
+                    .strip_prefix(id)
+                    .is_some_and(|rest| rest.is_empty() || is_date_or_latest(rest))
+        }) || OTHER_MODELS
+            .iter()
+            .any(|(p, id)| *p == provider && *id == model))
+    {
+        model
+    } else {
+        "unknown".into()
+    }
+}
+
+// Documented OpenAI codes/types, Anthropic types and Gemini statuses only.
+fn known_error_code(value: &Value) -> &'static str {
+    const CODES: &[&str] = &[
+        "invalid_api_key",
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "insufficient_quota",
+        "rate_limit_exceeded",
+        "model_not_found",
+        "context_length_exceeded",
+        "server_error",
+        "unsupported_parameter",
+        "unsupported_value",
+        "invalid_value",
+        "billing_hard_limit_reached",
+        "tokens",
+        "requests",
+        "not_found_error",
+        "api_error",
+        "overloaded_error",
+        "request_too_large",
+        "rate_limit_error",
+        "billing_error",
+        "timeout_error",
+        "INVALID_ARGUMENT",
+        "FAILED_PRECONDITION",
+        "PERMISSION_DENIED",
+        "NOT_FOUND",
+        "RESOURCE_EXHAUSTED",
+        "INTERNAL",
+        "UNAVAILABLE",
+        "DEADLINE_EXCEEDED",
+        "UNAUTHENTICATED",
+        "CANCELLED",
+    ];
+    CODES
+        .iter()
+        .copied()
+        .find(|code| Some(*code) == value.as_str())
+        .unwrap_or("unknown")
+}
+
+fn error_code(value: &Value) -> Option<&Value> {
+    let error = value.get("error")?;
+    let fields = ["code", "type", "status"].map(|field| error.get(field));
+    fields
+        .iter()
+        .flatten()
+        .copied()
+        .find(|value| value.is_string())
+        .or_else(|| fields.into_iter().flatten().find(|value| !value.is_null()))
+}
+
+fn known_incomplete_reason(value: &Value) -> &'static str {
+    match value.as_str() {
+        Some("max_output_tokens") => "max_output_tokens",
+        Some("content_filter") => "content_filter",
+        _ => "unknown",
+    }
+}
+
 fn id_matches(model: &str, id: &str, suffix: Suffix) -> bool {
     let Some(rest) = model.strip_prefix(id) else {
         return false;
@@ -300,6 +406,42 @@ pub trait LlmAdapter: Send + Sync {
     fn provider(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
     async fn compile(&self, request: &LlmRequest) -> Result<LlmResponse, String>;
+    /// True when `compile` reserves from `request.budget` per HTTP attempt
+    /// itself. Other adapters are charged one call by `call_budgeted`.
+    fn enforces_budget(&self) -> bool {
+        false
+    }
+}
+
+/// Calls without an explicit run budget share one process-wide budget.
+fn default_budget() -> Result<std::sync::Arc<crate::llm_budget::CallBudget>, String> {
+    static BUDGET: std::sync::OnceLock<
+        Result<std::sync::Arc<crate::llm_budget::CallBudget>, String>,
+    > = std::sync::OnceLock::new();
+    BUDGET
+        .get_or_init(|| crate::llm_budget::CallBudget::from_env().map(std::sync::Arc::new))
+        .clone()
+}
+
+/// Every LLM call goes through here so the budget holds for any adapter.
+pub async fn call_budgeted(
+    adapter: &dyn LlmAdapter,
+    request: &LlmRequest,
+) -> Result<LlmResponse, String> {
+    let mut bounded = request.clone();
+    if bounded.budget.is_none() {
+        bounded.budget = Some(default_budget()?);
+    }
+    let request = &bounded;
+    if !adapter.enforces_budget() {
+        if let Some(budget) = &request.budget {
+            budget.reserve()?;
+        }
+    }
+    let left = request.budget.as_ref().expect("default budget").remaining();
+    tokio::time::timeout(left, adapter.compile(request))
+        .await
+        .map_err(|_| "LLM time budget spent".to_string())?
 }
 
 pub struct FakeAdapter<F>
@@ -620,7 +762,7 @@ fn classify_endpoint(
     if private && parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err("LLM_BASE_URL scheme must be http or https".into());
     }
-    Ok((host, private))
+    Ok((host, private || allow_private))
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -708,13 +850,366 @@ pub fn parse_duration_ms(raw: &str) -> Option<u64> {
 }
 
 pub fn redact(text: &str, secrets: &[&str]) -> String {
-    let mut out = text.to_string();
-    for secret in secrets {
-        if secret.len() >= 8 && *secret != "replace-me" {
-            out = out.replace(secret, "[redacted]");
+    let mut known: Vec<String> = std::env::vars()
+        .filter(|(name, _)| {
+            !matches!(name.as_str(), "PWD" | "OLDPWD")
+                && [
+                    "KEY",
+                    "TOKEN",
+                    "SECRET",
+                    "PASSWORD",
+                    "PASSWD",
+                    "PWD",
+                    "DATABASE_URL",
+                ]
+                .iter()
+                .any(|part| name.to_ascii_uppercase().contains(part))
+        })
+        .map(|(_, value)| value)
+        .filter(|v| !v.is_empty())
+        .collect();
+    known.extend(secrets.iter().map(|v| v.to_string()));
+    let mut text = text.to_string();
+    let mut ranges = Vec::new();
+    static KEYS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)(?:\b(?:[a-z0-9]+[_-])*(?:password|passwd|pwd|secret|token|api[ _-]?key|database_url|private_key|credentials?|passphrase|authorization|auth|set-cookie|cookie|session)(?:[_-][a-z0-9]+)*\b|密碼|密码|口令|憑證)[ 	"']*[:=][ 	]*|\bbearer[ 	]+"#).expect("redaction keys")
+    });
+    static TOKENS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"[a-zA-Z][a-zA-Z0-9+.-]*://[^\r\n"'<>]*@[^\s"'<>]*|\b(?:sk-|xai-|github_pat_|gh[pousr]_)[A-Za-z0-9_-]+|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bxox[abprs]-[A-Za-z0-9-]+|\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"#).expect("redaction tokens")
+    });
+    static URL_VALUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\r\n"'<>]*:[^\r\n"'<>]*"#)
+            .expect("URL credentials")
+    });
+    static PEM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----").expect("private key marker")
+    });
+    let mut view = text.as_bytes().to_vec();
+    let mut spans: Vec<_> = (0..view.len()).map(|i| (i, i + 1)).collect();
+    for secret in &known {
+        if !secret.is_empty() {
+            ranges.extend(
+                text.match_indices(secret)
+                    .map(|(at, value)| (at, at + value.len())),
+            );
         }
     }
-    out
+    for iteration in 0..=16 {
+        let (readable, mapped) = readable_redaction_view(&view, &spans);
+        for secret in &known {
+            if !secret.is_empty() {
+                for (start, value) in readable.match_indices(secret) {
+                    ranges.push((mapped[start].0, mapped[start + value.len() - 1].1));
+                }
+            }
+        }
+        let mut cursor = 0;
+        while let Some(found) = KEYS.find_at(&readable, cursor) {
+            let key = readable[found.start()..found.end()]
+                .trim_end_matches([' ', '\t', ':', '=', '\'', '"']);
+            let value_text = readable[found.end()..].trim_start();
+            let auth_setting = key.eq_ignore_ascii_case("auth")
+                && [
+                    "required", "optional", "enabled", "disabled", "true", "false",
+                ]
+                .iter()
+                .any(|setting| {
+                    value_text.strip_prefix(setting).is_some_and(|rest| {
+                        rest.is_empty()
+                            || rest.starts_with(|c: char| {
+                                c.is_whitespace() || matches!(c, ';' | ',' | '}' | ']')
+                            })
+                    })
+                });
+            if matches!(key, "PWD" | "OLDPWD") || auth_setting {
+                cursor = found.end();
+                continue;
+            }
+            let start = mapped[found.start()].0;
+            let value = mapped[found.end() - 1].1;
+            let header =
+                key.eq_ignore_ascii_case("cookie") || key.eq_ignore_ascii_case("set-cookie");
+            let end = redaction_end(&text, start, value, header);
+            ranges.push((start, end));
+            cursor = found.end();
+            while cursor < mapped.len() && mapped[cursor].0 < end {
+                cursor += 1;
+            }
+        }
+        for found in TOKENS.find_iter(&readable) {
+            ranges.push((mapped[found.start()].0, mapped[found.end() - 1].1));
+        }
+        for found in URL_VALUE.find_iter(&readable) {
+            if !readable[found.start()..found.end()].contains('@') {
+                ranges.push((mapped[found.start()].0, mapped[found.end() - 1].1));
+            }
+        }
+        let mut cursor = 0;
+        while let Some(capture) = PEM.captures_at(&readable, cursor) {
+            let found = capture.get(0).expect("marker");
+            let closing = format!("-----END {}-----", &capture[1]);
+            let end = readable[found.end()..]
+                .find(&closing)
+                .map_or(readable.len(), |at| found.end() + at + closing.len());
+            ranges.push((mapped[found.start()].0, mapped[end - 1].1));
+            cursor = end;
+        }
+        let (next, next_spans) = decode_redaction_view(readable.as_bytes(), &mapped);
+        if next == view {
+            break;
+        }
+        if iteration == 16 {
+            ranges.push((0, text.len()));
+            break;
+        }
+        view = next;
+        spans = next_spans;
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    for (start, end) in merged.into_iter().rev() {
+        text.replace_range(start..end, "[redacted]");
+    }
+    text
+}
+
+// Original offsets keep encoded delimiters from shortening a redaction.
+fn redaction_end(text: &str, start: usize, value: usize, header: bool) -> usize {
+    let line_end = text[value..].find('\n').map_or(text.len(), |n| value + n);
+    let tail = &text[value..];
+    if header {
+        return line_end;
+    }
+    let first_line = text[value..line_end]
+        .split_once('#')
+        .map_or(&text[value..line_end], |(value, _)| value)
+        .trim();
+    {
+        let line_start = text[..start].rfind('\n').map_or(0, |n| n + 1);
+        let indent = text[line_start..]
+            .chars()
+            .take_while(|c| matches!(c, ' ' | '\t'))
+            .count();
+        let mut end = line_end;
+        while end < text.len() {
+            let next = end + 1;
+            let next_end = text[next..].find('\n').map_or(text.len(), |n| next + n);
+            let line = &text[next..next_end];
+            if !line.trim().is_empty()
+                && line.chars().take_while(|c| matches!(c, ' ' | '\t')).count() <= indent
+            {
+                break;
+            }
+            end = next_end;
+        }
+        if end > line_end || first_line.is_empty() || first_line.starts_with(['|', '>']) {
+            return end;
+        }
+    }
+    if tail.starts_with(['\\', '%', '&']) {
+        return text.len();
+    }
+    let mut quote = None;
+    let mut escaped = false;
+    let mut entity_end = 0;
+    for (index, ch) in tail.char_indices() {
+        if index < entity_end {
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+        } else if let Some(open) = quote {
+            if ch == open {
+                // Repeated decoding can change which quote closes a value.
+                if tail[..index].contains('\\') {
+                    return text.len();
+                }
+                return value + index + ch.len_utf8();
+            }
+        } else if index == 0 && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if ch == '&' && html_entity_len(&tail[index..]).is_some() {
+            entity_end = index + html_entity_len(&tail[index..]).expect("entity length");
+        } else if ch == '\n' || matches!(ch, ';' | ',' | '}' | ']' | '&') {
+            return value + index;
+        }
+    }
+    text.len()
+}
+
+fn html_entity_len(text: &str) -> Option<usize> {
+    let end = text.find(';')?;
+    let entity = text.get(1..end)?;
+    let valid = if let Some(number) = entity
+        .strip_prefix("#x")
+        .or_else(|| entity.strip_prefix("#X"))
+    {
+        !number.is_empty() && number.bytes().all(|b| b.is_ascii_hexdigit())
+    } else if let Some(number) = entity.strip_prefix('#') {
+        !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+    } else {
+        entity.starts_with(|c: char| c.is_ascii_alphabetic())
+            && entity.bytes().all(|b| b.is_ascii_alphanumeric())
+    };
+    valid.then_some(end + 1)
+}
+
+fn readable_redaction_view(
+    bytes: &[u8],
+    spans: &[(usize, usize)],
+) -> (String, Vec<(usize, usize)>) {
+    use unicode_normalization::UnicodeNormalization;
+    let mut readable = String::new();
+    let mut mapped = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let width = match bytes[cursor] {
+            0..=0x7f => 1,
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => 1,
+        };
+        let width = width.min(bytes.len() - cursor);
+        let length = if std::str::from_utf8(&bytes[cursor..cursor + width]).is_ok() {
+            width
+        } else {
+            1
+        };
+        let decoded = String::from_utf8_lossy(&bytes[cursor..cursor + length]);
+        let normalized: String = decoded.nfkc().collect();
+        mapped.extend(std::iter::repeat_n(
+            (spans[cursor].0, spans[cursor + length - 1].1),
+            normalized.len(),
+        ));
+        readable.push_str(&normalized);
+        cursor += length;
+    }
+    let normalized: String = readable.nfkc().collect();
+    if normalized != readable {
+        // Composition across characters uses a conservative original span.
+        let span = (spans[0].0, spans[spans.len() - 1].1);
+        mapped = vec![span; normalized.len()];
+        readable = normalized;
+    }
+    (readable, mapped)
+}
+
+fn decode_redaction_view(bytes: &[u8], spans: &[(usize, usize)]) -> (Vec<u8>, Vec<(usize, usize)>) {
+    let mut next = Vec::new();
+    let mut mapped = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut replacement = None;
+        if bytes[i] == b'&' {
+            if let Some(end) = bytes[i..]
+                .iter()
+                .take(33)
+                .position(|b| *b == b';')
+                .filter(|end| *end <= 32)
+            {
+                let entity = std::str::from_utf8(&bytes[i + 1..i + end]).unwrap_or("");
+                let ch = match entity {
+                    "equals" => Some('='),
+                    "colon" => Some(':'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "Tab" => Some('\t'),
+                    "NewLine" => Some('\n'),
+                    "nbsp" => Some(' '),
+                    "lowbar" => Some('_'),
+                    "sol" => Some('/'),
+                    "bsol" => Some('\\'),
+                    "semi" => Some(';'),
+                    "percnt" => Some('%'),
+                    "commat" => Some('@'),
+                    "period" => Some('.'),
+                    "num" => Some('#'),
+                    "hyphen" => Some('-'),
+                    _ => entity
+                        .strip_prefix("#x")
+                        .or_else(|| entity.strip_prefix("#X"))
+                        .and_then(|n| u32::from_str_radix(n, 16).ok())
+                        .or_else(|| entity.strip_prefix('#').and_then(|n| n.parse().ok()))
+                        .and_then(char::from_u32),
+                };
+                replacement = ch.map(|ch| (ch.to_string().into_bytes(), end + 1));
+            }
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(a), Some(b)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                replacement = Some((vec![(a * 16 + b) as u8], 3));
+            }
+        } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'x' && i + 3 < bytes.len() {
+                if let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 4]) {
+                    replacement = u8::from_str_radix(hex, 16).ok().map(|ch| (vec![ch], 4));
+                }
+            } else if bytes[i + 1] == b'u' && i + 5 < bytes.len() {
+                if let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 6]) {
+                    if let Ok(code) = u32::from_str_radix(hex, 16) {
+                        let mut scalar = code;
+                        let mut consumed = 6;
+                        if (0xd800..=0xdbff).contains(&code)
+                            && bytes.get(i + 6..i + 8) == Some(b"\\u")
+                        {
+                            if let Some(low) = bytes
+                                .get(i + 8..i + 12)
+                                .and_then(|hex| std::str::from_utf8(hex).ok())
+                                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                                .filter(|low| (0xdc00..=0xdfff).contains(low))
+                            {
+                                scalar = 0x10000 + ((code - 0xd800) << 10) + low - 0xdc00;
+                                consumed = 12;
+                            }
+                        }
+                        if let Some(ch) = char::from_u32(scalar) {
+                            replacement = Some((ch.to_string().into_bytes(), consumed));
+                        }
+                    }
+                }
+            } else {
+                let ch = match bytes[i + 1] {
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'b' => 8,
+                    b'f' => 12,
+                    other => other,
+                };
+                replacement = Some((vec![ch], 2));
+            }
+        }
+        if let Some((decoded, consumed)) = replacement {
+            mapped.extend(std::iter::repeat_n(
+                (spans[i].0, spans[i + consumed - 1].1),
+                decoded.len(),
+            ));
+            next.extend(decoded);
+            i += consumed;
+        } else {
+            next.push(bytes[i]);
+            mapped.push(spans[i]);
+            i += 1;
+        }
+    }
+    (next, mapped)
 }
 
 pub struct HttpAdapter {
@@ -726,22 +1221,40 @@ pub struct HttpAdapter {
 /// `describe_failure` and transport-error paths so secrets are never printed.
 pub fn mask_secrets(text: &str, api_key: &str) -> String {
     let mut out = text.to_string();
-    if api_key.len() >= 4 {
+    if !api_key.is_empty() {
         out = out.replace(api_key, "***");
     }
     // Query, fragment, and `;`-separated params: key / api_key / token / …
     static KEY_PARAM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-            r"(?i)([?&#;](?:key|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|token|secret|password|auth)=)[^&\s#;]*",
+            r"(?i)([?&#;](?:key|api[ _-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|token|secret|password|auth)=)[^&\s#;]*",
         )
         .expect("regex")
     });
     KEY_PARAM.replace_all(&out, "${1}***").into_owned()
 }
 
-/// Explains a failed or non-JSON LLM response. Only 401/403 blame the key;
-/// HTML (or a 404) hints at the base URL. The request URL and a short body
-/// excerpt are included, with the API key and secret query values masked.
+/// Formats transport causes before masking secrets in the complete message.
+fn error_chain(error: &(dyn std::error::Error + 'static), api_key: &str) -> String {
+    let mut parts = Vec::new();
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        let text = cause.to_string();
+        if !parts.contains(&text) {
+            parts.push(text);
+        }
+        current = cause.source();
+    }
+    let mut message = parts.join(": ");
+    if message.contains("resolves to non-public address") {
+        message.push_str("; if this host is a local proxy (for example a fake-IP DNS setup), set LLM_ALLOW_PRIVATE_HOST=true for local development; it is refused in CI and production");
+    }
+    mask_secrets(&message, api_key)
+}
+
+/// Explains a failed or non-JSON LLM response. JSON or empty 401/403 responses blame the key;
+/// HTML (or a 404) hints at the base URL. Only the masked URL and response
+/// classification and allowlisted error codes are included; response body text is never included.
 pub fn describe_failure(
     url: &str,
     status: u16,
@@ -751,26 +1264,22 @@ pub fn describe_failure(
 ) -> String {
     let shown_url = mask_secrets(url, api_key);
     let raw = String::from_utf8_lossy(body);
-    let excerpt: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Mask the full body first so a key straddling the 200-char cut cannot leak.
-    let excerpt = mask_secrets(&excerpt, api_key);
-    let excerpt: String = excerpt.chars().take(200).collect();
     let html = content_type.to_ascii_lowercase().contains("text/html")
-        || excerpt
+        || raw
             .trim_start()
             .to_ascii_lowercase()
             .starts_with("<!doctype html")
-        || excerpt
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("<html");
+        || raw.trim_start().to_ascii_lowercase().starts_with("<html");
     let lead = match status {
-        401 | 403 => format!("LLM_API_KEY was rejected (http {status})"),
+        401 | 403 if body.is_empty() || serde_json::from_slice::<Value>(body).is_ok() => {
+            format!("LLM_API_KEY was rejected (http {status})")
+        }
+        401 | 403 => format!("LLM endpoint or a proxy in front of it refused the request (http {status}); the response is not JSON, so this is probably not an API key problem"),
         404 => format!("LLM endpoint not found (http {status})"),
         429 => format!("LLM rate limit or quota exceeded (http {status})"),
         400 => format!("LLM request rejected (http {status}); check LLM_MODEL and the provider"),
         s if s >= 500 => format!("LLM provider error (http {s})"),
-        s if (200..300).contains(&s) => "LLM response was not JSON".to_string(),
+        s if (200..300).contains(&s) => format!("LLM response was not JSON (http {s})"),
         s => format!("LLM request failed (http {s})"),
     };
     let hint = if html || status == 404 {
@@ -778,12 +1287,18 @@ pub fn describe_failure(
     } else {
         ""
     };
-    format!("{lead}{hint}. URL: {shown_url}. Response: {excerpt}")
+    let code = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| error_code(&value).map(known_error_code))
+        .map(|code| format!("; provider error code: {code}"))
+        .unwrap_or_default();
+    mask_secrets(&format!("{lead}{hint}. URL: {shown_url}{code}"), api_key)
 }
 
 impl HttpAdapter {
     pub fn new(config: LlmConfig) -> Result<Self, String> {
         let mut builder = Client::builder()
+            .user_agent(USER_AGENT)
             .timeout(config.timeout)
             // A redirect could lead to a host the endpoint check never saw.
             .redirect(reqwest::redirect::Policy::none());
@@ -792,15 +1307,22 @@ impl HttpAdapter {
             // rebinding); every resolved address is checked before connecting.
             builder = crate::netguard::guard_client(builder);
         }
-        let client = builder
-            .build()
-            .map_err(|err| format!("http client: {err}"))?;
+        let client = builder.build().map_err(|err| {
+            mask_secrets(
+                &format!("http client: {}", error_chain(&err, &config.api_key)),
+                &config.api_key,
+            )
+        })?;
         Ok(Self { config, client })
     }
 }
 
 #[async_trait]
 impl LlmAdapter for HttpAdapter {
+    fn enforces_budget(&self) -> bool {
+        true
+    }
+
     fn provider(&self) -> &'static str {
         match self.config.provider.as_str() {
             ANTHROPIC => "anthropic",
@@ -818,12 +1340,66 @@ impl LlmAdapter for HttpAdapter {
     }
 
     async fn compile(&self, request: &LlmRequest) -> Result<LlmResponse, String> {
+        let mut bounded = request.clone();
+        if bounded.budget.is_none() {
+            bounded.budget = Some(default_budget()?);
+        }
+        let request = &bounded;
         let mut attempt = 0u32;
         let max = self.config.max_retries;
+        let started = std::time::Instant::now();
+        let deadline = retry_deadline();
         loop {
-            match self.compile_once(request).await {
+            // Every attempt reserves from the shared budget and may not run
+            // past the retry deadline or the budget's time left.
+            let mut window = deadline.saturating_sub(started.elapsed());
+            if let Some(budget) = &request.budget {
+                match budget.reserve() {
+                    Ok(left) => window = window.min(left),
+                    Err(why) => return Err(why),
+                }
+            }
+            if window.is_zero() {
+                return Err(format!(
+                    "LLM retry deadline {}s reached",
+                    deadline.as_secs()
+                ));
+            }
+            let attempt_result =
+                match tokio::time::timeout(window, self.compile_once(request)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(CallError {
+                        message: format!(
+                            "LLM call stopped after {}ms: deadline or budget reached",
+                            window.as_millis()
+                        ),
+                        retryable: false,
+                        retry_after: None,
+                    }),
+                };
+            match attempt_result {
                 Ok(response) => return Ok(response),
                 Err(err) if err.retryable && attempt < max => {
+                    // 408/429/5xx/network/timeouts: honor Retry-After, else
+                    // exponential backoff with jitter (#83); never past the
+                    // overall deadline or the budget.
+                    let delay = err.retry_after.unwrap_or_else(|| retry_delay(attempt));
+                    let budget_left = request
+                        .budget
+                        .as_ref()
+                        .map(|b| b.remaining())
+                        .unwrap_or(Duration::MAX);
+                    if started.elapsed() + delay >= deadline || delay >= budget_left {
+                        return Err(redact(
+                            &format!(
+                                "{} (gave up: retry deadline {}s or LLM budget reached)",
+                                err.message,
+                                deadline.as_secs()
+                            ),
+                            &[&self.config.api_key],
+                        ));
+                    }
+                    tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
                 Err(err) => {
@@ -834,9 +1410,35 @@ impl LlmAdapter for HttpAdapter {
     }
 }
 
+/// Delay before retry `attempt` (0-based): 1s, 2s, 4s, ... capped at 16s,
+/// plus up to 25% jitter so parallel runs do not retry in lockstep.
+pub fn retry_delay(attempt: u32) -> std::time::Duration {
+    let base_ms = 1_000u64.saturating_mul(1 << attempt.min(4));
+    let jitter = (uuid::Uuid::new_v4().as_u128() % (base_ms as u128 / 4 + 1)) as u64;
+    std::time::Duration::from_millis(base_ms + jitter)
+}
+
 struct CallError {
     message: String,
     retryable: bool,
+    retry_after: Option<std::time::Duration>,
+}
+
+/// Total time one LLM call may spend retrying (`LLM_RETRY_DEADLINE`
+/// seconds, default 120, max 600).
+pub fn retry_deadline() -> std::time::Duration {
+    let secs = std::env::var("LLM_RETRY_DEADLINE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|n| n.min(600))
+        .unwrap_or(120);
+    std::time::Duration::from_secs(secs)
+}
+
+/// `Retry-After` in delta-seconds (HTTP-dates are ignored), capped at 60s.
+pub fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    let secs: u64 = value.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(secs.min(60)))
 }
 
 impl HttpAdapter {
@@ -854,10 +1456,22 @@ impl HttpAdapter {
             builder = builder.header(key, value);
         }
         let response = builder.send().await.map_err(|err| CallError {
-            message: mask_secrets(&format!("LLM request failed: {err}"), &self.config.api_key),
+            message: mask_secrets(
+                &format!(
+                    "LLM request failed: {}",
+                    error_chain(&err, &self.config.api_key)
+                ),
+                &self.config.api_key,
+            ),
             retryable: true,
+            retry_after: None,
         })?;
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after);
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -865,8 +1479,15 @@ impl HttpAdapter {
             .unwrap_or("")
             .to_string();
         let bytes = response.bytes().await.map_err(|err| CallError {
-            message: mask_secrets(&format!("LLM response body: {err}"), &self.config.api_key),
+            message: mask_secrets(
+                &format!(
+                    "LLM response body: {}",
+                    error_chain(&err, &self.config.api_key)
+                ),
+                &self.config.api_key,
+            ),
             retryable: true,
+            retry_after: None,
         })?;
         if !status.is_success() {
             return Err(CallError {
@@ -877,7 +1498,8 @@ impl HttpAdapter {
                     &bytes,
                     &self.config.api_key,
                 ),
-                retryable: status.is_server_error() || status.as_u16() == 429,
+                retryable: status.is_server_error() || matches!(status.as_u16(), 408 | 429),
+                retry_after,
             });
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| CallError {
@@ -889,6 +1511,7 @@ impl HttpAdapter {
                 &self.config.api_key,
             ),
             retryable: false,
+            retry_after: None,
         })?;
         let parsed = match self.config.provider.as_str() {
             ANTHROPIC => parse_anthropic(&value),
@@ -901,15 +1524,21 @@ impl HttpAdapter {
         .map_err(|message| CallError {
             message: mask_secrets(&message, &self.config.api_key),
             retryable: false,
+            retry_after: None,
         })?;
         if let Some(reported) = &parsed.model_reported {
             if reported != &request.model && !reported.is_empty() {
                 return Err(CallError {
-                    message: format!(
-                        "provider reported model {reported}, expected {}",
-                        request.model
+                    message: mask_secrets(
+                        &format!(
+                            "provider reported an unexpected model (expected {}, got {})",
+                            known_model(&self.config.provider, &request.model),
+                            known_model(&self.config.provider, reported),
+                        ),
+                        &self.config.api_key,
                     ),
                     retryable: false,
+                    retry_after: None,
                 });
             }
         }
@@ -1092,23 +1721,25 @@ pub fn parse_openai_responses(value: &Value) -> Result<LlmResponse, String> {
     parse_openai_responses_masked(value, "")
 }
 
-/// Like [`parse_openai_responses`]; provider error messages are masked
-/// (API key, `key=`-style values) before they are cut to 200 characters.
+/// Like [`parse_openai_responses`]; diagnostics never include provider body text.
 pub fn parse_openai_responses_masked(value: &Value, api_key: &str) -> Result<LlmResponse, String> {
     let status = value["status"].as_str().unwrap_or("");
     if status == "incomplete" {
-        let reason = value["incomplete_details"]["reason"]
-            .as_str()
-            .unwrap_or("unknown");
-        return Err(format!("openai responses output is incomplete ({reason})"));
+        return Err(mask_secrets(
+            &format!(
+                "openai responses output is incomplete (reason: {})",
+                known_incomplete_reason(&value["incomplete_details"]["reason"])
+            ),
+            api_key,
+        ));
     }
     if matches!(status, "failed" | "error") || !value["error"].is_null() {
-        let error = &value["error"];
-        let code = error["code"].as_str().unwrap_or("unknown");
-        let message = mask_secrets(error["message"].as_str().unwrap_or("no message"), api_key);
-        let message: String = message.chars().take(200).collect();
-        return Err(format!(
-            "openai responses returned an error ({code}): {message}"
+        let code = error_code(value)
+            .map(|code| format!(" (code: {})", known_error_code(code)))
+            .unwrap_or_default();
+        return Err(mask_secrets(
+            &format!("openai responses returned an error{code}"),
+            api_key,
         ));
     }
     let text = if let Some(text) = value["output_text"].as_str() {
@@ -1168,17 +1799,401 @@ pub fn env_map_from_process() -> HashMap<String, String> {
     std::env::vars().collect()
 }
 
-pub fn runtime_llm_env_present() -> Option<String> {
-    std::env::vars()
-        .find(|(key, value)| {
-            !value.is_empty() && (key.starts_with("LLM_") || key.starts_with("OPENAI_"))
+/// Names only, including empty and non-Unicode values.
+pub fn runtime_llm_env_names(
+    keys: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    let mut names: Vec<_> = keys
+        .into_iter()
+        .filter(|key| {
+            let key = key.to_string_lossy();
+            key.starts_with("LLM_") || key.starts_with("OPENAI_")
         })
-        .map(|(key, _)| key)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Remove compile-time credentials before building runtime state or spawning tasks.
+pub fn strip_runtime_llm_env() -> Vec<std::ffi::OsString> {
+    let names = runtime_llm_env_names(std::env::vars_os().map(|(key, _)| key));
+    for name in &names {
+        std::env::remove_var(name);
+    }
+    names
+}
+
+pub fn runtime_llm_env_present() -> Option<String> {
+    runtime_llm_env_names(std::env::vars_os().map(|(key, _)| key))
+        .first()
+        .map(|key| key.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_value_after_comment_only_line() {
+        for first in ["", "# comment", "first", "\"first\""] {
+            let input = format!("  password: {first}\n    second\n    third\n  message: retained");
+            assert_eq!(redact(&input, &[]), "  [redacted]\n  message: retained");
+        }
+    }
+
+    #[test]
+    fn html_entity_inside_value() {
+        for entity in ["&amp;", "&#61;", "&#x3d;", "&copy;", "&semi;"] {
+            let input = format!("password=abc{entity}def&message=retained");
+            assert_eq!(redact(&input, &[]), "[redacted]&message=retained");
+        }
+        assert_eq!(
+            redact("password=abc&message=retained", &[]),
+            "[redacted]&message=retained"
+        );
+    }
+
+    #[test]
+    fn key_word_boundaries() {
+        for input in [
+            "author: name",
+            "max_tokens: 100",
+            "auth: required",
+            "auth: optional",
+            "tokenizer: value",
+        ] {
+            assert_eq!(redact(input, &[]), input);
+        }
+        for key in [
+            "auth_token",
+            "x-auth",
+            "api_key",
+            "APP_DATABASE_URL",
+            "password",
+            "authorization",
+        ] {
+            assert_eq!(redact(&format!("{key}: value"), &[]), "[redacted]");
+        }
+    }
+
+    #[test]
+    fn redact_fullwidth_colon() {
+        assert_eq!(redact("password：value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_fullwidth_equals() {
+        assert_eq!(redact("password＝value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_html_separator() {
+        assert_eq!(redact("password&#61;value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_hex_separator() {
+        assert_eq!(redact("password\\x3dvalue", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_yaml_block_scalar() {
+        assert_eq!(redact("password: |-\n  first\n  second", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_multiline_quote() {
+        assert_eq!(redact("password: \"first\nsecond\"", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_encoded_known_secret() {
+        assert_eq!(redact("value%2Dhidden", &["value-hidden"]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_url_userinfo_variant() {
+        assert_eq!(redact("https://user:pa ss@host", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_pem_private_key() {
+        assert_eq!(
+            redact(
+                "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----",
+                &[]
+            ),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_cookie_header() {
+        assert_eq!(redact("Cookie: a=value; b=other", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_json_auth() {
+        assert_eq!(redact("{\"auth\":\"value\"}", &[]), "{\"[redacted]}");
+    }
+
+    #[test]
+    fn redact_credentials_setting() {
+        assert_eq!(redact("credentials=value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_chinese_password() {
+        assert_eq!(redact("密碼：value", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_aws_access_key() {
+        assert_eq!(redact("AKIA1234567890ABCDEF", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_github_pat() {
+        assert_eq!(redact("github_pat_abcdef123456", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_slack_token() {
+        assert_eq!(redact("xoxb-123456-abcdef", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_compact_token_format() {
+        assert_eq!(
+            redact("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature", &[]),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_pwd_path() {
+        assert_eq!(
+            redact("PWD=/tmp/project\nOLDPWD=/tmp/other", &[]),
+            "PWD=/tmp/project\nOLDPWD=/tmp/other"
+        );
+    }
+
+    #[test]
+    fn redact_line_after_multiline_value() {
+        assert_eq!(
+            redact("password: >\n  first\n  second\nmessage: retained", &[]),
+            "[redacted]\nmessage: retained"
+        );
+    }
+
+    #[test]
+    fn redact_json_escaped_opening_quote() {
+        assert_eq!(
+            redact(r#"{"password": \"a\"b tail\"}"#, &[]),
+            r#"{"[redacted]"#
+        );
+    }
+
+    #[test]
+    fn redact_nested_json_escaped_opening_quote() {
+        let original = r#"{"password": \"a\"b tail\"}"#;
+        let nested = serde_json::to_string(original).unwrap();
+        let output = redact(&nested, &[]);
+        assert!(output.ends_with("[redacted]"), "{output}");
+        assert!(
+            !output.contains("tail") && !output.contains("b"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn redact_invalid_percent_byte_with_encoded_separator() {
+        assert_eq!(redact("%FF password%3Dsecret", &[]), "%FF [redacted]");
+    }
+
+    #[test]
+    fn redact_many_percent_encoding_layers() {
+        assert_eq!(redact("password%252525253Dsecret", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_nested_json_password() {
+        assert_eq!(
+            redact(r#"{"outer":{"password":"secret"}}"#, &[]),
+            r#"{"outer":{"[redacted]}}"#
+        );
+    }
+
+    #[test]
+    fn redact_percent_encoding_iteration_limit() {
+        let encoded = format!("password%{}3Dsecret; remainder", "25".repeat(20));
+        assert_eq!(redact(&encoded, &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_preserves_other_lines() {
+        assert_eq!(
+            redact("plain text\npassword=secret\nmore text", &[]),
+            "plain text\n[redacted]\nmore text"
+        );
+    }
+
+    #[test]
+    fn redact_multilevel_escaped_quoted_values_including_tail() {
+        for raw in [
+            r"password='a\\'b tail'",
+            r"password='a\\\\'b tail'",
+            r"database_url='a\\'b tail'",
+            r#"password="a\\"b tail""#,
+        ] {
+            assert_eq!(redact(raw, &[]), "[redacted]", "{raw}");
+        }
+    }
+
+    #[test]
+    fn redact_iteratively_percent_encoded_settings_in_original_text() {
+        for raw in [
+            "password%3Dsecret",
+            "pwd%3Dsecret%26x%3D1",
+            "password%253Dsecret",
+            "p%2561ssword%253Dsecret",
+            "password%25253Dsecret",
+        ] {
+            assert_eq!(
+                redact(&format!("before {raw}; after"), &[]),
+                "before [redacted]; after",
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_password_with_escaped_single_quote() {
+        assert_eq!(redact(r"password='a\'b'", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_password_with_escaped_double_quote_and_space() {
+        assert_eq!(redact(r#"password="a\"b c""#, &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_password_with_escaped_space() {
+        assert_eq!(redact(r"password=a\ b", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_dsn_with_percent_encoded_password() {
+        assert_eq!(
+            redact("postgres://user:a%40b%3Ac@host/db", &[]),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_fully_url_encoded_connection_string() {
+        assert_eq!(
+            redact("postgres%3A%2F%2Fuser%3Apass%40host", &[]),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_dsn_with_escaped_space() {
+        assert_eq!(redact(r"postgres://user:a\ b@host/db", &[]), "[redacted]");
+    }
+
+    #[test]
+    fn redact_connection_strings_and_settings() {
+        for scheme in [
+            "postgres",
+            "postgresql",
+            "mysql",
+            "mongodb+srv",
+            "redis",
+            "amqp",
+        ] {
+            let raw = format!("before {scheme}://user:credential@host/db after");
+            let text = redact(&raw, &[]);
+            assert!(!text.contains("credential"), "{scheme}: {text}");
+            assert!(text.contains("before") && text.contains("after"));
+        }
+        for raw in [
+            "Server=host;Password=ado-value;Database=db;",
+            "Server=host;Pwd=ado-value;Database=db;",
+            "Password=\"ado;value\";",
+            "DATABASE_URL=private-connection",
+            r#"{"DATABASE_URL": "private-connection"}"#,
+            "APP_DATABASE_URL='private-connection'",
+        ] {
+            let text = redact(raw, &[]);
+            assert!(!text.contains("ado-value"), "{text}");
+            assert!(!text.contains("ado;value"), "{text}");
+            assert!(!text.contains("private-connection"), "{text}");
+            assert!(text.contains("[redacted]"), "{text}");
+        }
+        assert_eq!(redact("short abc", &["abc"]), "short [redacted]");
+    }
+
+    #[tokio::test]
+    async fn default_budget_is_shared_and_configured() {
+        if std::env::var_os("VIBE_TEST_DEFAULT_BUDGET").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "llm::tests::default_budget_is_shared_and_configured",
+                ])
+                .env("VIBE_TEST_DEFAULT_BUDGET", "1")
+                .env("LLM_MAX_CALLS_PER_SOURCE", "2")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let adapter = FakeAdapter {
+            responder: |_: &LlmRequest| Ok("done".into()),
+        };
+        let request = LlmRequest {
+            system: String::new(),
+            input: String::new(),
+            model: "test".into(),
+            seed: 0,
+            timeout: Duration::from_secs(1),
+            budget: None,
+        };
+        assert!(call_budgeted(&adapter, &request).await.is_ok());
+        assert!(call_budgeted(&adapter, &request).await.is_ok());
+        assert!(call_budgeted(&adapter, &request)
+            .await
+            .unwrap_err()
+            .contains("2 calls"));
+    }
+
+    #[tokio::test]
+    async fn explicit_budget_is_enforced() {
+        let adapter = FakeAdapter {
+            responder: |request: &LlmRequest| {
+                let budget = request.budget.as_ref().expect("default bound");
+                let mut available = 0;
+                while budget.reserve().is_ok() {
+                    available += 1;
+                }
+                assert!(available < crate::llm_budget::Limits::default().source_calls);
+                Ok("done".into())
+            },
+        };
+        let request = LlmRequest {
+            system: String::new(),
+            input: String::new(),
+            model: "test".into(),
+            seed: 0,
+            timeout: Duration::from_secs(1),
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
+        };
+        assert!(call_budgeted(&adapter, &request).await.is_ok());
+    }
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -1277,6 +2292,9 @@ mod tests {
                 model: model.into(),
                 seed: 0,
                 timeout: Duration::from_secs(5),
+                budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                    crate::llm_budget::Limits::default(),
+                ))),
             };
             let (url, _, _) = gemini_call(&config, &request);
             let expected = format!(
@@ -1302,6 +2320,9 @@ mod tests {
             model: "gemini-2.5-pro-001".into(),
             seed: 0,
             timeout: Duration::from_secs(5),
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         let (url, _, _) = gemini_call(&config, &request);
         assert_eq!(
@@ -1361,6 +2382,9 @@ mod tests {
             model: "vendor-model-2026-09-01".into(),
             seed: 0,
             timeout: Duration::from_secs(1),
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         let unknown = model_capabilities(OPENAI, &request.model, 0);
         assert!(
@@ -1582,7 +2606,7 @@ mod failure_message_tests {
         );
         assert!(!m.contains("sk-STRADDLE"), "{m}");
         assert!(!m.contains(key), "{m}");
-        assert!(m.contains("***"), "{m}");
+        assert!(!m.contains(&filler), "{m}");
     }
 
     #[test]
@@ -1614,13 +2638,13 @@ mod responses_tests {
         let key = "sk-test-secret-value-1234567890";
         let long = format!("{}{key} and api_key=abc123secret", "x".repeat(190));
         let err = parse_openai_responses_masked(
-            &json!({"status": "failed", "error": {"code": "bad", "message": long}}),
+            &json!({"status": "failed", "error": {"code": "bad", "message": &long}}),
             key,
         )
         .unwrap_err();
         assert!(!err.contains("sk-test-secret"), "{err}");
         assert!(!err.contains("sk-test"), "partial key leaked: {err}");
-        assert!(err.contains("***"), "{err}");
+        assert!(!err.contains(&long), "{err}");
         let err = parse_openai_responses(&json!({
             "error": {"code": "bad", "message": "see https://x/?api_key=abc123secret"}
         }))
@@ -1643,7 +2667,11 @@ mod responses_tests {
             let body = format!("{{\"error\":{{\"message\":\"bad key {key}\"}}}}");
             let app = Router::new().route(
                 "/v1/responses",
-                post(move || {
+                post(move |headers: axum::http::HeaderMap| {
+                    assert_eq!(
+                        headers.get("user-agent").unwrap(),
+                        concat!("vibe-sdk/", env!("CARGO_PKG_VERSION"))
+                    );
                     let body = body.clone();
                     async move { (StatusCode::from_u16(status).unwrap(), body) }
                 }),
@@ -1662,11 +2690,115 @@ mod responses_tests {
                 model: model.into(),
                 seed: 7,
                 timeout: Duration::from_secs(5),
+                budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                    crate::llm_budget::Limits::default(),
+                ))),
             };
             let err = adapter.compile(&request).await.unwrap_err();
             assert!(err.contains(&status.to_string()), "{status}: {err}");
             assert!(!err.contains(key), "{status}: {err}");
             let _ = retry;
+        }
+    }
+
+    #[tokio::test]
+    async fn all_provider_failures_omit_headers_and_body() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let key = "sk-private-test-key";
+        let marker = "BODY-MARKER-7f3a";
+        for (provider, style, code_field) in [
+            (OPENAI, "chat", "code"),
+            (OPENAI, "responses", "code"),
+            (ANTHROPIC, "chat", "type"),
+            (GEMINI, "chat", "status"),
+        ] {
+            let structured = json!({"type": "error", "error": {
+                code_field: marker,
+                "message": format!("{marker} Authorization: Bearer {key} x-api-key: {key} x-goog-api-key: {key}")
+            }}).to_string();
+            for (status, body) in [
+                (400, structured.clone()),
+                (200, structured),
+                (401, format!(r#"{{"error":"{marker} Bearer {key}"}}"#)),
+                (403, format!("<html>{marker} Bearer {key}</html>")),
+                (500, format!("{marker} Bearer {key}")),
+                (200, format!("{marker} malformed Bearer {key}")),
+                (
+                    200,
+                    format!(r#"{{"error":{{"code":"{marker}","message":"{key}"}}}}"#),
+                ),
+            ] {
+                let app = Router::new().fallback(post(move || {
+                    let body = body.clone();
+                    async move { (StatusCode::from_u16(status).unwrap(), body) }
+                }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let mut config = responses_config("test-model");
+                config.provider = provider.into();
+                config.api_style = style.into();
+                config.api_key = key.into();
+                config.base_url = format!("http://{addr}/v1");
+                config.endpoint_private = true;
+                let adapter = HttpAdapter::new(config).unwrap();
+                let request = LlmRequest {
+                    system: "sys".into(),
+                    input: "in".into(),
+                    model: "test-model".into(),
+                    seed: 0,
+                    timeout: Duration::from_secs(2),
+                    budget: None,
+                };
+                let err = adapter.compile(&request).await.unwrap_err();
+                for secret in [
+                    key,
+                    "Bearer",
+                    "Authorization",
+                    "x-api-key",
+                    "x-goog-api-key",
+                    marker,
+                ] {
+                    assert!(!err.contains(secret), "{err}");
+                }
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn model_mismatch_displays_only_known_models() {
+        use axum::{routing::post, Router};
+        for (reported, expected) in [
+            ("gpt-4o", "expected gpt-4.1, got gpt-4o"),
+            ("gpt-4o-SECRETMARKER", "expected gpt-4.1, got unknown"),
+        ] {
+            let body = json!({"status": "completed", "model": reported, "output_text": "ok"});
+            let app = Router::new().route(
+                "/v1/responses",
+                post(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut config = responses_config("gpt-4.1");
+            config.base_url = format!("http://{addr}/v1");
+            let adapter = HttpAdapter::new(config).unwrap();
+            let request = LlmRequest {
+                system: "s".into(),
+                input: "i".into(),
+                model: "gpt-4.1".into(),
+                seed: 7,
+                timeout: Duration::from_secs(5),
+                budget: None,
+            };
+            let message = adapter.compile(&request).await.unwrap_err();
+            server.abort();
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("SECRETMARKER"), "{message}");
         }
     }
 
@@ -1702,6 +2834,9 @@ mod responses_tests {
                 model: model.into(),
                 seed: config.seed,
                 timeout: config.timeout,
+                budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                    crate::llm_budget::Limits::default(),
+                ))),
             };
             let (_, body, _) = openai_responses_call(&config, &request);
             let stamp = params.to_map();
@@ -1754,7 +2889,7 @@ mod responses_tests {
         ] {
             let err = parse_openai_responses(&value).unwrap_err();
             assert!(
-                err.contains("server_error") && err.contains("boom"),
+                err.contains("returned an error") && !err.contains("boom"),
                 "{err}"
             );
         }
@@ -1797,6 +2932,9 @@ mod responses_tests {
             model: model.into(),
             seed: 7,
             timeout: Duration::from_secs(5),
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         *reply.lock().unwrap() =
             json!({"status": "completed", "model": model, "output_text": "## A"});
@@ -1815,7 +2953,7 @@ mod responses_tests {
             "error": {"code": "server_error", "message": "boom"}
         });
         let err = adapter.compile(&request).await.unwrap_err();
-        assert!(err.contains("server_error"), "{err}");
+        assert!(err.contains("returned an error"), "{err}");
     }
 
     #[test]
@@ -1826,6 +2964,9 @@ mod responses_tests {
             model: "gpt-5.1-2026-01-01".into(),
             seed: 0,
             timeout: Duration::from_secs(1),
+            budget: Some(std::sync::Arc::new(crate::llm_budget::CallBudget::new(
+                crate::llm_budget::Limits::default(),
+            ))),
         };
         let body = openai_responses_body(&request, &model_capabilities(OPENAI, "gpt-5.1", 0));
         assert_eq!(body["instructions"], "sys");
@@ -1867,5 +3008,261 @@ mod responses_tests {
         );
         assert!(load_llm_config(&env("bogus", "openai"), false).is_err());
         assert!(load_llm_config(&env("responses", "gemini"), false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod transport_policy_tests {
+    use super::*;
+
+    #[test]
+    fn user_agent_identifies_sdk_version() {
+        assert_eq!(
+            USER_AGENT,
+            format!("vibe-sdk/{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reqwest_dns_error_exposes_the_refusal_chain() {
+        let resolver = crate::netguard::PublicOnlyResolver::with_lookup(|_| {
+            Box::pin(async { Ok(vec!["198.18.0.5:0".parse().unwrap()]) })
+        });
+        let client = crate::netguard::guard_client_with(Client::builder(), resolver)
+            .build()
+            .unwrap();
+        let error = client
+            .post("https://proxy.example.com/v1?key=test-key")
+            .header("Authorization", "Bearer test-key")
+            .header("x-api-key", "test-key")
+            .header("x-goog-api-key", "test-key")
+            .body("BODY-MARKER-7f3a")
+            .send()
+            .await
+            .unwrap_err();
+        let message = error_chain(&error, "test-key");
+        assert!(message.contains("198.18.0.5"), "{message}");
+        assert!(message.contains("198.18.0.0/15"), "{message}");
+        assert!(
+            message.contains("; if this host is a local proxy (for example a fake-IP DNS setup), set LLM_ALLOW_PRIVATE_HOST=true for local development; it is refused in CI and production"),
+            "{message}"
+        );
+        assert!(!message.contains("test-key"));
+        assert!(!message.contains("Bearer test-key"));
+        assert!(!message.contains("BODY-MARKER-7f3a"));
+    }
+
+    #[test]
+    fn error_chain_includes_causes_and_masks_keys() {
+        #[derive(Debug)]
+        struct Cause(&'static str, Option<Box<Cause>>);
+        impl std::fmt::Display for Cause {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Cause {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as _)
+            }
+        }
+        let cause = Cause(
+            "request failed",
+            Some(Box::new(Cause(
+                "request failed",
+                Some(Box::new(Cause("DNS failed sk-secret", None))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&cause, "sk-secret"),
+            "request failed: DNS failed ***"
+        );
+    }
+
+    #[test]
+    fn private_opt_in_marks_public_names_and_remains_local_only() {
+        for restricted in [false, true] {
+            let env = HashMap::from([
+                ("LLM_API_KEY".into(), "test-key".into()),
+                ("LLM_MODEL".into(), "test-model".into()),
+                ("LLM_BASE_URL".into(), "https://proxy.example.com/v1".into()),
+                ("LLM_ALLOW_PRIVATE_HOST".into(), "true".into()),
+            ]);
+            let config = load_llm_config(&env, restricted);
+            if restricted {
+                assert!(config.is_err());
+            } else {
+                assert!(config.unwrap().endpoint_private);
+            }
+        }
+        assert!(
+            !classify_endpoint("https://proxy.example.com", false, false)
+                .unwrap()
+                .1
+        );
+        assert!(classify_endpoint("http://proxy.example.com", true, false).is_err());
+    }
+
+    #[test]
+    fn auth_errors_distinguish_non_json_responses() {
+        for body in [b"{}".as_slice(), b""] {
+            let message = describe_failure("https://api.example.com", 403, "", body, "test-key");
+            assert!(message.contains("LLM_API_KEY was rejected"));
+        }
+        let message = describe_failure(
+            "https://api.example.com",
+            403,
+            "text/html",
+            b"<html>test-key</html>",
+            "test-key",
+        );
+        assert!(message.contains("probably not an API key problem"));
+        assert!(message.contains("LLM_BASE_URL"));
+        assert!(!message.contains("test-key"));
+        assert!(!message.contains("Bearer test-key"));
+        assert!(!message.contains("BODY-MARKER-7f3a"));
+    }
+}
+
+#[cfg(test)]
+mod known_value_tests {
+    use super::*;
+
+    #[test]
+    fn models_use_strict_display_allowlist() {
+        for (provider, model) in [
+            (OPENAI, "GPT-4.1"),
+            (OPENAI, "gpt-4.1-2026-01-01"),
+            (ANTHROPIC, "claude-sonnet-4-6-latest"),
+            (GEMINI, "gemini-2.5-pro"),
+        ] {
+            assert_eq!(known_model(provider, model), model.to_ascii_lowercase());
+        }
+        for model in [
+            "gpt-4.1-SECRETMARKER",
+            "gpt-4.1-hello world",
+            "gpt-4.1-ä",
+            &"a".repeat(65),
+        ] {
+            assert_eq!(known_model(OPENAI, model), "unknown");
+        }
+        assert_eq!(known_model(GEMINI, "gpt-4.1"), "unknown");
+    }
+
+    #[test]
+    fn provider_codes_are_known_or_unknown_without_body_text() {
+        let key = "sk-private-test-key";
+        let marker = "BODY-SECRETMARKER";
+        // OpenAI chat and Responses, Anthropic and Gemini error envelopes.
+        for (field, code) in [
+            ("code", "invalid_api_key"),
+            ("code", "server_error"),
+            ("type", "authentication_error"),
+            ("status", "PERMISSION_DENIED"),
+        ] {
+            for value in [
+                json!(code),
+                json!(marker),
+                json!("custom_code_xyz"),
+                json!(42),
+                Value::Null,
+            ] {
+                let body = json!({"type": "error", "error": {field: value,
+                    "message": format!("{marker} Authorization: Bearer {key} x-api-key: private-header x-goog-api-key: private-google")}});
+                let expected = if value == json!(code) {
+                    code
+                } else {
+                    "unknown"
+                };
+                let message = describe_failure(
+                    "https://example.com/v1",
+                    400,
+                    "application/json",
+                    &serde_json::to_vec(&body).unwrap(),
+                    key,
+                );
+                let response_message = parse_openai_responses_masked(&body, key).unwrap_err();
+                if value.is_null() {
+                    assert!(!message.contains("provider error code"), "{message}");
+                    assert!(!response_message.contains("code:"), "{response_message}");
+                } else {
+                    assert!(
+                        message.contains(&format!("provider error code: {expected}")),
+                        "{message}"
+                    );
+                    assert!(response_message.contains(&format!("code: {expected}")));
+                }
+                for message in [message, response_message] {
+                    for forbidden in [
+                        marker,
+                        key,
+                        "Bearer",
+                        "Authorization",
+                        "x-api-key",
+                        "x-goog-api-key",
+                        "private-header",
+                        "private-google",
+                        "custom_code_xyz",
+                    ] {
+                        assert!(!message.contains(forbidden), "{message}");
+                    }
+                }
+            }
+        }
+        for (body, expected) in [
+            (
+                json!({"error": {"code": 429, "message": "quota exceeded", "status": "RESOURCE_EXHAUSTED"}}),
+                "RESOURCE_EXHAUSTED",
+            ),
+            (
+                json!({"error": {"code": null, "type": "insufficient_quota", "message": "quota exceeded"}}),
+                "insufficient_quota",
+            ),
+        ] {
+            assert_eq!(error_code(&body).map(known_error_code), Some(expected));
+            let message = describe_failure(
+                "https://example.com",
+                429,
+                "application/json",
+                &serde_json::to_vec(&body).unwrap(),
+                key,
+            );
+            assert!(
+                message.contains(&format!("provider error code: {expected}")),
+                "{message}"
+            );
+            let message = parse_openai_responses_masked(&body, key).unwrap_err();
+            assert!(message.contains(&format!("code: {expected}")), "{message}");
+        }
+        let fallback = json!({"error": {"type": "rate_limit_error"}});
+        assert_eq!(
+            error_code(&fallback).map(known_error_code),
+            Some("rate_limit_error")
+        );
+        assert!(
+            !describe_failure("https://example.com", 400, "", b"{}", key)
+                .contains("provider error code")
+        );
+        assert_eq!(known_error_code(&json!("Server_Error")), "unknown");
+    }
+
+    #[test]
+    fn incomplete_reasons_and_final_masking() {
+        for (reason, expected) in [
+            ("max_output_tokens", "max_output_tokens"),
+            ("content_filter", "content_filter"),
+            ("SECRETMARKER", "unknown"),
+        ] {
+            let body = json!({"status": "incomplete", "incomplete_details": {"reason": reason}});
+            let message = parse_openai_responses_masked(&body, "test-key").unwrap_err();
+            assert_eq!(
+                message,
+                format!("openai responses output is incomplete (reason: {expected})")
+            );
+        }
+        let body = json!({"status": "failed", "error": {"code": "server_error"}});
+        assert!(!parse_openai_responses_masked(&body, "server_error")
+            .unwrap_err()
+            .contains("server_error"));
     }
 }

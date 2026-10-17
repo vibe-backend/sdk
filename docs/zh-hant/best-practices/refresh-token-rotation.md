@@ -4,6 +4,8 @@
 
 讓 access token 保持短效（≤ 1 小時），同時讓用戶端維持登入狀態，方法是使用帶重用偵測的**輪換 refresh token**（Decision 6、§4A.1）。Refresh 由內置 `token-refresh` pipeline 處理（Decision 45）；登出由內置 `token-revoke` pipeline 處理（Decision 65）。第一個 refresh token 在登入時簽發：`sign-jwt` 配 `issue-refresh: new-family`（§4A.1、F10；見 [user-login.md](user-login.md)）。
 
+Spec Decision 149（產品經理已批准 2026-10-17，§4A.1c）：`sign-method` 一定唯讀（`writes: false`），包括經 `op: method` 呼叫嘅 method；否則 `vibe validate`、build 同 `vibe serve` 會報錯（`REFRESH_SIGN_METHOD_WRITES`）。**尚未實作：**呢個阻擋同平台記錄嘅 `last_refreshed_at` 會喺 D149 code PR（#270）實作；喺嗰之前請自己跟住呢條規則。最後 refresh 時間由平台以家族為單位自己記（`_platform_refresh_families.last_refreshed_at`）；升級之後要先行 `vibe migrate` 先可以 `vibe serve`；其他寫入請放喺另一個寫入 method，由 client 喺 refresh 成功之後另外呼叫。
+
 ## 自然語言 source 範例
 
 `api/auth/v1/refresh/refresh.md`（路由 `POST /auth/v1/{slug}/refresh`）
@@ -127,3 +129,5 @@ Return 204.
 - 由 pipeline 產生回應時，feature lock 的 `## Transform`／`## Steps` 應包含甚麼**未有規定**。
 - Decision 72 說固定的 refresh 限流會「用 §4.3 的 schema 寫入 lock」，但沒有展示是以明確的 `rate-limit` step 出現（如本頁所示），還是由 `token-refresh` 隱含。
 - 寬限期內可選的用戶端指紋比對（§4A.1 第 5 點）沒有對應參數。
+
+輪換進行中的 reservation 回傳可重試的 503 `TX_CONFLICT`，不含 `Set-Cookie`。先檢查重用：超過寬限期的已使用 token 即使仍有 reservation 也撤銷家族。完成後在寬限期內重試依決定 61 重發，超過寬限期則視為重用。簽發錯誤清除 reservation；取消請求、簽發逾時、完成交易失敗或 reservation 過期同樣清除 reservation，原 token 維持有效，可以重試；只有已提交的子 token 才會消耗原 token。資料庫／連線池逾時回傳 504 `TX_TIMEOUT`。升級後先執行 `vibe migrate`，再執行 `vibe serve`；reservation 欄位由 migration 按租戶新增。

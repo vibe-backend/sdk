@@ -97,6 +97,15 @@ pub fn load_dev_public(dir: &std::path::Path) -> Result<VerifyingKey, String> {
     VerifyingKey::from_bytes(&*decode_key(&text, "public key")?).map_err(|err| err.to_string())
 }
 
+/// Load the local development key, creating it on first use.
+pub fn load_or_create(dir: &std::path::Path) -> Result<SigningKey, String> {
+    if dir.join(".vibe/signing.key").exists() {
+        load_dev_key(dir)
+    } else {
+        create_dev_key(dir)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

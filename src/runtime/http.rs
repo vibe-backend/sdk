@@ -19,10 +19,11 @@ use subtle::ConstantTimeEq;
 use crate::manifest::{Manifest, RouteSpec};
 
 use super::crud::{self, MethodFail};
-use super::exec::QueryExec;
+use super::exec::{ExecError, QueryExec};
 use super::limiter::{
     ip_bucket, owner_of, parse_hop, ProxyNet, QuotaBuckets, RateBuckets, RateDecision,
 };
+use super::refresh::{RevokeTarget, Rotated};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -102,8 +103,10 @@ impl AuthConfig {
                 // Route URIs come from locks: public hosts only, no dev exception.
                 let source = super::jwks::HttpsJwks::new(&uri)
                     .map_err(|err| format!("{} {}: {err}", route.method, route.path))?;
-                self.route_jwks
-                    .insert(uri, Arc::new(super::jwks::JwksCache::new(Arc::new(source))));
+                self.route_jwks.insert(
+                    uri,
+                    Arc::new(super::jwks::JwksCache::with_alg(Arc::new(source), self.alg)),
+                );
             }
         }
         Ok(())
@@ -376,6 +379,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
     let request_id = uuid::Uuid::new_v4().to_string();
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
+
     if path == "/health" {
         return json_response(StatusCode::OK, json!({"status": "ok"}), &request_id, &[]);
     }
@@ -396,7 +400,11 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             "METHOD_NOT_ALLOWED",
             "Method not allowed",
             &request_id,
-            &[("allow", allowed.as_str())],
+            &[
+                ("allow", allowed.as_str()),
+                ("cache-control", "no-store"),
+                ("pragma", "no-cache"),
+            ],
         );
     };
     if state.disabled.contains(&found.route.feature_id) {
@@ -622,6 +630,35 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         )
         .await;
     }
+    // Refresh routes answer every bad or missing token with the same 401,
+    // so they run before request-table validation (which would give 422).
+    if let Some(spec) = &found.route.refresh {
+        let mut response = refresh_response(
+            &state,
+            found.route,
+            spec,
+            &principal.tenant_id,
+            &ip,
+            &body,
+            &request_id,
+        )
+        .await;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            if let Some(slug) = found
+                .params
+                .get("slug")
+                .filter(|slug| super::slugs::valid_slug(slug))
+            {
+                let cookie = format!(
+                    "__Host-vibe_rt_{slug}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict"
+                );
+                if let Ok(value) = cookie.parse() {
+                    response.headers_mut().insert(header::SET_COOKIE, value);
+                }
+            }
+        }
+        return finish(found.route, &state, started, response).await;
+    }
     // Validate only after authentication and authorization, so unauthenticated
     // callers cannot probe the request schema of protected endpoints.
     if let Err(fail) = validate_request(found.route, &body, &query, &found.params, &headers) {
@@ -632,6 +669,15 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             fail_response(found.route, fail, &request_id),
         )
         .await;
+    }
+    if let Some(spec) = &found.route.revoke {
+        if let Err(response) = revoke_tokens(&state, spec, &principal, &body, &request_id).await {
+            return finish(found.route, &state, started, response).await;
+        }
+        if found.route.steps.is_empty() {
+            let response = empty_response(StatusCode::NO_CONTENT, &request_id, &[]);
+            return finish(found.route, &state, started, response).await;
+        }
     }
     if found.route.public_writes && quota_exhausted(&state, &principal.tenant_id, &ip) {
         let retry = seconds_until_utc_midnight().to_string();
@@ -696,9 +742,14 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                 subject: &principal.subject,
                 roles: &principal.roles,
             },
+            refresh_token: None,
         }),
     );
-    let input = match crud::eval_expr(&found.route.transform_in, &vars) {
+    let transform_in = match found.route.transform_in.trim() {
+        "" | "(none)" => "{}",
+        expr => expr,
+    };
+    let input = match crud::eval_expr(transform_in, &vars) {
         Ok(value) => value,
         Err(err) => {
             return finish(found.route, &state, started, {
@@ -714,6 +765,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             .await;
         }
     };
+    vars.insert("input".into(), input.clone());
     let role = if found.route.public {
         if found.route.public_writes {
             "public_writer"
@@ -763,6 +815,7 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
                             subject: &principal.subject,
                             roles: &principal.roles,
                         },
+                        refresh_token: None,
                     },
                     1,
                 )
@@ -792,11 +845,47 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             "respond" => {
                 let value = if step.value == "transform.out" || step.value.is_empty() {
                     match crud::eval_expr(&found.route.transform_out, &vars) {
+                        Ok(Value::Null) if found.route.transform_out.trim() == "result" => {
+                            result_value.clone()
+                        }
                         Ok(value) => value,
-                        Err(_) => result_value.clone(),
+                        Err(err) => {
+                            tracing::error!(%request_id, error = %err, "respond value failed");
+                            return finish(
+                                found.route,
+                                &state,
+                                started,
+                                error_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "INTERNAL",
+                                    "Internal error",
+                                    &request_id,
+                                    &[],
+                                ),
+                            )
+                            .await;
+                        }
                     }
                 } else {
-                    result_value.clone()
+                    match crud::eval_expr(&step.value, &vars) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            tracing::error!(%request_id, error = %err, "respond value failed");
+                            return finish(
+                                found.route,
+                                &state,
+                                started,
+                                error_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "INTERNAL",
+                                    "Internal error",
+                                    &request_id,
+                                    &[],
+                                ),
+                            )
+                            .await;
+                        }
+                    }
                 };
                 result_value = value;
                 if step.status != 0 {
@@ -878,8 +967,16 @@ async fn finish(
     route: &RouteSpec,
     state: &AppState,
     started: Instant,
-    response: HttpResponse,
+    mut response: HttpResponse,
 ) -> HttpResponse {
+    if route.refresh.is_some() || route.revoke.is_some() {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+        response
+            .headers_mut()
+            .insert(header::PRAGMA, "no-cache".parse().unwrap());
+    }
     let min_ms = state.min_override_ms.unwrap_or(if route.public {
         // Login-class endpoints (a verify-password step) pad to 500 ms so
         // timing does not reveal whether the account exists.
@@ -891,6 +988,12 @@ async fn finish(
     } else {
         0
     });
+    // All refresh paths share a minimum response time.
+    let min_ms = if route.refresh.is_some() {
+        min_ms.max(REFRESH_MIN_RESPONSE_MS)
+    } else {
+        min_ms
+    };
     let elapsed = started.elapsed();
     if min_ms > 0 {
         let min = Duration::from_millis(min_ms);
@@ -1234,7 +1337,7 @@ async fn authenticate(
         .map_err(|_| AuthError::unauthorized("Bearer"))?;
         (auth.alg, key)
     };
-    if jwt_header.alg != alg {
+    if alg != auth.alg || jwt_header.alg != alg {
         return Err(AuthError::unauthorized("Bearer"));
     }
     let iss = if route.jwt_iss.is_empty() {
@@ -1402,6 +1505,77 @@ pub fn detect_jwt_alg(pem: &str) -> Result<Algorithm, String> {
     Err("VIBE_JWT_PUBLIC_KEY_PEM is not a usable RSA or EC public key".into())
 }
 
+/// Startup error text for an ES256 key that is not a usable P-256 key.
+/// Never includes key material.
+pub(crate) fn ec_problem_message(what: &str, problem: super::eckey::EcProblem) -> String {
+    use super::eckey::EcProblem;
+    match problem {
+        EcProblem::Sec1 => {
+            "SEC1 EC PRIVATE KEY is not supported; use PKCS#8 PRIVATE KEY".to_string()
+        }
+        EcProblem::InvalidPem => "invalid PEM encoding".to_string(),
+        EcProblem::NotEc => format!("{what}: ES256 key is not a readable EC key"),
+        EcProblem::OtherCurve => format!("{what}: ES256 key must use the P-256 curve"),
+        EcProblem::BadPoint => format!("{what}: ES256 key has an invalid P-256 public point"),
+        EcProblem::BadScalar => format!("{what}: ES256 private scalar is out of range"),
+        EcProblem::TrailingData => format!("{what}: ES256 key has unexpected data in its encoding"),
+    }
+}
+
+/// Resolves the deployment JWT alg from `VIBE_JWT_PUBLIC_KEY_PEM` and
+/// `VIBE_JWT_ALG` and checks the static key against it (what `vibe serve`
+/// does at startup). `pem` must already have escaped newlines expanded.
+pub fn static_jwt_alg(pem: Option<&str>, alg_env: Option<&str>) -> Result<Algorithm, String> {
+    let mut alg = Algorithm::ES256;
+    if let Some(pem) = pem {
+        alg = detect_jwt_alg(pem)?;
+    }
+    if let Some(value) = alg_env {
+        alg = match value.trim().to_ascii_uppercase().as_str() {
+            "ES256" => Algorithm::ES256,
+            "RS256" => Algorithm::RS256,
+            other => {
+                return Err(format!(
+                    "VIBE_JWT_ALG `{other}`: only ES256 and RS256 are supported"
+                ));
+            }
+        };
+    }
+    if let Some(pem) = pem.filter(|p| !p.is_empty()) {
+        check_static_jwt_key(pem, alg)?;
+    }
+    Ok(alg)
+}
+
+/// Startup check of `VIBE_JWT_PUBLIC_KEY_PEM` against the configured alg
+/// (decision 139): the key type must match, RSA keys need >= 2048 bits and
+/// ES256 keys must be valid P-256 keys.
+pub fn check_static_jwt_key(pem: &str, alg: Algorithm) -> Result<(), String> {
+    const WHAT: &str = "VIBE_JWT_PUBLIC_KEY_PEM";
+    match alg {
+        Algorithm::RS256 => {
+            if DecodingKey::from_rsa_pem(pem.as_bytes()).is_err() {
+                return Err(format!(
+                    "{WHAT}: VIBE_JWT_ALG is RS256 but the key is not an RSA public key"
+                ));
+            }
+            super::rsakey::check_rsa_pem(WHAT, pem)
+        }
+        Algorithm::ES256 => {
+            if DecodingKey::from_ec_pem(pem.as_bytes()).is_err() {
+                return Err(format!(
+                    "{WHAT}: VIBE_JWT_ALG is ES256 but the key is not an EC public key"
+                ));
+            }
+            // Defense-in-depth only: report P-256 curve/point errors at startup.
+            // jsonwebtoken (aws_lc_rs) performs authoritative parsing and
+            // verification; JWKS keys bypass these hand-written checks.
+            super::eckey::p256_public(pem).map_err(|problem| ec_problem_message(WHAT, problem))
+        }
+        other => Err(format!("{WHAT}: unsupported alg {other:?}")),
+    }
+}
+
 pub fn hash_api_secret(pepper: &[u8], secret: &str) -> String {
     hmac_hex(pepper, secret)
 }
@@ -1495,9 +1669,11 @@ fn rate_limited(
     if route.rates.is_empty() {
         return None;
     }
+    // `family` limits are applied by the refresh handler once the family is known.
     let checks: Vec<(String, String, u32)> = route
         .rates
         .iter()
+        .filter(|rate| rate.key != "family")
         .enumerate()
         .map(|(index, rate)| {
             let (shard, key) =
@@ -1513,6 +1689,261 @@ fn rate_limited(
         RateDecision::Allow => None,
         RateDecision::Limited(wait) => Some(wait.to_string()),
     }
+}
+
+fn limit_check(state: &AppState, checks: &[(String, String, u32)], owner: &str) -> Option<String> {
+    let Ok(mut rates) = state.rates.lock() else {
+        return Some("1".into());
+    };
+    match rates.check(checks, owner, Instant::now()) {
+        RateDecision::Allow => None,
+        RateDecision::Limited(wait) => Some(wait.to_string()),
+    }
+}
+
+/// Platform ceilings for refresh routes (decision 72).
+// Bound database lookup, rotation and signing together; pad early results to
+// the same deadline in finish, including rate-limit and unknown-token paths.
+const REFRESH_MIN_RESPONSE_MS: u64 = 300;
+const REFRESH_IP_PER_MINUTE: u32 = 30;
+const REFRESH_FAMILY_PER_MINUTE: u32 = 10;
+
+static REFRESH_REJECTIONS: std::sync::LazyLock<Mutex<HashMap<&'static str, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Snapshot for internal metrics collectors, alongside saturation_refusals.
+pub fn refresh_rejections() -> HashMap<&'static str, u64> {
+    REFRESH_REJECTIONS
+        .lock()
+        .map(|counts| counts.clone())
+        .unwrap_or_default()
+}
+
+fn log_id_hash(value: &str) -> String {
+    let digest = <Sha256 as sha2::Digest>::digest(value.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn invalid_refresh(request_id: &str, reason: &'static str) -> HttpResponse {
+    if let Ok(mut counts) = REFRESH_REJECTIONS.lock() {
+        *counts.entry(reason).or_default() += 1;
+    }
+    json_response(
+        StatusCode::UNAUTHORIZED,
+        serde_json::json!({"error": {"code": "INVALID_REFRESH_TOKEN", "message": "Invalid refresh token"}}),
+        request_id,
+        &[],
+    )
+}
+
+fn refresh_unavailable(request_id: &str, err: &ExecError) -> HttpResponse {
+    json_response(
+        if matches!(err, ExecError::Timeout) {
+            StatusCode::GATEWAY_TIMEOUT
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        json!({"error": {
+            "code": if matches!(err, ExecError::Timeout) { "TX_TIMEOUT" } else { "TX_CONFLICT" },
+            "message": "Token refresh is temporarily unavailable; try again later",
+            "request_id": request_id,
+            "retryable": true,
+        }}),
+        request_id,
+        &[
+            ("retry-after".into(), "1".into()),
+            ("cache-control".into(), "no-store".into()),
+            ("pragma".into(), "no-cache".into()),
+        ],
+    )
+}
+
+fn rate_limited_response(request_id: &str, retry: &str) -> HttpResponse {
+    error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "RATE_LIMITED",
+        "Too many requests",
+        request_id,
+        &[("retry-after", retry)],
+    )
+}
+
+/// `token-refresh`: validate, prepare issuance, and commit rotation.
+async fn refresh_response(
+    state: &AppState,
+    route: &RouteSpec,
+    spec: &crate::manifest::RefreshSpec,
+    tenant: &str,
+    ip: &str,
+    body: &Value,
+    request_id: &str,
+) -> HttpResponse {
+    let ip_check = [(
+        format!("{}:refresh-ip", route.feature_id),
+        ip.to_string(),
+        REFRESH_IP_PER_MINUTE,
+    )];
+    let owner = owner_of(ip);
+    if let Some(retry) = limit_check(state, &ip_check, &owner) {
+        return rate_limited_response(request_id, &retry);
+    }
+    let Some(token) = body
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty() && t.len() <= 256)
+    else {
+        return invalid_refresh(request_id, "invalid");
+    };
+    let hash = super::ops::refresh_hash(&state.auth.pepper, token);
+    // The family lookup must succeed before rotating: a store error fails
+    // closed with a retryable 503 instead of skipping the family limit. The
+    // presented token is not consumed, so the client can retry it.
+    let family = match state.exec.refresh_family(tenant, &hash).await {
+        Ok(family) => family,
+        Err(err) => {
+            tracing::error!(%request_id, tenant_hash = %log_id_hash(tenant), error = ?err, "refresh family lookup failed; failing closed");
+            return refresh_unavailable(request_id, &err);
+        }
+    };
+    if let Some(family) = family {
+        let per_minute = route
+            .rates
+            .iter()
+            .filter(|r| r.key == "family")
+            .map(|r| r.per_minute)
+            .min()
+            .unwrap_or(REFRESH_FAMILY_PER_MINUTE)
+            .min(REFRESH_FAMILY_PER_MINUTE);
+        let family_check = [(
+            format!("{}:family", route.feature_id),
+            family.clone(),
+            per_minute,
+        )];
+        // Known tokens, including revoked children, reach rotation when allowed.
+        if limit_check(state, &family_check, &owner).is_some() {
+            tracing::warn!(tenant_hash = %log_id_hash(tenant), family_hash = %log_id_hash(&family), "refresh family rate limit reached");
+            return invalid_refresh(request_id, "family_limit");
+        }
+    } else {
+        return invalid_refresh(request_id, "unknown");
+    }
+    let (new_token, new_hash) = super::ops::new_refresh_token(&state.auth.pepper);
+    let policy = super::ops::policy_of(spec);
+    let issuer = HttpRefreshIssuer {
+        state,
+        spec,
+        tenant,
+        new_token: &new_token,
+    };
+    match state
+        .exec
+        .refresh_rotate_authorized(tenant, &hash, &new_hash, policy, Some(&issuer))
+        .await
+    {
+        Ok((Rotated::Ok { expires_in, .. }, Some(mut value))) => {
+            value["refresh_token"] = Value::String(new_token);
+            value["refresh_expires_in"] = Value::from(expires_in);
+            json_response(StatusCode::OK, value, request_id, &[])
+        }
+        Ok((Rotated::Reuse { family_id }, _)) => {
+            tracing::warn!(tenant_hash = %log_id_hash(tenant), family_hash = %log_id_hash(&family_id), "refresh token reuse detected; family revoked");
+            invalid_refresh(request_id, "invalid")
+        }
+        Ok(_) => invalid_refresh(request_id, "invalid"),
+        Err(err) => {
+            tracing::error!(%request_id, error = ?err, "refresh rotation failed");
+            refresh_unavailable(request_id, &err)
+        }
+    }
+}
+
+struct HttpRefreshIssuer<'a> {
+    state: &'a AppState,
+    spec: &'a crate::manifest::RefreshSpec,
+    tenant: &'a str,
+    new_token: &'a str,
+}
+
+#[async_trait::async_trait]
+impl super::exec::RefreshIssuer for HttpRefreshIssuer<'_> {
+    async fn issue(&self, user_id: &str) -> Result<Value, super::exec::ExecError> {
+        let input = json!({ "user_id": user_id });
+        let result = crud::run_method(
+            &self.state.manifest,
+            self.state.exec.as_ref(),
+            &self.spec.sign_method,
+            &input,
+            crud::CallCtx {
+                auth: &self.state.auth,
+                tenant_id: self.tenant,
+                role: "public_reader",
+                caller: crud::Caller {
+                    subject: user_id,
+                    roles: &[],
+                },
+                refresh_token: Some(self.new_token),
+            },
+            1,
+        )
+        .await;
+        match result {
+            Ok(result) if result.value.get("access_token").is_some() => Ok(result.value),
+            Err(err) if err.code == "TX_TIMEOUT" => Err(ExecError::Timeout),
+            Err(err) if matches!(err.code.as_str(), "TX_CONFLICT" | "CONFLICT") => {
+                Err(ExecError::Conflict)
+            }
+            _ => Err(ExecError::IssuanceFailed),
+        }
+    }
+}
+
+/// `token-revoke`: `family` revokes the presented token's family (only the
+/// caller's own); `all` revokes every family of the caller.
+async fn revoke_tokens(
+    state: &AppState,
+    spec: &crate::manifest::RevokeSpec,
+    principal: &Principal,
+    body: &Value,
+    request_id: &str,
+) -> Result<(), HttpResponse> {
+    let hash;
+    let target = if spec.scope == "all" {
+        RevokeTarget::User(&principal.subject)
+    } else {
+        let Some(token) = body.get("refresh_token").and_then(Value::as_str) else {
+            return Err(error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "VALIDATION_FAILED",
+                "refresh_token is required",
+                request_id,
+                &[],
+            ));
+        };
+        hash = super::ops::refresh_hash(&state.auth.pepper, token);
+        RevokeTarget::FamilyOf {
+            hash: &hash,
+            user: &principal.subject,
+        }
+    };
+    // Unknown tokens revoke nothing; the response is the same either way.
+    if let Err(err) = state
+        .exec
+        .refresh_revoke(&principal.tenant_id, target)
+        .await
+    {
+        tracing::error!(%request_id, error = ?err, "refresh revoke failed");
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "Internal error",
+            request_id,
+            &[],
+        ));
+    }
+    Ok(())
 }
 
 fn seconds_until_utc_midnight() -> i64 {
@@ -2124,6 +2555,113 @@ RTEHNuYnbAj0UxUkvDhcSG4gkWoh0D8/pvqjNI0bI5Rkrs6Mh8Yq2k1j\n\
         auth
     }
 
+    /// 2048-bit RSA modulus (src/runtime/testdata/rsa-p2048.pem).
+    const RSA_N: &str = "tupUT5sUR0iufz_2dX_ZWfdJ9oluerIsYtUELeYxbe_Bu71_oJUILJiNUyceUtmDJRNHj6NWalJ36zkykGm3ZU65cAI91A9d7mSN0ryaDn6-b45VINQIEtMSutWrGh2I7FgxLNGmDFMLQQ1sDVCS1lwtAD_EtYzzWrqjxdqRal1eaGF58dtMjqCk_rrGcQ7oEm_tTBZVge24sf7bQUliuwZQo6t7SI2tvocawcgDuZvFMU_I99dyGJNQxyY1pKkPqIdMxtrTrBoHcBXNvlSu8IoFslK49w3XY8kpkb7KGoJvDmT6NYQxXtjNY0_-ZZIdM_egJboeibuVVzi549nPjQ";
+
+    #[tokio::test]
+    async fn jwks_accepts_only_the_configured_alg() {
+        // Decision 139 (#225): a JWKS holding EC and RSA keys only serves the
+        // configured alg; keys of the other type are unused.
+        let doc = json!({"keys": [
+            {"kty": "EC", "crv": "P-256", "kid": "k1", "x": X, "y": Y},
+            {"kty": "RSA", "kid": "r1", "n": RSA_N, "e": "AQAB"},
+        ]});
+        let mut auth = AuthConfig::anonymous();
+        auth.jwks = Some(Arc::new(super::super::jwks::JwksCache::new(Arc::new(Doc(
+            doc.clone(),
+        )))));
+        let r = route(json!({}));
+        let t = token("k1", json!({"roles": ["staff"]}));
+        assert_eq!(auth.alg, Algorithm::ES256);
+        assert!(authenticate(&auth, &r, &bearer(&t)).await.is_ok());
+        auth.alg = Algorithm::RS256;
+        assert!(
+            authenticate(&auth, &r, &bearer(&t)).await.is_err(),
+            "ES256 key must not be used when RS256 is configured"
+        );
+        // Same rule for a route-level issuer JWKS.
+        let mut auth = AuthConfig::anonymous();
+        auth.alg = Algorithm::RS256;
+        const URI: &str = "https://idp.example.com/jwks.json";
+        auth.route_jwks.insert(
+            URI.into(),
+            Arc::new(super::super::jwks::JwksCache::new(Arc::new(Doc(doc)))),
+        );
+        let r = route(json!({"jwks_uri": URI}));
+        assert!(authenticate(&auth, &r, &bearer(&t)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rsa_key_sharing_a_kid_does_not_affect_es256_tokens() {
+        // An RSA key and an EC key with the same kid: the kid is ambiguous
+        // and unused whatever the order; other kids keep working.
+        let r = route(json!({}));
+        for keys in [
+            json!([
+                {"kty": "EC", "crv": "P-256", "kid": "k1", "x": X, "y": Y},
+                {"kty": "RSA", "kid": "k1", "n": RSA_N, "e": "AQAB"},
+                {"kty": "EC", "crv": "P-256", "kid": "k2", "x": X, "y": Y},
+            ]),
+            json!([
+                {"kty": "RSA", "kid": "k1", "n": RSA_N, "e": "AQAB"},
+                {"kty": "EC", "crv": "P-256", "kid": "k1", "x": X, "y": Y},
+                {"kty": "EC", "crv": "P-256", "kid": "k2", "x": X, "y": Y},
+            ]),
+        ] {
+            let mut auth = AuthConfig::anonymous();
+            auth.jwks = Some(Arc::new(super::super::jwks::JwksCache::with_alg(
+                Arc::new(Doc(json!({ "keys": keys }))),
+                Algorithm::ES256,
+            )));
+            let t1 = token("k1", json!({"roles": ["staff"]}));
+            let t2 = token("k2", json!({"roles": ["staff"]}));
+            assert!(authenticate(&auth, &r, &bearer(&t1)).await.is_err());
+            assert!(authenticate(&auth, &r, &bearer(&t2)).await.is_ok());
+        }
+    }
+
+    #[test]
+    fn static_jwt_key_must_match_alg_and_size() {
+        // Decision 139 (#224).
+        let pub2048 = include_str!("testdata/rsa-p2048.pem");
+        let pub1024 = include_str!("testdata/rsa-p1024.pem");
+        let ec = "-----BEGIN PUBLIC KEY-----\n\
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0mqNqll14aIJEhYqCiRLWJX63Ty6\n\
+Q0UxBzbmJ2wI9FMVJLw4XEhuIJFqIdA/P6b6ozSNGyOUZK7OjIfGKtpNYw==\n\
+-----END PUBLIC KEY-----\n";
+        assert!(check_static_jwt_key(pub2048, Algorithm::RS256).is_ok());
+        assert!(check_static_jwt_key(ec, Algorithm::ES256).is_ok());
+        let err = check_static_jwt_key(pub1024, Algorithm::RS256).unwrap_err();
+        assert!(err.contains("at least 2048 bits"), "{err}");
+        assert!(check_static_jwt_key(ec, Algorithm::RS256).is_err());
+        assert!(check_static_jwt_key(pub2048, Algorithm::ES256).is_err());
+        let p384 = include_str!("testdata/ec-p384-p.pem");
+        let err = check_static_jwt_key(p384, Algorithm::ES256).unwrap_err();
+        assert!(err.contains("P-256"), "{err}");
+        assert!(!err.contains("MH"), "{err}");
+    }
+
+    #[test]
+    fn static_jwt_alg_resolves_env_and_checks_the_key() {
+        let ec = include_str!("testdata/ec-p256-p.pem");
+        let rsa = include_str!("testdata/rsa-p2048.pem");
+        let p384 = include_str!("testdata/ec-p384-p.pem");
+        assert_eq!(static_jwt_alg(None, None).unwrap(), Algorithm::ES256);
+        assert_eq!(static_jwt_alg(Some(ec), None).unwrap(), Algorithm::ES256);
+        assert_eq!(static_jwt_alg(Some(rsa), None).unwrap(), Algorithm::RS256);
+        assert_eq!(
+            static_jwt_alg(Some(rsa), Some("rs256")).unwrap(),
+            Algorithm::RS256
+        );
+        let err = static_jwt_alg(Some(ec), Some("RS256")).unwrap_err();
+        assert!(err.contains("not an RSA public key"), "{err}");
+        let err = static_jwt_alg(Some(rsa), Some("ES256")).unwrap_err();
+        assert!(err.contains("not an EC public key"), "{err}");
+        assert!(static_jwt_alg(Some(p384), None).is_err());
+        assert!(static_jwt_alg(Some(p384), Some("ES256")).is_err());
+        assert!(static_jwt_alg(None, Some("HS256")).is_err());
+    }
+
     #[tokio::test]
     async fn jwks_keys_verify_tokens_and_unknown_kids_fail() {
         let auth = jwks_auth();
@@ -2642,5 +3180,65 @@ mod crypto_kats {
             mac,
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+    }
+}
+
+#[cfg(test)]
+mod refresh_response_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejection_responses_match_with_the_same_request_id() {
+        let invalid = invalid_refresh("request", "invalid");
+        let capped = invalid_refresh("request", "family_limit");
+        assert_eq!(invalid.status(), capped.status());
+        assert_eq!(invalid.headers(), capped.headers());
+        assert_eq!(invalid.headers()["x-request-id"], "request");
+        let invalid = axum::body::to_bytes(invalid.into_body(), 4096)
+            .await
+            .unwrap();
+        let capped = axum::body::to_bytes(capped.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(invalid, capped);
+    }
+
+    #[tokio::test]
+    async fn refresh_error_codes_reflect_the_store_error() {
+        for (error, code) in [
+            (ExecError::Conflict, "TX_CONFLICT"),
+            (
+                ExecError::Message("40001 serialization failure".into()),
+                "TX_CONFLICT",
+            ),
+            (
+                ExecError::Message("40P01 deadlock detected".into()),
+                "TX_CONFLICT",
+            ),
+            (
+                ExecError::Message("57014 timeout text".into()),
+                "TX_CONFLICT",
+            ),
+            (ExecError::Timeout, "TX_TIMEOUT"),
+        ] {
+            let response = refresh_unavailable("request", &error);
+            assert_eq!(
+                response.status(),
+                if code == "TX_TIMEOUT" {
+                    StatusCode::GATEWAY_TIMEOUT
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            );
+            assert_eq!(response.headers()["retry-after"], "1");
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert!(!response.headers().contains_key("set-cookie"));
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"]["code"], code);
+            assert_eq!(value["error"]["retryable"], true);
+        }
     }
 }

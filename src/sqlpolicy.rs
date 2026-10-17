@@ -116,10 +116,18 @@ fn unnest(expr: &Expr) -> &Expr {
 }
 
 fn is_column(expr: &Expr) -> bool {
-    matches!(
-        unnest(expr),
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_)
-    )
+    match unnest(expr) {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+        // Main's refresh-session fixture compares the UUID id as text with
+        // the JWT subject. Keep this column anchor; arbitrary casts remain
+        // outside the allowlist.
+        Expr::Cast {
+            expr,
+            data_type: sqlparser::ast::DataType::Text,
+            ..
+        } => is_column(expr),
+        _ => false,
+    }
 }
 
 fn is_placeholder(expr: &Expr) -> bool {
@@ -220,6 +228,7 @@ mod tests {
             "SELECT id, name FROM products WHERE id = $1",
             "INSERT INTO products (sku, name) VALUES ($1, $2) RETURNING id",
             "UPDATE products SET name = $1 WHERE id = $2",
+            "UPDATE users SET last_device = $1 WHERE id::text = $2",
             "UPDATE users SET a = $1 WHERE id = $2 AND tenant_id = current_setting('app.tenant_id', false)",
             "INSERT INTO users (email) VALUES ($1) ON CONFLICT (tenant_id, email) DO UPDATE SET email = EXCLUDED.email WHERE users.deleted_at IS NULL",
             "WITH x AS (INSERT INTO t (a) VALUES ($1) RETURNING id) SELECT id FROM x",

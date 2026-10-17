@@ -16,8 +16,17 @@ use crate::validate::{self, ValidateOptions};
 pub const MANIFEST_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildMode {
+    Dev,
+    Release,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
     pub manifest_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_mode: Option<BuildMode>,
     pub routes: Vec<RouteSpec>,
     pub models: Vec<ModelSpec>,
     pub methods: Vec<MethodSpec>,
@@ -30,8 +39,6 @@ pub struct Manifest {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Provenance {
-    /// `release` or `dev`.
-    pub build_mode: String,
     /// Source commit (`GITHUB_SHA`, `--commit`, or `git rev-parse HEAD`).
     pub commit: String,
     /// One entry per lock, sorted by id.
@@ -115,6 +122,209 @@ pub struct RouteSpec {
     pub challenge_when: String,
     pub deprecated: bool,
     pub sunset: String,
+    /// `### token-refresh` pipeline: this route rotates refresh tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<RefreshSpec>,
+    /// `### token-revoke` pipeline: revoke refresh tokens before the steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoke: Option<RevokeSpec>,
+}
+
+/// Platform refresh-token rotation (spec 4A.1).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RefreshSpec {
+    /// Method that signs the new access token (needs `sign-token`).
+    pub sign_method: String,
+    pub refresh_ttl_s: i64,
+    pub idle_ttl_s: i64,
+    pub reuse_grace_s: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RevokeSpec {
+    /// `family` (the presented refresh token's family) or `all` (every
+    /// family of the caller).
+    pub scope: String,
+}
+
+pub const MAX_REFRESH_TTL_S: i64 = 30 * 86_400;
+pub const MAX_IDLE_TTL_S: i64 = 7 * 86_400;
+/// Spec §4A.1 (decision 61): `reuse-grace` defaults to 10s and is at most 10s.
+pub const DEFAULT_REUSE_GRACE_S: i64 = 10;
+pub const MAX_REUSE_GRACE_S: i64 = 10;
+
+/// Startup check of a manifest's token-refresh settings (a manifest built by
+/// an older compiler may carry values outside the current limits).
+pub fn refresh_spec_problem(route: &str, spec: &RefreshSpec) -> Option<String> {
+    let checks = [
+        ("refresh-ttl", spec.refresh_ttl_s, MAX_REFRESH_TTL_S),
+        ("idle-ttl", spec.idle_ttl_s, MAX_IDLE_TTL_S),
+        ("reuse-grace", spec.reuse_grace_s, MAX_REUSE_GRACE_S),
+    ];
+    checks.iter().find_map(|(name, value, max)| {
+        (!(1..=*max).contains(value)).then(|| {
+            format!("route {route}: token-refresh {name} is {value}s; it must be between 1s and {max}s (spec §4A.1); recompile the lock")
+        })
+    })
+}
+
+fn bullet<'a>(bullets: &'a [crate::lock::Bullet], key: &str) -> Option<&'a str> {
+    bullets
+        .iter()
+        .find(|b| b.key == key)
+        .map(|b| b.value.trim())
+}
+
+fn secs(raw: Option<&str>, default: i64, max: i64, name: &str) -> Result<i64, String> {
+    let Some(raw) = raw else { return Ok(default) };
+    let raw = raw.trim();
+    let (number, unit) = [
+        ("ms", 1u128),
+        ("s", 1000),
+        ("m", 60_000),
+        ("h", 3_600_000),
+        ("d", 86_400_000),
+    ]
+    .into_iter()
+    .find_map(|(suffix, unit)| raw.strip_suffix(suffix).map(|n| (n.trim(), unit)))
+    .unwrap_or((raw, 1000));
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(format!("token-refresh {name}: bad duration `{raw}`"));
+    }
+    // Multiply decimal digits before converting to whole seconds.
+    let mut digits = Vec::new();
+    let mut carry = 0;
+    for digit in whole.bytes().chain(fraction.bytes()).rev() {
+        carry += u128::from(digit - b'0') * unit;
+        digits.push((carry % 10) as u8 + b'0');
+        carry /= 10;
+    }
+    while carry > 0 {
+        digits.push((carry % 10) as u8 + b'0');
+        carry /= 10;
+    }
+    while digits.len() <= fraction.len() {
+        digits.push(b'0');
+    }
+    digits.reverse();
+    let split = digits.len() - fraction.len();
+    let ms = std::str::from_utf8(&digits[..split])
+        .ok()
+        .and_then(|n| n.parse::<u128>().ok());
+    let fractional = digits[split..].iter().any(|b| *b != b'0');
+    let cap = max as u128 * 1000;
+    let Some(ms) = ms.filter(|ms| *ms >= 1000 && (*ms < cap || (*ms == cap && !fractional))) else {
+        return Err(format!(
+            "token-refresh {name} must be between 1s and {max}s"
+        ));
+    };
+    let s = (ms / 1000) as i64;
+    Ok(s)
+}
+
+/// Parses a `### token-refresh` block.
+pub fn parse_refresh_block(bullets: &[crate::lock::Bullet]) -> Result<RefreshSpec, String> {
+    let sign_method = bullet(bullets, "sign-method").unwrap_or("").to_string();
+    if sign_method.is_empty() {
+        return Err("token-refresh needs sign-method".into());
+    }
+    match bullet(bullets, "transport") {
+        None | Some("body") => {}
+        Some(other) => {
+            return Err(format!(
+                "token-refresh transport `{other}` is not supported by this runtime (only body)"
+            ))
+        }
+    }
+    for b in bullets {
+        // `source-lines` is metadata the compiler adds to every block.
+        if b.key == "source-lines" {
+            continue;
+        }
+        if ![
+            "sign-method",
+            "refresh-ttl",
+            "idle-ttl",
+            "reuse-grace",
+            "transport",
+        ]
+        .contains(&b.key.as_str())
+        {
+            return Err(format!("unknown token-refresh option `{}`", b.key));
+        }
+    }
+    Ok(RefreshSpec {
+        sign_method,
+        refresh_ttl_s: secs(
+            bullet(bullets, "refresh-ttl"),
+            MAX_REFRESH_TTL_S,
+            MAX_REFRESH_TTL_S,
+            "refresh-ttl",
+        )?,
+        idle_ttl_s: secs(
+            bullet(bullets, "idle-ttl"),
+            MAX_IDLE_TTL_S,
+            MAX_IDLE_TTL_S,
+            "idle-ttl",
+        )?,
+        reuse_grace_s: secs(
+            bullet(bullets, "reuse-grace"),
+            DEFAULT_REUSE_GRACE_S,
+            MAX_REUSE_GRACE_S,
+            "reuse-grace",
+        )?,
+    })
+}
+
+/// Checks that a `token-refresh` `sign-method` names an existing method
+/// with a `sign-jwt` step. A typo here must fail the build, not every
+/// refresh call at runtime.
+pub fn refresh_sign_method_problem(sign_method: &str, methods: &[MethodSpec]) -> Option<String> {
+    match methods.iter().find(|m| m.target == sign_method) {
+        None => Some(format!(
+            "token-refresh sign-method `{sign_method}` is not a known method"
+        )),
+        Some(m) if !m.steps.iter().any(|s| s.op == "sign-jwt") => Some(format!(
+            "token-refresh sign-method `{sign_method}` has no sign-jwt step"
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Parses a `### token-revoke` block.
+pub fn parse_revoke_block(bullets: &[crate::lock::Bullet]) -> Result<RevokeSpec, String> {
+    let scope = bullet(bullets, "scope").unwrap_or("family");
+    if scope != "family" && scope != "all" {
+        return Err(format!(
+            "token-revoke scope must be family or all (got `{scope}`)"
+        ));
+    }
+    Ok(RevokeSpec {
+        scope: scope.to_string(),
+    })
+}
+
+/// Route-shape rules for the refresh pipelines.
+pub fn check_refresh_route(
+    refresh: Option<&RefreshSpec>,
+    revoke: Option<&RevokeSpec>,
+    public: bool,
+    auth_removed: bool,
+) -> Result<(), String> {
+    if refresh.is_some() && revoke.is_some() {
+        return Err("a route cannot have both token-refresh and token-revoke".into());
+    }
+    if refresh.is_some() && !(public && auth_removed) {
+        return Err("token-refresh routes must be public with auth removed (the refresh token is the credential)".into());
+    }
+    if revoke.is_some() && auth_removed {
+        return Err("token-revoke needs auth".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -179,16 +389,11 @@ pub fn check_rate_key(key: &str, auth_removed: bool, auth_mode: &str) -> Result<
             Err("rate-limit key `api-key` needs `auth: { mode: api-key }`".into())
         }
         "api-key" => Ok(()),
-        "family" => Err(
-            "rate-limit key `family` is only for token-refresh, which is not implemented yet (see #26)"
-                .into(),
-        ),
+        "family" => Err("rate-limit key `family` is only allowed on token-refresh routes".into()),
         _ => match key.strip_prefix("input.") {
             Some(field)
                 if !field.is_empty()
-                    && field
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                    && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
             {
                 Ok(())
             }
@@ -308,8 +513,25 @@ pub struct MigrationSpec {
 }
 
 pub fn manifest_from_project(root: &Path, signing_key: &SigningKey) -> Result<Manifest, Report> {
-    // Read every lock once; validate and build from the same in-memory text.
+    manifest_from_project_with_mode(root, signing_key, false)
+}
+
+/// Build a local manifest with explicit private-endpoint policy.
+pub fn manifest_from_project_with_mode(
+    root: &Path,
+    signing_key: &SigningKey,
+    dev: bool,
+) -> Result<Manifest, Report> {
     let loaded = validate::load_project(root)?;
+    validate::validate_loaded(
+        &ValidateOptions {
+            root,
+            deploy: true,
+            dev,
+        },
+        &loaded,
+    )
+    .0?;
     manifest_from_loaded(root, &loaded, signing_key)
 }
 
@@ -357,9 +579,21 @@ pub fn build_signed(
             )));
         }
     }
-    let (result, docs) = validate::validate_loaded(&ValidateOptions { root, deploy: true }, loaded);
+    let (result, docs) = validate::validate_loaded(
+        &ValidateOptions {
+            root,
+            deploy: true,
+            dev: !info.release,
+        },
+        loaded,
+    );
     result?;
-    let mut manifest = build_manifest(&docs)?;
+    let mut manifest = build_manifest_with_mode(&docs, !info.release)?;
+    manifest.build_mode = Some(if info.release {
+        BuildMode::Release
+    } else {
+        BuildMode::Dev
+    });
     let mut locks = Vec::new();
     let mut items = Vec::new();
     for (source, text) in loaded.sources.iter().zip(&loaded.lock_texts) {
@@ -384,7 +618,6 @@ pub fn build_signed(
     locks.sort_by(|a, b| a.id.cmp(&b.id));
     items.sort_by(|a, b| (&a.lock, &a.item).cmp(&(&b.lock, &b.item)));
     manifest.provenance = Provenance {
-        build_mode: if info.release { "release" } else { "dev" }.into(),
         commit: info.commit.clone(),
         locks,
         security_items: items,
@@ -412,7 +645,7 @@ pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), St
         return Ok(());
     }
     let provenance = &manifest.provenance;
-    if provenance.build_mode != "release" {
+    if manifest.build_mode == Some(BuildMode::Dev) {
         return Err(
             "only release manifests (`vibe manifest --release`) can run outside development".into(),
         );
@@ -441,7 +674,7 @@ pub fn read_release_manifest(
     let manifest: Manifest =
         serde_json::from_slice(&bytes).map_err(|err| single(format!("manifest json: {err}")))?;
     let provenance = &manifest.provenance;
-    if provenance.build_mode != "release" {
+    if manifest.build_mode == Some(BuildMode::Dev) {
         return Err(single(
             "only release manifests (`vibe manifest --release`) can run outside development".into(),
         ));
@@ -485,6 +718,18 @@ pub fn read_manifest(path: &Path, key: &VerifyingKey) -> Result<Manifest, Report
 }
 
 pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Report> {
+    build_manifest_with_mode(docs, false)
+}
+
+pub fn build_manifest_with_mode(
+    docs: &HashMap<String, LockDoc>,
+    dev: bool,
+) -> Result<Manifest, Report> {
+    if !dev && docs.values().any(|doc| doc.meta.compiler.endpoint_private) {
+        return Err(single(
+            "locks compiled against a private endpoint cannot be deployed".into(),
+        ));
+    }
     let mut report = Report::new();
     let mut models = Vec::new();
     let mut methods = Vec::new();
@@ -529,12 +774,20 @@ pub fn build_manifest(docs: &HashMap<String, LockDoc>) -> Result<Manifest, Repor
             });
         }
     }
+    for route in &routes {
+        if let Some(spec) = &route.refresh {
+            if let Some(err) = refresh_sign_method_problem(&spec.sign_method, &methods) {
+                report.push(Diag::error(&route.feature_id, err).at_section("Pipelines"));
+            }
+        }
+    }
     if report.has_errors() {
         return Err(report);
     }
     Ok(Manifest {
         provenance: Provenance::default(),
         manifest_version: MANIFEST_VERSION,
+        build_mode: dev.then_some(BuildMode::Dev),
         routes,
         models,
         methods,
@@ -763,9 +1016,23 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
     let mut jwt_aud = String::new();
     let mut jwks_uri = String::new();
     let mut rates = Vec::new();
+    let mut refresh = None;
+    let mut revoke = None;
     if let Some(pipes) = find_section(&doc.sections, "Pipelines") {
         for block in &pipes.blocks {
             let name = pipeline_name(&block.heading);
+            if name == "token-refresh" {
+                refresh = Some(
+                    parse_refresh_block(&block.bullets)
+                        .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?,
+                );
+            }
+            if name == "token-revoke" {
+                revoke = Some(
+                    parse_revoke_block(&block.bullets)
+                        .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?,
+                );
+            }
             if name == "-auth"
                 || (name == "auth"
                     && block
@@ -843,12 +1110,17 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
             }
         }
     }
+    check_refresh_route(refresh.as_ref(), revoke.as_ref(), public, auth_removed)
+        .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
     if let Some(problem) =
         jwt_override_problem(&jwt_iss, &jwt_aud, &jwks_uri, auth_removed, &auth_mode)
     {
         return Err(Diag::error(&doc.meta.id, problem).at_section("Pipelines"));
     }
     for rate in &rates {
+        if rate.key == "family" && refresh.is_some() {
+            continue;
+        }
         check_rate_key(&rate.key, auth_removed, &auth_mode)
             .map_err(|err| Diag::error(&doc.meta.id, err).at_section("Pipelines"))?;
     }
@@ -858,6 +1130,20 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         .map(validate::parse_bytes)
         .unwrap_or(1_048_576);
     let transform = find_section(&doc.sections, "Transform");
+    let transform_expr = |key: &str, default: &str| -> Result<String, Diag> {
+        let expr = transform.and_then(|s| s.get(key)).unwrap_or(default);
+        let expr = if expr.trim() == "(none)" {
+            default
+        } else {
+            expr
+        };
+        crate::runtime::check_expr(expr).map_err(|err| {
+            Diag::error(&doc.meta.id, format!("transform {key}: {err}")).at_section("Transform")
+        })?;
+        Ok(expr.to_string())
+    };
+    let transform_in = transform_expr("in", "{}")?;
+    let transform_out = transform_expr("out", "result")?;
     let (challenge_type, challenge_when) =
         parse_challenge(access.and_then(|s| s.get("challenge")).unwrap_or(""));
     let min_response_ms = access
@@ -881,14 +1167,8 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         rates,
         body_limit,
         request: request_fields(find_section(&doc.sections, "Request")),
-        transform_in: transform
-            .and_then(|s| s.get("in"))
-            .unwrap_or("")
-            .to_string(),
-        transform_out: transform
-            .and_then(|s| s.get("out"))
-            .unwrap_or("result")
-            .to_string(),
+        transform_in,
+        transform_out,
         steps: steps_from(find_section(&doc.sections, "Steps"), &doc.meta.id)?,
         errors: error_rows(find_section(&doc.sections, "Errors")),
         min_response_ms,
@@ -897,6 +1177,8 @@ fn route_from(doc: &LockDoc, docs: &HashMap<String, LockDoc>) -> Result<RouteSpe
         challenge_when,
         deprecated,
         sunset,
+        refresh,
+        revoke,
     })
 }
 
@@ -978,6 +1260,26 @@ fn steps_from(section: Option<&crate::lock::Section>, file: &str) -> Result<Vec<
                 .unwrap_or_default()
         };
         let op = get("op");
+        let expression_key = match op.as_str() {
+            "method" if !get("args").is_empty() => Some("args"),
+            "respond" if !get("value").is_empty() => Some("value"),
+            _ => None,
+        };
+        if let Some(key) = expression_key {
+            crate::runtime::check_expr(&get(key)).map_err(|err| {
+                Diag::error(file, format!("{key}: {err}"))
+                    .at_step(&block.heading)
+                    .at_section("Steps")
+            })?;
+        }
+        if let Some(problem) = validate::op_expression_problems(block, &op)
+            .into_iter()
+            .next()
+        {
+            return Err(Diag::error(file, problem)
+                .at_step(&block.heading)
+                .at_section("Steps"));
+        }
         let id = block
             .heading
             .split_whitespace()
@@ -1481,10 +1783,9 @@ mod rate_key_tests {
         assert!(check_rate_key("user", true, "jwt").is_err());
         let family = check_rate_key("family", false, "jwt").unwrap_err();
         assert!(
-            family.contains("family is only for token-refresh")
-                || family.contains("`family` is only for token-refresh")
+            family.contains("only allowed on token-refresh routes"),
+            "{family}"
         );
-        assert!(family.contains("not implemented") && family.contains("#26"));
         for bad in ["per-hour", "per-day", "burst"] {
             assert!(super::check_rate_params(["key", bad]).is_err(), "{bad}");
         }
@@ -1501,6 +1802,213 @@ mod rate_key_tests {
         assert!(super::check_rate_set(&[r("tenant", 10_000)]).is_ok());
         for bad in ["family", "req.ip", "input.", "input.a-b", "everyone"] {
             assert!(check_rate_key(bad, false, "jwt").is_err(), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    #[test]
+    fn token_refresh_accepts_compiler_source_lines() {
+        let bullets = vec![
+            crate::lock::Bullet {
+                key: "sign-method".into(),
+                value: "user.sign-token".into(),
+            },
+            crate::lock::Bullet {
+                key: "source-lines".into(),
+                value: "12-18".into(),
+            },
+        ];
+        let spec = parse_refresh_block(&bullets).expect("source-lines is metadata");
+        assert_eq!(spec.sign_method, "user.sign-token");
+    }
+
+    #[test]
+    fn token_refresh_sign_method_typo_is_a_build_error() {
+        let method = |steps: Vec<StepSpec>| MethodSpec {
+            target: "user.sign-token".into(),
+            writes: false,
+            input: Vec::new(),
+            errors: Vec::new(),
+            capabilities: vec!["sign-token".into()],
+            steps,
+            crud_model: String::new(),
+            crud_action: String::new(),
+        };
+        let sign: StepSpec = serde_json::from_value(serde_json::json!({
+            "id": "s", "op": "sign-jwt", "target": "", "args": "", "value": "", "status": 0,
+            "sql": "", "params": [], "out": "", "fail": "", "when_expr": "", "writes": false,
+            "table": "", "opts": {}
+        }))
+        .unwrap();
+        let methods = vec![method(vec![sign])];
+        assert_eq!(
+            refresh_sign_method_problem("user.sign-token", &methods),
+            None
+        );
+        assert!(refresh_sign_method_problem("user.sign-tokn", &methods)
+            .unwrap()
+            .contains("not a known method"));
+        assert!(
+            refresh_sign_method_problem("user.sign-token", &[method(Vec::new())])
+                .unwrap()
+                .contains("no sign-jwt step")
+        );
+    }
+}
+
+#[cfg(test)]
+mod constant_response_tests {
+    use super::*;
+    use crate::runtime::{router, AppState, AuthConfig, MemoryExec, Slug};
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    #[test]
+    fn malformed_transform_bullets_cannot_build() {
+        for key in ["in", "out"] {
+            for expr in ["", "{a: }"] {
+                let doc = LockDoc {
+                    meta: crate::lock::Meta::pending(Kind::Api, Some(Scope::Feature), "hello", "hello.md"),
+                    sections: crate::lock::parse_sections(&format!("## Route\n- method: GET\n- path: /hello\n## Access\n- public: true\n## Pipelines\n### -auth\n## Transform\n- {key}: {expr}\n")).unwrap(),
+                };
+                let err = route_from(&doc, &HashMap::new()).unwrap_err();
+                assert!(
+                    err.message.contains(&format!("transform {key}:")),
+                    "{err:?}"
+                );
+                if expr.is_empty() {
+                    assert!(err.message.contains("empty expression"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn public_constant_response_without_transform() {
+        for transform in [
+            "",
+            "## Transform
+",
+            "## Transform
+
+(none)
+",
+            "## Transform\n- in: (none)\n- out: (none)\n",
+        ] {
+            for (value, expected, status) in [
+                (
+                    r#"{"message": "hello world"}"#,
+                    r#"{"message":"hello world"}"#,
+                    StatusCode::OK,
+                ),
+                ("", "null", StatusCode::OK),
+                ("transform.out", "null", StatusCode::OK),
+                ("input", "{}", StatusCode::OK),
+                ("{message: }", "", StatusCode::INTERNAL_SERVER_ERROR),
+            ] {
+                let body = format!(
+                    "## Route
+- method: GET
+- path: /hello/v1/{{slug}}/greet
+
+## Access
+- public: true
+
+## Pipelines
+### -auth
+
+{transform}
+## Steps
+### reply
+- op: respond
+- value: {value}
+- status: 200
+"
+                );
+                let doc = LockDoc {
+                    meta: crate::lock::Meta::pending(
+                        Kind::Api,
+                        Some(Scope::Feature),
+                        "api/hello/v1/greet/greet",
+                        "hello.md",
+                    ),
+                    sections: crate::lock::parse_sections(&body).unwrap(),
+                };
+                let mut build_doc = doc.clone();
+                if status == StatusCode::INTERNAL_SERVER_ERROR {
+                    assert!(route_from(&doc, &HashMap::new()).is_err());
+                    build_doc
+                        .sections
+                        .iter_mut()
+                        .find(|s| s.name == "Steps")
+                        .unwrap()
+                        .blocks[0]
+                        .bullets
+                        .iter_mut()
+                        .find(|b| b.key == "value")
+                        .unwrap()
+                        .value = "transform.out".into();
+                }
+                let mut route = route_from(&build_doc, &HashMap::new()).unwrap();
+                if status == StatusCode::INTERNAL_SERVER_ERROR {
+                    route.transform_out = "{message: }".into();
+                }
+                assert_eq!(route.transform_in, "{}");
+                let manifest = Manifest {
+                    provenance: Default::default(),
+                    build_mode: None,
+                    manifest_version: MANIFEST_VERSION,
+                    routes: vec![route],
+                    models: vec![],
+                    methods: vec![],
+                    migrations: vec![],
+                    signature: String::new(),
+                };
+                let state = Arc::new(AppState {
+                    manifest,
+                    exec: Arc::new(MemoryExec::new()),
+                    auth: AuthConfig::anonymous(),
+                    slugs: HashMap::from([(
+                        "testslug".into(),
+                        Slug {
+                            tenant_id: "tenant0001".into(),
+                            public_access: true,
+                            public_write: false,
+                        },
+                    )]),
+                    rates: Mutex::new(Default::default()),
+                    quotas: Mutex::new(Default::default()),
+                    disabled: Default::default(),
+                    min_override_ms: Some(0),
+                    honor_test_ip: true,
+                    trusted_proxies: vec![],
+                    dev_hints: true,
+                    challenge: None,
+                });
+                let response = router(state)
+                    .oneshot(
+                        Request::builder()
+                            .uri("/hello/v1/testslug/greet")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status, "{transform:?} {value}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                if status == StatusCode::OK {
+                    assert_eq!(body.as_ref(), expected.as_bytes());
+                } else {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert!(body.to_string().contains("INTERNAL"));
+                }
+            }
         }
     }
 }

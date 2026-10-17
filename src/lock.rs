@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 pub const COMPILER_NAME: &str = "md-logic";
 pub const COMPILER_VERSION: &str = "0.1.0";
-pub const PROMPT_VERSION: &str = "prompt-2";
+pub const PROMPT_VERSION: &str = "prompt-3";
 pub const LOCK_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +153,18 @@ impl CompilerStamp {
     }
 }
 
+/// D109: audit record of the 2.1a translation. Only the prompt version,
+/// provider/model and the hash of the translated text are stamped; the
+/// translated text itself goes into the release audit artifact, never into
+/// the lock. Not part of `source-hash` or `compiler-hash`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslationStamp {
+    pub prompt_version: String,
+    pub llm_provider: String,
+    pub model_snapshot: String,
+    pub hash: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecurityItem {
     pub item: String,
@@ -172,13 +184,13 @@ pub struct Meta {
     pub dependencies: Vec<Dependency>,
     pub compiler: CompilerStamp,
     pub compiler_hash: String,
+    /// Present only for translated sources.
+    pub translation: Option<TranslationStamp>,
     pub security_items: Vec<SecurityItem>,
     /// Pre-v1.8 frontmatter keys (`status`, `approval-*`, `approved-*`,
     /// `signature`, item `approved-by`) found while parsing. They are ignored
     /// and never rendered; the validator reports them as warnings.
     pub legacy_fields: Vec<String>,
-    /// Value of a legacy v1.7 `status:` field, if present.
-    pub legacy_status: Option<String>,
 }
 
 impl Meta {
@@ -199,9 +211,9 @@ impl Meta {
             dependencies: Vec::new(),
             compiler: CompilerStamp::deterministic(),
             compiler_hash: String::new(),
+            translation: None,
             security_items: Vec::new(),
             legacy_fields: Vec::new(),
-            legacy_status: None,
         }
     }
 }
@@ -399,6 +411,12 @@ fn render_meta(meta: &Meta) -> String {
         render_sent_params(&meta.compiler.sent_params)
     ));
     push_line(&mut out, "compiler-hash", &meta.compiler_hash);
+    if let Some(t) = &meta.translation {
+        out.push_str(&format!(
+            "translation: {{ prompt-version: {}, llm-provider: {}, model-snapshot: {}, hash: {} }}\n",
+            t.prompt_version, t.llm_provider, t.model_snapshot, t.hash
+        ));
+    }
     if meta.security_items.is_empty() {
         push_line(&mut out, "security-items", "[]");
     } else {
@@ -708,6 +726,10 @@ fn parse_meta(front: &str) -> Result<Meta, String> {
         legacy_fields.push("security-items approved-by".into());
     }
     let compiler = parse_compiler(&get("compiler")?)?;
+    let translation = match fields.iter().find(|(k, _)| k == "translation") {
+        Some((_, raw)) => Some(parse_translation(raw)?),
+        None => None,
+    };
     Ok(Meta {
         lock_version: get("lock-version")?
             .parse()
@@ -721,12 +743,9 @@ fn parse_meta(front: &str) -> Result<Meta, String> {
         dependencies,
         compiler,
         compiler_hash: get("compiler-hash")?,
+        translation,
         security_items: security,
         legacy_fields,
-        legacy_status: fields
-            .iter()
-            .find(|(key, _)| key == "status")
-            .map(|(_, value)| value.trim().to_string()),
     })
 }
 
@@ -817,6 +836,28 @@ fn parse_compiler(raw: &str) -> Result<CompilerStamp, String> {
         endpoint_private: map_get(&map, "endpoint-private")? == "true",
         seed: seed.parse().map_err(|_| "bad seed".to_string())?,
         sent_params: parse_sent_params(sent_raw)?,
+    })
+}
+
+fn parse_translation(raw: &str) -> Result<TranslationStamp, String> {
+    let map = parse_inline_map(raw)?;
+    for (key, _) in &map {
+        if !matches!(
+            key.as_str(),
+            "prompt-version" | "llm-provider" | "model-snapshot" | "hash"
+        ) {
+            return Err(format!("translation: unknown key {key}"));
+        }
+    }
+    let hash = map_get(&map, "hash")?.to_string();
+    if !hash.starts_with("sha256:") {
+        return Err("translation: hash must be sha256:<hex>".into());
+    }
+    Ok(TranslationStamp {
+        prompt_version: map_get(&map, "prompt-version")?.to_string(),
+        llm_provider: map_get(&map, "llm-provider")?.to_string(),
+        model_snapshot: map_get(&map, "model-snapshot")?.to_string(),
+        hash,
     })
 }
 
@@ -959,6 +1000,35 @@ pub fn signing_payload(rendered_with_none: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn translation_stamp_roundtrips_and_has_no_text_field() {
+        let mut meta = Meta::pending(Kind::Model, None, "product", "models/product/product.md");
+        meta.source_hash = "sha256:abc".into();
+        meta.compiler_hash = compiler_hash(&meta.compiler);
+        let before = meta.compiler_hash.clone();
+        meta.translation = Some(TranslationStamp {
+            prompt_version: "translate-1".into(),
+            llm_provider: "openai".into(),
+            model_snapshot: "gpt-test-2026-01-01".into(),
+            hash: "sha256:0123".into(),
+        });
+        assert_eq!(compiler_hash(&meta.compiler), before);
+        let doc = LockDoc {
+            meta,
+            sections: Vec::new(),
+        };
+        let text = render_lock(&doc);
+        assert!(text.contains(
+            "translation: { prompt-version: translate-1, llm-provider: openai, model-snapshot: gpt-test-2026-01-01, hash: sha256:0123 }\n"
+        ));
+        let parsed = parse_lock(&text).expect("parse");
+        assert_eq!(parsed.meta.translation, doc.meta.translation);
+        assert_eq!(render_lock(&parsed), text);
+        // A `text` key (or any other) is rejected: the text never goes in the lock.
+        let bad = text.replace("hash: sha256:0123 }", "hash: sha256:0123, text: hi }");
+        assert!(parse_lock(&bad).is_err());
+    }
 
     #[test]
     fn roundtrip_frontmatter() {
