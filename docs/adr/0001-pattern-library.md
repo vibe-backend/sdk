@@ -1,0 +1,50 @@
+# ADR 0001: Best-practice pattern library
+
+- **Status:** Proposed (draft, not yet reviewed). The PM hard rules below were set by the PM on 2026-10-17 09:59 HKT; the open points in "Pending PM confirmation" are not decided.
+- **Date:** 2026-10-17
+- **Spec:** [`../spec-pattern-library-v1.1.md`](../spec-pattern-library-v1.1.md) (decisions 150–157)
+- **Related:** decisions 79, 113, 117, 118, 119 (provenance, lock as build output, Sigstore keyless), 149 (read-only sign-method); PRs #147, #95.
+
+This ADR describes defensive design only.
+
+## Context
+
+The compiler turns natural-language Markdown into a lock and then into an executable artifact. Many endpoints follow well-known patterns. Today all of them are built into the SDK core:
+
+- **Security patterns** (auth, rate limiting, challenge, RLS, refresh token) define the security boundary. They must be released and reviewed together with the SDK.
+- **Business patterns** (CRUD, pagination, search, upload, email) change faster and do not define the security boundary. Shipping them with the core couples their release cadence to it.
+
+## Decision
+
+1. **Two kinds of pattern.** Security patterns stay in the core (`source: builtin`). In v1.1, business patterns are split into separately versioned packages, and `vibe compile` fetches only the ones an endpoint needs.
+2. **v1 uses the same interface internally.** In v1 every pattern is built in, but it is written behind the same manifest and trait, so that v1.1 only changes where business patterns come from.
+3. **Manifest.** Each pattern has `id`, a semver `version`, `kind: security | business`, `provides` (capabilities) and `requires` (DB privileges, outbound network defaulting to none with an allowlist, secret names, and the security pipelines it depends on).
+4. **Trait.** `manifest()`, `matches(endpoint AST)`, and `plan(endpoint, ctx) -> IR fragment`. A pattern produces IR only.
+5. **Selection.** Markdown → AST → required capabilities → candidate patterns. Security patterns are always applied. If more than one business pattern matches, compilation fails, and the author picks one explicitly with `use: <id>@<range>`. There is no implicit scoring.
+6. **Provenance.** Registry packages are verified with Sigstore against a pinned signer identity (issuer + SAN for one exact repo and workflow). Verification works offline (bundle plus a cached trust root) and fails closed. `vibe serve` never downloads patterns.
+7. **Lock.** The lock records the core SDK version and hash, compiler version, IR schema version, every pattern used (id, version, source, artifact sha256, Sigstore bundle details), and, per endpoint, which pattern provided each capability.
+
+## PM hard rules (2026-10-17 09:59 HKT)
+
+1. A pattern MUST only output IR and MUST NOT run its own code at runtime.
+2. `kind: security` MUST only be accepted from `source: builtin`; a pattern's `requires` MUST be a subset of what the endpoint declares.
+3. More than one match MUST be a compile error, resolved only by an explicit `use:`; there MUST NOT be implicit scoring.
+4. The signer identity MUST be pinned to an exact repo and workflow (issuer + SAN). Offline verification (bundle + cached trust root) MUST be supported so deploys still work when Sigstore/Rekor is down. Verification failure MUST fail closed. A `vibe serve` cold start MUST NOT download anything.
+5. The v1 internal refactor onto the same interface MUST wait until #147, #95 and the D149 implementation have merged, MUST be additive with no behaviour change, and MUST be scheduled at the end of the GA plan.
+
+## Consequences
+
+- Positive: business patterns can be released on their own schedule; the security boundary stays in reviewed core code; every compiled endpoint is traceable to exact pattern versions.
+- Negative: a registry and its signing workflow must be operated; compile needs network access or a pre-populated cache for business patterns; the IR schema becomes a versioned contract.
+- Neutral for v1: no behaviour change; locks gain fields with `source: builtin`.
+
+## Alternatives considered
+
+- **Keep everything in the core.** Simplest, but business patterns stay coupled to the core release cycle.
+- **Run pattern code at runtime (plugins).** Rejected: it widens the runtime trust boundary (rule 1).
+- **Score multiple matches and pick the best.** Rejected: not deterministic or reviewable (rule 3).
+- **Allow third-party security patterns.** Rejected: the security boundary must stay in the reviewed core (rule 2).
+
+## Pending PM confirmation
+
+See spec §9. Each item lists options and a recommendation.
