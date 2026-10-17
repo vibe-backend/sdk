@@ -5,26 +5,34 @@
 
 #![allow(clippy::result_large_err)]
 
-pub mod approve;
+pub mod buildrecord;
 pub mod compile;
 pub mod diag;
 pub mod discover;
+pub mod fsutil;
 pub mod hashutil;
 pub mod llm;
+pub mod llm_budget;
 pub mod lock;
+pub mod lockcommit;
 pub mod manifest;
 pub mod netguard;
+pub mod prompt_guide;
 pub mod runtime;
+pub mod scaffold;
 pub mod scan;
 pub mod secret;
 pub mod security;
 pub mod sign;
+pub mod sigstore;
 pub mod sqlguard;
+pub mod sqlpolicy;
 pub mod validate;
 
-pub use approve::{approve_project, ApproveOptions};
 pub use compile::{compile_project, CompileOptions, CompileOutput};
 pub use diag::{Diag, Level, Report};
 pub use llm::{load_llm_config, FakeAdapter, HttpAdapter, LlmAdapter, LlmConfig};
 pub use manifest::{manifest_from_project, read_manifest, write_manifest, Manifest};
 pub use validate::{validate_project, ValidateOptions};
+
+pub mod interactive;

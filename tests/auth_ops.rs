@@ -590,6 +590,7 @@ async fn sign_and_verify(
         manifest: gated,
         exec: Arc::new(exec),
         auth,
+        dev_slugs: None,
         slugs: HashMap::new(),
         rates: std::sync::Mutex::new(Default::default()),
         quotas: std::sync::Mutex::new(Default::default()),
@@ -837,6 +838,7 @@ async fn pg_app() -> Option<(axum::Router, tokio_postgres::Client, String, Strin
         manifest: fixture(),
         exec: Arc::new(exec),
         auth: auth(),
+        dev_slugs: None,
         slugs,
         rates: std::sync::Mutex::new(Default::default()),
         quotas: std::sync::Mutex::new(Default::default()),
@@ -1196,6 +1198,8 @@ async fn sign_jwt_sub_follows_the_claims_source_rules() {
         "{ sub: input.sub }",
         "{ sub: ctx.user.sub }",
         "{ sub: 'u1' }",
+        r#"{ sub: "admin" }"#,
+        r#"{ sub: "u.id" }"#,
     ] {
         let m = method_manifest(&["sign-token"], sign_steps(json!({"claims": claims})));
         let err = run(&m, &users(), json!({"sub": "u1"})).await.unwrap_err();

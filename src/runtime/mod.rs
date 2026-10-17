@@ -15,8 +15,8 @@ mod sql;
 
 pub use challenge::{ChallengeContext, ChallengeError, ChallengeVerifier, TurnstileVerifier};
 pub use crud::{
-    check_expr, check_when, parse_ownership, run_method, when_problem, CallCtx, CallResult, Caller,
-    MethodFail, Ownership,
+    check_expr, check_when, expression_roots, parse_ownership, run_method, when_problem, CallCtx,
+    CallResult, Caller, MethodFail, Ownership,
 };
 pub use exec::{
     etag, role_allows, ExecError, MemoryExec, PgExec, PgOptions, PgSession, QueryExec,
@@ -39,7 +39,7 @@ pub fn hash_password_for_tests(plain: &str) -> String {
 }
 pub use limiter::{saturation_refusals, ProxyNet, QuotaBuckets, RateBuckets};
 pub use migrate::migrate_tenant;
-pub use slugs::{add_slug, load_project_slugs, SlugLoad};
+pub use slugs::{add_slug, apply_dev_default, load_project_slugs, DevSlugs, SlugLoad};
 pub use sql::{
     bootstrap_statements, quote as quote_ident, quote as sql_quote, runtime_grant_statements,
     runtime_schema_statements, Col,
