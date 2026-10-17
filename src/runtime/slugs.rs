@@ -92,7 +92,7 @@ pub fn add_slug(
         );
     }
     if !valid_tenant(tenant_id) {
-        return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
+        return Err(TENANT_ID_RULE.into());
     }
     let dir = project.join(".vibe");
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
@@ -126,13 +126,20 @@ pub(super) fn valid_slug(slug: &str) -> bool {
         && !slug.contains("--")
 }
 
-/// Tenant ids must match `^[a-z0-9]{8,32}$` wherever they come from (slug
-/// file, JWT claim, API-key record) before they reach SQL session settings.
+/// Error text for an invalid tenant id.
+pub const TENANT_ID_RULE: &str = "tenant id must match ^[a-z0-9_]{8,61}$";
+
+/// Tenant ids are system-generated opaque ids matching `^[a-z0-9_]{8,61}$`
+/// (61 so that the schema `t_<id>` fits PostgreSQL's 63-byte identifier
+/// limit) wherever they come from (slug file, JWT claim, API-key record)
+/// before they reach SQL. Role names derived from an id are checked again
+/// against the 63-byte limit and refused, never truncated
+/// ([`super::grants::tenant_role`]).
 pub fn valid_tenant(tenant: &str) -> bool {
-    (8..=32).contains(&tenant.len())
+    (8..=61).contains(&tenant.len())
         && tenant
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 #[cfg(test)]
@@ -142,6 +149,9 @@ mod tests {
     #[test]
     fn tenant_ids_are_strictly_validated() {
         assert!(valid_tenant("tenant0001"));
+        assert!(valid_tenant("tenant_0001"));
+        assert!(valid_tenant(&"a".repeat(61)));
+        assert!(!valid_tenant(&"a".repeat(62)));
         for bad in [
             "zzzzzzzz, t_tenant0001",
             "TENANT0001",
@@ -149,6 +159,9 @@ mod tests {
             "tenant0001\"",
             "",
             "a b c d e f",
+            "tenant-0001",
+            "tenant.0001",
+            "tenant0001é",
         ] {
             assert!(!valid_tenant(bad), "{bad:?}");
         }

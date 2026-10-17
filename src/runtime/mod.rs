@@ -1,12 +1,16 @@
+pub mod allowlist;
 pub mod challenge;
 mod crud;
 pub mod eckey;
 mod exec;
+pub mod grants;
 mod http;
 pub mod jwks;
 mod limiter;
-mod migrate;
+mod memory;
+pub mod migrate;
 mod ops;
+mod pools;
 pub mod refresh;
 pub mod replay;
 pub mod rsakey;
@@ -19,8 +23,8 @@ pub use crud::{
     MethodFail, Ownership,
 };
 pub use exec::{
-    etag, role_allows, ExecError, MemoryExec, PgExec, PgOptions, PgSession, QueryExec,
-    RefreshIssuer, RoleStatus, Row,
+    check_server_version, etag, role_allows, ExecError, PgExec, PgOptions, PgSession, QueryExec,
+    RefreshIssuer, RoleStatus, Row, MIN_SERVER_VERSION_NUM,
 };
 pub use http::{
     check_static_jwt_key, detect_jwt_alg, hash_api_secret, load_api_keys, refresh_rejections,
@@ -31,18 +35,28 @@ pub use ops::{
     custom_claim_problem, ec_signing_key_from_der, ec_signing_key_from_pem, load_signing_keys,
     sub_source_problem,
 };
-pub use sql::Stmt;
 
 /// argon2id hash with the platform floor (for seeding test data).
 pub fn hash_password_for_tests(plain: &str) -> String {
     crud::hash_password(plain).expect("hash")
 }
 pub use limiter::{saturation_refusals, ProxyNet, QuotaBuckets, RateBuckets};
-pub use migrate::migrate_tenant;
-pub use slugs::{add_slug, load_project_slugs, SlugLoad};
+pub use memory::{MemoryExec, MEMORY_UNSUPPORTED_SQL};
+pub use migrate::{
+    check_owner_logins, migrate_tenant, migrate_tenant_recorded, migrate_with_owner_window,
+    owner_login_alerts_total,
+};
+pub use pools::{
+    parse_pool_max_total, parse_tenant_role, pool_exhausted_count, pool_exhausted_metrics,
+    pool_exhausted_total, pool_idle_closed_total, secret_source, secret_source_from_env,
+    EnvSecrets, FileSecrets, PoolScope, TenantPools, TenantSecretSource, DEFAULT_MAX_CONNECTIONS,
+    DEV_SECRETS_FILE, MAX_TENANT_CONNECTIONS, MAX_TENANT_POOL_SIZE, POOL_IDLE_TIMEOUT,
+    POOL_MAX_TOTAL_ENV,
+};
+pub use slugs::{add_slug, load_project_slugs, valid_tenant, SlugLoad, TENANT_ID_RULE};
 pub use sql::{
-    bootstrap_statements, quote as quote_ident, quote as sql_quote, runtime_grant_statements,
-    runtime_schema_statements, Col,
+    bootstrap_statements, policy_parts, quote as sql_quote, quote as quote_ident, render_policy,
+    rls_statements, tenant_schema_statements, Col, PolicyParts, Sort, Stmt, POLICY_TEMPLATE,
 };
 
 /// Render process counters for an internal metrics collector.

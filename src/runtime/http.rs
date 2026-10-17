@@ -131,6 +131,7 @@ impl AuthConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct Slug {
     pub tenant_id: String,
     pub public_access: bool,
@@ -2061,8 +2062,21 @@ impl AuthError {
     }
 }
 
+/// `Retry-After` (seconds) sent with 503 `DB_POOL_EXHAUSTED`.
+pub const DB_POOL_RETRY_AFTER_SECS: &str = "1";
+
 fn fail_response(route: &RouteSpec, fail: MethodFail, request_id: &str) -> HttpResponse {
     let mut status = platform_status(&fail.code);
+    if fail.code == "DB_POOL_EXHAUSTED" {
+        // Platform condition: always 503 with Retry-After, never remapped.
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &fail.code,
+            &fail.message,
+            request_id,
+            &[("retry-after", DB_POOL_RETRY_AFTER_SECS)],
+        );
+    }
     if let Some(mapped) = route.errors.iter().find(|err| err.code == fail.code) {
         status = StatusCode::from_u16(mapped.status).unwrap_or(status);
     }
@@ -2097,6 +2111,7 @@ fn platform_status(code: &str) -> StatusCode {
         "FORBIDDEN" => StatusCode::FORBIDDEN,
         "UNAUTHORIZED" => StatusCode::UNAUTHORIZED,
         "BAD_REQUEST" => StatusCode::BAD_REQUEST,
+        "DB_POOL_EXHAUSTED" => StatusCode::SERVICE_UNAVAILABLE,
         "SERVICE_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -2147,6 +2162,15 @@ async fn check_challenge(
     };
     match verifier.verify(token, &ctx).await {
         Ok(()) => None,
+        Err(super::challenge::ChallengeError::PoolExhausted) => Some(Box::new(|request_id| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DB_POOL_EXHAUSTED",
+                "Database connection limit reached",
+                request_id,
+                &[("Retry-After", "1")],
+            )
+        })),
         Err(super::challenge::ChallengeError::Rejected(why)) => {
             tracing::info!(route = %route.feature_id, %why, "challenge rejected");
             fail(
@@ -2374,6 +2398,17 @@ mod rate_tests {
             status(check_challenge(Some(&down), &route, Some(&tok), "1.2.3.4", "tenant0001").await),
             Some(StatusCode::SERVICE_UNAVAILABLE)
         );
+        let limited: Arc<dyn ChallengeVerifier> =
+            Arc::new(FakeVerifier(Err(ChallengeError::PoolExhausted)));
+        let response = check_challenge(Some(&limited), &route, Some(&tok), "1.2.3.4", "tenant0001")
+            .await
+            .unwrap()("request");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("DB_POOL_EXHAUSTED"));
         // `pow` has no verifier in v1: fail closed.
         route.challenge_type = "pow".into();
         assert_eq!(
@@ -2906,7 +2941,7 @@ Q0UxBzbmJ2wI9FMVJLw4XEhuIJFqIdA/P6b6ozSNGyOUZK7OjIfGKtpNYw==\n\
             "tenant0001; drop",
             "x, t_victim",
             "",
-            &"a".repeat(33),
+            &"a".repeat(62),
         ] {
             write(rec(bad));
             assert!(load_api_keys(&path).is_err(), "{bad:?}");

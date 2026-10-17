@@ -47,3 +47,9 @@ WARN vibe::rate_limit_saturation: rate-limit shard saturated; refusing new keys 
 - An admin can bypass the `main` ruleset (OrganizationAdmin bypass). The only human approval gate is Jack approving the `release` environment; the automatic gates remain decisions 113/114/118. The same account (`j113203`) can approve its own release. Admin bypass stays on; Jack accepted this risk.
 
 Internal metrics collectors can call `vibe::runtime::internal_metrics()` for the saturation counter and `vibe_refresh_rejections_total{reason}` counters in Prometheus text format.
+
+## Database connection cap (D129, #98)
+
+Connections in use are capped at 5 per (tenant, role), 15 per tenant and `VIBE_DB_POOL_MAX_TOTAL` (default 200) per process. When any cap is full, requests get 503 `DB_POOL_EXHAUSTED` with `Retry-After: 1` immediately (no queueing). The counter `vibe_db_pool_exhausted_total{scope=role|tenant|process}` (`vibe::runtime::pool_exhausted_metrics()`, also logged at warn on each refusal) counts these refusals; alert on any sustained increase.
+
+Run `vibe check-owners --interval 60` (with `VIBE_MIGRATE_ADMIN_DATABASE_URL`) as the periodic owner check; it sets NOLOGIN on, and logs an alert for, any `tenant_<id>_owner` that can log in outside a migrate window (`vibe_db_owner_login_alerts_total`). Tenant DB password files are dev/test only; production must use `VIBE_TENANT_DB_SECRET_REF`.

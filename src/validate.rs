@@ -367,18 +367,31 @@ fn check_model(doc: &LockDoc, file: &str, report: &mut Report) {
     }
     if let Some(policies) = find_section(&doc.sections, "Policies") {
         let policy = policies.get("policy").unwrap_or("");
-        if !policy.contains("current_setting('app.tenant_id', false)") {
+        // Must be exactly what `vibe migrate` installs (decision 97): the
+        // constant per-tenant policy, never `current_setting('app.tenant_id')`.
+        if policy != crate::runtime::POLICY_TEMPLATE {
             report.push(
-                Diag::error(file, "RLS policy must use current_setting(..., false)")
-                    .at_section("Policies"),
+                Diag::error(
+                    file,
+                    format!(
+                        "RLS policy must be `{}` (the per-tenant policy vibe migrate installs); recompile the lock",
+                        crate::runtime::POLICY_TEMPLATE
+                    ),
+                )
+                .at_section("Policies"),
             );
         }
-        let grants = policies.get("grants").unwrap_or("").to_ascii_lowercase();
-        if grants.contains("delete") || grants.contains("truncate") {
-            report.push(
-                Diag::error(file, "runtime grants cannot include DELETE or TRUNCATE")
-                    .at_section("Policies"),
-            );
+        // Parsed structurally: only SELECT/INSERT/UPDATE exist, so DELETE,
+        // TRUNCATE or anything else is refused, while a column such as
+        // `deleted_at` inside `UPDATE(...)` is fine.
+        if let Err(err) = crate::runtime::grants::parse_grants(policies.get("grants").unwrap_or(""))
+        {
+            let msg = if err.contains("unsupported privilege") {
+                format!("runtime grants cannot include DELETE or TRUNCATE ({err})")
+            } else {
+                format!("invalid grants: {err}")
+            };
+            report.push(Diag::error(file, msg).at_section("Policies"));
         }
     }
 }
@@ -1000,11 +1013,23 @@ fn check_migration_sql(doc: &LockDoc, file: &str, report: &mut Report) {
                     .at_section("Up"),
             );
         }
-        let lower = sql.to_ascii_lowercase();
-        if lower.contains("create index") && !lower.contains("concurrently") {
+        if let Err(problem) = crate::runtime::allowlist::classify(&sql) {
             report.push(
-                Diag::error(file, "CREATE INDEX must be CONCURRENTLY").at_step(&block.heading),
+                Diag::error(file, problem)
+                    .at_step(&block.heading)
+                    .at_section("Up"),
             );
+        }
+        // Spec 10.1: from the parsed index, not the text.
+        match crate::runtime::allowlist::index_kind(&sql) {
+            Some((false, false)) => report.push(
+                Diag::error(file, "CREATE INDEX must be CONCURRENTLY").at_step(&block.heading),
+            ),
+            Some((true, true)) => report.push(
+                Diag::error(file, "CREATE UNIQUE INDEX must not be CONCURRENTLY")
+                    .at_step(&block.heading),
+            ),
+            _ => {}
         }
     }
 }

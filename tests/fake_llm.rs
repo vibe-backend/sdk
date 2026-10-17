@@ -27,7 +27,8 @@ const SECTIONS: &str = r#"## Table
 ## Policies
 
 - rls: enable, force
-- policy: tenant_id = current_setting('app.tenant_id', false)
+- policy: tenant_isolation TO tenant_<id>_rw, tenant_<id>_public_reader, tenant_<id>_public_writer USING (tenant_id = '<id>') WITH CHECK (tenant_id = '<id>')
+- grants: app_rw [SELECT, INSERT, UPDATE], public_reader [SELECT(sku)], public_writer [UPDATE(sku, deleted_at)]
 "#;
 
 #[tokio::test]
@@ -95,6 +96,12 @@ async fn fake_adapter_compiles_natural_language_without_a_network() {
         .security_items
         .iter()
         .any(|item| item.item == "write-sql"));
+    // Grants written in the source reach the lock instead of the defaults,
+    // and a `deleted_at` column inside UPDATE(...) is not mistaken for DELETE.
+    assert!(
+        text.contains("public_writer [UPDATE(sku, deleted_at)]"),
+        "{text}"
+    );
     validate_project(&ValidateOptions {
         root: &root,
         deploy: false,

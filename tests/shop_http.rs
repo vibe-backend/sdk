@@ -114,9 +114,28 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
             public_write: false,
         },
     );
+    // The compiler writes exactly the per-tenant policy vibe migrate installs.
+    assert!(!manifest.models.is_empty());
+    for model in &manifest.models {
+        assert_eq!(model.policy, vibe::runtime::POLICY_TEMPLATE, "{}", model.id);
+    }
+    let exhausted_state = Arc::new(AppState {
+        exec: Arc::new(Exhausted),
+        manifest: manifest.clone(),
+        auth: auth.clone(),
+        slugs: slugs.clone(),
+        rates: std::sync::Mutex::new(Default::default()),
+        quotas: std::sync::Mutex::new(Default::default()),
+        disabled: std::collections::HashSet::new(),
+        min_override_ms: Some(0),
+        honor_test_ip: true,
+        trusted_proxies: Vec::new(),
+        dev_hints: true,
+        challenge: None,
+    });
     let state = Arc::new(AppState {
+        exec: Arc::new(MemoryExec::from_manifest(&manifest).unwrap()),
         manifest,
-        exec: Arc::new(MemoryExec::new()),
         auth,
         slugs,
         rates: std::sync::Mutex::new(Default::default()),
@@ -135,6 +154,29 @@ async fn shop_compiles_and_serves_catalog_and_cart() {
     assert_eq!(health.json["status"], "ok");
 
     let staff_token = token("staff-user", &["staff"], "tenant0001");
+
+    // Process-wide DB connection cap reached: 503 DB_POOL_EXHAUSTED with
+    // Retry-After, at once.
+    let exhausted = router(exhausted_state);
+    let res = send(
+        &exhausted,
+        "POST",
+        "/catalog/v1/products",
+        Some(bearer(&staff_token)),
+        Some(product("sku-503", "Pear", 100)),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{:?}",
+        res.json
+    );
+    assert_eq!(res.json["error"]["code"], "DB_POOL_EXHAUSTED");
+    assert_eq!(
+        res.headers.get("retry-after").map(String::as_str),
+        Some("1")
+    );
     let customer_token = token("customer-1", &["customer"], "tenant0001");
     let other_token = token("other-user", &["staff"], "tenant0002");
     let admin_token = token("admin-user", &["admin"], "tenant0001");
@@ -645,6 +687,53 @@ fn token(sub: &str, roles: &[&str], tenant: &str) -> String {
     encode(&header, &claims, &key).unwrap()
 }
 
+/// Executor that is always at the process-wide connection cap.
+struct Exhausted;
+
+#[async_trait::async_trait]
+impl vibe::runtime::QueryExec for Exhausted {
+    async fn refresh_issue(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: vibe::runtime::refresh::RefreshPolicy,
+    ) -> Result<String, vibe::runtime::ExecError> {
+        Err(vibe::runtime::ExecError::PoolExhausted)
+    }
+    async fn refresh_revoke(
+        &self,
+        _: &str,
+        _: vibe::runtime::refresh::RevokeTarget<'_>,
+    ) -> Result<u64, vibe::runtime::ExecError> {
+        Err(vibe::runtime::ExecError::PoolExhausted)
+    }
+    async fn refresh_family(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<String>, vibe::runtime::ExecError> {
+        Err(vibe::runtime::ExecError::PoolExhausted)
+    }
+
+    async fn execute(
+        &self,
+        _tenant_id: &str,
+        _role: &str,
+        _stmt: vibe::runtime::Stmt,
+    ) -> Result<Vec<serde_json::Map<String, Value>>, vibe::runtime::ExecError> {
+        Err(vibe::runtime::ExecError::PoolExhausted)
+    }
+
+    async fn user_roles(
+        &self,
+        _tenant_id: &str,
+        _user_id: &str,
+    ) -> Result<Option<Vec<String>>, vibe::runtime::ExecError> {
+        Err(vibe::runtime::ExecError::PoolExhausted)
+    }
+}
+
 struct HttpResult {
     status: StatusCode,
     json: Value,
@@ -766,8 +855,8 @@ async fn admin_without_ownership_role_cannot_touch_other_carts() {
     auth.public_pem = PUBLIC_PEM.into();
     auth.alg = Algorithm::ES256;
     let app = router(Arc::new(AppState {
+        exec: Arc::new(MemoryExec::from_manifest(&manifest).unwrap()),
         manifest,
-        exec: Arc::new(MemoryExec::new()),
         auth,
         slugs: std::collections::HashMap::new(),
         rates: std::sync::Mutex::new(Default::default()),
@@ -1014,8 +1103,8 @@ async fn route_jwt_overrides_end_to_end() {
         Arc::new(vibe::runtime::jwks::JwksCache::new(Arc::new(Keys))),
     );
     let app = router(Arc::new(AppState {
-        manifest,
-        exec: Arc::new(MemoryExec::new()),
+        exec: Arc::new(MemoryExec::from_manifest(&manifest).unwrap()),
+        manifest: manifest.clone(),
         auth,
         slugs: std::collections::HashMap::new(),
         rates: std::sync::Mutex::new(Default::default()),

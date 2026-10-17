@@ -190,7 +190,7 @@ async fn create(
             continue;
         }
         if field.name == "tenant_id" {
-            row_values.push((col(field), Value::String(tenant_id.into())));
+            // Set by the executor from the request tenant (spec §2C.4).
             continue;
         }
         if matches!(field.name.as_str(), "created_at" | "updated_at") {
@@ -198,7 +198,7 @@ async fn create(
             continue;
         }
         if matches!(field.name.as_str(), "deleted_at" | "erased_at") {
-            row_values.push((col(field), Value::Null));
+            // NULL by default; writing them would need an INSERT grant.
             continue;
         }
         if model.owner_key.as_deref() == Some(field.name.as_str()) {
@@ -217,7 +217,14 @@ async fn create(
             value = Value::String(hash_password(value.as_str().unwrap_or(""))?);
         }
         check_field(field, &value)?;
-        if field.unique && !value.is_null() {
+        if value.is_null() {
+            // Absent optional field: the column default (NULL) applies, and
+            // the role needs no INSERT privilege on it.
+            continue;
+        }
+        // Pre-check only when the role may read the column; otherwise the
+        // unique index reports the conflict.
+        if field.unique && role_grant(model, role)?.can_select(&field.name) {
             let existing = exec
                 .execute(
                     tenant_id,
@@ -254,7 +261,7 @@ async fn create(
             ));
         }
     }
-    let returning = output_cols(model, false);
+    let returning = visible(model, role, output_cols(model, false))?;
     let rows = exec
         .execute(
             tenant_id,
@@ -296,7 +303,7 @@ async fn get(
             role,
             Stmt::Select {
                 table: model.table.clone(),
-                columns: all_cols(model),
+                columns: visible(model, role, all_cols(model))?,
                 id: Some(id),
                 filters: owner_filters(model, ctx.caller)?,
                 sort: None,
@@ -372,7 +379,7 @@ async fn list(
             role,
             Stmt::Select {
                 table: model.table.clone(),
-                columns: output_cols(model, false),
+                columns: visible(model, role, output_cols(model, false))?,
                 id: None,
                 filters,
                 sort: Some(Sort {
@@ -484,7 +491,7 @@ async fn update(
                 sets,
                 expected_updated_at: updated_at,
                 touched_at: touched,
-                returning: all_cols(model),
+                returning: visible(model, role, all_cols(model))?,
                 owner: owner_eq(model, ctx.caller)?,
             },
         )
@@ -600,6 +607,25 @@ fn row_output(
         }
     }
     (out, tag)
+}
+
+/// The role's effective grant on the model's table (see `grants::effective`).
+fn role_grant(model: &ModelSpec, role: &str) -> Result<super::grants::RoleGrant, MethodFail> {
+    let grants = super::grants::parse_grants(&model.grants).map_err(|err| {
+        MethodFail::code("INTERNAL", format!("model {}: grants: {err}", model.id))
+    })?;
+    Ok(super::grants::effective(model, &grants, role))
+}
+
+/// Keeps the columns the role may SELECT. PostgreSQL needs SELECT on every
+/// column in a select list or `RETURNING`, so a column-limited role only
+/// reads back what it was granted.
+fn visible(model: &ModelSpec, role: &str, cols: Vec<Col>) -> Result<Vec<Col>, MethodFail> {
+    let grant = role_grant(model, role)?;
+    Ok(cols
+        .into_iter()
+        .filter(|c| grant.can_select(&c.name))
+        .collect())
 }
 
 fn all_cols(model: &ModelSpec) -> Vec<Col> {
@@ -870,6 +896,17 @@ fn db(err: ExecError) -> MethodFail {
         ExecError::Conflict => MethodFail::code("CONFLICT", "conflict"),
         ExecError::Precondition => MethodFail::code("PRECONDITION_FAILED", "precondition failed"),
         ExecError::IssuanceFailed => MethodFail::code("INTERNAL", "refresh issuance failed"),
+
+        ExecError::Denied(message) => {
+            // The role lacks a table/column privilege or hit the tenant
+            // policy. The client gets a stable 403; the details stay in logs.
+            tracing::warn!(%message, "database refused the statement for the role");
+            MethodFail::code("FORBIDDEN", "permission denied")
+        }
+        ExecError::PoolExhausted => MethodFail::code(
+            "DB_POOL_EXHAUSTED",
+            "database connections exhausted; retry shortly",
+        ),
         ExecError::Message(message) => MethodFail::code("INTERNAL", message),
     }
 }
@@ -1169,6 +1206,9 @@ mod ownership_tests {
             sensitive_output: vec![],
             owner_key: owner_key.map(str::to_string),
             ownership: ownership.into(),
+            grants: String::new(),
+            rls: String::new(),
+            policy: String::new(),
         }
     }
 
@@ -1244,6 +1284,20 @@ mod expr_check_tests {
         assert!(check_when("qty > 5").is_err());
         // Unknown conditions fail closed at runtime.
         assert!(when_matches("qty > 5", &Map::new()));
+    }
+}
+
+#[cfg(test)]
+mod db_error_tests {
+    use super::*;
+
+    #[test]
+    fn permission_errors_are_a_stable_403_without_details() {
+        let fail = db(ExecError::Denied(
+            "ERROR: permission denied for table users (42501)".into(),
+        ));
+        assert_eq!(fail.code, "FORBIDDEN");
+        assert_eq!(fail.message, "permission denied");
     }
 }
 

@@ -63,14 +63,52 @@ fn table_problem(name: &ObjectName) -> Option<String> {
     if !(plain_name(&value) && (ident.quote_style.is_none() || plain_name(&ident.value))) {
         return Some(format!("table {name} must be a plain lowercase name"));
     }
-    if value.starts_with("_platform")
-        || value.starts_with("vibe_")
-        || value.starts_with("pg_")
-        || value == "information_schema"
-    {
+    if reserved_name(&value) || value.starts_with("vibe_") || value == "only" {
         return Some(format!("table {name} is not allowed"));
     }
     None
+}
+
+/// Names reserved for platform and catalog objects (`pg_*`, `_platform*`,
+/// `vibe_*`, `information_schema`). Lock SQL and migrations both refuse
+/// them. Callers pass the ASCII-lowercased name, so the check is
+/// case-insensitive. PostgreSQL folds unquoted identifiers to lowercase but
+/// keeps quoted ones exactly (`"VIBE_x"` is a different identifier from
+/// `vibe_x`); table references are refused when either the folded or the
+/// literal spelling starts with a reserved prefix, and quoted names that are
+/// not plain lowercase are refused outright.
+pub fn reserved_name(value: &str) -> bool {
+    value.starts_with("pg_")
+        || value.starts_with("_platform")
+        || value.starts_with("vibe_")
+        || value == "information_schema"
+}
+
+/// SQL special-value keywords and session/introspection functions. Some
+/// parse as plain identifiers rather than function calls; both forms are
+/// refused like a function outside [`ALLOWED_FUNCTIONS`].
+pub const SESSION_KEYWORDS: &[&str] = &[
+    "current_role",
+    "current_user",
+    "session_user",
+    "user",
+    "system_user",
+    "current_schema",
+    "current_schemas",
+    "current_catalog",
+    "current_database",
+    "current_query",
+    "inet_client_addr",
+    "inet_client_port",
+    "inet_server_addr",
+    "inet_server_port",
+    "pg_backend_pid",
+    "version",
+];
+
+fn session_keyword(ident: &Ident) -> bool {
+    ident.quote_style.is_none()
+        && SESSION_KEYWORDS.contains(&ident.value.to_ascii_lowercase().as_str())
 }
 
 /// Problems in the set-expression tree that the visitor does not reach as
@@ -98,6 +136,13 @@ impl Visitor for Guard {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        for lock in &query.locks {
+            if let Some(name) = &lock.of {
+                if let Some(problem) = table_problem(name) {
+                    return self.fail(problem);
+                }
+            }
+        }
         if let Some(problem) = set_expr_problem(&query.body) {
             return self.fail(problem);
         }
@@ -191,6 +236,9 @@ impl Visitor for Guard {
                 op: BinaryOperator::PGCustomBinaryOperator(_),
                 ..
             } => return self.fail("OPERATOR(...) is not allowed in lock SQL".into()),
+            Expr::Identifier(ident) if session_keyword(ident) => {
+                return self.fail(format!("function {ident} is not allowed in lock SQL"));
+            }
             _ => {}
         }
         if let Expr::Function(func) = expr {
@@ -314,7 +362,7 @@ fn normalized_data_type_name(data_type: &DataType) -> Option<String> {
 }
 
 /// Rejects casts whose target is not in [`ALLOWED_CAST_TYPES`].
-fn cast_type_problem(data_type: &DataType) -> Option<String> {
+pub fn cast_type_problem(data_type: &DataType) -> Option<String> {
     match normalized_data_type_name(data_type) {
         Some(name) if ALLOWED_CAST_TYPES.contains(&name.as_str()) => None,
         _ => Some(format!("cast to {data_type} is not allowed in lock SQL")),
@@ -344,6 +392,16 @@ pub struct SqlInfo {
     pub writes: bool,
     /// UPDATE or DELETE (needs a row scope).
     pub targets_rows: bool,
+}
+
+/// Runs the lock SQL expression checks (allowlisted functions and cast
+/// types, plain unqualified relation names, no table functions, no
+/// data-modifying WITH) over any parsed node. Used for migration
+/// expressions too.
+pub fn node_problem<V: Visit>(node: &V) -> Option<String> {
+    let mut guard = Guard(None);
+    let _ = node.visit(&mut guard);
+    guard.0
 }
 
 /// Checks `sql` against the allowlist and describes it.
@@ -519,6 +577,17 @@ mod tests {
             "select * into tmp_copy from users",
             "select name from users where name = 'a' collate other_schema.\"C\"",
             "select 1 operator(other_schema.+) 1",
+            "select * from vibe_challenge_replay",
+            "select count(*) from \"vibe_challenge_replay\"",
+            "insert into vibe_challenge_replay (tenant_id) values ('x')",
+            "update vibe_challenge_replay set state = 'released' where true",
+            "delete from vibe_challenge_replay where true",
+            "select id from users where id in (select key from vibe_challenge_replay)",
+            "with r as (select * from vibe_challenge_replay) select * from r",
+            "select * from vibe_migrate_audit",
+            "select * from pg_class",
+            "select * from information_schema",
+            "update only users set name = 'x' where id = $1",
         ] {
             assert!(query_problem(sql).is_some(), "accepted: {sql}");
         }
@@ -654,6 +723,35 @@ mod tests {
     }
 
     #[test]
+    fn session_keywords_are_refused_like_functions() {
+        for sql in [
+            "select current_role",
+            "select CURRENT_USER",
+            "select session_user",
+            "select user",
+            "select current_schema",
+            "select current_catalog",
+            "select current_schema()",
+            "select current_database()",
+            "select system_user",
+            "select id from users where name = current_user",
+            "update users set name = current_role where id = $1",
+            "insert into users (name) values (session_user)",
+        ] {
+            let problem = query_problem(sql);
+            assert!(
+                problem
+                    .as_deref()
+                    .is_some_and(|p| p.contains("not allowed")),
+                "accepted: {sql}: {problem:?}"
+            );
+        }
+        // Quoted or qualified column names are ordinary columns.
+        assert_eq!(query_problem("select u.\"user\" from users u"), None);
+        assert_eq!(query_problem("select \"current_user\" from users"), None);
+    }
+
+    #[test]
     fn table_operands_are_checked() {
         for sql in [
             "select id from users union table _platform_refresh_tokens",
@@ -683,5 +781,81 @@ mod tests {
         ] {
             assert!(wrapped_problem(&wrap_for_rows(sql)).is_some(), "accepted: {sql}");
         }
+    }
+
+    /// Every spelling of a reserved `vibe_*` table reference is refused by
+    /// static validation (`analyze`) and by the runtime checks
+    /// (`query_problem`, `wrapped_problem`).
+    #[test]
+    fn reserved_name_rejected_in_all_forms() {
+        for sql in [
+            "select * from VIBE_challenge_replay",
+            "select * from Vibe_challenge_replay",
+            "select * from vIbE_ChAlLeNgE_rEpLaY",
+            "select * from \"vibe_challenge_replay\"",
+            "select * from \"VIBE_challenge_replay\"",
+            "select * from \"Vibe_Challenge_Replay\"",
+            "select * from t_x.vibe_challenge_replay",
+            "select * from \"t_x\".\"vibe_challenge_replay\"",
+            "select * from T_X.VIBE_CHALLENGE_REPLAY",
+            "select * from public.vibe_challenge_replay",
+            "with r as (select * from VIBE_challenge_replay) select * from r",
+            "with vibe_x as (select 1 as a) select * from vibe_x",
+            "select * from (select * from \"vibe_challenge_replay\") s",
+            "select id from users where exists (select 1 from Vibe_challenge_replay)",
+            "select u.id from users u join VIBE_challenge_replay r on r.key = u.id",
+            "select u.id from users u left join t_x.vibe_challenge_replay r on true",
+            "select id from users union select key from \"VIBE_challenge_replay\"",
+            "insert into VIBE_challenge_replay (tenant_id) values ('x')",
+            "insert into \"vibe_challenge_replay\" (tenant_id) values ('x')",
+            "insert into t_x.vibe_challenge_replay (tenant_id) values ('x')",
+            "insert into users (id) select key from Vibe_challenge_replay",
+            "update VIBE_challenge_replay set state = 'released' where true",
+            "update \"t_x\".\"vibe_challenge_replay\" set state = 'x' where true",
+            "update users set name = 'x' from vibe_challenge_replay r where r.key = users.id",
+            "delete from Vibe_challenge_replay where true",
+            "delete from \"VIBE_challenge_replay\" where true",
+            "delete from users using VIBE_challenge_replay r where r.key = users.id",
+        ] {
+            assert!(
+                query_problem(sql).is_some(),
+                "query_problem accepted: {sql}"
+            );
+            assert!(analyze(sql).is_err(), "analyze accepted: {sql}");
+            assert!(
+                wrapped_problem(&wrap_for_rows(sql)).is_some(),
+                "wrapped_problem accepted: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_name_rejected_in_locking_clauses() {
+        for sql in [
+            "select id from users for update of vibe_challenge_replay",
+            "select id from users for share of VIBE_challenge_replay",
+            "select id from users for update of \"vibe_challenge_replay\"",
+            "select id from users for no key update of t_x.vibe_challenge_replay",
+            "select id from users for key share of pg_class",
+            "select id from users u for update of u, _platform_x",
+        ] {
+            assert!(
+                query_problem(sql).is_some(),
+                "query_problem accepted: {sql}"
+            );
+            assert!(analyze(sql).is_err(), "analyze accepted: {sql}");
+        }
+        assert_eq!(
+            query_problem("select id from users u for update of u"),
+            None
+        );
+    }
+
+    #[test]
+    fn reserved_name_check_is_case_insensitive() {
+        for name in ["vibe_x", "VIBE_x", "Vibe_X", "PG_class", "_PLATFORM_x"] {
+            assert!(super::reserved_name(&name.to_ascii_lowercase()), "{name}");
+        }
+        assert!(!super::reserved_name("vibes"));
     }
 }

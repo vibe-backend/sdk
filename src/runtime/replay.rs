@@ -7,10 +7,10 @@
 //! token, the per-IP and per-tenant quotas and the per-tenant capacity hold
 //! across instances. No object is shared between tenants.
 //!
-//! The runtime role only has SELECT and INSERT on the table: the table is an
+//! The runtime role has SELECT, INSERT and expiry-restricted DELETE: an
 //! append-only log. A reservation is a `pending` row; settling it appends a
 //! `verified`, `rejected` or `released` row. Reads ignore expired rows, and
-//! only the owner role deletes them (during `vibe migrate`), so the runtime
+//! migration cleanup deletes them under the tenant rw role, so the runtime
 //! cannot remove or shorten a live verified row. Every store error is
 //! reported as [`ChallengeError::Unavailable`]: the request fails closed.
 
@@ -173,8 +173,16 @@ pub fn resolve_replay_store(
 }
 
 /// Replay state in each tenant's schema, shared by all instances.
+/// Where a [`PgReplayStore`] gets its connections.
+enum ReplayPools {
+    /// One pool (tests, or a single tenant).
+    Single(deadpool_postgres::Pool),
+    /// The tenant's own `app_rw` pool (D129: no shared runtime login).
+    Tenants(Arc<super::pools::TenantPools>),
+}
+
 pub struct PgReplayStore {
-    pool: deadpool_postgres::Pool,
+    pool: ReplayPools,
     ip_secret: Vec<u8>,
     ttl: Duration,
     capacity: i64,
@@ -219,9 +227,59 @@ pub fn ip_digest(secret: &[u8], tenant: &str, ip: &str) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+struct ReplayClient {
+    client: deadpool_postgres::Object,
+    _permits: Option<[tokio::sync::OwnedSemaphorePermit; 3]>,
+}
+
+impl std::ops::Deref for ReplayClient {
+    type Target = deadpool_postgres::Object;
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+impl std::ops::DerefMut for ReplayClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.client
+    }
+}
+
 impl PgReplayStore {
     /// `ip_secret` keys the per-tenant IP digest (the API-key pepper).
     pub fn new(pool: deadpool_postgres::Pool, ip_secret: &[u8]) -> Self {
+        Self::with_pools(ReplayPools::Single(pool), ip_secret)
+    }
+
+    /// Uses each tenant's `app_rw` pool from `vibe serve`'s [`super::pools::TenantPools`].
+    pub fn for_tenant_pools(pools: Arc<super::pools::TenantPools>, ip_secret: &[u8]) -> Self {
+        Self::with_pools(ReplayPools::Tenants(pools), ip_secret)
+    }
+
+    async fn client(&self, tenant: &str) -> Result<ReplayClient, ChallengeError> {
+        let (pool, permits) = match &self.pool {
+            ReplayPools::Single(pool) => (pool.clone(), None),
+            ReplayPools::Tenants(pools) => {
+                let permits = pools.acquire(tenant, "app_rw").map_err(|scope| {
+                    super::pools::record_exhaustion(scope);
+                    ChallengeError::PoolExhausted
+                })?;
+                (
+                    pools
+                        .pool(tenant, "app_rw")
+                        .await
+                        .map_err(unavailable)?
+                        .pool(),
+                    Some(permits),
+                )
+            }
+        };
+        Ok(ReplayClient {
+            client: pool.get().await.map_err(unavailable)?,
+            _permits: permits,
+        })
+    }
+
+    fn with_pools(pool: ReplayPools, ip_secret: &[u8]) -> Self {
         Self {
             pool,
             ip_secret: ip_secret.to_vec(),
@@ -257,8 +315,8 @@ impl PgReplayStore {
 
     /// DDL for one tenant's table, run inside that tenant's `vibe migrate`
     /// as the owner role (before the schema's RLS pass, which adds ENABLE +
-    /// FORCE RLS and the tenant policy). The runtime role gets SELECT and
-    /// INSERT only. Also removes expired rows (as the owner).
+    /// FORCE RLS and the tenant policy). A permanent restrictive DELETE policy
+    /// permits only this tenant's expired rows to be removed by its rw role.
     pub fn migration_sql(tenant: &str, runtime_role: &str) -> Result<Vec<String>, String> {
         if !super::slugs::valid_tenant(tenant) {
             return Err("invalid tenant id".into());
@@ -276,28 +334,27 @@ impl PgReplayStore {
             format!("CREATE INDEX IF NOT EXISTS {REPLAY_TABLE}_expires ON {t} (tenant_id, expires_at)"),
             format!("REVOKE ALL ON {t} FROM PUBLIC"),
             format!("REVOKE ALL ON {t} FROM {role}"),
-            format!("GRANT SELECT, INSERT ON {t} TO {role}"),
+            format!("GRANT SELECT, INSERT, DELETE ON {t} TO {role}"),
             format!("ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"),
             format!("ALTER TABLE {t} FORCE ROW LEVEL SECURITY"),
-            format!("SELECT set_config('app.tenant_id', '{tenant}', true)"),
-            format!("DELETE FROM {t} WHERE expires_at <= now()"),
+            format!("DROP POLICY IF EXISTS replay_expired_delete ON {t}"),
+            format!("CREATE POLICY replay_expired_delete ON {t} AS RESTRICTIVE FOR DELETE TO {role} USING (tenant_id = '{tenant}' AND expires_at < now())"),
         ])
     }
 
     /// Startup check run by `vibe serve`: every listed tenant has the table,
-    /// usable by this role, and the role cannot DELETE, UPDATE or TRUNCATE it.
+    /// usable by this role with SELECT/INSERT/DELETE, but no UPDATE or TRUNCATE.
     pub async fn check(&self, tenants: &[String]) -> Result<(), String> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|err| format!("challenge replay store: {err}"))?;
         for tenant in tenants {
+            let client = self
+                .client(tenant)
+                .await
+                .map_err(|err| format!("challenge replay store: {err:?}"))?;
             let t = table_for(tenant).map_err(|err| format!("{err:?}"))?;
             let row = client
                 .query_one(
-                    "SELECT has_table_privilege($1, 'SELECT') AND has_table_privilege($1, 'INSERT'), \
-                     has_table_privilege($1, 'DELETE') OR has_table_privilege($1, 'UPDATE') OR has_table_privilege($1, 'TRUNCATE')",
+                    "SELECT has_table_privilege($1, 'SELECT') AND has_table_privilege($1, 'INSERT') AND has_table_privilege($1, 'DELETE'), \
+                     has_table_privilege($1, 'UPDATE') OR has_table_privilege($1, 'TRUNCATE')",
                     &[&t],
                 )
                 .await
@@ -312,7 +369,7 @@ impl PgReplayStore {
             }
             if too_much {
                 return Err(format!(
-                    "challenge replay table {t} grants DELETE, UPDATE or TRUNCATE to this role; run `vibe migrate` to reset its grants"
+                    "challenge replay table {t} grants UPDATE or TRUNCATE to this role; run `vibe migrate` to reset its grants"
                 ));
             }
         }
@@ -351,7 +408,7 @@ impl PgReplayStore {
         let t = table_for(tenant)?;
         let live = live(&t);
         let k = key.as_slice();
-        let mut client = self.pool.get().await.map_err(unavailable)?;
+        let mut client = self.client(tenant).await?;
         // One lock per tenant serializes the checks below across instances.
         let tx = Self::begin(&mut client, tenant).await?;
         let used = Self::count(
@@ -454,7 +511,7 @@ impl ReplayStore for PgReplayStore {
         let t = table_for(tenant)?;
         let live = live(&t);
         let (k, nonce) = (slot.key.as_slice(), slot.nonce.as_slice());
-        let mut client = self.pool.get().await.map_err(unavailable)?;
+        let mut client = self.client(tenant).await?;
         let tx = Self::begin(&mut client, tenant).await?;
         // Only this reservation, while it is still live and pending.
         let pending = Self::count(
@@ -574,16 +631,16 @@ mod tests {
     }
 
     #[test]
-    fn migration_grants_only_select_and_insert() {
+    fn migration_grants_expiry_restricted_delete() {
         assert!(PgReplayStore::migration_sql("Bad name", "app").is_err());
         let sql = PgReplayStore::migration_sql("tenant0001", "app\"x").unwrap();
         assert!(sql.iter().all(|s| !s.contains("vibe_platform")));
         assert!(sql.iter().any(|s| s
-            == "GRANT SELECT, INSERT ON \"t_tenant0001\".vibe_challenge_replay TO \"app\"\"x\""));
+            == "GRANT SELECT, INSERT, DELETE ON \"t_tenant0001\".vibe_challenge_replay TO \"app\"\"x\""));
+        assert!(sql.iter().any(|s| s.contains("AS RESTRICTIVE FOR DELETE")));
         assert!(sql
             .iter()
-            .filter(|s| s.starts_with("GRANT"))
-            .all(|s| !s.contains("DELETE") && !s.contains("UPDATE")));
+            .all(|s| !s.contains("set_config") && !s.contains("replay_retention")));
     }
 
     #[test]

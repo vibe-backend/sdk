@@ -1,15 +1,127 @@
 use crate::manifest::Manifest;
 
+use super::allowlist::{classify, rebuild_placement, ConcurrentIndex, Placement};
 use super::exec::{PgExec, PgSession};
+use super::grants::{parse_grants, pg_grant_statements};
 use super::slugs::valid_tenant;
-use super::sql::{
-    bootstrap_statements, quote, rls_statements, runtime_grant_statements,
-    runtime_schema_statements, Col,
-};
+use super::sql::{bootstrap_statements, quote, rls_statements, tenant_schema_statements, Col};
+
+/// Role memberships involving tenant `tenant_expr`'s roles (its three
+/// runtime roles and `tenant_<id>_owner`) or role `extra_oid`, other than the
+/// single allowed one (D129, #246): `tenant_<id>_owner` as a direct member of
+/// `tenant_<id>_rw` for the same id, granted `WITH ADMIN FALSE, INHERIT
+/// FALSE, SET TRUE`. A missing or duplicate allowed membership also fails.
+/// One text row per problem; any row fails the caller closed. Every membership is a direct `pg_auth_members` row, so an
+/// indirect (chained) path always shows up as a row touching one of these
+/// roles. Reads `inherit_option` and `set_option`, so it needs
+/// PostgreSQL 16 or later; older servers fail the query (fail closed).
+pub fn membership_problems_sql(tenant_expr: &str, extra_oid: &str) -> String {
+    format!(
+        "SELECT format('%s is a member of %s (admin %s, inherit %s, set %s)', \
+           quote_ident(mr.rolname), quote_ident(gr.rolname), m.admin_option, m.inherit_option, m.set_option) \
+         FROM pg_auth_members m JOIN pg_roles mr ON mr.oid = m.member JOIN pg_roles gr ON gr.oid = m.roleid \
+         WHERE (m.member = {extra_oid} OR m.roleid = {extra_oid} \
+           OR mr.rolname = ANY (ARRAY['tenant_' || {t} || '_rw', 'tenant_' || {t} || '_public_reader', \
+             'tenant_' || {t} || '_public_writer', 'tenant_' || {t} || '_owner']) \
+           OR gr.rolname = ANY (ARRAY['tenant_' || {t} || '_rw', 'tenant_' || {t} || '_public_reader', \
+             'tenant_' || {t} || '_public_writer', 'tenant_' || {t} || '_owner'])) \
+         AND NOT (gr.rolname = 'tenant_' || {t} || '_rw' AND mr.rolname = 'tenant_' || {t} || '_owner' \
+           AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option) \
+         UNION ALL SELECT 'expected exactly one owner membership' WHERE ( \
+           SELECT count(*) FROM pg_auth_members m JOIN pg_roles mr ON mr.oid = m.member \
+           JOIN pg_roles gr ON gr.oid = m.roleid \
+           WHERE gr.rolname = 'tenant_' || {t} || '_rw' AND mr.rolname = 'tenant_' || {t} || '_owner' \
+           AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option) <> 1",
+        t = tenant_expr,
+    )
+}
+
+/// The only membership grant provisioning may issue for a tenant (D129,
+/// #246; PostgreSQL 16+ syntax): owner into the tenant's `_rw` role, NOINHERIT,
+/// no ADMIN OPTION, SET TRUE.
+pub fn owner_membership_grant(tenant: &str) -> Result<String, String> {
+    let rw = super::grants::tenant_role(tenant, "app_rw")?;
+    let owner = super::grants::tenant_owner_role(tenant)?;
+    Ok(format!(
+        "GRANT {} TO {} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE",
+        quote(&rw)?,
+        quote(&owner)?
+    ))
+}
+
+/// Problems with a tenant's pre-created roles, as seen by the owner role
+/// (decision 97). `$1` is the tenant id; one row per problem.
+pub const TENANT_ROLE_SETUP_SQL: &str = "\
+WITH want(name) AS (SELECT unnest(ARRAY[ \
+   'tenant_' || $1::text || '_rw', 'tenant_' || $1::text || '_public_reader', \
+   'tenant_' || $1::text || '_public_writer'])) \
+SELECT format('%s: %s', w.name, p) FROM want w LEFT JOIN pg_roles r ON r.rolname = w.name, \
+ LATERAL (VALUES \
+   (CASE WHEN r.oid IS NULL THEN 'does not exist' END), \
+   (CASE WHEN NOT r.rolcanlogin THEN 'is not LOGIN' END), \
+   (CASE WHEN r.rolinherit THEN 'is not NOINHERIT' END), \
+   (CASE WHEN r.rolsuper THEN 'is a superuser' END), \
+   (CASE WHEN r.rolbypassrls THEN 'has BYPASSRLS' END), \
+   (CASE WHEN r.rolcreaterole OR r.rolcreatedb OR r.rolreplication \
+     THEN 'has CREATEROLE, CREATEDB or REPLICATION' END), \
+   (CASE WHEN EXISTS (SELECT 1 FROM pg_auth_members m WHERE (m.member = r.oid OR m.roleid = r.oid) \
+     AND NOT (w.name = 'tenant_' || $1::text || '_rw' AND m.member = to_regrole('tenant_' || $1::text || '_owner') \
+       AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option)) \
+     THEN 'has a role membership other than tenant_<id>_owner in tenant_<id>_rw WITH ADMIN FALSE, INHERIT FALSE, SET TRUE' END), \
+   (CASE WHEN EXISTS (SELECT 1 FROM pg_class WHERE relowner = r.oid) \
+     OR EXISTS (SELECT 1 FROM pg_namespace WHERE nspowner = r.oid) \
+     OR EXISTS (SELECT 1 FROM pg_proc WHERE proowner = r.oid) \
+     OR EXISTS (SELECT 1 FROM pg_type WHERE typowner = r.oid) \
+     THEN 'owns database objects (runtime roles must not be owners)' END)) v(p) \
+WHERE p IS NOT NULL ORDER BY 1";
+
+/// Problems with the migration login for tenant `$1` (decision 97): it must
+/// be that tenant's own migration role, so it can neither own nor use any
+/// other tenant's schema, and it must not be (or be able to become) a
+/// superuser, a BYPASSRLS role, or any tenant runtime role.
+pub const MIGRATE_ROLE_SQL: &str = "\
+SELECT x FROM ( \
+ SELECT 'is or can become a superuser or BYPASSRLS role ' || quote_ident(m.rolname) AS x \
+   FROM pg_roles m WHERE (m.rolsuper OR m.rolbypassrls) \
+   AND pg_has_role(current_user, m.oid, 'MEMBER') \
+ UNION ALL \
+ SELECT format('can own schema %I', n.nspname) FROM pg_namespace n \
+   WHERE n.nspname LIKE 't\\_%' AND n.nspname <> 't_' || $1::text \
+   AND pg_has_role(current_user, n.nspowner, 'MEMBER') \
+ UNION ALL \
+ SELECT format('can use schema %I', n.nspname) FROM pg_namespace n \
+   WHERE n.nspname LIKE 't\\_%' AND n.nspname <> 't_' || $1::text \
+   AND NOT pg_has_role(current_user, n.nspowner, 'MEMBER') \
+   AND has_schema_privilege(current_user, n.oid, 'USAGE') \
+ UNION ALL \
+ SELECT format('is or can become tenant role %I', r.rolname) FROM pg_roles r \
+   WHERE r.rolname LIKE 'tenant\\_%' AND r.rolname <> current_user \
+   AND r.rolname <> 'tenant_' || $1::text || '_rw' \
+   AND pg_has_role(current_user, r.oid, 'MEMBER') \
+ UNION ALL \
+ SELECT 'has a role membership that is not allowed: ' || x FROM ( \
+   SELECT format('%s is a member of %s (admin %s, inherit %s, set %s)', \
+     quote_ident(mr.rolname), quote_ident(gr.rolname), m.admin_option, m.inherit_option, m.set_option) AS x \
+   FROM pg_auth_members m JOIN pg_roles mr ON mr.oid = m.member JOIN pg_roles gr ON gr.oid = m.roleid \
+   WHERE (m.member = (SELECT oid FROM pg_roles WHERE rolname = current_user) \
+     OR m.roleid = (SELECT oid FROM pg_roles WHERE rolname = current_user) \
+     OR gr.rolname = 'tenant_' || $1::text || '_rw') \
+   AND NOT (gr.rolname = 'tenant_' || $1::text || '_rw' AND mr.rolname = 'tenant_' || $1::text || '_owner' \
+     AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option)) z \
+ UNION ALL \
+ SELECT 'expected exactly one owner membership' WHERE ( \
+   SELECT count(*) FROM pg_auth_members m JOIN pg_roles mr ON mr.oid = m.member \
+   JOIN pg_roles gr ON gr.oid = m.roleid \
+   WHERE gr.rolname = 'tenant_' || $1::text || '_rw' AND mr.rolname = 'tenant_' || $1::text || '_owner' \
+   AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option) <> 1 \
+) y ORDER BY 1";
 
 /// Bootstraps one tenant schema and applies migrations, connected as the
-/// owner role. Grants the runtime role SELECT/INSERT/UPDATE only.
-/// Returns progress lines.
+/// tenant's owner role `tenant_<id>_owner` (required by name). Grants only that tenant's own roles (`tenant_<id>_rw`,
+/// `tenant_<id>_public_reader`, `tenant_<id>_public_writer`, see
+/// [`super::grants::tenant_role`]) SELECT/INSERT/UPDATE per the model
+/// grants. The roles are created by an operator beforehand; migrate refuses
+/// to run if any is missing or unsafe. Returns progress lines.
 ///
 /// Runs in one transaction: if any step (including the RLS checks) fails,
 /// nothing is committed, so a failed migration never leaves a table without
@@ -18,10 +130,78 @@ pub async fn migrate_tenant(
     exec: &PgExec,
     manifest: &Manifest,
     tenant: &str,
-    runtime_role: &str,
+) -> Result<Vec<String>, String> {
+    migrate_tenant_recorded(exec, manifest, tenant, &[], &mut Vec::new()).await
+}
+
+/// [`migrate_tenant`] with the platform's index records (spec §2B.3 item
+/// 5): `recorded` lists the indexes the concurrent index step built earlier
+/// in this tenant's schema (the only INVALID indexes migrate drops and
+/// rebuilds); `built` receives the name of every index this run's
+/// concurrent index step started, whether or not it succeeded, for the
+/// caller to record.
+pub async fn migrate_tenant_recorded(
+    exec: &PgExec,
+    manifest: &Manifest,
+    tenant: &str,
+    recorded: &[String],
+    built: &mut Vec<String>,
 ) -> Result<Vec<String>, String> {
     if !valid_tenant(tenant) {
-        return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
+        return Err(super::slugs::TENANT_ID_RULE.into());
+    }
+    // The migration login must be this tenant's owner role by name.
+    let owner = super::grants::tenant_owner_role(tenant)?;
+    super::grants::tenant_roles(tenant)?;
+    let me = exec
+        .query_texts("SELECT session_user::text WHERE $1::text IS NOT NULL", "")
+        .await?;
+    if me.first() != Some(&owner) {
+        return Err(format!(
+            "refusing to migrate t_{tenant}: VIBE_MIGRATE_DATABASE_URL must log in as {owner} (logged in as {})",
+            me.first().map(String::as_str).unwrap_or("?")
+        ));
+    }
+    let schema_owner = exec
+        .query_texts(
+            "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname = 't_' || $1::text",
+            tenant,
+        )
+        .await?;
+    if let Some(other) = schema_owner.first().filter(|o| **o != owner) {
+        return Err(format!(
+            "refusing to migrate t_{tenant}: the schema is owned by {other}, not {owner}"
+        ));
+    }
+    // The lock's policy must be the one vibe installs.
+    for model in &manifest.models {
+        if model
+            .policy
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            != super::sql::POLICY_TEMPLATE
+        {
+            return Err(format!(
+                "model {}: lock policy is not the per-tenant policy vibe installs (`{}`); recompile the lock",
+                model.id,
+                super::sql::POLICY_TEMPLATE
+            ));
+        }
+    }
+    let problems = exec.query_texts(MIGRATE_ROLE_SQL, tenant).await?;
+    if !problems.is_empty() {
+        return Err(format!(
+            "refusing to migrate t_{tenant}: the migration login {}; use a migration role that owns only this tenant's schema (VIBE_MIGRATE_DATABASE_URL, decision 97)",
+            problems.join(", ")
+        ));
+    }
+    let problems = exec.query_texts(TENANT_ROLE_SETUP_SQL, tenant).await?;
+    if !problems.is_empty() {
+        return Err(format!(
+            "tenant roles are not set up safely: {}; create each as `CREATE ROLE <name> LOGIN NOINHERIT PASSWORD '...'` with no other attributes; the only allowed role membership is `GRANT tenant_<id>_rw TO tenant_<id>_owner WITH ADMIN FALSE, INHERIT FALSE, SET TRUE` (decision 97, D129; PostgreSQL 16+)",
+            problems.join("; ")
+        ));
     }
     // Refuse transaction control up front: a COMMIT inside migration SQL
     // would end vibe's transaction and commit tables before RLS is applied.
@@ -34,6 +214,16 @@ pub async fn migrate_tenant(
                 ));
             }
         }
+    }
+    // Allowlist (spec §2B): every statement is checked, and each index is
+    // placed, before anything runs.
+    let mut placed: Vec<(String, Vec<Placement>)> = Vec::new();
+    for migration in &manifest.migrations {
+        let mut steps = Vec::new();
+        for statement in &migration.statements {
+            steps.push(classify(statement).map_err(|err| format!("{}: {err}", migration.id))?);
+        }
+        placed.push((migration.id.clone(), steps));
     }
     // The pool hands out a different connection per call; pin one so the
     // transaction covers every statement.
@@ -53,15 +243,19 @@ pub async fn migrate_tenant(
         session
             .batch(&[format!("SET LOCAL vibe.migrate_tx = '{marker}'")])
             .await?;
-        let log = migrate_in_tx(&session, manifest, tenant, runtime_role).await?;
+        let (mut log, deferred) =
+            migrate_in_tx(&session, manifest, &placed, tenant, recorded).await?;
+        log.extend(verify_tenant(&session, tenant).await?);
         still_in_transaction(&session, &marker).await?;
-        Ok::<_, String>(log)
+        Ok::<_, String>((log, deferred))
     }
     .await;
     match result {
-        Ok(log) => {
+        Ok((mut log, deferred)) => {
             session.batch(&["COMMIT".to_string()]).await?;
             session.in_transaction(false);
+            cleanup_replay(&mut session, tenant).await?;
+            log.extend(build_indexes_after_commit(&session, tenant, &deferred, built).await?);
             Ok(log)
         }
         Err(err) => {
@@ -70,6 +264,42 @@ pub async fn migrate_tenant(
             }
             Err(err)
         }
+    }
+}
+
+/// After migrating (same transaction): the schema is owned by
+/// `tenant_<id>_owner`, the runtime roles own nothing, and every table in the
+/// schema has ENABLE + FORCE row level security. Any failure rolls back.
+async fn verify_tenant(exec: &PgSession, tenant: &str) -> Result<Vec<String>, String> {
+    let owner = super::grants::tenant_owner_role(tenant)?;
+    let mut problems = exec
+        .query_texts(
+            "SELECT format('schema %I is owned by %s', n.nspname, n.nspowner::regrole::text) \
+             FROM pg_namespace n WHERE n.nspname = 't_' || $1::text \
+             AND n.nspowner::regrole::text <> 'tenant_' || $1::text || '_owner' \
+             UNION ALL \
+             SELECT format('table %I.%I lacks ENABLE + FORCE ROW LEVEL SECURITY', n.nspname, c.relname) \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 't_' || $1::text AND c.relkind IN ('r','p') \
+             AND NOT (c.relrowsecurity AND c.relforcerowsecurity) ORDER BY 1",
+            tenant,
+        )
+        .await?;
+    problems.extend(
+        exec.query_texts(TENANT_ROLE_SETUP_SQL, tenant)
+            .await?
+            .into_iter()
+            .filter(|p| p.contains("owns database objects")),
+    );
+    if problems.is_empty() {
+        Ok(vec![format!(
+            "verified t_{tenant}: owned by {owner}, runtime roles own nothing, every table has FORCE ROW LEVEL SECURITY"
+        )])
+    } else {
+        Err(format!(
+            "post-migration check failed for t_{tenant}: {}",
+            problems.join("; ")
+        ))
     }
 }
 
@@ -157,12 +387,21 @@ fn strip_leading_comments(mut sql: &str) -> &str {
     }
 }
 
+/// A non-unique index built `CONCURRENTLY` after the main transaction
+/// commits: (migration id or `rebuild`, index).
+type Deferred = Vec<(String, ConcurrentIndex)>;
+
+/// Prefix of log lines that `vibe migrate` also writes to the audit table.
+pub const AUDIT_PREFIX: &str = "audit: ";
+
 async fn migrate_in_tx(
     exec: &PgSession,
     manifest: &Manifest,
+    placed: &[(String, Vec<Placement>)],
     tenant: &str,
-    runtime_role: &str,
-) -> Result<Vec<String>, String> {
+    recorded: &[String],
+) -> Result<(Vec<String>, Deferred), String> {
+    let mut deferred: Deferred = Vec::new();
     let mut log = Vec::new();
     let schema = format!("t_{tenant}");
     let others_before = tenant_fingerprint(exec, &schema).await?;
@@ -183,53 +422,78 @@ async fn migrate_in_tx(
             .map(|field| field.name.clone())
             .collect();
         exec.batch(&bootstrap_statements(
-            &schema,
+            tenant,
             &model.table,
             &fields,
             &uniques,
         )?)
         .await?;
-        exec.batch(&runtime_schema_statements(&schema, runtime_role)?)
-            .await?;
-        exec.batch(&runtime_grant_statements(
-            &schema,
-            &model.table,
-            runtime_role,
-        )?)
-        .await?;
+        exec.batch(&tenant_schema_statements(tenant)?).await?;
         log.push(format!("bootstrapped {schema}.{}", model.table));
     }
+    if manifest.routes.iter().any(|r| r.refresh.is_some()) {
+        exec.batch(&super::refresh::table_statements(&schema)?)
+            .await?;
+        exec.batch(&super::refresh::cleanup_statements(&schema)?)
+            .await?;
+        // Replace the legacy GUC policy with the same constant tenant policy as models.
+        exec.batch(&rls_statements(tenant, "_platform_refresh_tokens")?)
+            .await?;
+        let runtime_role = super::grants::tenant_role(tenant, "app_rw")?;
+        exec.batch(&super::refresh::runtime_grant_statements(
+            &schema,
+            &runtime_role,
+        )?)
+        .await?;
+        log.push(format!(
+            "bootstrapped {schema}._platform_refresh_tokens (finished families cleaned up)"
+        ));
+    }
+    // An index left INVALID by a failed concurrent build is dropped and
+    // rebuilt (spec §2B), with an audit entry.
+    log.extend(drop_invalid_indexes(exec, &schema, recorded, &mut deferred).await?);
     // Migration DDL names tables unqualified; resolve them in the tenant
     // schema; each batch sets it for the migration statements that follow.
-    for migration in &manifest.migrations {
+    for (id, steps) in placed {
         exec.batch(&[format!("SET LOCAL search_path TO {}", quote(&schema)?)])
             .await?;
-        for statement in &migration.statements {
-            // One command per call (extended protocol): the server rejects a
-            // statement that smuggles `; COMMIT; ...` after the first command.
-            exec.execute_one(statement)
-                .await
-                .map_err(|err| format!("{}: {err}", migration.id))?;
+        for step in steps {
+            match step {
+                // One command per call (extended protocol): the server
+                // rejects a statement that smuggles `; COMMIT; ...`.
+                Placement::InTransaction(sql) => exec
+                    .execute_one(sql)
+                    .await
+                    .map_err(|err| format!("{id}: {err}"))?,
+                Placement::AfterCommit(index) => deferred.push((id.clone(), index.clone())),
+            }
         }
         exec.batch(&["RESET search_path".to_string()]).await?;
-        log.push(format!("applied {}", migration.id));
+        log.push(format!("applied {id}"));
+    }
+    // The tenant's own roles get exactly the effective grants from the lock,
+    // on every run (a changed grant is applied by the next migrate). No other
+    // role is granted anything on this schema.
+    for model in &manifest.models {
+        let grants = parse_grants(&model.grants)
+            .map_err(|err| format!("model {}: grants: {err}", model.id))?;
+        exec.batch(&pg_grant_statements(tenant, model, &grants)?)
+            .await?;
+        log.push(format!("granted {schema}.{}", model.table));
     }
     // #157: this tenant's challenge replay table (SELECT/INSERT for the
-    // runtime role; expired rows are removed here, as the owner).
+    // tenant's app_rw role only).
     exec.batch(&super::replay::PgReplayStore::migration_sql(
         tenant,
-        runtime_role,
+        &super::grants::tenant_role(tenant, "app_rw")?,
     )?)
     .await?;
     log.push(format!(
         "challenge replay table {schema}.{}",
         super::replay::REPLAY_TABLE
     ));
-    log.extend(protect_schema(exec, &schema).await?);
-    // Fail closed: any RLS problem in any tenant schema fails the migration,
-    // whether this run introduced it or it was already there (for example
-    // left by an earlier, unprotected migration). `vibe serve` refuses to
-    // start on the same problems.
+    log.extend(protect_schema(exec, tenant).await?);
+    // Verify this tenant; the fingerprint below protects other schemas from changes.
     let problems = rls_problems(exec, &schema).await?;
     if !problems.is_empty() {
         let new: Vec<&String> = problems
@@ -257,16 +521,125 @@ async fn migrate_in_tx(
             "migrations for {schema} changed another tenant's schema; a migration may only change its own tenant schema"
         ));
     }
+    Ok((log, deferred))
+}
+
+/// INVALID indexes left by a failed concurrent index step (spec §2B.3 item
+/// 5). Only an index that is (i) recorded in `recorded` (the platform's own
+/// concurrent index step records), (ii) in `schema` and (iii) marked
+/// `pg_index.indisvalid = false` is dropped and rebuilt, UNIQUE ones right
+/// away in the transaction, others after commit. The name used is the
+/// recorded one. Any other INVALID index is left in place and reported.
+async fn drop_invalid_indexes(
+    exec: &PgSession,
+    schema: &str,
+    recorded: &[String],
+    deferred: &mut Deferred,
+) -> Result<Vec<String>, String> {
+    let recorded: Vec<String> = recorded.to_vec();
+    let rows = (**exec)
+        .query(
+            "SELECT c.relname::text, pg_get_indexdef(c.oid), c.relname = ANY($2::text[]) \
+             FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND NOT i.indisvalid ORDER BY 1",
+            &[&schema, &recorded],
+        )
+        .await
+        .map_err(super::exec::pg_error)?;
+    let mut log = Vec::new();
+    for row in rows {
+        let (found, def, is_recorded): (String, String, bool) =
+            (row.get(0), row.get(1), row.get(2));
+        let Some(name) = recorded
+            .iter()
+            .find(|r| **r == found)
+            .filter(|_| is_recorded)
+        else {
+            tracing::error!(
+                schema,
+                index = found.as_str(),
+                "ALERT: INVALID index not built by the platform's concurrent index step; left in place"
+            );
+            log.push(format!(
+                "{AUDIT_PREFIX}invalid index {schema}.{} was not built by the platform's concurrent index step; left in place (use the 2B deprecation flow)",
+                quote(&found).unwrap_or_else(|_| "?".into())
+            ));
+            continue;
+        };
+        exec.batch(&[format!("DROP INDEX {}.{}", quote(schema)?, quote(name)?)])
+            .await?;
+        let placement = rebuild_placement(&def)?;
+        let when = match &placement {
+            Placement::InTransaction(sql) => {
+                exec.execute_one(sql).await?;
+                "in the migration transaction"
+            }
+            Placement::AfterCommit(index) => {
+                deferred.push(("rebuild".into(), index.clone()));
+                "concurrently after commit"
+            }
+        };
+        log.push(format!(
+            "{AUDIT_PREFIX}dropped invalid index {schema}.{name}; rebuilding {when}"
+        ));
+    }
+    Ok(log)
+}
+
+/// Builds the deferred non-unique indexes, one audited step each, after the
+/// main transaction committed (still inside the owner login window). Each
+/// index this step creates is added to `built` before it runs (an index
+/// that already existed is not). A failure is reported; the index it
+/// leaves INVALID is dropped and rebuilt on the next migrate.
+async fn build_indexes_after_commit(
+    exec: &PgSession,
+    tenant: &str,
+    deferred: &Deferred,
+    built: &mut Vec<String>,
+) -> Result<Vec<String>, String> {
+    let schema = format!("t_{tenant}");
+    let mut log = Vec::new();
+    if deferred.is_empty() {
+        return Ok(log);
+    }
+    exec.batch(&[format!("SET search_path TO {}", quote(&schema)?)])
+        .await?;
+    for (id, index) in deferred {
+        let exists = (**exec)
+            .query(
+                "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[&schema, &index.name],
+            )
+            .await
+            .map_err(super::exec::pg_error)?;
+        if exists.is_empty() {
+            built.push(index.name.clone());
+        }
+        if let Err(err) = exec.execute_one(&index.sql).await {
+            let _ = exec.batch(&["RESET search_path".to_string()]).await;
+            return Err(format!(
+                "{id}: the main migration transaction for {schema} committed, but the concurrent index step failed: {err}; an INVALID index it left is dropped and rebuilt on the next migrate"
+            ));
+        }
+        log.push(format!(
+            "{AUDIT_PREFIX}built index concurrently after commit ({id}) in {schema}"
+        ));
+    }
+    exec.batch(&["RESET search_path".to_string()]).await?;
     Ok(log)
 }
 
 /// After migrations: every table in the tenant schema gets ENABLE + FORCE RLS
 /// and the tenant policy. A table without `tenant_id`, or any view,
 /// materialized view or foreign table (which RLS cannot protect), fails.
-/// Any policy other than `tenant_isolation` fails too: permissive policies
+/// Except for the canonical replay expiry policy on the replay table, any
+/// policy other than `tenant_isolation` fails too: permissive policies
 /// are OR-combined, so `CREATE POLICY open ON t USING (true)` in a migration
 /// would expose every tenant's rows.
-async fn protect_schema(exec: &PgSession, schema: &str) -> Result<Vec<String>, String> {
+async fn protect_schema(exec: &PgSession, tenant: &str) -> Result<Vec<String>, String> {
+    let schema = &format!("t_{tenant}");
     let unsafe_rels = exec
         .query_texts(
             "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -318,9 +691,12 @@ async fn protect_schema(exec: &PgSession, schema: &str) -> Result<Vec<String>, S
     }
     let extra = exec
         .query_texts(
-            "SELECT format('%I.%I', c.relname, p.polname) FROM pg_policy p \
+            &format!(
+                "SELECT format('%I.%I', c.relname, p.polname) FROM pg_policy p \
              JOIN pg_class c ON c.oid = p.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = $1 AND p.polname <> 'tenant_isolation' ORDER BY 1",
+             WHERE n.nspname = $1 AND p.polname <> 'tenant_isolation' AND NOT ({}) ORDER BY 1",
+                replay_delete_policy_sql("p", "c.relname", "substr($1::text, 3)")
+            ),
             schema,
         )
         .await?;
@@ -339,38 +715,66 @@ async fn protect_schema(exec: &PgSession, schema: &str) -> Result<Vec<String>, S
         .await?;
     let mut log = Vec::new();
     for table in tables {
-        exec.batch(&rls_statements(schema, &table)?).await?;
+        exec.batch(&rls_statements(tenant, &table)?).await?;
         log.push(format!("row level security on {schema}.{table}"));
     }
     Ok(log)
 }
 
-/// RLS problems in every tenant schema, as `schema.table: problem`.
-/// Every table in every tenant schema (`t_%`), not just the one being
-/// migrated, must have ENABLE + FORCE RLS and exactly one policy:
-/// `tenant_isolation`, permissive, for all commands and roles, with the same
-/// expressions vibe installs. The owner role owns every tenant schema, so a
-/// migration for tenant A could otherwise weaken tenant B (e.g. `CREATE POLICY
-/// open ON t_b.notes USING (true)` or `ALTER TABLE ... NO FORCE ROW LEVEL
-/// SECURITY`), and `vibe serve` only checks at startup.
-async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>, String> {
+/// Remove expired replay rows after DDL commits, without changing table locks or policies.
+pub async fn cleanup_replay(exec: &mut PgSession, tenant: &str) -> Result<(), String> {
+    let role = super::grants::tenant_role(tenant, "app_rw")?;
+    let owner = format!("tenant_{tenant}_owner");
+    let table = format!("{}.vibe_challenge_replay", quote(&format!("t_{tenant}"))?);
+    loop {
+        exec.in_transaction(true);
+        let result = async {
+            exec.batch(&["BEGIN".into(), format!("SET LOCAL ROLE {}", quote(&role)?)]).await?;
+            let identities = exec.query_texts("SELECT current_user::text || ':' || session_user::text WHERE $1::text IS NOT NULL", tenant).await?;
+            if identities != [format!("{role}:{owner}")] {
+                return Err("replay cleanup role identity mismatch".to_string());
+            }
+            let count = exec.query_texts(&format!("WITH removed AS (DELETE FROM {table} WHERE ctid IN (SELECT ctid FROM {table} WHERE expires_at < now() LIMIT 1000) RETURNING 1) SELECT count(*)::text FROM removed WHERE $1::text IS NOT NULL"), tenant).await?;
+            let after = exec.query_texts("SELECT current_user::text || ':' || session_user::text WHERE $1::text IS NOT NULL", tenant).await?;
+            if after != identities { return Err("replay cleanup role identity changed".into()); }
+            Ok::<_, String>(count == ["0"])
+        }.await;
+        match result {
+            Ok(done) => {
+                exec.batch(&["COMMIT".into()]).await?;
+                exec.in_transaction(false);
+                if done {
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                if exec.batch(&["ROLLBACK".into()]).await.is_ok() {
+                    exec.in_transaction(false);
+                }
+                return Err(err);
+            }
+        }
+    }
+}
+
+/// Exact restrictive expiry policy, allowed only on the replay table.
+/// A missing role or expression fails closed rather than yielding SQL NULL.
+pub fn replay_delete_policy_sql(p: &str, table: &str, tenant: &str) -> String {
+    format!("COALESCE(({table} = 'vibe_challenge_replay' AND {p}.polname = 'replay_expired_delete' AND NOT {p}.polpermissive AND {p}.polcmd = 'd' AND cardinality({p}.polroles) = 1 AND {p}.polroles[1] = to_regrole('tenant_' || {tenant} || '_rw') AND {p}.polwithcheck IS NULL AND pg_get_expr({p}.polqual, {p}.polrelid) = format('((tenant_id = %L::text) AND (expires_at < now()))', {tenant})), false)")
+}
+
+/// RLS problems in the tenant being migrated, as `schema.table: problem`.
+/// Other schemas may still have legacy policies; their fingerprint is checked
+/// separately to ensure this migration does not change them.
+pub async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>, String> {
     exec.query_texts(
-        r#"WITH ref AS (
-                 -- The expression vibe installs: this tenant's, or before it
-                 -- exists, the most common one among tenant schemas.
-                 SELECT q, w FROM (
-                   SELECT pg_get_expr(p.polqual, p.polrelid) AS q,
-                          pg_get_expr(p.polwithcheck, p.polrelid) AS w,
-                          n.nspname = $1 AS own
-                   FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
-                   JOIN pg_namespace n ON n.oid = c.relnamespace
-                   WHERE n.nspname LIKE 't\_%' AND p.polname = 'tenant_isolation') x
-                 GROUP BY q, w ORDER BY bool_or(own) DESC, count(*) DESC LIMIT 1),
-               rels AS (
-                 SELECT c.oid, format('%I.%I', n.nspname, c.relname) AS name, c.relkind,
-                        c.relrowsecurity, c.relforcerowsecurity
+        &format!(
+            r#"WITH rels AS (
+                 SELECT c.oid, c.relname, format('%I.%I', n.nspname, c.relname) AS name, c.relkind,
+                        c.relrowsecurity, c.relforcerowsecurity, substr(n.nspname, 3) AS tenant
                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname LIKE 't\_%' AND c.relkind IN ('r','p','v','m','f'))
+                 WHERE n.nspname LIKE 't\_%' AND c.relkind IN ('r','p','v','m','f')
+                 AND ($1::text = '' OR n.nspname = $1::text))
              SELECT name || ': ' || problem FROM (
                SELECT name, 'view, materialized view or foreign table' AS problem
                  FROM rels WHERE relkind IN ('v','m','f')
@@ -381,23 +785,47 @@ async fn rls_problems(exec: &PgSession, own_schema: &str) -> Result<Vec<String>,
                UNION ALL
                SELECT r.name, 'unexpected policy ' || quote_ident(p.polname)
                  FROM rels r JOIN pg_policy p ON p.polrelid = r.oid
-                 WHERE p.polname <> 'tenant_isolation'
+                 WHERE p.polname <> 'tenant_isolation' AND NOT ({replay})
                UNION ALL
                SELECT r.name, 'tenant_isolation policy was altered'
-                 FROM rels r JOIN pg_policy p ON p.polrelid = r.oid, ref
-                 WHERE p.polname = 'tenant_isolation' AND (
-                   NOT p.polpermissive OR p.polcmd <> '*' OR p.polroles <> '{0}'::oid[]
-                   OR pg_get_expr(p.polqual, p.polrelid) IS DISTINCT FROM ref.q
-                   OR pg_get_expr(p.polwithcheck, p.polrelid) IS DISTINCT FROM ref.w)
+                 FROM rels r JOIN pg_policy p ON p.polrelid = r.oid
+                 WHERE p.polname = 'tenant_isolation' AND NOT ({canonical})
                UNION ALL
                SELECT r.name, 'tenant_isolation policy is missing'
                  FROM rels r WHERE r.relkind IN ('r','p') AND NOT EXISTS (
                    SELECT 1 FROM pg_policy p WHERE p.polrelid = r.oid
                    AND p.polname = 'tenant_isolation')
+               UNION ALL
+               SELECT r.name, 'replay DELETE policy is missing or altered'
+                 FROM rels r WHERE r.relname = 'vibe_challenge_replay' AND NOT EXISTS (
+                   SELECT 1 FROM pg_policy p WHERE p.polrelid = r.oid AND {replay})
+               UNION ALL
+               SELECT n.nspname::text, 'replay table is missing'
+                 FROM pg_namespace n WHERE n.nspname LIKE 't\_%'
+                 AND ($1::text = '' OR n.nspname = $1::text)
+                 AND NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.relnamespace = n.oid
+                   AND c.relname = 'vibe_challenge_replay' AND c.relkind IN ('r','p'))
              ) x ORDER BY 1"#,
+            canonical = canonical_policy_sql("p", "r.tenant"),
+            replay = replay_delete_policy_sql("p", "r.relname", "r.tenant")
+        ),
         own_schema,
     )
     .await
+}
+
+/// SQL condition: policy `p` is the canonical `tenant_isolation` for the
+/// tenant id in SQL expression `tenant` (see `sql::rls_statements`).
+pub fn canonical_policy_sql(p: &str, tenant: &str) -> String {
+    format!(
+        "COALESCE(({p}.polpermissive AND {p}.polcmd = '*' \
+         AND cardinality({p}.polroles) = 3 \
+         AND (SELECT count(*) FROM pg_roles WHERE oid = ANY({p}.polroles) AND rolname IN ( \
+           'tenant_' || {tenant} || '_rw', 'tenant_' || {tenant} || '_public_reader', \
+           'tenant_' || {tenant} || '_public_writer')) = 3 \
+         AND pg_get_expr({p}.polqual, {p}.polrelid) = format('(tenant_id = %L::text)', {tenant}) \
+         AND pg_get_expr({p}.polwithcheck, {p}.polrelid) = format('(tenant_id = %L::text)', {tenant})), false)"
+    )
 }
 
 /// A digest of every other tenant schema's tables, columns, policies,
@@ -478,6 +906,242 @@ fn join(items: &[&String]) -> String {
         .map(|s| s.as_str())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Advisory lock class held by `vibe migrate` (on the admin connection)
+/// for the whole owner login window; the second key is the owner role oid.
+pub const MIGRATE_LOCK_CLASS: i32 = 0x5649_4245; // "VIBE"
+
+/// Owner roles that can log in while no `vibe migrate` holds their window
+/// lock: `$1` is unused (pass "").
+pub const OWNER_LOGIN_SQL: &str = "\
+SELECT r.rolname::text FROM pg_roles r \
+ WHERE r.rolname ~ '^tenant_[a-z0-9_]+_owner$' AND r.rolcanlogin AND $1::text IS NOT NULL \
+ AND NOT EXISTS (SELECT 1 FROM pg_locks l WHERE l.locktype = 'advisory' \
+   AND l.classid::bigint = 1447641669 AND l.objid = r.oid AND l.objsubid = 2 AND l.granted) \
+ ORDER BY 1";
+
+/// SQL that ends an owner login window: NOLOGIN, password removed, and any
+/// remaining owner sessions terminated.
+pub fn close_owner_window_sql(owner: &str) -> Result<Vec<String>, String> {
+    let role = quote(owner)?;
+    Ok(vec![
+        format!("ALTER ROLE {role} NOLOGIN PASSWORD NULL"),
+        format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{owner}' AND pid <> pg_backend_pid()"
+        ),
+    ])
+}
+
+/// A random one-time password (256 bits, hex). Only its SCRAM verifier is
+/// sent to the server; the password itself is never logged.
+fn one_time_password() -> String {
+    let mut bytes = [0u8; 32];
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes)
+        .expect("OS random number generator failed");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `admin_url` with the user and password replaced.
+fn url_with_login(admin_url: &str, user: &str, password: &str) -> Result<String, String> {
+    let mut url =
+        url::Url::parse(admin_url).map_err(|err| format!("invalid admin database URL: {err}"))?;
+    url.set_username(user)
+        .map_err(|_| "admin database URL cannot carry a user".to_string())?;
+    url.set_password(Some(password))
+        .map_err(|_| "admin database URL cannot carry a password".to_string())?;
+    Ok(url.to_string())
+}
+
+/// `vibe migrate` (spec §2B, D129): the owner role `tenant_<id>_owner` is
+/// NOLOGIN outside migrate. On the platform-admin connection this takes the
+/// tenant's window lock, gives the owner a one-time password and LOGIN, runs
+/// [`migrate_tenant`] logged in as the owner (one transaction, then the
+/// deferred concurrent indexes), and then — whether that succeeded or
+/// failed — on a separate admin connection sets the owner NOLOGIN again,
+/// removes the password, terminates owner sessions and writes the audit
+/// entries to `public.vibe_migrate_audit`.
+pub async fn migrate_with_owner_window(
+    admin_url: &str,
+    manifest: &Manifest,
+    tenant: &str,
+) -> Result<Vec<String>, String> {
+    if !valid_tenant(tenant) {
+        return Err(super::slugs::TENANT_ID_RULE.into());
+    }
+    let owner = super::grants::tenant_owner_role(tenant)?;
+    let admin = PgExec::connect(admin_url).await?;
+    let lock = admin.session().await?;
+    let state = (*lock)
+        .query(
+            "SELECT r.oid::bigint, r.rolcanlogin, pg_try_advisory_lock($2, r.oid::bigint::bit(32)::int) \
+             FROM pg_roles r WHERE r.rolname = $1",
+            &[&owner, &MIGRATE_LOCK_CLASS],
+        )
+        .await
+        .map_err(super::exec::pg_error)?;
+    let Some(row) = state.first() else {
+        return Err(format!(
+            "refusing to migrate t_{tenant}: owner role {owner} does not exist; create it NOLOGIN (decision 129)"
+        ));
+    };
+    let (can_login, locked): (bool, bool) = (row.get(1), row.get(2));
+    if !locked {
+        return Err(format!(
+            "refusing to migrate t_{tenant}: another vibe migrate holds the owner login window"
+        ));
+    }
+    if can_login {
+        return Err(format!(
+            "refusing to migrate t_{tenant}: {owner} can already log in outside a migrate window; set it NOLOGIN and investigate (see the owner login check)"
+        ));
+    }
+    // The platform's own records of indexes its concurrent index step built.
+    lock.batch(&[INDEX_RECORD_TABLE_SQL.to_string()]).await?;
+    let recorded: Vec<String> = (*lock)
+        .query(
+            "SELECT index_name FROM public.vibe_concurrent_indexes WHERE tenant = $1 ORDER BY 1",
+            &[&tenant],
+        )
+        .await
+        .map_err(super::exec::pg_error)?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let mut built = Vec::new();
+    let password = one_time_password();
+    let verifier = postgres_protocol::password::scram_sha_256(password.as_bytes());
+    let opened = lock
+        .batch(&[format!(
+            "ALTER ROLE {} LOGIN PASSWORD '{verifier}'",
+            quote(&owner)?
+        )])
+        .await;
+    let result = match opened {
+        Err(err) => Err(format!("could not open the owner login window: {err}")),
+        Ok(()) => {
+            async {
+                let owner_url = url_with_login(admin_url, &owner, &password)?;
+                let exec = PgExec::connect(&owner_url).await?;
+                migrate_tenant_recorded(&exec, manifest, tenant, &recorded, &mut built).await
+            }
+            .await
+        }
+    };
+    drop(password);
+    // finally: always, on a separate admin connection.
+    let closed = close_owner_window(admin_url, &owner, tenant, &result, &built).await;
+    let _ = lock
+        .batch(&["SELECT pg_advisory_unlock_all()".to_string()])
+        .await;
+    drop(lock);
+    match (result, closed) {
+        (Ok(log), Ok(())) => Ok(log),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(close)) => Err(format!("{err}; additionally: {close}")),
+    }
+}
+
+async fn close_owner_window(
+    admin_url: &str,
+    owner: &str,
+    tenant: &str,
+    result: &Result<Vec<String>, String>,
+    built: &[String],
+) -> Result<(), String> {
+    let mut last = String::new();
+    for _ in 0..3 {
+        let attempt = async {
+            let admin = PgExec::connect(admin_url).await?;
+            let session = admin.session().await?;
+            session.batch(&close_owner_window_sql(owner)?).await?;
+            let mut events: Vec<String> = match result {
+                Ok(log) => log
+                    .iter()
+                    .filter_map(|l| l.strip_prefix(AUDIT_PREFIX).map(str::to_string))
+                    .collect(),
+                Err(err) => vec![format!("migrate failed: {err}")],
+            };
+            if result.is_ok() {
+                events.push("migrate committed".into());
+            }
+            events.push(format!(
+                "owner login window closed: {owner} NOLOGIN, password removed"
+            ));
+            session.batch(&[AUDIT_TABLE_SQL.to_string(), INDEX_RECORD_TABLE_SQL.to_string()]).await?;
+            for name in built {
+                (*session)
+                    .execute(
+                        "INSERT INTO public.vibe_concurrent_indexes (tenant, index_name) VALUES ($1, $2) \
+                         ON CONFLICT DO NOTHING",
+                        &[&tenant, name],
+                    )
+                    .await
+                    .map_err(super::exec::pg_error)?;
+            }
+            for event in events {
+                (*session)
+                    .execute(
+                        "INSERT INTO public.vibe_migrate_audit (tenant, event) VALUES ($1, $2)",
+                        &[&tenant, &event],
+                    )
+                    .await
+                    .map_err(super::exec::pg_error)?;
+            }
+            Ok::<_, String>(())
+        }
+        .await;
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(err) => last = err,
+        }
+    }
+    tracing::error!(
+        owner,
+        "owner login window could not be closed; the owner may still log in"
+    );
+    Err(format!(
+        "SECURITY: could not set {owner} back to NOLOGIN after migrate ({last}); run `ALTER ROLE {owner} NOLOGIN PASSWORD NULL` now"
+    ))
+}
+
+/// Audit table written by the platform-admin connection.
+pub const AUDIT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS public.vibe_migrate_audit (\
+ at timestamptz NOT NULL DEFAULT now(), tenant text NOT NULL, event text NOT NULL); \
+ REVOKE ALL ON public.vibe_migrate_audit FROM PUBLIC";
+
+/// Platform record of indexes built by the concurrent index step (spec
+/// §2B.3 item 5), written by the platform-admin connection only.
+pub const INDEX_RECORD_TABLE_SQL: &str =
+    "CREATE TABLE IF NOT EXISTS public.vibe_concurrent_indexes (\
+ tenant text NOT NULL, index_name text NOT NULL, at timestamptz NOT NULL DEFAULT now(), \
+ PRIMARY KEY (tenant, index_name)); \
+ REVOKE ALL ON public.vibe_concurrent_indexes FROM PUBLIC";
+
+/// Owner login alerts raised since process start (`vibe check-owners`).
+static OWNER_LOGIN_ALERTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Metric `vibe_db_owner_login_alerts_total`.
+pub fn owner_login_alerts_total() -> u64 {
+    OWNER_LOGIN_ALERTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Periodic owner check (spec §2B): every owner role that can log in while
+/// no migrate window is open is set NOLOGIN (password removed) and reported
+/// with an alert. Returns the roles found.
+pub async fn check_owner_logins(admin: &PgExec) -> Result<Vec<String>, String> {
+    let found = admin.query_texts(OWNER_LOGIN_SQL, "").await?;
+    for owner in &found {
+        OWNER_LOGIN_ALERTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(
+            owner = owner.as_str(),
+            vibe_db_owner_login_alerts_total = owner_login_alerts_total(),
+            "ALERT: tenant owner role can log in outside vibe migrate; setting NOLOGIN"
+        );
+        admin.batch(&close_owner_window_sql(owner)?).await?;
+    }
+    Ok(found)
 }
 
 #[cfg(test)]

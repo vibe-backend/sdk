@@ -14,9 +14,34 @@ pub enum ExecError {
     NotFound,
     Conflict,
     Precondition,
+    /// The database refused the statement for the role: a missing table or
+    /// column privilege, or a row-level security violation (SQLSTATE 42501).
+    /// The message is for logs only.
+    Denied(String),
+    /// The process-wide connection cap is reached; refused at once
+    /// (HTTP 503 `DB_POOL_EXHAUSTED` with `Retry-After`).
+    PoolExhausted,
     Timeout,
     IssuanceFailed,
     Message(String),
+}
+
+/// Rejects a caller-supplied `tenant_id` before any executor runs the
+/// statement (spec §2C.4): the executor sets it from the request tenant, so
+/// even the caller's own tenant id is refused. The errors match what
+/// PostgreSQL reports for the same statement under RLS + FORCE.
+pub fn reject_tenant_input(stmt: &Stmt) -> Result<(), ExecError> {
+    match stmt {
+        Stmt::Insert { table, values, .. } if values.iter().any(|(c, _)| c.name == "tenant_id") => {
+            Err(ExecError::Denied(format!(
+                "new row violates row-level security policy for table \"{table}\""
+            )))
+        }
+        Stmt::Update { table, sets, .. } if sets.iter().any(|(c, _)| c.name == "tenant_id") => Err(
+            ExecError::Denied(format!("permission denied for table {table}")),
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// Issuance work performed only after refresh validation, without holding a rotation connection.
@@ -123,7 +148,7 @@ pub trait QueryExec: Send + Sync {
 /// Database roles a `query` step may run as.
 pub const QUERY_ROLES: [&str; 2] = ["public_reader", "public_writer"];
 
-fn roles_from(value: Option<&Value>) -> Result<Vec<String>, ExecError> {
+pub(crate) fn roles_from(value: Option<&Value>) -> Result<Vec<String>, ExecError> {
     match value {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(items)) => items
@@ -181,14 +206,14 @@ impl<F: FnOnce()> Drop for ReservationGuard<F> {
 const REFRESH_TABLE: &str = "_platform_refresh_tokens";
 
 #[derive(Default)]
-pub struct MemoryExec {
+pub struct PlainMemoryExec {
     tables: Mutex<BTreeMap<String, Vec<Row>>>,
     refresh_gate: tokio::sync::Mutex<()>,
     /// Test stub for `query` steps (the memory executor runs no SQL).
     query_stub: Mutex<Option<String>>,
 }
 
-impl MemoryExec {
+impl PlainMemoryExec {
     pub fn new() -> Self {
         Self::default()
     }
@@ -210,7 +235,7 @@ impl MemoryExec {
 }
 
 #[async_trait]
-impl QueryExec for MemoryExec {
+impl QueryExec for PlainMemoryExec {
     async fn raw(
         &self,
         _tenant_id: &str,
@@ -635,106 +660,187 @@ fn project(row: &Row, columns: &[Col]) -> Row {
     out
 }
 
-/// Privileges of the runtime connection role, as read from the catalog.
-/// Everything is evaluated with `pg_has_role(.., 'MEMBER')`, so a role that
-/// could `SET ROLE` to a privileged or owning role (even through NOINHERIT
-/// membership) counts as having that privilege.
+/// What a tenant login role can do, as read from the catalog while logged
+/// in as it (decision 97). A safe role has no problems: it is exactly the
+/// expected `tenant_<id>_<class>` login, NOINHERIT, has no role memberships
+/// in either direction (so `SET ROLE` can reach nothing), owns nothing, and
+/// can reach no relation or schema outside its own tenant schema.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RoleStatus {
+    /// `current_user` of the connection.
     pub name: String,
-    /// Superuser roles the connection role is (or can become).
-    pub superuser_via: Vec<String>,
-    /// BYPASSRLS roles the connection role is (or can become).
-    pub bypass_rls_via: Vec<String>,
-    /// Tenant-schema relations (tables, views, sequences, ...) it can own.
-    pub owned_relations: i64,
-    /// Tenant-schema functions/procedures it can own.
-    pub owned_functions: i64,
-    /// Tenant-schema types it can own.
-    pub owned_types: i64,
-    /// Tenant schemas it can own.
-    pub owned_schemas: i64,
-    /// Tenant relations the role can read or write that are not tables with
-    /// ENABLE + FORCE row level security (views and RLS-less tables would
-    /// expose every tenant).
+    /// `session_user` of the connection.
+    pub session_user: String,
+    /// The role name the connection must be logged in as.
+    pub expected: String,
+    pub superuser: bool,
+    pub bypass_rls: bool,
+    /// INHERIT instead of NOINHERIT.
+    pub inherit: bool,
+    /// `member of X` / `has member Y`.
+    pub memberships: Vec<String>,
+    /// Schemas, relations, functions and types it owns (anywhere).
+    pub owned_objects: i64,
+    /// Relations and schemas outside its own tenant schema it can use
+    /// (other tenants, platform/shared tables in `public`), and any schema
+    /// it can CREATE in.
+    pub foreign_access: Vec<String>,
+    /// Relations in its own schema that are not tables with ENABLE + FORCE
+    /// row level security (whether or not it can access them today), or
+    /// where it holds DELETE, TRUNCATE, REFERENCES or TRIGGER.
     pub unprotected_relations: Vec<String>,
-    /// Policies on tenant tables other than the canonical `tenant_isolation`
-    /// (permissive policies are OR-combined, so any extra one widens access),
-    /// plus a `tenant_isolation` whose definition was altered.
+    /// Policies in its own schema other than the canonical
+    /// `tenant_isolation` for this tenant.
     pub foreign_policies: Vec<String>,
+    /// Privileges on `t_<id>.vibe_challenge_replay` that differ from the
+    /// allowed set: `tenant_<id>_rw` holds exactly SELECT and INSERT
+    /// (not grantable). Effective privileges are checked only for the current
+    /// role and PUBLIC; explicit table and column ACLs are also inspected for
+    /// grants to other roles. The owner's privileges are excluded.
+    pub replay_privileges: Vec<String>,
 }
 
 impl RoleStatus {
     pub fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if !self.superuser_via.is_empty() {
+        // D129: a pool must never log in as a tenant owner role.
+        if [&self.session_user, &self.name]
+            .iter()
+            .any(|u| super::grants::is_owner_role_name(u))
+        {
             out.push(format!(
-                "is or can become a superuser ({})",
-                self.superuser_via.join(", ")
+                "logs in as owner role `{}`; owner roles are for vibe migrate only and must never back a pool",
+                self.session_user
             ));
         }
-        if !self.bypass_rls_via.is_empty() {
+        if self.name != self.expected || self.session_user != self.expected {
             out.push(format!(
-                "is or can become a BYPASSRLS role ({})",
-                self.bypass_rls_via.join(", ")
+                "is logged in as `{}` (current user `{}`), not the tenant role `{}`",
+                self.session_user, self.name, self.expected
             ));
         }
-        for (count, what) in [
-            (self.owned_relations, "tenant relation(s)"),
-            (self.owned_functions, "tenant function(s)"),
-            (self.owned_types, "tenant type(s)"),
-            (self.owned_schemas, "tenant schema(s)"),
-        ] {
-            if count > 0 {
-                out.push(format!("can own {count} {what}"));
-            }
+        if self.superuser {
+            out.push("is a superuser".into());
+        }
+        if self.bypass_rls {
+            out.push("has BYPASSRLS".into());
+        }
+        if self.inherit {
+            out.push("is INHERIT (create it NOINHERIT)".into());
+        }
+        if !self.memberships.is_empty() {
+            out.push(format!(
+                "has role memberships other than tenant_<id>_owner in tenant_<id>_rw WITH ADMIN FALSE, INHERIT FALSE, SET TRUE ({}); a tenant role must not be able to SET ROLE to anything",
+                self.memberships.join(", ")
+            ));
+        }
+        if self.owned_objects > 0 {
+            out.push(format!("owns {} database object(s)", self.owned_objects));
+        }
+        if !self.foreign_access.is_empty() {
+            out.push(format!(
+                "can reach objects outside its own tenant schema ({})",
+                self.foreign_access.join(", ")
+            ));
         }
         if !self.unprotected_relations.is_empty() {
             out.push(format!(
-                "can access tenant relation(s) without ENABLE + FORCE ROW LEVEL SECURITY ({}); re-run `vibe migrate` or enable RLS on them",
+                "can access relation(s) without ENABLE + FORCE ROW LEVEL SECURITY or with a forbidden privilege ({}); re-run `vibe migrate`",
                 self.unprotected_relations.join(", ")
             ));
         }
         if !self.foreign_policies.is_empty() {
             out.push(format!(
-                "tenant table(s) carry policies other than the canonical tenant_isolation ({}); permissive policies are OR-combined and would let rows leak across tenants; drop them and re-run `vibe migrate`",
+                "tenant table(s) carry policies other than the canonical tenant_isolation ({}); drop them and re-run `vibe migrate`",
                 self.foreign_policies.join(", ")
+            ));
+        }
+        if !self.replay_privileges.is_empty() {
+            out.push(format!(
+                "has privileges on the challenge replay table other than exactly SELECT and INSERT for tenant_<id>_rw ({}); re-run `vibe migrate`",
+                self.replay_privileges.join(", ")
             ));
         }
         out
     }
 }
 
-/// Catalog query behind [`PgExec::check_runtime_role`].
-pub const ROLE_STATUS_SQL: &str = "\
-SELECT current_user::text, \
- COALESCE((SELECT array_agg(m.rolname::text ORDER BY m.rolname) FROM pg_roles m \
-   WHERE m.rolsuper AND pg_has_role(current_user, m.oid, 'MEMBER')), '{}'), \
- COALESCE((SELECT array_agg(m.rolname::text ORDER BY m.rolname) FROM pg_roles m \
-   WHERE m.rolbypassrls AND pg_has_role(current_user, m.oid, 'MEMBER')), '{}'), \
- (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-   WHERE n.nspname LIKE 't\\_%' AND pg_has_role(current_user, c.relowner, 'MEMBER')), \
- (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-   WHERE n.nspname LIKE 't\\_%' AND pg_has_role(current_user, p.proowner, 'MEMBER')), \
- (SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
-   WHERE n.nspname LIKE 't\\_%' AND t.typrelid = 0 \
-   AND pg_has_role(current_user, t.typowner, 'MEMBER')), \
- (SELECT count(*) FROM pg_namespace n WHERE n.nspname LIKE 't\\_%' \
-   AND pg_has_role(current_user, n.nspowner, 'MEMBER')), \
- COALESCE((SELECT array_agg(format('%I.%I', n.nspname, c.relname) ORDER BY 1) \
-   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-   WHERE n.nspname LIKE 't\\_%' AND c.relkind IN ('r','p','v','m','f') \
-   AND has_table_privilege(current_user, c.oid, 'SELECT,INSERT,UPDATE,DELETE') \
-   AND NOT (c.relkind IN ('r','p') AND c.relrowsecurity AND c.relforcerowsecurity)), '{}'), \
- COALESCE((SELECT array_agg(format('%I.%I:%I', n.nspname, c.relname, p.polname) ORDER BY 1) \
-   FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
-   JOIN pg_namespace n ON n.oid = c.relnamespace \
-   WHERE n.nspname LIKE 't\\_%' \
-   AND has_table_privilege(current_user, c.oid, 'SELECT,INSERT,UPDATE,DELETE') AND NOT ( \
-     p.polname = 'tenant_isolation' AND p.polpermissive AND p.polcmd = '*' \
-     AND p.polroles = '{0}'::oid[] \
-     AND pg_get_expr(p.polqual, p.polrelid) = '(tenant_id = current_setting(''app.tenant_id''::text, false))' \
-     AND pg_get_expr(p.polwithcheck, p.polrelid) = '(tenant_id = current_setting(''app.tenant_id''::text, false))')), '{}')";
+/// Catalog query behind [`PgExec::check_tenant_role`], run while logged in
+/// as the tenant role. `$1` is the tenant id, `$2` the expected role name.
+pub fn tenant_role_status_sql() -> String {
+    format!(
+        r#"SELECT current_user::text, session_user::text, $2::text, r.rolsuper, r.rolbypassrls, r.rolinherit,
+ COALESCE((SELECT array_agg(x ORDER BY x) FROM ({members}) y(x)), '{{}}'),
+ (SELECT count(*) FROM pg_class WHERE relowner = r.oid)
+   + (SELECT count(*) FROM pg_proc WHERE proowner = r.oid)
+   + (SELECT count(*) FROM pg_type WHERE typowner = r.oid)
+   + (SELECT count(*) FROM pg_namespace WHERE nspowner = r.oid),
+ COALESCE((SELECT array_agg(x ORDER BY x) FROM (
+   SELECT format('schema %I', n.nspname) AS x FROM pg_namespace n
+     WHERE n.nspname LIKE 't\_%' AND n.nspname <> 't_' || $1::text
+     AND has_schema_privilege(r.oid, n.oid, 'USAGE')
+   UNION ALL
+   SELECT format('CREATE on schema %I', n.nspname) FROM pg_namespace n
+     WHERE n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+     AND has_schema_privilege(r.oid, n.oid, 'CREATE')
+   UNION ALL
+   SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+     AND n.nspname <> 't_' || $1::text AND c.relkind IN ('r','p','v','m','f','S')
+     AND (has_table_privilege(r.oid, c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+       OR (c.relkind <> 'S' AND has_any_column_privilege(r.oid, c.oid, 'SELECT,INSERT,UPDATE,REFERENCES')))
+   ) y), '{{}}'),
+ COALESCE((SELECT array_agg(format('%I.%I', n.nspname, c.relname) ORDER BY 1)
+   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 't_' || $1::text AND c.relkind IN ('r','p','v','m','f')
+   AND (NOT (c.relkind IN ('r','p') AND c.relrowsecurity AND c.relforcerowsecurity)
+     OR has_table_privilege(r.oid, c.oid, 'TRUNCATE,REFERENCES,TRIGGER') OR (c.relname <> 'vibe_challenge_replay' AND has_table_privilege(r.oid, c.oid, 'DELETE')))), '{{}}'),
+ COALESCE((SELECT array_agg(format('%I.%I:%I', n.nspname, c.relname, p.polname) ORDER BY 1)
+   FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
+   JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 't_' || $1::text
+   AND NOT (p.polname = 'tenant_isolation' AND {canonical} OR {replay})), '{{}}'),
+ COALESCE((SELECT array_agg(x ORDER BY x) FROM (
+   SELECT format('%I.%I lacks %s', n.nspname, c.relname, need) AS x
+     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
+     LATERAL (VALUES ('SELECT'), ('INSERT'), ('DELETE')) v(need)
+     WHERE n.nspname = 't_' || $1::text AND c.relname = 'vibe_challenge_replay'
+     AND $2::text = 'tenant_' || $1::text || '_rw'
+     AND NOT has_table_privilege(r.oid, c.oid, need)
+   UNION ALL
+   SELECT format('%I.%I grants %s to %s', n.nspname, c.relname, a.privilege_type,
+       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(a.grantee::regrole::text) END)
+     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
+     LATERAL aclexplode(c.relacl) a
+     WHERE n.nspname = 't_' || $1::text AND c.relname = 'vibe_challenge_replay'
+     AND a.grantee <> c.relowner
+     AND NOT (a.grantee = to_regrole('tenant_' || $1::text || '_rw')
+       AND a.privilege_type IN ('SELECT', 'INSERT', 'DELETE') AND NOT a.is_grantable)
+   UNION ALL
+   SELECT format('%I.%I column %I grants %s to %s', n.nspname, c.relname, t.attname, a.privilege_type,
+       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(a.grantee::regrole::text) END)
+     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     JOIN pg_attribute t ON t.attrelid = c.oid AND t.attacl IS NOT NULL,
+     LATERAL aclexplode(t.attacl) a
+     WHERE n.nspname = 't_' || $1::text AND c.relname = 'vibe_challenge_replay'
+     AND a.grantee <> c.relowner) y), '{{}}')
+FROM pg_roles r WHERE r.rolname = current_user"#,
+        replay = super::migrate::replay_delete_policy_sql("p", "c.relname", "$1::text"),
+        canonical = super::migrate::canonical_policy_sql("p", "$1::text"),
+        members = super::migrate::membership_problems_sql("$1::text", "r.oid")
+    )
+}
+
+/// A statement kind the role may never run is a permission error (403); an
+/// unknown role is a bug.
+pub fn role_error(message: String) -> ExecError {
+    if message.starts_with("unknown executor role") {
+        ExecError::Message(message)
+    } else {
+        ExecError::Denied(message)
+    }
+}
 
 /// Logical caller classes passed as `role` to [`QueryExec::execute`], and the
 /// statements each may run. Enforced by every executor (spec §7.1/§7.2:
@@ -953,6 +1059,22 @@ pub struct PgExec {
     options: PgOptions,
 }
 
+/// Lowest supported `server_version_num` (PostgreSQL 16, decision 129).
+pub const MIN_SERVER_VERSION_NUM: u32 = 160000;
+
+/// Fails closed unless `server_version_num` is PostgreSQL 16 or later.
+pub fn check_server_version(server_version_num: &str) -> Result<(), String> {
+    let num: u32 = server_version_num.trim().parse().map_err(|_| {
+        format!("PostgreSQL 16 or later required (unreadable server_version_num {server_version_num:?})")
+    })?;
+    if num < MIN_SERVER_VERSION_NUM {
+        return Err(format!(
+            "PostgreSQL 16 or later required (server_version_num is {num})"
+        ));
+    }
+    Ok(())
+}
+
 impl PgExec {
     pub async fn connect(url: &str) -> Result<Self, String> {
         Self::connect_with(url, PgOptions::default()).await
@@ -1001,7 +1123,13 @@ impl PgExec {
             .build()
             .map_err(|err| err.to_string())?;
         // Fail at startup, not on the first request.
-        drop(pool.get().await.map_err(pool_error)?);
+        let client = pool.get().await.map_err(pool_error)?;
+        let row = client
+            .query_one("SHOW server_version_num", &[])
+            .await
+            .map_err(|err| format!("reading PostgreSQL server version: {err}"))?;
+        check_server_version(row.get::<_, &str>(0))?;
+        drop(client);
         let exec = Self { pool, options };
         exec.check_role_separation().await?;
         Ok(exec)
@@ -1056,36 +1184,125 @@ impl PgExec {
         Ok(())
     }
 
-    /// Refuses a connection role that can bypass row-level security: a
-    /// superuser, a role with BYPASSRLS, or a role that owns (directly or via
-    /// membership) any tenant schema or table. Spec §7.1: the connection role
-    /// must not own the tables and must not have BYPASSRLS.
-    pub async fn check_runtime_role(&self) -> Result<(), String> {
+    /// Refuses to serve `tenant`/`class` over this pool unless the login is
+    /// exactly that tenant's role and can reach only its own tenant schema
+    /// (decision 97, spec §7.1): not a superuser, no BYPASSRLS, NOINHERIT,
+    /// no role memberships either way (so `SET ROLE` reaches nothing), owns
+    /// nothing, no privileges outside `t_<tenant>`, and only RLS-forced
+    /// tables with the canonical policy inside it.
+    pub async fn check_tenant_role(&self, tenant: &str, class: &str) -> Result<(), String> {
+        let session = self.session().await?;
+        let problems = super::migrate::rls_problems(&session, "").await?;
+        if !problems.is_empty() {
+            return Err(format!("refusing to serve: {}", problems.join("; ")));
+        }
+        drop(session);
+        let expected = super::grants::tenant_role(tenant, class)?;
         let client = self.client().await?;
-        let row = client
-            .query_one(ROLE_STATUS_SQL, &[])
+        let rows = client
+            .query(&tenant_role_status_sql(), &[&tenant, &expected])
             .await
             .map_err(pg_error)?;
         drop(client);
+        let Some(row) = rows.first() else {
+            return Err(format!("refusing to serve: cannot read role `{expected}`"));
+        };
         let status = RoleStatus {
             name: row.get(0),
-            superuser_via: row.get(1),
-            bypass_rls_via: row.get(2),
-            owned_relations: row.get(3),
-            owned_functions: row.get(4),
-            owned_types: row.get(5),
-            owned_schemas: row.get(6),
-            unprotected_relations: row.get(7),
-            foreign_policies: row.get(8),
+            session_user: row.get(1),
+            expected: row.get(2),
+            superuser: row.get(3),
+            bypass_rls: row.get(4),
+            inherit: row.get(5),
+            memberships: row.get(6),
+            owned_objects: row.get(7),
+            foreign_access: row.get(8),
+            unprotected_relations: row.get(9),
+            foreign_policies: row.get(10),
+            replay_privileges: row.get(11),
         };
         let problems = status.problems();
         if problems.is_empty() {
             Ok(())
         } else {
             Err(format!(
-                "refusing to serve: database role `{}` {}; connect with a non-owner role without BYPASSRLS (use VIBE_MIGRATE_DATABASE_URL for `vibe migrate`)",
-                status.name,
+                "refusing to serve tenant {tenant}: database role `{expected}` {}",
                 problems.join(", ")
+            ))
+        }
+    }
+
+    /// Deploy-time check (D129): every model's compiled lock policy must be
+    /// the per-tenant policy, and the policy actually installed on
+    /// `t_<tenant>.<table>` (`pg_policies`) must say exactly what that lock
+    /// line says for this tenant: same name, PERMISSIVE, FOR ALL, the same
+    /// roles and the same USING / WITH CHECK. Any mismatch fails closed.
+    pub async fn check_policies(
+        &self,
+        tenant: &str,
+        models: &[crate::manifest::ModelSpec],
+    ) -> Result<(), String> {
+        let client = self.client().await?;
+        let schema = format!("t_{tenant}");
+        let mut problems = Vec::new();
+        for model in models {
+            let lock = model
+                .policy
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if lock != sql::POLICY_TEMPLATE {
+                problems.push(format!(
+                    "model {}: lock policy `{lock}` is not the per-tenant policy; recompile",
+                    model.id
+                ));
+                continue;
+            }
+            let want = sql::policy_parts(&lock.replace("<id>", tenant))?;
+            let rows = client
+                .query(
+                    "SELECT permissive, cmd, roles::text[], qual, with_check FROM pg_policies \
+                     WHERE schemaname = $1 AND tablename = $2 AND policyname = $3",
+                    &[&schema, &model.table, &want.name],
+                )
+                .await
+                .map_err(pg_error)?;
+            let Some(row) = rows.first() else {
+                problems.push(format!(
+                    "{schema}.{}: policy {} from the lock is not installed",
+                    model.table, want.name
+                ));
+                continue;
+            };
+            let mut roles: Vec<String> = row.get(2);
+            roles.sort();
+            let got = (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                roles,
+                row.get::<_, Option<String>>(3),
+                row.get::<_, Option<String>>(4),
+            );
+            let expected = (
+                "PERMISSIVE".to_string(),
+                "ALL".to_string(),
+                want.roles.clone(),
+                Some(format!("({}::text)", want.using)),
+                Some(format!("({}::text)", want.with_check)),
+            );
+            if got != expected {
+                problems.push(format!(
+                    "{schema}.{}: installed policy {} does not match the lock (installed {:?}, lock {:?})",
+                    model.table, want.name, got, expected
+                ));
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "refusing to serve tenant {tenant}: compiled policy and installed policies differ: {}; re-run `vibe migrate`",
+                problems.join("; ")
             ))
         }
     }
@@ -1186,10 +1403,22 @@ impl QueryExec for PgExec {
             return Err(ExecError::Message("invalid tenant id".into()));
         }
         // `role` is the logical caller class. It limits which statements may
-        // run; the database additionally enforces the non-owner connection
-        // role (checked by `check_runtime_role`) and its migrate-time grants.
-        role_allows(role, &stmt).map_err(ExecError::Message)?;
+        // run; the database additionally enforces the tenant login role's
+        // migrate-time grants and the tenant policy.
+        role_allows(role, &stmt).map_err(role_error)?;
+        reject_tenant_input(&stmt)?;
+        let mut stmt = stmt;
+        if let Stmt::Insert { values, .. } = &mut stmt {
+            values.push((
+                Col {
+                    name: "tenant_id".into(),
+                    ty: "string".into(),
+                },
+                Value::String(tenant_id.into()),
+            ));
+        }
         let (sql, params) = sql::render(&stmt).map_err(ExecError::Message)?;
+        let login = super::grants::tenant_role(tenant_id, role).map_err(ExecError::Message)?;
         let returning = returning_cols(&stmt);
         let mut client = self
             .client()
@@ -1200,17 +1429,29 @@ impl QueryExec for PgExec {
             .await
             .map_err(|err| ExecError::Message(pg_error(err)))?;
         let schema = format!("\"t_{tenant_id}\"");
-        tx.query(
-            "SELECT set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), \
-             set_config('statement_timeout', $3, true)",
-            &[
-                &tenant_id,
-                &schema,
-                &self.options.statement_timeout_ms.to_string(),
-            ],
-        )
-        .await
-        .map_err(|err| ExecError::Message(pg_error(err)))?;
+        // `app.tenant_id` is only for logs and diagnostics (decision 97); the
+        // tenant boundary is the login role and its own schema.
+        let who = tx
+            .query_one(
+                "SELECT session_user::text, current_user::text, \
+                 set_config('app.tenant_id', $1, true), set_config('search_path', $2, true), \
+                 set_config('statement_timeout', $3, true)",
+                &[
+                    &tenant_id,
+                    &schema,
+                    &self.options.statement_timeout_ms.to_string(),
+                ],
+            )
+            .await
+            .map_err(|err| ExecError::Message(pg_error(err)))?;
+        // There is no SET ROLE: the pool must be logged in as exactly this
+        // tenant's role for this class, or nothing runs.
+        let (session, current): (String, String) = (who.get(0), who.get(1));
+        if session != login || current != login {
+            return Err(ExecError::Message(format!(
+                "connection is logged in as `{session}`, not tenant role `{login}`; refusing to run"
+            )));
+        }
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p as _).collect();
         let rows = tx.query(&sql, &refs).await.map_err(map_pg)?;
@@ -1686,8 +1927,8 @@ impl QueryExec for PgExec {
 }
 
 impl PgExec {
-    /// One transaction in the tenant schema; `role` switches to a query role
-    /// with `SET LOCAL ROLE`; without `writes` it is READ ONLY.
+    /// One transaction in the tenant schema using the pool login identity.
+    /// `role` marks app SQL for validation; without `writes` it is READ ONLY.
     async fn run_tx(
         &self,
         tenant_id: &str,
@@ -1722,12 +1963,8 @@ impl PgExec {
         )
         .await
         .map_err(|err| ExecError::Message(err.to_string()))?;
-        if let Some(role) = role {
-            // `role` is one of QUERY_ROLES (checked by the caller).
-            tx.batch_execute(&format!("SET LOCAL ROLE {role}"))
-                .await
-                .map_err(|err| ExecError::Message(format!("SET ROLE {role}: {err}")))?;
-        }
+        // The pool logs in directly as this tenant's role (D97).
+        // `role` marks app SQL for validation; it never changes identity.
         let params: Vec<TextParam> = params.into_iter().map(TextParam).collect();
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p as _).collect();
@@ -1803,6 +2040,8 @@ fn map_pg(err: tokio_postgres::Error) -> ExecError {
         ExecError::Timeout
     } else if matches!(code, Some("23505" | "40001" | "40P01")) {
         ExecError::Conflict
+    } else if code == Some("42501") {
+        ExecError::Denied(pg_error(err))
     } else {
         ExecError::Message(pg_error(err))
     }
@@ -1858,28 +2097,58 @@ mod role_tests {
 
     #[test]
     fn safe_role_has_no_problems() {
-        assert!(RoleStatus::default().problems().is_empty());
+        let s = RoleStatus {
+            name: "tenant_acme0001_rw".into(),
+            session_user: "tenant_acme0001_rw".into(),
+            expected: "tenant_acme0001_rw".into(),
+            ..RoleStatus::default()
+        };
+        assert!(s.problems().is_empty());
+    }
+
+    #[test]
+    fn a_pool_logged_in_as_an_owner_role_is_refused() {
+        let s = RoleStatus {
+            name: "tenant_acme0001_owner".into(),
+            session_user: "tenant_acme0001_owner".into(),
+            expected: "tenant_acme0001_rw".into(),
+            ..RoleStatus::default()
+        };
+        let p = s.problems();
+        assert!(p[0].contains("owner role `tenant_acme0001_owner`"), "{p:?}");
+        assert!(super::super::grants::is_owner_role_name(
+            "tenant_acme_0001_owner"
+        ));
+        assert!(!super::super::grants::is_owner_role_name(
+            "tenant_acme0001_rw"
+        ));
+        assert!(!super::super::grants::is_owner_role_name("owner"));
     }
 
     #[test]
     fn unsafe_roles_are_reported() {
         let s = RoleStatus {
             name: "app".into(),
-            superuser_via: vec!["postgres".into()],
-            bypass_rls_via: vec!["etl".into()],
-            owned_relations: 2,
-            owned_functions: 1,
-            owned_types: 1,
-            owned_schemas: 1,
-            unprotected_relations: vec!["t_x.later".into()],
-            foreign_policies: vec!["t_x.notes:open".into()],
+            session_user: "app".into(),
+            expected: "tenant_acme0001_rw".into(),
+            superuser: true,
+            bypass_rls: true,
+            inherit: true,
+            memberships: vec!["member of app_rw".into()],
+            owned_objects: 2,
+            foreign_access: vec!["schema t_other001".into()],
+            unprotected_relations: vec!["t_acme0001.later".into()],
+            foreign_policies: vec!["t_acme0001.notes:open".into()],
+            replay_privileges: vec!["t_acme0001.vibe_challenge_replay grants UPDATE to x".into()],
         };
         let p = s.problems();
-        assert_eq!(p.len(), 8, "{p:?}");
-        assert!(p[6].contains("t_x.later"));
-        assert!(p[7].contains("t_x.notes:open") && p[7].contains("OR-combined"));
-        assert!(p[0].contains("postgres"));
-        assert!(p[1].contains("etl"));
+        assert_eq!(p.len(), 10, "{p:?}");
+        assert!(p[9].contains("grants UPDATE"));
+        assert!(p[0].contains("tenant_acme0001_rw"));
+        assert!(p[4].contains("member of app_rw") && p[4].contains("SET ROLE"));
+        assert!(p[6].contains("t_other001"));
+        assert!(p[7].contains("t_acme0001.later"));
+        assert!(p[8].contains("t_acme0001.notes:open"));
     }
 
     fn select() -> Stmt {
@@ -1944,6 +2213,40 @@ mod tls_tests {
 }
 
 #[cfg(test)]
+mod version_tests {
+    use super::check_server_version;
+
+    #[test]
+    fn postgres_below_16_is_refused() {
+        for v in ["150000", "150013", "140011", "90624", "159999"] {
+            let err = check_server_version(v).unwrap_err();
+            assert!(
+                err.contains("PostgreSQL 16 or later required"),
+                "{v}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_16_and_later_are_accepted() {
+        for v in ["160000", "160004", "170002", "180000"] {
+            check_server_version(v).unwrap();
+        }
+    }
+
+    #[test]
+    fn unreadable_version_is_refused() {
+        for v in ["", "16.4", "abc"] {
+            let err = check_server_version(v).unwrap_err();
+            assert!(
+                err.contains("PostgreSQL 16 or later required"),
+                "{v}: {err}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod reservation_tests {
     use super::*;
 
@@ -1962,7 +2265,7 @@ mod reservation_tests {
 
     #[tokio::test]
     async fn memory_expired_reservation_prevents_original_finalization() {
-        let exec = MemoryExec::new();
+        let exec = PlainMemoryExec::new();
         let tenant = "tenant0001";
         let policy = RefreshPolicy::default();
         exec.refresh_issue(tenant, "user", "parent", policy)
@@ -2016,7 +2319,7 @@ mod reservation_tests {
             .is_some());
     }
     async fn check_expired_memory_reservation(finalize: bool) {
-        let exec = MemoryExec::new();
+        let exec = PlainMemoryExec::new();
         let tenant = "tenant0001";
         let policy = RefreshPolicy::default();
         exec.refresh_issue(tenant, "user", "parent", policy)

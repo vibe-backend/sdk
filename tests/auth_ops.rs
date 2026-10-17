@@ -804,6 +804,29 @@ async fn pg_app() -> Option<(axum::Router, tokio_postgres::Client, String, Strin
         return None;
     };
     let _setup = PG_SETUP.lock().await;
+    // A database of its own: these schemas use the shared-role layout, and
+    // tests/postgres.rs fails closed on any non-canonical tenant policy in
+    // its database (D129).
+    let admin_url = {
+        let (root, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let exists = root
+            .query_opt(
+                "SELECT 1 FROM pg_database WHERE datname = 'vibe_auth_ops'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .is_some();
+        if !exists {
+            let _ = root.batch_execute("CREATE DATABASE vibe_auth_ops").await;
+        }
+        let mut url = url::Url::parse(&admin_url).unwrap();
+        url.set_path("/vibe_auth_ops");
+        url.to_string()
+    };
     let (admin, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
         .await
         .unwrap();

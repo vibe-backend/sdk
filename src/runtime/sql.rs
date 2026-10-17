@@ -114,6 +114,12 @@ fn render_insert(
         .map(|col| Ok(format!("{}::text", quote(&col.name)?)))
         .collect::<Result<Vec<_>, String>>()?
         .join(", ");
+    // An empty list (no readable column) still needs one expression.
+    let ret = if ret.is_empty() {
+        "NULL".to_string()
+    } else {
+        ret
+    };
     let sql = format!(
         "INSERT INTO {table} ({}) VALUES ({}) RETURNING {ret}",
         cols.join(", "),
@@ -143,6 +149,12 @@ fn render_select(
         })
         .collect::<Result<Vec<_>, String>>()?
         .join(", ");
+    // An empty list (no readable column) still needs one expression.
+    let cols = if cols.is_empty() {
+        "NULL".to_string()
+    } else {
+        cols
+    };
     let mut params = Vec::new();
     let mut where_sql = vec!["\"deleted_at\" IS NULL".to_string()];
     if let Some(id) = id {
@@ -239,6 +251,12 @@ fn render_update(
         .map(|col| Ok(format!("{}::text", quote(&col.name)?)))
         .collect::<Result<Vec<_>, String>>()?
         .join(", ");
+    // An empty list (no readable column) still needs one expression.
+    let ret = if ret.is_empty() {
+        "NULL".to_string()
+    } else {
+        ret
+    };
     let sql = format!(
         "UPDATE {table} SET {} WHERE \"id\" = ${id_n}::text::uuid AND \"updated_at\" = ${ts_n}::text::timestamptz AND \"deleted_at\" IS NULL{owner_sql} RETURNING {ret}",
         assigns.join(", ")
@@ -280,66 +298,97 @@ fn json_text(value: &Value) -> Option<String> {
     }
 }
 
-/// Grants for the runtime (non-owner) role: schema usage plus SELECT, INSERT
-/// and UPDATE on the table. Never DELETE or TRUNCATE (spec §7.1).
-pub fn runtime_grant_statements(
-    schema: &str,
-    table: &str,
-    role: &str,
-) -> Result<Vec<String>, String> {
-    let schema = quote(schema)?;
-    let qualified = format!("{schema}.{}", quote(table)?);
-    let role = quote(role)?;
+/// Schema-level statements for one tenant (decision 97): nobody but the
+/// owner may CREATE in `t_<tenant>`, PUBLIC gets nothing, and only that
+/// tenant's own roles ([`super::grants::tenant_roles`]) get USAGE. Table
+/// grants come from [`super::grants::pg_grant_statements`]; there is no
+/// `ALTER DEFAULT PRIVILEGES` (tables a migration creates get no grants).
+pub fn tenant_schema_statements(tenant: &str) -> Result<Vec<String>, String> {
+    let schema = quote(&format!("t_{tenant}"))?;
+    let mut out = vec![format!("REVOKE ALL ON SCHEMA {schema} FROM PUBLIC")];
+    for role in super::grants::tenant_roles(tenant)? {
+        let role = quote(&role)?;
+        out.push(format!("REVOKE CREATE ON SCHEMA {schema} FROM {role}"));
+        out.push(format!("GRANT USAGE ON SCHEMA {schema} TO {role}"));
+    }
+    Ok(out)
+}
+
+/// ENABLE + FORCE row level security and the tenant policy for one table of
+/// `t_<tenant>`.
+pub fn rls_statements(tenant: &str, table: &str) -> Result<Vec<String>, String> {
+    rls_statements_for(
+        tenant,
+        &format!("{}.{}", quote(&format!("t_{tenant}"))?, quote(table)?),
+    )
+}
+
+/// The `## Policies` `policy:` line the compiler writes into every model
+/// lock, and the only policy `vibe migrate` installs (decision 97). `<id>`
+/// stands for the tenant id; [`render_policy`] substitutes it, and the
+/// `CREATE POLICY` statement is built from exactly that text, so the lock
+/// and the database say the same thing.
+pub const POLICY_TEMPLATE: &str = "tenant_isolation TO tenant_<id>_rw, tenant_<id>_public_reader, tenant_<id>_public_writer USING (tenant_id = '<id>') WITH CHECK (tenant_id = '<id>')";
+
+/// [`POLICY_TEMPLATE`] for one tenant. `tenant` is `^[a-z0-9_]{8,61}$`, so
+/// the literal needs no escaping, and every role name must fit 63 bytes.
+pub fn render_policy(tenant: &str) -> Result<String, String> {
+    if !super::slugs::valid_tenant(tenant) {
+        return Err(super::slugs::TENANT_ID_RULE.into());
+    }
+    super::grants::tenant_roles(tenant)?;
+    Ok(POLICY_TEMPLATE.replace("<id>", tenant))
+}
+
+/// What a rendered policy line says, for comparison with `pg_policies`.
+#[derive(Debug, PartialEq)]
+pub struct PolicyParts {
+    pub name: String,
+    pub roles: Vec<String>,
+    pub using: String,
+    pub with_check: String,
+}
+
+/// Splits a rendered `<name> TO <roles> USING (<expr>) WITH CHECK (<expr>)`.
+pub fn policy_parts(rendered: &str) -> Result<PolicyParts, String> {
+    let bad = || format!("unexpected policy line `{rendered}`");
+    let (name, rest) = rendered.split_once(" TO ").ok_or_else(bad)?;
+    let (roles, rest) = rest.split_once(" USING (").ok_or_else(bad)?;
+    let (using, rest) = rest.split_once(") WITH CHECK (").ok_or_else(bad)?;
+    let with_check = rest.strip_suffix(')').ok_or_else(bad)?;
+    let mut roles: Vec<String> = roles.split(", ").map(str::to_string).collect();
+    roles.sort();
+    Ok(PolicyParts {
+        name: name.to_string(),
+        roles,
+        using: using.to_string(),
+        with_check: with_check.to_string(),
+    })
+}
+
+/// The policy applies only to the tenant's own roles and compares with the
+/// tenant id as a constant (decision 97): `app.tenant_id` never takes part in
+/// an access decision. Built from [`render_policy`].
+fn rls_statements_for(tenant: &str, qualified: &str) -> Result<Vec<String>, String> {
+    let rendered = render_policy(tenant)?;
+    let (name, rest) = rendered
+        .split_once(' ')
+        .ok_or("unexpected policy template")?;
     Ok(vec![
-        format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
-        format!("REVOKE ALL ON {qualified} FROM {role}"),
-        format!("GRANT SELECT, INSERT, UPDATE ON {qualified} TO {role}"),
-    ])
-}
-
-/// Schema-level statements for the runtime role: no CREATE on the tenant
-/// schema (for anyone but the owner), and default privileges so tables that
-/// migrations create later get the same SELECT/INSERT/UPDATE grant.
-pub fn runtime_schema_statements(schema: &str, role: &str) -> Result<Vec<String>, String> {
-    let schema = quote(schema)?;
-    let role = quote(role)?;
-    Ok(vec![
-        format!("REVOKE CREATE ON SCHEMA {schema} FROM PUBLIC"),
-        format!("REVOKE CREATE ON SCHEMA {schema} FROM {role}"),
-        format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
-        format!(
-            "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT, INSERT, UPDATE ON TABLES TO {role}"
-        ),
-    ])
-}
-
-/// ENABLE + FORCE row level security and the tenant policy for one table.
-pub fn rls_statements(schema: &str, table: &str) -> Result<Vec<String>, String> {
-    Ok(rls_statements_for(&format!(
-        "{}.{}",
-        quote(schema)?,
-        quote(table)?
-    )))
-}
-
-fn rls_statements_for(qualified: &str) -> Vec<String> {
-    vec![
         format!("ALTER TABLE {qualified} ENABLE ROW LEVEL SECURITY"),
         format!("ALTER TABLE {qualified} FORCE ROW LEVEL SECURITY"),
-        format!("DROP POLICY IF EXISTS tenant_isolation ON {qualified}"),
-        format!(
-            "CREATE POLICY tenant_isolation ON {qualified} USING (\"tenant_id\" = current_setting('app.tenant_id', false)) WITH CHECK (\"tenant_id\" = current_setting('app.tenant_id', false))"
-        ),
-    ]
+        format!("DROP POLICY IF EXISTS {name} ON {qualified}"),
+        format!("CREATE POLICY {name} ON {qualified} {rest}"),
+    ])
 }
 
 pub fn bootstrap_statements(
-    schema: &str,
+    tenant: &str,
     table: &str,
     fields: &[Col],
     uniques: &[String],
 ) -> Result<Vec<String>, String> {
-    let schema = quote(schema)?;
+    let schema = quote(&format!("t_{tenant}"))?;
     let table_name = quote(table)?;
     let qualified = format!("{schema}.{table_name}");
     let mut columns = Vec::new();
@@ -372,7 +421,7 @@ pub fn bootstrap_statements(
             columns.join(", ")
         ),
     ];
-    out.extend(rls_statements_for(&qualified));
+    out.extend(rls_statements_for(tenant, &qualified)?);
     for unique in uniques {
         let index = quote(&format!("{table}_{unique}_active"))?;
         out.push(format!(
@@ -389,15 +438,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_grants_never_include_delete() {
-        let stmts = runtime_grant_statements("t_acme0001", "products", "vibe_app").unwrap();
-        assert!(stmts
-            .iter()
-            .any(|s| s.contains("GRANT SELECT, INSERT, UPDATE")));
-        assert!(stmts
-            .iter()
-            .all(|s| !s.contains("DELETE") && !s.contains("TRUNCATE")));
-        assert!(runtime_grant_statements("t_x", "products", "bad\"role").is_err());
+    fn tenant_schema_grants_only_the_tenants_own_roles() {
+        let stmts = tenant_schema_statements("acme0001").unwrap().join("\n");
+        assert!(stmts.contains("REVOKE ALL ON SCHEMA \"t_acme0001\" FROM PUBLIC"));
+        for role in ["rw", "public_reader", "public_writer"] {
+            assert!(stmts.contains(&format!(
+                "GRANT USAGE ON SCHEMA \"t_acme0001\" TO \"tenant_acme0001_{role}\""
+            )));
+        }
+        assert!(!stmts.contains("app_rw") && !stmts.contains("DEFAULT PRIVILEGES"));
+        assert!(!stmts.contains("DELETE") && !stmts.contains("TRUNCATE"));
+        assert!(tenant_schema_statements("bad\"x").is_err());
+    }
+
+    #[test]
+    fn policy_names_the_tenant_roles_and_a_constant() {
+        let sql = rls_statements("acme0001", "notes").unwrap().join("\n");
+        assert!(sql.contains(
+            "TO tenant_acme0001_rw, tenant_acme0001_public_reader, tenant_acme0001_public_writer"
+        ));
+        assert!(sql.contains("USING (tenant_id = 'acme0001') WITH CHECK (tenant_id = 'acme0001')"));
+        let parts = policy_parts(&render_policy("acme0001").unwrap()).unwrap();
+        assert_eq!(parts.name, "tenant_isolation");
+        assert_eq!(parts.roles.len(), 3);
+        assert_eq!(parts.using, "tenant_id = 'acme0001'");
+        assert!(
+            render_policy(&"a".repeat(43)).is_err(),
+            "role names over 63 bytes are refused"
+        );
+        assert!(!sql.contains("current_setting"));
+        assert!(rls_statements("x'; --", "notes").is_err());
     }
     use serde_json::json;
 
@@ -457,7 +527,7 @@ mod tests {
     #[test]
     fn bootstrap_enables_rls_and_skips_delete_grants() {
         let sql = bootstrap_statements(
-            "t_tenant0001",
+            "tenant0001",
             "products",
             &[
                 Col {
@@ -476,7 +546,8 @@ mod tests {
         .to_ascii_lowercase();
         assert!(sql.contains("enable row level security"));
         assert!(sql.contains("force row level security"));
-        assert!(sql.contains("current_setting('app.tenant_id', false)"));
+        assert!(sql.contains("tenant_id = 'tenant0001'"));
+        assert!(!sql.contains("current_setting"));
         assert!(!sql.contains("grant delete"));
     }
 }

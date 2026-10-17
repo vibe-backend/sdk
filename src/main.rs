@@ -83,6 +83,13 @@ enum Command {
         #[arg(long)]
         tenant: String,
     },
+    /// Periodic owner check (D129): set NOLOGIN and alert on any tenant owner
+    /// role that can log in outside a `vibe migrate` window.
+    CheckOwners {
+        /// Seconds between checks; 0 checks once and exits non-zero on a finding.
+        #[arg(long, default_value_t = 0)]
+        interval: u64,
+    },
     /// Register a public slug for a tenant.
     Slug {
         #[command(subcommand)]
@@ -170,6 +177,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             project,
             tenant,
         } => cmd_migrate(&manifest, &project, &tenant).await,
+        Command::CheckOwners { interval } => cmd_check_owners(interval).await,
         Command::Slug { action } => match action {
             SlugAction::Add {
                 slug,
@@ -425,33 +433,38 @@ async fn cmd_serve(
     }
     // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
     auth.add_route_jwks(&manifest.routes)?;
-    let mut pg_pool = None;
+    let mut pg_pools = None;
     let exec: Arc<dyn QueryExec> = if memory {
-        Arc::new(vibe::runtime::MemoryExec::new())
+        Arc::new(vibe::runtime::MemoryExec::from_manifest(&manifest)?)
     } else {
-        let url = std::env::var("VIBE_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .map_err(|_| {
-                "set VIBE_DATABASE_URL or pass --memory for the dev executor".to_string()
-            })?;
-        let pg = PgExec::connect_with(&url, vibe::runtime::PgOptions::from_env()?).await?;
-        pg.check_runtime_role().await?;
-        pg_pool = Some(pg.pool());
-        Arc::new(pg)
+        // One pool per (tenant, role class), logged in as the tenant role
+        // itself (decision 97); every configured role is checked now.
+        let production = run_env == vibe::runtime::RunEnv::Production;
+        let pools = vibe::runtime::TenantPools::from_env(production, project)?;
+        let checked = pools.check_all(&manifest.models).await?;
+        println!(
+            "checked {checked} tenant database role(s) and their policies (credentials: {}; connection cap {})",
+            pools.describe_secrets(),
+            pools.max_connections()
+        );
+        let pools = Arc::new(pools);
+        // D129 (4): a tenant's pools close after 5 minutes unused.
+        vibe::runtime::TenantPools::spawn_idle_closer(&pools);
+        pg_pools = Some(pools.clone());
+        pools
     };
     let loaded = vibe::runtime::load_project_slugs(project, memory)?;
-    if let (Some(pool), true) = (
-        &pg_pool,
-        manifest.routes.iter().any(|r| r.refresh.is_some()),
-    ) {
-        let mut tenants: Vec<String> = loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
-        tenants.sort();
-        tenants.dedup();
-        let client = pool
-            .get()
-            .await
-            .map_err(|err| format!("refresh token store check: {err}"))?;
-        vibe::runtime::refresh::check_store(&client, &tenants).await?;
+    if let Some(pools) = &pg_pools {
+        if manifest.routes.iter().any(|r| r.refresh.is_some()) {
+            let mut tenants: Vec<_> = loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
+            tenants.sort();
+            tenants.dedup();
+            for tenant in tenants {
+                let pool = pools.pool(&tenant, "app_rw").await?;
+                let client = pool.pool().get().await.map_err(|err| err.to_string())?;
+                vibe::runtime::refresh::check_store(&client, &[tenant]).await?;
+            }
+        }
     }
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
@@ -471,11 +484,12 @@ async fn cmd_serve(
     // #157: build the per-tenant store chosen at startup; a missing or unusable
     // table refuses to start.
     let replay_store: Option<Arc<dyn vibe::runtime::replay::ReplayStore>> =
-        match (replay_choice, pg_pool) {
-            (Some(vibe::runtime::replay::StoreKind::Postgres), Some(pool)) => {
+        match (replay_choice, pg_pools) {
+            (Some(vibe::runtime::replay::StoreKind::Postgres), Some(pools)) => {
                 // Per-tenant tables; the IP digest is keyed per tenant from
                 // the API-key pepper.
-                let store = vibe::runtime::replay::PgReplayStore::new(pool, &auth.pepper);
+                let store =
+                    vibe::runtime::replay::PgReplayStore::for_tenant_pools(pools, &auth.pepper);
                 let mut tenants: Vec<String> =
                     loaded.slugs.values().map(|s| s.tenant_id.clone()).collect();
                 tenants.sort();
@@ -539,44 +553,43 @@ async fn cmd_serve(
 }
 
 async fn cmd_migrate(manifest_path: &Path, project: &Path, tenant: &str) -> Result<(), String> {
-    if !tenant
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        || !(8..=32).contains(&tenant.len())
-    {
-        return Err("tenant id must match ^[a-z0-9]{8,32}$".into());
+    if !vibe::runtime::valid_tenant(tenant) {
+        return Err(vibe::runtime::TENANT_ID_RULE.into());
     }
     let key = sign::load_public(project).map_err(|err| err.to_string())?;
     let manifest = read_manifest(manifest_path, &key).map_err(|err| err.to_string())?;
-    // Migrations need the table-owner role; serving must not use it.
-    let url = std::env::var("VIBE_MIGRATE_DATABASE_URL").map_err(|_| {
-        "VIBE_MIGRATE_DATABASE_URL is required (the owner role used for DDL; `vibe serve` uses a separate non-owner VIBE_DATABASE_URL)".to_string()
-    })?;
-    let runtime_role = std::env::var("VIBE_RUNTIME_DB_ROLE").map_err(|_| {
-        "VIBE_RUNTIME_DB_ROLE is required (the non-owner role `vibe serve` connects as; it is granted SELECT, INSERT, UPDATE)".to_string()
-    })?;
-    let exec = PgExec::connect(&url).await?;
-    for line in vibe::runtime::migrate_tenant(&exec, &manifest, tenant, &runtime_role).await? {
+    // The owner role is NOLOGIN outside migrate; the platform-admin login
+    // opens a one-time owner login window and always closes it (D129).
+    let url = admin_url_from_env()?;
+    for line in vibe::runtime::migrate_with_owner_window(&url, &manifest, tenant).await? {
         println!("{line}");
     }
-    // Last: the revoke is table-level (on `_platform_refresh_tokens` only).
-    // `GRANT ... ON ALL TABLES IN SCHEMA` in a migration expands to per-table
-    // grants when it runs, so revoking afterwards removes those as well.
-    exec.check_role_separation_for(Some(&runtime_role)).await?;
-    if manifest.routes.iter().any(|r| r.refresh.is_some()) {
-        let schema = format!("t_{tenant}");
-        exec.batch(&vibe::runtime::refresh::table_statements(&schema)?)
-            .await?;
-        exec.batch(&vibe::runtime::refresh::runtime_grant_statements(
-            &schema,
-            &runtime_role,
-        )?)
-        .await?;
-        exec.batch(&vibe::runtime::refresh::cleanup_statements(&schema)?)
-            .await?;
-        println!("bootstrapped {schema}._platform_refresh_tokens (finished families cleaned up)");
-    }
     Ok(())
+}
+
+fn admin_url_from_env() -> Result<String, String> {
+    std::env::var("VIBE_MIGRATE_ADMIN_DATABASE_URL").map_err(|_| {
+        "VIBE_MIGRATE_ADMIN_DATABASE_URL is required (a platform-admin login that may ALTER ROLE tenant_<id>_owner; the owner role is NOLOGIN outside migrate, and `vibe serve` never uses either)".to_string()
+    })
+}
+
+async fn cmd_check_owners(interval: u64) -> Result<(), String> {
+    let exec = PgExec::connect(&admin_url_from_env()?).await?;
+    loop {
+        let found = vibe::runtime::check_owner_logins(&exec).await?;
+        for owner in &found {
+            eprintln!("ALERT: owner role {owner} could log in outside vibe migrate; set NOLOGIN");
+        }
+        if interval == 0 {
+            return if found.is_empty() {
+                println!("no tenant owner role can log in");
+                Ok(())
+            } else {
+                Err(format!("{} owner role(s) could log in", found.len()))
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+    }
 }
 
 fn auth_from_env(run_env: vibe::runtime::RunEnv) -> Result<AuthConfig, String> {
