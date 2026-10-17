@@ -198,7 +198,7 @@ mod tests {
 
 /// Apply the convenience slug only for the development memory executor.
 pub fn apply_dev_default(slugs: &mut HashMap<String, Slug>, memory: bool, dev: bool) -> bool {
-    if !memory || !dev || !slugs.is_empty() {
+    if !memory || !dev || slugs.contains_key("dev") {
         return false;
     }
     slugs.insert(
@@ -279,16 +279,26 @@ impl DevSlugs {
 mod dev_tests {
     use super::*;
     #[test]
-    fn default_requires_memory_and_development_and_empty_map() {
+    fn default_requires_memory_and_development_and_preserves_explicit_dev() {
         for (memory, dev) in [(false, false), (false, true), (true, false)] {
             let mut slugs = HashMap::new();
             assert!(!apply_dev_default(&mut slugs, memory, dev));
             assert!(slugs.is_empty());
         }
         let mut slugs = HashMap::new();
+        slugs.insert(
+            "other".into(),
+            Slug {
+                tenant_id: "other".into(),
+                public_access: true,
+                public_write: false,
+            },
+        );
         assert!(apply_dev_default(&mut slugs, true, true));
         assert!(valid_tenant(&slugs["dev"].tenant_id));
         assert!(!slugs["dev"].public_write);
+        slugs.get_mut("dev").unwrap().tenant_id = "explicit".into();
         assert!(!apply_dev_default(&mut slugs, true, true));
+        assert_eq!(slugs["dev"].tenant_id, "explicit");
     }
 }

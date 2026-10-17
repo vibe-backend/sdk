@@ -655,23 +655,16 @@ async fn owner_key_id_is_rejected_outside_users() {
         text.replace("- owner-key: user_id", "- owner-key: id"),
     )
     .unwrap();
-    compile_project(&CompileOptions {
+    let report = compile_project(&CompileOptions {
         root: &root,
         llm: None,
         llm_config: None,
         check: false,
     })
     .await
-    .unwrap_or_else(|err| panic!("{err}"));
-    let report = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
-        dev: false,
-        root: &root,
-        deploy: false,
-    });
-    let rendered = match report {
-        Ok(report) => report.to_string(),
-        Err(report) => report.to_string(),
-    };
+    .err()
+    .expect("compile must reject an invalid owner key");
+    let rendered = report.to_string();
     assert!(
         rendered.contains("owner-key: id is only allowed on the users table"),
         "{rendered}"
@@ -1868,6 +1861,10 @@ async fn memory_dev_default_and_live_slug_reload() {
     vibe::runtime::add_slug(&root, "newslug", "tenant0001", false).unwrap();
     assert_eq!(
         app.clone().oneshot(get("newslug")).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone().oneshot(get("dev")).await.unwrap().status(),
         StatusCode::OK
     );
     fs::write(root.join(".vibe/slugs.json"), "broken").unwrap();

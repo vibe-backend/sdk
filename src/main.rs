@@ -574,7 +574,7 @@ async fn cmd_serve(
     let mut loaded = vibe::runtime::load_project_slugs(project, memory)?;
     let reload_slugs = memory && run_env.is_dev();
     if vibe::runtime::apply_dev_default(&mut loaded.slugs, memory, run_env.is_dev()) {
-        eprintln!("dev: no slugs configured; using slug `dev` (tenant devtenant) for public routes, e.g. /<def>/<ver>/dev/...");
+        eprintln!("dev: slug `dev` (tenant devtenant) is available for public routes, e.g. /<def>/<ver>/dev/...");
     }
     if let (Some(pool), true) = (
         &pg_pool,

@@ -1114,6 +1114,36 @@ pub fn check_when(expr: &str) -> Result<(), String> {
     parse_when(expr).map(|_| ())
 }
 
+/// Variable roots from the runtime parser (object keys and literals excluded).
+pub fn expression_roots(
+    input: &str,
+    when: bool,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut roots = std::collections::BTreeSet::new();
+    if when {
+        let (When::Empty(path, _) | When::Eq(path, _, _)) = parse_when(input)?;
+        roots.insert(path.split('.').next().unwrap().to_string());
+    } else {
+        fn visit(expr: &Expr, roots: &mut std::collections::BTreeSet<String>) {
+            match expr {
+                Expr::Path(path) => {
+                    roots.insert(path.split('.').next().unwrap().to_string());
+                }
+                Expr::Object(fields) => {
+                    for (_, value) in fields {
+                        visit(value, roots);
+                    }
+                }
+                Expr::Literal(_) => {}
+            }
+        }
+        check_expr(input)?;
+        let (expr, _) = parse_expr(input.trim())?;
+        visit(&expr, &mut roots);
+    }
+    Ok(roots)
+}
+
 /// Checks that an expression parses the way the runtime will parse it.
 pub fn check_expr(input: &str) -> Result<(), String> {
     let (_, rest) = parse_expr(input.trim())?;
