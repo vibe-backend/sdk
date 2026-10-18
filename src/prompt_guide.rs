@@ -63,7 +63,7 @@ API FEATURE KEYS:
 - ## Steps ops: method (target, args, out), validate (when, fail), respond (value, status). There is no transform step; request/response mapping goes in ## Transform.
 - A source creating/updating/deleting a model record MUST include ### s1 with op: method, target: <model>.create|update|delete (model object name), args: transform.in, out: result, followed by a respond step. Never emit Steps (none) for these features.
 - A feature that lists or reads records of a model MUST include `- op: method`, `- target: <model>.list` (or get), `- args: transform.in` (Transform in `{}` when there is no input) or explicit args, `- out: result`, then respond with `value: transform.out`. Never emit Steps (none) for model reads.
-- Errors codes and from must be platform runtime codes or errors declared by called method Signature errors or own validate fail codes. Use (none) when there are no custom mappings.
+- Errors codes and from must be platform runtime codes or errors declared by called method Signature errors or own validate fail codes. For a called method, ## Errors code/from must come from its listed errors=[...] (or model crud-errors=[...]), runtime public codes, or local validation failures (decision 171). Use (none) when there are no custom mappings.
 - ## Errors table header exactly `| status | code | from |`.
 ";
 

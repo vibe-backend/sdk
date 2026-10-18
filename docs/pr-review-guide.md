@@ -102,3 +102,5 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
 ## 8. 細團隊
 
 - 只有一個 maintainer 嘅 project：最少保留 CODEOWNERS、required status checks 同 `release` environment；高風險 PR 可以設定 merge 前等 24 小時，或者請外部 reviewer。
+
+After an rc is tagged, any compile-prompt change must bump to the next rc (decision 181), preserving decision 176 exact-match lock stamps. The CI prompt check skips pre-releases; this is a release rule.

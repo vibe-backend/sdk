@@ -386,6 +386,34 @@ async fn custom_writing_method_and_declared_errors_are_inherited() {
         deploy: false,
     })
     .unwrap_or_else(|e| panic!("{e}"));
+    // English natural compilation exposes the callee's contract and stays byte-identical.
+    source(&root, "---\nwrites: true\n---\n# Update stock\nCall inventory.bump-stock and map OUT_OF_STOCK to HTTP 409.\n");
+    let adapter = FakeAdapter {
+        responder: |request: &LlmRequest| {
+            assert!(request
+                .input
+                .contains("callable=inventory.bump-stock errors=[OUT_OF_STOCK]"));
+            Ok(body.clone())
+        },
+    };
+    let mut previous = None;
+    for _ in 0..2 {
+        let _ = fs::remove_dir_all(root.join(".vibe/cache"));
+        regenerate_project(&CompileOptions {
+            root: &root,
+            llm: Some(&adapter),
+            llm_config: Some(&config()),
+            check: false,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        let bytes =
+            fs::read(root.join("api/catalog/v1/example-create/example-create.lock.md")).unwrap();
+        if let Some(before) = previous {
+            assert_eq!(bytes, before);
+        }
+        previous = Some(bytes);
+    }
     source(&root, &format!("---\nwrites: false\n---\n{body}"));
     let err = regenerate_project(&CompileOptions {
         root: &root,

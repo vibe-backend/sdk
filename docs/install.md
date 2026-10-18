@@ -24,9 +24,9 @@ Checksum and pinned attestation verification are identical for both binaries.
 ## Usage
 
 ```sh
-./scripts/vibe-install.sh install --version v1.0.0-rc.2
-./scripts/vibe-install.sh install --version v1.0.0-rc.2 --runtime
-VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.2
+./scripts/vibe-install.sh install --version v1.0.0-rc.3
+./scripts/vibe-install.sh install --version v1.0.0-rc.3 --runtime
+VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.3
 ./scripts/vibe-install.sh upgrade --non-interactive
 ./scripts/vibe-install.sh remove --runtime
 ./scripts/vibe-install.sh remove
@@ -34,7 +34,7 @@ VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-r
 
 `install --version` and `upgrade --version` accept `vX.Y.Z` or `vX.Y.Z-rc.N`. Every number must be zero or a positive integer without leading zeros; other pre-release labels and build metadata are rejected.
 
-`upgrade` without `--version` requires a stable GitHub Release: pre-releases are not `latest`. Until GA, pass `--version v1.0.0-rc.2` explicitly. If no stable release exists, the script stops with guidance to use `--version`.
+`upgrade` without `--version` requires a stable GitHub Release: pre-releases are not `latest`. Until GA, pass `--version v1.0.0-rc.3` explicitly. If no stable release exists, the script stops with guidance to use `--version`.
 
 The default destination is `$HOME/.local/bin/vibe`; override it with `--install-dir /absolute/path`. If the directory is not on `PATH`, the script prints a hint and never edits shell profiles. Run `--help` for all options.
 

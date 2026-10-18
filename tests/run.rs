@@ -342,3 +342,43 @@ fn runtime_artifact_serves_hello() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn run_and_build_validation_reject_frontmatter_writes() {
+    for value in ["true", "false"] {
+        let root = project();
+        build(&root);
+        let path = root.join("api/hello/v1/hello/hello.lock.md");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            text.replacen("---\n", &format!("---\nwrites: {value}\n"), 1),
+        )
+        .unwrap();
+        let out = cli(&root).arg("build").output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr)
+            .contains("lock frontmatter must not contain `writes:`"));
+        let validation = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
+            root: &root,
+            deploy: false,
+            dev: true,
+        })
+        .unwrap_err();
+        assert!(validation
+            .to_string()
+            .contains("lock frontmatter must not contain `writes:`"));
+        let out = cli(&root)
+            .args(["run", "--allow-test-build"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("lock frontmatter must not contain `writes:`"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
