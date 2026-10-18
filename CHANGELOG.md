@@ -5,7 +5,13 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+## 1.0.0-rc.4
+
 - **Decision 183:** Memory query steps execute atomic counter UPDATE/upsert, unique-key SELECT and COALESCE(MAX) forms with tenant isolation and constraints. They use the same role-level checks as memory CRUD (`public_reader` is read-only; `public_writer` may INSERT/UPDATE); SQL mentioning `tenant_id` is rejected. Per-column grants are not modelled for memory query steps. Other SQL returns HTTP 500 `MEMORY_UNSUPPORTED_SQL`; build and memory startup warn only for unsupported steps.
+
+- Version 1.0.0-rc.4; locks are stamped `1.0.0-rc.4` (run `vibe build`).
+
+## 1.0.0-rc.3 and earlier
 
 - **Breaking (decision 181):** Lock frontmatter `writes:` is rejected; declare writes in source markdown (lock writes derive from method steps). Compile prompts list called methods’ declared error codes. Version is `1.0.0-rc.3`; locks are restamped: run `vibe build`. Prompt changes after a tagged rc require the next rc.
 

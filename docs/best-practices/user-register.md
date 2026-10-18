@@ -85,7 +85,7 @@ dependencies:
   - { id: email-outbox/methods/enqueue, kind: method, hash: sha256:81aa...c2 }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-vibe-version: 1.0.0-rc.3
+vibe-version: 1.0.0-rc.4
 status: approved
 approval-mode: manual
 approved-by: [jack@example, mei@example]
