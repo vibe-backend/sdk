@@ -1,3 +1,5 @@
+> 現行規則見 [v1.8 決定 180](spec-v1.8.md#014-v18-2026-10-17-決定決定-150180產品經理已批准-2026-10-17)：private endpoint 只記 `endpoint-private: true`，唔記 host 或衍生值；以下 endpoint-host／lock 記錄描述係歷史規格，已由決定 174、180 更新。
+
 # Markdown 驅動 Serverless Backend：架構 Spec v1.7（定稿）
 >
 > 核心架構：所有定義（model、method、api、pipeline、provider、migration）嘅 source `.md` 一律用自然語言寫。編譯流程係「自然語言 source `.md` → 結構化 lock markdown（`{name}.lock.md`）→ 簽名 manifest」。lock md 係 runtime 唯一依據，runtime 永遠唔會解譯自然語言。
