@@ -16,9 +16,9 @@ bare `vibe-runtime` means run, with artifact `.` by default. Both forms accept
 Install verified pre-release assets for either or both with the manager:
 
 ```sh
-./scripts/vibe-install.sh install --version v1.0.0-rc.3
-./scripts/vibe-install.sh install --version v1.0.0-rc.3 --runtime
-VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.3
+./scripts/vibe-install.sh install --version v1.0.0-rc.2
+./scripts/vibe-install.sh install --version v1.0.0-rc.2 --runtime
+VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.2
 ```
 
 The default installs `vibe`; `--runtime` installs `vibe-runtime`. They coexist.
@@ -101,6 +101,7 @@ Run the project with `vibe run`, then curl the API. Use `--artifact` to run a bu
 Locks record `vibe-version: 1.0.0-rc.3`: stable versions use major.minor and
 pre-releases use the full version, with an exact match required. Run
 `vibe build` to regenerate locks from another version or the old lock format.
+Locks built by an rc.2 binary are stamped `1.0.0-rc.2` and must be rebuilt with the matching binary using `vibe build`.
 
 ## Status
 

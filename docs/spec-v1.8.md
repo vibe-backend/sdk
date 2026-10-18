@@ -817,7 +817,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2，用 SHA pin
       - name: Install vibe（pin 版本同 SHA256）
         run: |
-          curl -fsSL -o vibe.tar.gz https://github.com/vibe-backend/sdk/releases/download/v1.0.0-rc.3/vibe-sdk-x86_64-unknown-linux-gnu.tar.gz
+          curl -fsSL -o vibe.tar.gz https://github.com/vibe-backend/sdk/releases/download/v1.0.0-rc.2/vibe-sdk-x86_64-unknown-linux-gnu.tar.gz
           echo "<SHA256SUMS 入面嘅值>  vibe.tar.gz" | sha256sum --check
           tar -xzf vibe.tar.gz && install -m 755 vibe "$HOME/.local/bin/vibe"
       - name: Secret scan
@@ -2584,6 +2584,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 決定 179：檢查一律經 `vibe build`，包括每次 secret scan（有發現即失敗）、slug 同停用檔格式；破壞性 migration 喺 build 只警告，喺 PostgreSQL run 啟動時預設拒絕，改過已套用 SQL 亦拒絕（2C.3e）。
 
 決定 181：目前版本 `1.0.0-rc.3` 嘅 lock 戳記係 `1.0.0-rc.3`；兩個 binary 都跟決定 176 完全一致規則。
+由 rc.2 binary 建立嘅 lock 戳記係 `1.0.0-rc.2`，必須用版本相符嘅 binary 執行 `vibe build` 重建。
 
 - 過時：`source-hash` 同而家 source 正規化 hash 唔一致；或者任何 `dependencies` hash 唔一致。Release 入面 lock hash 同 dependency hash 喺同一個 release build 入面計同驗，唔用之前 build 或者磁碟上嘅值。
 - 缺失：有 source 冇 lock，或者有 lock 冇 source（孤兒 lock）。
