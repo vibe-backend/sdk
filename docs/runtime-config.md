@@ -120,3 +120,5 @@ When upgrading from the removed `vibe migrate`, a failed migration for a tenant
 with an existing schema but no records prints the exact INSERT to record it.
 Verify that its SQL was already applied before executing that INSERT as owner,
 then restart. Never record SQL that has not actually been applied.
+
+Memory query steps support unique-key SELECT, `COALESCE(MAX(integer), default)`, integer increment or plain-assignment UPDATE with RETURNING, and single-row INSERT with a unique-key ON CONFLICT DO UPDATE (integer addition) or DO NOTHING. Each statement runs atomically under the store lock with tenant injection, role checks and unique/NOT NULL constraints; integer overflow fails without changes. SQL mentioning `tenant_id` is rejected. Other SQL returns HTTP 500 `MEMORY_UNSUPPORTED_SQL`: use `--db postgres` for those methods. Build and memory startup warn on stderr for unsupported query steps.

@@ -11,3 +11,8 @@ target/
 
 # vibe build output (spec v1.8 decision 117): locks are generated at build time and never committed
 *.lock.md
+
+# Structured counter fixture includes its development slug configuration.
+!tests/fixtures/counter/.vibe/
+tests/fixtures/counter/.vibe/*
+!tests/fixtures/counter/.vibe/slugs.json

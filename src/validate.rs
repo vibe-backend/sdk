@@ -1815,17 +1815,18 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
     if FORBIDDEN_SQL.is_match(&cleaned) {
         problems.push("DELETE, TRUNCATE, GRANT, and REVOKE are forbidden".into());
     }
-    static WHERE_WORD: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?is)\bwhere\b").expect("regex"));
     static SELECT_INTO: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)\bselect\b[^;]*\binto\b").expect("regex"));
     if !migration && (DDL_SQL.is_match(&cleaned) || SELECT_INTO.is_match(&cleaned)) {
         problems.push("DDL is only allowed in migration locks".into());
     }
-    if crate::security::sql_writes(trimmed)
-        && lower.contains("update")
-        && !WHERE_WORD.is_match(&lower)
-    {
+    if matches!(
+        crate::sqlguard::parse_one(trimmed),
+        Ok(sqlparser::ast::Statement::Update {
+            selection: None,
+            ..
+        })
+    ) {
         problems.push("UPDATE needs a WHERE clause".into());
     }
     if !migration {

@@ -2181,7 +2181,7 @@ fn platform_status(code: &str) -> StatusCode {
         "PAYLOAD_TOO_LARGE" => StatusCode::PAYLOAD_TOO_LARGE,
         "RATE_LIMITED" => StatusCode::TOO_MANY_REQUESTS,
         "UNSUPPORTED_MEDIA_TYPE" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        "INTERNAL" => StatusCode::INTERNAL_SERVER_ERROR,
+        "INTERNAL" | "MEMORY_UNSUPPORTED_SQL" => StatusCode::INTERNAL_SERVER_ERROR,
         "TX_TIMEOUT" => StatusCode::GATEWAY_TIMEOUT,
         "TX_CONFLICT" => StatusCode::SERVICE_UNAVAILABLE,
         "SERVICE_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
@@ -3341,7 +3341,12 @@ mod runtime_error_code_tests {
             assert!(sources
                 .iter()
                 .any(|text| text.contains(&format!("\"{code}\""))));
-            if *code != "INTERNAL" {
+            if matches!(*code, "INTERNAL" | "MEMORY_UNSUPPORTED_SQL") {
+                assert_eq!(
+                    super::platform_status(code),
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                );
+            } else {
                 assert_ne!(
                     super::platform_status(code),
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,

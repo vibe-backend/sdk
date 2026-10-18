@@ -5,6 +5,7 @@ mod exec;
 mod http;
 pub mod jwks;
 mod limiter;
+pub mod memsql;
 pub mod migrate;
 mod ops;
 pub mod refresh;
@@ -71,6 +72,7 @@ pub const RUNTIME_ERROR_CODES: &[&str] = &[
     "FORBIDDEN",
     "INTERNAL",
     "INVALID_REFRESH_TOKEN",
+    "MEMORY_UNSUPPORTED_SQL",
     "METHOD_NOT_ALLOWED",
     "NOT_FOUND",
     "PAYLOAD_TOO_LARGE",

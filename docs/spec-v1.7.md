@@ -1,4 +1,4 @@
-> 現行規則見 [v1.8 決定 180](spec-v1.8.md#014-v18-2026-10-17-決定決定-150181產品經理已批准-2026-10-17)：private endpoint 只記 `endpoint-private: true`，唔記 host 或衍生值；以下 endpoint-host／lock 記錄描述係歷史規格，已由決定 174、180 更新。
+> 現行規則見 [v1.8 決定 180](spec-v1.8.md#014-v18-2026-10-17-決定決定-150183產品經理已批准-2026-10-17)：private endpoint 只記 `endpoint-private: true`，唔記 host 或衍生值；以下 endpoint-host／lock 記錄描述係歷史規格，已由決定 174、180 更新。
 
 # Markdown 驅動 Serverless Backend：架構 Spec v1.7（定稿）
 >

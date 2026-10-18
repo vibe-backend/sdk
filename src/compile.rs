@@ -638,6 +638,19 @@ fn write_or_check(
             ));
         }
     }
+    if !report.has_errors() {
+        if let Ok(manifest) = crate::manifest::build_manifest(docs) {
+            for method in &manifest.methods {
+                for step in method.steps.iter().filter(|s| s.op == "query") {
+                    if let Err(reason) = crate::runtime::memsql::classify(&step.sql)
+                        .and_then(|plan| plan.check_models(&manifest.models))
+                    {
+                        eprintln!("warning: {} step {} will fail on --db memory with MEMORY_UNSUPPORTED_SQL; fine on PostgreSQL: {reason}", method.target, step.id);
+                    }
+                }
+            }
+        }
+    }
     let report = std::mem::take(report);
     if report.has_errors() {
         return Err(report);

@@ -35,8 +35,7 @@ pub trait QueryExec: Send + Sync {
 
     /// Runs a lock `query` step: validated, parameterised SQL in the tenant
     /// schema under row level security. Params are sent as text and parsed
-    /// by PostgreSQL for whatever type the statement needs. Only PostgreSQL
-    /// implements this.
+    /// by PostgreSQL for whatever type the statement needs. Memory supports a small allowlist.
     ///
     /// `role` is `public_reader` or `public_writer` (spec §12.8): the statement
     /// runs under `SET LOCAL ROLE`, and in a READ ONLY transaction unless
@@ -50,7 +49,7 @@ pub trait QueryExec: Send + Sync {
         _params: Vec<Option<String>>,
     ) -> Result<Vec<Row>, ExecError> {
         Err(ExecError::Message(
-            "query steps need PostgreSQL; the --memory executor does not run them".into(),
+            "MEMORY_UNSUPPORTED_SQL: this executor does not implement query steps".into(),
         ))
     }
 
@@ -187,8 +186,9 @@ const REFRESH_TABLE: &str = "_platform_refresh_tokens";
 pub struct MemoryExec {
     tables: Mutex<BTreeMap<String, Vec<Row>>>,
     unique: Mutex<BTreeMap<String, Vec<Vec<String>>>>,
+    models: Mutex<BTreeMap<String, crate::manifest::ModelSpec>>,
     refresh_gate: tokio::sync::Mutex<()>,
-    /// Test stub for `query` steps (the memory executor runs no SQL).
+    /// Optional query override for existing tests.
     query_stub: Mutex<Option<String>>,
 }
 
@@ -248,9 +248,13 @@ impl MemoryExec {
 #[async_trait]
 impl QueryExec for MemoryExec {
     fn configure_models(&self, models: &[crate::manifest::ModelSpec]) {
+        if let Ok(mut registry) = self.models.lock() {
+            registry.extend(models.iter().map(|m| (m.table.clone(), m.clone())));
+        }
         if let Ok(mut unique) = self.unique.lock() {
             for model in models {
                 let mut groups = model.constraints.clone();
+                groups.push(vec!["id".into()]);
                 groups.extend(
                     model
                         .fields
@@ -265,21 +269,74 @@ impl QueryExec for MemoryExec {
 
     async fn raw(
         &self,
-        _tenant_id: &str,
-        _role: &str,
-        _writes: bool,
-        _sql: &str,
+        tenant_id: &str,
+        role: &str,
+        writes: bool,
+        sql: &str,
         params: Vec<Option<String>>,
     ) -> Result<Vec<Row>, ExecError> {
-        let stub = self.query_stub.lock().ok().and_then(|s| s.clone());
-        let Some(column) = stub else {
-            return Err(ExecError::Message(
-                "query steps need PostgreSQL; the --memory executor does not run them".into(),
-            ));
+        if let Some(column) = self.query_stub.lock().ok().and_then(|s| s.clone()) {
+            let mut row = Row::new();
+            row.insert(column, params.into_iter().next().flatten().into());
+            return Ok(vec![row]);
+        }
+        let plan = super::memsql::classify(sql).map_err(|e| ExecError::Message(e.to_string()))?;
+        let writing = matches!(
+            plan.action,
+            super::memsql::Action::Update(_) | super::memsql::Action::Insert { .. }
+        );
+        if !QUERY_ROLES.contains(&role) || (writing && (!writes || role != "public_writer")) {
+            return Err(ExecError::Message(format!(
+                "role {role} may not run this query (writes={writes})"
+            )));
+        }
+        let operation = if writing {
+            Stmt::Insert {
+                table: plan.table.clone(),
+                values: vec![],
+                returning: vec![],
+            }
+        } else {
+            Stmt::Select {
+                table: plan.table.clone(),
+                columns: vec![],
+                id: None,
+                filters: vec![],
+                sort: None,
+                limit: 1,
+                offset: 0,
+            }
         };
-        let mut row = Row::new();
-        row.insert(column, params.into_iter().next().flatten().into());
-        Ok(vec![row])
+        role_allows(role, &operation).map_err(ExecError::Message)?;
+        let model = self
+            .models
+            .lock()
+            .map_err(|_| ExecError::Message("memory model registry poisoned".into()))?
+            .get(&plan.table)
+            .cloned()
+            .ok_or_else(|| {
+                ExecError::Message(
+                    super::memsql::Unsupported(format!("unconfigured table {}", plan.table))
+                        .to_string(),
+                )
+            })?;
+        let mut tables = self
+            .tables
+            .lock()
+            .map_err(|_| ExecError::Message("memory store poisoned".into()))?;
+        let stored = tables.entry(key(tenant_id, &plan.table)).or_default();
+        let mut candidate = stored.clone();
+        let result = super::memsql::evaluate(&plan, &model, &mut candidate, tenant_id, &params)?;
+        for (i, row) in candidate.iter().enumerate() {
+            let preceding = candidate
+                .get(..i)
+                .ok_or_else(|| ExecError::Message("invalid memory row range".into()))?;
+            self.check_unique(&plan.table, preceding, row, None)?;
+        }
+        if writing {
+            *stored = candidate;
+        }
+        Ok(result)
     }
 
     async fn user_roles(

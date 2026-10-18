@@ -5,6 +5,8 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Decision 183:** Memory query steps execute atomic counter UPDATE/upsert, unique-key SELECT and COALESCE(MAX) forms with tenant isolation and constraints. Other SQL returns HTTP 500 `MEMORY_UNSUPPORTED_SQL`; build and memory startup warn only for unsupported steps.
+
 - **Breaking (decision 181):** Lock frontmatter `writes:` is rejected; declare writes in source markdown (lock writes derive from method steps). Compile prompts list called methods’ declared error codes. Version is `1.0.0-rc.3`; locks are restamped: run `vibe build`. Prompt changes after a tagged rc require the next rc.
 
 - **Decision 180:** Private LLM endpoints record only `endpoint-private: true`, never the host or derived values in project/artifact provenance. Public hosts are unchanged; old records and signed manifests remain readable and are sanitized on rebuild. Local, uncommitted, unpackaged cache keys are the sole exception. GitHub Releases for pre-release tags use `--prerelease --latest=false`; stable tags use `--latest` (build metadata alone is stable).
