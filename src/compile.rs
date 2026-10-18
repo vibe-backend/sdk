@@ -527,7 +527,7 @@ fn collect_build_record(
                     .then(|| record.compilers.get(&rel).cloned())
                     .flatten()
             }) {
-                compilers.insert(rel.clone(), stamp);
+                compilers.insert(rel.clone(), stamp.without_private_host());
             }
             if doc.meta.compiler.llm_stamp().is_none() && !translations.contains_key(&rel) {
                 if let Some(stamp) = previous
@@ -650,6 +650,10 @@ pub(crate) fn commit_locks(writes: &[(std::path::PathBuf, String)]) -> std::io::
 /// `.vibe/cache/llm/<key>.md` key: everything that can change the LLM output
 /// (system prompt incl. prompt version, input incl. source and dependency
 /// context, provider, endpoint host, model, seed, sent params, compiler).
+/// Decision 180 exception: this local cache filename may derive from a private host.
+/// `.vibe/cache` is gitignored and never packaged: dev/release build output writes
+/// only the manifest; the runtime artifact loader reads that manifest (and release
+/// signature bundle), never the build cache.
 fn cache_key(
     opts: &CompileOptions<'_>,
     source: &SourceFile,

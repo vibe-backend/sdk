@@ -563,6 +563,16 @@ pub fn manifest_from_loaded(
     build_signed(root, loaded, Some(signing_key), &BuildInfo::default())
 }
 
+#[cfg(any(feature = "sdk", test))]
+fn sanitized_compilers(
+    compilers: BTreeMap<String, crate::lock::LlmStamp>,
+) -> BTreeMap<String, crate::lock::LlmStamp> {
+    compilers
+        .into_iter()
+        .map(|(path, stamp)| (path, stamp.without_private_host()))
+        .collect()
+}
+
 /// Validates (deploy rules) and builds the manifest from exactly the loaded
 /// lock texts; nothing is re-read. Records provenance. A dev build is signed
 /// with the development key; a release build takes no key and is left
@@ -644,7 +654,7 @@ pub fn build_signed(
         test_build: record.as_ref().is_some_and(|r| {
             r.test_build || r.compilers.values().any(|s| s.llm_provider == "fake")
         }),
-        compilers: record.map(|record| record.compilers).unwrap_or_default(),
+        compilers: sanitized_compilers(record.map(|record| record.compilers).unwrap_or_default()),
         translations: loaded
             .build_record
             .as_deref()
@@ -2111,3 +2121,71 @@ mod constant_response_tests {
 
 /// Errors declared by the generated model CRUD methods.
 pub const CRUD_ERROR_CODES: &[&str] = &["NOT_FOUND", "UNIQUE_VIOLATION", "PRECONDITION_FAILED"];
+
+#[cfg(test)]
+mod private_host_tests {
+    use super::*;
+
+    #[test]
+    fn provenance_writer_sanitizes_old_records_and_preserves_public_hosts() {
+        for private in [true, false] {
+            let host = if private {
+                "old-private.example"
+            } else {
+                "api.openai.com"
+            };
+            let stamp = serde_json::from_value(serde_json::json!({
+                "llm-provider":"openai","model-snapshot":"test","endpoint-host":host,
+                "endpoint-private":private,"llm-seed":0,"sent-params":{}
+            }))
+            .unwrap();
+            let provenance = Provenance {
+                compilers: sanitized_compilers(BTreeMap::from([("a.lock.md".into(), stamp)])),
+                ..Provenance::default()
+            };
+            let json = serde_json::to_value(provenance).unwrap();
+            let stamp = &json["compilers"]["a.lock.md"];
+            assert_eq!(stamp["endpoint-private"], private);
+            if private {
+                assert!(stamp.get("endpoint-host").is_none());
+            } else {
+                assert_eq!(stamp["endpoint-host"], host);
+            }
+        }
+    }
+
+    #[test]
+    fn old_signed_private_manifest_still_verifies() {
+        let mut manifest = Manifest {
+            manifest_version: MANIFEST_VERSION,
+            build_mode: Some(BuildMode::Dev),
+            routes: Vec::new(),
+            models: Vec::new(),
+            methods: Vec::new(),
+            migrations: Vec::new(),
+            provenance: Provenance::default(),
+            signature: String::new(),
+        };
+        let stamp = serde_json::from_value(serde_json::json!({
+            "llm-provider":"openai","model-snapshot":"test","endpoint-host":"old-private.example",
+            "endpoint-private":true,"llm-seed":0,"sent-params":{}
+        }))
+        .unwrap();
+        manifest
+            .provenance
+            .compilers
+            .insert("a.lock.md".into(), stamp);
+        let key = crate::sign::generate_key();
+        manifest.signature = crate::sign::sign_bytes(&serde_json::to_vec(&manifest).unwrap(), &key);
+        let old_json = serde_json::to_string(&manifest).unwrap();
+        assert!(old_json.contains("old-private.example"));
+        let parsed = serde_json::from_str(&old_json).unwrap();
+        let verified = verify_manifest(parsed, &key.verifying_key()).unwrap();
+        assert_eq!(
+            verified.provenance.compilers["a.lock.md"]
+                .endpoint_host
+                .as_deref(),
+            Some("old-private.example")
+        );
+    }
+}

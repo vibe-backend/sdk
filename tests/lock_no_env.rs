@@ -136,7 +136,7 @@ async fn locks_exclude_environment_and_record_llm_provenance() {
             .unwrap();
     assert_eq!(record.compilers.len(), 2);
     let stamp = &record.compilers["models/product/product.lock.md"];
-    assert_eq!(stamp.endpoint_host, config.endpoint_host);
+    assert_eq!(stamp.endpoint_host, None);
     assert_eq!(stamp.model_snapshot, config.model);
     assert!(stamp.endpoint_private);
     assert_eq!(record.translations.len(), 1);

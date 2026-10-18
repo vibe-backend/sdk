@@ -18,7 +18,7 @@
 
 ### v1.8（草稿，2026-10-14）
 
-- 補編決定 150–179（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
+- 補編決定 150–180（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 vibe-version 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe build` → `vibe run`（決定 177））
 - `vibe build` 係官方 build 指令：預設更新過時 lock、驗證同寫 dev manifest；`--release` 做 release 打包，`--check` 唔寫檔（決定 175）。
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
@@ -163,7 +163,7 @@
 
 | # | 決定 | 影響章節 |
 | --- | --- | --- |
-| 57 | 初始化 project／SDK 時，用戶揀編譯用 LLM：`LLM_PROVIDER` 係 `openai`（預設，涵蓋所有 OpenAI-compatible endpoint 包括 Ollama、LM Studio、vLLM）、`anthropic` 或者 `gemini`；只喺部署／編譯時用。中立變數 `LLM_BASE_URL`、`LLM_API_KEY`（必填）、`LLM_MODEL`（必填，pin 死 snapshot）；`OPENAI_*` 只做 `openai` 嘅別名，`LLM_*` 優先，值衝突 error；選填 `LLM_TIMEOUT`、`LLM_MAX_RETRIES`、`LLM_SEED`。本地開發准 http loopback，其他內網要 `LLM_ALLOW_PRIVATE_HOST=true`；CI／production 一定 https 公開 host，本地 lock 唔可以部署。Key 永遠唔寫入 repo、lock、manifest、log、部署報告或者錯誤訊息；runtime 唔可以有任何 `LLM_*`／`OPENAI_*`。沙盒網絡只准連 endpoint host；決定 174：provider、host、model 寫入 build record 同 manifest provenance 嘅 compilers stamp，唔計入 compiler-hash。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 2A.1、2A.6、2A.7、2A.8、9B、10.1、14 |
+| 57 | 初始化 project／SDK 時，用戶揀編譯用 LLM：`LLM_PROVIDER` 係 `openai`（預設，涵蓋所有 OpenAI-compatible endpoint 包括 Ollama、LM Studio、vLLM）、`anthropic` 或者 `gemini`；只喺部署／編譯時用。中立變數 `LLM_BASE_URL`、`LLM_API_KEY`（必填）、`LLM_MODEL`（必填，pin 死 snapshot）；`OPENAI_*` 只做 `openai` 嘅別名，`LLM_*` 優先，值衝突 error；選填 `LLM_TIMEOUT`、`LLM_MAX_RETRIES`、`LLM_SEED`。本地開發准 http loopback，其他內網要 `LLM_ALLOW_PRIVATE_HOST=true`；CI／production 一定 https 公開 host，本地 lock 唔可以部署。Key 永遠唔寫入 repo、lock、manifest、log、部署報告或者錯誤訊息；runtime 唔可以有任何 `LLM_*`／`OPENAI_*`。沙盒網絡只准連 endpoint host；決定 174：provider、public host（決定 180：private host 永遠唔記錄）、model 寫入 build record 同 manifest provenance 嘅 compilers stamp，唔計入 compiler-hash。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 2A.1、2A.6、2A.7、2A.8、9B、10.1、14 |
 
 ### 0.9 v1.7 review 修訂（決定 58 起）
 
@@ -284,7 +284,7 @@
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
-### 0.14 v1.8 2026-10-17 決定（決定 150–179，產品經理已批准 2026-10-17）
+### 0.14 v1.8 2026-10-17 決定（決定 150–180，產品經理已批准 2026-10-17）
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
@@ -312,12 +312,13 @@
 | 171 | Errors 嘅 code 同 from 只准 runtime 公開錯誤碼、被呼叫 method Signature errors／model CRUD errors，同本 feature validate fail；未知碼列出排序後嘅允許清單並 repair，structured 都適用。CRUD 唯一衝突用 UNIQUE_VIOLATION。 | 已批准（產品經理 2026-10-17） | 2A.4、2A.6、8、12.2 |
 | 172 | Transform in 平面 object 按 Request row 次序排 key（同名或 req.field 對應），其餘按 byte 字典序；冒號後一個空格、逗號後一個空格，expression 字串外空白正規化（包括 req.body.x），重複 key 報錯，唔能解析就保留原值。structured 同自然語言都適用；Transform out expression 同 respond value 相同就寫 transform.out。自然語言 model table 若等於 id_snake 或固定英文複數（不分大小寫），一律寫複數，其餘保留。 | 已批准（產品經理 2026-10-17） | 2A.4、2A.6 |
 | 173 | 未知 capability model 同 LLM_SEND_SAMPLING=0 嘅 sampling warning 合計每個 process 最多一次，跨 compile、repair 同 keep-going 共用。 | 已批准（產品經理 2026-10-17） | 2A.8.2 |
-| 174 | Lock 唔包含任何開發者環境資料；compiler 只留 name、version；LLM stamp 移去 build record 同 manifest provenance，compiler-hash 只計 compiler.version 同 prompt-version，PROMPT_VERSION 升到 prompt-10。決定 174：`scripts/vibe-install.sh` 接受 `vX.Y.Z` 同 `vX.Y.Z-rc.N` pre-release tags；checksum 同 attestation 驗證不變：signer workflow 係 `release.yml`，source ref 係 `refs/tags/v<version>`，issuer 係 `https://token.actions.githubusercontent.com`；決定 118 不變。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） | 已批准（產品經理 2026-10-17） | 2A.1、2A.6、2A.8、10.1 |
+| 174 | Lock 唔包含任何開發者環境資料；compiler 只留 name、version；LLM stamp 移去 build record 同 manifest provenance，compiler-hash 只計 compiler.version 同 prompt-version，PROMPT_VERSION 升到 prompt-10。決定 174：`scripts/vibe-install.sh` 接受 `vX.Y.Z` 同 `vX.Y.Z-rc.N` pre-release tags；checksum 同 attestation 驗證不變：signer workflow 係 `release.yml`，source ref 係 `refs/tags/v<version>`，issuer 係 `https://token.actions.githubusercontent.com`；決定 118 不變。 （決定 176 取代：lock 用 `vibe-version`，prompt 只喺 minor／major 版本改） （endpoint-host 部分由決定 180 更新） | 已批准（產品經理 2026-10-17） | 2A.1、2A.6、2A.8、10.1 |
 | 175 | 指令集只有 `vibe`（互動，TTY）、`vibe build` 同 `vibe run`（下一個 PR 加入）。`vibe build` 預設 dev build：產生／更新過時 lock（全部 lock 都係最新就唔叫 LLM，CI 冇 LLM key 都得）、自動驗證（等同舊 `vibe validate --deploy --dev`）、輸出 dev manifest；`vibe build --release` 取代 `vibe manifest --release`，保留所有 release 檢查：拒絕 private endpoint、唔准浮動 model alias、一定要記錄 provider；`vibe build --check` 喺記憶體 build 同跑決定 114 policy，唔寫檔。`vibe compile` 改名 `vibe build`；`vibe validate`、`vibe manifest`、`vibe new` 刪除，舊指令提示新指令並以非零退出。`vibe serve` 暫時保留做隱藏指令，`vibe run` 取代後刪除。（決定 177：`vibe serve` 已刪除，改用 `vibe run`）舊 `--labels`、`-o` 擴充同 10.10 部署報告構想延至 vNext，放喺 `vibe build --release` 之下。取代決定 164，亦更新決定 76、82、102、154、166 引用舊指令嘅部分。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.2、2C.3 |
 | 176 | lock 用 `vibe-version`，正式版（包括 0.x）記 major.minor（例如 `0.1`、`1.0`），pre-release 記完整版本（例如 `1.0.0-rc.2`），必須完全一致。版本唔啱（包括舊 `prompt-N` lock）喺 build 驗證同 serve／runtime 載入都係 error，提示用 `vibe build` 重新產生；source 冇改但版本唔同亦當過時。取消獨立 `PROMPT_VERSION`，compile prompt 只可以喺 minor（或者 major）版本改，patch 唔准改。CI `scripts/ci/check-prompt-version.py` 檢查 `src/compile_prompt.sha256`（system、translation、repair prompt 指紋）同 `src/prompt_guide.rs`（grammar、guides、examples、repair input）；PR 改咗呢啲檔而 Cargo.toml major.minor 冇高過 base branch 就 fail。Cargo.toml 係 pre-release 或者 1.0.0 之前跳過。 決定 165 嘅 byte-identical 保證改為「同一 source、同一 vibe 版本戳記同同一結構」。取代決定 162 同所有提及 `PROMPT_VERSION` 嘅舊決定（18、64、165、172、174 嘅相關部分）；`vibe-version` 取代 `compiler:` 同 `compiler-hash:`，即決定 174 嘅 compiler-hash 變成 vibe lock 版本戳記；manifest provenance `compiler_hash` 改為 `vibe_version`。 | 已批准（產品經理 2026-10-17） | 2A.1、2A.6、2C.3、10.1 |
 | 177 | `vibe run` 讀 project lock，喺記憶體做 dev manifest，預設 in-memory store、`127.0.0.1:8080`；`--db postgres`／`VIBE_DB` 用現有 PG 設定。Lock 缺少、過時或版本唔啱就 error 提示 `vibe build`，永遠唔叫 LLM。`--artifact` 跑 `vibe build -o` 或者 release artifact；run 邏輯係 library（`src/run.rs`），下一個 PR 嘅 `vibe-runtime` binary 會用。刪除 `vibe serve`，提示 `vibe run`，exit 2。`LLM_PROVIDER=fake` 做 keyless 測試 build：只喺 build record 同 manifest provenance 標 `test_build`，lock 唔標（決定 174）；`vibe run` 冇 `--allow-test-build` 拒絕、非 development 一律拒絕，`vibe build --release` 永遠拒絕 fake。`LLM_API_KEY_FILE` 讀 key，trim 尾部換行，`LLM_API_KEY` 優先，key 永遠唔顯示。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.2、2C.3、2A.8 |
 | 178 | 同一份 code 出兩個 binary（Cargo feature `sdk`，預設開）：`vibe-sdk`（安裝做 `vibe`，開發同 CI build 用：互動 `vibe`、`vibe build`、`vibe run`，冇其他輔助指令（決定 179））同 `vibe-runtime`（部署用，`--no-default-features` build，冇 LLM client、build／compile 同互動 TTY code；`vibe-runtime run` 或者冇 subcommand 跑 `--artifact`（預設目前目錄）嘅 manifest，flags `--addr`、`--db`／`VIBE_DB`、`--allow-test-build`，跟決定 176 lock 版本規則同決定 177 test build 規則）。CI 證明 runtime binary 冇 sdk feature 同 sdk-only 字串；release asset `vibe-sdk-<target>`／`vibe-runtime-<target>`，SHA256SUMS 同 build provenance attestation 覆蓋兩個，Sigstore／attestation 檢查不變；release workflow 喺 build 之前檢查 tag（去咗 v）等於 Cargo.toml version。`vibe-install.sh` 用 `--runtime`／`VIBE_INSTALL_BINARY=runtime` 揀 runtime（預設 sdk），兩者驗證一樣嚴格，rc.2 之前嘅 release 只有 sdk 舊名 asset。版本升到 `1.0.0-rc.2`，lock 戳記係 `1.0.0-rc.2`。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.3b、2C.3d、10.1、14 |
 | 179 | vibe-sdk 只剩 `vibe`、`vibe build`、`vibe run`；`migrate`、`keygen`、`slug`、`secret-scan`、`endpoint`、`approve` 刪除，印提示並 exit 2。keygen → build 自動建 dev key，release 唔使 key；slug → `.vibe/slugs.json`，build 檢查同列出；secret-scan → 每次 build，有發現就失敗；endpoint → `.vibe/disabled.txt`，build 檢查同列出；migrate → `vibe run --db postgres`／`vibe-runtime run --db postgres` 啟動時自動套用 pending migration（`vibe_platform.applied_migrations`、sha256、append-only、advisory lock），破壞性 migration 一律拒絕，要 `--allow-destructive-migrations` 先套用。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.3、2C.3e、9A、10、14 |
+| 180 | 修改決定 174：private endpoint 只記 `endpoint-private: true`，host 永遠唔以明文、hash 或任何衍生值寫入 build record、manifest provenance（dev 同 release）或者任何 project／artifact 檔案；public host 照舊記錄。唯一例外係 `.vibe/cache` key 可以包含 host（永遠唔 commit、唔打包）；`vibe build -o`／`--release` 只寫 manifest，runtime artifact loader 只讀 manifest 同 release signature bundle，唔讀 cache。舊 record／manifest 帶 private host 仍然 parse，該欄位唔參與任何決策，`vibe build` 重寫時刪走；舊 signed dev manifest 仍然驗簽成功。互動設定寫入 `.env` 嘅 `LLM_BASE_URL` 係用戶設定，保留不變。 | 已批准（產品經理 2026-10-18） | 2A.1、2A.6、2A.8、10.1 |
 
 ## 1. 目錄同命名
 
@@ -731,7 +732,7 @@ v1 支援三個 provider，用 `LLM_PROVIDER` 揀，預設 `openai`（決定 57�
 
 #### 2A.8.5 Key 保護
 
-- Key 永遠唔可以出現喺 repo、source、lock、manifest、log、部署報告、PR 留言或者錯誤訊息；錯誤訊息可以講「`LLM_API_KEY` 無效或者缺少」，亦可以提供 network／DNS／TLS 原因、HTTP status 同 endpoint host／URL（secret query 值一定要遮蔽），但永遠唔可以包含 key、request headers 或者 response body。錯誤訊息可以顯示硬編碼允許清單入面嘅已知值（model 名、provider error code、Responses API incomplete reason）；唔喺清單入面嘅值一律顯示做 `unknown`，自由文字同 response body 永遠唔會顯示。
+- Key 永遠唔可以出現喺 repo、source、lock、manifest、log、部署報告、PR 留言或者錯誤訊息；錯誤訊息可以講「`LLM_API_KEY` 無效或者缺少」，亦可以提供 network／DNS／TLS 原因、HTTP status 同 endpoint host／URL（只限 stderr，唔寫入 project／artifact 檔案；secret query 值一定要遮蔽），但永遠唔可以包含 key、request headers 或者 response body。錯誤訊息可以顯示硬編碼允許清單入面嘅已知值（model 名、provider error code、Responses API incomplete reason）；唔喺清單入面嘅值一律顯示做 `unknown`，自由文字同 response body 永遠唔會顯示。
 - 編譯器同 CLI 輸出 log 前會遮蔽 key（同第 9 節 token／secret 規則一致）。
 - CI 用 secret scanning 掃 repo、lock、manifest、部署報告同 CI log；發現疑似 key（包括 `LLM_API_KEY`／`OPENAI_API_KEY` 嘅實際值）即刻 fail build。
 - CI 用 GitHub Actions secrets 提供變數：release job 用 `release` environment secret `VIBE_LLM_API_KEY`；PR CI 用另一條 `VIBE_LLM_API_KEY_PREVIEW`（決定 118）。fork 嚟嘅 PR 攞唔到 secret，只跑驗證器，唔編譯。
@@ -794,7 +795,7 @@ interface LlmAdapter {
 
 - 2A.7 沙盒：網絡只准 egress 去 `LLM_BASE_URL`（或者 provider 預設 base URL）嘅 host；冇工具規則不變。
 - 2A.1／2A.6（決定 174）：LLM stamp 只記喺 build record 同 manifest provenance，唔寫入 lock，唔計入 vibe-version；永遠唔記 key。
-- 決定 174：改 provider、endpoint host 或者 model 唔會令 lock 過時，亦唔改 vibe-version；改動記喺 build record 同 manifest provenance 嘅 `compilers` stamps。Release job 仍然喺 CI 由 source build、通過決定 114 policy 同 attestation 先可以部署（決定 77、113、117）。
+- 決定 174：改 provider、endpoint host 或者 model 唔會令 lock 過時，亦唔改 vibe-version；改動記喺 build record 同 manifest provenance 嘅 `compilers` stamps；決定 180：private endpoint 只記 `endpoint-private: true`，唔記 host 或任何 host 衍生值，public host 照舊。Release job 仍然喺 CI 由 source build、通過決定 114 policy 同 attestation 先可以部署（決定 77、113、117）。
 - 只改 base URL 嘅 path（host 唔變）唔當 major，但 CI 決定性比對照樣要通過。
 - 唔再做 CI 重編比對（決定 113、117）；2A.8.2 決定性設定照送，只為減少 release summary 入面嘅無謂變化。
 

@@ -182,10 +182,21 @@ pub struct CompilerStamp {
 pub struct LlmStamp {
     pub llm_provider: String,
     pub model_snapshot: String,
-    pub endpoint_host: String,
+    // Preserve old signed manifests on read; sanitize only at writer boundaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_host: Option<String>,
     pub endpoint_private: bool,
     pub llm_seed: u64,
     pub sent_params: BTreeMap<String, String>,
+}
+
+impl LlmStamp {
+    pub fn without_private_host(mut self) -> Self {
+        if self.endpoint_private {
+            self.endpoint_host = None;
+        }
+        self
+    }
 }
 
 impl CompilerStamp {
@@ -193,7 +204,7 @@ impl CompilerStamp {
         (self.llm_provider != "none").then(|| LlmStamp {
             llm_provider: self.llm_provider.clone(),
             model_snapshot: self.model_snapshot.clone(),
-            endpoint_host: self.endpoint_host.clone(),
+            endpoint_host: (!self.endpoint_private).then(|| self.endpoint_host.clone()),
             endpoint_private: self.endpoint_private,
             llm_seed: self.seed,
             sent_params: self.sent_params.clone(),
@@ -1164,5 +1175,22 @@ mod tests {
             "# product\n\n## Table\n\n- provider: main\n"
         ));
         assert!(!is_structured_source("# product\n\nThis is a product.\n"));
+    }
+}
+
+#[cfg(test)]
+mod private_host_tests {
+    #[test]
+    fn compiler_stamp_omits_private_host_but_keeps_public_serialization() {
+        let mut compiler = super::CompilerStamp::deterministic();
+        compiler.llm_provider = "openai".into();
+        compiler.endpoint_host = "api.openai.com".into();
+        let public = serde_json::to_string(&compiler.llm_stamp().unwrap()).unwrap();
+        assert!(public.contains(r#""endpoint-host":"api.openai.com""#));
+        compiler.endpoint_private = true;
+        let private = serde_json::to_string(&compiler.llm_stamp().unwrap()).unwrap();
+        assert!(!private.contains("endpoint-host"));
+        assert!(!private.contains("api.openai.com"));
+        assert!(private.contains(r#""endpoint-private":true"#));
     }
 }
