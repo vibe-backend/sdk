@@ -34,6 +34,8 @@ VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-r
 
 `install --version` and `upgrade --version` accept `vX.Y.Z` or `vX.Y.Z-rc.N`. Every number must be zero or a positive integer without leading zeros; other pre-release labels and build metadata are rejected.
 
+`upgrade` without `--version` requires a stable GitHub Release: pre-releases are not `latest`. Until GA, pass `--version v1.0.0-rc.2` explicitly. If no stable release exists, the script stops with guidance to use `--version`.
+
 The default destination is `$HOME/.local/bin/vibe`; override it with `--install-dir /absolute/path`. If the directory is not on `PATH`, the script prints a hint and never edits shell profiles. Run `--help` for all options.
 
 ## Build from source

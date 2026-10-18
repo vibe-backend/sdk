@@ -54,7 +54,22 @@ if [ "$ACTION" = remove ]; then
 fi
 [ "$ACTION" != install ] || [ -n "$VERSION" ] || die "install requires --version vX.Y.Z or vX.Y.Z-rc.N"
 need curl; need tar; need awk; need gh
-if [ -z "$VERSION" ]; then latest=$(curl -fsSIL --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' "$DOWNLOAD_URL/$REPOSITORY/releases/latest") || die "failed to resolve latest release"; prefix="$DOWNLOAD_URL/$REPOSITORY/releases/tag/"; case $latest in "$prefix"*) VERSION=${latest#"$prefix"};; *) die "latest release redirected outside expected repository";; esac; fi
+if [ -z "$VERSION" ]; then
+ no_stable="no stable release of $REPOSITORY exists yet (pre-releases are not 'latest'); pass --version vX.Y.Z-rc.N"
+ # Keep curl's failure status separate from its HTTP status (404 means no stable).
+ latest_status=0
+ latest_response=$(curl -fsSIL --proto '=https' --tlsv1.2 -o /dev/null -w '%{http_code} %{url_effective}' "$DOWNLOAD_URL/$REPOSITORY/releases/latest") || latest_status=$?
+ latest_code=${latest_response%% *}
+ latest=${latest_response#* }
+ [ "$latest_code" != 404 ] || die "$no_stable"
+ [ "$latest_status" -eq 0 ] || die "failed to resolve latest release"
+ prefix="$DOWNLOAD_URL/$REPOSITORY/releases/tag/"
+ case $latest in
+  "$prefix"*) VERSION=${latest#"$prefix"};;
+  "$DOWNLOAD_URL/$REPOSITORY/releases"|"$DOWNLOAD_URL/$REPOSITORY/releases/") die "$no_stable";;
+  *) die "latest release redirected outside expected repository";;
+ esac
+fi
 if [ "$(printf '%s\n' "$VERSION" | wc -l)" -eq 1 ] && printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'; then :; else die "invalid release version: $VERSION"; fi
 os=$(uname -s) || die "cannot detect OS"; arch=$(uname -m) || die "cannot detect architecture"
 case "$os:$arch" in Linux:x86_64|Linux:amd64) target=x86_64-unknown-linux-gnu;; Linux:aarch64|Linux:arm64) target=aarch64-unknown-linux-gnu;; Darwin:x86_64|Darwin:amd64) target=x86_64-apple-darwin;; Darwin:arm64|Darwin:aarch64) target=aarch64-apple-darwin;; *) die "unsupported platform: $os/$arch";; esac

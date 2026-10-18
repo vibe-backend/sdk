@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const BODY: &str = "## Table\n- provider: main\n- table: products\n## Fields\n| name | type | rules | system |\n| --- | --- | --- | --- |\n| sku | string | required, unique, max: 40 | no |\n## CRUD\n| method | options |\n| --- | --- |\n| create | - |\n| get | - |\n## Policies\n- rls: enable, force\n- policy: tenant_id = current_setting('app.tenant_id', false)\n";
 
-fn scan(root: &Path) {
+fn scan(root: &Path, token: &str) {
     for entry in fs::read_dir(root).unwrap() {
         let path = entry.unwrap().path();
         // Decision 180's sole generated-file exception: local cache keys may
@@ -14,14 +14,14 @@ fn scan(root: &Path) {
             continue;
         }
         if path.is_dir() {
-            scan(&path);
+            scan(&path, token);
         } else {
             let bytes = fs::read(&path).unwrap();
-            assert!(
-                !bytes.windows(b"127.0.0.1".len()).any(|w| w == b"127.0.0.1"),
-                "host in {}",
-                path.display()
-            );
+            let count = bytes
+                .windows(token.len())
+                .filter(|w| *w == token.as_bytes())
+                .count();
+            assert_eq!(count, 0, "host occurs {count} times in {}", path.display());
         }
     }
 }
@@ -45,7 +45,22 @@ fn assert_compilers(raw: &str, manifest: bool) {
 async fn real_cli_build_never_records_private_host() {
     // Wildcard .localhost is not resolved by this environment's DNS path.
     // endpoint_host is host-only (no port), so scan for that exact token.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    #[cfg(target_os = "linux")]
+    let token = {
+        let random = uuid::Uuid::new_v4();
+        let bytes = random.as_bytes();
+        format!(
+            "127.{}.{}.{}",
+            100 + bytes[0] % 151,
+            1 + bytes[1] % 250,
+            1 + bytes[2] % 250
+        )
+    };
+    #[cfg(not(target_os = "linux"))]
+    let token = "127.0.0.1".to_owned();
+    let listener = tokio::net::TcpListener::bind((token.as_str(), 0))
+        .await
+        .unwrap();
     let base = format!("http://{}/v1", listener.local_addr().unwrap());
     let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = hits.clone();
@@ -103,7 +118,7 @@ async fn real_cli_build_never_records_private_host() {
             let mut record: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
             for stamp in record["compilers"].as_object_mut().unwrap().values_mut() {
-                stamp["endpoint-host"] = "127.0.0.1".into();
+                stamp["endpoint-host"] = token.clone().into();
             }
             fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
             let key = vibe::sign::load_dev_key(&project).unwrap();
@@ -133,8 +148,8 @@ async fn real_cli_build_never_records_private_host() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        scan(&project);
-        scan(&out);
+        scan(&project, &token);
+        scan(&out, &token);
         assert_compilers(
             &fs::read_to_string(project.join(".vibe/build-record.json")).unwrap(),
             false,

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Bind release assets to SHA256SUMS (#134).
 #
+#   release-assets.sh classify <tag>        print stable/prerelease or reject tag
 #   release-assets.sh verify <dir>          check <dir> and print the asset list
 #   release-assets.sh publish <dir> <tag>   verify, then create the GitHub Release
 #
@@ -11,6 +12,16 @@
 set -euo pipefail
 
 die() { echo "::error::$*" >&2; exit 1; }
+
+# Build metadata alone is stable; only a suffix before +metadata is pre-release.
+release_kind() {
+  local tag=$1
+  [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] || die "invalid release tag: $tag"
+  case ${tag%%+*} in
+    *-*) echo prerelease ;;
+    *) echo stable ;;
+  esac
+}
 
 verify() {
   local dir=$1
@@ -40,7 +51,10 @@ verify() {
 }
 
 publish() {
-  local dir=$1 tag=$2 list
+  local dir=$1 tag=$2 list kind
+  kind=$(release_kind "$tag")
+  local -a release_flags=(--latest)
+  if [ "$kind" = prerelease ]; then release_flags=(--prerelease --latest=false); fi
   list=$(verify "$dir")
   local -a files=()
   while IFS= read -r name; do files+=("$dir/$name"); done <<<"$list"
@@ -51,10 +65,11 @@ publish() {
   gh release create "$tag" "${files[@]}" \
     --repo "$GITHUB_REPOSITORY" \
     --title "$tag" \
-    --generate-notes
+    --generate-notes "${release_flags[@]}"
 }
 
 case "${1:-}" in
+  classify) [ $# -eq 2 ] || die "usage: $0 classify <tag>"; release_kind "$2" ;;
   verify) [ $# -eq 2 ] || die "usage: $0 verify <dir>"; verify "$2" ;;
   publish) [ $# -eq 3 ] || die "usage: $0 publish <dir> <tag>"; publish "$2" "$3" ;;
   *) die "usage: $0 verify <dir> | publish <dir> <tag>" ;;
