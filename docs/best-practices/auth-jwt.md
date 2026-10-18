@@ -62,7 +62,7 @@ dependencies:
   - { id: user/methods/register, kind: method, hash: sha256:c3e1...90 }
   - { id: users/_definition, kind: api, hash: sha256:11ab...3c }
   - { id: users/v2/_version, kind: api, hash: sha256:0d9e...51 }
-vibe-version: 1.0.0-rc.3
+vibe-version: 1.0.0-rc.4
 status: approved
 approval-mode: manual
 approved-by: [jack@example, mei@example]

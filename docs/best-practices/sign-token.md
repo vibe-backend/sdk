@@ -31,7 +31,7 @@ source-hash: sha256:3b90...d4
 source-type: natural
 dependencies:
   - { id: user, kind: model, hash: sha256:aa41...0f }
-vibe-version: 1.0.0-rc.3
+vibe-version: 1.0.0-rc.4
 status: approved
 approval-mode: manual
 approved-by: [jack@example, mei@example]

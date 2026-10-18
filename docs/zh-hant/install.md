@@ -20,17 +20,17 @@ runtime 冇 fallback。兩者 checksum 同固定身份 attestation 驗證一樣�
 ## 使用方式
 
 ```sh
-./scripts/vibe-install.sh install --version v1.0.0-rc.2
-./scripts/vibe-install.sh install --version v1.0.0-rc.2 --runtime
-VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.2
-./scripts/vibe-install.sh upgrade --version v1.0.0-rc.2 --non-interactive
+./scripts/vibe-install.sh install --version v1.0.0-rc.3
+./scripts/vibe-install.sh install --version v1.0.0-rc.3 --runtime
+VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.3
+./scripts/vibe-install.sh upgrade --version v1.0.0-rc.3 --non-interactive
 ./scripts/vibe-install.sh remove --runtime
 ./scripts/vibe-install.sh remove
 ```
 
 `install --version` 與 `upgrade --version` 接受 `vX.Y.Z` 或 `vX.Y.Z-rc.N`。每個數字必須為零或不帶前置零的正整數；不接受其他預發佈標籤或 build metadata。
 
-`upgrade` 冇指定 `--version` 時需要穩定版 GitHub Release；pre-release 唔算 `latest`。GA 之前請明確傳入 `--version v1.0.0-rc.2`。如果未有穩定版，腳本會停止並提示使用 `--version`。
+`upgrade` 冇指定 `--version` 時需要穩定版 GitHub Release；pre-release 唔算 `latest`。GA 之前請明確傳入 `--version v1.0.0-rc.3`。如果未有穩定版，腳本會停止並提示使用 `--version`。
 
 預設安裝至 `$HOME/.local/bin/vibe`；可用 `--install-dir /absolute/path` 改寫。若目錄不在 PATH，腳本只提示，不修改 shell profile。完整選項請執行 `--help`。
 
