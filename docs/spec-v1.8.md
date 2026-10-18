@@ -323,7 +323,6 @@
 | 182 | RESERVED：保留：#309 per-project release signing（option A，設計已批准 2026-10-18；條文隨實作 PR 加入） | 已批准（產品經理 2026-10-18） | 2C.3b、9B |
 | 183 | In-memory query 執行器支援小型 SQL allowlist：① `UPDATE t SET c = c + <整數或$n>`（亦准 literal／param 直接賦值）`WHERE <單欄唯一鍵> = $n RETURNING <cols或*>`；② 單列 `INSERT ... VALUES ... ON CONFLICT (<單欄唯一鍵>) DO UPDATE SET c = t.c + <整數或EXCLUDED.c> RETURNING ...` 或 `DO NOTHING [RETURNING ...]`；③ `SELECT <cols或*> FROM t WHERE <單欄唯一鍵> = $n`；④ `SELECT COALESCE(MAX(c), <整數>) AS x FROM t WHERE <單欄唯一鍵> = $n`。只准已設定 model table，`id` 算唯一鍵；同 CRUD 一樣租戶注入／隔離同 role 級檢查（`public_reader` 只准讀，`public_writer` 可 INSERT／UPDATE）；SQL 提及 `tenant_id` 一律拒絕，memory query steps 冇模擬逐欄 grant。亦檢查 unique、NOT NULL，套用 INSERT 系統預設值同 UPDATE `updated_at`。成句 SQL 喺同一 store lock 入面原子執行，整數溢位報錯；DO NOTHING 衝突回零列，aggregate 冇資料回預設值。其他 SQL 回 `MEMORY_UNSUPPORTED_SQL`（HTTP 500，backend 能力限制，唔係 client 輸入錯）；run 只警告唔支援嘅 query steps，列 method target 同原因；`vibe build` 每個唔支援 step 喺 stderr 警告（PostgreSQL 照常可用）。更新決定 74 已知差異。 | 已批准（產品經理 2026-10-18） | 2C.4、2A.6 |
 
-
 ## 1. 目錄同命名
 
 ```text
