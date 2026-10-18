@@ -140,7 +140,9 @@ pub async fn query(
 
 fn query_error(err: ExecError) -> MethodFail {
     match err {
-        ExecError::Message(msg) if msg.contains("--memory") => internal(msg),
+        ExecError::Message(msg) if msg.starts_with("MEMORY_UNSUPPORTED_SQL:") => {
+            MethodFail::code("MEMORY_UNSUPPORTED_SQL", msg)
+        }
         // SQLSTATE 23505 (unique violation), mapped in exec.
         ExecError::UniqueViolation => {
             MethodFail::code("UNIQUE_VIOLATION", "unique constraint violated")
@@ -630,6 +632,8 @@ mod query_error_tests {
     use super::*;
     #[test]
     fn unique_is_not_a_retryable_transaction_conflict() {
+        let unsupported = query_error(ExecError::Message("MEMORY_UNSUPPORTED_SQL: JOIN".into()));
+        assert_eq!(unsupported.code, "MEMORY_UNSUPPORTED_SQL");
         let unique = query_error(ExecError::UniqueViolation);
         assert_eq!(unique.code, "UNIQUE_VIOLATION");
         assert_eq!(unique.message, "unique constraint violated");

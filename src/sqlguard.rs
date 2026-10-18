@@ -346,13 +346,22 @@ pub struct SqlInfo {
     pub targets_rows: bool,
 }
 
+/// Parse exactly one PostgreSQL statement, shared by runtime backends.
+pub(crate) fn parse_one(sql: &str) -> Result<Statement, String> {
+    let mut statements =
+        Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(|e| e.to_string())?;
+    if statements.len() != 1 {
+        return Err("multiple statements (or empty SQL)".into());
+    }
+    statements.pop().ok_or_else(|| "empty SQL".into())
+}
+
 /// Checks `sql` against the allowlist and describes it.
 pub fn analyze(sql: &str) -> Result<SqlInfo, String> {
     if let Some(problem) = query_problem(sql) {
         return Err(problem);
     }
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(|e| e.to_string())?;
-    let statement = &statements[0];
+    let statement = parse_one(sql)?;
     Ok(SqlInfo {
         writes: !matches!(statement, Statement::Query(_)),
         targets_rows: matches!(statement, Statement::Update { .. } | Statement::Delete(_)),

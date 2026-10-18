@@ -709,7 +709,7 @@ async fn query_rejects_data_modifying_with_and_unmarked_writes() {
             .await
             .unwrap_err();
         assert!(
-            !err.1.contains("--memory"),
+            err.0 != "MEMORY_UNSUPPORTED_SQL",
             "rejected before execution: {sql} {err:?}"
         );
     }
@@ -776,7 +776,7 @@ fn unusable_es256_signing_key_refuses_to_start() {
 }
 
 #[tokio::test]
-async fn query_steps_need_postgres() {
+async fn unsupported_memory_query_has_a_public_error_code() {
     let m = method_manifest(
         &[],
         json!([
@@ -789,7 +789,8 @@ async fn query_steps_need_postgres() {
         ]),
     );
     let err = run(&m, &MemoryExec::new(), json!({})).await.unwrap_err();
-    assert!(err.1.contains("--memory"), "{err:?}");
+    assert_eq!(err.0, "MEMORY_UNSUPPORTED_SQL");
+    assert!(err.1.contains("use --db postgres"), "{err:?}");
 }
 
 // ---- PostgreSQL ----

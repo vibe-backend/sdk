@@ -18,7 +18,7 @@
 
 ### v1.8（草稿，2026-10-14）
 
-- 補編決定 150–181（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
+- 補編決定 150–183（見 0.14）：expression、LLM 錯誤同開發模式、auth、manifest、slug、validate repair、互動命名、Limits pins／structured 正規化同 prompt 版本規則。
 - 新增 `vibe dev`：本地 web API server，唔使預先編譯；request 嚟到先將 URL 對應去 `.md`，第一次用先編譯成 lock，按 source hash 同 vibe-version 輸入做 cache，檔案改動自動重編；驗證器每次都跑；預設用 in-memory 資料庫（模擬 RLS 同 grant），內嵌 PostgreSQL 做 opt-in（決定 73–75，見 2C.2、2C.4）。（決定 166：`vibe dev` 延至 vNext；v1 用互動 `vibe` → `vibe build` → `vibe run`（決定 177））
 - `vibe build` 係官方 build 指令：預設更新過時 lock、驗證同寫 dev manifest；`--release` 做 release 打包，`--check` 唔寫檔（決定 175）。
 - SDK 移除人手確認：刪除 `vibe approve`；lock frontmatter 唔再有 `status`、`approval-*`、`approved-*` 欄位同 lock 簽名；SDK 忽略 reviewer 同確認簽名；`security-items` 改為資訊性清單；manifest 照樣簽名，release 用 Sigstore keyless（決定 77–80、119）。重寫決定 10、11、16、19、20、28、33、34 同 2A.5、2B.3、9B、10.1 嘅相關內容；決定 29（CODEOWNERS）同 37（allowlist 受 CODEOWNERS 保護）照舊必須。
@@ -284,7 +284,7 @@
 
 點解唔揀其他做法：選項 B（喺輪換 transaction 同一條 connection 入面執行有寫入嘅 method）要持有 family lock 更耐、要將 method executor 改做共用 transaction，實作面大，而且失敗模式（lock 等候、pool 用盡、部分 step 失敗）更複雜；延後到 vNext 再評估。選項 C（事後補償，反做 method 寫入）唔係真正 atomic，補償本身都可以失敗，而且業務寫入未必可以反做；唔採用。
 
-### 0.14 v1.8 2026-10-17 決定（決定 150–181，產品經理已批准 2026-10-17）
+### 0.14 v1.8 2026-10-17 決定（決定 150–183，產品經理已批准 2026-10-17）
 
 | # | 決定 | 狀態 | 位置 |
 | --- | --- | --- | --- |
@@ -320,6 +320,8 @@
 | 179 | vibe-sdk 只剩 `vibe`、`vibe build`、`vibe run`；`migrate`、`keygen`、`slug`、`secret-scan`、`endpoint`、`approve` 刪除，印提示並 exit 2。keygen → build 自動建 dev key，release 唔使 key；slug → `.vibe/slugs.json`，build 檢查同列出；secret-scan → 每次 build，有發現就失敗；endpoint → `.vibe/disabled.txt`，build 檢查同列出；migrate → `vibe run --db postgres`／`vibe-runtime run --db postgres` 啟動時自動套用 pending migration（`vibe_platform.applied_migrations`、sha256、append-only、advisory lock），破壞性 migration 一律拒絕，要 `--allow-destructive-migrations` 先套用。 | 已批准（產品經理 2026-10-17） | 2C.1、2C.3、2C.3e、9A、10、14 |
 | 180 | 修改決定 174：private endpoint 只記 `endpoint-private: true`，host 永遠唔以明文、hash 或任何衍生值寫入 build record、manifest provenance（dev 同 release）或者任何 project／artifact 檔案；public host 照舊記錄。唯一例外係 `.vibe/cache` key 可以包含 host（永遠唔 commit、唔打包）；`vibe build -o`／`--release` 只寫 manifest，runtime artifact loader 只讀 manifest 同 release signature bundle，唔讀 cache。舊 record／manifest 帶 private host 仍然 parse，該欄位唔參與任何決策，`vibe build` 重寫時刪走；舊 signed dev manifest 仍然驗簽成功。互動設定寫入 `.env` 嘅 `LLM_BASE_URL` 係用戶設定，保留不變。 GitHub Release 遇到 pre-release tag 用 `--prerelease --latest=false`，stable tag 用 `--latest`；只有 `+build` metadata 唔算 pre-release。 | 已批准（產品經理 2026-10-18） | 2A.1、2A.6、2A.8、10.1 |
 | 181 | Lock frontmatter 唔准有 `writes:`；build 驗證同 run／runtime 載入都會報錯。Writes 由 method steps 推導（169），請喺 source markdown 宣告。Compile prompt 列出每個被呼叫 method 自己宣告嘅 error codes，模型只用列出嘅 codes（加 runtime public codes 同本地 validate failures，171），減少 repair；lock 保持 deterministic。RC tag 發佈之後任何 compile prompt 改動都要升下一個 rc（今次 `1.0.0-rc.3`），否則決定 176 exact-match 會容許 released rc 同 main 用同一 vibe-version 但產生唔同 lock。CI prompt check 跳過 pre-release，所以呢個係 release 規則，唔係 CI 強制。 | 已批准（產品經理 2026-10-18） | 2A.4、2A.6、2C.3、10.1 |
+| 182 | RESERVED：保留：#309 per-project release signing（option A，設計已批准 2026-10-18；條文隨實作 PR 加入） | 已批准（產品經理 2026-10-18） | 2C.3b、9B |
+| 183 | In-memory query 執行器支援小型 SQL allowlist：① `UPDATE t SET c = c + <整數或$n>`（亦准 literal／param 直接賦值）`WHERE <單欄唯一鍵> = $n RETURNING <cols或*>`；② 單列 `INSERT ... VALUES ... ON CONFLICT (<單欄唯一鍵>) DO UPDATE SET c = t.c + <整數或EXCLUDED.c> RETURNING ...` 或 `DO NOTHING [RETURNING ...]`；③ `SELECT <cols或*> FROM t WHERE <單欄唯一鍵> = $n`；④ `SELECT COALESCE(MAX(c), <整數>) AS x FROM t WHERE <單欄唯一鍵> = $n`。只准已設定 model table，`id` 算唯一鍵；同 CRUD 一樣租戶注入／隔離同 role 級檢查（`public_reader` 只准讀，`public_writer` 可 INSERT／UPDATE）；SQL 提及 `tenant_id` 一律拒絕，memory query steps 冇模擬逐欄 grant。亦檢查 unique、NOT NULL，套用 INSERT 系統預設值同 UPDATE `updated_at`。成句 SQL 喺同一 store lock 入面原子執行，整數溢位報錯；DO NOTHING 衝突回零列，aggregate 冇資料回預設值。其他 SQL 回 `MEMORY_UNSUPPORTED_SQL`（HTTP 500，backend 能力限制，唔係 client 輸入錯）；run 只警告唔支援嘅 query steps，列 method target 同原因；`vibe build` 每個唔支援 step 喺 stderr 警告（PostgreSQL 照常可用）。更新決定 74 已知差異。 | 已批准（產品經理 2026-10-18） | 2C.4、2A.6 |
 
 ## 1. 目錄同命名
 
@@ -1046,10 +1048,11 @@ DROP COLUMN、改 type、rename、TRUNCATE、DELETE，同所有無法分類嘅 S
   - 唯一鍵（包括 `(tenant_id, email)`）、NOT NULL、CHECK（`char_length`、enum）、`ON CONFLICT ... DO UPDATE ... WHERE`、`RETURNING`、軟刪除、If-Match／ETag 版本檢查。
   - 每個 request 一個 transaction（同 7.4 一樣），失敗就成個 request rollback，令失敗恢復行為（例如 11.4 重試）一致；超時同衝突錯誤碼（`TX_TIMEOUT`、`TX_CONFLICT`）一樣。
 - **已知語意差異**（喺 terminal 啟動訊息同文件列明）：
-  - 只支援 lock 白名單用到嘅 SQL 子集；任意 SQL 函數、複雜 JOIN／subquery、window function 未必支援，唔支援就報 `MEMORY_UNSUPPORTED_SQL`，唔會靜靜錯。
+  - Query SQL 只支援決定 183 四款：`UPDATE t SET c = c + <整數或$n>` 或直接 literal／param 賦值，`WHERE <單欄唯一鍵> = $n RETURNING <cols或*>`；單列 `INSERT ... VALUES ... ON CONFLICT (<單欄唯一鍵>) DO UPDATE SET c = t.c + <整數或EXCLUDED.c> RETURNING ...` 或 `DO NOTHING [RETURNING ...]`；`SELECT <cols或*> FROM t WHERE <單欄唯一鍵> = $n`；`SELECT COALESCE(MAX(c), <整數>) AS x FROM t WHERE <單欄唯一鍵> = $n`。表一定係配置嘅 model；unique／primary 單欄鍵同 `id` 可用。欄位可用 `t.col`，唔准 SQL 提及 `tenant_id`。同 memory CRUD 一樣做 role 級檢查（`public_reader` 只准讀，`public_writer` 可 INSERT／UPDATE）；memory query steps 冇模擬逐欄 grant。其他 SQL（JOIN、subquery、DELETE、其他函數、非唯一 WHERE、複合語句等）一律 `MEMORY_UNSUPPORTED_SQL`（HTTP 500）。
+  - 每句 SQL 只攞一次 store lock，串行執行，所以 increment 同 upsert 喺 memory 係原子操作；壞參數、NOT NULL、unique 同 overflow 失敗都唔改資料。`vibe run` 只為唔支援 query steps 列出 method／原因；`vibe build` 同樣喺 stderr 警告，唔當 error，PostgreSQL 可照用。
   - 冇真正並發隔離（全部 statement 串行），所以 race condition（例如 refresh 寬限期兩個並發請求）喺 in-memory 測唔出。
   - `now()`、`interval` 用 process 時鐘；collation、排序同大小寫比較用 Unicode code point，可能同 PostgreSQL locale 唔同。
-  - CTE 只支援 11.4a 嗰個「insert CTE + 同表 SELECT」固定模式。
+  - Query steps 唔支援 CTE（包括 insert CTE）；需要 CTE 請用 PostgreSQL。
   - 冇 `search_path`、schema／database 模式、PgBouncer 行為；冇 `CREATE INDEX CONCURRENTLY` 等 migration 細節（migration 只更新 in-memory schema）。
   - 冇 crypto-shredding 嘅 KMS；DEK 用記憶體假實作。
 - **CI**：整合測試照樣一定要對真 PostgreSQL 跑（`--db postgres` 或者 `--db url`）；in-memory 通過唔代表 production 通過。
@@ -2505,7 +2508,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 | 422 | 驗證唔通過，或者有未宣告欄位；`IDEMPOTENCY_KEY_REUSED`（2.3b）、`EMPTY_PATCH`（2.3c）、`WEAK_PASSWORD`（長度唔喺 12–256）、`BREACHED_PASSWORD`（洩漏密碼，#90；4A.2）；錯誤唔回顯密碼 |
 | 428 | 需要 `If-Match` 但冇帶（RFC 6585） |
 | 429 | 請求太多，要帶 `Retry-After`（`RATE_LIMITED`；決定 130 嘅網段 slot 上限同 slot 表滿都用呢個 code，唔講係邊一層） |
-| 500 | 未宣告嘅錯誤，code 一律係 `INTERNAL`，唔會洩露內部資料 |
+| 500 | 未宣告嘅錯誤用 `INTERNAL`，唔會洩露內部資料；已宣告 `MEMORY_UNSUPPORTED_SQL` 代表 in-memory backend 唔支援該 query（決定 183），請用 `--db postgres` |
 | 503 | 暫時唔可用（包括遷移期間凍結寫入、kill switch 停用咗嘅 endpoint、`TX_CONFLICT`（7.4，帶 `Retry-After: 1`）、`DB_POOL_EXHAUSTED`（決定 129，連線池任何上限滿咗，帶 `Retry-After`；值 `1`，已確認（產品經理 2026-10-16））），可以帶 `Retry-After` |
 | 504 | 對外 call 超時，或者 transaction 超時 `TX_TIMEOUT`（7.4） |
 

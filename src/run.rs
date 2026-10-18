@@ -238,17 +238,14 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
     auth.signing_keys =
         crate::runtime::load_signing_keys(&manifest, &|name| std::env::var(name).ok(), &auth.kid)?;
     if memory {
-        let with_query: Vec<&str> = manifest
-            .methods
-            .iter()
-            .filter(|m| m.steps.iter().any(|s| s.op == "query"))
-            .map(|m| m.target.as_str())
-            .collect();
-        if !with_query.is_empty() {
-            eprintln!(
-                "warning: --db memory does not run `query` steps; these methods will fail until you use PostgreSQL: {}",
-                with_query.join(", ")
-            );
+        for method in &manifest.methods {
+            for step in method.steps.iter().filter(|s| s.op == "query") {
+                if let Err(reason) = crate::runtime::memsql::classify(&step.sql)
+                    .and_then(|plan| plan.check_models(&manifest.models))
+                {
+                    eprintln!("warning: {} step {} will fail on --db memory with MEMORY_UNSUPPORTED_SQL; fine on PostgreSQL: {reason}", method.target, step.id);
+                }
+            }
         }
     }
     // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.

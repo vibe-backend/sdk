@@ -5,6 +5,7 @@ mod exec;
 mod http;
 pub mod jwks;
 mod limiter;
+pub mod memsql;
 pub mod migrate;
 mod ops;
 pub mod refresh;
@@ -61,7 +62,8 @@ pub fn internal_metrics() -> String {
     output
 }
 
-/// Platform error codes that may reach API clients.
+/// Platform error codes advertised to the compiler prompt.
+/// Backend-specific failures are handled separately to keep runtime changes prompt-neutral.
 pub const RUNTIME_ERROR_CODES: &[&str] = &[
     "BAD_REQUEST",
     "CHALLENGE_FAILED",
