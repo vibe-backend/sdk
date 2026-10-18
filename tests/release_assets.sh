@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests for scripts/ci/release-assets.sh, including a rehearsal of the tag-path
 # publish step with a stub `gh` (no token, nothing is published).
-# Usage: tests/release_assets.sh [dist-dir]   (default: synthetic archives)
+# Usage: tests/release_assets.sh [dist-dir | --unit-only]   (default: synthetic archives)
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 script="$here/scripts/ci/release-assets.sh"
@@ -24,6 +24,19 @@ mkdist() {
 expect_ok() { if "$@" >/dev/null 2>&1; then echo "ok   $T"; else echo "FAIL $T"; fail=1; fi; }
 expect_err() { if "$@" >/dev/null 2>&1; then echo "FAIL $T (accepted)"; fail=1; else echo "ok   $T"; fi; }
 
+# Pure classification checks run before any synthetic or supplied artifacts.
+for tag in v1.0.0 v1.0.0+meta; do
+  T="stable tag $tag"
+  if [ "$("$script" classify "$tag")" = stable ]; then echo "ok   $T"; else echo "FAIL $T"; fail=1; fi
+done
+for tag in v1.0.0-rc.1 v1.0.0-rc.2 v1.2.3-beta.1 v1.0.0-rc.1+meta; do
+  T="prerelease tag $tag"
+  if [ "$("$script" classify "$tag")" = prerelease ]; then echo "ok   $T"; else echo "FAIL $T"; fail=1; fi
+done
+for tag in v1.0 1.0.0 v1.0.0junk v1.0.0- v1.0.0+; do
+  T="reject malformed tag $tag"; expect_err "$script" classify "$tag"
+done
+[ "${1:-}" != --unit-only ] || exit "$fail"
 SRC=${1:-}
 
 T="valid dist";             mkdist; expect_ok "$script" verify "$work/dist"
@@ -52,6 +65,15 @@ if PATH="$work/bin:$PATH" "$script" publish "$work/dist" v0.0.0-rehearsal >/dev/
   want=$( (cut -c67- "$work/dist/SHA256SUMS"; echo SHA256SUMS) | LC_ALL=C sort)
   if [ "$got" = "$want" ] && grep -qx "v0.0.0-rehearsal" "$GH_LOG"; then echo "ok   $T"; echo "       ${got//$'\n'/ }"; else echo "FAIL $T"; cat "$GH_LOG"; fail=1; fi
 else echo "FAIL $T"; fail=1; fi
+for tag in v1.0.0-rc.2 v1.0.0-rc.1+build v1.0.0 v1.0.0+meta; do
+  T="publish flags $tag"
+  if PATH="$work/bin:$PATH" "$script" publish "$work/dist" "$tag" >/dev/null; then
+    case $tag in
+      *-*) if grep -qx -- --prerelease "$GH_LOG" && grep -qx -- --latest=false "$GH_LOG" && ! grep -qx -- --latest "$GH_LOG"; then echo "ok   $T"; else echo "FAIL $T"; fail=1; fi ;;
+      *) if grep -qx -- --latest "$GH_LOG" && ! grep -qx -- --prerelease "$GH_LOG" && ! grep -qx -- --latest=false "$GH_LOG"; then echo "ok   $T"; else echo "FAIL $T"; fail=1; fi ;;
+    esac
+  else echo "FAIL $T"; fail=1; fi
+done
 T="publish refuses tampered dist"; mkdist; rm -f "$GH_LOG"; echo x >"$work/dist/vibe-extra.zip"
 if PATH="$work/bin:$PATH" "$script" publish "$work/dist" v0.0.0-rehearsal >/dev/null 2>&1 || [ -e "$GH_LOG" ]; then echo "FAIL $T"; fail=1; else echo "ok   $T"; fi
 T="publish refuses existing release"; mkdist

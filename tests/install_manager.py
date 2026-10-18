@@ -10,7 +10,10 @@ set -eu
 printf "%s\\n" "$*" >> "$MOCK_CURL_LOG"
 out=; url=
 while [ $# -gt 0 ]; do case $1 in -o) out=$2;shift 2;;-w|--retry|--proto)shift 2;;--tlsv1.2|-f|-L|-s|-S|-I|-fsSIL)shift;;*)url=$1;shift;;esac;done
-if echo "$url"|grep -q '/releases/latest$';then printf '%s/test/repo/releases/tag/%s' "$VIBE_INSTALL_DOWNLOAD_URL" "${MOCK_LATEST:-v2.0.0}";exit 0;fi
+if echo "$url"|grep -q '/releases/latest$';then
+ if [ "${MOCK_LATEST_404:-0}" = 1 ]; then printf '404 %s' "$url"; exit 22; fi
+ if [ -n "${MOCK_LATEST_REDIRECT:-}" ]; then printf '200 %s' "$MOCK_LATEST_REDIRECT"; exit 0; fi
+ printf '200 %s/test/repo/releases/tag/%s' "$VIBE_INSTALL_DOWNLOAD_URL" "${MOCK_LATEST:-v2.0.0}";exit 0;fi
 [ "${MOCK_NETWORK_FAIL:-0}" != 1 ]||exit 22
 name=${url##*/};rest=${url#*/download/};version=${rest%%/*};cp "$MOCK_SERVER/$version/$name" "$out"
 ''')
@@ -29,6 +32,14 @@ name=${url##*/};rest=${url#*/download/};version=${rest%%/*};cp "$MOCK_SERVER/$ve
  def test_help(self):self.assertEqual(self.runit("--help").returncode,0)
  def test_fresh_repeat(self):self.install1();self.assertEqual(subprocess.check_output([self.dest/"vibe"],text=True).strip(),"one");before=os.readlink(self.dest/"vibe");self.assertEqual(self.runit("install","--version","v1.0.0").returncode,0);self.assertEqual(before,os.readlink(self.dest/"vibe"))
  def test_upgrade_latest(self):self.install1();r=self.runit("upgrade");self.assertEqual(r.returncode,0,r.stderr);self.assertEqual(subprocess.check_output([self.dest/"vibe"],text=True).strip(),"two")
+ def test_latest_missing_stable(self):
+  self.install1();before=os.readlink(self.dest/"vibe")
+  for mock in [{"MOCK_LATEST_404":"1"},{"MOCK_LATEST_REDIRECT":"https://mock.invalid/test/repo/releases"}]:
+   with self.subTest(mock=mock):
+    r=self.runit("upgrade",env=self.env|mock);self.assertNotEqual(r.returncode,0);self.assertIn("no stable release of test/repo",r.stderr);self.assertIn("--version",r.stderr);self.assertEqual(os.readlink(self.dest/"vibe"),before)
+ def test_latest_outside_repository(self):
+  r=self.runit("upgrade",env=self.env|{"MOCK_LATEST_REDIRECT":"https://other.invalid/test/repo/releases"})
+  self.assertNotEqual(r.returncode,0);self.assertIn("redirected outside expected repository",r.stderr)
  def test_remove_only_managed(self):self.dest.mkdir();keep=self.dest/"keep";keep.write_text("safe");self.install1();self.assertEqual(self.runit("remove").returncode,0);self.assertTrue(keep.exists());self.assertFalse((self.dest/"vibe").exists())
  def test_network_failure_preserves(self):self.install1();self.assertNotEqual(self.runit("upgrade","--version","v2.0.0",env=self.env|{"MOCK_NETWORK_FAIL":"1"}).returncode,0);self.assertEqual(subprocess.check_output([self.dest/"vibe"],text=True).strip(),"one")
  def test_checksum_failure_preserves(self):self.install1();self.release("v3.0.0","bad",True);self.assertNotEqual(self.runit("upgrade","--version","v3.0.0").returncode,0);self.assertEqual(subprocess.check_output([self.dest/"vibe"],text=True).strip(),"one")

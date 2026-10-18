@@ -60,7 +60,9 @@ Fork PRs get no secrets, so they only run the validator, not the recompile (§2A
 
 ## Compiled lock md example
 
-Decision 174: provider, endpoint host, model, seed and sent parameters are recorded in the build record and manifest provenance `compilers` map. Locks contain `vibe-version`: stable versions use major.minor (including 0.x); pre-releases use the full version. Exact matches are required (decision 176).
+Decision 174: provider, public endpoint host, model, seed and sent parameters are recorded in the build record and manifest provenance `compilers` map. Locks contain `vibe-version`: stable versions use major.minor (including 0.x); pre-releases use the full version. Exact matches are required (decision 176).
+
+Decision 180 modifies decision 174: private endpoints record only `endpoint-private: true`; the host is never recorded, in plaintext, hashed or derived, in build records, dev/release manifest provenance or generated project/artifact files. Public hosts retain their existing serialization. Old records/manifests still parse, and old signed dev manifests still verify; build writers remove legacy private hosts. The sole exception is `.vibe/cache` keys: this cache is never committed or packaged. `vibe build -o <manifest-path>` and `--release` write a manifest, and the runtime artifact loader reads only the manifest and release signature bundle, never the cache. Interactive setup may save `LLM_BASE_URL` in `.env`; that user configuration is unchanged.
 
 ````markdown
 vibe-version: 1.0.0-rc.2
@@ -174,7 +176,7 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 
 `vibe build` replaces the official `*.lock.md` files only when **every** source compiles. Any failure leaves all locks on disk unchanged and exits non-zero. The replacement stages each lock in a fsynced temp file, swaps them in, and rolls back if a rename fails.
 
-Each source's successful LLM output is cached in `.vibe/cache/llm/<key>.md`, so a rerun after a partial failure does not call the LLM again for those files. The key is a SHA-256 over the system prompt (incl. vibe version stamp), the LLM input (source plus dependency context), provider, endpoint host, model, seed, sent parameters and vibe version stamp; any change is a cache miss. Cached output goes through the same normalization and checks as fresh output, and `vibe build --check` builds in memory and checks deploy policy without writing files. `.vibe/` is gitignored; delete `.vibe/cache/` to force fresh LLM calls.
+Each source's successful LLM output is cached in `.vibe/cache/llm/<key>.md`, so a rerun after a partial failure does not call the LLM again for those files. The key is a SHA-256 over the system prompt (incl. vibe version stamp), the LLM input (source plus dependency context), provider, public endpoint host, model, seed, sent parameters and vibe version stamp; any change is a cache miss. Cached output goes through the same normalization and checks as fresh output, and `vibe build --check` builds in memory and checks deploy policy without writing files. `.vibe/` is gitignored; delete `.vibe/cache/` to force fresh LLM calls.
 
 ## Interrupted writes
 

@@ -59,7 +59,10 @@ pub fn write_with_compilers(
 ) -> Result<(), String> {
     let record = BuildRecord {
         test_build: compilers.values().any(|s| s.llm_provider == "fake"),
-        compilers,
+        compilers: compilers
+            .into_iter()
+            .map(|(path, stamp)| (path, stamp.without_private_host()))
+            .collect(),
         version: VERSION,
         locks,
         translations,
@@ -117,5 +120,44 @@ mod tests {
         assert!(provenance.translations.is_empty());
         assert!(provenance.compilers.is_empty());
         assert_eq!(serde_json::to_string(&provenance).unwrap(), old);
+    }
+}
+
+#[cfg(test)]
+mod private_host_tests {
+    #[test]
+    fn old_private_records_parse_but_writers_remove_hosts() {
+        for private in [true, false] {
+            let host = if private {
+                "old-private.example"
+            } else {
+                "api.openai.com"
+            };
+            let raw = serde_json::json!({"version":1,"locks":{},"compilers":{"a.lock.md":{
+                "llm-provider":"openai","model-snapshot":"test","endpoint-host":host,
+                "endpoint-private":private,"llm-seed":0,"sent-params":{}
+            }}});
+            let record: super::BuildRecord = serde_json::from_value(raw).unwrap();
+            assert_eq!(
+                record.compilers["a.lock.md"].endpoint_host.as_deref(),
+                Some(host)
+            );
+            let root =
+                std::env::temp_dir().join(format!("vibe-private-record-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(root.join(".vibe")).unwrap();
+            super::write_with_compilers(&root, record.locks, record.translations, record.compilers)
+                .unwrap();
+            let written = std::fs::read_to_string(root.join(super::PATH)).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&written).unwrap();
+            let stamp = &json["compilers"]["a.lock.md"];
+            assert_eq!(stamp["endpoint-private"], private);
+            if private {
+                assert!(stamp.get("endpoint-host").is_none());
+                assert!(!written.contains(host));
+            } else {
+                assert_eq!(stamp["endpoint-host"], host);
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }

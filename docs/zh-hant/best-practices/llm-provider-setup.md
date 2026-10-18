@@ -54,7 +54,9 @@ Fork PR 沒有 secrets，因此只執行 validator，不重新編譯（§2A.8.5�
 
 ## 編譯後的 lock md 範例
 
-決定 174：provider、endpoint host、model、seed 同 sent parameters 記喺 build record 同 manifest provenance 嘅 `compilers` map。Lock 只記 `vibe-version`：正式版（包括 0.x）用 major.minor，pre-release 用完整版本，必須完全一致（決定 176）。
+決定 174：provider、public endpoint host、model、seed 同 sent parameters 記喺 build record 同 manifest provenance 嘅 `compilers` map。Lock 只記 `vibe-version`：正式版（包括 0.x）用 major.minor，pre-release 用完整版本，必須完全一致（決定 176）。
+
+決定 180 更新決定 174：private endpoint 只記 `endpoint-private: true`，host 永遠唔以明文、hash 或任何衍生值記喺 build record、dev／release manifest provenance 或產生嘅 project／artifact 檔案；public host 照舊。舊 record／manifest 仍然 parse，舊 signed dev manifest 仍然驗簽；build 重寫時刪走 private host。唯一例外係 `.vibe/cache` key，cache 永遠唔 commit、唔打包；`vibe build -o <manifest-path>`／`--release` 只寫 manifest，runtime artifact loader 只讀 manifest 同 release signature bundle，唔讀 cache。互動設定可能寫 `LLM_BASE_URL` 入 `.env`，呢個用戶設定保持不變。
 
 ````markdown
 vibe-version: 1.0.0-rc.2
