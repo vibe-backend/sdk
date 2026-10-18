@@ -137,6 +137,7 @@ async fn real_model_create_zh_and_en() {
             std::env::temp_dir().join(format!("vibe-real-create-{}", uuid::Uuid::new_v4())),
         );
         let root = &project.0;
+        write(root, ".gitignore", ".env\n.vibe/cache/\n");
         write(
             root,
             "providers/main.md",
@@ -150,7 +151,7 @@ async fn real_model_create_zh_and_en() {
         );
         write(
             root,
-            "slugs.example.json",
+            ".vibe/slugs.json",
             r#"{"dev":{"tenant_id":"dev00001","public_access":true,"public_write":true}}"#,
         );
         write(
@@ -230,8 +231,11 @@ async fn real_model_create_zh_and_en() {
                 }
             }
         }
-        run(root, &["build"], &redact);
-        run(root, &["build"], &redact);
+        assert!(
+            runs.iter().skip(1).all(|snapshot| snapshot == &runs[0]),
+            "locks differ across the three builds ({})",
+            if zh { "zh" } else { "en" }
+        );
         let create = route(root, "create-product");
         let list = route(root, "list-products");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -278,7 +282,7 @@ async fn real_model_create_zh_and_en() {
         let body = response.text().await.expect("create body");
         eprintln!("POST {status}: {}", redact.clean(&body));
         assert!(
-            status.as_u16() == 201 || status.as_u16() == 200,
+            status.as_u16() == 201,
             "create failed: {}\n{}\n{}",
             redact.clean(&body),
             server_logs(root, &redact),
@@ -293,7 +297,7 @@ async fn real_model_create_zh_and_en() {
         let body = response.text().await.expect("list body");
         eprintln!("GET {status}: {}", redact.clean(&body));
         assert!(
-            status.is_success() && body.contains("SKU-1"),
+            status.as_u16() == 200 && body.contains("SKU-1"),
             "list failed: {}\n{}",
             redact.clean(&body),
             feature_locks(root, &redact)
