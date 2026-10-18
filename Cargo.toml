@@ -1,6 +1,6 @@
 [package]
 name = "vibe"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Markdown-driven serverless backend SDK and the vibe CLI"

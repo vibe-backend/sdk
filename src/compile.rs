@@ -81,8 +81,14 @@ pub async fn build_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, R
         let Some(text) = fs::read_to_string(opts.root.join(&rel)).ok() else {
             continue;
         };
-        let Ok(doc) = crate::lock::parse_lock(&text) else {
-            continue;
+        let doc = match crate::lock::parse_lock(&text) {
+            Ok(doc) => doc,
+            Err(error) if error.starts_with("lock frontmatter must not contain `writes:`") => {
+                let mut report = Report::new();
+                report.push(Diag::error(&rel, error));
+                return Err(report);
+            }
+            Err(_) => continue,
         };
         if !(record
             .as_ref()
@@ -1474,6 +1480,25 @@ pub(crate) fn llm_input(source: &SourceFile, docs: &HashMap<String, LockDoc>) ->
             if let Some((object, method)) = id.split_once("/methods/") {
                 line.push_str(&format!(" callable={object}.{method}"));
             }
+            let errors: std::collections::BTreeSet<String> =
+                crate::lock::find_section(&doc.sections, "Signature")
+                    .and_then(|sig| sig.get("errors"))
+                    .and_then(|raw| crate::lock::parse_string_list(raw).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+            if !errors.is_empty() {
+                line.push_str(&format!(
+                    " errors=[{}]",
+                    errors.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+        if doc.meta.kind == Kind::Model {
+            let mut errors = crate::manifest::CRUD_ERROR_CODES.to_vec();
+            errors.sort_unstable();
+            errors.dedup();
+            line.push_str(&format!(" crud-errors=[{}]", errors.join(", ")));
         }
         deps.push_str(&prompt_safe(&line));
         deps.push('\n');
@@ -3257,7 +3282,7 @@ mod prompt_tests {
             hash.update(prompt.as_bytes());
         }
         let actual = hex::encode(hash.finalize());
-        assert_eq!(actual, include_str!("compile_prompt.sha256").trim(), "compile prompt changed: update src/compile_prompt.sha256 and bump the minor version in Cargo.toml (prompts change only in minor versions; scripts/ci/check-prompt-version.py enforces this)");
+        assert_eq!(actual, include_str!("compile_prompt.sha256").trim(), "compile prompt changed: update src/compile_prompt.sha256 and bump the minor/major version, or the next rc after a tagged rc (decision 181; CI skips pre-releases)");
     }
 
     #[test]
@@ -3459,6 +3484,30 @@ mod prompt_tests {
             .filter_map(|l| l.strip_prefix("- ").and_then(|l| l.split(' ').next()))
             .map(str::to_string)
             .collect()
+    }
+
+    #[test]
+    fn method_dependency_errors_are_sorted_unique_and_optional() {
+        let mut doc = LockDoc {
+            meta: crate::lock::Meta::pending(
+                Kind::Method,
+                None,
+                "product/methods/create",
+                "method.md",
+            ),
+            sections: crate::lock::parse_sections(
+                "## Signature\n- errors: [Z_CODE, A_CODE, Z_CODE]\n",
+            )
+            .unwrap(),
+        };
+        let mut docs = HashMap::new();
+        docs.insert(doc.meta.id.clone(), doc.clone());
+        let first = llm_input(&feature("Call product.create"), &docs);
+        assert!(first.contains("callable=product.create errors=[A_CODE, Z_CODE]"));
+        assert_eq!(llm_input(&feature("Call product.create"), &docs), first);
+        doc.sections = crate::lock::parse_sections("## Signature\n- writes: true\n").unwrap();
+        docs.insert(doc.meta.id.clone(), doc);
+        assert!(!llm_input(&feature("Call product.create"), &docs).contains("errors="));
     }
 
     #[tokio::test]

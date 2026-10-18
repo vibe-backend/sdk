@@ -57,7 +57,7 @@ source: pipelines/login-guard.md
 source-hash: sha256:51bd...07
 source-type: natural
 dependencies: []
-vibe-version: 1.0.0-rc.2
+vibe-version: 1.0.0-rc.3
 status: approved
 approval-mode: manual
 approved-by: [jack@example]

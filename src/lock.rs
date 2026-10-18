@@ -736,6 +736,9 @@ fn parse_meta(front: &str) -> Result<Meta, String> {
         if let Some((key, value)) = line.split_once(':') {
             let key = key.trim();
             let value = value.trim();
+            if key == "writes" {
+                return Err("lock frontmatter must not contain `writes:`; writes are derived from method steps (decision 169). Declare writes in the source markdown, not in the lock".into());
+            }
             if value.is_empty() {
                 list_key = Some(key.to_string());
             } else {
@@ -1043,6 +1046,25 @@ pub fn signing_payload(rendered_with_none: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontmatter_writes_is_rejected() {
+        let doc = LockDoc {
+            meta: Meta::pending(Kind::Method, None, "product/methods/create", "create.md"),
+            sections: parse_sections("## Signature\n- writes: true\n").unwrap(),
+        };
+        let rendered = render_lock(&doc);
+        assert!(!split_frontmatter(&rendered)
+            .unwrap()
+            .0
+            .lines()
+            .any(|line| line.starts_with("writes:")));
+        assert_eq!(parse_lock(&rendered).unwrap(), doc);
+        for value in ["true", "false", ""] {
+            let text = format!("---\nwrites: {value}\n---\n## Signature\n- writes: true\n");
+            assert_eq!(parse_lock(&text).unwrap_err(), "lock frontmatter must not contain `writes:`; writes are derived from method steps (decision 169). Declare writes in the source markdown, not in the lock");
+        }
+    }
 
     #[test]
     fn version_stamps() {

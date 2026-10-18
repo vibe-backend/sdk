@@ -98,9 +98,10 @@ all release checks, ready for Sigstore signing. Options include `--project`,
 `-o`/`--output`, `--release-version`, and `--commit`.
 
 Run the project with `vibe run`, then curl the API. Use `--artifact` to run a build artifact.
-Locks record `vibe-version: 1.0.0-rc.2`: stable versions use major.minor and
+Locks record `vibe-version: 1.0.0-rc.3`: stable versions use major.minor and
 pre-releases use the full version, with an exact match required. Run
 `vibe build` to regenerate locks from another version or the old lock format.
+Locks built by an rc.2 binary are stamped `1.0.0-rc.2` and must be rebuilt with the matching binary using `vibe build`.
 
 ## Status
 

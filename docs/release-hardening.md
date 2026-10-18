@@ -49,3 +49,5 @@ WARN vibe::rate_limit_saturation: rate-limit shard saturated; refusing new keys 
 - An admin can bypass the `main` ruleset (OrganizationAdmin bypass). The only human approval gate is Jack approving the `release` environment; the automatic gates remain decisions 113/114/118. The same account (`j113203`) can approve its own release. Admin bypass stays on; Jack accepted this risk.
 
 Internal metrics collectors can call `vibe::runtime::internal_metrics()` for the saturation counter and `vibe_refresh_rejections_total{reason}` counters in Prometheus text format.
+
+After an rc is tagged, any compile-prompt change must bump to the next rc (decision 181), preserving decision 176 exact-match lock stamps. The CI prompt check skips pre-releases; this is a release rule.

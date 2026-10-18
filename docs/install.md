@@ -27,7 +27,7 @@ Checksum and pinned attestation verification are identical for both binaries.
 ./scripts/vibe-install.sh install --version v1.0.0-rc.2
 ./scripts/vibe-install.sh install --version v1.0.0-rc.2 --runtime
 VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.2
-./scripts/vibe-install.sh upgrade --non-interactive
+./scripts/vibe-install.sh upgrade --version v1.0.0-rc.2 --non-interactive
 ./scripts/vibe-install.sh remove --runtime
 ./scripts/vibe-install.sh remove
 ```
