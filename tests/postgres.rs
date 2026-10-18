@@ -1708,72 +1708,139 @@ async fn concurrent_startups_apply_a_tenant_migration_once() {
 #[tokio::test]
 async fn memory_allowlist_forms_match_postgres_raw_tenant_roles() {
     let s = require_pg!(setup().await);
-    // setup holds the catalog lock, so creating shared query roles is race-free.
-    for role in ["public_reader", "public_writer"] {
-        s.admin.batch_execute(&format!("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN CREATE ROLE {role}; END IF; END $$; GRANT {role} TO {}",s.app)).await.unwrap();
-    }
-    let table = format!("\"t_{}\".counters", s.tenant);
-    s.admin.batch_execute(&format!(
-        "CREATE TABLE {table} (id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY, tenant_id text NOT NULL DEFAULT current_setting('app.tenant_id'), name text UNIQUE NOT NULL, value integer NOT NULL DEFAULT 0, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()); \
-         ALTER TABLE {table} ENABLE ROW LEVEL SECURITY; ALTER TABLE {table} FORCE ROW LEVEL SECURITY; \
-         CREATE POLICY tenant_isolation ON {table} USING (tenant_id = current_setting('app.tenant_id')) WITH CHECK (tenant_id = current_setting('app.tenant_id')); \
-         GRANT USAGE ON SCHEMA \"t_{}\" TO public_reader,public_writer; \
-         GRANT SELECT ON {table} TO public_reader; GRANT SELECT,INSERT,UPDATE ON {table} TO public_writer",s.tenant)).await.unwrap();
-    let pg = PgExec::connect(&url_as(&s.admin_url, &s.app))
-        .await
-        .unwrap();
-    let read = "SELECT COALESCE(MAX(value), 0) AS value FROM counters WHERE name = $1";
-    let rows = pg
-        .raw(
-            &s.tenant,
-            "public_reader",
-            false,
-            read,
-            vec![Some("counter".into())],
-        )
-        .await
-        .unwrap();
-    assert_eq!(rows[0]["value"], 0);
-    for (sql,params,expected) in [
-        ("INSERT INTO counters (name,value) VALUES ($1,1) ON CONFLICT (name) DO UPDATE SET value = counters.value + EXCLUDED.value RETURNING value",vec![Some("counter".into())],1),
-        ("INSERT INTO counters (name,value) VALUES ($1,1) ON CONFLICT (name) DO UPDATE SET value = counters.value + EXCLUDED.value RETURNING value",vec![Some("counter".into())],2),
-        ("UPDATE counters SET value = value + $2 WHERE name = $1 RETURNING value",vec![Some("counter".into()),Some("3".into())],5),
-        ("UPDATE counters SET value = value + 2 WHERE name = $1 RETURNING *",vec![Some("counter".into())],7),
-        ("INSERT INTO counters (name,value) VALUES ($1,1) ON CONFLICT (name) DO UPDATE SET value = counters.value + 4 RETURNING value",vec![Some("counter".into())],11),
-        (read,vec![Some("counter".into())],11),
-    ] {
-        let writes=!sql.starts_with("SELECT");
-        let rows=pg.raw(&s.tenant,if writes {"public_writer"} else {"public_reader"},writes,sql,params).await.unwrap();
-        assert_eq!(rows[0]["value"],expected);
-    }
-    let rows=pg.raw(&s.tenant,"public_writer",true,"INSERT INTO counters (name,value) VALUES ($1,99) ON CONFLICT (name) DO NOTHING RETURNING value",vec![Some("counter".into())]).await.unwrap();
-    assert!(rows.is_empty());
-    assert!(pg
-        .raw(
-            &s.tenant,
-            "public_reader",
-            true,
-            "UPDATE counters SET value = value + 1 WHERE name = $1 RETURNING value",
-            vec![Some("counter".into())]
-        )
-        .await
-        .is_err());
     let other = format!("tn{}", suffix());
-    s.admin.batch_execute(&format!("CREATE SCHEMA \"t_{other}\"; CREATE TABLE \"t_{other}\".counters (LIKE {table} INCLUDING ALL); GRANT USAGE ON SCHEMA \"t_{other}\" TO public_reader; GRANT SELECT ON \"t_{other}\".counters TO public_reader")).await.unwrap();
-    assert_eq!(
-        pg.raw(
-            &other,
-            "public_reader",
-            false,
-            read,
-            vec![Some("counter".into())]
-        )
-        .await
-        .unwrap()[0]["value"],
-        0
-    );
+    // Match tests/fixtures/auth-app/schema.sql, preserving pre-existing roles.
+    let mut created_roles = Vec::new();
+    for role in ["public_reader", "public_writer"] {
+        if !s
+            .admin
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)",
+                &[&role],
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+        {
+            created_roles.push(role);
+        }
+    }
+    let admin_url = s.admin_url.clone();
+    let owner = s.owner.clone();
+    let app = s.app.clone();
+    let tenant = s.tenant.clone();
+    let other_tenant = other.clone();
+    // A task captures assertion panics, letting cleanup finish while the
+    // harness still holds the exclusive catalog lock.
+    let result = tokio::spawn(async move {
+        let admin = connect(&admin_url).await;
+        for role in ["public_reader", "public_writer"] {
+            admin.batch_execute(&format!(
+                "DO $$ BEGIN CREATE ROLE {role} NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$; GRANT {role} TO {app}"
+            )).await.unwrap();
+        }
+        let mut m = manifest();
+        let mut counter = m.models[0].clone();
+        counter.id = "counter".into();
+        counter.table = "counters".into();
+        counter.fields.retain(|f| f.name != "body");
+        let mut name = field("name", "string");
+        name["unique"] = json!(true);
+        counter.fields.push(serde_json::from_value(name).unwrap());
+        counter.fields.push(serde_json::from_value(field("value", "integer")).unwrap());
+        m.models.push(counter);
+        let mut migration = m.migrations[0].clone();
+        migration.id = "migrations/main/0003-counters".into();
+        migration.seq = "0003".into();
+        // Model bootstrap supplies the platform RLS policy. Migrations supply
+        // defaults and the global name constraint used by ON CONFLICT (name).
+        migration.statements = vec![
+            "ALTER TABLE counters ALTER COLUMN id SET DEFAULT gen_random_uuid(), ALTER COLUMN tenant_id SET DEFAULT current_setting('app.tenant_id', false), ALTER COLUMN created_at SET DEFAULT now(), ALTER COLUMN updated_at SET DEFAULT now(), ALTER COLUMN value SET DEFAULT 0, ADD UNIQUE (name)".into(),
+        ];
+        m.migrations.push(migration);
+        let owner_exec = PgExec::connect(&url_as(&admin_url, &owner)).await.unwrap();
+        for tenant in [&tenant, &other_tenant] {
+            migrate_tenant(&owner_exec, &m, tenant, &app).await.unwrap();
+            admin.batch_execute(&format!(
+                "GRANT USAGE ON SCHEMA \"t_{tenant}\" TO public_reader, public_writer; \
+                 GRANT SELECT ON \"t_{tenant}\".counters TO public_reader; \
+                 GRANT SELECT, INSERT, UPDATE ON \"t_{tenant}\".counters TO public_writer"
+            )).await.unwrap();
+        }
+        let pg = PgExec::connect(&url_as(&admin_url, &app))
+            .await
+            .unwrap();
+        let read = "SELECT COALESCE(MAX(value), 0) AS value FROM counters WHERE name = $1";
+        let rows = pg
+            .raw(
+                &tenant,
+                "public_reader",
+                false,
+                read,
+                vec![Some("counter".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["value"], 0);
+        for (sql,params,expected) in [
+            ("INSERT INTO counters (name,value) VALUES ($1,1) ON CONFLICT (name) DO UPDATE SET value = counters.value + EXCLUDED.value RETURNING value",vec![Some("counter".into())],1),
+            ("INSERT INTO counters (name,value) VALUES ($1,1) ON CONFLICT (name) DO UPDATE SET value = counters.value + EXCLUDED.value RETURNING value",vec![Some("counter".into())],2),
+            ("UPDATE counters SET value = value + $2 WHERE name = $1 RETURNING value",vec![Some("counter".into()),Some("3".into())],5),
+            ("UPDATE counters SET value = value + 2 WHERE name = $1 RETURNING *",vec![Some("counter".into())],7),
+            ("INSERT INTO counters (name,value) VALUES ($1,1) ON CONFLICT (name) DO UPDATE SET value = counters.value + 4 RETURNING value",vec![Some("counter".into())],11),
+            (read,vec![Some("counter".into())],11),
+        ] {
+            let writes=!sql.starts_with("SELECT");
+            let rows=pg.raw(&tenant,if writes {"public_writer"} else {"public_reader"},writes,sql,params).await.unwrap();
+            assert_eq!(rows[0]["value"],expected);
+        }
+        let rows=pg.raw(&tenant,"public_writer",true,"INSERT INTO counters (name,value) VALUES ($1,99) ON CONFLICT (name) DO NOTHING RETURNING value",vec![Some("counter".into())]).await.unwrap();
+        assert!(rows.is_empty());
+        assert!(pg
+            .raw(
+                &tenant,
+                "public_reader",
+                true,
+                "UPDATE counters SET value = value + 1 WHERE name = $1 RETURNING value",
+                vec![Some("counter".into())]
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            pg.raw(
+                &other_tenant,
+                "public_reader",
+                false,
+                read,
+                vec![Some("counter".into())]
+            )
+            .await
+            .unwrap()[0]["value"],
+            0
+        );
+    }).await;
+    // Drop both migrated tenants and setup's platform schema before removing
+    // their owners. DROP OWNED also revokes database grants; DROP ROLE
+    // removes memberships without deleting pre-existing shared query roles.
     s.admin
-        .batch_execute(&format!("DROP SCHEMA \"t_{other}\" CASCADE"))
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS \"t_{}\" CASCADE; DROP SCHEMA IF EXISTS \"t_{other}\" CASCADE; \
+         DROP SCHEMA IF EXISTS vibe_platform CASCADE; \
+         DROP OWNED BY {}, {}; DROP ROLE {}, {}",
+            s.tenant, s.app, s.owner, s.app, s.owner
+        ))
         .await
         .unwrap();
+    for role in created_roles {
+        s.admin
+            .batch_execute(&format!("DROP ROLE {role}"))
+            .await
+            .unwrap();
+    }
+    if let Err(error) = result {
+        if error.is_panic() {
+            std::panic::resume_unwind(error.into_panic());
+        }
+        panic!("counter task failed: {error}");
+    }
 }

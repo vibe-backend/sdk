@@ -62,7 +62,8 @@ pub fn internal_metrics() -> String {
     output
 }
 
-/// Platform error codes that may reach API clients.
+/// Platform error codes advertised to the compiler prompt.
+/// Backend-specific failures are handled separately to keep runtime changes prompt-neutral.
 pub const RUNTIME_ERROR_CODES: &[&str] = &[
     "BAD_REQUEST",
     "CHALLENGE_FAILED",
@@ -72,7 +73,6 @@ pub const RUNTIME_ERROR_CODES: &[&str] = &[
     "FORBIDDEN",
     "INTERNAL",
     "INVALID_REFRESH_TOKEN",
-    "MEMORY_UNSUPPORTED_SQL",
     "METHOD_NOT_ALLOWED",
     "NOT_FOUND",
     "PAYLOAD_TOO_LARGE",

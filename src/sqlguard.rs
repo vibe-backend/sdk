@@ -361,8 +361,7 @@ pub fn analyze(sql: &str) -> Result<SqlInfo, String> {
     if let Some(problem) = query_problem(sql) {
         return Err(problem);
     }
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(|e| e.to_string())?;
-    let statement = &statements[0];
+    let statement = parse_one(sql)?;
     Ok(SqlInfo {
         writes: !matches!(statement, Statement::Query(_)),
         targets_rows: matches!(statement, Statement::Update { .. } | Statement::Delete(_)),

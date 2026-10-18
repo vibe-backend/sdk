@@ -230,7 +230,7 @@ impl MemoryExec {
     }
 
     /// Tests only: every `query` step returns one row `{column: <first
-    /// param>}` instead of the PostgreSQL-only error (a stand-in lookup).
+    /// param>}` instead of executing SQL (a stand-in lookup).
     pub fn stub_queries(&self, column: &str) {
         if let Ok(mut stub) = self.query_stub.lock() {
             *stub = Some(column.to_string());

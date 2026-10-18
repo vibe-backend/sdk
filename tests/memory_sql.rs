@@ -216,3 +216,16 @@ fn classifier_rejects_unsupported_constructs_without_panicking() {
         classify(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+#[test]
+fn supported_forms_pass_the_postgres_guard_and_row_wrapper() {
+    for sql in [
+        UPSERT,
+        GET,
+        "UPDATE counters SET value = value + $2 WHERE name = $1 RETURNING *",
+        "INSERT INTO counters (name,value) VALUES ($1,1) ON CONFLICT (name) DO NOTHING RETURNING value",
+    ] {
+        assert_eq!(vibe::sqlguard::query_problem(sql), None, "{sql}");
+        assert_eq!(vibe::sqlguard::wrapped_problem(&vibe::sqlguard::wrap_for_rows(sql)), None, "{sql}");
+    }
+}

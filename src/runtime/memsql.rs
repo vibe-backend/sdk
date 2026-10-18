@@ -8,6 +8,8 @@ impl std::fmt::Display for Unsupported {
         write!(f, "MEMORY_UNSUPPORTED_SQL: the in-memory database supports only UPDATE ... SET c = c + n WHERE <unique> = $n, INSERT ... ON CONFLICT (<unique>) DO UPDATE|DO NOTHING, SELECT ... WHERE <unique> = $n and SELECT COALESCE(MAX(c), n); use --db postgres for: {}", self.0)
     }
 }
+impl std::error::Error for Unsupported {}
+
 fn unsupported(reason: impl ToString) -> Unsupported {
     Unsupported(reason.to_string())
 }
@@ -83,9 +85,9 @@ fn input(e: &Expr, excluded: bool) -> Result<Input, Unsupported> {
             .map(Input::Param)
             .ok_or_else(|| unsupported("parameter placeholder")),
         Expr::Value(a::Value::Number(n, false)) => n
-            .parse::<i64>()
+            .parse::<serde_json::Number>()
             .map(|n| Input::Literal(n.into()))
-            .map_err(|_| unsupported("non-integer or out-of-range literal")),
+            .map_err(|_| unsupported("out-of-range numeric literal")),
         Expr::UnaryOp {
             op: a::UnaryOperator::Minus,
             expr,
@@ -141,6 +143,9 @@ fn assignments(
                 )
             {
                 return Err(unsupported("non-integer increment"));
+            }
+            if add && matches!(&value, Input::Literal(serde_json::Value::Number(n)) if n.as_i64().is_none()) {
+                return Err(unsupported("non-integer increment literal"));
             }
             if upsert && matches!(value, Input::Param(_)) {
                 return Err(unsupported("upsert parameter increment"));
@@ -242,6 +247,39 @@ impl MemPlan {
                 self.unique
             )));
         }
+        let integer_column = |name: &str| -> Result<(), Unsupported> {
+            if model
+                .fields
+                .iter()
+                .any(|f| f.name == name && f.ty == "integer")
+            {
+                Ok(())
+            } else {
+                Err(unsupported(format!(
+                    "integer operation on non-integer or unknown column {name}"
+                )))
+            }
+        };
+        let sets = match &self.action {
+            Action::Update(sets)
+            | Action::Insert {
+                sets: Some(sets), ..
+            } => sets.as_slice(),
+            Action::Max { column, .. } => {
+                integer_column(column)?;
+                &[]
+            }
+            _ => &[],
+        };
+        for set in sets {
+            if set.add {
+                integer_column(&set.column)?;
+            }
+            if let Input::Excluded(c) = &set.input {
+                integer_column(c)?;
+            }
+        }
+
         Ok(())
     }
 }
@@ -440,14 +478,14 @@ fn coerce(value: Value, ty: &str) -> Result<Value, ExecError> {
         "integer" => {
             let n = value
                 .as_i64()
-                .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+                .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
                 .ok_or_else(|| error("invalid integer parameter"))?;
             i32::try_from(n).map_err(|_| error("integer overflow"))?;
             Ok(n.into())
         }
         "number" => value
             .as_f64()
-            .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+            .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
             .and_then(serde_json::Number::from_f64)
             .map(Value::Number)
             .ok_or_else(|| error("invalid number parameter")),
@@ -460,6 +498,15 @@ fn coerce(value: Value, ty: &str) -> Result<Value, ExecError> {
             },
             _ => Err(error("invalid boolean parameter")),
         },
+        "json" => value
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .ok_or_else(|| error("invalid json parameter")),
+        "timestamp" => value
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.to_rfc3339().into())
+            .ok_or_else(|| error("invalid timestamp parameter")),
         "uuid" => value
             .as_str()
             .and_then(|s| uuid::Uuid::parse_str(s).ok())

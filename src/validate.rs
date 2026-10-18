@@ -1820,13 +1820,27 @@ pub fn sql_problems(sql: &str, params: &str, migration: bool) -> Vec<String> {
     if !migration && (DDL_SQL.is_match(&cleaned) || SELECT_INTO.is_match(&cleaned)) {
         problems.push("DDL is only allowed in migration locks".into());
     }
+    static WHERE_WORD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)\bwhere\b").expect("regex"));
+    let parsed = crate::sqlguard::parse_one(trimmed);
+    let is_upsert = matches!(
+        &parsed,
+        Ok(sqlparser::ast::Statement::Insert(sqlparser::ast::Insert {
+            on: Some(sqlparser::ast::OnInsert::OnConflict(_)),
+            ..
+        }))
+    );
     if matches!(
-        crate::sqlguard::parse_one(trimmed),
+        &parsed,
         Ok(sqlparser::ast::Statement::Update {
             selection: None,
             ..
         })
-    ) {
+    ) || (!is_upsert
+        && crate::security::sql_writes(trimmed)
+        && lower.contains("update")
+        && !WHERE_WORD.is_match(&lower))
+    {
         problems.push("UPDATE needs a WHERE clause".into());
     }
     if !migration {
@@ -2644,6 +2658,31 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("WHERE")));
     }
 
+    #[test]
+    fn upserts_without_where_are_accepted() {
+        for sql in [
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = EXCLUDED.a",
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING",
+        ] {
+            assert!(sql_problems(sql, "[]", false).is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn cte_and_unparsable_updates_without_where_are_rejected() {
+        for sql in [
+            "WITH x AS (UPDATE t SET a=1 RETURNING *) SELECT * FROM x",
+            "UPDATE t SET",
+        ] {
+            assert!(
+                sql_problems(sql, "[]", false)
+                    .iter()
+                    .any(|p| p == "UPDATE needs a WHERE clause"),
+                "{sql}"
+            );
+        }
+    }
+
     fn parsed_doc(kind: Kind, scope: Option<Scope>, id: &str, body: &str) -> LockDoc {
         LockDoc {
             meta: crate::lock::Meta::pending(kind, scope, id, format!("{id}.md")),
@@ -3226,6 +3265,8 @@ pub(crate) fn check_feature_contract(
         .iter()
         .map(|s| s.to_string())
         .collect();
+    // Runtime-only backend capability error; do not advertise it in compile prompts.
+    allowed.insert("MEMORY_UNSUPPORTED_SQL".into());
     let mut writing = None;
     let mut has_method = false;
     let mut constant_response = false;
