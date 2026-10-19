@@ -75,7 +75,7 @@ Keyless CI builds and file-based API keys are documented in
 ### Release manifest pins (decision 182)
 
 | Flag | Environment | Requirement |
-|---|---|---|
+| --- | --- | --- |
 | `--expect-identity` | `VIBE_EXPECT_IDENTITY` | Required caller workflow identity |
 | `--expect-issuer` | `VIBE_EXPECT_ISSUER` | Required; only `https://token.actions.githubusercontent.com` |
 | `--expect-repository-id` | `VIBE_EXPECT_REPOSITORY_ID` | Optional numeric GitHub repository id |
