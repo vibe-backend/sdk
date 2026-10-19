@@ -306,3 +306,54 @@ async fn public_gate_repairs_both_directions() {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[tokio::test]
+async fn unknown_model_provider_reaches_repair() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = std::env::temp_dir().join(format!("vibe-provider-repair-{}", uuid::Uuid::new_v4()));
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web-counter"),
+        &root,
+    );
+    assert!(!root.join("providers").exists());
+    let path = root.join("models/counter/counter.md");
+    let original = fs::read_to_string(&path).unwrap();
+    let good = format!("## Table{}", original.split_once("## Table").unwrap().1);
+    fs::write(
+        &path,
+        "Store a counter with a unique name and an integer value defaulting to zero.",
+    )
+    .unwrap();
+    let calls = AtomicUsize::new(0);
+    let adapter = vibe::FakeAdapter {
+        responder: |request: &vibe::llm::LlmRequest| {
+            assert!(request
+                .input
+                .contains("Target store: memory (provider: main;"));
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(good.replace("provider: main", "provider: memory"))
+            } else {
+                assert!(
+                    request
+                        .input
+                        .contains("unknown provider `memory`; use `main`"),
+                    "{}",
+                    request.input
+                );
+                Ok(good.clone())
+            }
+        },
+    };
+    vibe::regenerate_project(&vibe::CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&fake_config()),
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|r| panic!("{r}"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let lock = fs::read_to_string(root.join("models/counter/counter.lock.md")).unwrap();
+    assert!(lock.contains("- provider: main"), "{lock}");
+    fs::remove_dir_all(root).unwrap();
+}

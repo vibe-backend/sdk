@@ -19,7 +19,7 @@ LOCK GRAMMAR (the parser rejects anything else):
 
 const MODEL_KEYS: &str = "\
 MODEL KEYS:
-- ## Table bullets: provider, table, optional owner-key (a field holding the owner user id), optional ownership (tenant-wide | role(admin)).
+- ## Table bullets: provider, table, optional owner-key (a field holding the owner user id), optional ownership (tenant-wide | role(admin)). The provider is the name given in the Target store/DEPENDENCIES lines (for the implicit store, `main`), never the store kind.
 - ## Fields table header is exactly `| name | type | rules | system |`. One row per user field; do NOT add id, tenant_id, created_at, updated_at, deleted_at, erased_at (the platform adds them). system is `no`.
 - type is one of: uuid, string, string[], integer, number, boolean, timestamp, password, json, bytes.
 - rules is a comma-separated list from: required, nullable, unique, primary, default: <value|gen|now>, format: email, min: <int>, max: <int>, enum: [a, b], sensitive, untrusted, personal: <standard|sensitive>, public-writable. For strings min/max are character lengths (\"at most 80 characters\" is `max: 80`; there is no max_length/min_length/maxLength key). For integers/numbers min/max are values.
