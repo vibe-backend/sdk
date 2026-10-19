@@ -237,7 +237,9 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/vibe-release-llm-key"
       - name: Sign manifest with keyless OIDC (no fallback)
-        run: cosign sign-blob --yes --new-bundle-format --bundle dist/manifest.json.sigstore.json dist/manifest.json
+        # Require a Rekor v1 entry with inclusion proof and integrated time, verified offline by the runtime.
+        # The self-verify step below fails closed if this ever diverges.
+        run: cosign sign-blob --yes --use-signing-config=false --new-bundle-format --bundle dist/manifest.json.sigstore.json dist/manifest.json
       - name: Verify signed artifact with deployer pins
         env:
           VERSION: ${{ steps.guard.outputs.version }}

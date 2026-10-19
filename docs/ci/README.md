@@ -14,17 +14,22 @@ Locks are build output. They are not committed (`*.lock.md` is in
    to your project's `.github/workflows/release.yml`. A `v*` tag push calls
    `vibe-backend/sdk/.github/workflows/vibe-project-release.yml@v1.0.0`
    (`v1.0.0` is a placeholder). The SDK reference must be a release **tag**,
-   never a branch or SHA; Dependabot can bump it. Select the same SDK version
-   as the deployed runtime. The workflow checks its tag's commit against its
-   own commit and installs the SDK and runtime through the unchanged checksum
-   and SDK attestation checks.
+   never a branch or SHA; Dependabot can bump it. The reusable workflow is
+   available only from the first SDK release tag that contains it (the next
+   release after `v1.0.0-rc.4`); select that release or later, with the SDK tag
+   version equal to the deployed runtime version. The workflow checks its tag's
+   commit against its own commit and installs the SDK and runtime through the
+   unchanged checksum and SDK attestation checks.
    Its `build-and-sign` job uses the protected caller environment, validates
    the caller tag and explicit LLM model/key, builds a release manifest,
    signs with keyless OIDC/Fulcio/Rekor, self-verifies with caller pins, attests
    and uploads exactly the manifest and bundle. Signing failures fail the job
    without fallback. The key is passed through a 0600 temporary file and deleted.
-   The caller job grants `contents: write` (or `read` if publishing is disabled),
-   `id-token: write`, and `attestations: write`; top-level permissions are empty.
+   Signing disables cosign's TUF signing config to require a Rekor v1 entry with inclusion proof and integrated time for offline runtime verification; self-verification fails closed if this ever diverges.
+   The caller job must always grant `contents: write`, `id-token: write`, and
+   `attestations: write`, even if publishing is disabled: GitHub validates called
+   workflow job permissions at parse time, including the skipped `publish` job's
+   `contents: write`. Top-level permissions are empty.
    Internally only `build-and-sign` has OIDC/attestation write permission and
    `contents: read`. The separate `publish` job has only `contents: write`:
    it checks the digest and exact two-file artifact, then creates a release or
