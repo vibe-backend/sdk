@@ -1585,7 +1585,14 @@ fn normalize(
         Kind::Model => normalize_model(doc, source),
         Kind::Method => normalize_method(doc),
         Kind::Api => match source.scope {
-            Some(Scope::Definition) => normalize_definition(doc),
+            Some(Scope::Definition) => {
+                if implicit_memory_provider(docs)
+                    && find_section(&doc.sections, "Providers").is_none()
+                {
+                    doc.sections.push(Section::none("Providers"));
+                }
+                normalize_definition(doc)
+            }
             Some(Scope::Version) => normalize_version(doc),
             _ => normalize_feature(doc, source, docs),
         },
@@ -2230,7 +2237,15 @@ fn normalize_source_lines(sections: &mut [Section], text: &str) {
     }
 }
 
-fn dependencies(id: &str, docs: &HashMap<String, LockDoc>) -> Result<Vec<Dependency>, Diag> {
+/// No synthetic document or lock is created for the built-in memory provider.
+pub(crate) fn implicit_memory_provider(docs: &HashMap<String, LockDoc>) -> bool {
+    !docs.values().any(|doc| doc.meta.kind == Kind::Provider)
+}
+
+pub(crate) fn dependencies(
+    id: &str,
+    docs: &HashMap<String, LockDoc>,
+) -> Result<Vec<Dependency>, Diag> {
     let doc = docs.get(id).expect("doc");
     let mut ids: Vec<(String, Kind)> = Vec::new();
     match doc.meta.kind {
@@ -2324,6 +2339,9 @@ fn dependencies(id: &str, docs: &HashMap<String, LockDoc>) -> Result<Vec<Depende
     }
     let mut deps = Vec::new();
     for (dep_id, kind) in ids {
+        if kind == Kind::Provider && dep_id == "main" && implicit_memory_provider(docs) {
+            continue;
+        }
         let Some(dep) = docs.get(&dep_id) else {
             return Err(Diag::error(
                 &doc.meta.source,

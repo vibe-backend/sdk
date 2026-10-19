@@ -1,6 +1,6 @@
 # vibe-backend SDK
 
-Rust SDK and `vibe` CLI for a markdown-driven serverless backend. Source files under `providers/`, `models/`, `migrations/`, and `api/` compile into structured `{name}.lock.md` files and a signed manifest. The HTTP runtime loads that manifest. It does not interpret natural language.
+Rust SDK and `vibe` CLI for a markdown-driven serverless backend. Source files under `providers/`, `models/`, `migrations/`, and `api/` compile into structured `{name}.lock.md` files and a signed manifest. The `providers/` directory is optional: without provider sources, the built-in in-memory provider `main` stores data until restart. Release builds and runtime startup warn; production still refuses memory. Add `providers/main.md` to use PostgreSQL. The HTTP runtime loads that manifest. It does not interpret natural language.
 
 The specification is [docs/spec-v1.7.md](docs/spec-v1.7.md). The draft [docs/spec-v1.8.md](docs/spec-v1.8.md) is under review.
 

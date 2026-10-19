@@ -79,6 +79,8 @@ pub struct Provenance {
     pub signing: Option<SigningClaim>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub test_build: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub implicit_memory_provider: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub compilers: BTreeMap<String, crate::lock::LlmStamp>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -682,7 +684,11 @@ pub fn build_signed(
     }
     locks.sort_by(|a, b| a.id.cmp(&b.id));
     items.sort_by(|a, b| (&a.lock, &a.item).cmp(&(&b.lock, &b.item)));
+    if info.release && manifest.provenance.implicit_memory_provider {
+        eprintln!("warning: no providers/ defined; using the implicit in-memory provider `main`: data is kept in memory only and is lost when the runtime restarts; add providers/main.md to use PostgreSQL");
+    }
     manifest.provenance = Provenance {
+        implicit_memory_provider: manifest.provenance.implicit_memory_provider,
         signing: if info.release {
             SigningClaim::from_env(|key| std::env::var(key).ok(), env!("CARGO_PKG_VERSION"))
         } else {
@@ -907,7 +913,10 @@ pub fn build_manifest_with_record(
         return Err(report);
     }
     Ok(Manifest {
-        provenance: Provenance::default(),
+        provenance: Provenance {
+            implicit_memory_provider: crate::compile::implicit_memory_provider(docs),
+            ..Provenance::default()
+        },
         manifest_version: MANIFEST_VERSION,
         build_mode: dev.then_some(BuildMode::Dev),
         routes,

@@ -446,6 +446,12 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
     if matches!(opts.source, RunSource::Project) {
         check_verified_manifest(&manifest, run_env, opts.allow_test_build)?;
     }
+    if manifest.provenance.implicit_memory_provider {
+        eprintln!("warning: this manifest uses the implicit in-memory provider `main`: data is kept in memory only and is lost on restart; add providers/main.md to use PostgreSQL");
+        if !memory {
+            return Err("the manifest uses the implicit in-memory provider `main` (no providers/); add providers/main.md to use --db postgres".into());
+        }
+    }
     // `sign-jwt` key-refs name environment variables holding private PEMs.
     auth.signing_keys =
         crate::runtime::load_signing_keys(&manifest, &|name| std::env::var(name).ok(), &auth.kid)?;
