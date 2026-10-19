@@ -18,6 +18,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Run(RunArgs),
+    Verify(VerifyArgs),
 }
 
 #[derive(Args)]
@@ -30,6 +31,16 @@ struct RunArgs {
     addr: String,
     #[arg(long, value_parser = ["memory", "postgres"])]
     db: Option<String>,
+    #[command(flatten)]
+    pins: PinFlags,
+    #[arg(long)]
+    allow_test_build: bool,
+    #[arg(long)]
+    allow_destructive_migrations: bool,
+}
+
+#[derive(Args)]
+struct PinFlags {
     /// Exact project tag workflow identity (VIBE_EXPECT_IDENTITY).
     #[arg(long)]
     expect_identity: Option<String>,
@@ -39,10 +50,48 @@ struct RunArgs {
     /// Numeric GitHub repository id (VIBE_EXPECT_REPOSITORY_ID).
     #[arg(long)]
     expect_repository_id: Option<String>,
+}
+impl From<PinFlags> for vibe::run::PinArgs {
+    fn from(flags: PinFlags) -> Self {
+        Self {
+            identity: flags.expect_identity,
+            issuer: flags.expect_issuer,
+            repository_id: flags.expect_repository_id,
+        }
+    }
+}
+#[derive(Args)]
+struct VerifyArgs {
+    #[arg(long)]
+    artifact: PathBuf,
+    #[arg(long)]
+    project: Option<PathBuf>,
+    #[command(flatten)]
+    pins: PinFlags,
     #[arg(long)]
     allow_test_build: bool,
-    #[arg(long)]
-    allow_destructive_migrations: bool,
+}
+fn verify(args: VerifyArgs) -> Result<(), String> {
+    let result = vibe::run::verify_artifact(&vibe::run::VerifyOptions {
+        project: args
+            .project
+            .unwrap_or_else(|| artifact_project(&args.artifact)),
+        artifact: args.artifact,
+        pins: args.pins.into(),
+        allow_test_build: args.allow_test_build,
+    })?;
+    if let Some(identity) = result.identity {
+        println!(
+            "verified: {} (release {}, commit {}, identity {})",
+            result.path.display(),
+            result.manifest.provenance.version,
+            result.manifest.provenance.commit,
+            identity
+        );
+    } else {
+        println!("verified: {} (development manifest)", result.path.display());
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -51,11 +100,12 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
-    let args = match cli.command {
-        Some(Command::Run(args)) => args,
-        None => cli.run,
+    let result = match cli.command {
+        Some(Command::Verify(args)) => verify(args),
+        Some(Command::Run(args)) => run(args).await,
+        None => run(cli.run).await,
     };
-    if let Err(message) = run(args).await {
+    if let Err(message) = result {
         eprintln!("{message}");
         std::process::exit(1);
     }
@@ -78,11 +128,7 @@ async fn run(args: RunArgs) -> Result<(), String> {
         .project
         .unwrap_or_else(|| artifact_project(&args.artifact));
     vibe::run::run(RunOptions {
-        pins: vibe::run::PinArgs {
-            identity: args.expect_identity,
-            issuer: args.expect_issuer,
-            repository_id: args.expect_repository_id,
-        },
+        pins: args.pins.into(),
         project,
         source: RunSource::Artifact(args.artifact),
         addr: args.addr,
@@ -126,6 +172,7 @@ mod tests {
             let args = match cli.command {
                 Some(Command::Run(args)) => args,
                 None => cli.run,
+                Some(Command::Verify(_)) => panic!("expected run"),
             };
             assert_eq!(args.artifact, PathBuf::from("manifest.json"));
             assert_eq!(args.addr, "0.0.0.0:8080");

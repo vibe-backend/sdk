@@ -64,6 +64,16 @@ pub fn load_manifest(
     run_env: crate::runtime::RunEnv,
     pins: &PinArgs,
 ) -> Result<manifest::Manifest, String> {
+    load_manifest_with_signer(manifest_path, project, run_env, pins, None)
+}
+
+fn load_manifest_with_signer(
+    manifest_path: &Path,
+    project: &Path,
+    run_env: crate::runtime::RunEnv,
+    pins: &PinArgs,
+    signer: Option<&crate::sigstore::Signer>,
+) -> Result<manifest::Manifest, String> {
     let mode: manifest::Manifest =
         serde_json::from_slice(&fs::read(manifest_path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -89,6 +99,21 @@ pub fn load_manifest(
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
+    // Claims are diagnostic only: even malformed claims cannot change the result.
+    if let (Some(claim), Some(identity), Some(issuer), Ok(version)) = (
+        &mode.provenance.signing,
+        &pins.identity,
+        &pins.issuer,
+        std::env::var("VIBE_RELEASE_VERSION"),
+    ) {
+        if let Ok(pin) =
+            crate::sigstore::Pin::parse(identity, issuer, pins.repository_id.as_deref())
+        {
+            for hint in claim_hints(claim, &pin, &version).unwrap_or_default() {
+                eprintln!("{hint}");
+            }
+        }
+    }
     if mode.provenance.test_build {
         return Err(RELEASE_TEST_BUILD.into());
     }
@@ -106,7 +131,14 @@ pub fn load_manifest(
     let issuer = pins.issuer.as_deref().unwrap();
     let pin = crate::sigstore::Pin::parse(identity, issuer, pins.repository_id.as_deref())?;
     let version = std::env::var("VIBE_RELEASE_VERSION").ok().filter(|v| !v.is_empty()).ok_or("VIBE_RELEASE_VERSION is required to verify a release manifest; .vibe/signing.pub is not trusted for release manifests")?;
-    let signer = crate::sigstore::Signer::compiled()?;
+    let compiled;
+    let signer = match signer {
+        Some(signer) => signer,
+        None => {
+            compiled = crate::sigstore::Signer::compiled()?;
+            &compiled
+        }
+    };
     let id = pins
         .repository_id
         .as_ref()
@@ -130,8 +162,130 @@ pub fn load_manifest(
             name.push(".sigstore.json");
             PathBuf::from(name)
         });
-    manifest::read_release_manifest(manifest_path, &bundle, &version, &pin, &signer)
+    manifest::read_release_manifest(manifest_path, &bundle, &version, &pin, signer)
         .map_err(|err| err.to_string())
+}
+
+pub fn claim_hints(
+    claim: &manifest::SigningClaim,
+    pin: &crate::sigstore::Pin,
+    version: &str,
+) -> Result<Vec<String>, String> {
+    let expected = pin.identity_for(version)?;
+    let mut hints = Vec::new();
+    if claim.source_identity != expected {
+        hints.push(format!(
+            "note: manifest claims source identity {}; pinned identity is {expected}",
+            claim.source_identity
+        ));
+    }
+    if claim.issuer != crate::sigstore::ISSUER {
+        hints.push(format!(
+            "note: manifest claims issuer {}; pinned issuer is {}",
+            claim.issuer,
+            crate::sigstore::ISSUER
+        ));
+    }
+    Ok(hints)
+}
+
+pub struct VerifyOptions {
+    pub artifact: PathBuf,
+    pub project: PathBuf,
+    pub pins: PinArgs,
+    pub allow_test_build: bool,
+}
+pub struct VerifiedArtifact {
+    pub manifest: manifest::Manifest,
+    pub path: PathBuf,
+    pub identity: Option<String>,
+}
+/// Verify without serving or connecting to a database. Unset VIBE_ENV is production.
+pub fn verify_artifact(opts: &VerifyOptions) -> Result<VerifiedArtifact, String> {
+    verify_artifact_with_signer(opts, None)
+}
+/// Library injection for offline certificate tests; the CLI always uses the compiled signer.
+pub fn verify_artifact_with_signer(
+    opts: &VerifyOptions,
+    signer: Option<&crate::sigstore::Signer>,
+) -> Result<VerifiedArtifact, String> {
+    load_dotenv(&opts.project);
+    let run_env =
+        crate::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), false);
+    verify_artifact_in_env(opts, run_env, signer)
+}
+fn verify_artifact_in_env(
+    opts: &VerifyOptions,
+    run_env: crate::runtime::RunEnv,
+    signer: Option<&crate::sigstore::Signer>,
+) -> Result<VerifiedArtifact, String> {
+    let pins = opts.pins.resolve(|key| std::env::var(key).ok())?;
+    check_runtime_llm(run_env)?;
+    let path = artifact_paths(&opts.artifact).0;
+    fs::metadata(&path).map_err(|err| format!("cannot read manifest {}: {err}", path.display()))?;
+    let manifest = load_manifest_with_signer(&path, &opts.project, run_env, &pins, signer)?;
+    check_verified_manifest(&manifest, run_env, opts.allow_test_build)?;
+    let identity = if manifest.build_mode == Some(manifest::BuildMode::Release) {
+        Some(
+            crate::sigstore::Pin::parse(
+                pins.identity.as_deref().unwrap(),
+                pins.issuer.as_deref().unwrap(),
+                pins.repository_id.as_deref(),
+            )?
+            .identity_for(&manifest.provenance.version)?,
+        )
+    } else {
+        None
+    };
+    Ok(VerifiedArtifact {
+        manifest,
+        path,
+        identity,
+    })
+}
+fn check_verified_manifest(
+    manifest: &manifest::Manifest,
+    run_env: crate::runtime::RunEnv,
+    allow_test_build: bool,
+) -> Result<(), String> {
+    if manifest.provenance.test_build {
+        if manifest.build_mode == Some(manifest::BuildMode::Release) {
+            return Err(RELEASE_TEST_BUILD.into());
+        }
+        if !allow_test_build || !run_env.is_dev() {
+            return Err("this manifest is a test build made with LLM_PROVIDER=fake; refusing to run it. Pass --allow-test-build to run it anyway (never in production)".into());
+        }
+        eprintln!("warning: running a test build made with LLM_PROVIDER=fake");
+    }
+    check_deployable(manifest, run_env)?;
+    for route in &manifest.routes {
+        if let Some(problem) = route
+            .refresh
+            .as_ref()
+            .and_then(|spec| crate::manifest::refresh_spec_problem(&route.feature_id, spec))
+        {
+            return Err(problem);
+        }
+    }
+    Ok(())
+}
+
+fn check_runtime_llm(run_env: crate::runtime::RunEnv) -> Result<(), String> {
+    if let Some(name) = runtime_env::runtime_llm_env_present() {
+        if !run_env.is_dev() {
+            return Err(format!("runtime environment must not contain {name}"));
+        }
+        let names = runtime_env::strip_runtime_llm_env();
+        eprintln!(
+            "warning: removing compile-time variables from runtime environment: {}",
+            names
+                .iter()
+                .map(|key| key.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
 }
 
 pub fn check_deployable(
@@ -217,20 +371,7 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
     let pins = opts.pins.resolve(|key| std::env::var(key).ok())?;
     let run_env =
         crate::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), memory);
-    if let Some(name) = runtime_env::runtime_llm_env_present() {
-        if !run_env.is_dev() {
-            return Err(format!("runtime environment must not contain {name}"));
-        }
-        let names = runtime_env::strip_runtime_llm_env();
-        eprintln!(
-            "warning: removing compile-time variables from runtime environment: {}",
-            names
-                .iter()
-                .map(|key| key.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    check_runtime_llm(run_env)?;
     if memory && !run_env.is_dev() {
         return Err(format!(
             "--db memory is a development executor and is refused when VIBE_ENV is {:?}; use PostgreSQL",
@@ -257,9 +398,7 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
     let mut auth = auth_from_env(run_env)?;
     let manifest = match &opts.source {
         RunSource::Artifact(path) => {
-            let manifest_path = artifact_paths(path).0;
-            fs::metadata(&manifest_path).map_err(|err| format!("cannot read manifest {}: {err}", manifest_path.display()))?;
-            load_manifest(&manifest_path, project, run_env, &pins)?
+            verify_artifact_in_env(&VerifyOptions { artifact: path.clone(), project: project.into(), pins: opts.pins.clone(), allow_test_build: opts.allow_test_build }, run_env, None)?.manifest
         },
         #[cfg(not(feature = "sdk"))]
         RunSource::Project => return Err("project mode needs vibe-sdk (`vibe run`); vibe-runtime runs build artifacts: pass --artifact".into()),
@@ -304,24 +443,8 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
             "note: --expect-identity/--expect-issuer pins are ignored for development manifests"
         );
     }
-    if manifest.provenance.test_build {
-        if manifest.build_mode == Some(manifest::BuildMode::Release) {
-            return Err(RELEASE_TEST_BUILD.into());
-        }
-        if !opts.allow_test_build || !run_env.is_dev() {
-            return Err("this manifest is a test build made with LLM_PROVIDER=fake; refusing to run it. Pass --allow-test-build to run it anyway (never in production)".into());
-        }
-        eprintln!("warning: running a test build made with LLM_PROVIDER=fake");
-    }
-    check_deployable(&manifest, run_env)?;
-    for route in &manifest.routes {
-        if let Some(problem) = route
-            .refresh
-            .as_ref()
-            .and_then(|spec| crate::manifest::refresh_spec_problem(&route.feature_id, spec))
-        {
-            return Err(problem);
-        }
+    if matches!(opts.source, RunSource::Project) {
+        check_verified_manifest(&manifest, run_env, opts.allow_test_build)?;
     }
     // `sign-jwt` key-refs name environment variables holding private PEMs.
     auth.signing_keys =
@@ -836,5 +959,46 @@ mod pin_tests {
         .resolve(|_| None)
         .unwrap_err()
         .contains("VIBE_EXPECT_IDENTITY is invalid"));
+    }
+}
+
+#[cfg(test)]
+mod claim_hint_tests {
+    use super::*;
+    #[test]
+    fn only_identity_and_issuer_mismatches_produce_hints() {
+        let pin = crate::sigstore::Pin::parse(
+            "https://github.com/acme/shop/.github/workflows/release.yml@refs/tags/v*",
+            crate::sigstore::ISSUER,
+            None,
+        )
+        .unwrap();
+        let mut claim = manifest::SigningClaim {
+            issuer: crate::sigstore::ISSUER.into(),
+            source_identity: pin.identity_for("1.8.0").unwrap(),
+            source_repository: "untrusted".into(),
+            signer_workflow: "untrusted".into(),
+        };
+        assert!(claim_hints(&claim, &pin, "1.8.0").unwrap().is_empty());
+        claim.source_identity = "other".into();
+        assert_eq!(
+            claim_hints(&claim, &pin, "1.8.0").unwrap(),
+            vec![format!(
+                "note: manifest claims source identity other; pinned identity is {}",
+                pin.identity_for("1.8.0").unwrap()
+            )]
+        );
+        claim.issuer = "other".into();
+        let hints = claim_hints(&claim, &pin, "1.8.0").unwrap();
+        assert_eq!(hints.len(), 2);
+        assert_eq!(
+            hints[1],
+            format!(
+                "note: manifest claims issuer other; pinned issuer is {}",
+                crate::sigstore::ISSUER
+            )
+        );
+        claim.source_identity = pin.identity_for("1.8.0").unwrap();
+        assert_eq!(claim_hints(&claim, &pin, "1.8.0").unwrap().len(), 1);
     }
 }

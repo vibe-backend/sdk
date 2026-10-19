@@ -29,7 +29,7 @@ Locks are build output. They are not committed (`*.lock.md` is in
    `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<version>`,
    issuer `https://token.actions.githubusercontent.com` and the commit
    (fail closed), then deploys the same files to staging and then production.
-4. **Run.** `vibe-runtime --artifact manifest.json --db postgres` verifies release
+4. **Run.** `vibe-runtime verify --artifact dist` checks an artifact without serving. `vibe-runtime --artifact manifest.json --db postgres` verifies release
    manifests in every environment using deployer-provided project identity and
    issuer pins, optional repository id, and `VIBE_RELEASE_VERSION`.
    See [release manifest pins](../runtime-config.md#release-manifest-pins-decision-182).
