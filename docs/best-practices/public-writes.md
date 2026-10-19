@@ -9,6 +9,7 @@ Prose limits that the lock cannot express produce a build warning quoting the
 source sentence. “At most 50 per day” is not enforced by a per-minute rate limit.
 For implicit memory, query SQL must use decision 183's supported unique-key
 counter forms; unsupported SQL fails the build.
+A source naming a single thing, such as “the counter”, gets a constant key.
 
 ## Purpose
 

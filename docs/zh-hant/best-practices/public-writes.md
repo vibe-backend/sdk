@@ -7,6 +7,7 @@ GET 同 POST 共用 URL 時，用兩個 endpoint 檔明示同一條 route path�
 來源句限制無法喺 lock 表達時，build warning 必須引述原句。
 「每日最多 50 次」唔等於 per-minute rate-limit，warning 代表未執行該限制。
 隱式 memory 只准決定 183 嘅 unique-key counter SQL；其他 SQL 係 build error。
+來源只指一個事物（例如「the counter」）時，用固定 key。
 
 ## 用途
 
