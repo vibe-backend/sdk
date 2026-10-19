@@ -1469,24 +1469,56 @@ async fn production_runs_only_release_manifests() {
     let mut forged = dev.clone();
     forged.build_mode = Some(vibe::manifest::BuildMode::Release);
     forged.provenance.version = "1.8.0".into();
+    forged.provenance.commit = "a".repeat(40);
+    forged.provenance.test_build = false;
     let path = root.join("forged.json");
     vibe::manifest::write_manifest(&path, &forged).unwrap();
-    let err =
-        vibe::manifest::read_release_manifest(&path, &root.join("none.sigstore.json"), "1.8.0")
-            .unwrap_err()
-            .to_string();
+    let err = vibe::manifest::read_release_manifest(
+        &path,
+        &root.join("none.sigstore.json"),
+        "1.8.0",
+        &vibe::sigstore::Pin::parse(
+            "https://github.com/acme/shop/.github/workflows/release.yml@refs/tags/v*",
+            vibe::sigstore::ISSUER,
+            None,
+        )
+        .unwrap(),
+        &vibe::sigstore::Signer::new("1.8.0", &"a".repeat(40)).unwrap(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("no key signature"), "{err}");
     forged.signature.clear();
     vibe::manifest::write_manifest(&path, &forged).unwrap();
-    let err =
-        vibe::manifest::read_release_manifest(&path, &root.join("none.sigstore.json"), "1.8.1")
-            .unwrap_err()
-            .to_string();
+    let err = vibe::manifest::read_release_manifest(
+        &path,
+        &root.join("none.sigstore.json"),
+        "1.8.1",
+        &vibe::sigstore::Pin::parse(
+            "https://github.com/acme/shop/.github/workflows/release.yml@refs/tags/v*",
+            vibe::sigstore::ISSUER,
+            None,
+        )
+        .unwrap(),
+        &vibe::sigstore::Signer::new("1.8.0", &"a".repeat(40)).unwrap(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("not the deployed version"), "{err}");
-    let err =
-        vibe::manifest::read_release_manifest(&path, &root.join("none.sigstore.json"), "1.8.0")
-            .unwrap_err()
-            .to_string();
+    let err = vibe::manifest::read_release_manifest(
+        &path,
+        &root.join("none.sigstore.json"),
+        "1.8.0",
+        &vibe::sigstore::Pin::parse(
+            "https://github.com/acme/shop/.github/workflows/release.yml@refs/tags/v*",
+            vibe::sigstore::ISSUER,
+            None,
+        )
+        .unwrap(),
+        &vibe::sigstore::Signer::new("1.8.0", &"a".repeat(40)).unwrap(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("Sigstore bundle"), "{err}");
 }
 

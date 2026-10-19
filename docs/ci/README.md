@@ -29,17 +29,15 @@ Locks are build output. They are not committed (`*.lock.md` is in
    `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<version>`,
    issuer `https://token.actions.githubusercontent.com` and the commit
    (fail closed), then deploys the same files to staging and then production.
-4. **Run.** `vibe run --artifact manifest.json` runs the build artifact. Outside development, `vibe run` / `vibe-runtime run` accept only
-   `build_mode: release` manifests with a Sigstore bundle
-   (`<manifest>.sigstore.json`, or `VIBE_MANIFEST_BUNDLE`) for the deployed
-   version `VIBE_RELEASE_VERSION`. They check that the certificate identity
-   equals exactly the identity above, the issuer, the manifest's commit, this
-   repository and ref, a GitHub-hosted runner (Fulcio runner-environment
-   extension) and a Rekor inclusion proof, then run `cosign verify-blob
-   --offline` against the Sigstore `trusted_root.json` compiled into the
-   binary (`assets/sigstore/trusted_root.json`; there is no runtime override).
-   `cosign` must be on `PATH`. `.vibe/signing.pub` and dev manifests are
-   never trusted there.
+4. **Run.** `vibe-runtime --artifact manifest.json --db postgres` verifies release
+   manifests in every environment using deployer-provided project identity and
+   issuer pins, optional repository id, and `VIBE_RELEASE_VERSION`.
+   See [release manifest pins](../runtime-config.md#release-manifest-pins-decision-182).
+   Both the caller pin and the SDK reusable signer fixed in the runtime must
+   match. Verification uses the Sigstore bundle and compiled-in trust root
+   offline; `cosign` must be on `PATH`. Development keys are never trusted for
+   release manifests. The reusable workflow that produces accepted project
+   manifests lands in a follow-up (#309).
 
 ## Setup (done by a repo admin, not by the SDK)
 
@@ -50,7 +48,9 @@ Locks are build output. They are not committed (`*.lock.md` is in
   release secrets).
 - `staging` and `production` environments for the deploy job.
 - Runtime configuration: `VIBE_RELEASE_VERSION` = deployed version (e.g.
-  `1.8.0`), and `cosign` installed.
+  `1.8.0`), `VIBE_EXPECT_IDENTITY`, `VIBE_EXPECT_ISSUER`, optional
+  `VIBE_EXPECT_REPOSITORY_ID`, and `cosign` installed; see
+  [runtime pins](../runtime-config.md#release-manifest-pins-decision-182).
 - Make `preview` a required status check on `main`.
 
 ## Local development

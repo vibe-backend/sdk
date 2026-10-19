@@ -30,6 +30,15 @@ struct RunArgs {
     addr: String,
     #[arg(long, value_parser = ["memory", "postgres"])]
     db: Option<String>,
+    /// Exact project tag workflow identity (VIBE_EXPECT_IDENTITY).
+    #[arg(long)]
+    expect_identity: Option<String>,
+    /// GitHub Actions OIDC issuer (VIBE_EXPECT_ISSUER).
+    #[arg(long)]
+    expect_issuer: Option<String>,
+    /// Numeric GitHub repository id (VIBE_EXPECT_REPOSITORY_ID).
+    #[arg(long)]
+    expect_repository_id: Option<String>,
     #[arg(long)]
     allow_test_build: bool,
     #[arg(long)]
@@ -69,6 +78,11 @@ async fn run(args: RunArgs) -> Result<(), String> {
         .project
         .unwrap_or_else(|| artifact_project(&args.artifact));
     vibe::run::run(RunOptions {
+        pins: vibe::run::PinArgs {
+            identity: args.expect_identity,
+            issuer: args.expect_issuer,
+            repository_id: args.expect_repository_id,
+        },
         project,
         source: RunSource::Artifact(args.artifact),
         addr: args.addr,

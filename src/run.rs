@@ -1,5 +1,5 @@
 use crate::{
-    manifest::{self, read_manifest},
+    manifest,
     runtime::{router, AppState, AuthConfig, PgExec, QueryExec},
     runtime_env, sign,
 };
@@ -9,9 +9,52 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-/// Loads and verifies the manifest. Outside development only a release
-/// manifest with a Sigstore keyless signature from the release workflow is
-/// trusted (decision 119): the bundle (`VIBE_MANIFEST_BUNDLE`, default
+/// Explicit deployer pin values; empty environment values count as unset.
+#[derive(Clone, Debug, Default)]
+pub struct PinArgs {
+    pub identity: Option<String>,
+    pub issuer: Option<String>,
+    pub repository_id: Option<String>,
+}
+impl PinArgs {
+    pub fn resolve(&self, lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let merge =
+            |flag: &Option<String>, key: &str, name: &str| -> Result<Option<String>, String> {
+                let env = lookup(key).filter(|v| !v.is_empty());
+                if let (Some(a), Some(b)) = (flag, &env) {
+                    if a != b {
+                        return Err(format!("--{name} and {key} disagree; set only one"));
+                    }
+                }
+                Ok(flag.clone().or(env))
+            };
+        let out = Self {
+            identity: merge(&self.identity, "VIBE_EXPECT_IDENTITY", "expect-identity")?,
+            issuer: merge(&self.issuer, "VIBE_EXPECT_ISSUER", "expect-issuer")?,
+            repository_id: merge(
+                &self.repository_id,
+                "VIBE_EXPECT_REPOSITORY_ID",
+                "expect-repository-id",
+            )?,
+        };
+        crate::sigstore::Pin::parse(
+            out.identity.as_deref().unwrap_or(
+                "https://github.com/example/project/.github/workflows/release.yml@refs/tags/v*",
+            ),
+            out.issuer.as_deref().unwrap_or(crate::sigstore::ISSUER),
+            out.repository_id.as_deref(),
+        )?;
+        Ok(out)
+    }
+    fn any(&self) -> bool {
+        self.identity.is_some() || self.issuer.is_some() || self.repository_id.is_some()
+    }
+}
+const RELEASE_TEST_BUILD: &str =
+    "release manifest is marked test_build; release manifests can never be test builds";
+/// Loads and verifies the manifest. Release manifests in every environment
+/// require deployer caller pins and the compiled-in SDK signer (decision 182).
+/// The bundle (`VIBE_MANIFEST_BUNDLE`, default
 /// `<manifest>.sigstore.json`) is verified offline against the compiled-in
 /// trust root for the deployed version `VIBE_RELEASE_VERSION`. The
 /// development key in `.vibe/signing.pub` is accepted in development only.
@@ -19,8 +62,15 @@ pub fn load_manifest(
     manifest_path: &Path,
     project: &Path,
     run_env: crate::runtime::RunEnv,
+    pins: &PinArgs,
 ) -> Result<manifest::Manifest, String> {
-    if run_env.is_dev() {
+    let mode: manifest::Manifest =
+        serde_json::from_slice(&fs::read(manifest_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if mode.build_mode != Some(manifest::BuildMode::Release) && run_env.is_dev() {
+        if pins.any() {
+            eprintln!("note: --expect-identity/--expect-issuer pins are ignored for development manifests");
+        }
         eprintln!("warning: verifying the manifest with the development key in .vibe/signing.pub");
         let artifact_dir = manifest_path.parent().unwrap_or(Path::new("."));
         let key_dir = if project.join(".vibe/signing.pub").exists() {
@@ -31,20 +81,48 @@ pub fn load_manifest(
             project
         };
         let key = sign::load_dev_public(key_dir)?;
-        return read_manifest(manifest_path, &key).map_err(|err| err.to_string());
+        return manifest::verify_manifest(mode, &key).map_err(|err| err.to_string());
     }
-    let mode: manifest::Manifest =
-        serde_json::from_slice(&fs::read(manifest_path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
     if mode.build_mode == Some(manifest::BuildMode::Dev) {
         return Err(format!(
             "this development manifest (`vibe build`) is refused when VIBE_ENV is {:?}",
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
-    let version = std::env::var("VIBE_RELEASE_VERSION").map_err(|_| {
-        "VIBE_RELEASE_VERSION (the deployed version, e.g. 1.8.0) is required to verify the release manifest's Sigstore identity; the project's .vibe/signing.pub is not trusted outside development".to_string()
-    })?;
+    if mode.provenance.test_build {
+        return Err(RELEASE_TEST_BUILD.into());
+    }
+    let mut missing = Vec::new();
+    if pins.identity.is_none() {
+        missing.push("--expect-identity / VIBE_EXPECT_IDENTITY");
+    }
+    if pins.issuer.is_none() {
+        missing.push("--expect-issuer / VIBE_EXPECT_ISSUER");
+    }
+    if !missing.is_empty() {
+        return Err(format!("release manifest needs a pinned signer: set --expect-identity / VIBE_EXPECT_IDENTITY (e.g. https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/v*) and --expect-issuer / VIBE_EXPECT_ISSUER (https://token.actions.githubusercontent.com). Matching is exact: the only substitution is v* -> v<VIBE_RELEASE_VERSION>; no globs or regex. Missing: {}.", missing.join(", ")));
+    }
+    let identity = pins.identity.as_deref().unwrap();
+    let issuer = pins.issuer.as_deref().unwrap();
+    let pin = crate::sigstore::Pin::parse(identity, issuer, pins.repository_id.as_deref())?;
+    let version = std::env::var("VIBE_RELEASE_VERSION").ok().filter(|v| !v.is_empty()).ok_or("VIBE_RELEASE_VERSION is required to verify a release manifest; .vibe/signing.pub is not trusted for release manifests")?;
+    let signer = crate::sigstore::Signer::compiled()?;
+    let id = pins
+        .repository_id
+        .as_ref()
+        .map(|id| format!(", repository id {id}"))
+        .unwrap_or_default();
+    eprintln!(
+        "verifying release manifest: identity {identity}, issuer {issuer}{id}, version {version}"
+    );
+    if manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(".vibe/signing.pub")
+        .exists()
+    {
+        eprintln!("warning: .vibe/signing.pub is ignored for release manifests");
+    }
     let bundle = std::env::var_os("VIBE_MANIFEST_BUNDLE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -52,7 +130,8 @@ pub fn load_manifest(
             name.push(".sigstore.json");
             PathBuf::from(name)
         });
-    manifest::read_release_manifest(manifest_path, &bundle, &version).map_err(|err| err.to_string())
+    manifest::read_release_manifest(manifest_path, &bundle, &version, &pin, &signer)
+        .map_err(|err| err.to_string())
 }
 
 pub fn check_deployable(
@@ -95,6 +174,7 @@ impl DbChoice {
 }
 
 pub struct RunOptions {
+    pub pins: PinArgs,
     pub project: PathBuf,
     pub source: RunSource,
     pub addr: String,
@@ -134,6 +214,7 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
         eprintln!("warning: --allow-destructive-migrations has no effect with --db memory");
     }
     load_dotenv(project);
+    let pins = opts.pins.resolve(|key| std::env::var(key).ok())?;
     let run_env =
         crate::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), memory);
     if let Some(name) = runtime_env::runtime_llm_env_present() {
@@ -178,7 +259,7 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
         RunSource::Artifact(path) => {
             let manifest_path = artifact_paths(path).0;
             fs::metadata(&manifest_path).map_err(|err| format!("cannot read manifest {}: {err}", manifest_path.display()))?;
-            load_manifest(&manifest_path, project, run_env)?
+            load_manifest(&manifest_path, project, run_env, &pins)?
         },
         #[cfg(not(feature = "sdk"))]
         RunSource::Project => return Err("project mode needs vibe-sdk (`vibe run`); vibe-runtime runs build artifacts: pass --artifact".into()),
@@ -218,7 +299,15 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
                 .map_err(|e| e.to_string())?
         }
     };
+    if matches!(opts.source, RunSource::Project) && pins.any() {
+        eprintln!(
+            "note: --expect-identity/--expect-issuer pins are ignored for development manifests"
+        );
+    }
     if manifest.provenance.test_build {
+        if manifest.build_mode == Some(manifest::BuildMode::Release) {
+            return Err(RELEASE_TEST_BUILD.into());
+        }
         if !opts.allow_test_build || !run_env.is_dev() {
             return Err("this manifest is a test build made with LLM_PROVIDER=fake; refusing to run it. Pass --allow-test-build to run it anyway (never in production)".into());
         }
@@ -523,6 +612,7 @@ mod tests {
     #[tokio::test]
     async fn project_mode_requires_sdk() {
         let options = super::RunOptions {
+            pins: Default::default(),
             project: ".".into(),
             source: super::RunSource::Project,
             addr: "127.0.0.1:0".into(),
@@ -688,5 +778,63 @@ mod tenant_tests {
                 .contains("VIBE_TENANTS"));
         }
         assert!(configured_tenants(Vec::new(), None).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    #[test]
+    fn resolves_flags_and_environment_without_precedence() {
+        for (index, key, name, value) in [
+            (
+                0,
+                "VIBE_EXPECT_IDENTITY",
+                "expect-identity",
+                "https://github.com/acme/shop/.github/workflows/release.yml@refs/tags/v*",
+            ),
+            (
+                1,
+                "VIBE_EXPECT_ISSUER",
+                "expect-issuer",
+                crate::sigstore::ISSUER,
+            ),
+            (
+                2,
+                "VIBE_EXPECT_REPOSITORY_ID",
+                "expect-repository-id",
+                "123",
+            ),
+        ] {
+            let mut flags = PinArgs::default();
+            match index {
+                0 => flags.identity = Some(value.into()),
+                1 => flags.issuer = Some(value.into()),
+                _ => flags.repository_id = Some(value.into()),
+            }
+            assert!(flags.resolve(|_| None).is_ok());
+            assert!(PinArgs::default()
+                .resolve(|k| (k == key).then(|| value.into()))
+                .is_ok());
+            assert!(flags.resolve(|k| (k == key).then(|| value.into())).is_ok());
+            assert_eq!(
+                flags
+                    .resolve(|k| (k == key).then(|| "different".into()))
+                    .unwrap_err(),
+                format!("--{name} and {key} disagree; set only one")
+            );
+        }
+        assert!(PinArgs::default()
+            .resolve(|_| Some(String::new()))
+            .unwrap()
+            .identity
+            .is_none());
+        assert!(PinArgs {
+            identity: Some("bad".into()),
+            ..Default::default()
+        }
+        .resolve(|_| None)
+        .unwrap_err()
+        .contains("VIBE_EXPECT_IDENTITY is invalid"));
     }
 }

@@ -711,20 +711,28 @@ pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), St
 }
 
 /// Reads a release manifest and verifies its Sigstore keyless signature
-/// (decision 119): the bundle certificate must name exactly
-/// `release.yml@refs/tags/v<version>` with the GitHub Actions issuer, the
+/// (decision 182): both deployer caller pins and the fixed SDK signer
+/// must match exactly, along with the GitHub Actions issuer, the
 /// manifest's commit and a GitHub-hosted runner, with Rekor inclusion,
 /// verified offline against the compiled-in trust root.
 pub fn read_release_manifest(
     path: &Path,
     bundle: &Path,
     version: &str,
+    pin: &crate::sigstore::Pin,
+    signer: &crate::sigstore::Signer,
 ) -> Result<Manifest, Report> {
     crate::sigstore::check_version(version).map_err(single)?;
     let bytes = fs::read(path).map_err(|err| single(format!("cannot read manifest: {err}")))?;
     let manifest: Manifest =
         serde_json::from_slice(&bytes).map_err(|err| single(format!("manifest json: {err}")))?;
     let provenance = &manifest.provenance;
+    if provenance.test_build {
+        return Err(single(
+            "release manifest is marked test_build; release manifests can never be test builds"
+                .into(),
+        ));
+    }
     if manifest.build_mode == Some(BuildMode::Dev) {
         return Err(single(
             "only release manifests (`vibe build --release`) can run outside development".into(),
@@ -741,9 +749,13 @@ pub fn read_release_manifest(
             provenance.version
         )));
     }
+    crate::sigstore::check_commit(&provenance.commit).map_err(single)?;
+    pin.ref_for(version).map_err(single)?;
     let expected = crate::sigstore::Expected {
         version: version.to_string(),
         commit: provenance.commit.clone(),
+        pin: pin.clone(),
+        signer: signer.clone(),
     };
     crate::sigstore::verify_release_manifest(path, bundle, &expected).map_err(single)?;
     Ok(manifest)
