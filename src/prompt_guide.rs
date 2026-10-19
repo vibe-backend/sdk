@@ -12,6 +12,7 @@ pub const GRAMMAR: &str = "\
 LOCK GRAMMAR (the parser rejects anything else):
 - Every non-blank line is exactly one of: `## Section`, `### sN op` (steps/blocks), `- key: value`, a table row `| a | b |`, or `(none)` for an empty section.
 - `- key: value` is one flat line. NEVER indent bullets, NEVER nest bullets, NEVER write a bullet without `key:`. Put structure inside the value: lists `[a, b]`, maps `{ k: v, k2: v2 }`.
+- Endpoints must supply every required method input; when the source refers to a single named thing (\"the counter\") and no request field names it, pass a constant key in Transform in, e.g. `{name: \"counter\"}`.
 - No prose, no comments, no code fences, no frontmatter, no `# Title` needed.
 - Keys are lowercase kebab-case and must come from the lists below; do not invent keys.
 - Tables: header row, then `| --- | --- |`, then one row per item; empty cell is `-`. Cells never contain `|`.

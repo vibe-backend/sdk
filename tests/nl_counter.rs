@@ -357,3 +357,49 @@ async fn unknown_model_provider_reaches_repair() {
     assert!(lock.contains("- provider: main"), "{lock}");
     fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn missing_required_method_input_reaches_repair() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = std::env::temp_dir().join(format!("vibe-input-repair-{}", uuid::Uuid::new_v4()));
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web-counter"),
+        &root,
+    );
+    let method = root.join("models/counter/methods/read.md");
+    let text = fs::read_to_string(&method)
+        .unwrap()
+        .replace("{name: string}", "{name: {type: string, required: true}}");
+    fs::write(method, text).unwrap();
+    let source = root.join("api/web/v1/counter.md");
+    let original = fs::read_to_string(&source).unwrap();
+    let good = format!("## Route{}", original.split_once("## Route").unwrap().1);
+    let bad = good.replace("{name: \"counter\"}", "{}");
+    assert_ne!(bad, good);
+    fs::write(
+        source,
+        "Anyone can read the counter. Use GET at /web/v1/counter.",
+    )
+    .unwrap();
+    let calls = AtomicUsize::new(0);
+    let adapter = vibe::FakeAdapter {
+        responder: |request: &vibe::llm::LlmRequest| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(bad.clone())
+            } else {
+                assert!(request.input.contains("api/web/v1/counter.md: method counter.read needs required input `name`, but args transform.in does not provide it"), "{}", request.input);
+                Ok(good.clone())
+            }
+        },
+    };
+    vibe::regenerate_project(&vibe::CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&fake_config()),
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|r| panic!("{r}"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    fs::remove_dir_all(root).unwrap();
+}

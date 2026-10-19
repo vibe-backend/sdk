@@ -310,6 +310,7 @@ pub(crate) fn check_lock(
     }
     let structured = crate::lock::is_structured_source(&source.combined_text());
     check_feature_contract(doc, source, docs, report);
+    check_required_method_inputs(doc, docs, report);
     if doc.meta.source_type == SourceType::Structured && !structured {
         report.push(Diag::error(
             &file,
@@ -2749,6 +2750,34 @@ mod tests {
     }
 
     #[test]
+    fn required_method_inputs_check_known_argument_keys() {
+        let callee = parsed_doc(Kind::Method, None, "counter/methods/read",
+            "## Signature\n- input: {name: {type: string, required: true}, optional: {type: string, required: false}}\n");
+        let docs = HashMap::from([("counter/methods/read".into(), callee)]);
+        for kind in [Kind::Api, Kind::Method] {
+            for (args, transform, missing) in [
+                ("transform.in", "{}", true),
+                ("transform.in", r#"{name: "counter"}"#, false),
+                ("request.body", "{}", false),
+                ("input", "{}", false),
+                ("{}", "{}", true),
+                ("{name: input.name}", "{}", false),
+            ] {
+                let doc = parsed_doc(kind, None, "caller", &format!(
+                    "## Transform\n- in: {transform}\n## Steps\n### s1\n- op: method\n- target: counter.read\n- args: {args}\n"));
+                let mut report = Report::new();
+                check_required_method_inputs(&doc, &docs, &mut report);
+                assert_eq!(report.has_errors(), missing, "{args}: {report}");
+                if missing {
+                    assert!(report
+                        .to_string()
+                        .contains("method counter.read needs required input `name`"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn targets_accept_crud_actions_and_method_locks() {
         let docs = target_docs();
         for ok in [
@@ -3282,6 +3311,63 @@ mod limits_value_tests {
                     error.contains(key) && error.contains(value) && error.contains("e.g."),
                     "{error}"
                 );
+            }
+        }
+    }
+}
+
+/// Check only argument shapes whose keys are statically known.
+fn check_required_method_inputs(
+    doc: &LockDoc,
+    docs: &HashMap<String, LockDoc>,
+    report: &mut Report,
+) {
+    if !matches!(doc.meta.kind, Kind::Api | Kind::Method) {
+        return;
+    }
+    let Some(steps) = find_section(&doc.sections, "Steps") else {
+        return;
+    };
+    for block in &steps.blocks {
+        if block_val(block, "op") != "method" {
+            continue;
+        }
+        let target = block_val(block, "target");
+        let Some((object, method)) = target.split_once('.') else {
+            continue;
+        };
+        let Some(input) = docs
+            .get(&format!("{object}/methods/{method}"))
+            .and_then(|callee| find_section(&callee.sections, "Signature"))
+            .and_then(|sig| sig.get("input"))
+        else {
+            continue;
+        };
+        let args = block_val(block, "args");
+        let shape = if args.trim() == "transform.in" {
+            find_section(&doc.sections, "Transform")
+                .and_then(|s| s.get("in"))
+                .unwrap_or("{}")
+        } else {
+            args.trim()
+        };
+        if !shape.starts_with('{') || !shape.ends_with('}') {
+            continue;
+        }
+        let (Ok(provided), Ok(inputs)) = (
+            crate::lock::parse_inline_map(shape),
+            crate::lock::parse_inline_map(input),
+        ) else {
+            continue;
+        };
+        for (field, spec) in inputs {
+            let required = spec.starts_with('{')
+                && crate::lock::parse_inline_map(&spec)
+                    .is_ok_and(|attrs| attrs.iter().any(|(k, v)| k == "required" && v == "true"));
+            if required && !provided.iter().any(|(key, _)| key == &field) {
+                report.push(Diag::error(&doc.meta.source, format!(
+                    "method {target} needs required input `{field}`, but args {args} does not provide it"
+                )));
             }
         }
     }
