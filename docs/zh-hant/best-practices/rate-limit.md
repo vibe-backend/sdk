@@ -8,7 +8,6 @@ GET 同 POST 共用 URL 時，用兩個 endpoint 檔明示同一條 route path�
 「每日最多 50 次」唔等於 per-minute rate-limit，warning 代表未執行該限制。
 隱式 memory 只准決定 183 嘅 unique-key counter SQL；其他 SQL 係 build error。
 
-
 ## 用途
 
 使用內建的 `rate-limit` pipeline（§4），或以 `rate-limit-check` op 組合的自訂 pipeline（§2A.4，例如 §11.2 的 `login-guard`），按 IP、租戶及帳戶限制請求頻率。限流設定按 `_definition` → `_version` → feature 繼承（§3）。

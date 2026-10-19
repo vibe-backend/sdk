@@ -10,7 +10,6 @@ source sentence. “At most 50 per day” is not enforced by a per-minute rate l
 For implicit memory, query SQL must use decision 183's supported unique-key
 counter forms; unsupported SQL fails the build.
 
-
 ## Purpose
 
 Bound request rates per IP, per tenant and per account using the built-in `rate-limit` pipeline (§4) or a custom pipeline composed from the `rate-limit-check` op (§2A.4, e.g. `login-guard` in §11.2). Limits are inherited `_definition` → `_version` → feature (§3).

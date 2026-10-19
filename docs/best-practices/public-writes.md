@@ -10,7 +10,6 @@ source sentence. “At most 50 per day” is not enforced by a per-minute rate l
 For implicit memory, query SQL must use decision 183's supported unique-key
 counter forms; unsupported SQL fails the build.
 
-
 ## Purpose
 
 Allow unauthenticated visitors to create or update data (e.g. submitting a review) under tightly controlled conditions. Public endpoints may call `writes: true` methods (Decision 4), but every rule in §7.2 is mandatory (Decisions 21–26, 38, 39, 41, 47, 49, 53).

@@ -329,6 +329,15 @@ mod tests {
     }
 }
 
+#[cfg(feature = "sdk")]
+fn model_table_name(name: &sqlparser::ast::ObjectName) -> String {
+    name.0
+        .iter()
+        .map(|id| id.value.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// Check SQL names against normalized model locks. CRUD read permission is
 /// represented by either `get` or `list`; writes use create/update/delete.
 #[cfg(feature = "sdk")]
@@ -345,6 +354,7 @@ pub(crate) fn model_problems(
         aliases: std::collections::HashMap<String, String>,
         derived: Vec<String>,
         outputs: Vec<String>,
+        projection_columns: Vec<String>,
     }
     impl Visitor for Names {
         type Break = ();
@@ -357,9 +367,45 @@ pub(crate) fn model_problems(
                 );
             }
             if let SetExpr::Select(select) = &*query.body {
+                for from in &select.from {
+                    for join in &from.joins {
+                        use sqlparser::ast::{JoinConstraint, JoinOperator};
+                        let constraint = match &join.join_operator {
+                            JoinOperator::Inner(c)
+                            | JoinOperator::LeftOuter(c)
+                            | JoinOperator::RightOuter(c)
+                            | JoinOperator::FullOuter(c)
+                            | JoinOperator::LeftSemi(c)
+                            | JoinOperator::RightSemi(c)
+                            | JoinOperator::LeftAnti(c)
+                            | JoinOperator::RightAnti(c) => Some(c),
+                            _ => None,
+                        };
+                        if let Some(JoinConstraint::Using(columns)) = constraint {
+                            self.columns
+                                .extend(columns.iter().map(|id| vec![id.value.clone()]));
+                        }
+                    }
+                }
                 for item in &select.projection {
-                    if let sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } = item {
+                    if let sqlparser::ast::SelectItem::QualifiedWildcard(table, _) = item {
+                        self.columns.push(vec![model_table_name(table), "*".into()]);
+                    }
+                    if let sqlparser::ast::SelectItem::ExprWithAlias { alias, expr } = item {
                         self.outputs.push(alias.value.clone());
+                        struct Columns(Vec<String>);
+                        impl Visitor for Columns {
+                            type Break = ();
+                            fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+                                if let Expr::Identifier(id) = expr {
+                                    self.0.push(id.value.clone());
+                                }
+                                ControlFlow::Continue(())
+                            }
+                        }
+                        let mut columns = Columns(Vec::new());
+                        let _ = expr.visit(&mut columns);
+                        self.projection_columns.extend(columns.0);
                     }
                 }
             }
@@ -376,12 +422,12 @@ pub(crate) fn model_problems(
             } = factor
             {
                 self.aliases
-                    .insert(alias.name.value.clone(), name.to_string());
+                    .insert(alias.name.value.clone(), model_table_name(name));
             }
             ControlFlow::Continue(())
         }
         fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<()> {
-            self.tables.push(name.to_string());
+            self.tables.push(model_table_name(name));
             ControlFlow::Continue(())
         }
         fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
@@ -405,21 +451,28 @@ pub(crate) fn model_problems(
         aliases: Default::default(),
         derived: Vec::new(),
         outputs: Vec::new(),
+        projection_columns: Vec::new(),
     };
     let _ = statement.visit(&mut names);
     let actions: &[&str] = match &statement {
         Statement::Query(_) => &["get", "list"],
         Statement::Insert(insert) => {
-            names
-                .columns
-                .extend(insert.columns.iter().map(|id| vec![id.value.clone()]));
+            let target = model_table_name(&insert.table_name);
+            names.columns.extend(
+                insert
+                    .columns
+                    .iter()
+                    .map(|id| vec![target.clone(), id.value.clone()]),
+            );
             if let Some(sqlparser::ast::OnInsert::OnConflict(conflict)) = &insert.on {
                 if let Some(sqlparser::ast::ConflictTarget::Columns(columns)) =
                     &conflict.conflict_target
                 {
-                    names
-                        .columns
-                        .extend(columns.iter().map(|id| vec![id.value.clone()]));
+                    names.columns.extend(
+                        columns
+                            .iter()
+                            .map(|id| vec![target.clone(), id.value.clone()]),
+                    );
                 }
                 if let sqlparser::ast::OnConflictAction::DoUpdate(update) = &conflict.action {
                     for assignment in &update.assignments {
@@ -457,6 +510,14 @@ pub(crate) fn model_problems(
         Statement::Delete(_) => &["delete"],
         _ => return vec![],
     };
+    let write_target = match &statement {
+        Statement::Insert(insert) => Some(model_table_name(&insert.table_name)),
+        Statement::Update { table, .. } => match &table.relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => Some(model_table_name(name)),
+            _ => None,
+        },
+        _ => None,
+    };
     let mut known: Vec<_> = models.iter().map(|m| m.table.as_str()).collect();
     known.sort_unstable();
     let mut problems = Vec::new();
@@ -464,19 +525,24 @@ pub(crate) fn model_problems(
         if names.derived.contains(table) {
             continue;
         }
+        let table_actions = if write_target.as_ref().is_some_and(|target| target != table) {
+            &["get", "list"][..]
+        } else {
+            actions
+        };
         match models.iter().find(|m| &m.table == table) {
             None => problems.push(format!(
                 "unknown table {table} in step {step}; known tables: {}",
                 known.join(", ")
             )),
             Some(model)
-                if !actions
+                if !table_actions
                     .iter()
                     .any(|action| model.crud.iter().any(|a| a == action)) =>
             {
                 problems.push(format!(
                     "action {} is not allowed by model {} in step {step}",
-                    actions.join("/"),
+                    table_actions.join("/"),
                     model.id
                 ))
             }
@@ -497,10 +563,13 @@ pub(crate) fn model_problems(
                     && table.is_none_or(|t| t.eq_ignore_ascii_case("excluded") || t == model.table)
             })
             .collect();
-        let known_column = candidates
-            .iter()
-            .any(|model| model.fields.iter().any(|f| &f.name == name));
-        let output_alias = qualifier.is_none() && names.outputs.contains(name);
+        let known_column = name == "*"
+            || candidates
+                .iter()
+                .any(|model| model.fields.iter().any(|f| &f.name == name));
+        let output_alias = qualifier.is_none()
+            && names.outputs.contains(name)
+            && !names.projection_columns.contains(name);
         if name == "tenant_id"
             || (candidates.is_empty() && qualifier.is_some())
             || (!candidates.is_empty() && !known_column && !output_alias)

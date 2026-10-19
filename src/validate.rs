@@ -3622,14 +3622,16 @@ fn check_model_sql(
             for problem in crate::sqlpolicy::model_problems(sql, &models, &block.heading) {
                 report.push(Diag::error(file, problem));
             }
-            if memory {
-                if let Err(error) = crate::runtime::memsql::classify(sql)
-                    .and_then(|plan| plan.check_models(&models))
-                {
+            if let Err(error) =
+                crate::runtime::memsql::classify(sql).and_then(|plan| plan.check_models(&models))
+            {
+                if memory {
                     report.push(Diag::error(
                         file,
                         format!("step {}: MEMORY_UNSUPPORTED_SQL: {error}", block.heading),
                     ));
+                } else {
+                    report.push(Diag::warning(file, format!("{} step {} will fail on --db memory with MEMORY_UNSUPPORTED_SQL; fine on PostgreSQL: {error}", doc.meta.id.replace("/methods/", "."), block.heading)));
                 }
             }
         }
