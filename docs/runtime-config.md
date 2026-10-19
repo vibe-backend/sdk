@@ -190,3 +190,31 @@ then restart. Never record SQL that has not actually been applied.
 Memory query steps support unique-key SELECT, `COALESCE(MAX(integer), default)`, integer increment or plain-assignment UPDATE with RETURNING, and single-row INSERT with a unique-key ON CONFLICT DO UPDATE (integer addition) or DO NOTHING. Each statement runs atomically under the store lock with tenant injection, the same role-level checks as memory CRUD (`public_reader` is read-only; `public_writer` may INSERT/UPDATE) and unique/NOT NULL constraints; integer overflow fails without changes. SQL mentioning `tenant_id` is rejected. Per-column grants are not modelled for memory query steps. Other SQL returns HTTP 500 `MEMORY_UNSUPPORTED_SQL`: use `--db postgres` for those methods. Build and memory startup warn on stderr for unsupported query steps.
 
 Projects without any provider `.md` sources use the implicit in-memory provider `main` (decision 184). Its manifest provenance records `implicit_memory_provider: true`; release builds and runtime startup warn that data is lost on restart. Production still refuses `--db memory`. To use `--db postgres`, add `providers/main.md` and rebuild.
+
+## Global LLM configuration (decision 185)
+
+Global LLM settings for development live in `$XDG_CONFIG_HOME/vibe/llm.env`
+when XDG_CONFIG_HOME is nonempty and absolute, otherwise
+`$HOME/.config/vibe/llm.env`. Allowed keys are `LLM_PROVIDER`, `LLM_BASE_URL`,
+`LLM_MODEL`, `LLM_API_STYLE` and `LLM_API_KEY_FILE`. Unknown keys and inline
+`LLM_API_KEY`/`OPENAI_API_KEY` are refused. Put the key in a separate file;
+relative key paths resolve against the global config directory. Both files
+must have no group/other permission bits on Unix (`mode & 077 == 0`; fix with
+`chmod 600 <path>`). This check applies only to global files, not project or
+process-supplied key files.
+
+Precedence per key is process environment > project `.env` > global; empty
+LLM values count as missing. Higher-precedence credentials skip the global key
+file. Interactive first run writes global `llm.env` and a separate key file
+(0600) in a new directory (0700) only when no `LLM_*` setting exists in the
+process environment, project `.env` or global config. With partial project or
+process LLM settings, it prompts only for missing values and appends them to
+project `.env` (0600), adding `.env` to `.gitignore`. It refuses to overwrite
+existing files and keeps `LLM_ALLOW_PRIVATE_HOST` project-scoped.
+`VIBE_DEBUG_LLM_CONFIG=1` prints variable names and sources
+(`env`, `project`, `global`) to stderr, never values.
+
+Global settings are ignored by `vibe run`/runtime, `vibe build --release`,
+CI (`CI` nonempty except `false`/`0`, or `GITHUB_ACTIONS=true`), and environments
+other than development (`VIBE_ENV=dev/development/local/test`, unset or empty).
+Development `vibe`, `vibe build` and `vibe build --check` use them.

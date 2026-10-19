@@ -77,7 +77,7 @@ vibe run
 curl http://127.0.0.1:8080/hello/v1/dev/hello
 ```
 
-First run writes LLM settings to `.env` (gitignored; the key is entered masked and never printed). The CLI shows the files and asks before writing, never overwrites, and non-interactive `vibe` prints help. In development, `run` always serves slug `dev`, even when other slugs are configured, and reloads edits to `.vibe/slugs.json` without restart. `vibe build` refreshes locks, runs deploy validation and writes the dev manifest. `vibe run` validates project locks and builds the dev manifest in memory; it never calls the LLM. Missing, stale or wrong-version locks ask for `vibe build`.
+First run writes global `llm.env` and a separate key file (0600) only when no `LLM_*` setting exists in the process environment, project `.env` or global config. With partial project or process LLM settings, it prompts only for missing values and appends them to project `.env` (0600), adding `.env` to `.gitignore`. The key is entered masked and never printed; see [global LLM configuration](runtime-config.md#global-llm-configuration-decision-185). The CLI shows the files and asks before writing, never overwrites, and non-interactive `vibe` prints help. In development, `run` always serves slug `dev`, even when other slugs are configured, and reloads edits to `.vibe/slugs.json` without restart. `vibe build` refreshes locks, runs deploy validation and writes the dev manifest. `vibe run` validates project locks and builds the dev manifest in memory; it never calls the LLM. Missing, stale or wrong-version locks ask for `vibe build`.
 
 ## Run a project
 
@@ -140,3 +140,14 @@ Required CI checks are **Markdown lint & link check** and **Rust fmt / clippy / 
 ## Binary installation
 
 The install/upgrade/remove manager in [docs/install.md](install.md) installs verified pre-release assets. It checks SHA256SUMS and GitHub build provenance attestations before installation; see the guide for verification requirements and source-build alternatives.
+
+## Global LLM configuration (decision 185)
+
+Development `vibe`, `vibe build` and `vibe build --check` can reuse personal LLM
+settings across projects. Settings live in `$XDG_CONFIG_HOME/vibe/llm.env` when
+`XDG_CONFIG_HOME` is nonempty and absolute, otherwise `$HOME/.config/vibe/llm.env`,
+with the API key in a separate private file. Process environment settings take
+precedence over project `.env`, which takes precedence over global settings.
+Global settings are ignored by runtime, release builds, CI and non-development
+environments. See [the detailed configuration reference](runtime-config.md#global-llm-configuration-decision-185)
+for allowed keys, permissions, first-run behavior, precedence and diagnostics.

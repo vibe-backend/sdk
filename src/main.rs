@@ -6,7 +6,6 @@ use std::io::IsTerminal;
 use vibe::compile::{build_project, CompileOptions};
 use vibe::llm::{self, LlmAdapter};
 use vibe::manifest;
-use vibe::run::load_dotenv;
 use vibe::secret::secret_scan;
 use vibe::sign;
 use vibe::validate::{validate_project, ValidateOptions};
@@ -94,12 +93,15 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), String> {
     let Some(command) = cli.command else {
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() || ci_or_prod() {
+        if !std::io::stdin().is_terminal()
+            || !std::io::stdout().is_terminal()
+            || !vibe::global_config::enabled(&llm::env_map_from_process(), false)
+        {
             Cli::command().print_help().map_err(|e| e.to_string())?;
             return Ok(());
         }
         let project = Path::new(".");
-        load_dotenv(project);
+        vibe::global_config::load_process(project)?;
         let mut io = TerminalIo;
         let config = vibe::interactive::setup(project, &mut io, llm::env_map_from_process())?;
         let adapter = llm::adapter_for(&config)?;
@@ -160,7 +162,7 @@ async fn run(cli: Cli) -> Result<(), String> {
 
 async fn cmd_build(project: &Path, check: bool) -> Result<(), String> {
     if !ci_or_prod() {
-        load_dotenv(project);
+        vibe::global_config::load_process(project)?;
     }
     if check {
         // Check and release always compile from source, ignoring disk locks.

@@ -35,8 +35,9 @@ This installs the `vibe` command. On Windows, download the zip from
 vibe
 ```
 
-The first time, it asks for your AI settings (your key is hidden as you type and is
-saved only on your computer, in `.env`). Then type what you want, for example
+The first time, `vibe` asks for your AI settings and key once (your key is hidden
+as you type). It saves them only on your computer in your personal settings folder
+and reuses them for your other projects. Then type what you want, for example
 *"make a hello world API"*. `vibe` shows you the files it wants to create and asks
 before writing anything.
 

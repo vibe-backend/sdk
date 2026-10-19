@@ -373,8 +373,30 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
         crate::runtime::RunEnv::from_var(std::env::var("VIBE_ENV").ok().as_deref(), memory);
     check_runtime_llm(run_env)?;
     if memory && !run_env.is_dev() {
+        let implicit = match &opts.source {
+            RunSource::Artifact(path) => std::fs::read(artifact_paths(path).0)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|v| v["provenance"]["implicit_memory_provider"] == true),
+            RunSource::Project => {
+                #[cfg(feature = "sdk")]
+                {
+                    crate::discover::discover(project)
+                        .is_ok_and(|sources| crate::compile::implicit_memory_provider(&sources))
+                }
+                #[cfg(not(feature = "sdk"))]
+                {
+                    false
+                }
+            }
+        };
+        let hint = if implicit {
+            "; the project has no providers/ (it uses the implicit in-memory provider `main`); adding providers/main.md (PostgreSQL) fixes it"
+        } else {
+            ""
+        };
         return Err(format!(
-            "--db memory is a development executor and is refused when VIBE_ENV is {:?}; use PostgreSQL",
+            "--db memory is a development executor and is refused when VIBE_ENV is {:?}; use PostgreSQL{hint}",
             std::env::var("VIBE_ENV").unwrap_or_default()
         ));
     }
