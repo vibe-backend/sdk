@@ -110,6 +110,7 @@ pub fn setup_with_resolver(
             }
         }
     }
+    let write_global = !combined.keys().any(|key| key.starts_with("LLM_"));
     let mut values = HashMap::new();
     let fresh = !combined.contains_key("LLM_PROVIDER");
     let provider = if fresh {
@@ -197,28 +198,30 @@ pub fn setup_with_resolver(
                 .map_err(|r| llm::redact(&errors(r), &[&key]))?;
         }
     }
-    let global_values = combined
-        .iter()
-        .filter(|(k, _)| {
-            matches!(
-                k.as_str(),
-                "LLM_PROVIDER" | "LLM_BASE_URL" | "LLM_MODEL" | "LLM_API_STYLE"
-            )
-        })
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let (config_path, key_path) = crate::global_config::write_initial(
-        dir.as_deref()
-            .ok_or("HOME is required for global LLM configuration")?,
-        &global_values,
-        &key,
-    )?;
-    io.write(&format!(
-        "wrote {} and {}",
-        config_path.display(),
-        key_path.display()
-    ));
-    values.retain(|k, _| k == "LLM_ALLOW_PRIVATE_HOST");
+    if write_global {
+        let global_values = combined
+            .iter()
+            .filter(|(k, _)| {
+                matches!(
+                    k.as_str(),
+                    "LLM_PROVIDER" | "LLM_BASE_URL" | "LLM_MODEL" | "LLM_API_STYLE"
+                )
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let (config_path, key_path) = crate::global_config::write_initial(
+            dir.as_deref()
+                .ok_or("HOME is required for global LLM configuration")?,
+            &global_values,
+            &key,
+        )?;
+        io.write(&format!(
+            "wrote {} and {}",
+            config_path.display(),
+            key_path.display()
+        ));
+        values.retain(|k, _| k == "LLM_ALLOW_PRIVATE_HOST");
+    }
     fs::create_dir_all(project).map_err(|e| e.to_string())?;
     if !values.is_empty() {
         let mut options = fs::OpenOptions::new();
@@ -251,7 +254,7 @@ pub fn setup_with_resolver(
             .map_err(|_| "Cannot write .env".to_string())?;
         io.write("wrote .env (LLM settings)");
     }
-    if values.contains_key("LLM_ALLOW_PRIVATE_HOST") {
+    if !values.is_empty() {
         let ignore = project.join(".gitignore");
         let existing = fs::read_to_string(&ignore).unwrap_or_default();
         if !existing

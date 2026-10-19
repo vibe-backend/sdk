@@ -291,13 +291,13 @@ fn implicit_provider_builds_and_guards() {
             "{stderr}"
         );
     }
-    for artifact in [false, true] {
+    for artifact in [None, Some("manifest.json"), Some(".")] {
         let mut command = cli();
         command
             .env("VIBE_ENV", "production")
             .args(["run", "--db", "memory"]);
-        if artifact {
-            command.args(["--artifact", "manifest.json"]);
+        if let Some(path) = artifact {
+            command.args(["--artifact", path]);
         }
         let out = command.output().unwrap();
         assert!(!out.status.success());

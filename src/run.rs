@@ -374,7 +374,7 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
     check_runtime_llm(run_env)?;
     if memory && !run_env.is_dev() {
         let implicit = match &opts.source {
-            RunSource::Artifact(path) => std::fs::read(path)
+            RunSource::Artifact(path) => std::fs::read(artifact_paths(path).0)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
                 .is_some_and(|v| v["provenance"]["implicit_memory_provider"] == true),

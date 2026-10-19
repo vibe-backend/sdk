@@ -130,6 +130,20 @@ fn setup_and_existing_config() {
     assert!(!p.join(".env").exists());
     let text = fs::read_to_string(p.join("config/vibe/llm.env")).unwrap();
     assert!(text.contains("LLM_API_KEY_FILE="));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for (path, mode) in [
+            ("config/vibe", 0o700),
+            ("config/vibe/llm.env", 0o600),
+            ("config/vibe/llm-api-key", 0o600),
+        ] {
+            assert_eq!(
+                fs::metadata(p.join(path)).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+    }
     assert!(!text.contains("super-secret-key"));
     let mut io = Script::default();
     settings.extend(env());
@@ -182,6 +196,241 @@ fn setup_and_existing_config() {
                 .count(),
             1
         );
+        fs::remove_dir_all(project).unwrap();
+    }
+    for blank in ["", "   "] {
+        let project = root();
+        let original = format!("LLM_PROVIDER=openai\nLLM_MODEL=m\nLLM_API_KEY={blank}\n");
+        fs::write(project.join(".env"), &original).unwrap();
+        let mut io = Script::new(&["replacement-secret"]);
+        let config = interactive::setup_with_resolver(
+            &project,
+            &mut io,
+            HashMap::from([(
+                "XDG_CONFIG_HOME".into(),
+                project.join("config").to_string_lossy().into_owned(),
+            )]),
+            |_, _| Ok(vec!["93.184.216.34:443".parse().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(config.api_key, "replacement-secret");
+        assert!(io.lines.is_empty());
+        assert!(!project.join("config").exists());
+        assert_eq!(
+            fs::read_to_string(project.join(".gitignore"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == ".env")
+                .count(),
+            1
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(project.join(".env"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert!(io.output.contains("API key:"));
+        for prompt in [
+            "Provider",
+            "Model:",
+            "Base URL",
+            "API style",
+            "replacement-secret",
+        ] {
+            assert!(!io.output.contains(prompt));
+        }
+        let bytes = fs::read(project.join(".env")).unwrap();
+        assert!(bytes.starts_with(original.as_bytes()));
+        assert!(String::from_utf8(bytes).unwrap()[original.len()..]
+            .contains("LLM_API_KEY=replacement-secret\n"));
+    }
+    // Only the missing key is requested; existing model and original bytes win.
+    for model in ["gpt-4o-2024-08-06", "existing-model"] {
+        let project = root();
+        let original = format!("# mine\nLLM_PROVIDER=openai\nLLM_MODEL={model}\n");
+        fs::write(project.join(".env"), &original).unwrap();
+        let mut io = Script::new(&["partial-secret"]);
+        let config = interactive::setup_with_resolver(
+            &project,
+            &mut io,
+            HashMap::from([(
+                "XDG_CONFIG_HOME".into(),
+                project.join("config").to_string_lossy().into_owned(),
+            )]),
+            |_, _| Ok(vec!["93.184.216.34:443".parse().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.model, model);
+        assert!(io.output.contains("API key:"));
+        for prompt in [
+            "Provider",
+            "Base URL",
+            "Model:",
+            "API style",
+            "partial-secret",
+        ] {
+            assert!(!io.output.contains(prompt));
+        }
+        assert!(io.lines.is_empty());
+        assert!(!project.join("config").exists());
+        assert_eq!(
+            fs::read_to_string(project.join(".gitignore"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == ".env")
+                .count(),
+            1
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(project.join(".env"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let text = fs::read_to_string(project.join(".env")).unwrap();
+        assert!(text.starts_with(&original));
+        for key in ["LLM_PROVIDER", "LLM_MODEL", "LLM_API_KEY"] {
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.starts_with(&format!("{key}=")))
+                    .count(),
+                1
+            );
+        }
+        fs::remove_dir_all(project).unwrap();
+    }
+    // Process-supplied values are never copied into .env; append preserves a
+    // missing final newline and the first occurrence of an existing key.
+    let project = root();
+    let original = "# mine\nLLM_PROVIDER=openai\nLLM_MODEL=first-model\nLLM_MODEL=second-model";
+    fs::write(project.join(".env"), original).unwrap();
+    let supplied = HashMap::from([
+        ("LLM_API_KEY".into(), "process-secret".into()),
+        (
+            "XDG_CONFIG_HOME".into(),
+            project.join("config").to_string_lossy().into_owned(),
+        ),
+    ]);
+    let mut io = Script::default();
+    let config = interactive::setup_with_resolver(&project, &mut io, supplied, |_, _| {
+        panic!("usable config must skip DNS lookup")
+    })
+    .unwrap();
+    assert_eq!(config.model, "first-model");
+    assert_eq!(fs::read_to_string(project.join(".env")).unwrap(), original);
+    assert!(!io.output.contains("wrote .env"));
+    assert!(!io.output.contains("process-secret"));
+    fs::write(
+        project.join(".env"),
+        "# mine\nLLM_PROVIDER=openai\nLLM_MODEL=first-model",
+    )
+    .unwrap();
+    let mut io = Script::new(&["new-secret"]);
+    interactive::setup_with_resolver(
+        &project,
+        &mut io,
+        HashMap::from([(
+            "XDG_CONFIG_HOME".into(),
+            project.join("config").to_string_lossy().into_owned(),
+        )]),
+        |_, _| Ok(vec!["93.184.216.34:443".parse().unwrap()]),
+    )
+    .unwrap();
+    assert!(fs::read_to_string(project.join(".env"))
+        .unwrap()
+        .starts_with("# mine\nLLM_PROVIDER=openai\nLLM_MODEL=first-model\n# vibe LLM settings\n"));
+    fs::remove_dir_all(project).unwrap();
+    // Keep setup cases in this test because setup mutates process variables.
+    for (base, port, response) in [
+        ("https://proxy.example.com/v1", 443, "y"),
+        ("https://proxy.example.com:8443/v1", 8443, "n"),
+    ] {
+        let project = root();
+        let mut io = Script::new(&["", base, "test-model", "", "test-key", response]);
+        let config = interactive::setup_with_resolver(
+            &project,
+            &mut io,
+            HashMap::from([(
+                "XDG_CONFIG_HOME".into(),
+                project.join("config").to_string_lossy().into_owned(),
+            )]),
+            |host, actual_port| {
+                assert_eq!(host, "proxy.example.com");
+                assert_eq!(actual_port, port);
+                Ok(vec![
+                    "8.8.8.8:443".parse().unwrap(),
+                    "198.18.0.1:443".parse().unwrap(),
+                ])
+            },
+        )
+        .unwrap();
+        let text = fs::read_to_string(project.join(".env")).unwrap_or_default();
+        assert_eq!(
+            text.contains("LLM_ALLOW_PRIVATE_HOST=true"),
+            response == "y"
+        );
+        assert_eq!(config.endpoint_private, response == "y");
+        assert!(io
+            .output
+            .contains("The endpoint resolves to a private or local address."));
+        fs::remove_dir_all(project).unwrap();
+    }
+    let project = root();
+    let mut io = Script::new(&["", "", "test-model", "", "test-key"]);
+    interactive::setup_with_resolver(
+        &project,
+        &mut io,
+        HashMap::from([(
+            "XDG_CONFIG_HOME".into(),
+            project.join("config").to_string_lossy().into_owned(),
+        )]),
+        |_, _| Err(std::io::Error::other("DNS unavailable")),
+    )
+    .unwrap();
+    assert!(!io.output.contains("Allow it for local development"));
+    fs::remove_dir_all(project).unwrap();
+    // Partial process settings also append only missing values to the project.
+    for supplied_key in [false, true] {
+        let project = root();
+        let mut settings = HashMap::from([
+            (
+                "XDG_CONFIG_HOME".into(),
+                project.join("config").to_string_lossy().into_owned(),
+            ),
+            ("LLM_PROVIDER".into(), "openai".into()),
+        ]);
+        let mut io = if supplied_key {
+            settings.insert("LLM_API_KEY".into(), "process-secret".into());
+            Script::new(&["missing-model"])
+        } else {
+            settings.insert("LLM_MODEL".into(), "existing-model".into());
+            Script::new(&["missing-secret"])
+        };
+        interactive::setup_with_resolver(&project, &mut io, settings, |_, _| Ok(Vec::new()))
+            .unwrap();
+        assert!(io.lines.is_empty());
+        assert!(!project.join("config").exists());
+        assert!(!io.output.contains("process-secret"));
+        assert!(!io.output.contains("missing-secret"));
+        let text = fs::read_to_string(project.join(".env")).unwrap();
+        assert!(!text.contains("LLM_PROVIDER="));
+        assert!(!text.contains("process-secret"));
+        assert_eq!(text.contains("LLM_MODEL="), supplied_key);
+        assert_eq!(text.contains("LLM_API_KEY="), !supplied_key);
         fs::remove_dir_all(project).unwrap();
     }
     // An incomplete global file is an error, without prompting or overwriting it.
