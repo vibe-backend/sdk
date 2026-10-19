@@ -12,6 +12,7 @@ pub const GRAMMAR: &str = "\
 LOCK GRAMMAR (the parser rejects anything else):
 - Every non-blank line is exactly one of: `## Section`, `### sN op` (steps/blocks), `- key: value`, a table row `| a | b |`, or `(none)` for an empty section.
 - `- key: value` is one flat line. NEVER indent bullets, NEVER nest bullets, NEVER write a bullet without `key:`. Put structure inside the value: lists `[a, b]`, maps `{ k: v, k2: v2 }`.
+- Endpoints must supply every required method input; when the source refers to a single named thing (\"the counter\") and no request field names it, pass a constant key in Transform in, e.g. `{name: \"counter\"}`.
 - No prose, no comments, no code fences, no frontmatter, no `# Title` needed.
 - Keys are lowercase kebab-case and must come from the lists below; do not invent keys.
 - Tables: header row, then `| --- | --- |`, then one row per item; empty cell is `-`. Cells never contain `|`.
@@ -19,7 +20,7 @@ LOCK GRAMMAR (the parser rejects anything else):
 
 const MODEL_KEYS: &str = "\
 MODEL KEYS:
-- ## Table bullets: provider, table, optional owner-key (a field holding the owner user id), optional ownership (tenant-wide | role(admin)).
+- ## Table bullets: provider, table, optional owner-key (a field holding the owner user id), optional ownership (tenant-wide | role(admin)). The provider is the name given in the Target store/DEPENDENCIES lines (for the implicit store, `main`), never the store kind.
 - ## Fields table header is exactly `| name | type | rules | system |`. One row per user field; do NOT add id, tenant_id, created_at, updated_at, deleted_at, erased_at (the platform adds them). system is `no`.
 - type is one of: uuid, string, string[], integer, number, boolean, timestamp, password, json, bytes.
 - rules is a comma-separated list from: required, nullable, unique, primary, default: <value|gen|now>, format: email, min: <int>, max: <int>, enum: [a, b], sensitive, untrusted, personal: <standard|sensitive>, public-writable. For strings min/max are character lengths (\"at most 80 characters\" is `max: 80`; there is no max_length/min_length/maxLength key). For integers/numbers min/max are values.
@@ -30,6 +31,8 @@ MODEL KEYS:
 
 const METHOD_KEYS: &str = "\
 METHOD KEYS:
+- Use each Model dependency's table= value exactly; never invent a table or column. SQL permissions follow CRUD: SELECT needs get or list, INSERT create, UPDATE update, DELETE delete.
+- When the input says the target store is memory, use only these forms: UPDATE t SET c = c + <int|$n> WHERE <unique> = $n RETURNING ...; single-row INSERT ... VALUES ... ON CONFLICT (<unique>) DO UPDATE SET c = t.c + <int|EXCLUDED.c> RETURNING ... or DO NOTHING [RETURNING ...]; SELECT <cols|*> FROM t WHERE <unique> = $n; SELECT COALESCE(MAX(c), <int>) AS x FROM t WHERE <unique> = $n.
 - ## Signature bullets: input ({ name: { type: T, required: true } }), output, errors ([CODE, ...]), writes (true|false), capabilities ([] or [sign-token] / [set-password] / [confirm-verification] only when the source says so).
 - ## Calls: `- methods: [object.action, ...]` (platform recomputes it from steps).
 - ## Steps keys per op (plus `op` first and `source-lines` last on every step):
@@ -53,9 +56,11 @@ const AUTH_OP_KEYS: &str = "\
 
 const API_KEYS: &str = "\
 API FEATURE KEYS:
+- Route path follows the flat source filename and Project route rule; exclude the project prefix. To share a URL across GET and POST, use two endpoint files with an explicit same route path sentence in each.
+- Public requires original source wording: anyone can, public, publicly, no login, without logging in, without login, no authentication, unauthenticated; or 公開, 任何人, 唔使登入, 不用登入, 無需登入, 毋須登入, 免登入. Match public in both directions. Public endpoints remove auth and set public-writes exactly when their called methods write. Explicit public/auth/public-writes frontmatter takes precedence. Otherwise use private with auth required.
 - ## Route: method (GET|POST|PUT|DELETE), path (/definition/version/...; `{slug}` for public tenants, `{id}` for params).
 - ## Access: public (true|false); for public also public-writes and tenant as specified by the input's Project route rule.
-- ## Pipelines: blocks `### auth` (mode: jwt|api-key, optional roles: [..]), `### -auth` with `- removed: true` ONLY if the source explicitly removes auth, `### rate-limit` (per-minute: N, key: ip|tenant|input.email). Removing auth never adds JWT/token settings. Write `(none)` when the source says nothing.
+- ## Pipelines: blocks `### auth` (mode: jwt|api-key, optional roles: [..]), `### -auth` with `- removed: true` for public endpoints or if the source explicitly removes auth, `### rate-limit` (per-minute: N, key: ip|tenant|input.email). Removing auth never adds JWT/token settings. Write `(none)` when the source says nothing.
 - ## Limits: computed by the compiler from frontmatter pins (provider, timeout, body) and inherited defaults; never derive limits from prose.
 - ## Request table header exactly `| field | type | rules | required |`; field is path.x, query.x, body.x or header.x; required yes|no.
 - ## Response: status.

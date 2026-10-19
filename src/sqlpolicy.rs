@@ -328,3 +328,315 @@ mod tests {
         assert!(rejected("UPDATE products SET WHERE").contains("does not parse"));
     }
 }
+
+#[cfg(feature = "sdk")]
+fn model_table_name(name: &sqlparser::ast::ObjectName) -> String {
+    name.0
+        .iter()
+        .map(|id| id.value.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Check SQL names against normalized model locks. CRUD read permission is
+/// represented by either `get` or `list`; writes use create/update/delete.
+#[cfg(feature = "sdk")]
+pub(crate) fn model_problems(
+    sql: &str,
+    models: &[crate::manifest::ModelSpec],
+    step: &str,
+) -> Vec<String> {
+    use sqlparser::ast::{ObjectName, Visit, Visitor};
+    use std::ops::ControlFlow;
+    struct Names {
+        tables: Vec<String>,
+        columns: Vec<Vec<String>>,
+        aliases: std::collections::HashMap<String, String>,
+        derived: Vec<String>,
+        outputs: Vec<String>,
+        projection_columns: Vec<String>,
+    }
+    impl Visitor for Names {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            if let Some(with) = &query.with {
+                self.derived.extend(
+                    with.cte_tables
+                        .iter()
+                        .map(|cte| cte.alias.name.value.clone()),
+                );
+            }
+            if let SetExpr::Select(select) = &*query.body {
+                for from in &select.from {
+                    for join in &from.joins {
+                        use sqlparser::ast::{JoinConstraint, JoinOperator};
+                        let constraint = match &join.join_operator {
+                            JoinOperator::Inner(c)
+                            | JoinOperator::LeftOuter(c)
+                            | JoinOperator::RightOuter(c)
+                            | JoinOperator::FullOuter(c)
+                            | JoinOperator::LeftSemi(c)
+                            | JoinOperator::RightSemi(c)
+                            | JoinOperator::LeftAnti(c)
+                            | JoinOperator::RightAnti(c) => Some(c),
+                            _ => None,
+                        };
+                        if let Some(JoinConstraint::Using(columns)) = constraint {
+                            self.columns
+                                .extend(columns.iter().map(|id| vec![id.value.clone()]));
+                        }
+                    }
+                }
+                for item in &select.projection {
+                    if let sqlparser::ast::SelectItem::QualifiedWildcard(table, _) = item {
+                        self.columns.push(vec![model_table_name(table), "*".into()]);
+                    }
+                    if let sqlparser::ast::SelectItem::ExprWithAlias { alias, expr } = item {
+                        self.outputs.push(alias.value.clone());
+                        struct Columns(Vec<String>);
+                        impl Visitor for Columns {
+                            type Break = ();
+                            fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+                                if let Expr::Identifier(id) = expr {
+                                    self.0.push(id.value.clone());
+                                }
+                                ControlFlow::Continue(())
+                            }
+                        }
+                        let mut columns = Columns(Vec::new());
+                        let _ = expr.visit(&mut columns);
+                        self.projection_columns.extend(columns.0);
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_table_factor(
+            &mut self,
+            factor: &sqlparser::ast::TableFactor,
+        ) -> ControlFlow<()> {
+            if let sqlparser::ast::TableFactor::Table {
+                name,
+                alias: Some(alias),
+                ..
+            } = factor
+            {
+                self.aliases
+                    .insert(alias.name.value.clone(), model_table_name(name));
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<()> {
+            self.tables.push(model_table_name(name));
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            match expr {
+                Expr::Identifier(id) => self.columns.push(vec![id.value.clone()]),
+                Expr::CompoundIdentifier(ids) => self
+                    .columns
+                    .push(ids.iter().map(|id| id.value.clone()).collect()),
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let statement = match crate::sqlguard::parse_one(sql) {
+        Ok(statement) => statement,
+        Err(error) => return vec![error],
+    };
+    let mut names = Names {
+        tables: Vec::new(),
+        columns: Vec::new(),
+        aliases: Default::default(),
+        derived: Vec::new(),
+        outputs: Vec::new(),
+        projection_columns: Vec::new(),
+    };
+    let _ = statement.visit(&mut names);
+    let actions: &[&str] = match &statement {
+        Statement::Query(_) => &["get", "list"],
+        Statement::Insert(insert) => {
+            let target = model_table_name(&insert.table_name);
+            names.columns.extend(
+                insert
+                    .columns
+                    .iter()
+                    .map(|id| vec![target.clone(), id.value.clone()]),
+            );
+            if let Some(sqlparser::ast::OnInsert::OnConflict(conflict)) = &insert.on {
+                if let Some(sqlparser::ast::ConflictTarget::Columns(columns)) =
+                    &conflict.conflict_target
+                {
+                    names.columns.extend(
+                        columns
+                            .iter()
+                            .map(|id| vec![target.clone(), id.value.clone()]),
+                    );
+                }
+                if let sqlparser::ast::OnConflictAction::DoUpdate(update) = &conflict.action {
+                    for assignment in &update.assignments {
+                        match &assignment.target {
+                            sqlparser::ast::AssignmentTarget::ColumnName(name) => names
+                                .columns
+                                .push(name.0.iter().map(|id| id.value.clone()).collect()),
+                            sqlparser::ast::AssignmentTarget::Tuple(columns) => names
+                                .columns
+                                .extend(columns.iter().map(|name| {
+                                    name.0.iter().map(|id| id.value.clone()).collect()
+                                })),
+                        }
+                    }
+                }
+            }
+            &["create"]
+        }
+        Statement::Update { assignments, .. } => {
+            for assignment in assignments {
+                use sqlparser::ast::AssignmentTarget;
+                match &assignment.target {
+                    AssignmentTarget::ColumnName(name) => names
+                        .columns
+                        .push(name.0.iter().map(|id| id.value.clone()).collect()),
+                    AssignmentTarget::Tuple(names_) => names.columns.extend(
+                        names_
+                            .iter()
+                            .map(|name| name.0.iter().map(|id| id.value.clone()).collect()),
+                    ),
+                }
+            }
+            &["update"]
+        }
+        Statement::Delete(_) => &["delete"],
+        _ => return vec![],
+    };
+    let write_target = match &statement {
+        Statement::Insert(insert) => Some(model_table_name(&insert.table_name)),
+        Statement::Update { table, .. } => match &table.relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => Some(model_table_name(name)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut known: Vec<_> = models.iter().map(|m| m.table.as_str()).collect();
+    known.sort_unstable();
+    let mut problems = Vec::new();
+    for table in &names.tables {
+        if names.derived.contains(table) {
+            continue;
+        }
+        let table_actions = if write_target.as_ref().is_some_and(|target| target != table) {
+            &["get", "list"][..]
+        } else {
+            actions
+        };
+        match models.iter().find(|m| &m.table == table) {
+            None => problems.push(format!(
+                "unknown table {table} in step {step}; known tables: {}",
+                known.join(", ")
+            )),
+            Some(model)
+                if !table_actions
+                    .iter()
+                    .any(|action| model.crud.iter().any(|a| a == action)) =>
+            {
+                problems.push(format!(
+                    "action {} is not allowed by model {} in step {step}",
+                    table_actions.join("/"),
+                    model.id
+                ))
+            }
+            _ => {}
+        }
+    }
+    for column in &names.columns {
+        let Some(name) = column.last() else { continue };
+        let qualifier = column.iter().rev().nth(1).map(String::as_str);
+        if name == "tenant_id" {
+            let table = qualifier
+                .unwrap_or_else(|| names.tables.first().map(String::as_str).unwrap_or("?"));
+            problems.push(format!("unknown column {table}.{name} in step {step}"));
+            continue;
+        }
+        if qualifier.is_some_and(|q| names.derived.iter().any(|d| d == q)) {
+            continue;
+        }
+        let table = qualifier.map(|q| names.aliases.get(q).map(String::as_str).unwrap_or(q));
+        let candidates: Vec<_> = models
+            .iter()
+            .filter(|model| {
+                names.tables.contains(&model.table)
+                    && table.is_none_or(|t| t.eq_ignore_ascii_case("excluded") || t == model.table)
+            })
+            .collect();
+        let known_column = name == "*"
+            || candidates
+                .iter()
+                .any(|model| model.fields.iter().any(|f| &f.name == name));
+        let output_alias = qualifier.is_none()
+            && names.outputs.contains(name)
+            && !names.projection_columns.contains(name);
+        if (candidates.is_empty() && qualifier.is_some())
+            || (!candidates.is_empty() && !known_column && !output_alias)
+        {
+            let table = table
+                .unwrap_or_else(|| candidates.first().map(|m| m.table.as_str()).unwrap_or("?"));
+            problems.push(format!("unknown column {table}.{name} in step {step}"));
+        }
+    }
+    problems.sort();
+    problems.dedup();
+    problems
+}
+
+#[cfg(all(test, feature = "sdk"))]
+mod model_tests {
+    use super::model_problems;
+    fn model() -> crate::manifest::ModelSpec {
+        crate::manifest::model_from(&crate::lock::LockDoc {
+            meta: crate::lock::Meta::pending(crate::lock::Kind::Model, None, "counter", "counter.md"),
+            sections: crate::lock::parse_sections("## Table\n- table: counters\n## Fields\n| name | type | rules | system |\n| --- | --- | --- | --- |\n| id | uuid | primary | yes |\n| value | integer | required | no |\n## CRUD\n| method | options |\n| --- | --- |\n| get | - |\n| update | - |\n").unwrap(),
+        })
+    }
+    #[test]
+    fn model_names_columns_and_permissions() {
+        let m = model();
+        for (sql, expected) in [
+            (
+                "SELECT value FROM invented WHERE id = $1",
+                "unknown table invented in step s1; known tables: counters",
+            ),
+            (
+                "SELECT missing FROM counters WHERE id = $1",
+                "counters.missing",
+            ),
+            (
+                "SELECT tenant_id FROM counters WHERE id = $1",
+                "counters.tenant_id",
+            ),
+            (
+                "INSERT INTO counters (value) VALUES ($1)",
+                "action create is not allowed by model counter",
+            ),
+            (
+                "UPDATE counters SET missing = $1 WHERE id = $2",
+                "counters.missing",
+            ),
+        ] {
+            let errors = model_problems(sql, std::slice::from_ref(&m), "s1");
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "{sql}: {errors:?}"
+            );
+        }
+        for sql in [
+            "SELECT c.value FROM counters c WHERE c.id = $1",
+            "UPDATE counters SET value = value + 1 WHERE id = $1 RETURNING value",
+        ] {
+            assert!(
+                model_problems(sql, std::slice::from_ref(&m), "s1").is_empty(),
+                "{sql}"
+            );
+        }
+    }
+}

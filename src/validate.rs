@@ -310,6 +310,7 @@ pub(crate) fn check_lock(
     }
     let structured = crate::lock::is_structured_source(&source.combined_text());
     check_feature_contract(doc, source, docs, report);
+    check_required_method_inputs(doc, docs, report);
     if doc.meta.source_type == SourceType::Structured && !structured {
         report.push(Diag::error(
             &file,
@@ -366,6 +367,10 @@ pub(crate) fn check_lock(
         crate::project::for_source(source).default_slug.as_deref(),
         report,
     );
+    check_model_sql(doc, docs, &file, report);
+    if doc.meta.source_type == crate::lock::SourceType::Natural {
+        crate::compile::check_natural_security(doc, source, report);
+    }
     check_variable_roots(doc, &file, report);
     let env_fields: Vec<_> = doc
         .meta
@@ -2745,6 +2750,34 @@ mod tests {
     }
 
     #[test]
+    fn required_method_inputs_check_known_argument_keys() {
+        let callee = parsed_doc(Kind::Method, None, "counter/methods/read",
+            "## Signature\n- input: {name: {type: string, required: true}, optional: {type: string, required: false}}\n");
+        let docs = HashMap::from([("counter/methods/read".into(), callee)]);
+        for kind in [Kind::Api, Kind::Method] {
+            for (args, transform, missing) in [
+                ("transform.in", "{}", true),
+                ("transform.in", r#"{name: "counter"}"#, false),
+                ("request.body", "{}", false),
+                ("input", "{}", false),
+                ("{}", "{}", true),
+                ("{name: input.name}", "{}", false),
+            ] {
+                let doc = parsed_doc(kind, None, "caller", &format!(
+                    "## Transform\n- in: {transform}\n## Steps\n### s1\n- op: method\n- target: counter.read\n- args: {args}\n"));
+                let mut report = Report::new();
+                check_required_method_inputs(&doc, &docs, &mut report);
+                assert_eq!(report.has_errors(), missing, "{args}: {report}");
+                if missing {
+                    assert!(report
+                        .to_string()
+                        .contains("method counter.read needs required input `name`"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn targets_accept_crud_actions_and_method_locks() {
         let docs = target_docs();
         for ok in [
@@ -3283,6 +3316,63 @@ mod limits_value_tests {
     }
 }
 
+/// Check only argument shapes whose keys are statically known.
+fn check_required_method_inputs(
+    doc: &LockDoc,
+    docs: &HashMap<String, LockDoc>,
+    report: &mut Report,
+) {
+    if !matches!(doc.meta.kind, Kind::Api | Kind::Method) {
+        return;
+    }
+    let Some(steps) = find_section(&doc.sections, "Steps") else {
+        return;
+    };
+    for block in &steps.blocks {
+        if block_val(block, "op") != "method" {
+            continue;
+        }
+        let target = block_val(block, "target");
+        let Some((object, method)) = target.split_once('.') else {
+            continue;
+        };
+        let Some(input) = docs
+            .get(&format!("{object}/methods/{method}"))
+            .and_then(|callee| find_section(&callee.sections, "Signature"))
+            .and_then(|sig| sig.get("input"))
+        else {
+            continue;
+        };
+        let args = block_val(block, "args");
+        let shape = if args.trim() == "transform.in" {
+            find_section(&doc.sections, "Transform")
+                .and_then(|s| s.get("in"))
+                .unwrap_or("{}")
+        } else {
+            args.trim()
+        };
+        if !shape.starts_with('{') || !shape.ends_with('}') {
+            continue;
+        }
+        let (Ok(provided), Ok(inputs)) = (
+            crate::lock::parse_inline_map(shape),
+            crate::lock::parse_inline_map(input),
+        ) else {
+            continue;
+        };
+        for (field, spec) in inputs {
+            let required = spec.starts_with('{')
+                && crate::lock::parse_inline_map(&spec)
+                    .is_ok_and(|attrs| attrs.iter().any(|(k, v)| k == "required" && v == "true"));
+            if required && !provided.iter().any(|(key, _)| key == &field) {
+                report.push(Diag::error(&doc.meta.source, format!(
+                    "method {target} needs required input `{field}`, but args {args} does not provide it"
+                )));
+            }
+        }
+    }
+}
+
 fn literal_response(value: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(value.trim()).is_ok()
         || crate::runtime::expression_roots(value, false).is_ok_and(|roots| roots.is_empty())
@@ -3590,5 +3680,46 @@ mod feature_contract_tests {
             &body.replace("| BAD_NAME | BAD_NAME |", "| BAD_NAME | INVENTED |")
         )
         .contains("unknown Errors code `INVENTED`"));
+    }
+}
+
+fn check_model_sql(
+    doc: &LockDoc,
+    docs: &HashMap<String, LockDoc>,
+    file: &str,
+    report: &mut Report,
+) {
+    if doc.meta.kind == Kind::Migration {
+        return;
+    }
+    let models: Vec<_> = docs
+        .values()
+        .filter(|d| d.meta.kind == Kind::Model)
+        .map(crate::manifest::model_from)
+        .collect();
+    let memory = !docs.values().any(|d| d.meta.kind == Kind::Provider);
+    if let Some(steps) = find_section(&doc.sections, "Steps") {
+        for block in &steps.blocks {
+            if block_val(block, "op") != "query" {
+                continue;
+            }
+            let sql = block_val(block, "sql");
+            let sql = sql.trim().trim_matches('`');
+            for problem in crate::sqlpolicy::model_problems(sql, &models, &block.heading) {
+                report.push(Diag::error(file, problem));
+            }
+            if let Err(error) =
+                crate::runtime::memsql::classify(sql).and_then(|plan| plan.check_models(&models))
+            {
+                if memory {
+                    report.push(Diag::error(
+                        file,
+                        format!("step {}: MEMORY_UNSUPPORTED_SQL: {error}", block.heading),
+                    ));
+                } else {
+                    report.push(Diag::warning(file, format!("{} step {} will fail on --db memory with MEMORY_UNSUPPORTED_SQL; fine on PostgreSQL: {error}", doc.meta.id.replace("/methods/", "."), block.heading)));
+                }
+            }
+        }
     }
 }

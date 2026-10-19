@@ -22,7 +22,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 fn method(claims: &str, custom: &str) -> String {
     format!(
-        "# issue\n\n## Signature\n\n- input: {{email: string}}\n- output: {{access_token: string}}\n- writes: false\n- capabilities: [sign-token]\n\n## Calls\n\n(none)\n\n## Steps\n\n### s1\n\n- op: query\n- sql: select id::text as id from users where email = $1\n- params: [input.email]\n- out: u\n\n### s2\n\n- op: sign-jwt\n- alg: ES256\n- key-ref: VIBE_JWT_PRIVATE_KEY\n- claims: {claims}\n- custom-claims: {custom}\n- out: t\n\n### s3\n\n- op: respond\n- value: {{access_token: t.access_token}}\n"
+        "# issue\n\n## Signature\n\n- input: {{email: string}}\n- output: {{access_token: string}}\n- writes: false\n- capabilities: [sign-token]\n\n## Calls\n\n(none)\n\n## Steps\n\n### s1\n\n- op: query\n- sql: select id::text as id from products where sku = $1\n- params: [input.email]\n- out: u\n\n### s2\n\n- op: sign-jwt\n- alg: ES256\n- key-ref: VIBE_JWT_PRIVATE_KEY\n- claims: {claims}\n- custom-claims: {custom}\n- out: t\n\n### s3\n\n- op: respond\n- value: {{access_token: t.access_token}}\n"
     )
 }
 

@@ -24,6 +24,7 @@ const SECTIONS: &str = r#"## Table
 | method | options |
 | --- | --- |
 | create | - |
+| update | optimistic-lock: if-match |
 | get | - |
 
 ## Policies

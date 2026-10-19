@@ -10,6 +10,40 @@ Rust SDK and `vibe` CLI for a markdown-driven serverless backend. Source files u
 
 The specification is [docs/spec-v1.7.md](spec-v1.7.md). The draft [docs/spec-v1.8.md](spec-v1.8.md) is under review.
 
+## Plain-language authoring (decision 188)
+
+Write “Anyone can read the counter” to authorize a public endpoint; “公開” and
+“任何人” also work. Public endpoints remove auth, and public-writes follows the
+methods they call. Explicit `public`, `auth` and `public-writes` frontmatter wins.
+Without clear public wording, endpoints stay private and require auth.
+
+The flat filename and project route rule determine the path. With
+`default-slug: demo`, `api/web/v1/counter.md` resolves to `/web/v1/counter`;
+`prefix: /api` adds `/api` at runtime. Without default-slug, public paths include
+`/{slug}`. Locks exclude the project prefix.
+
+GET and POST on one URL use two files with an explicit same-path sentence:
+
+- `counter.md`: “Anyone can read the counter. Use GET at /web/v1/counter.”
+- `increment-counter.md`: “Anyone can add one to the counter. Use POST at /web/v1/counter.”
+
+The router and manifest distinguish method plus path, so these coexist.
+
+Model dependencies provide their actual normalized table names. SQL must name
+existing model tables and columns and respect CRUD: SELECT needs `get` or `list`,
+INSERT needs `create`, UPDATE needs `update`, DELETE needs `delete`.
+`tenant_id` is platform-owned and cannot appear in query SQL.
+
+Without providers, the target is memory: query SQL must use decision 183's
+unique-key UPDATE increments, single-row INSERT upserts/DO NOTHING, unique-key
+SELECT, or COALESCE(MAX) forms. Unsupported SQL is a build error sent to repair.
+Explicit PostgreSQL providers retain an advisory warning for memory development.
+
+A prose requirement such as “at most 50 per day” produces a warning quoting the
+source sentence when the lock cannot enforce it. Built-in rate limits use
+per-minute windows; a warning never means that a daily cap was installed.
+Review warnings before relying on a limit.
+
 ## SDK and deployment runtime
 
 **vibe-sdk** installs as `vibe` for development and CI builds: interactive `vibe`,

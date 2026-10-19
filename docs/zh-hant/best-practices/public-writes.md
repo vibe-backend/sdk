@@ -1,5 +1,14 @@
 # 公開寫入
 
+決定 188：「任何人」或「公開」可直接授權 public，唔使寫 frontmatter flags。
+公開 endpoint 移除 auth，public-writes 按呼叫方法有冇寫入推導；明示 frontmatter 優先。
+GET 同 POST 共用 URL 時，用兩個 endpoint 檔明示同一條 route path。
+
+來源句限制無法喺 lock 表達時，build warning 必須引述原句。
+「每日最多 50 次」唔等於 per-minute rate-limit，warning 代表未執行該限制。
+隱式 memory 只准決定 183 嘅 unique-key counter SQL；其他 SQL 係 build error。
+來源只指一個事物（例如「the counter」）時，用固定 key。
+
 ## 用途
 
 在嚴格控制的條件下，允許未經認證的訪客建立或更新資料（例如提交評論）。公開端點可以呼叫 `writes: true` 的 method（Decision 4），但 §7.2 的每一條規則都是強制的（Decisions 21–26、38、39、41、47、49、53）。
