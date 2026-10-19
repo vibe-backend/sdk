@@ -48,7 +48,7 @@
 
 - v1 只支援 HTTP API 入口，method 限 GET／POST／PUT／PATCH／DELETE（PATCH 由決定 105 加入，已確認（產品經理 2026-10-14））；排程、queue、webhook 入口唔喺 v1 範圍內。
 - `{definition}` 代表 domain；`{version}` 代表 API 版本。
-- 主檔用 `{feature}/{feature}.md`，唔用 `index.md`。
+- 主檔用 `{endpoint}.md`，唔用 `index.md`。
 - 只用路徑揀版本，唔支援 `Accept-Version` header；每個 version 可以有自己獨立嘅 feature。
 - 狀態碼跟 RFC 9110（429 跟 RFC 6585）；已認證但冇權限回 403。
 - v1 預設 provider type 係 PostgreSQL（`type: postgres`）。
@@ -324,6 +324,7 @@
 | 183 | In-memory query 執行器支援小型 SQL allowlist：① `UPDATE t SET c = c + <整數或$n>`（亦准 literal／param 直接賦值）`WHERE <單欄唯一鍵> = $n RETURNING <cols或*>`；② 單列 `INSERT ... VALUES ... ON CONFLICT (<單欄唯一鍵>) DO UPDATE SET c = t.c + <整數或EXCLUDED.c> RETURNING ...` 或 `DO NOTHING [RETURNING ...]`；③ `SELECT <cols或*> FROM t WHERE <單欄唯一鍵> = $n`；④ `SELECT COALESCE(MAX(c), <整數>) AS x FROM t WHERE <單欄唯一鍵> = $n`。只准已設定 model table，`id` 算唯一鍵；同 CRUD 一樣租戶注入／隔離同 role 級檢查（`public_reader` 只准讀，`public_writer` 可 INSERT／UPDATE）；SQL 提及 `tenant_id` 一律拒絕，memory query steps 冇模擬逐欄 grant。亦檢查 unique、NOT NULL，套用 INSERT 系統預設值同 UPDATE `updated_at`。成句 SQL 喺同一 store lock 入面原子執行，整數溢位報錯；DO NOTHING 衝突回零列，aggregate 冇資料回預設值。其他 SQL 回 `MEMORY_UNSUPPORTED_SQL`（HTTP 500，backend 能力限制，唔係 client 輸入錯）；run 只警告唔支援嘅 query steps，列 method target 同原因；`vibe build` 每個唔支援 step 喺 stderr 警告（PostgreSQL 照常可用）。更新決定 74 已知差異。 | 已批准（產品經理 2026-10-18） | 2C.4、2A.6 |
 | 184 | 冇 `providers/`（或者冇任何 provider）嘅 project 用內建隱含 in-memory provider `main`；dev、`vibe run`、`vibe build --release` 都得；release build 同 runtime 啟動會出警告（資料只喺記憶體，重啟會冇）；production 照決定 91 拒絕 in-memory；有 provider source 嘅 project 行為不變（冇 `main` 照樣 `missing dependency main`）；allowlist 寫其他 provider 照舊驗證；manifest provenance 記 `implicit_memory_provider`。 | 已批准 | 2、5、10.1 |
 | 185 | 全域 LLM 設定用絕對非空 `$XDG_CONFIG_HOME/vibe/llm.env`，否則 `$HOME/.config/vibe/llm.env`；只准 LLM_PROVIDER、LLM_BASE_URL、LLM_MODEL、LLM_API_STYLE、LLM_API_KEY_FILE。優先次序 env > project .env > global，空值當缺少。Key 放獨立 0600 檔案，由 LLM_API_KEY_FILE 引用，相對路徑以設定目錄為準；兩個檔案都拒絕 group/world 權限並提示 chmod 600。CI、production、build --release 同 runtime 永遠唔讀。VIBE_DEBUG_LLM_CONFIG=1 只印名稱同來源。首次互動 vibe 只有 process env、project `.env` 同全域設定都冇任何 `LLM_*` 設定，先寫全域 `llm.env` 同獨立 key file（0600）；project `.env` 或 env 有部分 LLM 設定時，只問缺少嘅值並追加到 project `.env`（0600），同喺 `.gitignore` 加 `.env`，唔覆蓋現有檔案；private host opt-in 留喺 project。澄清決定 91：production 只由環境決定，唔睇 release manifest；VIBE_ENV 嘅 dev/development/local/test 係開發，ci 係 CI，其餘非空值係 production；unset/空值用 memory 係開發，否則 production。Release manifest 可喺 VIBE_ENV=development 用 memory（例如 Docker demo），production 仍拒絕所有 memory，包括隱含 main。 | 已確認 | 2A.8、2C.1、2C.4 |
+| 186 | Endpoint 改用平面檔案 `api/<def>/<ver>/<endpoint>.md`，可選同層 `<endpoint>.schema.md`，build 產生同層 `<endpoint>.lock.md`；路由由檔名推導，id 同 runtime 行為不變。舊 endpoint 資料夾係硬性 build error，每個舊檔都要列出確切新路徑；rc.5 breaking change，唔支援雙格式。 | 已確認 | 2A.1、2C.1 |
 
 ## 1. 目錄同命名
 
@@ -353,14 +354,13 @@ project/
         └── {version}/
             ├── _version.md
             ├── _version.lock.md
-            └── {feature}/
-                ├── {feature}.md
-                ├── {feature}.lock.md
-                └── schema.md      # 選填，自然語言欄位補充說明，會併入 feature 嘅 lock
+            ├── {endpoint}.md
+            ├── {endpoint}.lock.md
+            └── {endpoint}.schema.md      # 選填，自然語言欄位補充說明，會併入 feature 嘅 lock
 ```
 
 - 所有名一律用 kebab-case，只准 `a-z0-9-`。
-- Build 時每個 source `.md` 旁邊會產生一個同名嘅 `.lock.md`（`schema.md` 除外，佢併入 `{feature}.lock.md`）。上面目錄樹入面嘅 `*.lock.md` 全部係 build 輸出，已 gitignore，唔 commit（決定 117）。
+- Build 時每個 source `.md` 旁邊會產生一個同名嘅 `.lock.md`（`{endpoint}.schema.md` 除外，佢併入 `{endpoint}.lock.md`）。上面目錄樹入面嘅 `*.lock.md` 全部係 build 輸出，已 gitignore，唔 commit（決定 117）。
 - migration 檔名 `{seq}-{name}`：`seq` 係 4 位數字（`0001` 起，連續唔可以跳號），例如 `0003-add-user-phone.md`。lock 檔由編譯器產生，唔准手寫或者手改。
 - `_` 開頭嘅檔係保留檔，永遠唔會被路由；`_definition.md` 只可以放喺 `{definition}/`，`_version.md` 只可以放喺 `{version}/`。
 - version 名必須符合 `^v[1-9][0-9]*$`（例如 v1、v2、v10）。version 只存在於 api 層；models 同 method 唔分 version。
@@ -1410,7 +1410,7 @@ pipeline lock 嘅 `## Order` 只准一行 `must-run: {值}`：
 
 #### Auth pipeline markdown 寫法
 
-Source（`api/auth/refresh.md`）用自然語言寫，frontmatter 宣告高風險欄位（決定 112）：
+Source（`api/auth/v1/refresh.md`）用自然語言寫，frontmatter 宣告高風險欄位（決定 112）：
 
 ```markdown
 ---
@@ -1529,7 +1529,7 @@ Logout（節錄）：
 - 錯誤碼 `REFRESH_SIGN_METHOD_WRITES`。訊息一定要講：邊個 lock 檔案、邊個 `sign-method`、邊個 method／step 寫入（間接寫入要列出 `op: method` 呼叫鏈），同埋點樣修正。範例：
 
 ```text
-error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-refresh sign-method `user.sign-token` writes
+error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh.lock.md: token-refresh sign-method `user.sign-token` writes
   write: models/user/methods/touch-login.lock.md step s2 (writes: true), reached via user.sign-token -> op: method user.touch-login
   fix: sign-methods must be read-only (decision 149). Move the write into a separate write method that the client calls after the refresh succeeds, then set `writes: false` in ## Signature. The last refresh time is recorded by the platform per family (_platform_refresh_families.last_refreshed_at).
 ```
@@ -1687,7 +1687,7 @@ error[REFRESH_SIGN_METHOD_WRITES]: api/auth/v1/refresh/refresh.lock.md: token-re
 - value: {}
 ```
 
-`api/auth/v1/refresh/refresh.md`（`token-refresh` route，sign-method 係上面唯讀嘅 `user.sign-token`）
+`api/auth/v1/refresh.md`（`token-refresh` route，sign-method 係上面唯讀嘅 `user.sign-token`）
 
 ```markdown
 ---
@@ -1754,7 +1754,7 @@ body: 4KB
 (none)
 ```
 
-`api/auth/v1/session/session.md`（要 JWT；呼叫 `user.record-session`。標題要提到寫入：compile 嘅 semantic check 要求有 `write-sql` 嘅 source 提到 write／update 等字）
+`api/auth/v1/session.md`（要 JWT；呼叫 `user.record-session`。標題要提到寫入：compile 嘅 semantic check 要求有 `write-sql` 嘅 source 提到 write／update 等字）
 
 ```markdown
 ---
@@ -1818,7 +1818,7 @@ body: 4KB
 | 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ```
 
-Fixture 仲有 `providers/main.md`、`api/auth/_definition.md`（`auth` pipeline `mode: jwt`）、`api/auth/v1/_version.md` 同 `slugs.example.json`，同 `tests/fixtures/shop` 嘅寫法一樣。`vibe build` 會為上面每個檔案產生 `.lock.md`（包括 `api/auth/v1/session/session.lock.md`），本地開發用 `vibe build` 驗證之後，再用 `vibe build` build。
+Fixture 仲有 `providers/main.md`、`api/auth/_definition.md`（`auth` pipeline `mode: jwt`）、`api/auth/v1/_version.md` 同 `slugs.example.json`，同 `tests/fixtures/shop` 嘅寫法一樣。`vibe build` 會為上面每個檔案產生 `.lock.md`（包括 `api/auth/v1/session.lock.md`），本地開發用 `vibe build` 驗證之後，再用 `vibe build` build。
 
 Client 流程：`POST …/refresh` 成功攞到新 access token 之後，再 `POST /auth/v1/session`。兩個 request 唔係 atomic：session 寫入失敗唔影響已經完成嘅輪換，client 可以重試；呢個寫入同 refresh token 狀態無關。
 
@@ -2623,7 +2623,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 
 ### 10.2 結構同路由（error）
 
-- 目錄深度唔係啱啱好 `api/{definition}/{version}/{feature}/{feature}.md`；models 唔合 `models/{object}/{object}.md` 或者 `models/{object}/methods/{method}.md`；檔名同資料夾名唔一致；version 名唔合規則；`_` 開頭檔放錯位置；出現已取消嘅 `models/{object}/{version}/` 資料夾。
+- 目錄深度唔係啱啱好 `api/{definition}/{version}/{feature}.md`；models 唔合 `models/{object}/{object}.md` 或者 `models/{object}/methods/{method}.md`；model 檔名同資料夾名唔一致；version 名唔合規則；`_` 開頭檔放錯位置；出現已取消嘅 `models/{object}/{version}/` 資料夾。
 - `## Route` 嘅 method 唔喺支援範圍；normalize 之後 method 加 path 重複（normalize 包括轉細楷、去尾斜線、解 % 編碼，同埋統一 `:id` 同 `{id}`）；path 越出自己前綴、用咗保留路徑，或者有 `..` 或萬用字元。
 
 ### 10.3 Pipeline 同 auth（error）
@@ -2907,7 +2907,7 @@ security-items: [{ item: rate-limit-new, risk: medium, reason: "登入防爆破"
 - sunset: 2027-06-30
 ````
 
-### 11.4 `api/users/v2/create-user/create-user.md`（路由 `POST /users/v2/create-user`）
+### 11.4 `api/users/v2/create-user.md`（路由 `POST /users/v2/create-user`）
 
 ```markdown
 # 建立用戶
@@ -2918,7 +2918,7 @@ POST。只有 admin 可以用，每分鐘最多 30 次。
 email 已經屬於已驗證或者有密碼嘅用戶就回 409 EMAIL_TAKEN；驗證唔通過回 422。
 ```
 
-`api/users/v2/create-user/create-user.lock.md`
+`api/users/v2/create-user.lock.md`
 
 ````markdown
 ---
@@ -2926,7 +2926,7 @@ lock-version: 1
 kind: api
 scope: feature
 id: users/v2/create-user
-source: api/users/v2/create-user/create-user.md
+source: api/users/v2/create-user.md
 source-hash: sha256:7f02...aa
 source-type: natural
 dependencies:
@@ -3163,7 +3163,7 @@ security-items:
 - s4 失敗（outbox insert 錯誤）：method fail `INVITE_NOT_QUEUED`（503，決定 95）；寄信失敗唔會令 method fail，只會喺背景重試，超過上限標 `delivery_failed`；成個 request rollback（決定 99），s2 嘅 token 輪換都唔會生效，舊邀請連結照樣有效（如果未過期）；重試或者 re-invite 會發新連結。
 - 用戶唔存在同已驗證都回 `ALREADY_ACTIVE`（admin 路徑，404／409 分唔分冇私隱影響；揀一個錯誤碼令 lock 簡單）。
 
-### 11.4b Re-invite：`api/users/v2/re-invite/re-invite.md`（路由 `POST /users/v2/{id}/invite`，決定 86，已確認（產品經理 2026-10-14））
+### 11.4b Re-invite：`api/users/v2/re-invite.md`（路由 `POST /users/v2/{id}/invite`，決定 86，已確認（產品經理 2026-10-14））
 
 ```markdown
 ---
@@ -3175,7 +3175,7 @@ POST，路徑 /users/v2/{id}/invite。只有 admin 可以用，每個 admin 每�
 用戶已經驗證回 409 ALREADY_ACTIVE。
 ```
 
-`api/users/v2/re-invite/re-invite.lock.md`
+`api/users/v2/re-invite.lock.md`
 
 ````markdown
 ---
@@ -3183,7 +3183,7 @@ lock-version: 1
 kind: api
 scope: feature
 id: users/v2/re-invite
-source: api/users/v2/re-invite/re-invite.md
+source: api/users/v2/re-invite.md
 source-hash: sha256:e4a0...19
 source-type: natural
 dependencies:
@@ -3253,7 +3253,7 @@ security-items: [{ item: roles, risk: high, reason: "只限 admin 寄邀請" }]
 
 - 503 時可以直接重試，每次重試都發新 token（決定 95）。
 
-### 11.5 `api/users/v2/get-user/get-user.md`（路由 `GET /users/v2/{id}`）
+### 11.5 `api/users/v2/get-user.md`（路由 `GET /users/v2/{id}`）
 
 ```markdown
 # 攞用戶
@@ -3318,7 +3318,7 @@ v2 嘅 name 欄位叫 display_name。
 
 - 呢個例子示範決定 2：`user.get` 只有一個版本，v2 嘅 `display_name` 改名由 api 層 `## Transform` 處理。
 
-### 11.6 Public 讀取：`api/catalog/v1/list-items/list-items.md`（路由 `GET /catalog/v1/{slug}/items`）
+### 11.6 Public 讀取：`api/catalog/v1/list-items.md`（路由 `GET /catalog/v1/{slug}/items`）
 
 `api/catalog/_definition.md`
 
@@ -3407,7 +3407,7 @@ query 要有 region（2 個字元）。
 | 404 | NOT_FOUND | NOT_FOUND |
 ````
 
-### 11.7 Public 建立資料：`api/catalog/v1/submit-review/submit-review.md`（路由 `POST /catalog/v1/{slug}/reviews`）
+### 11.7 Public 建立資料：`api/catalog/v1/submit-review.md`（路由 `POST /catalog/v1/{slug}/reviews`）
 
 ```markdown
 ---
@@ -3877,7 +3877,7 @@ security-items:
 認證 API，只用 provider main。
 ```
 
-`api/auth/v1/login/login.md`（路由 `POST /auth/v1/{slug}/login`）
+`api/auth/v1/login.md`（路由 `POST /auth/v1/{slug}/login`）
 
 ```markdown
 # 登入
@@ -3891,7 +3891,7 @@ POST，路徑 /auth/v1/{slug}/login。
 帳戶密碼錯回 401 INVALID_CREDENTIALS；驗證唔通過回 422。
 ```
 
-`api/auth/v1/login/login.lock.md`
+`api/auth/v1/login.lock.md`
 
 ````markdown
 ---
@@ -3899,7 +3899,7 @@ lock-version: 1
 kind: api
 scope: feature
 id: auth/v1/login
-source: api/auth/v1/login/login.md
+source: api/auth/v1/login.md
 source-hash: sha256:4c2d...19
 source-type: natural
 dependencies:
@@ -4411,7 +4411,7 @@ security-items:
 - 成功 commit 之後，平台用 `refresh_store` 撤銷該用戶所有 refresh 家族（`revoke_reason: email-verified`）；method lock 唔需要寫，屬平台行為（決定 67）。
 - 決定 56 嘅「一律做 `hash-password`」已移到呢一步（決定 67 已確認）。
 
-#### 12.11.6 api：`api/auth/v1/register/register.md`（路由 `POST /auth/v1/{slug}/register`）
+#### 12.11.6 api：`api/auth/v1/register.md`（路由 `POST /auth/v1/{slug}/register`）
 
 ```markdown
 ---
@@ -4428,7 +4428,7 @@ POST，路徑 /auth/v1/{slug}/register。
 無論 email 係咪已經存在，都回 202 同一句「如果資料正確，你會收到確認電郵」。
 ```
 
-`api/auth/v1/register/register.lock.md`
+`api/auth/v1/register.lock.md`
 
 ````markdown
 ---
@@ -4436,7 +4436,7 @@ lock-version: 1
 kind: api
 scope: feature
 id: auth/v1/register
-source: api/auth/v1/register/register.md
+source: api/auth/v1/register.md
 source-hash: sha256:5a7e...31
 source-type: natural
 dependencies:
@@ -4528,7 +4528,7 @@ security-items:
 - 耗時：新用戶、未驗證、已驗證三條路都係「1 個 upsert + 1 個 outbox insert」，工作量一樣；再補到 300ms。
 - 有效權限摘要：public；role public_writer，grant 等於上面 `effective-grant`；唔寫 password；冇讀 output；唔簽 token；冇對外 call；captcha 每次；IP 5/min、租戶 60/min；每日配額 1,000／租戶、50／IP（每次 upsert 算一次）；audit 只記 email hash；最低 300ms。
 
-#### 12.11.7 api：`api/auth/v1/verify-email/verify-email.md`（路由 `POST /auth/v1/{slug}/verify-email`）
+#### 12.11.7 api：`api/auth/v1/verify-email.md`（路由 `POST /auth/v1/{slug}/verify-email`）
 
 ```markdown
 ---
@@ -4546,7 +4546,7 @@ email 連結會開一個設定密碼頁；用戶輸入密碼之後，頁面將 t
 token 錯、過期或者用過回 422 INVALID_TOKEN；密碼長度唔合回 422 WEAK_PASSWORD，喺洩漏清單搵到回 422 BREACHED_PASSWORD；錯誤唔回顯密碼。
 ```
 
-`api/auth/v1/verify-email/verify-email.lock.md`
+`api/auth/v1/verify-email.lock.md`
 
 ````markdown
 ---
@@ -4554,7 +4554,7 @@ lock-version: 1
 kind: api
 scope: feature
 id: auth/v1/verify-email
-source: api/auth/v1/verify-email/verify-email.md
+source: api/auth/v1/verify-email.md
 source-hash: sha256:b81f...4d
 source-type: natural
 dependencies:

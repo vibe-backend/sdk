@@ -19,7 +19,7 @@
 Provide get, list and update CRUD.
 ```
 
-`api/users/v2/update-user/update-user.md`（路由 `PUT /users/v2/{id}`）
+`api/users/v2/update-user.md`（路由 `PUT /users/v2/{id}`）
 
 ```text
 # Update user
@@ -43,7 +43,7 @@ User not found returns 404 NOT_FOUND. Missing If-Match returns 428 PRECONDITION_
 | update | partial: true, optimistic-lock: if-match |
 ````
 
-`api/users/v2/update-user/update-user.lock.md`（僅列出 section；`kind: api`、`scope: feature`；`dependencies` 包含 `user/crud/update`）
+`api/users/v2/update-user.lock.md`（僅列出 section；`kind: api`、`scope: feature`；`dependencies` 包含 `user/crud/update`）
 
 ````markdown
 ## Route

@@ -57,7 +57,7 @@ async fn validate_deploy_refuses_after_failures_fixture_lock() {
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shop"),
         &root,
     );
-    let product = root.join("api/catalog/v1/get-product/get-product.md");
+    let product = root.join("api/catalog/v1/get-product.md");
     let src = fs::read_to_string(&product).unwrap();
     fs::write(
         &product,
@@ -85,8 +85,7 @@ async fn validate_deploy_refuses_after_failures_fixture_lock() {
     .await
     .unwrap_or_else(|err| panic!("{err}"));
 
-    let lock =
-        fs::read_to_string(root.join("api/catalog/v1/get-product/get-product.lock.md")).unwrap();
+    let lock = fs::read_to_string(root.join("api/catalog/v1/get-product.lock.md")).unwrap();
     assert!(
         lock.contains("after-failures"),
         "fixture lock should declare after-failures"

@@ -16,7 +16,7 @@ User management API. Allowed providers: main and enterprise; default is main.
 All endpoints require JWT authentication.
 ```
 
-`api/users/v2/create-user/create-user.md` (route `POST /users/v2/create-user`)
+`api/users/v2/create-user.md` (route `POST /users/v2/create-user`)
 
 ```text
 # Create user
@@ -46,7 +46,7 @@ If the email is already taken return 409 EMAIL_TAKEN; validation failure returns
 
 With no `iss`/`aud`/`jwks-uri` given, the platform defaults apply: `iss` = `https://auth.{platform-domain}/{project}`, `aud` = `{project}`, `jwks-uri` = `{iss}/.well-known/jwks.json` (§4.1).
 
-`api/users/v2/create-user/create-user.lock.md`
+`api/users/v2/create-user.lock.md`
 
 ````markdown
 ---
@@ -54,7 +54,7 @@ lock-version: 1
 kind: api
 scope: feature
 id: users/v2/create-user
-source: api/users/v2/create-user/create-user.md
+source: api/users/v2/create-user.md
 source-hash: sha256:7f02...aa
 source-type: natural
 dependencies:

@@ -27,7 +27,7 @@ Fields:
 Provide get, list and update CRUD. list defaults to 20 per page, at most 100, can sort by created_at or name, and can filter by email.
 ```
 
-`api/users/v2/list-users/list-users.md` (route `GET /users/v2/list-users`)
+`api/users/v2/list-users.md` (route `GET /users/v2/list-users`)
 
 ```text
 # List users
@@ -82,7 +82,7 @@ This matches the v1.7 §12.8 `user` lock. The `public_writer` grant at model lev
 
 The injected `user.list` method has its own platform-generated, signed lock (`id: user/crud/list`, `source-type: structured`) (§12.9).
 
-`api/users/v2/list-users/list-users.lock.md` (sections only; `kind: api`, `scope: feature`; `dependencies` include `user/crud/list`)
+`api/users/v2/list-users.lock.md` (sections only; `kind: api`, `scope: feature`; `dependencies` include `user/crud/list`)
 
 ````markdown
 ## Route

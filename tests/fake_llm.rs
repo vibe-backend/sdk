@@ -394,7 +394,7 @@ async fn compile_auth_feature_output(
     Result<vibe::compile::CompileOutput, vibe::diag::Report>,
 ) {
     let root = std::env::temp_dir().join(format!("vibe-auth-removal-{}", uuid::Uuid::new_v4()));
-    for dir in ["providers", "api/catalog/v1/greet"] {
+    for dir in ["providers", "api/catalog/v1"] {
         fs::create_dir_all(root.join(dir)).unwrap();
     }
     fs::write(
@@ -418,7 +418,7 @@ async fn compile_auth_feature_output(
     )
     .unwrap();
     fs::write(
-        root.join("api/catalog/v1/greet/greet.md"),
+        root.join("api/catalog/v1/greet.md"),
         format!("---\npublic: {public}\nwrites: false\nauth: {auth}\n---\n# greet\n{prose}\n"),
     )
     .unwrap();
@@ -504,8 +504,8 @@ async fn auth_none_overrides_every_model_auth_form_and_recognizes_removal_prose(
                         "{}",
                         out.report
                     );
-                    let text = fs::read_to_string(root.join("api/catalog/v1/greet/greet.lock.md"))
-                        .unwrap();
+                    let text =
+                        fs::read_to_string(root.join("api/catalog/v1/greet.lock.md")).unwrap();
                     let lock = parse_lock(&text).unwrap();
                     let pipelines = lock
                         .sections
@@ -536,7 +536,7 @@ async fn disabled_auth_aliases_force_removal_even_without_removal_prose() {
         let (root, result) =
             compile_auth_feature(auth, "A greeting route.", "### auth\n- mode: jwt", true).await;
         result.unwrap_or_else(|err| panic!("{auth}: {err}"));
-        let text = fs::read_to_string(root.join("api/catalog/v1/greet/greet.lock.md")).unwrap();
+        let text = fs::read_to_string(root.join("api/catalog/v1/greet.lock.md")).unwrap();
         assert!(text.contains("### -auth\n- removed: true"), "{text}");
         assert!(!text.contains("mode: jwt"), "{text}");
         fs::remove_dir_all(root).unwrap();
@@ -602,7 +602,7 @@ async fn structured_auth_confirms_double_negations_and_retains_the_requirement()
             "{phrase}: {}",
             out.report
         );
-        let text = fs::read_to_string(root.join("api/catalog/v1/greet/greet.lock.md")).unwrap();
+        let text = fs::read_to_string(root.join("api/catalog/v1/greet.lock.md")).unwrap();
         assert!(text.contains("mode: jwt"), "{text}");
         assert!(!text.contains("### -auth"), "{text}");
         fs::remove_dir_all(root).unwrap();
@@ -630,7 +630,7 @@ async fn optional_api_parts_normalize_deterministically() {
                 if slug { "none" } else { "jwt" }, "A greeting route.", "(none)", true, slug, Some(&body),
             ).await;
             result.unwrap_or_else(|err| panic!("{err}"));
-            let bytes = fs::read(root.join("api/catalog/v1/greet/greet.lock.md")).unwrap();
+            let bytes = fs::read(root.join("api/catalog/v1/greet.lock.md")).unwrap();
             let text = std::str::from_utf8(&bytes).unwrap();
             if slug {
                 assert!(text.contains("| path.slug | string | - | yes |"));
@@ -663,7 +663,7 @@ async fn decision_165_cache_free_locks_and_audit_provenance() {
     ] {
         let (root, result) = compile_auth_feature("none", prose, "(none)", false).await;
         result.unwrap_or_else(|err| panic!("{err}"));
-        let rel = "api/catalog/v1/greet/greet.lock.md";
+        let rel = "api/catalog/v1/greet.lock.md";
         let before = fs::read(root.join(rel)).unwrap();
         let doc = parse_lock(std::str::from_utf8(&before).unwrap()).unwrap();
         let body = vibe::lock::render_sections(&doc.sections);
@@ -767,7 +767,7 @@ async fn decision_165_cache_free_locks_and_audit_provenance() {
             .to_string()
             .contains("regenerate it with `vibe build`"));
         fs::write(root.join(rel), &before).unwrap();
-        let source = root.join("api/catalog/v1/greet/greet.md");
+        let source = root.join("api/catalog/v1/greet.md");
         fs::write(
             &source,
             format!(
@@ -786,9 +786,9 @@ async fn decision_165_cache_free_locks_and_audit_provenance() {
             .to_string()
             .contains("source-hash does not match"));
         // Several natural-language files still yield a single sampling warning.
-        fs::create_dir_all(root.join("api/catalog/v1/other")).unwrap();
+        fs::create_dir_all(root.join("api/catalog/v1")).unwrap();
         fs::write(
-            root.join("api/catalog/v1/other/other.md"),
+            root.join("api/catalog/v1/other.md"),
             "---\nauth: none\npublic: true\nwrites: false\n---\nAnother greeting, no auth.",
         )
         .unwrap();
@@ -796,7 +796,7 @@ async fn decision_165_cache_free_locks_and_audit_provenance() {
             responder: |request: &LlmRequest| {
                 if request.system == vibe::compile::TRANSLATE_PROMPT {
                     Ok("Return hello world without authentication.".into())
-                } else if request.input.contains("api/catalog/v1/other/other.md") {
+                } else if request.input.contains("api/catalog/v1/other.md") {
                     Ok(body.replace("/greet", "/other"))
                 } else {
                     Ok(body.clone())
@@ -839,11 +839,11 @@ async fn decision_167_block_snap_and_validate() {
         let (root, result) =
             compile_auth_feature("none", "A greeting route.", "(none)", false).await;
         result.unwrap_or_else(|err| panic!("{err}"));
-        let rel = "api/catalog/v1/greet/greet.lock.md";
+        let rel = "api/catalog/v1/greet.lock.md";
         let original = parse_lock(&fs::read_to_string(root.join(rel)).unwrap()).unwrap();
         let body = vibe::lock::render_sections(&original.sections);
         let source = format!("---\npublic: true\nwrites: false\nauth: none\n---\n# Hello World API\n\n{paragraph}\n\n```json\n{{\"message\":\"hello world\"}}\n```\n");
-        fs::write(root.join("api/catalog/v1/greet/greet.md"), &source).unwrap();
+        fs::write(root.join("api/catalog/v1/greet.md"), &source).unwrap();
         let calls = AtomicUsize::new(0);
         let translations = AtomicUsize::new(0);
         let adapter = FakeAdapter {

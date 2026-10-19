@@ -3461,7 +3461,7 @@ mod feature_contract_tests {
 
     fn errors_with_out(prose: &str, route: &str, body: &str, out: &str) -> String {
         let source = SourceFile {
-            rel: "api/catalog/v1/create/create.md".into(),
+            rel: "api/catalog/v1/create.md".into(),
             abs: "/tmp/create.md".into(),
             kind: Kind::Api,
             scope: Some(Scope::Feature),

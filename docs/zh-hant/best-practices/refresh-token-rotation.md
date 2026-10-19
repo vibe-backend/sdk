@@ -8,7 +8,7 @@ Spec Decision 149（產品經理已批准 2026-10-17，§4A.1c）：`sign-method
 
 ## 自然語言 source 範例
 
-`api/auth/v1/refresh/refresh.md`（路由 `POST /auth/v1/{slug}/refresh`）
+`api/auth/v1/refresh.md`（路由 `POST /auth/v1/{slug}/refresh`）
 
 ```text
 # Refresh token
@@ -19,7 +19,7 @@ Request body: refresh_token (string, required).
 Return 200 with the new token and refresh_token.
 ```
 
-`api/auth/v1/logout/logout.md`（路由 `POST /auth/v1/logout`）
+`api/auth/v1/logout.md`（路由 `POST /auth/v1/logout`）
 
 ```text
 # Logout
@@ -30,7 +30,7 @@ Return 204.
 
 ## 編譯後的 lock md 範例
 
-`api/auth/v1/refresh/refresh.lock.md`（僅列出 section；frontmatter 依照 §2A.1，`kind: api`、`scope: feature`；安全項目 `public` 和 `auth-removed`，高風險）
+`api/auth/v1/refresh.lock.md`（僅列出 section；frontmatter 依照 §2A.1，`kind: api`、`scope: feature`；安全項目 `public` 和 `auth-removed`，高風險）
 
 ````markdown
 ## Route
@@ -92,7 +92,7 @@ Return 204.
 | 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ````
 
-`api/auth/v1/logout/logout.lock.md`（只列 `## Pipelines`）
+`api/auth/v1/logout.lock.md`（只列 `## Pipelines`）
 
 ````markdown
 ## Pipelines

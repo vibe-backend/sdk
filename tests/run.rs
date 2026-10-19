@@ -4,9 +4,9 @@ use std::{fs, path::PathBuf, process::Command};
 
 fn project() -> PathBuf {
     let root = std::env::temp_dir().join(format!("vibe-run-{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(root.join("api/hello/v1/hello")).unwrap();
+    fs::create_dir_all(root.join("api/hello/v1")).unwrap();
     fs::write(
-        root.join("api/hello/v1/hello/hello.md"),
+        root.join("api/hello/v1/hello.md"),
         "---\npublic: true\nauth: removed\n---\n# Hello\n\nA public GET endpoint returning {\"message\":\"hello world\"}.\n",
     )
     .unwrap();
@@ -47,7 +47,7 @@ fn build(root: &std::path::Path) {
 fn fake_build_and_run_guards() {
     let root = project();
     build(&root);
-    let lock = fs::read_to_string(root.join("api/hello/v1/hello/hello.lock.md")).unwrap();
+    let lock = fs::read_to_string(root.join("api/hello/v1/hello.lock.md")).unwrap();
     assert!(!lock.contains("fake"));
     for file in ["manifest.json", ".vibe/build-record.json"] {
         let json: serde_json::Value =
@@ -83,10 +83,10 @@ fn missing_stale_and_wrong_version_require_build() {
             build(&root);
         }
         if case == "stale" {
-            fs::write(root.join("api/hello/v1/hello/hello.md"), "Changed source").unwrap();
+            fs::write(root.join("api/hello/v1/hello.md"), "Changed source").unwrap();
         }
         if case == "version" {
-            let path = root.join("api/hello/v1/hello/hello.lock.md");
+            let path = root.join("api/hello/v1/hello.lock.md");
             fs::write(
                 &path,
                 fs::read_to_string(&path).unwrap().replace(
@@ -382,7 +382,7 @@ fn run_and_build_validation_reject_frontmatter_writes() {
     for value in ["true", "false"] {
         let root = project();
         build(&root);
-        let path = root.join("api/hello/v1/hello/hello.lock.md");
+        let path = root.join("api/hello/v1/hello.lock.md");
         let text = fs::read_to_string(&path).unwrap();
         fs::write(
             &path,

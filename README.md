@@ -78,7 +78,7 @@ simple web page.
   (`vibe-runtime`), runtime features, security, signing, CI/CD.
 - [Runtime configuration](docs/runtime-config.md): databases, environment variables
   and production settings.
-- [Specification](docs/spec-v1.7.md) and [project status](docs/status.md).
+- [Specification](docs/spec-v1.8.md) and [project status](docs/status.md).
 - [Changelog](CHANGELOG.md).
 
 ## License

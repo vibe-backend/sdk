@@ -162,7 +162,7 @@ fn static_jwt_key_must_match_the_configured_alg() {
 /// #199 unverified gate via the real CLI startup path.
 fn project_with_after_failures_lock() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("vibe-serve-af-{}", uuid::Uuid::new_v4()));
-    let feature = dir.join("api/auth/v1/login");
+    let feature = dir.join("api/auth/v1");
     std::fs::create_dir_all(&feature).unwrap();
     std::fs::write(
         feature.join("login.md"),
@@ -176,7 +176,7 @@ lock-version: 1
 kind: api
 scope: feature
 id: auth/v1/login
-source: api/auth/v1/login/login.md
+source: api/auth/v1/login.md
 source-hash: sha256:00
 source-type: structured
 dependencies: []

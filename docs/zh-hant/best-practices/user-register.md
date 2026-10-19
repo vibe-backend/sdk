@@ -40,7 +40,7 @@ Steps:
 2. If the token is correct, unexpired and not yet used, set the password, record the verification time and clear the token in a single update; otherwise fail INVALID_TOKEN.
 ```
 
-`api/auth/v1/register/register.md`（路由 `POST /auth/v1/{slug}/register`）
+`api/auth/v1/register.md`（路由 `POST /auth/v1/{slug}/register`）
 
 ```text
 # Register
@@ -54,7 +54,7 @@ Register with user.self-register.
 Whether or not the email already exists, return 202 with the same message "If the details are correct, you will receive a confirmation email".
 ```
 
-`api/auth/v1/verify-email/verify-email.md`（路由 `POST /auth/v1/{slug}/verify-email`）
+`api/auth/v1/verify-email.md`（路由 `POST /auth/v1/{slug}/verify-email`）
 
 ```text
 # Verify email and set password
@@ -191,7 +191,7 @@ signature: MEYCIQ...
 - source-lines: 7-7
 ````
 
-`api/auth/v1/register/register.lock.md`（僅列出 section；安全項目 `public`、`auth-removed`、`public-writes`，均為高風險）
+`api/auth/v1/register.lock.md`（僅列出 section；安全項目 `public`、`auth-removed`、`public-writes`，均為高風險）
 
 ````markdown
 ## Route
@@ -269,7 +269,7 @@ signature: MEYCIQ...
 | 429 | RATE_LIMITED | RATE_LIMITED |
 ````
 
-`api/auth/v1/verify-email/verify-email.lock.md`（只列 `## Access` 和 `## Errors`；安全項目 `public`、`auth-removed`、`public-writes`、`password-write`、`verification-write`，均為高風險，剛好是每個 PR 5 項的上限）
+`api/auth/v1/verify-email.lock.md`（只列 `## Access` 和 `## Errors`；安全項目 `public`、`auth-removed`、`public-writes`、`password-write`、`verification-write`，均為高風險，剛好是每個 PR 5 項的上限）
 
 ````markdown
 ## Access

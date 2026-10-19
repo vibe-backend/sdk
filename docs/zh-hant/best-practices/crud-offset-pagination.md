@@ -27,7 +27,7 @@ Fields:
 Provide get, list and update CRUD. list defaults to 20 per page, at most 100, can sort by created_at or name, and can filter by email.
 ```
 
-`api/users/v2/list-users/list-users.md`（路由 `GET /users/v2/list-users`）
+`api/users/v2/list-users.md`（路由 `GET /users/v2/list-users`）
 
 ```text
 # List users
@@ -82,7 +82,7 @@ Validation failure returns 422.
 
 注入的 `user.list` method 有自己的 lock，由平台產生並簽名（`id: user/crud/list`、`source-type: structured`）（§12.9）。
 
-`api/users/v2/list-users/list-users.lock.md`（僅列 section；`kind: api`、`scope: feature`；`dependencies` 包含 `user/crud/list`）
+`api/users/v2/list-users.lock.md`（僅列 section；`kind: api`、`scope: feature`；`dependencies` 包含 `user/crud/list`）
 
 ````markdown
 ## Route

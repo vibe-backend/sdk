@@ -1,6 +1,6 @@
 # Best Practices
 
-This directory collects best-practice patterns for writing Markdown-driven backend definitions. Every page is written **strictly** against [`docs/spec-v1.7.md`](../spec-v1.7.md), the current finalized spec. Section references such as "§7.2" or "Decision 48" point to that spec. The older [`docs/spec-v1.5.md`](../spec-v1.5.md) is kept for historical reference only.
+This directory collects best-practice patterns for writing Markdown-driven backend definitions. Every page is written **strictly** against [`docs/spec-v1.8.md`](../spec-v1.7.md), the current finalized spec. Section references such as "§7.2" or "Decision 48" point to that spec. The older [`docs/spec-v1.5.md`](../spec-v1.5.md) is kept for historical reference only.
 
 > **Spec version note:** these pages were revised for **spec v1.7** (issue #17). Main changes from the v1.5 edition: optimistic locking uses `ETag`/`If-Match` with 428/412 (Decision 48); public registration takes no password and always returns 202 (Decisions 56, 67); login requires a verified email (Decision 55); admin user creation is an invite flow (Decision 69); API-key, JWT, rate-limit, refresh-token and LLM-provider settings follow the values v1.7 now specifies (Decisions 43–45, 57–59, 61, 62, 65, 72). If a page and the spec disagree, the spec wins.
 
