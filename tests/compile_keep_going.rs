@@ -275,3 +275,36 @@ fn retry_after_parsing() {
     assert_eq!(parse_retry_after("9999"), Some(Duration::from_secs(60)));
     assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
 }
+
+#[tokio::test]
+async fn failed_provider_source_does_not_enable_implicit_memory() {
+    let root = project();
+    // Structured normalization fails deterministically, without any LLM calls.
+    fs::write(
+        root.join("providers/main.md"),
+        "# main\n## Invalid\n(none)\n",
+    )
+    .unwrap();
+    for model in ["product", "zbroken"] {
+        fs::write(root.join(format!("models/{model}/{model}.md")), GOOD).unwrap();
+    }
+    let report = vibe::compile::build_project(&CompileOptions {
+        root: &root,
+        llm: None,
+        llm_config: None,
+        check: false,
+    })
+    .await
+    .err()
+    .expect("a failed provider must fail the build");
+    let text = report.to_string();
+    assert!(text.contains("providers/main.md"), "{text}");
+    assert!(text.contains("missing dependency main"), "{text}");
+    for model in ["product", "zbroken"] {
+        assert!(!root
+            .join(format!("models/{model}/{model}.lock.md"))
+            .exists());
+    }
+    assert!(!root.join("manifest.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}

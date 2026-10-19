@@ -655,7 +655,12 @@ pub fn build_signed(
         .build_record
         .as_deref()
         .and_then(|raw| serde_json::from_str::<crate::buildrecord::BuildRecord>(raw).ok());
-    let mut manifest = build_manifest_with_record(&docs, !info.release, record.as_ref())?;
+    let mut manifest = build_manifest_with_provider(
+        &docs,
+        !info.release,
+        record.as_ref(),
+        crate::compile::implicit_memory_provider(&loaded.sources),
+    )?;
     manifest.build_mode = Some(if info.release {
         BuildMode::Release
     } else {
@@ -847,6 +852,19 @@ pub fn build_manifest_with_record(
     dev: bool,
     record: Option<&crate::buildrecord::BuildRecord>,
 ) -> Result<Manifest, Report> {
+    // These document-only entry points receive the full validated lock set;
+    // build_signed has sources available and uses their provider decision instead.
+    let implicit = !docs.values().any(|doc| doc.meta.kind == Kind::Provider);
+    build_manifest_with_provider(docs, dev, record, implicit)
+}
+
+#[cfg(feature = "sdk")]
+pub(crate) fn build_manifest_with_provider(
+    docs: &HashMap<String, LockDoc>,
+    dev: bool,
+    record: Option<&crate::buildrecord::BuildRecord>,
+    implicit: bool,
+) -> Result<Manifest, Report> {
     if !dev
         && record.is_some_and(|record| {
             record
@@ -914,7 +932,7 @@ pub fn build_manifest_with_record(
     }
     Ok(Manifest {
         provenance: Provenance {
-            implicit_memory_provider: crate::compile::implicit_memory_provider(docs),
+            implicit_memory_provider: implicit,
             ..Provenance::default()
         },
         manifest_version: MANIFEST_VERSION,
