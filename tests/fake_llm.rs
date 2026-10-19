@@ -394,7 +394,7 @@ async fn compile_auth_feature_output(
     Result<vibe::compile::CompileOutput, vibe::diag::Report>,
 ) {
     let root = std::env::temp_dir().join(format!("vibe-auth-removal-{}", uuid::Uuid::new_v4()));
-    for dir in ["providers", "api/catalog/v1/greet"] {
+    for dir in ["providers", "api/catalog/v1"] {
         fs::create_dir_all(root.join(dir)).unwrap();
     }
     fs::write(

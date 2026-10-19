@@ -96,8 +96,8 @@ fn collect_dir(
             report.push(old_layout(&rel, &parts));
             continue;
         }
-        if name.ends_with(".schema.md") {
-            let endpoint = path.with_file_name(name.replace(".schema.md", ".md"));
+        if let Some(stem) = name.strip_suffix(".schema.md") {
+            let endpoint = path.with_file_name(format!("{stem}.md"));
             if !endpoint.is_file() {
                 report.push(Diag::error(
                     &rel,
@@ -110,9 +110,6 @@ fn collect_dir(
             continue;
         }
         if !name.ends_with(".md") || name.ends_with(".lock.md") {
-            continue;
-        }
-        if name == "schema.md" {
             continue;
         }
         match classify(root, &path) {

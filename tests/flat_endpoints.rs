@@ -36,6 +36,11 @@ fn flat_sources_attach_schemas_and_skip_locks() {
         "{report}"
     );
     fs::remove_file(root.join("api/shop/v1/orphan.schema.md")).unwrap();
+    write(&root, "api/shop/v1/schema.md", "endpoint named schema");
+    assert!(discover(&root)
+        .unwrap()
+        .iter()
+        .any(|f| f.id == "shop/v1/schema"));
     write(&root, "api/shop/v1/bad.name.md", "bad");
     assert!(discover(&root).is_err());
     fs::remove_dir_all(root).unwrap();
