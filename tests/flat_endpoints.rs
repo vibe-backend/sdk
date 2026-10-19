@@ -47,6 +47,22 @@ fn flat_sources_attach_schemas_and_skip_locks() {
 }
 
 #[test]
+fn model_schema_is_rejected_as_a_source_path() {
+    let root = std::env::temp_dir().join(format!("vibe-model-schema-{}", uuid::Uuid::new_v4()));
+    write(&root, "models/item/item.md", "model");
+    write(&root, "models/item/item.schema.md", "schema");
+
+    let report = discover(&root).unwrap_err();
+    assert_eq!(report.diags.len(), 1);
+    assert_eq!(report.diags[0].file, "models/item/item.schema.md");
+    assert_eq!(
+        report.diags[0].message,
+        "item.schema.md is not a source markdown file"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn old_files_are_all_reported_in_path_order_and_cli_modes_fail() {
     let root = std::env::temp_dir().join(format!("vibe-old-{}", uuid::Uuid::new_v4()));
     let cases = [

@@ -96,7 +96,10 @@ fn collect_dir(
             report.push(old_layout(&rel, &parts));
             continue;
         }
-        if let Some(stem) = name.strip_suffix(".schema.md") {
+        if let Some(stem) = name
+            .strip_suffix(".schema.md")
+            .filter(|_| parts.first() == Some(&"api") && parts.len() == 4)
+        {
             let endpoint = path.with_file_name(format!("{stem}.md"));
             if !endpoint.is_file() {
                 report.push(Diag::error(
