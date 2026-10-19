@@ -12,11 +12,11 @@ Locks are build output. They are not committed (`*.lock.md` is in
    `VIBE_LLM_API_KEY_PREVIEW`.
 2. **Build once through the reusable workflow.** Copy [the caller example](vibe-release.yml)
    to your project's `.github/workflows/release.yml`. A `v*` tag push calls
-   `vibe-backend/sdk/.github/workflows/vibe-project-release.yml@v1.0.0`
-   (`v1.0.0` is a placeholder). The SDK reference must be a release **tag**,
+   `vibe-backend/sdk/.github/workflows/vibe-project-release.yml@v1.0.0-rc.5`.
+   The SDK reference must be a release **tag**,
    never a branch or SHA; Dependabot can bump it. The reusable workflow is
-   available only from the first SDK release tag that contains it (the next
-   release after `v1.0.0-rc.4`); select that release or later, with the SDK tag
+   available from `v1.0.0-rc.5`, the first SDK release tag that contains it;
+   select that release or later, with the SDK tag
    version equal to the deployed runtime version. The workflow checks its tag's
    commit against its own commit and installs the SDK and runtime through the
    unchanged checksum and SDK attestation checks.
