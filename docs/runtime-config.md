@@ -101,8 +101,10 @@ The signer half is fixed in the binary: SAN and Build Signer URI name the SDK
 `vibe-project-release.yml` at the runtime's own version, and Build Signer Digest
 matches the SDK tag commit compiled in as `VIBE_SDK_COMMIT`. There is no runtime
 override. Current non-release builds without that commit refuse release manifests.
-SDK release embedding follows in PR 3/4; use a clean build when changing this
-compile-time value. The project pin is never taken from artifact contents.
+SDK tag release builds embed this commit; an empty compile-time value is treated
+like an absent value and still refuses release manifests. Use a clean build when
+changing it. Projects call the [reusable release workflow](ci/README.md) at the
+same SDK tag as the runtime. The project pin is never taken from artifact contents.
 Verification checks caller repository, workflow, ref, commit, optional repository
 id, issuer, push trigger, GitHub-hosted runner and Rekor inclusion, then uses
 `cosign` on `PATH` offline against the compiled-in trust root.

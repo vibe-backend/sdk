@@ -90,7 +90,7 @@ GitHub ruleset 冇辦法按 label 要求 approval 數量，所以要用一個自
   ```
 
 - 任何 API 錯誤、404 或者 rate limit，release build 都會失敗（fail closed），唔好加 retry 去繞過。
-- Release manifest 用 Sigstore keyless 簽（spec 決定 119）：release workflow 喺 `release` environment 用 GitHub OIDC 身份簽，寫入 Rekor；冇長期 key。驗證時 pin issuer `https://token.actions.githubusercontent.com`，證書身份完全等於 `https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<部署緊嘅版本>`（只接受完全相等；如果工具一定要 regex，只可以用完全錨定、正確轉義嘅式，例如 `^https://github\.com/vibe-backend/sdk/\.github/workflows/release\.yml@refs/tags/v1\.8\.0$`），加 commit SHA；離線驗證，trust root embed 入 binary（spec 2C.3b）。Keyless 身份只證明邊個 workflow 同 tag 產生 build，唔證明邊個批准。
+- Release manifest 用 SDK reusable workflow `vibe-backend/sdk/.github/workflows/vibe-project-release.yml` 經 GitHub OIDC／Fulcio 簽，寫入 Rekor（決定 182）；冇長期 key。Runtime 用部署者提供嘅 project identity／issuer pins、可選 repository id 同部署版本，並核對編入 binary 嘅 SDK signer tag／commit；離線驗證，trust root embed 入 binary。SDK 自己嘅 release assets 繼續用 `release.yml` 身份。Keyless 身份只證明邊個 workflow 同 tag 產生 build，唔證明邊個批准。
 - Environment secret（例如簽名 secret）只可以用喺 dev／test，永遠唔簽 release。
 - Sigstore 簽名失敗就失敗，唔可以 fallback 去 dev key。
 - 詳細加固步驟見 issue #28。

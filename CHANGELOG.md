@@ -5,6 +5,8 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Decision 182 (#309 PR 3):** Add the reusable project release workflow with guarded tag builds, keyless signing, verification, publishing and a secret-free dry-run self-test. SDK release builds embed `VIBE_SDK_COMMIT`; the CI docs example now calls the reusable workflow.
+
 - **Breaking (decision 182):** Release manifests require deployer identity and issuer pins (optional repository id) and the SDK reusable workflow signer fixed in the runtime binary. Verification applies in development too; release test builds are always refused. Builds without a compile-time SDK signer commit refuse release manifests. Development manifests and SDK asset verification are unchanged.
 
 - **Decision 182 (#309 PR 2):** Release builds under GitHub Actions record an optional diagnostic signing claim, never used for trust; claim/pin mismatches print hints. `vibe-runtime verify` uses startup artifact verification without serving or connecting to a database (exit 0/1).

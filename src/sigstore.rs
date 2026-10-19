@@ -215,10 +215,10 @@ impl Signer {
         Ok(Self { version: sdk_version.into(), identity: format!("https://github.com/vibe-backend/sdk/.github/workflows/vibe-project-release.yml@refs/tags/v{sdk_version}"), digest: digest.into() })
     }
     /// SDK release workflow will set VIBE_SDK_COMMIT=${{ github.sha }} at build time
-    /// (PR 3/4). Until then binaries refuse release manifests. Use a clean build
+    /// for tag builds. Other binaries refuse release manifests. Use a clean build
     /// when changing the compile-time value; no runtime override exists.
     pub fn compiled() -> Result<Self, String> {
-        match option_env!("VIBE_SDK_COMMIT") {
+        match option_env!("VIBE_SDK_COMMIT").filter(|digest| !digest.is_empty()) {
             Some(digest) => Self::new(env!("CARGO_PKG_VERSION"), digest)
                 .map_err(|reason| format!("compiled-in VIBE_SDK_COMMIT is invalid: {reason}")),
             None => Err("this vibe-runtime build has no compiled-in SDK signer commit (VIBE_SDK_COMMIT at build time); only official SDK release binaries can verify release manifests".into()),
@@ -737,7 +737,7 @@ mod tests {
         for digest in ["", "abc", &"A".repeat(40), &"g".repeat(40)] {
             assert!(Signer::new("1.8.0", digest).is_err());
         }
-        if option_env!("VIBE_SDK_COMMIT").is_none() {
+        if option_env!("VIBE_SDK_COMMIT").is_none_or(str::is_empty) {
             assert!(Signer::compiled()
                 .unwrap_err()
                 .contains("no compiled-in SDK signer commit"));

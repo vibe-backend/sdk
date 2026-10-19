@@ -1,0 +1,295 @@
+name: Project release
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        default: release
+      project-path:
+        type: string
+        default: .
+      release-version:
+        type: string
+        required: false
+      llm-provider:
+        type: string
+        default: openai
+      llm-model:
+        type: string
+        default: ""
+      llm-base-url:
+        type: string
+        required: false
+      llm-api-style:
+        type: string
+        default: chat
+      publish-release:
+        type: boolean
+        default: true
+      dry-run:
+        type: boolean
+        default: false
+    secrets:
+      llm-api-key:
+        required: false
+    outputs:
+      manifest-sha256:
+        value: ${{ jobs.build-and-sign.outputs.manifest-sha256 }}
+      artifact-name:
+        value: ${{ jobs.build-and-sign.outputs.artifact-name }}
+      expect-identity:
+        value: ${{ jobs.build-and-sign.outputs.expect-identity }}
+      expect-issuer:
+        value: ${{ jobs.build-and-sign.outputs.expect-issuer }}
+      repository-id:
+        value: ${{ jobs.build-and-sign.outputs.repository-id }}
+
+permissions: {}
+
+jobs:
+  dry-run:
+    if: inputs.dry-run
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .vibe-sdk
+          persist-credentials: false
+      - name: Validate dry-run SDK
+        env:
+          SDK_REPOSITORY: ${{ job.workflow_repository }}
+          SDK_SHA: ${{ job.workflow_sha }}
+        run: .vibe-sdk/scripts/ci/project-release.sh dry-run-ref "$SDK_REPOSITORY" "$SDK_SHA" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.89"
+      - name: Build SDK at calling commit
+        working-directory: .vibe-sdk
+        run: |
+          cargo build --release --locked --bin vibe
+          cargo build --release --locked --no-default-features --bin vibe-runtime
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: project-src
+          persist-credentials: false
+      - name: Exercise real caller guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF: ${{ github.ref }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          VERSION_INPUT: ${{ inputs.release-version }}
+        run: |
+          if [ "$EVENT_NAME" = push ] && [ "$REF_TYPE" = tag ]; then
+            .vibe-sdk/scripts/ci/project-release.sh guard "$EVENT_NAME" "$REF_TYPE" "$REF" "$WORKFLOW_REF" "$VERSION_INPUT"
+          elif .vibe-sdk/scripts/ci/project-release.sh guard "$EVENT_NAME" "$REF_TYPE" "$REF" "$WORKFLOW_REF" "$VERSION_INPUT"; then
+            echo '::error::guard accepted a non-tag event'; exit 1
+          fi
+      - name: Build and verify development artifact (no LLM key)
+        env:
+          PROJECT_PATH: ${{ inputs.project-path }}
+          LLM_PROVIDER: ${{ inputs.llm-provider }}
+          LLM_MODEL: ${{ inputs.llm-model }}
+          BASE_URL: ${{ inputs.llm-base-url }}
+          LLM_API_STYLE: ${{ inputs.llm-api-style }}
+        run: |
+          if [ -n "$BASE_URL" ]; then export LLM_BASE_URL="$BASE_URL"; fi
+          project="project-src/$PROJECT_PATH"
+          vibe build --check --project "$project"
+          vibe build --project "$project" -o "$project/manifest.json"
+          if [ "$LLM_PROVIDER" = fake ]; then
+            if vibe build --release --project "$project" --release-version 1.0.0 --commit "$GITHUB_SHA" -o "$RUNNER_TEMP/refused.json" > "$RUNNER_TEMP/release-check.log" 2>&1; then
+              echo '::error::fake release build succeeded'; exit 1
+            fi
+            grep -F 'cannot be used for a release build' "$RUNNER_TEMP/release-check.log"
+          fi
+          test -f "$project/manifest.json"
+          jq -e '.build_mode == "dev" and (.provenance | has("signing") | not)' "$project/manifest.json"
+          if [ "$LLM_PROVIDER" = fake ]; then
+            jq -e '.provenance.test_build == true' "$project/manifest.json"
+          fi
+          # Production verification forbids compile-time LLM configuration.
+          unset LLM_PROVIDER LLM_MODEL LLM_BASE_URL LLM_API_STYLE
+          VIBE_ENV=development vibe-runtime verify --artifact "$project" --allow-test-build > "$RUNNER_TEMP/dev-verify.log" 2>&1
+          grep -F 'verified:' "$RUNNER_TEMP/dev-verify.log"
+          if VIBE_ENV=production vibe-runtime verify --artifact "$project" --allow-test-build > "$RUNNER_TEMP/prod-verify.log" 2>&1; then
+            echo '::error::production accepted a development manifest'; exit 1
+          else
+            test "$?" -eq 1
+          fi
+          grep -F 'development manifest' "$RUNNER_TEMP/prod-verify.log"
+          mkdir -p "$RUNNER_TEMP/relabelled"
+          jq '.build_mode = "release"' "$project/manifest.json" > "$RUNNER_TEMP/relabelled/manifest.json"
+          if jq -e '.provenance.test_build == true' "$project/manifest.json" > /dev/null; then
+            if VIBE_ENV=production vibe-runtime verify --artifact "$RUNNER_TEMP/relabelled" > "$RUNNER_TEMP/test-build-verify.log" 2>&1; then
+              echo '::error::release accepted a test build'; exit 1
+            else
+              test "$?" -eq 1
+            fi
+            grep -F 'release manifest is marked test_build' "$RUNNER_TEMP/test-build-verify.log"
+          fi
+          # Clear the fake marker in this tampered copy to reach the missing-pin
+          # check: release test_build is independently rejected before pin checks.
+          jq '.build_mode = "release" | .provenance.test_build = false' "$project/manifest.json" > "$RUNNER_TEMP/relabelled/manifest.json"
+          if VIBE_ENV=production vibe-runtime verify --artifact "$RUNNER_TEMP/relabelled" > "$RUNNER_TEMP/pins-verify.log" 2>&1; then
+            echo '::error::release accepted without deployer pins'; exit 1
+          else
+            test "$?" -eq 1
+          fi
+          grep -F -- '--expect-identity / VIBE_EXPECT_IDENTITY' "$RUNNER_TEMP/pins-verify.log"
+          echo 'Dry-run: check/build passed; dev verification passed; fake release, production dev manifest and unpinned release refused. No signing or publishing.' >> "$GITHUB_STEP_SUMMARY"
+
+  build-and-sign:
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      manifest-sha256: ${{ steps.digest.outputs.sha256 }}
+      artifact-name: vibe-release-${{ steps.guard.outputs.version }}
+      expect-identity: ${{ steps.guard.outputs.expect_identity }}
+      expect-issuer: https://token.actions.githubusercontent.com
+      repository-id: ${{ github.repository_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: vibe-backend/sdk
+          ref: ${{ job.workflow_sha }}
+          path: .vibe-sdk
+          persist-credentials: false
+      - name: Validate SDK release tag and immutable commit
+        id: sdk
+        env:
+          SDK_REF: ${{ job.workflow_ref }}
+          SDK_SHA: ${{ job.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .vibe-sdk/scripts/ci/project-release.sh sdk-ref "$SDK_REF" "$SDK_SHA" > "$RUNNER_TEMP/sdk-outputs"
+          cat "$RUNNER_TEMP/sdk-outputs" >> "$GITHUB_OUTPUT"
+          sdk_version=$(sed -n 's/^sdk_version=//p' "$RUNNER_TEMP/sdk-outputs")
+          tag_sha=$(gh api "repos/vibe-backend/sdk/commits/refs/tags/v$sdk_version" --jq .sha)
+          if [ "$tag_sha" != "$SDK_SHA" ]; then
+            echo '::error::SDK tag commit differs from reusable workflow commit'; exit 1
+          fi
+      - name: Validate caller tag
+        id: guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF: ${{ github.ref }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          VERSION_INPUT: ${{ inputs.release-version }}
+        run: .vibe-sdk/scripts/ci/project-release.sh guard "$EVENT_NAME" "$REF_TYPE" "$REF" "$WORKFLOW_REF" "$VERSION_INPUT" >> "$GITHUB_OUTPUT"
+      - name: Validate release LLM configuration
+        env:
+          MODEL: ${{ inputs.llm-model }}
+          PROVIDER: ${{ inputs.llm-provider }}
+          KEY: ${{ secrets.llm-api-key }}
+        run: |
+          test -n "$MODEL" || { echo '::error::llm-model is required'; exit 1; }
+          test "$PROVIDER" != fake || { echo '::error::fake provider cannot release'; exit 1; }
+          test -n "$KEY" || { echo '::error::llm-api-key is required'; exit 1; }
+      - name: Install verified SDK release binaries
+        env:
+          SDK_VERSION: ${{ steps.sdk.outputs.sdk_version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .vibe-sdk/scripts/vibe-install.sh install --version "v$SDK_VERSION" --install-dir "$RUNNER_TEMP/vibe-bin"
+          .vibe-sdk/scripts/vibe-install.sh install --version "v$SDK_VERSION" --install-dir "$RUNNER_TEMP/vibe-bin" --runtime
+          echo "$RUNNER_TEMP/vibe-bin" >> "$GITHUB_PATH"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: project-src
+          persist-credentials: false
+      - name: Build release manifest
+        env:
+          KEY: ${{ secrets.llm-api-key }}
+          LLM_PROVIDER: ${{ inputs.llm-provider }}
+          LLM_MODEL: ${{ inputs.llm-model }}
+          BASE_URL: ${{ inputs.llm-base-url }}
+          LLM_API_STYLE: ${{ inputs.llm-api-style }}
+          PROJECT_PATH: ${{ inputs.project-path }}
+          VERSION: ${{ steps.guard.outputs.version }}
+        run: |
+          umask 077
+          key_file="$RUNNER_TEMP/vibe-release-llm-key"
+          trap 'rm -f "$key_file"' EXIT HUP INT TERM
+          printf '%s' "$KEY" > "$key_file"
+          unset KEY
+          export LLM_API_KEY_FILE="$key_file"
+          if [ -n "$BASE_URL" ]; then export LLM_BASE_URL="$BASE_URL"; fi
+          vibe build --release --project "project-src/$PROJECT_PATH" --release-version "$VERSION" --commit "$GITHUB_SHA" -o dist/manifest.json
+      - name: Remove LLM key file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/vibe-release-llm-key"
+      - name: Sign manifest with keyless OIDC (no fallback)
+        run: cosign sign-blob --yes --new-bundle-format --bundle dist/manifest.json.sigstore.json dist/manifest.json
+      - name: Verify signed artifact with deployer pins
+        env:
+          VERSION: ${{ steps.guard.outputs.version }}
+          SELF_IDENTITY: ${{ steps.guard.outputs.self_identity }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          VIBE_ENV=production VIBE_RELEASE_VERSION="$VERSION" vibe-runtime verify --artifact dist \
+            --expect-identity "$SELF_IDENTITY" --expect-issuer https://token.actions.githubusercontent.com \
+            --expect-repository-id "$REPOSITORY_ID"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/manifest.json
+      - name: Manifest digest
+        id: digest
+        run: echo "sha256=$(sha256sum dist/manifest.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vibe-release-${{ steps.guard.outputs.version }}
+          path: |
+            dist/manifest.json
+            dist/manifest.json.sigstore.json
+          if-no-files-found: error
+
+  publish:
+    needs: build-and-sign
+    if: ${{ !inputs.dry-run && inputs.publish-release }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build-and-sign.outputs.artifact-name }}
+          path: dist
+      - name: Check exact artifact contents and digest
+        env:
+          EXPECTED_SHA256: ${{ needs.build-and-sign.outputs.manifest-sha256 }}
+        run: |
+          test -f dist/manifest.json && test ! -L dist/manifest.json
+          test -f dist/manifest.json.sigstore.json && test ! -L dist/manifest.json.sigstore.json
+          test "$(find dist -mindepth 1 | wc -l)" -eq 2
+          printf '%s  dist/manifest.json\n' "$EXPECTED_SHA256" | sha256sum -c -
+      - name: Publish caller release without replacing assets
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/manifest.json dist/manifest.json.sigstore.json
+          elif [[ "$TAG" == *-* ]]; then
+            gh release create "$TAG" dist/manifest.json dist/manifest.json.sigstore.json --verify-tag --title "$TAG" --prerelease --latest=false
+          else
+            gh release create "$TAG" dist/manifest.json dist/manifest.json.sigstore.json --verify-tag --title "$TAG" --latest
+          fi

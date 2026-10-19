@@ -43,8 +43,30 @@ jobs:
         run: python3 scripts/check-zh-code-blocks.py
       - name: Install script tests
         run: python3 tests/install_manager.py
+      - name: Project release guard tests
+        run: |
+          shellcheck scripts/ci/project-release.sh tests/project_release.sh
+          tests/project_release.sh
       - name: Shellcheck install script
         run: shellcheck scripts/vibe-install.sh
+
+  project-release-dry-run:
+    name: Reusable project release (dry-run self-test)
+    if: github.event_name == 'pull_request'
+    # GitHub checks called job permissions against the caller even for skipped jobs.
+    # These are a ceiling: only dry-run (contents: read) runs; signing and publish
+    # are skipped. No secrets are passed.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/vibe-project-release.yml
+    with:
+      dry-run: true
+      project-path: tests/fixtures/project-release
+      llm-provider: fake
+      llm-model: fake
+      publish-release: false
 
   rust:
     name: Rust fmt / clippy / test
