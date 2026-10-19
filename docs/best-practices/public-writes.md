@@ -1,5 +1,16 @@
 # Public writes
 
+Decision 188: “Anyone can …” authorizes public access without frontmatter flags.
+Public endpoints remove auth and derive public-writes from their called methods;
+explicit frontmatter pins take precedence. For GET and POST on the same URL,
+use two endpoint files explicitly naming the same route path.
+
+Prose limits that the lock cannot express produce a build warning quoting the
+source sentence. “At most 50 per day” is not enforced by a per-minute rate limit.
+For implicit memory, query SQL must use decision 183's supported unique-key
+counter forms; unsupported SQL fails the build.
+
+
 ## Purpose
 
 Allow unauthenticated visitors to create or update data (e.g. submitting a review) under tightly controlled conditions. Public endpoints may call `writes: true` methods (Decision 4), but every rule in §7.2 is mandatory (Decisions 21–26, 38, 39, 41, 47, 49, 53).

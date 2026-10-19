@@ -1,5 +1,7 @@
 # vibe-backend
 
+You can make an endpoint public by writing “anyone can …”; public/auth flags are optional.
+
 **Describe the backend (server side) of your app in plain words, and vibe-backend turns it into a working web API.**
 
 ## Who is this for?

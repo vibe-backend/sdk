@@ -985,7 +985,7 @@ pub(crate) fn build_manifest_with_provider(
 }
 
 #[cfg(feature = "sdk")]
-fn model_from(doc: &LockDoc) -> ModelSpec {
+pub(crate) fn model_from(doc: &LockDoc) -> ModelSpec {
     let provider = find_section(&doc.sections, "Table")
         .and_then(|s| s.get("provider"))
         .unwrap_or("")

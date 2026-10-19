@@ -112,7 +112,7 @@ async fn chinese_create_is_canonical_across_three_cache_free_compiles() {
         "# product\n\n商品有 sku 同 name，可以新增、更新、刪除同列出。\n",
     )
     .unwrap();
-    source(&root, "---\npublic: true\nauth: false\n---\n# 建立商品\n\n公開 POST 建立商品，唔使登入，sku 同 name 必填。\n");
+    source(&root, "---\npublic: true\nauth: false\n---\n# 建立商品\n\n公開 POST 建立商品，唔使登入，sku 同 name 必填。 Use path /catalog/v1/products.\n");
     let public = GOOD
         .replace(
             "- public: false",
@@ -501,7 +501,7 @@ async fn missing_list_is_repaired_and_constants_are_preserved() {
         let root = project();
         fs::remove_dir_all(root.join("models/cart-item")).unwrap();
         fs::remove_dir_all(root.join("api/shop")).unwrap();
-        source(&root, prose);
+        source(&root, &format!("{prose} Use path {path}."));
         let good = vibe::prompt_guide::feature_list_example()
             .replace("/catalog/v1/example-products", path)
             .replace("product.list", target);

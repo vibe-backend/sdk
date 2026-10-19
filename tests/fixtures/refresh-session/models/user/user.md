@@ -18,6 +18,7 @@
 | method | options |
 | --- | --- |
 | get | - |
+| update | optimistic-lock: if-match |
 
 ## Policies
 

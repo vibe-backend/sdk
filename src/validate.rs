@@ -366,6 +366,10 @@ pub(crate) fn check_lock(
         crate::project::for_source(source).default_slug.as_deref(),
         report,
     );
+    check_model_sql(doc, docs, &file, report);
+    if doc.meta.source_type == crate::lock::SourceType::Natural {
+        crate::compile::check_natural_security(doc, source, report);
+    }
     check_variable_roots(doc, &file, report);
     let env_fields: Vec<_> = doc
         .meta
@@ -3590,5 +3594,44 @@ mod feature_contract_tests {
             &body.replace("| BAD_NAME | BAD_NAME |", "| BAD_NAME | INVENTED |")
         )
         .contains("unknown Errors code `INVENTED`"));
+    }
+}
+
+fn check_model_sql(
+    doc: &LockDoc,
+    docs: &HashMap<String, LockDoc>,
+    file: &str,
+    report: &mut Report,
+) {
+    if doc.meta.kind == Kind::Migration {
+        return;
+    }
+    let models: Vec<_> = docs
+        .values()
+        .filter(|d| d.meta.kind == Kind::Model)
+        .map(crate::manifest::model_from)
+        .collect();
+    let memory = !docs.values().any(|d| d.meta.kind == Kind::Provider);
+    if let Some(steps) = find_section(&doc.sections, "Steps") {
+        for block in &steps.blocks {
+            if block_val(block, "op") != "query" {
+                continue;
+            }
+            let sql = block_val(block, "sql");
+            let sql = sql.trim().trim_matches('`');
+            for problem in crate::sqlpolicy::model_problems(sql, &models, &block.heading) {
+                report.push(Diag::error(file, problem));
+            }
+            if memory {
+                if let Err(error) = crate::runtime::memsql::classify(sql)
+                    .and_then(|plan| plan.check_models(&models))
+                {
+                    report.push(Diag::error(
+                        file,
+                        format!("step {}: MEMORY_UNSUPPORTED_SQL: {error}", block.heading),
+                    ));
+                }
+            }
+        }
     }
 }

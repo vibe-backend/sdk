@@ -14,7 +14,11 @@
 
 ## CRUD
 
-(none)
+| method | options |
+| --- | --- |
+| create | - |
+| get | - |
+| update | optimistic-lock: if-match |
 
 ## Policies
 

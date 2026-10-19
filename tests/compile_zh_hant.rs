@@ -49,6 +49,7 @@ const CART_ITEM: &str = "## Table
 ## CRUD
 | method | options |
 | --- | --- |
+| create | - |
 | get | - |
 | list | page-size: 50, max-page-size: 100, sort: [created_at] |
 ## Policies

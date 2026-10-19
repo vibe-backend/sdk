@@ -3271,6 +3271,9 @@ fn fake_response(request: &LlmRequest) -> Result<String, String> {
     let unsupported = || {
         "the fake LLM (LLM_PROVIDER=fake) only supports constant-response API features such as hello world".to_string()
     };
+    if let Some(counter) = fake_counter_response(input) {
+        return Ok(counter);
+    }
     if !input.contains("KIND: api") {
         return Err(unsupported());
     }
@@ -3394,4 +3397,65 @@ mod fake_response_tests {
             .unwrap_err()
             .contains("the fake LLM (LLM_PROVIDER=fake) only supports"));
     }
+}
+
+/// A deliberately small natural-language counter fixture, not a general compiler.
+fn fake_counter_response(input: &str) -> Option<String> {
+    let id = input.lines().find_map(|line| line.strip_prefix("ID: "))?;
+    let kind = input.lines().find_map(|line| line.strip_prefix("KIND: "))?;
+    let source = input
+        .split("\n<<<SOURCE ")
+        .nth(1)?
+        .split_once('\n')?
+        .1
+        .split("<<<END SOURCE")
+        .next()?;
+    if !source.to_ascii_lowercase().contains("counter") {
+        return None;
+    }
+    if kind == "model" && id == "counter" {
+        return Some("## Table\n- provider: main\n- table: counter\n## Fields\n| name | type | rules | system |\n| --- | --- | --- | --- |\n| name | string | required, unique | no |\n| value | integer | required, default: 0 | no |\n## CRUD\n| method | options |\n| --- | --- |\n| create | - |\n| get | - |\n| update | optimistic-lock: if-match |\n## Policies\n(none)\n".into());
+    }
+    let table = input
+        .lines()
+        .find(|line| line.contains("kind model") && line.contains("counter"))?
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("table="))?;
+    let increment = source.to_ascii_lowercase().contains("add one")
+        || source.to_ascii_lowercase().contains("increment");
+    let writes = if increment { "true" } else { "false" };
+    if kind == "method" && id.starts_with("counter/methods/") {
+        let sql = if increment {
+            format!("INSERT INTO {table} (name, value) VALUES ($1, 1) ON CONFLICT (name) DO UPDATE SET value = {table}.value + EXCLUDED.value RETURNING value")
+        } else {
+            format!("SELECT COALESCE(MAX(value), 0) AS value FROM {table} WHERE name = $1")
+        };
+        return Some(format!("## Signature\n- input: {{name: string}}\n- output: {{value: integer}}\n- errors: []\n- writes: {writes}\n## Calls\n(none)\n## Steps\n### s1\n- op: query\n- sql: `{sql}`\n- params: [input.name]\n- writes: {writes}\n- out: result\n- source-lines: 1-1\n### s2\n- op: respond\n- value: result\n- source-lines: 1-1\n"));
+    }
+    if kind != "api" {
+        return None;
+    }
+    let parts: Vec<_> = id.split('/').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let default = input
+        .lines()
+        .any(|l| l.starts_with("Project route rule:") && l.contains("tenant: default-slug"));
+    let public = crate::compile::clearly_public(source);
+    let segment = if public && !default { "/{slug}" } else { "" };
+    let tenant = if default { "default-slug" } else { "path.slug" };
+    let method = if increment { "POST" } else { "GET" };
+    let action = if increment { "increment" } else { "read" };
+    let endpoint = if source.contains("/web/v1/counter") {
+        "counter"
+    } else {
+        parts[2]
+    };
+    let pipelines = if public {
+        "### -auth\n- removed: true"
+    } else {
+        "(none)"
+    };
+    Some(format!("## Route\n- method: {method}\n- path: /{}/{}{segment}/{endpoint}\n## Access\n- public: {public}\n- public-writes: {}\n- tenant: {tenant}\n## Pipelines\n{pipelines}\n## Limits\n(none)\n## Request\n(none)\n## Response\n- status: 200\n## Transform\n- in: {{name: \"counter\"}}\n- out: result\n## Steps\n### s1\n- op: method\n- target: counter.{action}\n- args: transform.in\n- out: result\n- source-lines: 1-1\n### s2\n- op: respond\n- value: transform.out\n- status: 200\n- source-lines: 1-1\n## Errors\n(none)\n", parts[0], parts[1], if public && increment { "true" } else { "false" }))
 }

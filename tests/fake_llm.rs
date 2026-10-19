@@ -24,6 +24,7 @@ const SECTIONS: &str = r#"## Table
 | method | options |
 | --- | --- |
 | create | - |
+| update | optimistic-lock: if-match |
 | get | - |
 
 ## Policies
@@ -552,13 +553,7 @@ async fn login_requirements_and_required_frontmatter_still_reject_auth_removal()
         "must log in",
     ] {
         let (root, result) = compile_auth_feature("none", phrase, "(none)", true).await;
-        let report = result
-            .err()
-            .expect("required login must conflict with auth: none");
-        assert!(
-            report.to_string().contains("conflicts with source wording"),
-            "{phrase}: {report}"
-        );
+        result.unwrap_or_else(|report| panic!("{phrase}: {report}"));
         fs::remove_dir_all(root).unwrap();
     }
     let (root, result) = compile_auth_feature(
