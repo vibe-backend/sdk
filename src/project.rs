@@ -22,9 +22,16 @@ impl Routes {
         let mut routes = false;
         let mut seen = std::collections::HashSet::new();
         for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            if line == "# project" { continue; }
-            if line == "## Routes" { routes = true; continue; }
-            if routes && line == "(none)" { continue; }
+            if line == "# project" {
+                continue;
+            }
+            if line == "## Routes" {
+                routes = true;
+                continue;
+            }
+            if routes && line == "(none)" {
+                continue;
+            }
             let Some((key, value)) = line.strip_prefix("- ").and_then(|l| l.split_once(':')) else {
                 return Err(format!("api/_project.md: unknown section/key `{line}`; use ## Routes with prefix and default-slug bullets"));
             };
@@ -34,8 +41,16 @@ impl Routes {
             }
             match key {
                 "prefix" => settings.prefix = if value == "(none)" { "" } else { value }.into(),
-                "default-slug" => if !value.is_empty() && value != "(none)" { settings.default_slug = Some(value.into()); },
-                _ => return Err(format!("api/_project.md: unknown key `{key}`; use prefix or default-slug")),
+                "default-slug" => {
+                    if !value.is_empty() && value != "(none)" {
+                        settings.default_slug = Some(value.into());
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "api/_project.md: unknown key `{key}`; use prefix or default-slug"
+                    ))
+                }
             }
         }
         settings.validate()?;
@@ -44,11 +59,20 @@ impl Routes {
 
     pub fn validate(&self) -> Result<(), String> {
         let prefix = &self.prefix;
-        if !prefix.is_empty() && (prefix.len() > 64 || !prefix.starts_with('/') || prefix[1..].split('/').any(|s| {
-            s.is_empty() || !s.as_bytes()[0].is_ascii_lowercase() && !s.as_bytes()[0].is_ascii_digit()
-                || !s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-                || matches!(s, "health" | "_internal") && prefix.split('/').nth(1) == Some(s)
-        })) {
+        if !prefix.is_empty()
+            && (prefix.len() > 64
+                || !prefix.starts_with('/')
+                || prefix[1..].split('/').any(|s| {
+                    s.is_empty()
+                        || !s.as_bytes()[0].is_ascii_lowercase()
+                            && !s.as_bytes()[0].is_ascii_digit()
+                        || !s
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                        || matches!(s, "health" | "_internal")
+                            && prefix.split('/').nth(1) == Some(s)
+                }))
+        {
             return Err("api/_project.md: invalid prefix; use /api or lowercase alphanumeric/hyphen segments, no trailing slash or empty segments, at most 64 bytes; first segment cannot be health or _internal".into());
         }
         if let Some(slug) = &self.default_slug {
@@ -84,7 +108,8 @@ impl Routes {
                 let path = root.join(name);
                 if path.exists() {
                     let loaded = crate::runtime::load_slug_file(&path)?;
-                    self.check_slugs(loaded.slugs.keys()).map_err(|e| format!("{name}: {e}"))?;
+                    self.check_slugs(loaded.slugs.keys())
+                        .map_err(|e| format!("{name}: {e}"))?;
                 }
             }
         }
@@ -94,6 +119,38 @@ impl Routes {
 
 pub fn for_source(source: &crate::discover::SourceFile) -> Routes {
     let mut root = source.abs.clone();
-    for _ in Path::new(&source.rel).components() { root.pop(); }
+    for _ in Path::new(&source.rel).components() {
+        root.pop();
+    }
     Routes::load(&root).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn structured_routes_are_strict_and_optional() {
+        for text in [
+            "",
+            "# project",
+            "## Routes\n(none)",
+            "## Routes\n- prefix: (none)\n- default-slug: (none)",
+        ] {
+            let routes = Routes::parse(text).unwrap();
+            assert!(routes.prefix.is_empty());
+            assert!(routes.default_slug.is_none());
+        }
+        for (text, key) in [
+            ("## Unknown", "Unknown"),
+            ("## Routes\n- typo: x", "typo"),
+            ("- prefix: /api", "prefix"),
+            ("## Routes\n- prefix: /api\n- prefix: /other", "prefix"),
+        ] {
+            assert!(Routes::parse(text).unwrap_err().contains(key));
+        }
+        assert!(Routes::parse(&format!("## Routes\n- prefix: /{}", "a".repeat(63))).is_ok());
+        for slug in ["-acme", "acme-", "a--b", "A", "a/b", "a.b", &"a".repeat(64)] {
+            assert!(Routes::parse(&format!("## Routes\n- default-slug: {slug}")).is_err());
+        }
+    }
 }

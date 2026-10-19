@@ -526,7 +526,12 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         }
     };
     let principal = if found.route.public && found.route.auth_removed {
-        let slug = state.manifest.default_slug.clone().or_else(|| found.params.get("slug").cloned()).unwrap_or_default();
+        let slug = state
+            .manifest
+            .default_slug
+            .clone()
+            .or_else(|| found.params.get("slug").cloned())
+            .unwrap_or_default();
         let entry = match &state.dev_slugs {
             Some(slugs) => slugs.lookup(&slug),
             None => state.slugs.get(&slug).cloned(),
@@ -590,10 +595,20 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             Some(slugs) => slugs.lookup(slug),
             None => state.slugs.get(slug).cloned(),
         };
-        if !entry.is_some_and(|entry| entry.tenant_id == principal.tenant_id) {
-            return finish(found.route, &state, started, error_response(
-                StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "Unauthorised", &request_id, &[],
-            )).await;
+        if entry.is_none_or(|entry| entry.tenant_id != principal.tenant_id) {
+            return finish(
+                found.route,
+                &state,
+                started,
+                error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "UNAUTHORIZED",
+                    "Unauthorised",
+                    &request_id,
+                    &[],
+                ),
+            )
+            .await;
         }
     }
     if !found.route.roles.is_empty()

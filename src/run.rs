@@ -225,6 +225,7 @@ fn verify_artifact_in_env(
     fs::metadata(&path).map_err(|err| format!("cannot read manifest {}: {err}", path.display()))?;
     let manifest = load_manifest_with_signer(&path, &opts.project, run_env, &pins, signer)?;
     check_verified_manifest(&manifest, run_env, opts.allow_test_build)?;
+    vibe_route_settings(&manifest).check_project_slugs(&opts.project)?;
     let identity = if manifest.build_mode == Some(manifest::BuildMode::Release) {
         Some(
             crate::sigstore::Pin::parse(
@@ -467,6 +468,7 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
     }
     if matches!(opts.source, RunSource::Project) {
         check_verified_manifest(&manifest, run_env, opts.allow_test_build)?;
+        vibe_route_settings(&manifest).check_project_slugs(&opts.project)?;
     }
     if manifest.provenance.implicit_memory_provider {
         eprintln!("warning: this manifest uses the implicit in-memory provider `main`: data is kept in memory only and is lost on restart; add providers/main.md to use PostgreSQL");
@@ -541,8 +543,16 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
         Arc::new(pg)
     };
     let reload_slugs = memory && run_env.is_dev();
-    if crate::runtime::slugs::apply_dev_default_named(&mut loaded.slugs, memory, run_env.is_dev(), manifest.default_slug.as_deref().unwrap_or("dev")) {
-        eprintln!("dev: slug `{}` (tenant devtenant) is available for public routes", manifest.default_slug.as_deref().unwrap_or("dev"));
+    if crate::runtime::slugs::apply_dev_default_named(
+        &mut loaded.slugs,
+        memory,
+        run_env.is_dev(),
+        manifest.default_slug.as_deref().unwrap_or("dev"),
+    ) {
+        eprintln!(
+            "dev: slug `{}` (tenant devtenant) is available for public routes",
+            manifest.default_slug.as_deref().unwrap_or("dev")
+        );
     }
     if let (Some(pool), true) = (
         &pg_pool,
@@ -612,8 +622,13 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
         manifest,
         exec,
         auth,
-        dev_slugs: reload_slugs
-            .then(|| crate::runtime::DevSlugs::with_default(project, loaded.slugs.clone(), route_settings.default_slug.clone())),
+        dev_slugs: reload_slugs.then(|| {
+            crate::runtime::DevSlugs::with_default(
+                project,
+                loaded.slugs.clone(),
+                route_settings.default_slug.clone(),
+            )
+        }),
         slugs: loaded.slugs,
         rates: std::sync::Mutex::new(Default::default()),
         quotas: std::sync::Mutex::new(Default::default()),
@@ -1035,5 +1050,8 @@ mod claim_hint_tests {
 }
 
 fn vibe_route_settings(manifest: &manifest::Manifest) -> crate::project::Routes {
-    crate::project::Routes { prefix: manifest.route_prefix.clone(), default_slug: manifest.default_slug.clone() }
+    crate::project::Routes {
+        prefix: manifest.route_prefix.clone(),
+        default_slug: manifest.default_slug.clone(),
+    }
 }

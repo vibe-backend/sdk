@@ -3291,6 +3291,34 @@ mod prompt_tests {
     }
 
     #[test]
+    fn project_route_rule_is_input_data_in_both_modes() {
+        let root = std::env::temp_dir().join(format!("vibe-rule-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("api/web/v1")).unwrap();
+        let source = crate::discover::SourceFile {
+            rel: "api/web/v1/hello.md".into(),
+            abs: root.join("api/web/v1/hello.md"),
+            kind: Kind::Api,
+            scope: Some(Scope::Feature),
+            id: "web/v1/hello".into(),
+            text: "Hello".into(),
+            schema: None,
+        };
+        let slug_hash = source.source_hash();
+        assert!(llm_input(&source, &HashMap::new())
+            .starts_with(crate::project::Routes::default().rule()));
+        std::fs::write(
+            root.join("api/_project.md"),
+            "## Routes\n- prefix: /api\n- default-slug: acme\n",
+        )
+        .unwrap();
+        let input = llm_input(&source, &HashMap::new());
+        assert!(input.starts_with("Project route rule: public routes use /{definition}/{version}/<endpoint> and tenant: default-slug"));
+        assert!(!input.contains("/api"));
+        assert_ne!(source.source_hash(), slug_hash);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn compile_prompt_fingerprint() {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();

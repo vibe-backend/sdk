@@ -100,6 +100,11 @@ pub fn validate_loaded(
 ) -> (Result<Report, Report>, HashMap<String, LockDoc>) {
     let sources = &loaded.sources;
     let mut report = Report::new();
+    if let Err(error) =
+        crate::project::Routes::load(opts.root).and_then(|r| r.check_project_slugs(opts.root))
+    {
+        report.push(Diag::error("api/_project.md", error));
+    }
     // Make all available callees visible to per-lock repair checks, regardless
     // of discovery order. Use source ids, as the cross-lock checks do below.
     let callees: HashMap<String, LockDoc> = sources
@@ -355,7 +360,12 @@ pub(crate) fn check_lock(
             ));
         }
     }
-    check_sections_mode(doc, &file, crate::project::for_source(source).default_slug.as_deref(), report);
+    check_sections_mode(
+        doc,
+        &file,
+        crate::project::for_source(source).default_slug.as_deref(),
+        report,
+    );
     check_variable_roots(doc, &file, report);
     let env_fields: Vec<_> = doc
         .meta
@@ -597,7 +607,9 @@ fn check_sections_mode(doc: &LockDoc, file: &str, default_slug: Option<&str>, re
         Kind::Provider => check_provider(doc, file, report),
         Kind::Model => check_model(doc, file, report),
         Kind::Method => check_method(doc, file, report),
-        Kind::Api if doc.meta.scope == Some(Scope::Feature) => check_feature_mode(doc, file, default_slug, report),
+        Kind::Api if doc.meta.scope == Some(Scope::Feature) => {
+            check_feature_mode(doc, file, default_slug, report)
+        }
         Kind::Api => {}
         Kind::Pipeline => check_pipeline(doc, file, report),
         Kind::Migration => check_migration_sql(doc, file, report),
@@ -1141,7 +1153,8 @@ fn check_feature_mode(doc: &LockDoc, file: &str, default_slug: Option<&str>, rep
         if path.contains("{slug}") {
             report.push(Diag::error(file, format!("route uses {{slug}} but api/_project.md sets default-slug {default}; remove the {{slug}} segment (route {}) or remove default-slug", path.replace("/{slug}", ""))));
         }
-        if public && find_section(&doc.sections, "Access").and_then(|s| s.get("tenant")) != Some("default-slug") {
+        let tenant = find_section(&doc.sections, "Access").and_then(|s| s.get("tenant"));
+        if tenant == Some("path.slug") || public && tenant != Some("default-slug") {
             report.push(Diag::error(file, "api/_project.md sets default-slug; replace tenant: path.slug with tenant: default-slug (or remove default-slug)"));
         }
     } else if public {

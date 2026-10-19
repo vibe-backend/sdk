@@ -375,7 +375,11 @@ pub async fn run(
     };
     let mut request = llm::LlmRequest {
         system: SYSTEM.into(),
-        input: format!("{}\n{}", crate::project::Routes::load(project)?.rule(), input),
+        input: format!(
+            "{}\n{}",
+            crate::project::Routes::load(project)?.rule(),
+            input
+        ),
         model: config.model.clone(),
         seed: config.seed,
         timeout: config.timeout,

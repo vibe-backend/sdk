@@ -175,7 +175,12 @@ pub fn apply_dev_default(slugs: &mut HashMap<String, Slug>, memory: bool, dev: b
     apply_dev_default_named(slugs, memory, dev, "dev")
 }
 
-pub(crate) fn apply_dev_default_named(slugs: &mut HashMap<String, Slug>, memory: bool, dev: bool, name: &str) -> bool {
+pub(crate) fn apply_dev_default_named(
+    slugs: &mut HashMap<String, Slug>,
+    memory: bool,
+    dev: bool,
+    name: &str,
+) -> bool {
     if !memory || !dev || slugs.contains_key(name) {
         return false;
     }
@@ -208,7 +213,11 @@ impl DevSlugs {
         Self::with_default(project, slugs, None)
     }
 
-    pub fn with_default(project: &Path, slugs: HashMap<String, Slug>, default_slug: Option<String>) -> Self {
+    pub fn with_default(
+        project: &Path,
+        slugs: HashMap<String, Slug>,
+        default_slug: Option<String>,
+    ) -> Self {
         Self {
             default_slug,
             project: project.into(),
@@ -239,13 +248,24 @@ impl DevSlugs {
                 state.stamps = stamps;
                 match load_project_slugs(&self.project, true) {
                     Ok(mut loaded) => {
-                        let settings = crate::project::Routes { default_slug: self.default_slug.clone(), ..Default::default() };
-                        if let Err(error) = settings.check_project_slugs(&self.project).and_then(|()| settings.check_slugs(loaded.slugs.keys())) {
+                        let settings = crate::project::Routes {
+                            default_slug: self.default_slug.clone(),
+                            ..Default::default()
+                        };
+                        if let Err(error) = settings
+                            .check_project_slugs(&self.project)
+                            .and_then(|()| settings.check_slugs(loaded.slugs.keys()))
+                        {
                             state.slugs.clear();
                             eprintln!("warning: cannot reload slugs: {error}");
                             return None;
                         }
-                        apply_dev_default_named(&mut loaded.slugs, true, true, self.default_slug.as_deref().unwrap_or("dev"));
+                        apply_dev_default_named(
+                            &mut loaded.slugs,
+                            true,
+                            true,
+                            self.default_slug.as_deref().unwrap_or("dev"),
+                        );
                         state.slugs = loaded.slugs;
                         for warning in loaded.warnings {
                             eprintln!("warning: {warning}");
@@ -257,7 +277,12 @@ impl DevSlugs {
                         };
                         eprintln!("reloaded slugs from {}", self.project.join(path).display());
                     }
-                    Err(error) => eprintln!("warning: cannot reload slugs: {error}"),
+                    Err(error) => {
+                        if self.default_slug.is_some() {
+                            state.slugs.clear();
+                        }
+                        eprintln!("warning: cannot reload slugs: {error}");
+                    }
                 }
             }
         }

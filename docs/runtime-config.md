@@ -218,3 +218,11 @@ Global settings are ignored by `vibe run`/runtime, `vibe build --release`,
 CI (`CI` nonempty except `false`/`0`, or `GITHUB_ACTIONS=true`), and environments
 other than development (`VIBE_ENV=dev/development/local/test`, unset or empty).
 Development `vibe`, `vibe build` and `vibe build --check` use them.
+
+## Default project slug (decision 187)
+
+Set `default-slug: acme` under `## Routes` in `api/_project.md` to serve public routes without a `{slug}` segment. An optional `prefix: /api` yields routes such as `/api/web/v1/counter`. These settings are recorded in the signed manifest; runtime does not compile project markdown or accept a new trust input. Runtime/verify validate the manifest prefix against every route.
+
+This mode supports one slug only. Both build and startup reject extra slugs in `.vibe/slugs.json` or `slugs.example.json`; remove the extra slugs or remove default-slug. Public requests resolve the configured slug through the same lookup and checks as an explicit path slug: `public_access`, `public_write`, tenant role selection, challenges and public write quota keyed by **tenant_id**. JWT/API-key tenants must equal the default slug's tenant; mismatches are unauthorised.
+
+A missing default slug returns 404. Only development `vibe run --db memory` supplies the convenience mapping to `devtenant`: it uses the configured default slug instead of `dev`, with `public_access: true` and `public_write: false`. To enable POST, explicitly configure `public_write: true` in the slug file. Development reload keeps the manifest's default slug, refuses conflicting slugs and fails closed. Outside development memory mode, no convenience mapping is added, and `slugs.example.json` is ignored as before.

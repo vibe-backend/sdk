@@ -177,3 +177,24 @@ done
 
 `vibe build` lists every file still to move, with its exact new path.
 Rebuild to generate the new sibling locks.
+
+## Project route settings (decision 187)
+
+Optional `api/_project.md` is parsed deterministically and never compiled by the LLM:
+
+```markdown
+# project
+
+## Routes
+
+- prefix: /api
+- default-slug: acme
+```
+
+With both settings, a public `api/web/v1/counter.md` route is `/api/web/v1/counter`, with `tenant: default-slug`. Without the file, public routes keep `/{definition}/{version}/{slug}/<endpoint>` and `tenant: path.slug`. Missing keys, empty values and `(none)` retain the defaults. Unknown sections or keys are errors. Underscore files are reserved; only `_project.md` is accepted directly under `api/`.
+
+The prefix must start with `/`, have no trailing slash or empty segments, and total at most 64 bytes. Each segment matches `^[a-z0-9][a-z0-9-]*$`; the first cannot be `health` or `_internal`. It is applied only to manifest routes, never sent to the LLM or stored in locks. Changing only the prefix updates the manifest without recompiling features.
+
+`default-slug` uses the same validation as `slugs.json` and is single-tenant only. Remove other slugs from both `.vibe/slugs.json` and `slugs.example.json`, remove `{slug}` from routes, and use `tenant: default-slug` for public routes; conflicts fail the build. Changing slug mode invalidates compiled locks and caches. The compiler and interactive authoring prompts receive the project route rule as input data (rc.5). The signed manifest records optional `route_prefix` and `default_slug`; empty defaults are omitted for compatibility. Runtime and verification reject routes inconsistent with these fields.
+
+See [runtime configuration](runtime-config.md) for tenant permissions and development defaults.

@@ -737,15 +737,23 @@ pub fn build_signed(
     Ok(manifest)
 }
 
-/// Outside development only release manifests run (decisions 75, 79, 91):
-/// built with `vibe build --release` and verified with Sigstore keyless
-/// ([`read_release_manifest`]). High-risk items are reported, not blocking
-/// (decision 90 withdrawn).
+/// Validate deterministic routing metadata before serving a loaded manifest.
 pub fn check_route_settings(manifest: &Manifest) -> Result<(), String> {
-    crate::project::Routes { prefix: manifest.route_prefix.clone(), default_slug: manifest.default_slug.clone() }.validate()?;
+    crate::project::Routes {
+        prefix: manifest.route_prefix.clone(),
+        default_slug: manifest.default_slug.clone(),
+    }
+    .validate()?;
     for route in &manifest.routes {
-        if !route.path.strip_prefix(&manifest.route_prefix).is_some_and(|rest| rest.starts_with('/')) {
-            return Err(format!("manifest route {} does not start with route_prefix {}", route.path, manifest.route_prefix));
+        if !route
+            .path
+            .strip_prefix(&manifest.route_prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+        {
+            return Err(format!(
+                "manifest route {} does not start with route_prefix {}",
+                route.path, manifest.route_prefix
+            ));
         }
         if manifest.default_slug.is_some() && route.path.contains("{slug}") {
             return Err(format!("manifest route {} uses {{slug}} with default_slug; remove the slug segment or default_slug", route.path));
@@ -754,6 +762,10 @@ pub fn check_route_settings(manifest: &Manifest) -> Result<(), String> {
     Ok(())
 }
 
+/// Outside development only release manifests run (decisions 75, 79, 91):
+/// built with `vibe build --release` and verified with Sigstore keyless
+/// ([`read_release_manifest`]). High-risk items are reported, not blocking
+/// (decision 90 withdrawn).
 pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), String> {
     check_route_settings(manifest)?;
     for lock in &manifest.provenance.locks {
@@ -2172,8 +2184,8 @@ mod constant_response_tests {
                     provenance: Default::default(),
                     build_mode: None,
                     route_prefix: String::new(),
-        default_slug: None,
-        manifest_version: MANIFEST_VERSION,
+                    default_slug: None,
+                    manifest_version: MANIFEST_VERSION,
                     routes: vec![route],
                     models: vec![],
                     methods: vec![],
@@ -2263,8 +2275,8 @@ mod private_host_tests {
     fn old_signed_private_manifest_still_verifies() {
         let mut manifest = Manifest {
             route_prefix: String::new(),
-        default_slug: None,
-        manifest_version: MANIFEST_VERSION,
+            default_slug: None,
+            manifest_version: MANIFEST_VERSION,
             build_mode: Some(BuildMode::Dev),
             routes: Vec::new(),
             models: Vec::new(),

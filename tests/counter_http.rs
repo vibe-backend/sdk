@@ -35,7 +35,11 @@ fn build_fixture(fixture: &str) -> PathBuf {
     fs::create_dir_all(root.join(".vibe")).unwrap();
     fs::write(
         root.join(".vibe/slugs.json"),
-        "{\"dev\":{\"tenant_id\":\"devtenant\",\"public_access\":true,\"public_write\":true}}\n",
+        if fixture == "web-counter" {
+            "{\"acme\":{\"tenant_id\":\"acme0001\",\"public_access\":true,\"public_write\":true}}\n"
+        } else {
+            "{\"dev\":{\"tenant_id\":\"devtenant\",\"public_access\":true,\"public_write\":true}}\n"
+        },
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_vibe"))
@@ -140,9 +144,17 @@ fn implicit_provider_project_and_artifact_serve_counter() {
     }
 }
 
+#[test]
+fn project_routes_and_artifact_serve_web_counter() {
+    for artifact in [false, true] {
+        serve_counter(build_fixture("web-counter"), artifact);
+    }
+}
+
 fn serve_counter(root: PathBuf, artifact: bool) {
     use std::io::{Read, Write};
     let implicit = !root.join("providers").exists();
+    let project_routes = root.join("api/_project.md").exists();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
@@ -186,7 +198,12 @@ fn serve_counter(root: PathBuf, artifact: bool) {
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(10)))
                 .unwrap();
-            write!(stream,"{method} /counter/v1/dev/{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").unwrap();
+            let path = if project_routes {
+                "/api/web/v1/counter".into()
+            } else {
+                format!("/counter/v1/dev/{path}")
+            };
+            write!(stream,"{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").unwrap();
             let mut response = String::new();
             stream.read_to_string(&mut response).unwrap();
             assert!(response.starts_with("HTTP/1.1 200"), "{response}");

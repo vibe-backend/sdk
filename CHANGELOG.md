@@ -5,6 +5,8 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Decision 187 (rc.5):** Add optional structured `api/_project.md` route prefix and single-tenant default-slug. Signed manifests carry routing settings; runtime preserves slug permissions and tenant quotas, rejects extra slugs and credential tenant mismatches. Slug mode invalidates locks/caches; prefix changes only rebuild the manifest. Compile and interactive prompts now receive the public route rule as input data (prompt change rides with rc.5).
+
 - **Breaking (rc.5), decision 186:** Endpoint sources now use flat files with sibling schemas and locks. Old endpoint folders fail the build with migration paths. See [migration instructions](docs/README-details.md#migrating-to-flat-endpoint-files-decision-186).
 
 - **Decision 185:** Add private global development LLM settings and separate key files, per-key precedence and secret-free source diagnostics; first-run setup writes global `llm.env` and a separate key file (0600) only when no `LLM_*` setting exists in the process environment, project `.env` or global config. With partial project or process LLM settings, it prompts only for missing values and appends them to project `.env` (0600), adding `.env` to `.gitignore`. Align decision 91 with environment-only production detection and explain implicit providers in memory refusal errors. Hello-world scaffolding now uses the implicit provider.
