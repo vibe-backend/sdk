@@ -1,168 +1,88 @@
-# vibe-backend SDK
+# vibe-backend
 
-Rust SDK and `vibe` CLI for a markdown-driven serverless backend. Source files under `providers/`, `models/`, `migrations/`, and `api/` compile into structured `{name}.lock.md` files and a signed manifest. The `providers/` directory is optional: without provider sources, the built-in in-memory provider `main` stores data until restart. Release builds and runtime startup warn; production still refuses memory. Add `providers/main.md` to use PostgreSQL. The HTTP runtime loads that manifest. It does not interpret natural language.
+**Describe the backend (server side) of your app in plain words, and vibe-backend turns it into a working web API.**
 
-The specification is [docs/spec-v1.7.md](docs/spec-v1.7.md). The draft [docs/spec-v1.8.md](docs/spec-v1.8.md) is under review.
+## Who is this for?
 
-## SDK and deployment runtime
+- People with an app idea who don't know programming.
+- Designers, product people and students who want a real backend without writing code.
+- Developers who would rather write a short description than lots of boilerplate.
 
-**vibe-sdk** installs as `vibe` for development and CI builds: interactive `vibe`,
-`vibe build` and `vibe run`.
-**vibe-runtime** is for deployment and only runs build artifacts. It contains no
-LLM client, build or interactive code. Use `vibe-runtime run --artifact <dir>`;
-bare `vibe-runtime` means run, with artifact `.` by default. Both forms accept
-`--addr`, `--db` / `VIBE_DB`, and `--allow-test-build` (development only).
-`vibe-runtime verify --artifact dist` checks an artifact with the same pins without serving (exit 0 on success, 1 on failure).
+You write simple text files (Markdown) that say what your API should do, in English,
+Chinese or another language. vibe-backend uses an AI model, with **your own** AI key,
+to turn them into a clear, checked file. Then it runs your API from that file.
+The AI is only used when you build, never while your API is running.
 
-Release artifacts need `--expect-identity` / `VIBE_EXPECT_IDENTITY` and
-`--expect-issuer` / `VIBE_EXPECT_ISSUER`; optional `--expect-repository-id` /
-`VIBE_EXPECT_REPOSITORY_ID` pins the numeric repo id. See
-[runtime configuration](docs/runtime-config.md#release-manifest-pins-decision-182).
+## Quick start (3 steps)
 
-Install verified pre-release assets for either or both with the manager:
+**1. Install.** On macOS or Linux, download this project and run the installer
+(you need the [GitHub CLI](https://cli.github.com/) installed and signed in;
+the installer uses it to check that the download is genuine):
 
 ```sh
-./scripts/vibe-install.sh install --version v1.0.0-rc.3
-./scripts/vibe-install.sh install --version v1.0.0-rc.3 --runtime
-VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.3
+git clone https://github.com/vibe-backend/sdk.git
+cd sdk
+./scripts/vibe-install.sh install --version v1.0.0-rc.4
 ```
 
-The default installs `vibe`; `--runtime` installs `vibe-runtime`. They coexist.
-Release archives are `vibe-sdk-<target>.tar.gz` / `.zip` and
-`vibe-runtime-<target>.tar.gz` / `.zip`; SHA256SUMS and build provenance
-attestations cover both. See [installation details](docs/install.md).
+This installs the `vibe` command. On Windows, download the zip from
+[Releases](https://github.com/vibe-backend/sdk/releases). More options are in the
+[installation guide](docs/install.md).
 
-Build from source with Rust 1.89:
+**2. Tell `vibe` what you want.** In a new, empty folder, run:
 
 ```sh
-cargo build --release --bin vibe
-cargo build --release --no-default-features --bin vibe-runtime
+vibe
 ```
 
-## Development
+The first time, `vibe` asks for your AI settings and key once (your key is hidden
+as you type). It saves them only on your computer in your personal settings folder
+and reuses them for your other projects. Then type what you want, for example
+*"make a hello world API"*. `vibe` shows you the files it wants to create and asks
+before writing anything.
 
-`vibe dev` (no precompile) is planned for vNext (spec decision 166); use the Hello world flow below.
+**3. Build and run.**
 
-## Runtime features
-
-**Method ops (#26, part 1).** Method steps `query`, `verify-password`, `hash-password`, `random-token`, `hash-token` and `sign-jwt` now run. `query` runs the lock's parameterised SQL in the tenant schema under row level security, as `public_reader` (or `public_writer` for a step marked `writes: true`, via `SET LOCAL ROLE`; both database roles must exist and be granted to the runtime role), in a READ ONLY transaction unless the step writes. Lock SQL is checked with a PostgreSQL parser by `vibe build` and again at runtime: exactly one SELECT, INSERT, UPDATE or DELETE; unqualified plain table names (no `pg_*`, `information_schema` or platform tables); no table functions; no `SELECT … INTO`; no casts to object-identifier types (`regclass`, `regproc`, …); only allowlisted functions (`src/sqlguard.rs`), so no `SET`, settings or dynamic SQL. A data-modifying `WITH` is rejected, and a unique violation (SQLSTATE 23505) returns 409 `CONFLICT`. `query` is PostgreSQL only: with `--db memory`, `vibe run` warns at startup and the step fails with a PostgreSQL-required error (500). `verify-password` uses argon2id and only accepts hashes made with the platform's own parameters (m=65536, t=3, p=1) and passwords of at most 256 characters (at most four hashes at a time per instance; a request that waits more than 5 s gets 503). When the user does not exist (`missing-user: dummy-hash`) it compares against a dummy hash, built at startup, so timing and the result look the same as a wrong password. Endpoints that reach a `verify-password` step are padded to at least 500 ms. `validate` conditions are `X is empty`, `X is not empty`, `X == true|false|null` or `X != true|false|null` (code-span backticks are allowed); anything else is a validate error and, at runtime, fails closed (the step's `fail` fires), never a silent pass. Step expressions can read `ctx.user.sub`, `ctx.user.roles` and `ctx.user.tenant`. `random-token` returns `{value, hash}` for 32 random bytes; `hash` (and `hash-token`) is HMAC-SHA-256 under a key derived from `VIBE_API_KEY_PEPPER`, as a `bytea` literal (`\x…`) for a `bytea` column (`normalize: email` trims and lowercases first). `sign-jwt` runs only in methods with `capabilities: [sign-token]`. It reads the private PEM from the environment variable named by `key-ref` (`<key-ref>_KID` sets the kid, default `VIBE_JWT_KID`), and `vibe run` refuses to start if that variable is missing. The runtime sets `iss`, `aud`, `iat`/`nbf`/`exp` (ttl at most 1 h), `jti`, `tenant_id` (always the request's tenant) and the roles claim, which it reads from `users.roles` for the token's `sub`; a lock cannot supply roles. `sub` must be a field of a row read by an earlier `query` step (for example `u.id`), checked by `vibe build` and at runtime. Other claims must be listed in `custom-claims` and can never be a reserved claim or any configured roles claim. The step returns `{access_token, token_type, expires_in, expires_at}`. `issue-refresh: platform-decided` (or `new-family`) adds a `refresh_token`; it needs a route with a `token-refresh` pipeline whose `sign-method` is that method, otherwise the step errors.
-
-**Refresh tokens (#26, part 2).** A route with a `### token-refresh` pipeline (`sign-method`, `refresh-ttl` ≤ 30d, `idle-ttl` ≤ 7d, `reuse-grace` default and max 10s (1s–10s; larger values or 0 are rejected by the build and at `vibe run` startup), `transport: body`) must be public with auth removed. It takes `{refresh_token}` and returns `{access_token, token_type, expires_in, expires_at, refresh_token, refresh_expires_in}`. Refresh token expiry: each token expires `idle-ttl` (default and max 7d) after it was issued unless it is used, and a family ends `refresh-ttl` (default and max 30d) after login. `refresh_expires_in` is the seconds until the returned token expires if unused: the smaller of `idle-ttl` and what is left of the family lifetime. A `sign-jwt` step with `issue-refresh` returns `refresh_expires_in` on login too. The compiler-added `source-lines` bullet is ignored; any other unknown setting is an error. `vibe build` and the manifest builder accept `issue-refresh: none | platform-decided | new-family`, and reject a `sign-method` that does not name a method with a `sign-jwt` step. Refresh routes run before request-table validation, so a missing or malformed token is the same 401 as an unknown one. Tokens are 32 random bytes; only an HMAC (under a key derived from the pepper) is stored, in each tenant's `_platform_refresh_tokens` (created by `vibe run --db postgres` when such a route exists). Every use rotates the token. Presenting a spent token again revokes the whole family (also after it expired), except for one reissue inside `reuse-grace` while the earlier child is still unused; that reissue kills the lost child. On PostgreSQL every rotation and revocation of a family holds a transaction-scoped family lock. Until the dedicated refresh-store role lands (#51), `vibe run --db postgres` revokes all privileges on the table from `public_reader`, `public_writer`, `app_rw` and `PUBLIC`. This is a table-level `REVOKE` on `_platform_refresh_tokens`, not a schema-level one. It runs after the tenant's migrations, so it also removes the table grant that a `GRANT … ON ALL TABLES IN SCHEMA` in a migration creates (that statement grants on each existing table when it runs). It does not change schema privileges or default privileges (`ALTER DEFAULT PRIVILEGES`). Existing tenants must restart `vibe run --db postgres` with `VIBE_MIGRATE_DATABASE_URL` set to get the revoke. The runtime role gets SELECT, INSERT and column-level UPDATE on rotation and revocation columns only (no DELETE); a trigger keeps identity columns immutable and revocation final, and `vibe run` refuses to start if those grants or the trigger differ. Each `vibe run --db postgres` also deletes families whose lifetime ended more than a day ago, in bounded batches (see [docs/runtime-config.md](docs/runtime-config.md#refresh-tokens)). Logout-all takes the same per-family lock as rotation for every family it revokes, and a per-user lock shared with login, so a login that runs at the same time is either revoked too or starts after logout-all finishes. Every failure (unknown, expired, revoked, replayed) is the same 401 `INVALID_REFRESH_TOKEN`, padded to 300 ms. Replays are logged. Limits: 30/min per IP (platform, 429), and 10/min per family (`rate-limit` `key: family` can only lower it). Only live (unrevoked) tokens count toward the family limit, and hitting it returns the same 401, so the response never reveals whether a token exists. Clients should not retry a 401 from the refresh route in a loop: back off (for example, wait at least a minute) or send the user back to login. A rate-limited token is not consumed, so it still works after the back-off. If the token store cannot be read (for example the connection pool is exhausted), the refresh fails closed with a retryable 503 `SERVICE_UNAVAILABLE` (`Retry-After: 1`) instead of skipping the family limit; the token is not consumed. Logout revokes refresh tokens only; access tokens already issued stay valid until they expire (`ttl`, at most 1 h), so keep access token TTLs short. The per-IP limit uses the client IP: `X-Forwarded-For` is honoured only from `VIBE_TRUSTED_PROXIES`, so set it when `vibe run` runs behind a proxy, or all clients behind it share one bucket. Pepper rotation is not supported: refresh tokens and API keys are stored as HMACs under keys derived from `VIBE_API_KEY_PEPPER`, so changing it invalidates every refresh token (users must log in again) and every API key. A `### token-revoke` pipeline (`scope: family` takes the caller's own `refresh_token`; `scope: all` revokes every family of the caller) needs auth, runs before the route's steps, and answers 204 whether or not anything was revoked.
-
-**Database roles.** `public_reader`, `public_writer` and `app_rw` must never be members of the runtime role (directly or through other roles): `vibe run --db postgres` refuses to start if they are, and startup migration fails if any of them can still reach `_platform_refresh_tokens` after its revoke. Startup migration revokes access on the tables it creates; schema-level or default-privilege grants added by hand afterwards (for example `GRANT ALL ON ALL TABLES IN SCHEMA …` or `ALTER DEFAULT PRIVILEGES`) can re-open that access, so restart `vibe run --db postgres` with `VIBE_MIGRATE_DATABASE_URL` set after changing grants.
-
-## Install
-
-Pre-releases are available on [GitHub Releases](https://github.com/vibe-backend/sdk/releases); the CLI is not on crates.io or a container image. You can also build from source with Rust 1.89:
-
-```bash
-cargo build --release --locked --bin vibe
-./target/release/vibe --help
-```
-
-Use an existing release tag and verify downloaded assets as described in [the installation guide](docs/install.md).
-
-## Hello world
-
-```bash
-vibe            # first run asks for LLM settings, then: 幫我開一個 hello world
+```sh
 vibe build
 vibe run
-curl http://127.0.0.1:8080/hello/v1/dev/hello
 ```
 
-First run writes global `llm.env` and a separate key file (0600) only when no `LLM_*` setting exists in the process environment, project `.env` or global config. With partial project or process LLM settings, it prompts only for missing values and appends them to project `.env` (0600), adding `.env` to `.gitignore`. The key is entered masked and never printed (see below). The CLI shows the files and asks before writing, never overwrites, and non-interactive `vibe` prints help. In development, `run` always serves slug `dev`, even when other slugs are configured, and reloads edits to `.vibe/slugs.json` without restart. `vibe build` refreshes locks, runs deploy validation and writes the dev manifest. `vibe run` validates project locks and builds the dev manifest in memory; it never calls the LLM. Missing, stale or wrong-version locks ask for `vibe build`.
+`vibe build` turns your text into a checked file. `vibe run` starts your API on your
+computer (at `http://127.0.0.1:8080`). Change your text any time, then run both again.
 
-## Run a project
+## What a description looks like
 
-Another sample is [vibe-backend/sample-envelope](https://github.com/vibe-backend/sample-envelope), a Chinese envelope generator that is frontend-only for now.
+A file that describes one API endpoint can be as small as this:
 
-The shop demo is moving to [vibe-backend/sample-shop](https://github.com/vibe-backend/sample-shop). That repository currently contains only the frontend; the vibe backend project will be added there later. Until then, the small shop project used by this repo's tests, [tests/fixtures/shop](tests/fixtures/shop), is the runnable example. From a checkout of this repo with Rust 1.89 (`rust-version` in `Cargo.toml`; `rust-toolchain.toml` pins the same channel), replace `tests/fixtures/shop` with your own project path as needed:
+```markdown
+# Hello World API
 
-```bash
-vibe build --project tests/fixtures/shop -o manifest.json
-vibe run --artifact manifest.json --project tests/fixtures/shop --db memory
+Create a public endpoint that anyone can call without logging in.
+It always answers with the JSON message {"message": "hello world"}.
 ```
 
-**Breaking (#31):** `vibe build` (any mode) without `-o` writes `./manifest.json` relative to the current working directory (same as `-o` / `run --artifact`), not `<project>/manifest.json`.
+You don't have to write these files yourself: `vibe` creates them from your request,
+and you can then edit them like any text document.
 
-Runtime configuration (PostgreSQL roles and TLS, connection pool, LLM variables, `VIBE_ENV`, JWT/JWKS and API keys, rate limits and trusted proxies) is in [docs/runtime-config.md](docs/runtime-config.md).
+## See a full example
 
-Locks are build output: they are not committed (`*.lock.md` is gitignored) and carry no approval or signature (spec v1.8). Deployments use only the manifest built and attested in the protected `release` environment (`vibe build --release`); see [docs/ci/README.md](docs/ci/README.md). Review happens in pull requests; see [docs/pr-review-guide.md](docs/pr-review-guide.md). `security-items` in a lock are informational. The manifest is still signed.
+[vibe-backend/sample-hello-world](https://github.com/vibe-backend/sample-hello-world)
+is a small, complete project: a "hello" message and a counter, with a backend and a
+simple web page.
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-```
+## Learn more
 
-The CLI flow is interactive `vibe` → `vibe build` → `vibe run` → curl. Build refreshes stale locks,
-validates, and writes a dev manifest. Fresh locks need no LLM call or LLM key,
-including in CI. Use `vibe build --check` for an in-memory policy check that
-writes nothing, or `vibe build --release` for an unsigned release manifest with
-all release checks, ready for Sigstore signing. Options include `--project`,
-`-o`/`--output`, `--release-version`, and `--commit`.
-
-Run the project with `vibe run`, then curl the API. Use `--artifact` to run a build artifact.
-Locks record `vibe-version: 1.0.0-rc.4`: stable versions use major.minor and
-pre-releases use the full version, with an exact match required. Run
-`vibe build` to regenerate locks from another version or the old lock format.
-Locks built by an rc.3 binary are stamped `1.0.0-rc.3` and must be rebuilt with the matching binary using `vibe build`.
-
-## Status
-
-See [docs/status.md](docs/status.md) and [CHANGELOG.md](CHANGELOG.md).
+- [Installation guide](docs/install.md): all install options, upgrades and removal.
+- [Technical details](docs/README-details.md): commands and options, deployment
+  (`vibe-runtime`), runtime features, security, signing, CI/CD.
+- [Runtime configuration](docs/runtime-config.md): databases, environment variables
+  and production settings.
+- [Specification](docs/spec-v1.7.md) and [project status](docs/status.md).
+- [Changelog](CHANGELOG.md).
 
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
-
-Build also creates `.vibe/signing.key` and `.vibe/signing.pub` for development
-(release builds need no key), validates and lists slugs and disabled endpoints,
-and always runs the secret scan, failing on findings. Edit `.vibe/slugs.json`
-and `.vibe/disabled.txt` directly; restart to apply disabled-endpoint changes.
-PostgreSQL startup applies pending migrations with owner credentials and advisory
-locks; see [runtime configuration](docs/runtime-config.md#automatic-migrations-decision-179)
-for roles, tenant selection, append-only tracking and destructive-migration recovery.
-
-## CI/CD
-
-Required CI checks are **Markdown lint & link check** and **Rust fmt / clippy / test**. There is no Docker image job.
-
-- **CI** (`.github/workflows/ci.yml`, on PRs and pushes to `main`): Markdown lint + local link check; Rust 1.89 `cargo check --locked`, `fmt`, `clippy`, and `test` once a `Cargo.toml` exists.
-- **Release workflow** (`.github/workflows/release.yml`, on tags `v*`): is configured to build archives for Linux x86_64 and aarch64, macOS x86_64 and aarch64, and Windows x86_64 (`tar.gz` on Unix, `zip` on Windows) plus `SHA256SUMS` for pre-releases. Nothing is pushed to GHCR or crates.io.
-- **CD** (`.github/workflows/cd.yml`): GHCR image publishing is disabled.
-
-## Binary installation
-
-The install/upgrade/remove manager in [docs/install.md](docs/install.md) installs verified pre-release assets. It checks SHA256SUMS and GitHub build provenance attestations before installation; see the guide for verification requirements and source-build alternatives.
-
-## Global LLM configuration (decision 185)
-
-Global LLM settings for development live in `$XDG_CONFIG_HOME/vibe/llm.env`
-when XDG_CONFIG_HOME is nonempty and absolute, otherwise
-`$HOME/.config/vibe/llm.env`. Allowed keys are `LLM_PROVIDER`, `LLM_BASE_URL`,
-`LLM_MODEL`, `LLM_API_STYLE` and `LLM_API_KEY_FILE`. Unknown keys and inline
-`LLM_API_KEY`/`OPENAI_API_KEY` are refused. Put the key in a separate file;
-relative key paths resolve against the global config directory. Both files
-must have no group/other permission bits on Unix (`mode & 077 == 0`; fix with
-`chmod 600 <path>`). This check applies only to global files, not project or
-process-supplied key files.
-
-Precedence per key is process environment > project `.env` > global; empty
-LLM values count as missing. Higher-precedence credentials skip the global key
-file. Interactive first run writes global `llm.env` and a separate key file
-(0600) in a new directory (0700) only when no `LLM_*` setting exists in the
-process environment, project `.env` or global config. With partial project or
-process LLM settings, it prompts only for missing values and appends them to
-project `.env` (0600), adding `.env` to `.gitignore`. It refuses to overwrite
-existing files and keeps `LLM_ALLOW_PRIVATE_HOST` project-scoped.
-`VIBE_DEBUG_LLM_CONFIG=1` prints variable names and sources
-(`env`, `project`, `global`) to stderr, never values.
-
-Global settings are ignored by `vibe run`/runtime, `vibe build --release`,
-CI (`CI` nonempty except `false`/`0`, or `GITHUB_ACTIONS=true`), and environments
-other than development (`VIBE_ENV=dev/development/local/test`, unset or empty).
-Development `vibe`, `vibe build` and `vibe build --check` use them.
