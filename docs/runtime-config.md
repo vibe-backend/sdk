@@ -191,6 +191,8 @@ Memory query steps support unique-key SELECT, `COALESCE(MAX(integer), default)`,
 
 Projects without any provider `.md` sources use the implicit in-memory provider `main` (decision 184). Its manifest provenance records `implicit_memory_provider: true`; release builds and runtime startup warn that data is lost on restart. Production still refuses `--db memory`. To use `--db postgres`, add `providers/main.md` and rebuild.
 
+## Global LLM configuration (decision 185)
+
 Global LLM settings for development live in `$XDG_CONFIG_HOME/vibe/llm.env`
 when XDG_CONFIG_HOME is nonempty and absolute, otherwise
 `$HOME/.config/vibe/llm.env`. Allowed keys are `LLM_PROVIDER`, `LLM_BASE_URL`,

@@ -23,16 +23,13 @@ fn precedence_keys_sources_and_paths() {
     let (merged, debug) = load(&env, "LLM_MODEL=project-model\n", &dir, false).unwrap();
     assert_eq!(merged["LLM_PROVIDER"], "env-provider");
     assert_eq!(merged["LLM_MODEL"], "project-model");
-    assert_eq!(merged["LLM_API_KEY"], "sentinel-secret");
+    assert!(merged["LLM_API_KEY"] == "sentinel-secret");
     assert!(debug.contains(&"LLM_PROVIDER: env".into()));
     assert!(debug.contains(&"LLM_MODEL: project".into()));
     assert!(debug.contains(&"LLM_API_KEY: global".into()));
     assert!(!debug.join("\n").contains("sentinel-secret"));
     fs::write(&config, "LLM_PROVIDER=fake\nLLM_API_KEY_FILE=llm-api-key\n").unwrap();
-    assert_eq!(
-        load(&HashMap::new(), "", &dir, false).unwrap().0["LLM_API_KEY"],
-        "sentinel-secret"
-    );
+    assert!(load(&HashMap::new(), "", &dir, false).unwrap().0["LLM_API_KEY"] == "sentinel-secret");
     fs::remove_file(key).unwrap();
     env.insert("LLM_API_KEY".into(), "higher-secret".into());
     assert!(load(&env, "", &dir, false).is_ok());
@@ -57,7 +54,10 @@ fn validation_and_gates() {
         "UNKNOWN=sentinel-secret",
     ] {
         fs::write(&config, text).unwrap();
-        let error = load(&HashMap::new(), "", &dir, false).unwrap_err();
+        let error = match load(&HashMap::new(), "", &dir, false) {
+            Err(error) => error,
+            Ok(_) => panic!("expected refusal"),
+        };
         assert!(!error.contains("sentinel-secret"));
         assert!(error.contains(text.split('=').next().unwrap()));
         for (k, v) in [
@@ -72,6 +72,19 @@ fn validation_and_gates() {
         }
         assert!(load(&HashMap::new(), "", &dir, true).is_ok());
     }
+    fs::write(&config, "LLM_PROVIDER=fake\n").unwrap();
+    for value in ["false", "0", ""] {
+        let (merged, _) = load(
+            &HashMap::from([("CI".into(), value.into())]),
+            "",
+            &dir,
+            false,
+        )
+        .unwrap();
+        assert_eq!(merged["LLM_PROVIDER"], "fake");
+    }
+    let (merged, _) = load(&HashMap::new(), "VIBE_ENV=production", &dir, false).unwrap();
+    assert!(!merged.contains_key("LLM_PROVIDER"));
     let env = HashMap::from([
         ("XDG_CONFIG_HOME".into(), "relative".into()),
         ("HOME".into(), "/test-home".into()),
@@ -102,10 +115,13 @@ fn private_modes_and_permission_errors() {
     assert!(!fs::read_to_string(&config)
         .unwrap()
         .contains("sentinel-secret"));
-    assert_eq!(fs::read_to_string(&key).unwrap(), "sentinel-secret");
+    assert!(fs::read_to_string(&key).unwrap() == "sentinel-secret");
     for path in [&config, &key] {
         fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
-        let error = load(&HashMap::new(), "", &dir, false).unwrap_err();
+        let error = match load(&HashMap::new(), "", &dir, false) {
+            Err(error) => error,
+            Ok(_) => panic!("expected refusal"),
+        };
         assert!(error.contains("chmod 600"));
         assert!(error.contains(&path.display().to_string()));
         assert!(!error.contains("sentinel-secret"));
@@ -158,6 +174,15 @@ fn dev_build_and_release_ignore_global() {
     assert!(stderr.contains("LLM_PROVIDER: global"));
     assert!(!stderr.contains("sentinel-secret"));
     assert!(!stderr.contains("global-model"));
+    let check = Command::new(env!("CARGO_BIN_EXE_vibe"))
+        .env_clear()
+        .env("XDG_CONFIG_HOME", &config)
+        .env("HOME", &root)
+        .current_dir(&project)
+        .args(["build", "--check"])
+        .output()
+        .unwrap();
+    assert!(check.status.success(), "dev check failed");
     // Invalid global contents demonstrate these paths do not even parse it.
     fs::write(config.join("vibe/llm.env"), "UNKNOWN=sentinel-secret").unwrap();
     for (release, extra) in [

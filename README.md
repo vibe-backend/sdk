@@ -71,7 +71,7 @@ vibe run
 curl http://127.0.0.1:8080/hello/v1/dev/hello
 ```
 
-First run writes LLM settings to `.env` (gitignored; the key is entered masked and never printed). The CLI shows the files and asks before writing, never overwrites, and non-interactive `vibe` prints help. In development, `run` always serves slug `dev`, even when other slugs are configured, and reloads edits to `.vibe/slugs.json` without restart. `vibe build` refreshes locks, runs deploy validation and writes the dev manifest. `vibe run` validates project locks and builds the dev manifest in memory; it never calls the LLM. Missing, stale or wrong-version locks ask for `vibe build`.
+First run writes global LLM settings to `llm.env` and a separate private key file (see below; the key is entered masked and never printed). The CLI shows the files and asks before writing, never overwrites, and non-interactive `vibe` prints help. In development, `run` always serves slug `dev`, even when other slugs are configured, and reloads edits to `.vibe/slugs.json` without restart. `vibe build` refreshes locks, runs deploy validation and writes the dev manifest. `vibe run` validates project locks and builds the dev manifest in memory; it never calls the LLM. Missing, stale or wrong-version locks ask for `vibe build`.
 
 ## Run a project
 
@@ -138,6 +138,8 @@ Required CI checks are **Markdown lint & link check** and **Rust fmt / clippy / 
 ## Binary installation
 
 The install/upgrade/remove manager in [docs/install.md](docs/install.md) installs verified pre-release assets. It checks SHA256SUMS and GitHub build provenance attestations before installation; see the guide for verification requirements and source-build alternatives.
+
+## Global LLM configuration (decision 185)
 
 Global LLM settings for development live in `$XDG_CONFIG_HOME/vibe/llm.env`
 when XDG_CONFIG_HOME is nonempty and absolute, otherwise

@@ -121,6 +121,8 @@ fn setup_and_existing_config() {
         "LLM_API_KEY",
         "LLM_BASE_URL",
         "LLM_API_STYLE",
+        "LLM_API_KEY_FILE",
+        "LLM_ALLOW_PRIVATE_HOST",
     ];
     let old: Vec<_> = names.iter().map(std::env::var_os).collect();
     interactive::setup_with_resolver(&p, &mut io, settings.clone(), |_, _| Ok(Vec::new())).unwrap();
@@ -132,6 +134,72 @@ fn setup_and_existing_config() {
     let mut io = Script::default();
     settings.extend(env());
     interactive::setup_with_resolver(&p, &mut io, settings, |_, _| Ok(Vec::new())).unwrap();
+    // Existing project settings are preserved, including the bytes surrounding them.
+    let project = root();
+    let original = "# local settings\nLLM_PROVIDER=openai\nLLM_MODEL=gpt-4o-2024-08-06\nLLM_API_KEY=project-secret\n";
+    fs::write(project.join(".env"), original).unwrap();
+    let settings = HashMap::from([(
+        "XDG_CONFIG_HOME".into(),
+        project.join("config").to_string_lossy().into_owned(),
+    )]);
+    let mut io = Script::default();
+    interactive::setup_with_resolver(&project, &mut io, settings, |_, _| Ok(Vec::new())).unwrap();
+    assert!(fs::read_to_string(project.join(".env")).unwrap() == original);
+    assert!(!io.output.contains("project-secret"));
+    assert!(!project.join("config").exists());
+    fs::remove_dir_all(project).unwrap();
+    // A private-host opt-in remains project scoped and uses the existing append logic.
+    for base in ["http://127.0.0.1:11434/v1", "https://example.com/v1"] {
+        let project = root();
+        fs::write(project.join(".env"), "# keep this comment").unwrap();
+        fs::write(project.join(".gitignore"), "target/\n").unwrap();
+        let settings = HashMap::from([(
+            "XDG_CONFIG_HOME".into(),
+            project.join("config").to_string_lossy().into_owned(),
+        )]);
+        let mut io = Script::new(&["", base, "test-model", "responses", "private-secret", "yes"]);
+        interactive::setup_with_resolver(&project, &mut io, settings.clone(), |_, _| {
+            Ok(vec!["127.0.0.1:443".parse().unwrap()])
+        })
+        .unwrap();
+        let text = fs::read_to_string(project.join(".env")).unwrap();
+        assert!(text.starts_with("# keep this comment\n"));
+        assert!(text.contains("LLM_ALLOW_PRIVATE_HOST=true"));
+        assert!(!text.contains("private-secret"));
+        assert!(!text.contains("LLM_MODEL"));
+        assert!(!io.output.contains("private-secret"));
+        let global = fs::read_to_string(project.join("config/vibe/llm.env")).unwrap();
+        assert!(global.contains("LLM_API_STYLE=responses"));
+        assert!(!global.contains("LLM_ALLOW_PRIVATE_HOST"));
+        let mut io = Script::default();
+        interactive::setup_with_resolver(&project, &mut io, settings, |_, _| Ok(Vec::new()))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(project.join(".gitignore"))
+                .unwrap()
+                .lines()
+                .filter(|l| *l == ".env")
+                .count(),
+            1
+        );
+        fs::remove_dir_all(project).unwrap();
+    }
+    // An incomplete global file is an error, without prompting or overwriting it.
+    let config_path = p.join("config/vibe/llm.env");
+    fs::write(&config_path, "LLM_PROVIDER=openai\n").unwrap();
+    let settings = HashMap::from([(
+        "XDG_CONFIG_HOME".into(),
+        p.join("config").to_string_lossy().into_owned(),
+    )]);
+    let mut io = Script::default();
+    assert!(
+        interactive::setup_with_resolver(&p, &mut io, settings, |_, _| Ok(Vec::new())).is_err()
+    );
+    assert!(io.output.is_empty());
+    assert_eq!(
+        fs::read_to_string(config_path).unwrap(),
+        "LLM_PROVIDER=openai\n"
+    );
     for (name, value) in names.into_iter().zip(old) {
         match value {
             Some(v) => std::env::set_var(name, v),

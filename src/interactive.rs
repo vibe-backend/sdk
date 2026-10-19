@@ -45,9 +45,14 @@ pub fn setup_with_resolver(
     env: HashMap<String, String>,
     resolve: impl Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
 ) -> Result<llm::LlmConfig, String> {
-    let dir = crate::global_config::config_dir(&env)?;
+    let dir = crate::global_config::config_dir(&env).ok();
     let project_env = fs::read_to_string(project.join(".env")).unwrap_or_default();
-    let (env, _) = crate::global_config::load(&env, &project_env, &dir, false)?;
+    let (env, _) = crate::global_config::load(
+        &env,
+        &project_env,
+        dir.as_deref().unwrap_or(Path::new("")),
+        dir.is_none(),
+    )?;
     if let Ok(config) = llm::load_llm_config(&env, false) {
         io.write(&llm::redact(
             &format!(
@@ -97,7 +102,10 @@ pub fn setup_with_resolver(
                 .filter_map(|k| combined.get(*k).map(String::as_str))
                 .collect();
             let message = llm::redact(&errors(report), &secrets);
-            if !missing_only || dir.join("llm.env").exists() {
+            if !missing_only
+                || (crate::global_config::enabled(&combined, false)
+                    && dir.as_ref().is_some_and(|dir| dir.join("llm.env").exists()))
+            {
                 return Err(message);
             }
         }
@@ -199,7 +207,12 @@ pub fn setup_with_resolver(
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let (config_path, key_path) = crate::global_config::write_initial(&dir, &global_values, &key)?;
+    let (config_path, key_path) = crate::global_config::write_initial(
+        dir.as_deref()
+            .ok_or("HOME is required for global LLM configuration")?,
+        &global_values,
+        &key,
+    )?;
     io.write(&format!(
         "wrote {} and {}",
         config_path.display(),
