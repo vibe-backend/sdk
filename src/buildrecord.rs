@@ -58,7 +58,9 @@ pub fn write_with_compilers(
     compilers: BTreeMap<String, crate::lock::LlmStamp>,
 ) -> Result<(), String> {
     let record = BuildRecord {
-        test_build: compilers.values().any(|s| s.llm_provider == "fake"),
+        test_build: compilers
+            .values()
+            .any(|s| matches!(s.llm_provider.as_str(), "fake" | "replay")),
         compilers: compilers
             .into_iter()
             .map(|(path, stamp)| (path, stamp.without_private_host()))

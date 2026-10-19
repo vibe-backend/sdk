@@ -232,3 +232,42 @@ The prefix must start with `/`, have no trailing slash or empty segments, and to
 `default-slug` uses the same validation as `slugs.json` and is single-tenant only. Remove other slugs from both `.vibe/slugs.json` and `slugs.example.json`, remove `{slug}` from routes, and use `tenant: default-slug` for public routes; conflicts fail the build. Changing slug mode invalidates compiled locks and caches. The compiler and interactive authoring prompts receive the project route rule as input data (rc.5). The signed manifest records optional `route_prefix` and `default_slug`; empty defaults are omitted for compatibility. Runtime and verification reject routes inconsistent with these fields.
 
 See [runtime configuration](runtime-config.md) for tenant permissions and development defaults.
+
+
+## LLM replay and recording (decision 189)
+
+Build reviewed natural-language sources without credentials or network access:
+
+```sh
+LLM_PROVIDER=replay vibe build
+LLM_PROVIDER=replay vibe build --check
+```
+
+Fixtures live in project-relative `fixtures/llm/`; `VIBE_LLM_FIXTURES` overrides
+this with a project-relative or absolute directory. Each `<key>.md` is the raw
+response; `index.json` is a sorted, pretty JSON array of `{key, source, purpose}`.
+Source is project-relative; purpose is `compile`, `repair-<n>` or `translate`.
+Review and commit these responses, not generated `*.lock.md` files.
+
+The key is lowercase hex SHA-256 of the concatenation of VIBE_VERSION, decimal
+LOCK_VERSION, `LlmRequest.system`, and the full `LlmRequest.input`. Each UTF-8
+string is prefixed with its byte length as an eight-byte big-endian integer.
+Host, model, credentials, URL, seed, timeouts and timestamps are excluded.
+Prompt or SDK version changes therefore require new recordings.
+
+Record locally with your configured real provider (or `fake` for supported tests):
+
+```sh
+VIBE_LLM_RECORD=fixtures/llm LLM_PROVIDER=openai vibe build --check
+```
+
+Use a clean checkout without generated locks to record every call, or use
+`--check`. Recording stores only response text and index fields, never request
+headers or connection metadata. It scans both payloads before writing for the
+configured API key, base URL and endpoint host (host case-insensitively), and
+refuses a match without printing the value. Build and check also scan existing
+fixtures using credentials from environment, project `.env` and enabled global
+settings. Empty values are ignored. Replay misses identify source and purpose
+and show a recording command; unused index entries and response files warn.
+Recording is refused in CI; recording and replay are refused with `--release`.
+Replay manifests carry `test_build`, just like fake builds.

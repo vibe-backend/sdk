@@ -55,6 +55,8 @@ fn adapter(base_url: String, timeout: Duration) -> HttpAdapter {
 
 fn request(budget: &Arc<CallBudget>) -> LlmRequest {
     LlmRequest {
+        source: String::new(),
+        purpose: String::new(),
         system: "s".into(),
         input: "i".into(),
         model: "gpt-test-2026-01-01".into(),

@@ -40,6 +40,8 @@ async fn retries_stop_at_the_deadline() {
     let started = std::time::Instant::now();
     let Err(err) = adapter
         .compile(&LlmRequest {
+            source: String::new(),
+            purpose: String::new(),
             system: "s".into(),
             input: "i".into(),
             model: "gpt-test-2026-01-01".into(),

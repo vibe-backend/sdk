@@ -379,6 +379,8 @@ pub async fn run(
         input
     );
     let mut request = llm::LlmRequest {
+        source: String::new(),
+        purpose: String::new(),
         system: SYSTEM.into(),
         input: input.clone(),
         model: config.model.clone(),
