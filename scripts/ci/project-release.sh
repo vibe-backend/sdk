@@ -16,8 +16,12 @@ for argument do
 done
 case ${1-} in
     guard)
-        [ "$#" -ge 5 ] && [ "$#" -le 6 ] || fail 'guard needs event, ref type, ref, workflow ref and optional version'
-        [ "$2" = push ] && [ "$3" = tag ] || fail 'release requires a tag push'
+        if [ "$#" -lt 5 ] || [ "$#" -gt 6 ]; then
+            fail 'guard needs event, ref type, ref, workflow ref and optional version'
+        fi
+        if [ "$2" != push ] || [ "$3" != tag ]; then
+            fail 'release requires a tag push'
+        fi
         case $4 in refs/tags/v*) version=${4#refs/tags/v} ;; *) fail 'release requires refs/tags/v<SemVer>' ;; esac
         version_ok "$version" || fail 'invalid release version'
         case $5 in *"@$4") caller=${5%"@$4"} ;; *) fail 'caller workflow must use the release tag' ;; esac
