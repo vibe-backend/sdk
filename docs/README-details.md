@@ -233,7 +233,6 @@ The prefix must start with `/`, have no trailing slash or empty segments, and to
 
 See [runtime configuration](runtime-config.md) for tenant permissions and development defaults.
 
-
 ## LLM replay and recording (decision 189)
 
 Build reviewed natural-language sources without credentials or network access:
