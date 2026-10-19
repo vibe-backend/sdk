@@ -5,6 +5,20 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+## 1.0.0-rc.5
+
+- **Decision 184:** Implicit in-memory `main` provider for projects without provider sources.
+- **Decision 185:** Private global LLM settings, separate key files and per-key setup precedence.
+- **Breaking (decision 186):** Flat endpoint files replace endpoint folders.
+- **Decision 187:** Project route prefixes and single-tenant default slugs.
+- **Decision 188:** Model-aware plain-language endpoints, SQL validation and required method inputs.
+- **Decision 189:** Credential-free LLM replay fixtures, recording and release guards.
+- **Breaking (decision 182):** Release manifest identity and issuer pins are required.
+
+- **Prompt changes:** PR D (#323) adds the `Project route rule:` input line to compile and interactive prompts. PR E (#324) adds model dependency `table=<name>`; the `Target store: memory (provider: main; only the memory SQL forms)` / `Target store: postgres` input line; the memory SQL forms guide; CRUD-to-SQL mapping; route/prefix and GET+POST guidance; the public phrase list with frontmatter precedence; the `-auth` pipeline wording; the provider-name rule; and the required-method-input / constant-key rule. Compile prompt fingerprint is `d201a2e6c4dcc630789d9fd965f9cbdf435f58f6875cc7c4f719e7a36df22722`.
+
+- Version 1.0.0-rc.5; locks are stamped `1.0.0-rc.5` (run `vibe build`). Replay fixtures recorded for rc.4 miss and must be re-recorded.
+
 - **Decision 189:** Add reviewed LLM replay fixtures for credential-free CI previews, local response recording with secret scans, unused fixture warnings and release/test-build guards. Prompts are unchanged.
 
 - **Decision 188 (rc.5):** Compile plain-language public endpoints with model table context, model-aware SQL validation and strict implicit-memory SQL checks through repair. Unknown model providers (e.g. store kind `memory` instead of implicit provider `main`) fail the build, list available providers and feed the repair retry; prompt input names `provider: main` for the implicit store. Method steps with statically known args (Transform in or an inline map) must supply every required target method `Signature` input; build errors name the item, target and field, also checked in `validate`. Normalize endpoint routes, infer public auth removal and public writes, and warn when prose limits cannot be enforced. Frontmatter removing auth or setting public still conflicts with source requiring login (fail-closed); the public phrase gate ignores negated sentences. GET and POST may share an explicit path in separate files. Prompt changes ride with rc.5.

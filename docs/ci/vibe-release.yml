@@ -11,10 +11,10 @@ jobs:
       id-token: write
       attestations: write
     # Must be a tag of vibe-backend/sdk, not a branch or SHA; Dependabot can bump it.
-    # v1.0.0 is a placeholder. The reusable workflow is available only from the
-    # first SDK release tag that contains it (the next release after v1.0.0-rc.4).
+    # The reusable workflow is available from v1.0.0-rc.5, the first SDK release
+    # tag that contains it.
     # Select that release or later; the SDK tag version must equal your runtime version.
-    uses: vibe-backend/sdk/.github/workflows/vibe-project-release.yml@v1.0.0
+    uses: vibe-backend/sdk/.github/workflows/vibe-project-release.yml@v1.0.0-rc.5
     with:
       environment: release
       llm-model: gpt-4.1-2025-04-14
