@@ -480,7 +480,7 @@ async fn generation_confirmation_and_preservation() {
             );
             assert!(!p.join("providers/main.md").exists());
             assert_eq!(
-                fs::read_to_string(p.join("api/hello/v1/hello/hello.md")).unwrap(),
+                fs::read_to_string(p.join("api/hello/v1/hello.md")).unwrap(),
                 source()
             );
             assert_eq!(vibe::discover::discover(&p).unwrap().len(), 3);
@@ -597,7 +597,7 @@ async fn kebab_names_are_repaired_or_write_nothing() {
             result.unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 2);
             assert_eq!(
-                fs::read_to_string(p.join("api/hello/v1/hello/hello.md")).unwrap(),
+                fs::read_to_string(p.join("api/hello/v1/hello.md")).unwrap(),
                 source()
             );
         } else {

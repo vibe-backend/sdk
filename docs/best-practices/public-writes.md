@@ -6,7 +6,7 @@ Allow unauthenticated visitors to create or update data (e.g. submitting a revie
 
 ## Natural-language source example
 
-`api/catalog/v1/submit-review/submit-review.md` (route `POST /catalog/v1/{slug}/reviews`)
+`api/catalog/v1/submit-review.md` (route `POST /catalog/v1/{slug}/reviews`)
 
 ```text
 # Submit review
@@ -19,7 +19,7 @@ Create the review with review.submit; on success return 201 with id. If the item
 
 ## Compiled lock md example
 
-`api/catalog/v1/submit-review/submit-review.lock.md` (sections only; frontmatter per §2A.1 with `kind: api`, `scope: feature`; security items on **this** lock: `public`, `auth-removed`, `public-writes` (high risk) and `output-new-field` for the new response field (medium risk)). The `write-sql` item (medium) for the new INSERT belongs to the `review.submit` **method** lock, not this api lock. The cap of 5 security items applies to **all locks in the same PR together** (Decision 34), so this api lock plus `review.submit` total 5 items. The `review` model's public-writable / `untrusted` fields are a further security item and must be merged and deployed in an **earlier PR**.
+`api/catalog/v1/submit-review.lock.md` (sections only; frontmatter per §2A.1 with `kind: api`, `scope: feature`; security items on **this** lock: `public`, `auth-removed`, `public-writes` (high risk) and `output-new-field` for the new response field (medium risk)). The `write-sql` item (medium) for the new INSERT belongs to the `review.submit` **method** lock, not this api lock. The cap of 5 security items applies to **all locks in the same PR together** (Decision 34), so this api lock plus `review.submit` total 5 items. The `review` model's public-writable / `untrusted` fields are a further security item and must be merged and deployed in an **earlier PR**.
 
 ````markdown
 ## Route

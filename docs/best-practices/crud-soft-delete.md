@@ -21,7 +21,7 @@ Fields:
 Provide all CRUD. list defaults to 20 per page, at most 100, can sort by created_at.
 ```
 
-`api/notes/v1/delete-note/delete-note.md` (route `DELETE /notes/v1/{id}`)
+`api/notes/v1/delete-note.md` (route `DELETE /notes/v1/{id}`)
 
 ```text
 # Delete note
@@ -70,7 +70,7 @@ Note not found returns 404 NOT_FOUND.
 
 Note the grants: no runtime role ever has `DELETE` (§7.1).
 
-`api/notes/v1/delete-note/delete-note.lock.md` (sections only; `kind: api`, `scope: feature`; `dependencies` include `note/crud/delete`)
+`api/notes/v1/delete-note.lock.md` (sections only; `kind: api`, `scope: feature`; `dependencies` include `note/crud/delete`)
 
 ````markdown
 ## Route

@@ -3451,7 +3451,7 @@ mod prompt_tests {
 
     fn feature(text: &str) -> SourceFile {
         SourceFile {
-            rel: "api/shop/v1/new-thing/new-thing.md".into(),
+            rel: "api/shop/v1/new-thing.md".into(),
             abs: "/tmp/x".into(),
             kind: Kind::Api,
             scope: Some(Scope::Feature),
@@ -3606,7 +3606,7 @@ mod prompt_tests {
             (
                 Kind::Api,
                 Some(Scope::Feature),
-                "api/catalog/v1/example-get/example-get.md",
+                "api/catalog/v1/example-get.md",
             ),
         ] {
             let prompt = system_prompt(kind, scope);
@@ -3629,7 +3629,7 @@ mod prompt_tests {
             )
             .unwrap();
         }
-        let api = dir.join("api/catalog/v1/example-get/example-get.md");
+        let api = dir.join("api/catalog/v1/example-get.md");
         let text = std::fs::read_to_string(&api).unwrap();
         std::fs::write(&api, text.replace("## Transform\n", "")).unwrap();
         let opts = super::CompileOptions {
@@ -3673,7 +3673,7 @@ mod prompt_tests {
         let src = shop_fixture();
         let dir = std::env::temp_dir().join(format!("vibe-target-{}", uuid::Uuid::new_v4()));
         copy_dir(&src, &dir);
-        let f = dir.join("api/catalog/v1/get-product/get-product.md");
+        let f = dir.join("api/catalog/v1/get-product.md");
         let text = std::fs::read_to_string(&f).unwrap();
         std::fs::write(&f, text.replace("target: product.get", "target: nope.get")).unwrap();
         let opts = super::CompileOptions {
@@ -3697,7 +3697,7 @@ mod security_tests {
 
     fn feature(text: &str, body: &str) -> (LockDoc, Vec<SourceFile>) {
         let source = SourceFile {
-            rel: "api/shop/v1/x/x.md".into(),
+            rel: "api/shop/v1/x.md".into(),
             abs: "/tmp/x".into(),
             kind: Kind::Api,
             scope: Some(Scope::Feature),

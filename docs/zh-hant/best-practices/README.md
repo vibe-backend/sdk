@@ -1,6 +1,6 @@
 # 最佳實踐
 
-本目錄收錄撰寫 Markdown 驅動後端定義的最佳實踐模式。每一頁都**嚴格**依據目前定稿的規格 [`docs/spec-v1.7.md`](../../spec-v1.7.md) 撰寫。文中「§7.2」、「Decision 48」等章節引用均指該份規格。舊版 [`docs/spec-v1.5.md`](../../spec-v1.5.md) 只作歷史參考。
+本目錄收錄撰寫 Markdown 驅動後端定義的最佳實踐模式。每一頁都**嚴格**依據目前定稿的規格 [`docs/spec-v1.8.md`](../../spec-v1.7.md) 撰寫。文中「§7.2」、「Decision 48」等章節引用均指該份規格。舊版 [`docs/spec-v1.5.md`](../../spec-v1.5.md) 只作歷史參考。
 
 > **規格版本說明：** 這些頁面已按**規格 v1.7** 修訂（issue #17）。與 v1.5 版本相比的主要改動：樂觀鎖改用 `ETag`／`If-Match`，缺少時回 428、不一致時回 412（Decision 48）；公開註冊不收密碼，並一律回 202（Decisions 56、67）；登入要求電郵已驗證（Decision 55）；admin 建立用戶改為邀請流程（Decision 69）；API key、JWT、rate-limit、refresh token 和 LLM provider 的設定改用 v1.7 已定案的數值（Decisions 43–45、57–59、61、62、65、72）。頁面與規格有出入時，以規格為準。
 

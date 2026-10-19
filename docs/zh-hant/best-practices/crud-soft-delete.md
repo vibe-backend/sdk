@@ -21,7 +21,7 @@ Fields:
 Provide all CRUD. list defaults to 20 per page, at most 100, can sort by created_at.
 ```
 
-`api/notes/v1/delete-note/delete-note.md`（路由 `DELETE /notes/v1/{id}`）
+`api/notes/v1/delete-note.md`（路由 `DELETE /notes/v1/{id}`）
 
 ```text
 # Delete note
@@ -70,7 +70,7 @@ Note not found returns 404 NOT_FOUND.
 
 留意授權設定：任何執行階段角色都沒有 `DELETE` 權限（§7.1）。
 
-`api/notes/v1/delete-note/delete-note.lock.md`（僅列 section；`kind: api`、`scope: feature`；`dependencies` 包含 `note/crud/delete`）
+`api/notes/v1/delete-note.lock.md`（僅列 section；`kind: api`、`scope: feature`；`dependencies` 包含 `note/crud/delete`）
 
 ````markdown
 ## Route

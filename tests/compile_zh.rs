@@ -179,14 +179,14 @@ async fn unknown_headers_and_constraints_require_exact_migration() {
 #[tokio::test]
 async fn chinese_create_api_returns_private_unique_violation_in_memory() {
     let root = fixture(false);
-    fs::create_dir_all(root.join("api/catalog/v1/create-product")).unwrap();
+    fs::create_dir_all(root.join("api/catalog/v1")).unwrap();
     fs::write(root.join("api/catalog/_definition.md"), "## Providers\n- allowlist: [main]\n- default: main\n## Pipelines\n(none)\n## Defaults\n(none)\n").unwrap();
     fs::write(
         root.join("api/catalog/v1/_version.md"),
         "## Pipelines\n(none)\n## Defaults\n(none)\n## Lifecycle\n(none)\n",
     )
     .unwrap();
-    fs::write(root.join("api/catalog/v1/create-product/create-product.md"), "---\npublic: true\nauth: false\nwrites: true\n---\n# 建立商品 API\n\n公開 POST /catalog/v1/{slug}/products，唔使登入。公開寫入，同一租戶可以建立商品，用 product.create，sku 同 name 必填。\n").unwrap();
+    fs::write(root.join("api/catalog/v1/create-product.md"), "---\npublic: true\nauth: false\nwrites: true\n---\n# 建立商品 API\n\n公開 POST /catalog/v1/{slug}/products，唔使登入。公開寫入，同一租戶可以建立商品，用 product.create，sku 同 name 必填。\n").unwrap();
     compile(&root, MODEL)
         .await
         .unwrap_or_else(|e| panic!("{e}"));

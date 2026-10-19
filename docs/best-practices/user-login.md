@@ -23,7 +23,7 @@ Steps:
 4. Sign tokens with user.sign-token and return user, token and refresh_token.
 ```
 
-`api/auth/v1/login/login.md` (route `POST /auth/v1/{slug}/login`)
+`api/auth/v1/login.md` (route `POST /auth/v1/{slug}/login`)
 
 ```text
 # Login
@@ -127,7 +127,7 @@ signature: MEUCIQ...
 - source-lines: 10-10
 ````
 
-`api/auth/v1/login/login.lock.md` (sections only; frontmatter per §2A.1 with `kind: api`, `scope: feature`, and security items `public`, `auth-removed`, `public-writes`, all high risk)
+`api/auth/v1/login.lock.md` (sections only; frontmatter per §2A.1 with `kind: api`, `scope: feature`, and security items `public`, `auth-removed`, `public-writes`, all high risk)
 
 ````markdown
 ## Route

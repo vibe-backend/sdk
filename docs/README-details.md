@@ -151,3 +151,29 @@ precedence over project `.env`, which takes precedence over global settings.
 Global settings are ignored by runtime, release builds, CI and non-development
 environments. See [the detailed configuration reference](runtime-config.md#global-llm-configuration-decision-185)
 for allowed keys, permissions, first-run behavior, precedence and diagnostics.
+
+## Migrating to flat endpoint files (decision 186)
+
+Starting with rc.5, endpoints live at `api/<definition>/<version>/<endpoint>.md`.
+The file name determines the route; endpoint ids and routes stay the same.
+Optional schemas and generated locks are siblings: `<endpoint>.schema.md` and
+`<endpoint>.lock.md`. Run this POSIX sh snippet from the project root:
+
+```sh
+for folder in api/*/*/*; do
+    [ -d "$folder" ] || continue
+    name=${folder##*/}
+    version=${folder%/*}
+    if [ -f "$folder/$name.md" ]; then
+        git mv "$folder/$name.md" "$version/$name.md" || exit 1
+    fi
+    if [ -f "$folder/schema.md" ]; then
+        git mv "$folder/schema.md" "$version/$name.schema.md" || exit 1
+    fi
+    rm -f "$folder/$name.lock.md"
+    rmdir "$folder" || exit 1
+done
+```
+
+`vibe build` lists every file still to move, with its exact new path.
+Rebuild to generate the new sibling locks.

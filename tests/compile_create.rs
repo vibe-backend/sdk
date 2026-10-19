@@ -27,7 +27,7 @@ fn project() -> PathBuf {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shop"),
         &root,
     );
-    fs::create_dir_all(root.join("api/catalog/v1/example-create")).unwrap();
+    fs::create_dir_all(root.join("api/catalog/v1")).unwrap();
     for rel in ["api/catalog/_definition.md", "api/catalog/v1/_version.md"] {
         let path = root.join(rel);
         let text = fs::read_to_string(&path).unwrap();
@@ -36,11 +36,7 @@ fn project() -> PathBuf {
     root
 }
 fn source(root: &Path, text: &str) {
-    fs::write(
-        root.join("api/catalog/v1/example-create/example-create.md"),
-        text,
-    )
-    .unwrap();
+    fs::write(root.join("api/catalog/v1/example-create.md"), text).unwrap();
 }
 fn config() -> LlmConfig {
     LlmConfig {
@@ -137,9 +133,9 @@ async fn chinese_create_is_canonical_across_three_cache_free_compiles() {
             "| body.sku | string | max: 40 | yes |\n| body.name | string | max: 80 | yes |\n",
             "",
         );
-    fs::create_dir_all(root.join("api/catalog/v1/example-list")).unwrap();
+    fs::create_dir_all(root.join("api/catalog/v1")).unwrap();
     fs::write(
-        root.join("api/catalog/v1/example-list/example-list.md"),
+        root.join("api/catalog/v1/example-list.md"),
         format!("---\npublic: true\nauth: false\n---\n{list}"),
     )
     .unwrap();
@@ -187,8 +183,7 @@ async fn chinese_create_is_canonical_across_three_cache_free_compiles() {
             .matches("sampling parameters were not sent")
             .count();
         let feature =
-            fs::read_to_string(root.join("api/catalog/v1/example-create/example-create.lock.md"))
-                .unwrap();
+            fs::read_to_string(root.join("api/catalog/v1/example-create.lock.md")).unwrap();
         let model = fs::read_to_string(root.join("models/product/product.lock.md")).unwrap();
         let doc = parse_lock(&feature).unwrap();
         assert!(doc
@@ -311,10 +306,8 @@ async fn structured_create_example_and_writes_contracts() {
             })
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-            let text = fs::read_to_string(
-                root.join("api/catalog/v1/example-create/example-create.lock.md"),
-            )
-            .unwrap();
+            let text =
+                fs::read_to_string(root.join("api/catalog/v1/example-create.lock.md")).unwrap();
             assert!(parse_lock(&text)
                 .unwrap()
                 .meta
@@ -371,9 +364,7 @@ async fn custom_writing_method_and_declared_errors_are_inherited() {
     })
     .await
     .unwrap_or_else(|e| panic!("{e}"));
-    let text =
-        fs::read_to_string(root.join("api/catalog/v1/example-create/example-create.lock.md"))
-            .unwrap();
+    let text = fs::read_to_string(root.join("api/catalog/v1/example-create.lock.md")).unwrap();
     assert!(parse_lock(&text)
         .unwrap()
         .meta
@@ -407,8 +398,7 @@ async fn custom_writing_method_and_declared_errors_are_inherited() {
         })
         .await
         .unwrap_or_else(|e| panic!("{e}"));
-        let bytes =
-            fs::read(root.join("api/catalog/v1/example-create/example-create.lock.md")).unwrap();
+        let bytes = fs::read(root.join("api/catalog/v1/example-create.lock.md")).unwrap();
         if let Some(before) = previous {
             assert_eq!(bytes, before);
         }
@@ -540,9 +530,7 @@ async fn missing_list_is_repaired_and_constants_are_preserved() {
         .await
         .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        let lock =
-            fs::read_to_string(root.join("api/catalog/v1/example-create/example-create.lock.md"))
-                .unwrap();
+        let lock = fs::read_to_string(root.join("api/catalog/v1/example-create.lock.md")).unwrap();
         assert!(lock.contains(&format!("- target: {target}")));
         fs::remove_dir_all(root).unwrap();
     }
@@ -601,7 +589,7 @@ async fn validate_rejects_source_writes_false_with_create_step() {
     })
     .await
     .unwrap_or_else(|e| panic!("{e}"));
-    let path = root.join("api/catalog/v1/example-create/example-create.md");
+    let path = root.join("api/catalog/v1/example-create.md");
     let text = fs::read_to_string(&path).unwrap();
     fs::write(&path, format!("---\nwrites: false\n---\n{text}")).unwrap();
     let err = validate_project(&ValidateOptions {
@@ -630,7 +618,7 @@ async fn validate_rejects_hand_edited_lock_unknown_errors_code() {
     })
     .await
     .unwrap_or_else(|e| panic!("{e}"));
-    let path = root.join("api/catalog/v1/example-create/example-create.lock.md");
+    let path = root.join("api/catalog/v1/example-create.lock.md");
     let text = fs::read_to_string(&path).unwrap();
     assert!(text.contains("## Errors\n(none)"), "{text}");
     fs::write(&path, text.replace("## Errors\n(none)", "## Errors\n| status | code | from |\n| --- | --- | --- |\n| 409 | INVENTED | INVENTED |" )).unwrap();

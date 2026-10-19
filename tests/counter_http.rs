@@ -400,7 +400,7 @@ fn implicit_provider_builds_and_guards() {
         String::from_utf8_lossy(&out.stderr)
     );
     fs::write(&model, original_model).unwrap();
-    let feature = root.join("api/counter/v1/get-counter/get-counter.md");
+    let feature = root.join("api/counter/v1/get-counter.md");
     let original_feature = fs::read_to_string(&feature).unwrap();
     fs::write(
         &feature,

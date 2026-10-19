@@ -19,7 +19,7 @@ This replaces the v1.5 pattern (client sends `updated_at`, conflict → 409), wh
 Provide get, list and update CRUD.
 ```
 
-`api/users/v2/update-user/update-user.md` (route `PUT /users/v2/{id}`)
+`api/users/v2/update-user.md` (route `PUT /users/v2/{id}`)
 
 ```text
 # Update user
@@ -43,7 +43,7 @@ User not found returns 404 NOT_FOUND. Missing If-Match returns 428 PRECONDITION_
 | update | partial: true, optimistic-lock: if-match |
 ````
 
-`api/users/v2/update-user/update-user.lock.md` (sections only; `kind: api`, `scope: feature`; `dependencies` include `user/crud/update`)
+`api/users/v2/update-user.lock.md` (sections only; `kind: api`, `scope: feature`; `dependencies` include `user/crud/update`)
 
 ````markdown
 ## Route

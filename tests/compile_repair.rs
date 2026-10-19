@@ -140,7 +140,7 @@ const API_GOOD: &str = "## Route\n- method: GET\n- path: /catalog/v1/hello\n## A
 fn api_project() -> std::path::PathBuf {
     let root = project();
     fs::remove_dir_all(root.join("models")).unwrap();
-    fs::create_dir_all(root.join("api/catalog/v1/hello")).unwrap();
+    fs::create_dir_all(root.join("api/catalog/v1")).unwrap();
     fs::write(
         root.join("api/catalog/_definition.md"),
         include_str!("fixtures/shop/api/catalog/_definition.md"),
@@ -152,7 +152,7 @@ fn api_project() -> std::path::PathBuf {
     )
     .unwrap();
     fs::write(
-        root.join("api/catalog/v1/hello/hello.md"),
+        root.join("api/catalog/v1/hello.md"),
         "# hello\n\nReturn a hello world message.\n",
     )
     .unwrap();
@@ -222,7 +222,7 @@ async fn invalid_api_exhausts_shared_retry_budget_without_writes() {
         1 + vibe::prompt_guide::format_retries().unwrap() as usize
     );
     assert!(!root.join("providers/main.lock.md").exists());
-    assert!(!root.join("api/catalog/v1/hello/hello.lock.md").exists());
+    assert!(!root.join("api/catalog/v1/hello.lock.md").exists());
     assert!(!root.join(vibe::buildrecord::PATH).exists());
     fs::remove_dir_all(root).unwrap();
 }
@@ -275,7 +275,7 @@ async fn cached_lock_failing_validate_is_recompiled() {
 async fn structured_limits_pins_and_slug_normalization() {
     for slug in [true, false] {
         let root = api_project();
-        let source_path = root.join("api/catalog/v1/hello/hello.md");
+        let source_path = root.join("api/catalog/v1/hello.md");
         let body = API_GOOD.replace("- provider: main", "- provider: main\n- timeout: 5s\n- body: 4KB")
             .replace("## Request\n(none)", "## Request\n| field | type | rules | required |\n| --- | --- | --- | --- |\n| path.slug | uuid | - | no |\n| path.slug | string | - | no |")
             .replace("/catalog/v1/hello", if slug { "/catalog/v1/{slug}/hello" } else { "/catalog/v1/hello" });
@@ -306,7 +306,7 @@ async fn structured_limits_pins_and_slug_normalization() {
                 "{error}"
             );
         }
-        assert!(!root.join("api/catalog/v1/hello/hello.lock.md").exists());
+        assert!(!root.join("api/catalog/v1/hello.lock.md").exists());
         fs::write(
             &source_path,
             format!("---\ntimeout: 5s\nbody: 4KB\n---\n{body}"),
@@ -315,7 +315,7 @@ async fn structured_limits_pins_and_slug_normalization() {
         regenerate_project(&opts)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let lock = fs::read_to_string(root.join("api/catalog/v1/hello/hello.lock.md")).unwrap();
+        let lock = fs::read_to_string(root.join("api/catalog/v1/hello.lock.md")).unwrap();
         assert!(lock.contains("- provider: main\n- timeout: 5s\n- body: 4KB"));
         assert_eq!(lock.matches("| path.slug |").count(), usize::from(slug));
         if slug {

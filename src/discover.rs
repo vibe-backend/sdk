@@ -47,6 +47,7 @@ pub fn discover(root: &Path) -> Result<Vec<SourceFile>, Report> {
     collect_dir(&mut report, &mut files, root, root.join("migrations"), 0);
     collect_dir(&mut report, &mut files, root, root.join("models"), 0);
     collect_dir(&mut report, &mut files, root, root.join("api"), 0);
+    report.diags.sort_by(|a, b| a.file.cmp(&b.file));
     if report.has_errors() {
         return Err(report);
     }
@@ -89,6 +90,25 @@ fn collect_dir(
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
+        let rel = display_rel(root, &path);
+        let parts: Vec<_> = rel.split('/').collect();
+        if parts.first() == Some(&"api") && parts.len() >= 5 {
+            report.push(old_layout(&rel, &parts));
+            continue;
+        }
+        if name.ends_with(".schema.md") {
+            let endpoint = path.with_file_name(name.replace(".schema.md", ".md"));
+            if !endpoint.is_file() {
+                report.push(Diag::error(
+                    &rel,
+                    format!(
+                        "schema has no matching endpoint file: {}",
+                        display_rel(root, &endpoint)
+                    ),
+                ));
+            }
+            continue;
+        }
         if !name.ends_with(".md") || name.ends_with(".lock.md") {
             continue;
         }
@@ -107,7 +127,10 @@ fn attach_schemas(files: &mut [SourceFile]) {
         if file.kind != Kind::Api || file.scope != Some(Scope::Feature) {
             continue;
         }
-        let schema_path = file.abs.parent().map(|parent| parent.join("schema.md"));
+        let schema_path = file.abs.file_stem().map(|stem| {
+            file.abs
+                .with_file_name(format!("{}.schema.md", stem.to_string_lossy()))
+        });
         if let Some(path) = schema_path {
             if path.exists() {
                 if let Ok(text) = fs::read_to_string(&path) {
@@ -149,13 +172,11 @@ fn classify_parts(rel: &str, parts: &[&str]) -> Result<Classified, Diag> {
         ["models", object, "methods", file] => classify_method(object, file)?,
         ["api", definition, file] => classify_definition(definition, file)?,
         ["api", definition, version, file] => classify_version(definition, version, file)?,
-        ["api", definition, version, feature, file] => {
-            classify_feature(definition, version, feature, file)?
-        }
+        ["api", _, _, _, ..] => return Err(old_layout(rel, parts)),
         _ => {
             return Err(Diag::error(
                 rel,
-                "path does not match providers, pipelines, migrations, models, or api/{definition}/{version}/{feature}",
+                "path does not match providers, pipelines, migrations, models, or api/{definition}/{version}/{endpoint}.md",
             ));
         }
     };
@@ -257,41 +278,38 @@ fn classify_version(definition: &str, version: &str, file: &str) -> Result<Class
     let rel = format!("api/{definition}/{version}/{file}");
     check_kebab(definition).map_err(|message| Diag::error(&rel, message))?;
     check_version(version).map_err(|message| Diag::error(&rel, message))?;
-    if file != "_version.md" {
-        return Err(Diag::error(
-            &rel,
-            "only _version.md is allowed directly under an api version",
-        ));
-    }
+    let (scope, stem) = if file == "_version.md" {
+        (Scope::Version, "_version".to_string())
+    } else {
+        let stem = stem_md(file).map_err(|message| Diag::error(&rel, message))?;
+        check_kebab(&stem).map_err(|message| Diag::error(&rel, message))?;
+        (Scope::Feature, stem)
+    };
     Ok(Classified {
         kind: Kind::Api,
-        scope: Some(Scope::Version),
-        id: format!("{definition}/{version}/_version"),
+        scope: Some(scope),
+        id: format!("{definition}/{version}/{stem}"),
     })
 }
 
-fn classify_feature(
-    definition: &str,
-    version: &str,
-    feature: &str,
-    file: &str,
-) -> Result<Classified, Diag> {
-    let rel = format!("api/{definition}/{version}/{feature}/{file}");
-    check_kebab(definition).map_err(|message| Diag::error(&rel, message))?;
-    check_version(version).map_err(|message| Diag::error(&rel, message))?;
-    check_kebab(feature).map_err(|message| Diag::error(&rel, message))?;
-    let stem = stem_md(file).map_err(|message| Diag::error(&rel, message))?;
-    if stem != feature {
-        return Err(Diag::error(
-            &rel,
-            "feature file name must match the folder name",
-        ));
-    }
-    Ok(Classified {
-        kind: Kind::Api,
-        scope: Some(Scope::Feature),
-        id: format!("{definition}/{version}/{feature}"),
-    })
+fn old_layout(rel: &str, parts: &[&str]) -> Diag {
+    let base = format!("api/{}/{}", parts[1], parts[2]);
+    let feature = parts[3];
+    let action = if parts.len() == 5 && parts[4] == format!("{feature}.md") {
+        format!("move it to {base}/{feature}.md")
+    } else if parts.len() == 5 && parts[4] == "schema.md" {
+        format!("move it to {base}/{feature}.schema.md")
+    } else if parts.len() == 5 && parts[4] == format!("{feature}.lock.md") {
+        format!("delete it; `vibe build` writes {base}/{feature}.lock.md")
+    } else {
+        format!(
+            "endpoint folders are no longer supported; move endpoint sources to {base}/<name>.md"
+        )
+    };
+    Diag::error(
+        rel,
+        format!("uses the old endpoint folder layout (decision 186): {action}"),
+    )
 }
 
 fn stem_md(file: &str) -> Result<String, String> {

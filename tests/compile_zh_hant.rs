@@ -210,10 +210,9 @@ async fn zh_hant_sample_shop_compiles_and_validates() {
         .iter()
         .any(|i| i.item == "ownership"));
     // (2) add-cart-item: write-sql inherited from cart-item.add.
-    let feature = parse_lock(
-        &fs::read_to_string(root.join("api/shop/v1/add-cart-item/add-cart-item.lock.md")).unwrap(),
-    )
-    .unwrap();
+    let feature =
+        parse_lock(&fs::read_to_string(root.join("api/shop/v1/add-cart-item.lock.md")).unwrap())
+            .unwrap();
     assert!(feature
         .meta
         .security_items
@@ -313,7 +312,7 @@ async fn translation_failure_fails_the_compile() {
 #[tokio::test]
 async fn feature_writes_declaration_is_optional() {
     let root = fixture();
-    let f = root.join("api/shop/v1/add-cart-item/add-cart-item.md");
+    let f = root.join("api/shop/v1/add-cart-item.md");
     let text = fs::read_to_string(&f).unwrap();
     fs::write(&f, text.replace("writes: true\n", "")).unwrap();
     let adapter = FakeAdapter { responder };

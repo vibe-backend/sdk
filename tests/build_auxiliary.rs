@@ -124,9 +124,9 @@ fn build_lists_and_validates_slug_files() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("slugs from slugs.example.json (dev/memory only)"));
     assert!(stdout(&out).contains("slug example -> tenant tenant0001 (public write: no)"));
-    fs::create_dir_all(root.join("api/demo/v1/test")).unwrap();
+    fs::create_dir_all(root.join("api/demo/v1")).unwrap();
     fs::write(
-        root.join("api/demo/v1/test/test.md"),
+        root.join("api/demo/v1/test.md"),
         "# test\nGET /demo/v1/{slug}/test\n",
     )
     .unwrap();

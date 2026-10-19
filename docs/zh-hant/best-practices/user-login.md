@@ -23,7 +23,7 @@ Steps:
 4. Sign tokens with user.sign-token and return user, token and refresh_token.
 ```
 
-`api/auth/v1/login/login.md`（路由 `POST /auth/v1/{slug}/login`）
+`api/auth/v1/login.md`（路由 `POST /auth/v1/{slug}/login`）
 
 ```text
 # Login
@@ -127,7 +127,7 @@ signature: MEUCIQ...
 - source-lines: 10-10
 ````
 
-`api/auth/v1/login/login.lock.md`（僅列 section；frontmatter 依 §2A.1，`kind: api`、`scope: feature`，安全項目為 `public`、`auth-removed`、`public-writes`，全屬高風險）
+`api/auth/v1/login.lock.md`（僅列 section；frontmatter 依 §2A.1，`kind: api`、`scope: feature`，安全項目為 `public`、`auth-removed`、`public-writes`，全屬高風險）
 
 ````markdown
 ## Route

@@ -14,7 +14,7 @@ Partner integration API. Only uses provider main.
 All endpoints require an API key with partners:read scope.
 ```
 
-`api/partners/v1/list-orders/list-orders.md`（路由 `GET /partners/v1/list-orders`）
+`api/partners/v1/list-orders.md`（路由 `GET /partners/v1/list-orders`）
 
 ```text
 # List partner orders
@@ -42,7 +42,7 @@ List orders with order.list and return 200 with items, page, page_size and has_m
 - body: 1MB
 ````
 
-`api/partners/v1/list-orders/list-orders.lock.md`（僅列出 section；`kind: api`、`scope: feature`）
+`api/partners/v1/list-orders.lock.md`（僅列出 section；`kind: api`、`scope: feature`）
 
 ````markdown
 ## Route

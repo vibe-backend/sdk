@@ -24,7 +24,7 @@ fn project() -> PathBuf {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shop"),
         &root,
     );
-    fs::create_dir_all(root.join("api/catalog/v1/example-create")).unwrap();
+    fs::create_dir_all(root.join("api/catalog/v1")).unwrap();
     for rel in ["api/catalog/_definition.md", "api/catalog/v1/_version.md"] {
         let path = root.join(rel);
         let text = fs::read_to_string(&path).unwrap();
@@ -33,11 +33,7 @@ fn project() -> PathBuf {
     root
 }
 fn source(root: &Path, text: &str) {
-    fs::write(
-        root.join("api/catalog/v1/example-create/example-create.md"),
-        text,
-    )
-    .unwrap();
+    fs::write(root.join("api/catalog/v1/example-create.md"), text).unwrap();
 }
 fn config() -> LlmConfig {
     LlmConfig {

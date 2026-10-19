@@ -311,8 +311,8 @@ fn answer(text: &str) -> Result<Answer, Vec<String>> {
         }
     }
     if let Err(e) = discover::check_source_path(&format!(
-        "api/{}/{}/{}/{}.md",
-        a.definition, a.version, a.feature, a.feature
+        "api/{}/{}/{}.md",
+        a.definition, a.version, a.feature
     )) {
         errors.push(e.to_string());
     }
@@ -410,10 +410,7 @@ pub async fn run(
             scaffold::version_content(&a.definition, &a.version),
         ),
         (
-            format!(
-                "api/{}/{}/{}/{}.md",
-                a.definition, a.version, a.feature, a.feature
-            ),
+            format!("api/{}/{}/{}.md", a.definition, a.version, a.feature),
             format!("{}\n", a.source.trim_end_matches(['\r', '\n'])),
         ),
     ];

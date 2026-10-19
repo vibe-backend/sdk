@@ -8,7 +8,7 @@ Spec decision 149 (PM-approved 2026-10-17, §4A.1c): the `sign-method` must be r
 
 ## Natural-language source example
 
-`api/auth/v1/refresh/refresh.md` (route `POST /auth/v1/{slug}/refresh`)
+`api/auth/v1/refresh.md` (route `POST /auth/v1/{slug}/refresh`)
 
 ```text
 # Refresh token
@@ -19,7 +19,7 @@ Request body: refresh_token (string, required).
 Return 200 with the new token and refresh_token.
 ```
 
-`api/auth/v1/logout/logout.md` (route `POST /auth/v1/logout`)
+`api/auth/v1/logout.md` (route `POST /auth/v1/logout`)
 
 ```text
 # Logout
@@ -30,7 +30,7 @@ Return 204.
 
 ## Compiled lock md example
 
-`api/auth/v1/refresh/refresh.lock.md` (sections only; frontmatter per §2A.1, `kind: api`, `scope: feature`; security items `public` and `auth-removed`, high risk)
+`api/auth/v1/refresh.lock.md` (sections only; frontmatter per §2A.1, `kind: api`, `scope: feature`; security items `public` and `auth-removed`, high risk)
 
 ````markdown
 ## Route
@@ -92,7 +92,7 @@ Return 204.
 | 422 | VALIDATION_FAILED | VALIDATION_FAILED |
 ````
 
-`api/auth/v1/logout/logout.lock.md` (`## Pipelines` only)
+`api/auth/v1/logout.lock.md` (`## Pipelines` only)
 
 ````markdown
 ## Pipelines

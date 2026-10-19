@@ -90,8 +90,7 @@ fn locks(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
 }
 
 fn route(root: &Path, feature: &str) -> String {
-    let text = fs::read_to_string(root.join(format!("api/catalog/v1/{feature}/{feature}.lock.md")))
-        .unwrap();
+    let text = fs::read_to_string(root.join(format!("api/catalog/v1/{feature}.lock.md"))).unwrap();
     let doc = vibe::lock::parse_lock(&text).expect("parse feature lock");
     let section = vibe::lock::find_section(&doc.sections, "Route").expect("Route section");
     section
@@ -114,7 +113,7 @@ fn feature_locks(root: &Path, redact: &Redactor) -> String {
     ["create-product", "list-products"]
         .iter()
         .map(|feature| {
-            let path = format!("api/catalog/v1/{feature}/{feature}.lock.md");
+            let path = format!("api/catalog/v1/{feature}.lock.md");
             let text = fs::read_to_string(root.join(&path)).unwrap_or_default();
             format!("{path}:\n{}", redact.clean(&text))
         })
@@ -183,7 +182,7 @@ async fn real_model_create_zh_and_en() {
         ] {
             write(
                 root,
-                &format!("api/catalog/v1/{feature}/{feature}.md"),
+                &format!("api/catalog/v1/{feature}.md"),
                 &format!("---\npublic: true\nauth: none\n---\n\n# {feature}\n\n{description}\n"),
             );
         }

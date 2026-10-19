@@ -6,7 +6,7 @@
 
 ## 自然語言 source 範例
 
-`api/catalog/v1/submit-review/submit-review.md`（路由 `POST /catalog/v1/{slug}/reviews`）
+`api/catalog/v1/submit-review.md`（路由 `POST /catalog/v1/{slug}/reviews`）
 
 ```text
 # Submit review
@@ -19,7 +19,7 @@ Create the review with review.submit; on success return 201 with id. If the item
 
 ## 編譯後的 lock md 範例
 
-`api/catalog/v1/submit-review/submit-review.lock.md`（僅列 section；frontmatter 依 §2A.1，`kind: api`、`scope: feature`；**這個** lock 上的安全項目：`public`、`auth-removed`、`public-writes`（高風險），以及新回應欄位的 `output-new-field`（中風險））。新 INSERT 的 `write-sql` 項目（中風險）屬於 `review.submit` **method** 的 lock，而不是這個 api lock。每個 PR 最多 5 個安全項目的上限是**同一個 PR 內所有 lock 合計**計算（Decision 34），所以這個 api lock 加上 `review.submit` 合共 5 項。`review` model 中可公開寫入／`untrusted` 的欄位是另一個安全項目，必須在**更早的 PR** 中合併並部署。
+`api/catalog/v1/submit-review.lock.md`（僅列 section；frontmatter 依 §2A.1，`kind: api`、`scope: feature`；**這個** lock 上的安全項目：`public`、`auth-removed`、`public-writes`（高風險），以及新回應欄位的 `output-new-field`（中風險））。新 INSERT 的 `write-sql` 項目（中風險）屬於 `review.submit` **method** 的 lock，而不是這個 api lock。每個 PR 最多 5 個安全項目的上限是**同一個 PR 內所有 lock 合計**計算（Decision 34），所以這個 api lock 加上 `review.submit` 合共 5 項。`review` model 中可公開寫入／`untrusted` 的欄位是另一個安全項目，必須在**更早的 PR** 中合併並部署。
 
 ````markdown
 ## Route

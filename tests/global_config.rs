@@ -133,7 +133,7 @@ fn private_modes_and_permission_errors() {
 fn dev_build_and_release_ignore_global() {
     let root = root();
     let project = root.join("project");
-    fs::create_dir_all(project.join("api/hello/v1/hello")).unwrap();
+    fs::create_dir_all(project.join("api/hello/v1")).unwrap();
     fs::write(
         project.join("api/hello/_definition.md"),
         vibe::scaffold::definition_content("hello"),
@@ -144,7 +144,7 @@ fn dev_build_and_release_ignore_global() {
         vibe::scaffold::version_content("hello", "v1"),
     )
     .unwrap();
-    fs::write(project.join("api/hello/v1/hello/hello.md"), "---\npublic: true\nwrites: false\nauth: none\n---\n# Hello\nGET /hello/v1/{slug}/hello returns constant JSON {\"message\":\"hello world\"} with status 200.\n").unwrap();
+    fs::write(project.join("api/hello/v1/hello.md"), "---\npublic: true\nwrites: false\nauth: none\n---\n# Hello\nGET /hello/v1/{slug}/hello returns constant JSON {\"message\":\"hello world\"} with status 200.\n").unwrap();
     fs::write(project.join(".gitignore"), ".env\n.vibe/\n").unwrap();
     let config = root.join("config");
     write_initial(&config.join("vibe"), &values(), "sentinel-secret").unwrap();

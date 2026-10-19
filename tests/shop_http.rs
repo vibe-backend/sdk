@@ -548,7 +548,7 @@ async fn legacy_approval_fields_are_ignored_with_a_warning() {
     // v1.8: locks carry no approval metadata or signature. Older locks that
     // still have them validate (with warnings) and build a manifest.
     let root = compiled_shop().await;
-    let lock = root.join("api/catalog/v1/get-product/get-product.lock.md");
+    let lock = root.join("api/catalog/v1/get-product.lock.md");
     let text = fs::read_to_string(&lock).unwrap();
     let front = text.split("\n---\n").next().unwrap();
     assert!(
@@ -570,7 +570,7 @@ async fn legacy_approval_fields_are_ignored_with_a_warning() {
     })
     .unwrap_or_else(|err| panic!("{err}"));
     let text = report.to_string();
-    let file = "api/catalog/v1/get-product/get-product.lock.md";
+    let file = "api/catalog/v1/get-product.lock.md";
     let lines: Vec<&str> = text.lines().filter(|l| l.contains(file)).collect();
     assert_eq!(lines.len(), 1, "one summary line per file: {text}");
     for field in [
@@ -842,7 +842,7 @@ fn edit(root: &Path, rel: &str, from: &str, to: &str) {
 #[tokio::test]
 async fn validator_rejects_steps_the_runtime_cannot_run() {
     let root = compiled_shop().await;
-    let lock = "api/catalog/v1/create-product/create-product.lock.md";
+    let lock = "api/catalog/v1/create-product.lock.md";
     edit(
         &root,
         lock,
@@ -868,13 +868,13 @@ async fn validator_reports_every_broken_file_at_once() {
     let root = compiled_shop().await;
     edit(
         &root,
-        "api/catalog/v1/create-product/create-product.lock.md",
+        "api/catalog/v1/create-product.lock.md",
         "- value: transform.out\n- status: 201",
         "- value: transform.out\n- status: 9999",
     );
     edit(
         &root,
-        "api/shop/v1/add-cart-item/add-cart-item.lock.md",
+        "api/shop/v1/add-cart-item.lock.md",
         "- target: cart-item.create",
         "- target: cart-item.create\n- bogus: 1",
     );
@@ -969,7 +969,7 @@ async fn manifest_refuses_a_hand_edited_lock_but_build_repairs_it() {
 #[tokio::test]
 async fn manifest_refuses_locks_that_fail_validation() {
     let root = compiled_shop().await;
-    let lock = root.join("api/catalog/v1/get-product/get-product.lock.md");
+    let lock = root.join("api/catalog/v1/get-product.lock.md");
     let text = fs::read_to_string(&lock).unwrap();
     fs::write(
         &lock,
@@ -987,7 +987,7 @@ async fn manifest_refuses_locks_that_fail_validation() {
 #[tokio::test]
 async fn manifest_refuses_stale_locks() {
     let root = compiled_shop().await;
-    let source = root.join("api/catalog/v1/get-product/get-product.md");
+    let source = root.join("api/catalog/v1/get-product.md");
     let text = fs::read_to_string(&source).unwrap();
     fs::write(&source, text.replace("timeout: 10s", "timeout: 9s")).unwrap();
     let key = sign::generate_key();
@@ -1039,7 +1039,7 @@ fn rerecord(root: &Path) {
 async fn legacy_rejected_or_pending_locks_are_ignored_with_one_warning() {
     for status in ["rejected", "pending"] {
         let root = compiled_shop().await;
-        let lock = root.join("api/catalog/v1/get-product/get-product.lock.md");
+        let lock = root.join("api/catalog/v1/get-product.lock.md");
         let text = fs::read_to_string(&lock).unwrap();
         fs::write(
             &lock,
@@ -1077,7 +1077,7 @@ async fn legacy_rejected_or_pending_locks_are_ignored_with_one_warning() {
 #[tokio::test]
 async fn tampered_dependency_hash_fails_deploy_and_manifest() {
     let root = compiled_shop().await;
-    let lock = root.join("api/catalog/v1/get-product/get-product.lock.md");
+    let lock = root.join("api/catalog/v1/get-product.lock.md");
     let text = fs::read_to_string(&lock).unwrap();
     let start = text.find("{ id: product, kind: model, hash: ").unwrap();
     let line_end = start + text[start..].find('}').unwrap();
@@ -1104,7 +1104,7 @@ async fn tampered_dependency_hash_fails_deploy_and_manifest() {
 #[tokio::test]
 async fn removing_roles_from_a_lock_cannot_deploy() {
     let root = compiled_shop().await;
-    let lock = root.join("api/catalog/v1/create-product/create-product.lock.md");
+    let lock = root.join("api/catalog/v1/create-product.lock.md");
     let text = fs::read_to_string(&lock).unwrap();
     assert!(text.contains("- roles: [staff]\n"));
     fs::write(&lock, text.replacen("- roles: [staff]\n", "", 1)).unwrap();
@@ -1589,16 +1589,14 @@ async fn production_serve_ignores_the_project_public_key() {
 #[tokio::test]
 async fn auth_mode_change_is_high_risk_and_keeps_the_inherited_roles() {
     let root = compiled_shop().await;
-    let lock =
-        fs::read_to_string(root.join("api/catalog/v1/import-product/import-product.lock.md"))
-            .unwrap();
+    let lock = fs::read_to_string(root.join("api/catalog/v1/import-product.lock.md")).unwrap();
     assert!(lock.contains("auth-mode-change"), "{lock}");
 
     // A mode change cannot widen the inherited roles.
     let root = copy_shop();
     edit(
         &root,
-        "api/catalog/v1/import-product/import-product.md",
+        "api/catalog/v1/import-product.md",
         "- mode: api-key",
         "- mode: api-key\n- roles: [staff, customer]",
     );
@@ -1626,7 +1624,7 @@ async fn auth_mode_change_is_high_risk_and_keeps_the_inherited_roles() {
 #[tokio::test]
 async fn auth_mode_change_without_the_high_risk_item_fails() {
     let root = compiled_shop().await;
-    let rel = "api/catalog/v1/import-product/import-product.lock.md";
+    let rel = "api/catalog/v1/import-product.lock.md";
     let text = fs::read_to_string(root.join(rel)).unwrap();
     let stripped: String = text
         .lines()
@@ -1655,7 +1653,7 @@ async fn auth_roles_merge_every_parent_auth_block() {
     );
     edit(
         &root,
-        "api/catalog/v1/import-product/import-product.md",
+        "api/catalog/v1/import-product.md",
         "- mode: api-key",
         "- mode: jwt\n- roles: [staff, admin, customer]",
     );
@@ -1696,7 +1694,7 @@ async fn route_jwt_overrides_end_to_end() {
     let build = |jwks: &'static str| async move {
         let root = copy_shop();
         // v1.8: locks must match a recompile, so the override lives in the source.
-        let source = root.join("api/catalog/v1/create-product/create-product.md");
+        let source = root.join("api/catalog/v1/create-product.md");
         let text = fs::read_to_string(&source).unwrap();
         fs::write(
             &source,
@@ -1863,7 +1861,7 @@ async fn private_endpoint_deployment_requires_signed_dev_mode() {
     })
     .await
     .unwrap_or_else(|e| panic!("{e}"));
-    let lock_path = root.join("api/catalog/v1/get-product/get-product.lock.md");
+    let lock_path = root.join("api/catalog/v1/get-product.lock.md");
     let mut lock = parse_lock(&fs::read_to_string(&lock_path).unwrap()).unwrap();
     lock.meta.compiler.endpoint_private = true;
     lock.meta.compiler.endpoint_host = "localhost".into();
@@ -1873,7 +1871,7 @@ async fn private_endpoint_deployment_requires_signed_dev_mode() {
         serde_json::from_str(&fs::read_to_string(root.join(vibe::buildrecord::PATH)).unwrap())
             .unwrap();
     record.compilers.insert(
-        "api/catalog/v1/get-product/get-product.lock.md".into(),
+        "api/catalog/v1/get-product.lock.md".into(),
         lock.meta.compiler.llm_stamp().unwrap(),
     );
     assert!(
