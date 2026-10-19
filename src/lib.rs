@@ -67,3 +67,6 @@ pub mod runtime_env;
 
 #[cfg(feature = "sdk")]
 pub mod global_config;
+
+#[cfg(feature = "sdk")]
+pub mod llm_replay;

@@ -710,7 +710,10 @@ pub fn build_signed(
             None
         },
         test_build: record.as_ref().is_some_and(|r| {
-            r.test_build || r.compilers.values().any(|s| s.llm_provider == "fake")
+            r.test_build
+                || r.compilers
+                    .values()
+                    .any(|s| matches!(s.llm_provider.as_str(), "fake" | "replay"))
         }),
         compilers: sanitized_compilers(record.map(|record| record.compilers).unwrap_or_default()),
         translations: loaded

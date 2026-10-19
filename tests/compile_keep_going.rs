@@ -198,6 +198,8 @@ async fn flaky_server() -> String {
 
 fn request() -> LlmRequest {
     LlmRequest {
+        source: String::new(),
+        purpose: String::new(),
         system: "s".into(),
         input: "i".into(),
         model: "gpt-test-2026-01-01".into(),

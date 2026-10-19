@@ -1,5 +1,11 @@
 use sha2::{Digest, Sha256};
 
+/// Feed one UTF-8 field using the compile prompt fingerprint encoding.
+pub fn hash_length_prefixed(hash: &mut Sha256, value: &str) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value.as_bytes());
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex::encode(digest)

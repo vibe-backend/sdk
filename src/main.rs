@@ -116,6 +116,12 @@ async fn run(cli: Cli) -> Result<(), String> {
             release_version,
             commit,
         } => {
+            if !release {
+                if !ci_or_prod() {
+                    vibe::global_config::load_process(&project)?;
+                }
+                vibe::llm_replay::scan_project(&project)?;
+            }
             check_build_inputs(&project)?;
             if release {
                 cmd_manifest(&project, &output, true, release_version, commit).await
@@ -161,13 +167,13 @@ async fn run(cli: Cli) -> Result<(), String> {
 }
 
 async fn cmd_build(project: &Path, check: bool) -> Result<(), String> {
-    if !ci_or_prod() {
-        vibe::global_config::load_process(project)?;
-    }
     if check {
         // Check and release always compile from source, ignoring disk locks.
         let config = llm::load_llm_config(&llm::env_map_from_process(), ci_or_prod()).ok();
-        let adapter = config.as_ref().map(|c| llm::adapter_for(c)).transpose()?;
+        let adapter = config
+            .as_ref()
+            .map(|c| llm::adapter_for_at(c, project))
+            .transpose()?;
         let output = vibe::compile::regenerate_project(&CompileOptions {
             root: project,
             check: true,
@@ -247,8 +253,16 @@ async fn cmd_manifest(
     release_version: Option<String>,
     commit: Option<String>,
 ) -> Result<(), String> {
-    if release && std::env::var("LLM_PROVIDER").as_deref() == Ok("fake") {
-        return Err("the fake LLM provider (LLM_PROVIDER=fake) is for tests and cannot be used for a release build".into());
+    if release
+        && (matches!(
+            std::env::var("LLM_PROVIDER").as_deref(),
+            Ok("fake" | "replay")
+        ) || std::env::var_os("VIBE_LLM_RECORD").is_some())
+    {
+        return Err(
+            "fake/replay LLM providers and VIBE_LLM_RECORD cannot be used for a release build"
+                .into(),
+        );
     }
     // Release manifests are signed by the release workflow with Sigstore
     // keyless (decisions 92, 119); no key is ever loaded for them.

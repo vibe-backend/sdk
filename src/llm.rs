@@ -31,6 +31,8 @@ pub struct LlmConfig {
 
 #[derive(Clone, Debug)]
 pub struct LlmRequest {
+    pub source: String,
+    pub purpose: String,
     pub system: String,
     pub input: String,
     pub model: String,
@@ -483,10 +485,14 @@ pub fn load_llm_config(
     ci_or_prod: bool,
 ) -> Result<LlmConfig, Report> {
     let mut nonempty = merge_dotenv("", env);
-    if nonempty.get("LLM_PROVIDER").map(String::as_str) == Some("fake") {
+    if matches!(
+        nonempty.get("LLM_PROVIDER").map(String::as_str),
+        Some("fake" | "replay")
+    ) {
+        let provider = nonempty["LLM_PROVIDER"].clone();
         return Ok(LlmConfig {
-            provider: "fake".into(),
-            model: "fake".into(),
+            provider: provider.clone(),
+            model: provider,
             base_url: String::new(),
             api_key: String::new(),
             timeout: Duration::from_secs(60),
@@ -2114,6 +2120,8 @@ mod tests {
             responder: |_: &LlmRequest| Ok("done".into()),
         };
         let request = LlmRequest {
+            source: String::new(),
+            purpose: String::new(),
             system: String::new(),
             input: String::new(),
             model: "test".into(),
@@ -2143,6 +2151,8 @@ mod tests {
             },
         };
         let request = LlmRequest {
+            source: String::new(),
+            purpose: String::new(),
             system: String::new(),
             input: String::new(),
             model: "test".into(),
@@ -2247,6 +2257,8 @@ mod tests {
             ("a b", "a%20b"),
         ] {
             let request = LlmRequest {
+                source: String::new(),
+                purpose: String::new(),
                 system: "s".into(),
                 input: "i".into(),
                 model: model.into(),
@@ -2275,6 +2287,8 @@ mod tests {
             );
         }
         let request = LlmRequest {
+            source: String::new(),
+            purpose: String::new(),
             system: "s".into(),
             input: "i".into(),
             model: "gemini-2.5-pro-001".into(),
@@ -2337,6 +2351,8 @@ mod tests {
     #[test]
     fn deterministic_bodies_have_no_tools() {
         let request = LlmRequest {
+            source: String::new(),
+            purpose: String::new(),
             system: "sys".into(),
             input: "in".into(),
             model: "vendor-model-2026-09-01".into(),
@@ -2645,6 +2661,8 @@ mod responses_tests {
             config.max_retries = 0;
             let adapter = HttpAdapter::new(config).unwrap();
             let request = LlmRequest {
+                source: String::new(),
+                purpose: String::new(),
                 system: "s".into(),
                 input: "i".into(),
                 model: model.into(),
@@ -2703,6 +2721,8 @@ mod responses_tests {
                 config.endpoint_private = true;
                 let adapter = HttpAdapter::new(config).unwrap();
                 let request = LlmRequest {
+                    source: String::new(),
+                    purpose: String::new(),
                     system: "sys".into(),
                     input: "in".into(),
                     model: "test-model".into(),
@@ -2750,6 +2770,8 @@ mod responses_tests {
             config.base_url = format!("http://{addr}/v1");
             let adapter = HttpAdapter::new(config).unwrap();
             let request = LlmRequest {
+                source: String::new(),
+                purpose: String::new(),
                 system: "s".into(),
                 input: "i".into(),
                 model: "gpt-4.1".into(),
@@ -2793,6 +2815,8 @@ mod responses_tests {
             let params = sent_params(&config, model);
             assert!(params.seed.is_none(), "responses never sends seed");
             let request = LlmRequest {
+                source: String::new(),
+                purpose: String::new(),
                 system: "s".into(),
                 input: "i".into(),
                 model: model.into(),
@@ -2891,6 +2915,8 @@ mod responses_tests {
         config.base_url = format!("http://{addr}/v1");
         let adapter = HttpAdapter::new(config).unwrap();
         let request = LlmRequest {
+            source: String::new(),
+            purpose: String::new(),
             system: "sys".into(),
             input: "in".into(),
             model: model.into(),
@@ -2923,6 +2949,8 @@ mod responses_tests {
     #[test]
     fn responses_body_and_parse() {
         let request = LlmRequest {
+            source: String::new(),
+            purpose: String::new(),
             system: "sys".into(),
             input: "in".into(),
             model: "gpt-5.1-2026-01-01".into(),
@@ -3255,6 +3283,17 @@ pub fn resolve_api_key_file(env: &mut HashMap<String, String>) -> Result<(), Str
 /// table data and source public wording; other unsupported shapes fail.
 /// Translation returns its input unchanged; repair requests use the original input.
 pub fn adapter_for(config: &LlmConfig) -> Result<Box<dyn LlmAdapter>, String> {
+    adapter_for_at(config, std::path::Path::new("."))
+}
+
+pub fn adapter_for_at(
+    config: &LlmConfig,
+    root: &std::path::Path,
+) -> Result<Box<dyn LlmAdapter>, String> {
+    crate::llm_replay::wrap(config, root)
+}
+
+pub(crate) fn raw_adapter(config: &LlmConfig) -> Result<Box<dyn LlmAdapter>, String> {
     if config.provider == "fake" {
         Ok(Box::new(FakeAdapter {
             responder: fake_response,
@@ -3377,6 +3416,8 @@ mod fake_response_tests {
     #[test]
     fn hello_sources_and_write_rejection() {
         let request = |source: &str| super::LlmRequest {
+            source: String::new(),
+            purpose: String::new(),
             system: String::new(),
             input: format!(
                 "KIND: api\nID: hello/v1/hello\n<<<SOURCE hello\n{source}\n<<<END SOURCE"

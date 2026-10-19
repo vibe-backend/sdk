@@ -93,7 +93,7 @@ pub async fn build_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, R
         if !(record
             .as_ref()
             .and_then(|r| r.compilers.get(&rel))
-            .is_some_and(|s| s.llm_provider == "fake")
+            .is_some_and(|s| matches!(s.llm_provider.as_str(), "fake" | "replay"))
             && std::env::var("LLM_PROVIDER").as_deref() != Ok("fake"))
             && doc.meta.vibe_version == lock_stamp()
             && doc.meta.lock_version == crate::lock::LOCK_VERSION
@@ -126,11 +126,13 @@ pub async fn build_project(opts: &CompileOptions<'_>) -> Result<CompileOutput, R
             let loaded =
                 crate::llm::load_llm_config(&crate::llm::env_map_from_process(), ci_or_prod)
                     .and_then(|c| {
-                        crate::llm::adapter_for(&c).map(|a| (c, a)).map_err(|e| {
-                            let mut r = Report::new();
-                            r.push(Diag::error("build", e));
-                            r
-                        })
+                        crate::llm::adapter_for_at(&c, opts.root)
+                            .map(|a| (c, a))
+                            .map_err(|e| {
+                                let mut r = Report::new();
+                                r.push(Diag::error("build", e));
+                                r
+                            })
                     });
             match loaded {
                 Ok((c, a)) => {
@@ -556,7 +558,9 @@ fn collect_build_record(
     (
         texts,
         crate::buildrecord::BuildRecord {
-            test_build: compilers.values().any(|s| s.llm_provider == "fake"),
+            test_build: compilers
+                .values()
+                .any(|s| matches!(s.llm_provider.as_str(), "fake" | "replay")),
             version: 1,
             locks: record,
             translations,
@@ -678,6 +682,9 @@ fn cache_key(
     docs: &HashMap<String, LockDoc>,
 ) -> Option<String> {
     let config = opts.llm_config?;
+    if config.provider == "replay" || std::env::var_os("VIBE_LLM_RECORD").is_some() {
+        return None;
+    }
     let stamp = stamp_from(Some(config));
     let material = serde_json::json!({
         "vibe-version": lock_stamp(),
@@ -855,6 +862,12 @@ async fn llm_sections(
     let mut attempt = 0u32;
     loop {
         let request = LlmRequest {
+            source: source.rel.clone(),
+            purpose: if attempt == 0 {
+                "compile".into()
+            } else {
+                format!("repair-{attempt}")
+            },
             system: system.clone(),
             input: attempt_input.clone(),
             model: config.model.clone(),
@@ -1335,12 +1348,20 @@ async fn translate_source(
         .root
         .join(".vibe/cache/translate")
         .join(format!("{key}.txt"));
-    if let Ok(text) = fs::read_to_string(&path) {
+    if let Ok(text) = fs::read_to_string(&path).and_then(|text| {
+        if config.provider == "replay" || std::env::var_os("VIBE_LLM_RECORD").is_some() {
+            Err(std::io::Error::other("fixture mode"))
+        } else {
+            Ok(text)
+        }
+    }) {
         if !text.trim().is_empty() {
             return Ok(text);
         }
     }
     let request = LlmRequest {
+        source: source.rel.clone(),
+        purpose: "translate".into(),
         system: TRANSLATE_PROMPT.into(),
         input: delimit_source(&body),
         model: config.model.clone(),
@@ -3466,16 +3487,14 @@ mod prompt_tests {
                     "for vibe <stamp>.",
                     1,
                 );
-                hash.update((prompt.len() as u64).to_be_bytes());
-                hash.update(prompt.as_bytes());
+                crate::hashutil::hash_length_prefixed(&mut hash, &prompt);
             }
         }
         for prompt in [
             super::TRANSLATE_PROMPT.to_string(),
             crate::prompt_guide::repair_input("<source>", "<previous>", &["<error>".into()]),
         ] {
-            hash.update((prompt.len() as u64).to_be_bytes());
-            hash.update(prompt.as_bytes());
+            crate::hashutil::hash_length_prefixed(&mut hash, &prompt);
         }
         let actual = hex::encode(hash.finalize());
         assert_eq!(actual, include_str!("compile_prompt.sha256").trim(), "compile prompt changed: update src/compile_prompt.sha256 and bump the minor/major version, or the next rc after a tagged rc (decision 181; CI skips pre-releases)");

@@ -5,6 +5,8 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Decision 189:** Add reviewed LLM replay fixtures for credential-free CI previews, local response recording with secret scans, unused fixture warnings and release/test-build guards. Prompts are unchanged.
+
 - **Decision 188 (rc.5):** Compile plain-language public endpoints with model table context, model-aware SQL validation and strict implicit-memory SQL checks through repair. Unknown model providers (e.g. store kind `memory` instead of implicit provider `main`) fail the build, list available providers and feed the repair retry; prompt input names `provider: main` for the implicit store. Method steps with statically known args (Transform in or an inline map) must supply every required target method `Signature` input; build errors name the item, target and field, also checked in `validate`. Normalize endpoint routes, infer public auth removal and public writes, and warn when prose limits cannot be enforced. Frontmatter removing auth or setting public still conflicts with source requiring login (fail-closed); the public phrase gate ignores negated sentences. GET and POST may share an explicit path in separate files. Prompt changes ride with rc.5.
 
 - **Decision 187 (rc.5):** Add optional structured `api/_project.md` route prefix and single-tenant default-slug. Signed manifests carry routing settings; runtime preserves slug permissions and tenant quotas, rejects extra slugs and credential tenant mismatches. Slug mode invalidates locks/caches; prefix changes only rebuild the manifest. Compile and interactive prompts now receive the public route rule as input data (prompt change rides with rc.5).

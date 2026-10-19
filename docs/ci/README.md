@@ -104,3 +104,24 @@ Use `VIBE_MIGRATE_DATABASE_URL` for owner credentials and `VIBE_DATABASE_URL`
 for the non-owner serving connection. Once nothing is pending, subsequent
 startups may omit owner credentials. See [automatic migrations](../runtime-config.md#automatic-migrations-decision-179)
 for tenant selection, advisory locks and destructive-migration recovery.
+
+## Replay previews without a key
+
+Review and commit recorded responses under `fixtures/llm/` as described in
+[replay and recording](../README-details.md#llm-replay-and-recording-decision-189).
+PR CI can run `LLM_PROVIDER=replay vibe build --check` without any key, URL or
+model and without LLM network access. Replay is for test/preview builds;
+release builds require a real provider. CI cannot record new responses.
+
+To include rendered locks in the GitHub step summary, build first (check only
+compiles in memory), then append the generated, untracked locks:
+
+```sh
+LLM_PROVIDER=replay vibe build
+while IFS= read -r -d '' f; do
+  printf '\n### %s\n\n' "$f"
+  cat "$f"
+done < <(git ls-files -z -o --exclude-standard --ignored '*.lock.md') >> "$GITHUB_STEP_SUMMARY"
+```
+
+This Bash snippet includes ignored lock output; locks remain uncommitted.
