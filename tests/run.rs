@@ -484,3 +484,15 @@ fn release_builder_writes_claim_only_under_actions_and_never_for_dev() {
         );
     }
 }
+
+#[test]
+fn fake_build_without_provider_sources() {
+    let root = project();
+    fs::remove_dir_all(root.join("providers")).unwrap();
+    build(&root);
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(json["provenance"]["implicit_memory_provider"], true);
+    assert!(!root.join("providers").exists());
+    fs::remove_dir_all(root).unwrap();
+}

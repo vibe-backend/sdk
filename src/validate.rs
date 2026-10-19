@@ -189,6 +189,17 @@ pub fn validate_loaded(
         }
         docs.insert(source.id.clone(), doc);
     }
+    // Check references as well as recorded hashes: implicit main has no lock.
+    // Source kinds decide whether the implicit provider exists, even if a
+    // provider source has a missing or invalid lock.
+    let implicit = crate::compile::implicit_memory_provider(sources);
+    if implicit {
+        for id in docs.keys() {
+            if let Err(diag) = crate::compile::dependencies(id, &docs, implicit) {
+                report.push(diag);
+            }
+        }
+    }
     check_dependencies(&docs, sources, &mut report);
     check_inherited_auth(&docs, sources, &mut report);
     if opts.deploy {

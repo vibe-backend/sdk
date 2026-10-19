@@ -79,6 +79,8 @@ pub struct Provenance {
     pub signing: Option<SigningClaim>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub test_build: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub implicit_memory_provider: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub compilers: BTreeMap<String, crate::lock::LlmStamp>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -653,7 +655,12 @@ pub fn build_signed(
         .build_record
         .as_deref()
         .and_then(|raw| serde_json::from_str::<crate::buildrecord::BuildRecord>(raw).ok());
-    let mut manifest = build_manifest_with_record(&docs, !info.release, record.as_ref())?;
+    let mut manifest = build_manifest_with_provider(
+        &docs,
+        !info.release,
+        record.as_ref(),
+        crate::compile::implicit_memory_provider(&loaded.sources),
+    )?;
     manifest.build_mode = Some(if info.release {
         BuildMode::Release
     } else {
@@ -682,7 +689,11 @@ pub fn build_signed(
     }
     locks.sort_by(|a, b| a.id.cmp(&b.id));
     items.sort_by(|a, b| (&a.lock, &a.item).cmp(&(&b.lock, &b.item)));
+    if info.release && manifest.provenance.implicit_memory_provider {
+        eprintln!("warning: no providers/ defined; using the implicit in-memory provider `main`: data is kept in memory only and is lost when the runtime restarts; add providers/main.md to use PostgreSQL");
+    }
     manifest.provenance = Provenance {
+        implicit_memory_provider: manifest.provenance.implicit_memory_provider,
         signing: if info.release {
             SigningClaim::from_env(|key| std::env::var(key).ok(), env!("CARGO_PKG_VERSION"))
         } else {
@@ -841,6 +852,19 @@ pub fn build_manifest_with_record(
     dev: bool,
     record: Option<&crate::buildrecord::BuildRecord>,
 ) -> Result<Manifest, Report> {
+    // These document-only entry points receive the full validated lock set;
+    // build_signed has sources available and uses their provider decision instead.
+    let implicit = !docs.values().any(|doc| doc.meta.kind == Kind::Provider);
+    build_manifest_with_provider(docs, dev, record, implicit)
+}
+
+#[cfg(feature = "sdk")]
+pub(crate) fn build_manifest_with_provider(
+    docs: &HashMap<String, LockDoc>,
+    dev: bool,
+    record: Option<&crate::buildrecord::BuildRecord>,
+    implicit: bool,
+) -> Result<Manifest, Report> {
     if !dev
         && record.is_some_and(|record| {
             record
@@ -907,7 +931,10 @@ pub fn build_manifest_with_record(
         return Err(report);
     }
     Ok(Manifest {
-        provenance: Provenance::default(),
+        provenance: Provenance {
+            implicit_memory_provider: implicit,
+            ..Provenance::default()
+        },
         manifest_version: MANIFEST_VERSION,
         build_mode: dev.then_some(BuildMode::Dev),
         routes,

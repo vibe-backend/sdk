@@ -245,6 +245,7 @@ async fn compile_docs(
     natural: &HashMap<String, LockDoc>,
 ) -> Result<Compiled, Report> {
     let opts = &opts;
+    let implicit = implicit_memory_provider(sources);
     let mut report = Report::new();
     let mut docs: HashMap<String, LockDoc> = HashMap::new();
     let mut ordered: Vec<String> = Vec::new();
@@ -329,7 +330,9 @@ async fn compile_docs(
             if let Some(sections) = key
                 .as_deref()
                 .and_then(|k| read_cache(opts.root, k))
-                .and_then(|sections| checked_llm_sections(opts, source, &docs, sections).ok())
+                .and_then(|sections| {
+                    checked_llm_sections(opts, source, &docs, implicit, sections).ok()
+                })
             {
                 report.push(Diag::warning(
                     &source.rel,
@@ -337,7 +340,7 @@ async fn compile_docs(
                 ));
                 sections
             } else {
-                match llm_sections(opts, source, &docs, &budget).await {
+                match llm_sections(opts, source, &docs, implicit, &budget).await {
                     Ok((sections, fingerprint)) => {
                         if let Some(key) = &key {
                             pending_cache.insert(
@@ -372,7 +375,7 @@ async fn compile_docs(
         };
         doc.meta.compiler = stamp.clone();
         doc.meta.vibe_version = lock_stamp();
-        if let Err(diags) = normalize(&mut doc, source, &docs) {
+        if let Err(diags) = normalize(&mut doc, source, &docs, implicit) {
             report.extend(diags);
             continue;
         }
@@ -424,7 +427,7 @@ async fn compile_docs(
     let mut stale_deps = Vec::new();
     let mut failed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for id in &ordered {
-        let deps = match dependencies(id, &docs) {
+        let deps = match dependencies(id, &docs, implicit) {
             Ok(deps) => deps,
             Err(diag) => {
                 report.push(diag);
@@ -639,7 +642,12 @@ fn write_or_check(
         }
     }
     if !report.has_errors() {
-        if let Ok(manifest) = crate::manifest::build_manifest(docs) {
+        if let Ok(manifest) = crate::manifest::build_manifest_with_provider(
+            docs,
+            false,
+            None,
+            implicit_memory_provider(sources),
+        ) {
             for method in &manifest.methods {
                 for step in method.steps.iter().filter(|s| s.op == "query") {
                     if let Err(reason) = crate::runtime::memsql::classify(&step.sql)
@@ -748,6 +756,7 @@ fn checked_llm_sections(
     opts: &CompileOptions<'_>,
     source: &SourceFile,
     docs: &HashMap<String, LockDoc>,
+    implicit: bool,
     sections: Vec<Section>,
 ) -> Result<Vec<Section>, Vec<String>> {
     let original_sections = sections.clone();
@@ -759,7 +768,7 @@ fn checked_llm_sections(
     doc.meta.source_type = SourceType::Natural;
     doc.meta.compiler = stamp_from(opts.llm_config);
     doc.meta.vibe_version = lock_stamp();
-    normalize(&mut doc, source, docs)
+    normalize(&mut doc, source, docs, implicit)
         .map_err(|diags| diags.into_iter().map(|d| d.to_string()).collect::<Vec<_>>())?;
     normalize_source_lines(&mut doc.sections, &source.combined_text());
     doc.meta.security_items = security::extract_items(&doc);
@@ -797,6 +806,7 @@ async fn llm_sections(
     opts: &CompileOptions<'_>,
     source: &SourceFile,
     docs: &HashMap<String, LockDoc>,
+    implicit: bool,
     budget: &std::sync::Arc<crate::llm_budget::CallBudget>,
 ) -> Result<(Vec<Section>, Option<String>), Diag> {
     let adapter = opts
@@ -833,8 +843,8 @@ async fn llm_sections(
         let text = strip_fence(&response.text);
         let formatted = check_llm_output(&text, source.kind, source.scope);
         let format_error = formatted.is_err();
-        let checked =
-            formatted.and_then(|sections| checked_llm_sections(opts, source, docs, sections));
+        let checked = formatted
+            .and_then(|sections| checked_llm_sections(opts, source, docs, implicit, sections));
         if dump && checked.is_err() {
             if let Err(err) = dump_llm_output(
                 opts.root,
@@ -1543,6 +1553,7 @@ fn normalize(
     doc: &mut LockDoc,
     source: &SourceFile,
     docs: &HashMap<String, LockDoc>,
+    implicit: bool,
 ) -> Result<(), Vec<Diag>> {
     for section in &mut doc.sections {
         if matches!(section.name.as_str(), "Fields" | "Request") {
@@ -1585,7 +1596,12 @@ fn normalize(
         Kind::Model => normalize_model(doc, source),
         Kind::Method => normalize_method(doc),
         Kind::Api => match source.scope {
-            Some(Scope::Definition) => normalize_definition(doc),
+            Some(Scope::Definition) => {
+                if implicit && find_section(&doc.sections, "Providers").is_none() {
+                    doc.sections.push(Section::none("Providers"));
+                }
+                normalize_definition(doc)
+            }
             Some(Scope::Version) => normalize_version(doc),
             _ => normalize_feature(doc, source, docs),
         },
@@ -2230,7 +2246,16 @@ fn normalize_source_lines(sections: &mut [Section], text: &str) {
     }
 }
 
-fn dependencies(id: &str, docs: &HashMap<String, LockDoc>) -> Result<Vec<Dependency>, Diag> {
+/// No synthetic document or lock is created for the built-in memory provider.
+pub(crate) fn implicit_memory_provider(sources: &[SourceFile]) -> bool {
+    !sources.iter().any(|source| source.kind == Kind::Provider)
+}
+
+pub(crate) fn dependencies(
+    id: &str,
+    docs: &HashMap<String, LockDoc>,
+    implicit: bool,
+) -> Result<Vec<Dependency>, Diag> {
     let doc = docs.get(id).expect("doc");
     let mut ids: Vec<(String, Kind)> = Vec::new();
     match doc.meta.kind {
@@ -2324,6 +2349,9 @@ fn dependencies(id: &str, docs: &HashMap<String, LockDoc>) -> Result<Vec<Depende
     }
     let mut deps = Vec::new();
     for (dep_id, kind) in ids {
+        if kind == Kind::Provider && dep_id == "main" && implicit {
+            continue;
+        }
         let Some(dep) = docs.get(&dep_id) else {
             return Err(Diag::error(
                 &doc.meta.source,
@@ -4526,5 +4554,25 @@ mod sampling_warning_tests {
             .contains("LLM_SEND_SAMPLING=0"));
         config.send_sampling = true;
         assert_eq!(super::sampling_warning(&config, &warned), None);
+    }
+}
+
+#[cfg(test)]
+mod provider_dependency_tests {
+    use super::*;
+
+    #[test]
+    fn missing_explicit_provider_is_not_an_implicit_dependency() {
+        let doc = LockDoc {
+            meta: Meta::pending(Kind::Model, None, "product", "models/product/product.md"),
+            sections: crate::lock::parse_sections(
+                "## Table\n- provider: main\n- table: products\n",
+            )
+            .unwrap(),
+        };
+        let docs = HashMap::from([("product".to_string(), doc)]);
+        let error = dependencies("product", &docs, false).unwrap_err();
+        assert!(error.to_string().contains("missing dependency main"));
+        assert!(dependencies("product", &docs, true).unwrap().is_empty());
     }
 }

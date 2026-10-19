@@ -322,12 +322,13 @@
 | 181 | Lock frontmatter 唔准有 `writes:`；build 驗證同 run／runtime 載入都會報錯。Writes 由 method steps 推導（169），請喺 source markdown 宣告。Compile prompt 列出每個被呼叫 method 自己宣告嘅 error codes，模型只用列出嘅 codes（加 runtime public codes 同本地 validate failures，171），減少 repair；lock 保持 deterministic。RC tag 發佈之後任何 compile prompt 改動都要升下一個 rc（今次 `1.0.0-rc.3`），否則決定 176 exact-match 會容許 released rc 同 main 用同一 vibe-version 但產生唔同 lock。CI prompt check 跳過 pre-release，所以呢個係 release 規則，唔係 CI 強制。 | 已批准（產品經理 2026-10-18） | 2A.4、2A.6、2C.3、10.1 |
 | 182 | 修改決定 79、92、119：每個 project 嘅 release manifest 由 project tag workflow 呼叫 SDK reusable workflow `vibe-backend/sdk/.github/workflows/vibe-project-release.yml`，用 GitHub OIDC 經 Sigstore keyless 簽；runtime 用 binary 編入嘅 trust root 離線驗證，trust root 輪換要出新版 runtime。兩邊都 pin：signer 由 runtime 寫死，SAN／Build Signer URI 必須係 `https://github.com/vibe-backend/sdk/.github/workflows/vibe-project-release.yml@refs/tags/v<runtime version>`，Build Signer Digest 必須係 release 編入嘅 SDK tag commit（compile-time `VIBE_SDK_COMMIT`）；冇呢個值嘅 binary 拒絕所有 release manifest，永遠冇 runtime env override。Project 身份由部署者用 `--expect-identity`／`VIBE_EXPECT_IDENTITY`、`--expect-issuer`／`VIBE_EXPECT_ISSUER`（只接受 `https://token.actions.githubusercontent.com`）、可選 `--expect-repository-id`／`VIBE_EXPECT_REPOSITORY_ID` pin，永遠唔由 artifact 讀取。Identity 格式 `https://github.com/<owner>/<repo>/.github/workflows/<file>@refs/tags/v*` 或 `@refs/tags/v<version>`；owner／repo 大細楷完全相等，要用 GitHub 回報嘅大細楷；唯一替換係 `v*` → `v<VIBE_RELEASE_VERSION>`，唔接受 glob／regex，固定 tag 要同部署版本一致。證書 issuer、build config、source repository／ref／commit、可選 repository id、trigger `push`、runner `github-hosted`、SAN、build signer URI／digest 全部要完全相等，必須有 Rekor inclusion proof。Flag／env 衝突喺 startup 拒絕；冇 pin 拒絕 release（development 都一樣）；release `test_build` 永遠拒絕，唔理 `--allow-test-build`。Dev manifest 同 `.vibe/signing.pub` 不變，只限 development；release 永遠唔信任 dev key。Option D（unsigned release）延至 GA 之後，冇長期簽名 key。實作：PR 1 runtime pins；manifest claim 同 `vibe-runtime verify`（PR 2）、reusable workflow（PR 3）、SDK release 編入 signer commit（PR 3/4）跟進。 補充（#309 PR 2）：`vibe build --release` 喺 GitHub Actions 寫入 `provenance.signing`（issuer、source_identity、source_repository、signer_workflow），只作診斷，runtime 永遠唔用佢做信任判斷；同 pin 唔一致時只印提示。`vibe-runtime` 新增 `verify` 子指令（決定 179 原本只有 `run`）：用同 startup 完全相同嘅驗證，唔 serve，exit 0／非 0。 補充（#309 PR 3）：reusable workflow 已加入；SDK release build 設定 `VIBE_SDK_COMMIT`。 | 已批准（產品經理 2026-10-18） | 2C.3b、9B、2C.2、2C.3 |
 | 183 | In-memory query 執行器支援小型 SQL allowlist：① `UPDATE t SET c = c + <整數或$n>`（亦准 literal／param 直接賦值）`WHERE <單欄唯一鍵> = $n RETURNING <cols或*>`；② 單列 `INSERT ... VALUES ... ON CONFLICT (<單欄唯一鍵>) DO UPDATE SET c = t.c + <整數或EXCLUDED.c> RETURNING ...` 或 `DO NOTHING [RETURNING ...]`；③ `SELECT <cols或*> FROM t WHERE <單欄唯一鍵> = $n`；④ `SELECT COALESCE(MAX(c), <整數>) AS x FROM t WHERE <單欄唯一鍵> = $n`。只准已設定 model table，`id` 算唯一鍵；同 CRUD 一樣租戶注入／隔離同 role 級檢查（`public_reader` 只准讀，`public_writer` 可 INSERT／UPDATE）；SQL 提及 `tenant_id` 一律拒絕，memory query steps 冇模擬逐欄 grant。亦檢查 unique、NOT NULL，套用 INSERT 系統預設值同 UPDATE `updated_at`。成句 SQL 喺同一 store lock 入面原子執行，整數溢位報錯；DO NOTHING 衝突回零列，aggregate 冇資料回預設值。其他 SQL 回 `MEMORY_UNSUPPORTED_SQL`（HTTP 500，backend 能力限制，唔係 client 輸入錯）；run 只警告唔支援嘅 query steps，列 method target 同原因；`vibe build` 每個唔支援 step 喺 stderr 警告（PostgreSQL 照常可用）。更新決定 74 已知差異。 | 已批准（產品經理 2026-10-18） | 2C.4、2A.6 |
+| 184 | 冇 `providers/`（或者冇任何 provider）嘅 project 用內建隱含 in-memory provider `main`；dev、`vibe run`、`vibe build --release` 都得；release build 同 runtime 啟動會出警告（資料只喺記憶體，重啟會冇）；production 照決定 91 拒絕 in-memory；有 provider source 嘅 project 行為不變（冇 `main` 照樣 `missing dependency main`）；allowlist 寫其他 provider 照舊驗證；manifest provenance 記 `implicit_memory_provider`。 | 已批准 | 2、5、10.1 |
 
 ## 1. 目錄同命名
 
 ```text
 project/
-├── providers/
+├── providers/                    # 可選（決定 184）
 │   ├── {name}.md
 │   └── {name}.lock.md
 ├── pipelines/
@@ -1857,6 +1858,8 @@ Client 流程：`POST …/refresh` 成功攞到新 access token 之後，再 `PO
 - 另加 IP 限流：每分鐘 10 次登入（見 11.2 `login-guard`）；request 次數用滑動窗口；另外每個網段新計數器 slot 數目按決定 130 限制（IPv4 /24、IPv6 /48 加 /32，加平台層跨租戶網段 slot 上限，固定窗口）。
 
 ## 5. 資料庫提供者 `providers/{name}.md`
+
+`providers/` 可選（決定 184）：冇任何 provider source 就用內建隱含 in-memory provider `main`，唔產生 source 或 lock；資料重啟會冇，release build 同 runtime 啟動會警告。要用 PostgreSQL 就加 `providers/main.md`；有明確 provider 嘅 project 照舊驗證。production 照決定 91 拒絕 in-memory。
 
 source 用自然語言描述，例如：
 
