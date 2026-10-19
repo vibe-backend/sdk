@@ -105,7 +105,6 @@ for the non-owner serving connection. Once nothing is pending, subsequent
 startups may omit owner credentials. See [automatic migrations](../runtime-config.md#automatic-migrations-decision-179)
 for tenant selection, advisory locks and destructive-migration recovery.
 
-
 ## Replay previews without a key
 
 Review and commit recorded responses under `fixtures/llm/` as described in

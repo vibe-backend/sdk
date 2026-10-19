@@ -1,4 +1,6 @@
 {
+  // Recorded LLM responses must preserve their raw bytes.
+  "ignores": ["**/fixtures/llm/**"],
   "config": {
     "default": true,
     "MD013": false,
