@@ -199,14 +199,19 @@ when XDG_CONFIG_HOME is nonempty and absolute, otherwise
 `LLM_MODEL`, `LLM_API_STYLE` and `LLM_API_KEY_FILE`. Unknown keys and inline
 `LLM_API_KEY`/`OPENAI_API_KEY` are refused. Put the key in a separate file;
 relative key paths resolve against the global config directory. Both files
-must have no group/other permissions on Unix (`chmod 600 <path>`). This check
-applies only to global files, not project or process-supplied key files.
+must have no group/other permission bits on Unix (`mode & 077 == 0`; fix with
+`chmod 600 <path>`). This check applies only to global files, not project or
+process-supplied key files.
 
 Precedence per key is process environment > project `.env` > global; empty
 LLM values count as missing. Higher-precedence credentials skip the global key
-file. Interactive first run writes global files (0600) in a new directory
-(0700), refuses to overwrite existing files, and keeps `LLM_ALLOW_PRIVATE_HOST`
-project-scoped. `VIBE_DEBUG_LLM_CONFIG=1` prints variable names and sources
+file. Interactive first run writes global `llm.env` and a separate key file
+(0600) in a new directory (0700) only when no `LLM_*` setting exists in the
+process environment, project `.env` or global config. With partial project or
+process LLM settings, it prompts only for missing values and appends them to
+project `.env` (0600), adding `.env` to `.gitignore`. It refuses to overwrite
+existing files and keeps `LLM_ALLOW_PRIVATE_HOST` project-scoped.
+`VIBE_DEBUG_LLM_CONFIG=1` prints variable names and sources
 (`env`, `project`, `global`) to stderr, never values.
 
 Global settings are ignored by `vibe run`/runtime, `vibe build --release`,

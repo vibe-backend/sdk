@@ -5,7 +5,7 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
-- **Decision 185:** Add private global development LLM settings and separate key files, per-key precedence and secret-free source diagnostics; first-run setup writes global config. Align decision 91 with environment-only production detection and explain implicit providers in memory refusal errors. Hello-world scaffolding now uses the implicit provider.
+- **Decision 185:** Add private global development LLM settings and separate key files, per-key precedence and secret-free source diagnostics; first-run setup writes global `llm.env` and a separate key file (0600) only when no `LLM_*` setting exists in the process environment, project `.env` or global config. With partial project or process LLM settings, it prompts only for missing values and appends them to project `.env` (0600), adding `.env` to `.gitignore`. Align decision 91 with environment-only production detection and explain implicit providers in memory refusal errors. Hello-world scaffolding now uses the implicit provider.
 
 - **Decision 184:** Projects without provider sources use an implicit in-memory `main`, recorded in manifest provenance without a source or lock. Release builds and runtime startup warn about data loss on restart; production still refuses memory and PostgreSQL requires an explicit provider.
 
