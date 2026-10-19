@@ -61,7 +61,8 @@ an LLM. Missing, stale or wrong-version locks fail with a hint to run `vibe buil
 - `--artifact <path>` runs a manifest file or a directory containing `manifest.json`,
   from `vibe build -o` or a release build. Release verification uses
   `<manifest>.sigstore.json` or `VIBE_MANIFEST_BUNDLE`; existing Sigstore and
-  attestation requirements still apply.
+  attestation requirements still apply. Release manifests require the deployer pins below,
+  including in development.
 - `--addr <address>` defaults to `127.0.0.1:8080`.
 - `--db memory|postgres` selects the store, also settable with `VIBE_DB`.
   The default memory store is for development; PostgreSQL uses the existing
@@ -70,6 +71,47 @@ an LLM. Missing, stale or wrong-version locks fail with a hint to run `vibe buil
 
 Keyless CI builds and file-based API keys are documented in
 [LLM provider setup](best-practices/llm-provider-setup.md#keyless-test-builds-and-key-files).
+
+### Release manifest pins (decision 182)
+
+| Flag | Environment | Requirement |
+| --- | --- | --- |
+| `--expect-identity` | `VIBE_EXPECT_IDENTITY` | Required caller workflow identity |
+| `--expect-issuer` | `VIBE_EXPECT_ISSUER` | Required; only `https://token.actions.githubusercontent.com` |
+| `--expect-repository-id` | `VIBE_EXPECT_REPOSITORY_ID` | Optional numeric GitHub repository id |
+
+Identity format: `https://github.com/<owner>/<repo>/.github/workflows/<file>@refs/tags/v*`
+or an exact `@refs/tags/v<version>`. Matching is exact and case-sensitive: use the
+exact owner/repo case GitHub reports. Only literal `v*` is substituted with
+`v<VIBE_RELEASE_VERSION>`; no globs or regex. An exact tag must agree with that
+version. Repository ids are 1–20 decimal digits with no leading zero
+(`gh api repos/<owner>/<repo> --jq .id`).
+
+Flags and environment values must agree when both are set; otherwise startup
+fails with `disagree; set only one`. Empty environment values count as unset.
+Invalid syntax fails startup even for development manifests.
+Without identity or issuer, startup fails with `release manifest needs a pinned signer`
+and lists the missing flag / env pairs. There is no default identity.
+Release manifests are verified in development too; release `test_build` is always
+refused, even with `--allow-test-build`. Development manifests still use
+`.vibe/signing.pub` only in development, with a note that pins are ignored.
+A development key next to a release manifest is ignored with a warning.
+
+The signer half is fixed in the binary: SAN and Build Signer URI name the SDK
+`vibe-project-release.yml` at the runtime's own version, and Build Signer Digest
+matches the SDK tag commit compiled in as `VIBE_SDK_COMMIT`. There is no runtime
+override. Current non-release builds without that commit refuse release manifests.
+SDK release embedding follows in PR 3/4; use a clean build when changing this
+compile-time value. The project pin is never taken from artifact contents.
+Verification checks caller repository, workflow, ref, commit, optional repository
+id, issuer, push trigger, GitHub-hosted runner and Rekor inclusion, then uses
+`cosign` on `PATH` offline against the compiled-in trust root.
+
+```sh
+VIBE_RELEASE_VERSION=1.8.0 vibe-runtime --artifact dist --db postgres \
+  --expect-identity 'https://github.com/acme/shop/.github/workflows/release.yml@refs/tags/v*' \
+  --expect-issuer https://token.actions.githubusercontent.com
+```
 
 ## Build inputs (decision 179)
 

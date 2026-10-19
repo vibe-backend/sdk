@@ -205,9 +205,28 @@ fn prepared_hello_router_without_socket() {
         use tower::ServiceExt;
         let root = project();
         build(&root);
-        fs::remove_file(root.join("manifest.json")).unwrap();
         tokio::runtime::Runtime::new().unwrap().block_on(async {
+            vibe::run::prepare(&vibe::run::RunOptions {
+                pins: vibe::run::PinArgs {
+                    identity: Some(
+                        "https://github.com/acme/shop/.github/workflows/release.yml@refs/tags/v*"
+                            .into(),
+                    ),
+                    issuer: Some(vibe::sigstore::ISSUER.into()),
+                    repository_id: None,
+                },
+                project: root.clone(),
+                source: vibe::run::RunSource::Artifact(root.clone()),
+                addr: "127.0.0.1:8080".into(),
+                db: vibe::run::DbChoice::Memory,
+                allow_destructive_migrations: false,
+                allow_test_build: true,
+            })
+            .await
+            .unwrap();
+            fs::remove_file(root.join("manifest.json")).unwrap();
             let ready = vibe::run::prepare(&vibe::run::RunOptions {
+                pins: Default::default(),
                 project: root.clone(),
                 source: vibe::run::RunSource::Project,
                 addr: "127.0.0.1:8080".into(),
@@ -249,7 +268,13 @@ fn prepared_hello_router_without_socket() {
                 .env("LLM_PROVIDER", "bogus")
                 .env("LLM_BASE_URL", "http://10.255.255.1");
         }
-        assert!(child.status().unwrap().success());
+        let out = child.args(["--nocapture"]).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("ignored for development manifests"));
     }
 }
 
@@ -309,7 +334,15 @@ fn runtime_artifact_serves_hello() {
         .env_clear()
         .args(["run", "--artifact"])
         .arg(&root)
-        .args(["--allow-test-build", "--addr", &addr.to_string()])
+        .args([
+            "--allow-test-build",
+            "--addr",
+            &addr.to_string(),
+            "--expect-identity",
+            "https://github.com/acme/shop/.github/workflows/release.yml@refs/tags/v*",
+            "--expect-issuer",
+            vibe::sigstore::ISSUER,
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -335,6 +368,7 @@ fn runtime_artifact_serves_hello() {
     })();
     let _ = child.kill();
     let out = child.wait_with_output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ignored for development manifests"));
     fs::remove_dir_all(root).unwrap();
     assert!(
         response.starts_with("HTTP/1.1 200") && response.contains("hello world"),
