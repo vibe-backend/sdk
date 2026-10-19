@@ -552,6 +552,12 @@ pub(crate) fn model_problems(
     for column in &names.columns {
         let Some(name) = column.last() else { continue };
         let qualifier = column.iter().rev().nth(1).map(String::as_str);
+        if name == "tenant_id" {
+            let table = qualifier
+                .unwrap_or_else(|| names.tables.first().map(String::as_str).unwrap_or("?"));
+            problems.push(format!("unknown column {table}.{name} in step {step}"));
+            continue;
+        }
         if qualifier.is_some_and(|q| names.derived.iter().any(|d| d == q)) {
             continue;
         }
@@ -570,8 +576,7 @@ pub(crate) fn model_problems(
         let output_alias = qualifier.is_none()
             && names.outputs.contains(name)
             && !names.projection_columns.contains(name);
-        if name == "tenant_id"
-            || (candidates.is_empty() && qualifier.is_some())
+        if (candidates.is_empty() && qualifier.is_some())
             || (!candidates.is_empty() && !known_column && !output_alias)
         {
             let table = table

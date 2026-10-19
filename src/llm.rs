@@ -3250,9 +3250,9 @@ pub fn resolve_api_key_file(env: &mut HashMap<String, String>) -> Result<(), Str
 }
 
 /// Creates the network adapter or the deterministic, network-free test adapter.
-/// Fake supports only public GET API features returning constant JSON objects
-/// (default {"message":"hello world"}); GET/public words need not appear in source.
-/// Sources mentioning writes or authentication, models, methods and other shapes fail.
+/// Fake supports constant-response GET features (default {"message":"hello world"})
+/// and the small natural-language counter fixture. The counter uses dependency
+/// table data and source public wording; other unsupported shapes fail.
 /// Translation returns its input unchanged; repair requests use the original input.
 pub fn adapter_for(config: &LlmConfig) -> Result<Box<dyn LlmAdapter>, String> {
     if config.provider == "fake" {
