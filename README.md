@@ -138,3 +138,24 @@ Required CI checks are **Markdown lint & link check** and **Rust fmt / clippy / 
 ## Binary installation
 
 The install/upgrade/remove manager in [docs/install.md](docs/install.md) installs verified pre-release assets. It checks SHA256SUMS and GitHub build provenance attestations before installation; see the guide for verification requirements and source-build alternatives.
+
+Global LLM settings for development live in `$XDG_CONFIG_HOME/vibe/llm.env`
+when XDG_CONFIG_HOME is nonempty and absolute, otherwise
+`$HOME/.config/vibe/llm.env`. Allowed keys are `LLM_PROVIDER`, `LLM_BASE_URL`,
+`LLM_MODEL`, `LLM_API_STYLE` and `LLM_API_KEY_FILE`. Unknown keys and inline
+`LLM_API_KEY`/`OPENAI_API_KEY` are refused. Put the key in a separate file;
+relative key paths resolve against the global config directory. Both files
+must have no group/other permissions on Unix (`chmod 600 <path>`). This check
+applies only to global files, not project or process-supplied key files.
+
+Precedence per key is process environment > project `.env` > global; empty
+LLM values count as missing. Higher-precedence credentials skip the global key
+file. Interactive first run writes global files (0600) in a new directory
+(0700), refuses to overwrite existing files, and keeps `LLM_ALLOW_PRIVATE_HOST`
+project-scoped. `VIBE_DEBUG_LLM_CONFIG=1` prints variable names and sources
+(`env`, `project`, `global`) to stderr, never values.
+
+Global settings are ignored by `vibe run`/runtime, `vibe build --release`,
+CI (`CI` nonempty except `false`/`0`, or `GITHUB_ACTIONS=true`), and environments
+other than development (`VIBE_ENV=dev/development/local/test`, unset or empty).
+Development `vibe`, `vibe build` and `vibe build --check` use them.

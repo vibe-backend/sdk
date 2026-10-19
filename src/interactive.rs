@@ -45,7 +45,9 @@ pub fn setup_with_resolver(
     env: HashMap<String, String>,
     resolve: impl Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
 ) -> Result<llm::LlmConfig, String> {
-    let env = llm::merge_dotenv("", &env);
+    let dir = crate::global_config::config_dir(&env)?;
+    let project_env = fs::read_to_string(project.join(".env")).unwrap_or_default();
+    let (env, _) = crate::global_config::load(&env, &project_env, &dir, false)?;
     if let Ok(config) = llm::load_llm_config(&env, false) {
         io.write(&llm::redact(
             &format!(
@@ -95,7 +97,7 @@ pub fn setup_with_resolver(
                 .filter_map(|k| combined.get(*k).map(String::as_str))
                 .collect();
             let message = llm::redact(&errors(report), &secrets);
-            if !missing_only {
+            if !missing_only || dir.join("llm.env").exists() {
                 return Err(message);
             }
         }
@@ -187,6 +189,23 @@ pub fn setup_with_resolver(
                 .map_err(|r| llm::redact(&errors(r), &[&key]))?;
         }
     }
+    let global_values = combined
+        .iter()
+        .filter(|(k, _)| {
+            matches!(
+                k.as_str(),
+                "LLM_PROVIDER" | "LLM_BASE_URL" | "LLM_MODEL" | "LLM_API_STYLE"
+            )
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let (config_path, key_path) = crate::global_config::write_initial(&dir, &global_values, &key)?;
+    io.write(&format!(
+        "wrote {} and {}",
+        config_path.display(),
+        key_path.display()
+    ));
+    values.retain(|k, _| k == "LLM_ALLOW_PRIVATE_HOST");
     fs::create_dir_all(project).map_err(|e| e.to_string())?;
     if !values.is_empty() {
         let mut options = fs::OpenOptions::new();
@@ -219,28 +238,30 @@ pub fn setup_with_resolver(
             .map_err(|_| "Cannot write .env".to_string())?;
         io.write("wrote .env (LLM settings)");
     }
-    let ignore = project.join(".gitignore");
-    let existing = fs::read_to_string(&ignore).unwrap_or_default();
-    if !existing
-        .lines()
-        .any(|l| matches!(l.trim(), ".env" | "/.env"))
-    {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(ignore)
-            .map_err(|e| e.to_string())?;
-        if !existing.is_empty() && !existing.ends_with('\n') {
-            file.write_all(b"\n").map_err(|e| e.to_string())?;
+    if values.contains_key("LLM_ALLOW_PRIVATE_HOST") {
+        let ignore = project.join(".gitignore");
+        let existing = fs::read_to_string(&ignore).unwrap_or_default();
+        if !existing
+            .lines()
+            .any(|l| matches!(l.trim(), ".env" | "/.env"))
+        {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(ignore)
+                .map_err(|e| e.to_string())?;
+            if !existing.is_empty() && !existing.ends_with('\n') {
+                file.write_all(b"\n").map_err(|e| e.to_string())?;
+            }
+            file.write_all(b".env\n").map_err(|e| e.to_string())?;
         }
-        file.write_all(b".env\n").map_err(|e| e.to_string())?;
+        io.write(".gitignore contains .env");
     }
     for (k, v) in combined {
         if k.starts_with("LLM_") && std::env::var(&k).map_or(true, |v| v.trim().is_empty()) {
             std::env::set_var(k, v);
         }
     }
-    io.write(".gitignore contains .env");
     Ok(config)
 }
 
@@ -372,7 +393,6 @@ pub async fn run(
             format!("api/{}/{}/_version.md", a.definition, a.version),
             scaffold::version_content(&a.definition, &a.version),
         ),
-        ("providers/main.md".into(), scaffold::provider_content()),
         (
             format!(
                 "api/{}/{}/{}/{}.md",

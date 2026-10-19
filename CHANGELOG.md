@@ -5,6 +5,8 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Decision 185:** Add private global development LLM settings and separate key files, per-key precedence and secret-free source diagnostics; first-run setup writes global config. Align decision 91 with environment-only production detection and explain implicit providers in memory refusal errors. Hello-world scaffolding now uses the implicit provider.
+
 - **Decision 184:** Projects without provider sources use an implicit in-memory `main`, recorded in manifest provenance without a source or lock. Release builds and runtime startup warn about data loss on restart; production still refuses memory and PostgreSQL requires an explicit provider.
 
 - **Decision 182 (#309 PR 3):** Add the reusable project release workflow with guarded tag builds, keyless signing, verification, publishing and a secret-free dry-run self-test. SDK release builds embed `VIBE_SDK_COMMIT`; the CI docs example now calls the reusable workflow.

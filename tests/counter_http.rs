@@ -291,6 +291,23 @@ fn implicit_provider_builds_and_guards() {
             "{stderr}"
         );
     }
+    for artifact in [false, true] {
+        let mut command = cli();
+        command
+            .env("VIBE_ENV", "production")
+            .args(["run", "--db", "memory"]);
+        if artifact {
+            command.args(["--artifact", "manifest.json"]);
+        }
+        let out = command.output().unwrap();
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("project has no providers/"), "{stderr}");
+        assert!(
+            stderr.contains("adding providers/main.md (PostgreSQL) fixes it"),
+            "{stderr}"
+        );
+    }
     let out = cli()
         .env("LLM_PROVIDER", "fake")
         .args(["build", "--check"])
