@@ -1,132 +1,30 @@
-# Reference release workflow (spec v1.8, decisions 113, 118, 119).
-# Install it as `.github/workflows/release.yml`: the Sigstore certificate
-# identity that runtimes accept is exactly
-#   https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v<version>
-#
-# - pull_request: informational build preview + policy report in the job
-#   summary. Never a deploy source. Uses the low-quota preview LLM key.
-# - push of a `v*` tag: build ONCE in the protected `release` environment,
-#   sign the manifest with Sigstore keyless (GitHub OIDC -> Fulcio, recorded
-#   in Rekor; no long-lived key), attest it, upload manifest + bundle.
-# - deploy: verify the attestation and the Sigstore signature (exact identity,
-#   issuer, commit, GitHub-hosted runner; fail closed), then promote the same
-#   digest to staging and production without rebuilding.
+# Copy to .github/workflows/release.yml in the project repository.
 name: vibe release
-
 on:
-  pull_request:
   push:
     tags: ["v*"]
-
-permissions:
-  contents: read
-
+permissions: {}
 jobs:
-  preview:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      VIBE_LLM_API_KEY: ${{ secrets.VIBE_LLM_API_KEY_PREVIEW }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Install vibe
-        run: cargo install --locked --git https://github.com/vibe-backend/sdk --bin vibe vibe
-      - name: Build preview and policy report (informational)
-        run: |
-          set -o pipefail
-          {
-            echo '## vibe build --check preview (not a deploy artifact)'
-            echo '```'
-            LLM_API_KEY="$VIBE_LLM_API_KEY" vibe build --check --project . 2>&1
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-  # The only job with id-token: write.
   release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    environment: release
     permissions:
-      contents: read
+      contents: write
       id-token: write
       attestations: write
-    outputs:
-      digest: ${{ steps.digest.outputs.sha256 }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Install vibe
-        run: cargo install --locked --git https://github.com/vibe-backend/sdk --bin vibe vibe
-      - uses: sigstore/cosign-installer@v3
-      - name: Release build (compile in memory, policy, unsigned manifest)
-        env:
-          VIBE_LLM_API_KEY: ${{ secrets.VIBE_LLM_API_KEY }}
-        run: |
-          vibe build --release --project . \
-            --release-version "${GITHUB_REF_NAME#v}" \
-            --commit "$GITHUB_SHA" \
-            -o manifest.json 2> >(tee -a "$GITHUB_STEP_SUMMARY" >&2)
-      - name: Sign with Sigstore keyless (Fulcio + Rekor, no fallback)
-        run: |
-          cosign sign-blob --yes --new-bundle-format \
-            --bundle manifest.json.sigstore.json manifest.json
-      - id: digest
-        run: echo "sha256=$(sha256sum manifest.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: manifest.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: manifest
-          path: |
-            manifest.json
-            manifest.json.sigstore.json
+    # Must be a tag of vibe-backend/sdk, not a branch or SHA; Dependabot can bump it.
+    # v1.0.0 is a placeholder. The reusable workflow is available only from the
+    # first SDK release tag that contains it (the next release after v1.0.0-rc.4).
+    # Select that release or later; the SDK tag version must equal your runtime version.
+    uses: vibe-backend/sdk/.github/workflows/vibe-project-release.yml@v1.0.0
+    with:
+      environment: release
+      llm-model: gpt-4.1-2025-04-14
+    secrets:
+      llm-api-key: ${{ secrets.VIBE_LLM_API_KEY }} # environment secret in release
 
-  deploy:
-    needs: release
-    runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 1
-      matrix:
-        target: [staging, production]
-    environment: ${{ matrix.target }}
-    permissions:
-      contents: read
-      attestations: read
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: manifest
-      - uses: sigstore/cosign-installer@v3
-      - name: Same digest as the release build
-        run: echo "${{ needs.release.outputs.digest }}  manifest.json" | sha256sum -c -
-      - name: Verify attestation (fail closed)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh attestation verify manifest.json \
-            --repo vibe-backend/sdk \
-            --signer-workflow vibe-backend/sdk/.github/workflows/release.yml \
-            --source-ref "$GITHUB_REF" \
-            --source-digest "$GITHUB_SHA" \
-            --deny-self-hosted-runners
-      - name: Verify Sigstore signature (exact identity; fail closed)
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          cosign verify-blob manifest.json \
-            --bundle manifest.json.sigstore.json \
-            --new-bundle-format \
-            --certificate-identity "https://github.com/vibe-backend/sdk/.github/workflows/release.yml@refs/tags/v${version}" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            --certificate-github-workflow-sha "$GITHUB_SHA" \
-            --certificate-github-workflow-repository vibe-backend/sdk \
-            --certificate-github-workflow-ref "refs/tags/v${version}"
-      - name: Deploy
-        run: |
-          echo "deploy manifest.json + manifest.json.sigstore.json to ${{ matrix.target }}"
-          echo "runtime: VIBE_RELEASE_VERSION=${GITHUB_REF_NAME#v} (vibe run re-verifies offline, incl. GitHub-hosted runner)"
+# Deploy-side verification (replace placeholders with the project's values):
+# gh attestation verify manifest.json --repo <owner>/<repo> \
+#   --signer-workflow vibe-backend/sdk/.github/workflows/vibe-project-release.yml \
+#   --source-ref refs/tags/v<version> --source-digest <commit> --deny-self-hosted-runners
+# VIBE_ENV=production VIBE_RELEASE_VERSION=<version> vibe-runtime verify --artifact dist \
+#   --expect-identity 'https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/v*' \
+#   --expect-issuer https://token.actions.githubusercontent.com --expect-repository-id <id>

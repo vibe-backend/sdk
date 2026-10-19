@@ -1,0 +1,5 @@
+# actionlint 1.7.12 does not yet model the reusable workflow job metadata.
+paths:
+  .github/workflows/vibe-project-release.yml:
+    ignore:
+      - '^property "workflow_(repository|sha|ref)" is not defined in object type '
