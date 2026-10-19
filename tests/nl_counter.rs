@@ -229,7 +229,25 @@ async fn route_prefix_and_slug_errors_reach_repair() {
 #[tokio::test]
 async fn public_gate_repairs_both_directions() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    for public in [true, false] {
+    for (prose, public) in [
+        ("Anyone can read the counter.", true),
+        ("This is a public endpoint.", true),
+        ("No login needed.", true),
+        ("任何人都可以讀", true),
+        ("唔使登入", true),
+        ("Read my counter.", false),
+        ("This endpoint is not public.", false),
+        ("Not for anyone without an account.", false),
+        ("Only staff can read it; it requires login.", false),
+        ("唔係公開", false),
+        ("任何人都唔可以睇", false),
+        ("需要登入", false),
+        ("Anyone can read it; login required.", false),
+        (
+            "This is public but not for anyone without an account.",
+            false,
+        ),
+    ] {
         let root =
             std::env::temp_dir().join(format!("vibe-public-repair-{}", uuid::Uuid::new_v4()));
         copy(
@@ -242,15 +260,7 @@ async fn public_gate_repairs_both_directions() {
         let private_body = public_body
             .replace("- public: true", "- public: false")
             .replace("### -auth\n\n- removed: true", "### auth\n\n- mode: jwt");
-        fs::write(
-            path,
-            if public {
-                "Anyone can read the counter."
-            } else {
-                "Read my counter."
-            },
-        )
-        .unwrap();
+        fs::write(path, prose).unwrap();
         let (bad, good) = if public {
             (&private_body, &public_body)
         } else {
@@ -259,14 +269,21 @@ async fn public_gate_repairs_both_directions() {
         let calls = AtomicUsize::new(0);
         let adapter = vibe::FakeAdapter {
             responder: |request: &vibe::llm::LlmRequest| {
+                if request.system == vibe::compile::TRANSLATE_PROMPT {
+                    return Ok("Read the counter.".into());
+                }
                 if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     Ok(bad.clone())
                 } else {
-                    assert!(request.input.contains(if public {
-                        "source clearly says"
-                    } else {
-                        "source does not clearly say"
-                    }));
+                    assert!(
+                        request.input.contains(if public {
+                            "source clearly says"
+                        } else {
+                            "source does not clearly say"
+                        }),
+                        "{prose}: {}",
+                        request.input
+                    );
                     Ok(good.clone())
                 }
             },
@@ -280,6 +297,12 @@ async fn public_gate_repairs_both_directions() {
         .await
         .unwrap_or_else(|r| panic!("{r}"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let lock = fs::read_to_string(root.join("api/web/v1/counter.lock.md")).unwrap();
+        assert!(
+            lock.contains(&format!("- public: {public}\n")),
+            "{prose}: {lock}"
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -2520,10 +2520,7 @@ fn semantic_check(
             if let Some((_, value)) = front.iter().find(|(key, _)| key == field) {
                 let enabled =
                     !matches!(value.as_str(), "false" | "none" | "removed" | "off" | "[]");
-                if field != "public"
-                    && field != "auth"
-                    && ((enabled && negative) || (!enabled && definite))
-                {
+                if (enabled && negative) || (!enabled && definite) {
                     report.push(Diag::error(
                         &doc.meta.source,
                         format!(
@@ -3914,12 +3911,23 @@ mod security_tests {
     }
 
     #[test]
-    fn explicit_auth_pin_precedes_prose() {
+    fn ambiguous_occurrence_keeps_other_affirmative_conflicts() {
+        for auth in ["removed", "none"] {
+            let text = format!("---\nauth: {auth}\n---\nRequire login. not necessarily login.");
+            assert!(errors(&text, PUBLIC)
+                .iter()
+                .any(|e| e.contains("conflicts with source wording near `login`")));
+        }
+    }
+
+    #[test]
+    fn explicit_auth_pin_cannot_contradict_prose() {
         assert!(errors(
             "---\npublic: true\nauth: removed\n---\nRequire login.",
             PUBLIC
         )
-        .is_empty());
+        .iter()
+        .any(|e| e.contains("conflicts with source wording")));
     }
 
     #[test]
@@ -4012,8 +4020,12 @@ mod security_tests {
     }
 
     #[test]
-    fn explicit_public_pin_precedes_prose() {
-        assert!(errors("---\npublic: true\nauth: removed\n---\nnot public", PUBLIC).is_empty());
+    fn explicit_public_pin_cannot_contradict_prose() {
+        assert!(
+            errors("---\npublic: true\nauth: removed\n---\nnot public", PUBLIC)
+                .iter()
+                .any(|e| e.contains("conflicts with source wording"))
+        );
     }
 
     #[test]
@@ -4031,7 +4043,11 @@ mod security_tests {
         let (doc, sources) = feature(text, PRIVATE);
         let mut report = Report::new();
         semantic_check(&doc, &sources, &HashMap::new(), &mut report);
-        assert!(!report.has_errors(), "{report}");
+        assert!(report.has_errors(), "{report}");
+        assert!(
+            report.to_string().contains("conflicts with source wording"),
+            "{report}"
+        );
         assert!(!report.to_string().contains("ambiguous negation"));
         assert!(keyword_reading("login not required", "login").1);
         assert_eq!(keyword_reading("唔需要登入", "登入"), (false, false, true));
@@ -4231,7 +4247,11 @@ mod security_tests {
     fn public_prose_replaces_flags_and_pins_win() {
         assert!(errors("Anyone can list products; it is public.", PUBLIC).is_empty());
         assert!(!errors("This list is public.", PRIVATE).is_empty());
-        assert!(errors("---\npublic: false\n---\nThis list is public.\n", PRIVATE).is_empty());
+        assert!(
+            errors("---\npublic: false\n---\nThis list is public.\n", PRIVATE)
+                .iter()
+                .any(|e| e.contains("conflicts with source wording"))
+        );
     }
 
     #[test]
@@ -4674,25 +4694,73 @@ pub(crate) fn clearly_public(source: &str) -> bool {
     let Ok(prose) = security_prose(&lower) else {
         return false;
     };
-    [
-        "anyone can",
-        "public",
-        "publicly",
-        "no login",
+    // Strip explicit exemptions before looking for remaining login requirements.
+    let mut requirements = prose.clone();
+    for phrase in AUTH_REMOVAL_PHRASES.iter().copied().chain([
+        "無需登入",
+        "不用登入",
+        "毋須登入",
+        "免登入",
         "without logging in",
         "without login",
         "no authentication",
         "unauthenticated",
-        "公開",
-        "任何人",
-        "唔使登入",
-        "不用登入",
-        "無需登入",
-        "毋須登入",
-        "免登入",
-    ]
-    .iter()
-    .any(|phrase| keyword_occurrences(&prose, phrase).3)
+    ]) {
+        requirements = requirements.replace(phrase, "");
+    }
+    if ["login", "log in", "auth", "authentication", "登入", "驗證"]
+        .iter()
+        .any(|word| keyword_occurrences(&requirements, word).0)
+    {
+        return false;
+    }
+    static NEGATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:\b(?:not|no|never|without|cannot|non)\b|\b[a-z]+n't\b|[唔不冇無毋非])",
+        )
+        .expect("public negation pattern")
+    });
+    prose
+        .split(['.', '!', '?', '。', '！', '？', '\n'])
+        .any(|sentence| {
+            // Remove affirmative no-auth phrases before checking for other negations.
+            let mut remainder = sentence.to_string();
+            for phrase in [
+                "no login",
+                "no auth",
+                "without logging in",
+                "without login",
+                "no authentication",
+                "unauthenticated",
+                "唔使登入",
+                "不用登入",
+                "無需登入",
+                "毋須登入",
+                "免登入",
+            ] {
+                remainder = remainder.replace(phrase, "");
+            }
+            !NEGATION.is_match(&remainder)
+                && [
+                    "anyone can",
+                    "public",
+                    "publicly",
+                    "no login",
+                    "without logging in",
+                    "without login",
+                    "no authentication",
+                    "unauthenticated",
+                    "公開",
+                    "任何人",
+                    "唔使登入",
+                    "不用登入",
+                    "無需登入",
+                    "毋須登入",
+                    "免登入",
+                ]
+                .iter()
+                .any(|phrase| keyword_occurrences(sentence, phrase).3)
+        })
 }
 
 /// Deterministic advisory for requirements that did not survive compilation.
@@ -4744,6 +4812,10 @@ mod natural_rules_tests {
     fn public_phrase_gate_and_negation() {
         for text in [
             "Anyone can read the counter.",
+            "This is a public endpoint.",
+            "No login needed.",
+            "任何人都可以讀",
+            "唔使登入",
             "任何人可以讀取。",
             "公開計數器。",
             "No login is needed.",
@@ -4753,6 +4825,14 @@ mod natural_rules_tests {
         }
         for text in [
             "Read my counter.",
+            "This endpoint is not public.",
+            "Not for anyone without an account.",
+            "Only staff can read it; it requires login.",
+            "唔係公開",
+            "任何人都唔可以睇",
+            "需要登入",
+            "Anyone can read it; login required.",
+            "This is public but not for anyone without an account.",
             "This is not public.",
             "`public`",
             "Uses public-writable fields.",
