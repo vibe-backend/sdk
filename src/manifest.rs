@@ -33,6 +33,10 @@ pub struct Manifest {
     pub manifest_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_mode: Option<BuildMode>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub route_prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_slug: Option<String>,
     pub routes: Vec<RouteSpec>,
     pub models: Vec<ModelSpec>,
     pub methods: Vec<MethodSpec>,
@@ -661,6 +665,12 @@ pub fn build_signed(
         record.as_ref(),
         crate::compile::implicit_memory_provider(&loaded.sources),
     )?;
+    let settings = crate::project::Routes::load(root).map_err(single)?;
+    manifest.route_prefix = settings.prefix;
+    manifest.default_slug = settings.default_slug;
+    for route in &mut manifest.routes {
+        route.path = format!("{}{}", manifest.route_prefix, route.path);
+    }
     manifest.build_mode = Some(if info.release {
         BuildMode::Release
     } else {
@@ -727,11 +737,37 @@ pub fn build_signed(
     Ok(manifest)
 }
 
+/// Validate deterministic routing metadata before serving a loaded manifest.
+pub fn check_route_settings(manifest: &Manifest) -> Result<(), String> {
+    crate::project::Routes {
+        prefix: manifest.route_prefix.clone(),
+        default_slug: manifest.default_slug.clone(),
+    }
+    .validate()?;
+    for route in &manifest.routes {
+        if !route
+            .path
+            .strip_prefix(&manifest.route_prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+        {
+            return Err(format!(
+                "manifest route {} does not start with route_prefix {}",
+                route.path, manifest.route_prefix
+            ));
+        }
+        if manifest.default_slug.is_some() && route.path.contains("{slug}") {
+            return Err(format!("manifest route {} uses {{slug}} with default_slug; remove the slug segment or default_slug", route.path));
+        }
+    }
+    Ok(())
+}
+
 /// Outside development only release manifests run (decisions 75, 79, 91):
 /// built with `vibe build --release` and verified with Sigstore keyless
 /// ([`read_release_manifest`]). High-risk items are reported, not blocking
 /// (decision 90 withdrawn).
 pub fn check_deployable(manifest: &Manifest, development: bool) -> Result<(), String> {
+    check_route_settings(manifest)?;
     for lock in &manifest.provenance.locks {
         if lock.vibe_version.starts_with("sha256:") {
             return Err(
@@ -830,6 +866,7 @@ pub fn verify_manifest(mut manifest: Manifest, key: &VerifyingKey) -> Result<Man
         return Err(single("manifest signature is invalid".into()));
     }
     manifest.signature = signature;
+    check_route_settings(&manifest).map_err(single)?;
     Ok(manifest)
 }
 
@@ -935,6 +972,8 @@ pub(crate) fn build_manifest_with_provider(
             implicit_memory_provider: implicit,
             ..Provenance::default()
         },
+        route_prefix: String::new(),
+        default_slug: None,
         manifest_version: MANIFEST_VERSION,
         build_mode: dev.then_some(BuildMode::Dev),
         routes,
@@ -2144,6 +2183,8 @@ mod constant_response_tests {
                 let manifest = Manifest {
                     provenance: Default::default(),
                     build_mode: None,
+                    route_prefix: String::new(),
+                    default_slug: None,
                     manifest_version: MANIFEST_VERSION,
                     routes: vec![route],
                     models: vec![],
@@ -2233,6 +2274,8 @@ mod private_host_tests {
     #[test]
     fn old_signed_private_manifest_still_verifies() {
         let mut manifest = Manifest {
+            route_prefix: String::new(),
+            default_slug: None,
             manifest_version: MANIFEST_VERSION,
             build_mode: Some(BuildMode::Dev),
             routes: Vec::new(),

@@ -11,7 +11,7 @@ mod ops;
 pub mod refresh;
 pub mod replay;
 pub mod rsakey;
-mod slugs;
+pub(crate) mod slugs;
 mod sql;
 
 pub use challenge::{ChallengeContext, ChallengeError, ChallengeVerifier, TurnstileVerifier};

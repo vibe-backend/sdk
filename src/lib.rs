@@ -22,6 +22,7 @@ pub mod lock;
 pub mod lockcommit;
 pub mod manifest;
 pub mod netguard;
+pub mod project;
 #[cfg(feature = "sdk")]
 pub mod prompt_guide;
 pub mod runtime;

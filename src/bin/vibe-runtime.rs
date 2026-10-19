@@ -80,6 +80,13 @@ fn verify(args: VerifyArgs) -> Result<(), String> {
         pins: args.pins.into(),
         allow_test_build: args.allow_test_build,
     })?;
+    if !result.manifest.route_prefix.is_empty() || result.manifest.default_slug.is_some() {
+        println!(
+            "routes: prefix {}, default-slug {}",
+            result.manifest.route_prefix,
+            result.manifest.default_slug.as_deref().unwrap_or("(none)")
+        );
+    }
     if let Some(identity) = result.identity {
         println!(
             "verified: {} (release {}, commit {}, identity {})",

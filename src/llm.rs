@@ -3321,7 +3321,17 @@ fn fake_response(request: &LlmRequest) -> Result<String, String> {
             }
         }
     }
-    Ok(format!("## Route\n- method: GET\n- path: /{}/{}/{{slug}}/{}\n## Access\n- public: true\n- tenant: path.slug\n## Pipelines\n### -auth\n- removed: true\n## Limits\n(none)\n## Request\n(none)\n## Response\n- status: 200\n## Transform\n- in: {{}}\n- out: {}\n## Steps\n### s1\n- op: respond\n- value: transform.out\n- status: 200\n- source-lines: 1-1\n## Errors\n(none)\n", parts[0], parts[1], parts[2], body))
+    let default_mode = input
+        .lines()
+        .find(|l| l.starts_with("Project route rule:"))
+        .is_some_and(|l| l.contains("tenant: default-slug"));
+    let segment = if default_mode { "" } else { "/{slug}" };
+    let tenant = if default_mode {
+        "default-slug"
+    } else {
+        "path.slug"
+    };
+    Ok(format!("## Route\n- method: GET\n- path: /{}/{}{segment}/{}\n## Access\n- public: true\n- tenant: {tenant}\n## Pipelines\n### -auth\n- removed: true\n## Limits\n(none)\n## Request\n(none)\n## Response\n- status: 200\n## Transform\n- in: {{}}\n- out: {}\n## Steps\n### s1\n- op: respond\n- value: transform.out\n- status: 200\n- source-lines: 1-1\n## Errors\n(none)\n", parts[0], parts[1], parts[2], body))
 }
 
 #[cfg(test)]

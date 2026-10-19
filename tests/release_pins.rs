@@ -425,6 +425,8 @@ fn verify_development_requires_explicit_development_and_checks_signature() {
     let root = root();
     let key = vibe::sign::load_or_create(&root).unwrap();
     let mut manifest = vibe::manifest::Manifest {
+        route_prefix: String::new(),
+        default_slug: None,
         manifest_version: 1,
         build_mode: Some(vibe::manifest::BuildMode::Dev),
         routes: vec![],

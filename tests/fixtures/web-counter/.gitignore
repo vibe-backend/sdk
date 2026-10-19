@@ -1,0 +1,5 @@
+.env
+*.lock.md
+manifest.json
+.vibe/*
+!.vibe/slugs.json

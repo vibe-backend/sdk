@@ -325,6 +325,7 @@
 | 184 | 冇 `providers/`（或者冇任何 provider）嘅 project 用內建隱含 in-memory provider `main`；dev、`vibe run`、`vibe build --release` 都得；release build 同 runtime 啟動會出警告（資料只喺記憶體，重啟會冇）；production 照決定 91 拒絕 in-memory；有 provider source 嘅 project 行為不變（冇 `main` 照樣 `missing dependency main`）；allowlist 寫其他 provider 照舊驗證；manifest provenance 記 `implicit_memory_provider`。 | 已批准 | 2、5、10.1 |
 | 185 | 全域 LLM 設定用絕對非空 `$XDG_CONFIG_HOME/vibe/llm.env`，否則 `$HOME/.config/vibe/llm.env`；只准 LLM_PROVIDER、LLM_BASE_URL、LLM_MODEL、LLM_API_STYLE、LLM_API_KEY_FILE。優先次序 env > project .env > global，空值當缺少。Key 放獨立 0600 檔案，由 LLM_API_KEY_FILE 引用，相對路徑以設定目錄為準；兩個檔案都拒絕 group/world 權限並提示 chmod 600。CI、production、build --release 同 runtime 永遠唔讀。VIBE_DEBUG_LLM_CONFIG=1 只印名稱同來源。首次互動 vibe 只有 process env、project `.env` 同全域設定都冇任何 `LLM_*` 設定，先寫全域 `llm.env` 同獨立 key file（0600）；project `.env` 或 env 有部分 LLM 設定時，只問缺少嘅值並追加到 project `.env`（0600），同喺 `.gitignore` 加 `.env`，唔覆蓋現有檔案；private host opt-in 留喺 project。澄清決定 91：production 只由環境決定，唔睇 release manifest；VIBE_ENV 嘅 dev/development/local/test 係開發，ci 係 CI，其餘非空值係 production；unset/空值用 memory 係開發，否則 production。Release manifest 可喺 VIBE_ENV=development 用 memory（例如 Docker demo），production 仍拒絕所有 memory，包括隱含 main。 | 已確認 | 2A.8、2C.1、2C.4 |
 | 186 | Endpoint 改用平面檔案 `api/<def>/<ver>/<endpoint>.md`，可選同層 `<endpoint>.schema.md`，build 產生同層 `<endpoint>.lock.md`；路由由檔名推導，id 同 runtime 行為不變。舊 endpoint 資料夾係硬性 build error，每個舊檔都要列出確切新路徑；rc.5 breaking change，唔支援雙格式。 | 已確認 | 2A.1、2C.1 |
+| 187 | 可選 `api/_project.md` 用結構化 `## Routes` 設定 `prefix` 同 `default-slug`，唔經 LLM。prefix 必須以 `/` 開頭、冇尾斜線／空段，每段只准小寫英數開頭加英數或連字號，總長最多 64，首段唔可以係 `_internal` 或 `health`；空值／缺省維持原路由。default-slug 沿用 slugs.json 驗證，只限單租戶：其他 slug、路由 `{slug}` 或 public `tenant: path.slug` 都係 build error，要移除衝突或 default-slug；public 改用 `tenant: default-slug`。runtime 同明示 slug 用完全相同 tenant lookup、權限、角色同 tenant_id quota，憑證 tenant 必須相符。manifest 記錄 `route_prefix`／`default_slug` 並一同簽署；prefix 只喺 manifest 套用，slug mode 變更令 lock／cache 過期。prompt 只以 input data 傳入 project route rule，隨 rc.5 發佈。 | 已確認 | 2A.1、2C.1 |
 
 ## 1. 目錄同命名
 
@@ -348,6 +349,7 @@ project/
 │           ├── {method}.md
 │           └── {method}.lock.md
 └── api/
+    ├── _project.md                      # 選填，結構化專案路由設定，唔產生 lock
     └── {definition}/
         ├── _definition.md
         ├── _definition.lock.md
@@ -364,7 +366,7 @@ project/
 - migration 檔名 `{seq}-{name}`：`seq` 係 4 位數字（`0001` 起，連續唔可以跳號），例如 `0003-add-user-phone.md`。lock 檔由編譯器產生，唔准手寫或者手改。
 - `_` 開頭嘅檔係保留檔，永遠唔會被路由；`_definition.md` 只可以放喺 `{definition}/`，`_version.md` 只可以放喺 `{version}/`。
 - version 名必須符合 `^v[1-9][0-9]*$`（例如 v1、v2、v10）。version 只存在於 api 層；models 同 method 唔分 version。
-- 預設路由係 `/{definition}/{version}/{feature}`；路由一定要包含 version，冇預設版本，亦唔會自動轉去最新版本。
+- 預設 public 路由係 `/{definition}/{version}/{slug}/{feature}`，private 係 `/{definition}/{version}/{feature}`；`api/_project.md` 設定 default-slug 後 public 省略 `{slug}`，prefix 會加喺所有路由前面（例如 `/api/web/v1/counter`）。路由一定要包含 version，冇預設版本，亦唔會自動轉去最新版本。
 - 保留路徑：`/_internal/*`、`/health`。
 
 ## 2. 編譯流程同 source 寫法

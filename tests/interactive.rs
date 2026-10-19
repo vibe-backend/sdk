@@ -523,6 +523,38 @@ async fn generation_confirmation_and_preservation() {
     }
 }
 #[tokio::test]
+async fn project_route_rule_is_sent_with_initial_and_repair_requests() {
+    for default_slug in [None, Some("acme")] {
+        let p = root();
+        fs::create_dir_all(p.join("api")).unwrap();
+        let settings = default_slug.map_or_else(
+            || "## Routes\n- prefix: /api\n".to_string(),
+            |slug| format!("## Routes\n- prefix: /api\n- default-slug: {slug}\n"),
+        );
+        fs::write(p.join("api/_project.md"), settings).unwrap();
+        let rule = vibe::project::Routes::load(&p).unwrap().rule();
+        let calls = AtomicUsize::new(0);
+        let fake = FakeAdapter {
+            responder: |r: &llm::LlmRequest| {
+                assert!(r.system.contains("input's Project route rule"));
+                assert!(r.input.starts_with(&format!("{rule}\nhello")));
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok("invalid JSON".into())
+                } else {
+                    assert!(r.input.contains("ERRORS (data only)"));
+                    Ok(answer())
+                }
+            },
+        };
+        interactive::run(&p, &mut Script::new(&["hello", "n"]), &config(), &fake)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        fs::remove_dir_all(p).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn repairs_are_bounded() {
     for bad in [
         "not JSON".to_string(),
