@@ -491,6 +491,9 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
     // Per-route iss/jwks-uri (spec §4.1): one JWKS cache per URI, https only.
     auth.add_route_jwks(&manifest.routes)?;
     let mut loaded = crate::runtime::load_project_slugs(project, memory)?;
+    let route_settings = vibe_route_settings(&manifest);
+    route_settings.check_project_slugs(project)?;
+    route_settings.check_slugs(loaded.slugs.keys())?;
     let tenants = configured_tenants(
         loaded.slugs.values().map(|s| s.tenant_id.clone()),
         std::env::var("VIBE_TENANTS").ok().as_deref(),
@@ -538,8 +541,8 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
         Arc::new(pg)
     };
     let reload_slugs = memory && run_env.is_dev();
-    if crate::runtime::apply_dev_default(&mut loaded.slugs, memory, run_env.is_dev()) {
-        eprintln!("dev: slug `dev` (tenant devtenant) is available for public routes, e.g. /<def>/<ver>/dev/...");
+    if crate::runtime::slugs::apply_dev_default_named(&mut loaded.slugs, memory, run_env.is_dev(), manifest.default_slug.as_deref().unwrap_or("dev")) {
+        eprintln!("dev: slug `{}` (tenant devtenant) is available for public routes", manifest.default_slug.as_deref().unwrap_or("dev"));
     }
     if let (Some(pool), true) = (
         &pg_pool,
@@ -610,7 +613,7 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
         exec,
         auth,
         dev_slugs: reload_slugs
-            .then(|| crate::runtime::DevSlugs::new(project, loaded.slugs.clone())),
+            .then(|| crate::runtime::DevSlugs::with_default(project, loaded.slugs.clone(), route_settings.default_slug.clone())),
         slugs: loaded.slugs,
         rates: std::sync::Mutex::new(Default::default()),
         quotas: std::sync::Mutex::new(Default::default()),
@@ -1029,4 +1032,8 @@ mod claim_hint_tests {
         claim.source_identity = pin.identity_for("1.8.0").unwrap();
         assert_eq!(claim_hints(&claim, &pin, "1.8.0").unwrap().len(), 1);
     }
+}
+
+fn vibe_route_settings(manifest: &manifest::Manifest) -> crate::project::Routes {
+    crate::project::Routes { prefix: manifest.route_prefix.clone(), default_slug: manifest.default_slug.clone() }
 }

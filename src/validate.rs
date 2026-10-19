@@ -7,7 +7,6 @@ use std::sync::LazyLock;
 
 use crate::diag::{Diag, Report};
 use crate::discover::{self, SourceFile};
-use crate::hashutil::source_hash;
 use crate::lock::{
     check_lock_stamp, find_section, parse_lock, section_order, Kind, LockDoc, Scope, SourceType,
     LOCK_VERSION,
@@ -300,7 +299,7 @@ pub(crate) fn check_lock(
             }
         }
     }
-    let hash = source_hash(&source.combined_text());
+    let hash = source.source_hash();
     if doc.meta.source_hash != hash {
         report.push(Diag::error(&file, "source-hash does not match the source"));
     }
@@ -356,7 +355,7 @@ pub(crate) fn check_lock(
             ));
         }
     }
-    check_sections(doc, &file, report);
+    check_sections_mode(doc, &file, crate::project::for_source(source).default_slug.as_deref(), report);
     check_variable_roots(doc, &file, report);
     let env_fields: Vec<_> = doc
         .meta
@@ -563,7 +562,12 @@ fn check_dependencies(
     }
 }
 
+#[cfg(test)]
 fn check_sections(doc: &LockDoc, file: &str, report: &mut Report) {
+    check_sections_mode(doc, file, None, report);
+}
+
+fn check_sections_mode(doc: &LockDoc, file: &str, default_slug: Option<&str>, report: &mut Report) {
     for section in &doc.sections {
         if matches!(section.name.as_str(), "Fields" | "Request") {
             if let Some(table) = &section.table {
@@ -593,7 +597,7 @@ fn check_sections(doc: &LockDoc, file: &str, report: &mut Report) {
         Kind::Provider => check_provider(doc, file, report),
         Kind::Model => check_model(doc, file, report),
         Kind::Method => check_method(doc, file, report),
-        Kind::Api if doc.meta.scope == Some(Scope::Feature) => check_feature(doc, file, report),
+        Kind::Api if doc.meta.scope == Some(Scope::Feature) => check_feature_mode(doc, file, default_slug, report),
         Kind::Api => {}
         Kind::Pipeline => check_pipeline(doc, file, report),
         Kind::Migration => check_migration_sql(doc, file, report),
@@ -1106,7 +1110,12 @@ fn check_method_inherited_writes(docs: &HashMap<String, LockDoc>, report: &mut R
     }
 }
 
+#[cfg(test)]
 fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
+    check_feature_mode(doc, file, None, report);
+}
+
+fn check_feature_mode(doc: &LockDoc, file: &str, default_slug: Option<&str>, report: &mut Report) {
     let Some(route) = find_section(&doc.sections, "Route") else {
         return;
     };
@@ -1127,7 +1136,15 @@ fn check_feature(doc: &LockDoc, file: &str, report: &mut Report) {
     if removed && !public {
         report.push(Diag::error(file, "removing auth requires public: true").at_section("Access"));
     }
-    if public {
+    if let Some(default) = default_slug {
+        let path = route.get("path").unwrap_or("");
+        if path.contains("{slug}") {
+            report.push(Diag::error(file, format!("route uses {{slug}} but api/_project.md sets default-slug {default}; remove the {{slug}} segment (route {}) or remove default-slug", path.replace("/{slug}", ""))));
+        }
+        if public && find_section(&doc.sections, "Access").and_then(|s| s.get("tenant")) != Some("default-slug") {
+            report.push(Diag::error(file, "api/_project.md sets default-slug; replace tenant: path.slug with tenant: default-slug (or remove default-slug)"));
+        }
+    } else if public {
         let path = route.get("path").unwrap_or("");
         if !path.contains("{slug}") {
             report.push(Diag::error(file, "public routes must include {slug}").at_section("Route"));

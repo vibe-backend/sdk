@@ -23,6 +23,16 @@ impl SourceFile {
         }
     }
 
+    /// Include only the compilation-affecting mode, never the route prefix.
+    pub fn source_hash(&self) -> String {
+        let text = self.combined_text();
+        if crate::project::for_source(self).default_slug.is_some() {
+            crate::hashutil::source_hash(&format!("{text}\n<!-- project route mode: default-slug -->"))
+        } else {
+            crate::hashutil::source_hash(&text)
+        }
+    }
+
     pub fn lock_rel(&self) -> String {
         let path = Path::new(&self.rel);
         match path.extension().and_then(|ext| ext.to_str()) {
@@ -41,6 +51,9 @@ impl SourceFile {
 
 pub fn discover(root: &Path) -> Result<Vec<SourceFile>, Report> {
     let mut report = Report::new();
+    crate::project::Routes::load(root).and_then(|r| r.check_project_slugs(root)).map_err(|e| {
+        let mut r = Report::new(); r.push(Diag::error("api/_project.md", e)); r
+    })?;
     let mut files = Vec::new();
     collect_dir(&mut report, &mut files, root, root.join("providers"), 0);
     collect_dir(&mut report, &mut files, root, root.join("pipelines"), 0);
@@ -115,6 +128,7 @@ fn collect_dir(
         if !name.ends_with(".md") || name.ends_with(".lock.md") {
             continue;
         }
+        if rel == "api/_project.md" { continue; }
         match classify(root, &path) {
             Ok(file) => files.push(file),
             Err(diag) => report.push(diag),

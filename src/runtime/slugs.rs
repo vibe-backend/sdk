@@ -89,7 +89,7 @@ pub fn load_slug_file(path: &Path) -> Result<SlugLoad, String> {
     })
 }
 
-pub(super) fn valid_slug(slug: &str) -> bool {
+pub(crate) fn valid_slug(slug: &str) -> bool {
     let bytes = slug.as_bytes();
     (1..=63).contains(&bytes.len())
         && bytes
@@ -172,11 +172,15 @@ mod tests {
 
 /// Apply the convenience slug only for the development memory executor.
 pub fn apply_dev_default(slugs: &mut HashMap<String, Slug>, memory: bool, dev: bool) -> bool {
-    if !memory || !dev || slugs.contains_key("dev") {
+    apply_dev_default_named(slugs, memory, dev, "dev")
+}
+
+pub(crate) fn apply_dev_default_named(slugs: &mut HashMap<String, Slug>, memory: bool, dev: bool, name: &str) -> bool {
+    if !memory || !dev || slugs.contains_key(name) {
         return false;
     }
     slugs.insert(
-        "dev".into(),
+        name.into(),
         Slug {
             tenant_id: "devtenant".into(),
             public_access: true,
@@ -189,6 +193,7 @@ pub fn apply_dev_default(slugs: &mut HashMap<String, Slug>, memory: bool, dev: b
 /// Request-driven reload, enabled only by the development memory server.
 pub struct DevSlugs {
     project: std::path::PathBuf,
+    default_slug: Option<String>,
     state: std::sync::Mutex<DevSlugState>,
 }
 
@@ -200,7 +205,12 @@ struct DevSlugState {
 
 impl DevSlugs {
     pub fn new(project: &Path, slugs: HashMap<String, Slug>) -> Self {
+        Self::with_default(project, slugs, None)
+    }
+
+    pub fn with_default(project: &Path, slugs: HashMap<String, Slug>, default_slug: Option<String>) -> Self {
         Self {
+            default_slug,
             project: project.into(),
             state: std::sync::Mutex::new(DevSlugState {
                 stamps: Self::stamps(project),
@@ -229,7 +239,13 @@ impl DevSlugs {
                 state.stamps = stamps;
                 match load_project_slugs(&self.project, true) {
                     Ok(mut loaded) => {
-                        apply_dev_default(&mut loaded.slugs, true, true);
+                        let settings = crate::project::Routes { default_slug: self.default_slug.clone(), ..Default::default() };
+                        if let Err(error) = settings.check_project_slugs(&self.project).and_then(|()| settings.check_slugs(loaded.slugs.keys())) {
+                            state.slugs.clear();
+                            eprintln!("warning: cannot reload slugs: {error}");
+                            return None;
+                        }
+                        apply_dev_default_named(&mut loaded.slugs, true, true, self.default_slug.as_deref().unwrap_or("dev"));
                         state.slugs = loaded.slugs;
                         for warning in loaded.warnings {
                             eprintln!("warning: {warning}");
