@@ -416,3 +416,71 @@ fn run_and_build_validation_reject_frontmatter_writes() {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[tokio::test]
+async fn signing_claim_builder_child() {
+    if std::env::var_os("CLAIM_BUILD_TEST").is_none() {
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shop");
+    let (loaded, _) = vibe::compile::compile_in_memory(&root, None, None)
+        .await
+        .unwrap();
+    let release = std::env::var("CLAIM_BUILD_TEST").unwrap() == "release";
+    let key = vibe::sign::generate_key();
+    let manifest = vibe::manifest::build_signed(
+        &root,
+        &loaded,
+        if release { None } else { Some(&key) },
+        &vibe::manifest::BuildInfo {
+            release,
+            version: "1.8.0".into(),
+            commit: "a".repeat(40),
+        },
+    )
+    .unwrap();
+    let json = serde_json::to_value(manifest).unwrap();
+    let expected = std::env::var("CLAIM_EXPECTED").unwrap() == "true";
+    assert_eq!(json["provenance"].get("signing").is_some(), expected);
+    if expected {
+        assert_eq!(
+            json["provenance"]["signing"]["source_identity"],
+            "https://github.com/acme/shop/.github/workflows/release.yml@refs/tags/v1.8.0"
+        );
+        assert_eq!(json["provenance"]["signing"]["signer_workflow"], format!("https://github.com/vibe-backend/sdk/.github/workflows/vibe-project-release.yml@refs/tags/v{}", env!("CARGO_PKG_VERSION")));
+    }
+}
+#[test]
+fn release_builder_writes_claim_only_under_actions_and_never_for_dev() {
+    for (mode, actions, workflow, repository, expected) in [
+        ("release", "true", true, true, true),
+        ("release", "false", true, true, false),
+        ("release", "true", false, true, false),
+        ("release", "true", true, false, false),
+        ("dev", "true", true, true, false),
+    ] {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .env_clear()
+            .args(["--exact", "signing_claim_builder_child", "--nocapture"])
+            .env("CLAIM_BUILD_TEST", mode)
+            .env("CLAIM_EXPECTED", expected.to_string())
+            .env("GITHUB_ACTIONS", actions);
+        if workflow {
+            child.env(
+                "GITHUB_WORKFLOW_REF",
+                "acme/shop/.github/workflows/release.yml@refs/tags/v1.8.0",
+            );
+        }
+        if repository {
+            child.env("GITHUB_REPOSITORY", "acme/shop");
+        }
+        let out = child.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

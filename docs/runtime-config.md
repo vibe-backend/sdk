@@ -113,6 +113,28 @@ VIBE_RELEASE_VERSION=1.8.0 vibe-runtime --artifact dist --db postgres \
   --expect-issuer https://token.actions.githubusercontent.com
 ```
 
+`vibe-runtime verify --artifact dist [--project <dir>]` accepts the same pin flags
+and `--allow-test-build` as `run`, with `VIBE_RELEASE_VERSION`,
+`VIBE_MANIFEST_BUNDLE` and `VIBE_ENV`. It uses startup's artifact verification,
+prints `verified: <path> (release <version>, commit <commit>, identity <expanded pin>)`
+on success (or `verified: <path> (development manifest)`), and exits 0; failures
+print the startup error to stderr and exit 1. It never serves or connects to a
+database. Unset `VIBE_ENV` counts as production (`memory=false`); set
+`VIBE_ENV=development` explicitly for development manifests. Like startup, it
+refuses `LLM_*` / `OPENAI_*` outside development.
+
+Under GitHub Actions, `vibe build --release` records `provenance.signing`
+(issuer, source_identity, source_repository, signer_workflow). This optional claim
+is diagnostic only, never trusted. Source identity or issuer differences from the
+pin print hints to stderr even when verification fails; only the certificate,
+deployer pin and compiled-in SDK signer determine trust.
+
+```sh
+VIBE_RELEASE_VERSION=1.8.0 vibe-runtime verify --artifact dist \
+  --expect-identity 'https://github.com/acme/shop/.github/workflows/release.yml@refs/tags/v*' \
+  --expect-issuer https://token.actions.githubusercontent.com
+```
+
 ## Build inputs (decision 179)
 
 `vibe build` creates `.vibe/signing.key` (mode 0600) and `.vibe/signing.pub`

@@ -12,6 +12,8 @@ The specification is [docs/spec-v1.7.md](docs/spec-v1.7.md). The draft [docs/spe
 LLM client, build or interactive code. Use `vibe-runtime run --artifact <dir>`;
 bare `vibe-runtime` means run, with artifact `.` by default. Both forms accept
 `--addr`, `--db` / `VIBE_DB`, and `--allow-test-build` (development only).
+`vibe-runtime verify --artifact dist` checks an artifact with the same pins without serving (exit 0 on success, 1 on failure).
+
 Release artifacts need `--expect-identity` / `VIBE_EXPECT_IDENTITY` and
 `--expect-issuer` / `VIBE_EXPECT_ISSUER`; optional `--expect-repository-id` /
 `VIBE_EXPECT_REPOSITORY_ID` pins the numeric repo id. See

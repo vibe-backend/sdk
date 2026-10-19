@@ -43,8 +43,40 @@ pub struct Manifest {
     pub signature: String,
 }
 
+/// Informational claim written by `vibe build --release`. Never used for trust: the runtime verifies only the certificate against the deployer pin and the compiled-in signer (decision 182).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SigningClaim {
+    pub issuer: String,
+    pub source_identity: String,
+    pub source_repository: String,
+    pub signer_workflow: String,
+}
+impl SigningClaim {
+    pub fn from_env(lookup: impl Fn(&str) -> Option<String>, sdk_version: &str) -> Option<Self> {
+        if lookup("GITHUB_ACTIONS").as_deref() != Some("true") {
+            return None;
+        }
+        let workflow = lookup("GITHUB_WORKFLOW_REF")?;
+        let repository = lookup("GITHUB_REPOSITORY")?;
+        if [&workflow, &repository, sdk_version]
+            .iter()
+            .any(|v| v.is_empty() || v.chars().any(|c| c.is_whitespace() || c.is_control()))
+        {
+            return None;
+        }
+        Some(Self {
+            issuer: crate::sigstore::ISSUER.into(),
+            source_identity: format!("https://github.com/{workflow}"),
+            source_repository: repository,
+            signer_workflow: format!("https://github.com/vibe-backend/sdk/.github/workflows/vibe-project-release.yml@refs/tags/v{sdk_version}"),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Provenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<SigningClaim>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub test_build: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -651,6 +683,11 @@ pub fn build_signed(
     locks.sort_by(|a, b| a.id.cmp(&b.id));
     items.sort_by(|a, b| (&a.lock, &a.item).cmp(&(&b.lock, &b.item)));
     manifest.provenance = Provenance {
+        signing: if info.release {
+            SigningClaim::from_env(|key| std::env::var(key).ok(), env!("CARGO_PKG_VERSION"))
+        } else {
+            None
+        },
         test_build: record.as_ref().is_some_and(|r| {
             r.test_build || r.compilers.values().any(|s| s.llm_provider == "fake")
         }),
@@ -2199,5 +2236,72 @@ mod private_host_tests {
                 .as_deref(),
             Some("old-private.example")
         );
+    }
+}
+
+#[cfg(test)]
+mod signing_claim_tests {
+    use super::*;
+    #[test]
+    fn claims_require_actions_and_complete_clean_values() {
+        let values = [
+            "true",
+            "acme/shop/.github/workflows/release.yml@refs/tags/v1.8.0",
+            "acme/shop",
+        ];
+        let keys = ["GITHUB_ACTIONS", "GITHUB_WORKFLOW_REF", "GITHUB_REPOSITORY"];
+        let lookup = |key: &str| {
+            keys.iter()
+                .position(|k| *k == key)
+                .map(|i| values[i].to_string())
+        };
+        let claim = SigningClaim::from_env(lookup, "1.8.0").unwrap();
+        assert_eq!(claim.issuer, crate::sigstore::ISSUER);
+        assert_eq!(
+            claim.source_identity,
+            format!("https://github.com/{}", values[1])
+        );
+        assert_eq!(claim.source_repository, values[2]);
+        assert!(claim.signer_workflow.ends_with("@refs/tags/v1.8.0"));
+        for key in keys {
+            for bad in [
+                None,
+                Some(""),
+                Some("false"),
+                Some("a b"),
+                Some("a\nb"),
+                Some("a\0b"),
+            ] {
+                // Nonempty clean strings remain acceptable for repository/workflow values.
+                if key != "GITHUB_ACTIONS" && bad == Some("false") {
+                    continue;
+                }
+                assert!(SigningClaim::from_env(
+                    |k| if k == key {
+                        bad.map(str::to_owned)
+                    } else {
+                        lookup(k)
+                    },
+                    "1.8.0"
+                )
+                .is_none());
+            }
+        }
+        assert!(SigningClaim::from_env(|_| None, "1.8.0").is_none());
+        let provenance = Provenance {
+            signing: Some(claim),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&provenance).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Provenance>(&json).unwrap(),
+            provenance
+        );
+        let old = serde_json::to_value(Provenance::default()).unwrap();
+        assert!(old.get("signing").is_none());
+        assert!(serde_json::from_value::<Provenance>(old)
+            .unwrap()
+            .signing
+            .is_none());
     }
 }

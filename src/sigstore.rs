@@ -192,7 +192,7 @@ impl Pin {
     fn repository_uri(&self) -> String {
         format!("https://github.com/{}", self.repository())
     }
-    fn identity_for(&self, version: &str) -> Result<String, String> {
+    pub fn identity_for(&self, version: &str) -> Result<String, String> {
         Ok(format!(
             "{}/.github/workflows/{}@{}",
             self.repository_uri(),
