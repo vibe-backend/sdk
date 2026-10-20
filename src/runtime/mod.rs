@@ -88,3 +88,6 @@ pub const RUNTIME_ERROR_CODES: &[&str] = &[
     "VALIDATION_FAILED",
     "WEAK_PASSWORD",
 ];
+
+#[cfg(feature = "sdk")]
+pub(crate) use crud::expression_paths;

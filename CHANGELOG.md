@@ -5,6 +5,8 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+- **Decision 190:** Check method return shapes and caller field reads during build repair and lock validation. No prompt change; future prompt changes wait for the next rc.
+
 ## 1.0.0-rc.5
 
 - **Decision 184:** Implicit in-memory `main` provider for projects without provider sources.

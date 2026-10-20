@@ -1147,6 +1147,30 @@ pub fn expression_roots(
     Ok(roots)
 }
 
+/// Field paths from parsed expressions; quoted literals and object keys are excluded.
+#[cfg(feature = "sdk")]
+pub(crate) fn expression_paths(input: &str, when: bool) -> Result<Vec<String>, String> {
+    if when {
+        let (When::Empty(path, _) | When::Eq(path, _, _)) = parse_when(input)?;
+        return Ok(vec![path]);
+    }
+    fn visit(expr: Expr, paths: &mut Vec<String>) {
+        match expr {
+            Expr::Path(path) => paths.push(path),
+            Expr::Object(fields) => {
+                for (_, value) in fields {
+                    visit(value, paths);
+                }
+            }
+            Expr::Literal(_) => {}
+        }
+    }
+    check_expr(input)?;
+    let mut paths = Vec::new();
+    visit(parse_expr(input)?.0, &mut paths);
+    Ok(paths)
+}
+
 /// Checks that an expression parses the way the runtime will parse it.
 pub fn check_expr(input: &str) -> Result<(), String> {
     let (_, rest) = parse_expr(input.trim())?;
