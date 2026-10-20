@@ -403,3 +403,100 @@ async fn missing_required_method_input_reaches_repair() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn scalar_method_return_reaches_repair() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = std::env::temp_dir().join(format!("vibe-return-repair-{}", uuid::Uuid::new_v4()));
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web-counter"),
+        &root,
+    );
+    let method = root.join("models/counter/methods/read.md");
+    let text = fs::read_to_string(&method)
+        .unwrap()
+        .replace("{value: integer}", "number")
+        .replace("- value: result", "- value: result.value");
+    let method_body = format!("## Signature{}", text.split_once("## Signature").unwrap().1);
+    fs::write(
+        method,
+        "Read the named counter and return its numeric value.",
+    )
+    .unwrap();
+    let source = root.join("api/web/v1/counter.md");
+    let original = fs::read_to_string(&source).unwrap();
+    let good = format!("## Route{}", original.split_once("## Route").unwrap().1);
+    let bad = good.replacen("- out: result", "- out: {value: result.value}", 1);
+    assert_ne!(bad, good);
+    fs::write(
+        source,
+        "Anyone can read the counter. Use GET at /web/v1/counter.",
+    )
+    .unwrap();
+    let calls = AtomicUsize::new(0);
+    let method_calls = AtomicUsize::new(0);
+    let adapter = vibe::FakeAdapter {
+        responder: |request: &vibe::llm::LlmRequest| {
+            if request.source == "models/counter/methods/read.md" {
+                method_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(method_body.clone());
+            }
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(bad.clone())
+            } else {
+                assert!(request.input.contains("api/web/v1/counter.md: method counter.read returns a number, but `result.value` reads field `value`"), "{}", request.input);
+                Ok(good.clone())
+            }
+        },
+    };
+    vibe::regenerate_project(&vibe::CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&fake_config()),
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|r| panic!("{r}"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(method_calls.load(Ordering::SeqCst), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn declared_object_with_scalar_response_reaches_method_repair() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = std::env::temp_dir().join(format!("vibe-method-shape-{}", uuid::Uuid::new_v4()));
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web-counter"),
+        &root,
+    );
+    fs::write(
+        root.join("models/counter/methods/read.md"),
+        "Read the counter and return an object containing its value.",
+    )
+    .unwrap();
+    let good = "## Signature\n- input: {name: string}\n- output: {value: integer}\n- errors: []\n- writes: false\n## Calls\n(none)\n## Steps\n### s1\n- op: respond\n- value: {value: 42}\n";
+    let bad = good.replace("- value: {value: 42}", "- value: 42");
+    let calls = AtomicUsize::new(0);
+    let adapter = vibe::FakeAdapter {
+        responder: |request: &vibe::llm::LlmRequest| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(bad.clone())
+            } else {
+                assert!(request.input.contains("models/counter/methods/read.md: method counter/methods/read Signature output"), "{}", request.input);
+                assert!(request.input.contains("disagrees with respond value"));
+                Ok(good.into())
+            }
+        },
+    };
+    vibe::regenerate_project(&vibe::CompileOptions {
+        root: &root,
+        llm: Some(&adapter),
+        llm_config: Some(&fake_config()),
+        check: false,
+    })
+    .await
+    .unwrap_or_else(|r| panic!("{r}"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    fs::remove_dir_all(root).unwrap();
+}

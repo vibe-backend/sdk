@@ -37,6 +37,7 @@ INSERT needs `create`, UPDATE needs `update`, DELETE needs `delete`.
 Without providers, the target is memory: query SQL must use decision 183's
 unique-key UPDATE increments, single-row INSERT upserts/DO NOTHING, unique-key
 SELECT, or COALESCE(MAX) forms. Unsupported SQL is a build error sent to repair.
+Build and lock validation also reject statically known method return-shape mismatches and reads of fields the method does not return.
 Explicit PostgreSQL providers retain an advisory warning for memory development.
 
 A prose requirement such as “at most 50 per day” produces a warning quoting the

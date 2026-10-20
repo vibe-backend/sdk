@@ -311,6 +311,7 @@ pub(crate) fn check_lock(
     let structured = crate::lock::is_structured_source(&source.combined_text());
     check_feature_contract(doc, source, docs, report);
     check_required_method_inputs(doc, docs, report);
+    check_method_return_shapes(doc, docs, report);
     if doc.meta.source_type == SourceType::Structured && !structured {
         report.push(Diag::error(
             &file,
@@ -2736,6 +2737,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn method_return_shapes_are_checked() {
+        for (output, value, field, fails) in [
+            ("number", "row.value", "value", true),
+            ("{type: number}", "row.value", "value", true),
+            ("{value: integer}", "{value: row.value}", "value", false),
+            ("{value: integer}", "{value: row.value}", "missing", true),
+            ("json", "row", "anything", false),
+            ("[integer]", "row", "anything", false),
+        ] {
+            let callee = parsed_doc(Kind::Method, None, "counter/methods/read", &format!("## Signature\n- output: {output}\n## Steps\n### s1\n- op: respond\n- value: {value}\n"));
+            let caller = parsed_doc(Kind::Api, Some(Scope::Feature), "api/counter", &format!("## Transform\n- out: {{value: result.{field}}}\n## Steps\n### s1\n- op: method\n- target: counter.read\n- out: result\n"));
+            let docs = HashMap::from([("counter/methods/read".into(), callee)]);
+            let mut report = Report::default();
+            check_method_return_shapes(&caller, &docs, &mut report);
+            assert_eq!(report.has_errors(), fails, "{output}: {report}");
+        }
+        for value in ["42", "{other: 42}"] {
+            let doc = parsed_doc(Kind::Method, None, "counter/methods/read", &format!("## Signature\n- output: {{value: integer}}\n## Steps\n### s1\n- op: respond\n- value: {value}\n"));
+            let mut report = Report::default();
+            check_method_return_shapes(&doc, &HashMap::new(), &mut report);
+            assert!(report.has_errors());
+            assert!(report.to_string().contains("counter/methods/read.md"));
+        }
+    }
+
+    #[test]
+    fn method_return_reads_use_expression_syntax_and_scope() {
+        let callee = parsed_doc(
+            Kind::Method,
+            None,
+            "counter/methods/read",
+            "## Signature\n- output: number\n## Steps\n### s1\n- op: respond\n- value: row.value\n",
+        );
+        let docs = HashMap::from([("counter/methods/read".into(), callee)]);
+        for (body, fails) in [
+            ("- value: result.value", true),
+            ("- args: {value: result.value}", true),
+            ("- params: [result.value]", true),
+            ("- params: [\"result.value\"]", false),
+            ("- when: result.value == true", true),
+            ("- value: \"result.value\"", false),
+            ("- value: {result: 42}", false),
+            ("- value: other.result.value", false),
+            ("- value: result", false),
+        ] {
+            let caller = parsed_doc(Kind::Method, None, "caller", &format!(
+                "## Steps\n### s1\n- op: method\n- target: counter.read\n- out: result\n### s2\n{body}\n"));
+            let mut report = Report::new();
+            check_method_return_shapes(&caller, &docs, &mut report);
+            assert_eq!(report.has_errors(), fails, "{body}: {report}");
+        }
+    }
+
     fn target_docs() -> HashMap<String, LockDoc> {
         let mut docs = HashMap::new();
         docs.insert(
@@ -3368,6 +3423,192 @@ fn check_required_method_inputs(
                 report.push(Diag::error(&doc.meta.source, format!(
                     "method {target} needs required input `{field}`, but args {args} does not provide it"
                 )));
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReturnShape {
+    Scalar(String),
+    Object(std::collections::BTreeSet<String>),
+}
+
+impl std::fmt::Display for ReturnShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Scalar(ty) => {
+                let article = if ty == "integer" { "an" } else { "a" };
+                write!(f, "{article} {ty}")
+            }
+            Self::Object(fields) if fields.is_empty() => write!(f, "an object with no fields"),
+            Self::Object(fields) => write!(
+                f,
+                "an object with fields {}",
+                fields.iter().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+}
+
+fn declared_return_shape(output: &str) -> Option<ReturnShape> {
+    let output = output.trim();
+    if matches!(
+        output,
+        "number" | "integer" | "string" | "boolean" | "uuid" | "timestamp"
+    ) {
+        return Some(ReturnShape::Scalar(output.into()));
+    }
+    if !output.starts_with('{') || !output.ends_with('}') {
+        return None;
+    }
+    let fields = crate::lock::parse_inline_map(output).ok()?;
+    if let Some((_, ty)) = fields.iter().find(|(key, _)| key == "type") {
+        return declared_return_shape(ty);
+    }
+    Some(ReturnShape::Object(
+        fields.into_iter().map(|(key, _)| key).collect(),
+    ))
+}
+
+fn produced_return_shape(doc: &LockDoc, declared: &Option<ReturnShape>) -> Option<ReturnShape> {
+    let value = find_section(&doc.sections, "Steps")?
+        .blocks
+        .iter()
+        .rev()
+        .find(|b| block_val(b, "op") == "respond")
+        .map(|b| block_val(b, "value"))?;
+    if value.trim().starts_with('{') {
+        return crate::lock::parse_inline_map(&value)
+            .ok()
+            .map(|fields| ReturnShape::Object(fields.into_iter().map(|(key, _)| key).collect()));
+    }
+    if let Ok(literal) = serde_json::from_str::<serde_json::Value>(&value) {
+        let ty = match literal {
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Bool(_) => "boolean",
+            _ => return None,
+        };
+        return Some(ReturnShape::Scalar(ty.into()));
+    }
+    // A bare variable may be a query row or another object. Only a scalar
+    // declaration establishes its shape; do not infer from a dotted path.
+    if matches!(declared, Some(ReturnShape::Scalar(_)))
+        && crate::runtime::check_expr(&value).is_ok()
+    {
+        return declared.clone();
+    }
+    None
+}
+
+fn check_method_return_shapes(doc: &LockDoc, docs: &HashMap<String, LockDoc>, report: &mut Report) {
+    if !matches!(doc.meta.kind, Kind::Api | Kind::Method) {
+        return;
+    }
+    let declared = find_section(&doc.sections, "Signature")
+        .and_then(|s| s.get("output"))
+        .and_then(declared_return_shape);
+    let produced = produced_return_shape(doc, &declared);
+    if let (Some(expected), Some(actual)) = (&declared, &produced) {
+        let mismatch = match (expected, actual) {
+            (ReturnShape::Object(a), ReturnShape::Object(b)) => a != b,
+            (ReturnShape::Scalar(_), ReturnShape::Scalar(_)) => false,
+            _ => true,
+        };
+        if mismatch {
+            report.push(Diag::error(
+                &doc.meta.source,
+                format!(
+                    "method {} Signature output {expected} disagrees with respond value {actual}",
+                    doc.meta.id
+                ),
+            ));
+        }
+    }
+    let Some(steps) = find_section(&doc.sections, "Steps") else {
+        return;
+    };
+    for (index, block) in steps.blocks.iter().enumerate() {
+        if block_val(block, "op") != "method" {
+            continue;
+        }
+        let target = block_val(block, "target");
+        let out = block_val(block, "out");
+        if out.is_empty() {
+            continue;
+        }
+        let Some((object, method)) = target.split_once('.') else {
+            continue;
+        };
+        let Some(callee) = docs.get(&format!("{object}/methods/{method}")) else {
+            continue;
+        };
+        let declared = find_section(&callee.sections, "Signature")
+            .and_then(|s| s.get("output"))
+            .and_then(declared_return_shape);
+        let Some(shape) = produced_return_shape(callee, &declared).or(declared) else {
+            continue;
+        };
+        let transform = find_section(&doc.sections, "Transform")
+            .and_then(|s| s.get("out"))
+            .filter(|_| {
+                !steps.blocks[index + 1..]
+                    .iter()
+                    .any(|b| block_val(b, "out") == out)
+            })
+            .into_iter()
+            .map(|v| (v, false));
+        let later = steps.blocks[index + 1..]
+            .iter()
+            .scan(false, |shadowed, b| {
+                if *shadowed {
+                    return None;
+                }
+                *shadowed = block_val(b, "out") == out;
+                Some(b)
+            })
+            .flat_map(|b| b.bullets.iter())
+            .filter(|b| {
+                matches!(
+                    b.key.as_str(),
+                    "args" | "value" | "when" | "condition" | "params"
+                )
+            })
+            .map(|b| {
+                (
+                    b.value.as_str(),
+                    matches!(b.key.as_str(), "when" | "condition"),
+                )
+            });
+        let mut seen = HashSet::new();
+        for (expression, when) in transform.chain(later) {
+            // params are expression lists rather than expression objects.
+            let expressions = if let Some(inner) = expression
+                .trim()
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+            {
+                crate::lock::split_top_level(inner)
+            } else {
+                vec![expression.to_string()]
+            };
+            for expression in expressions {
+                for path in crate::runtime::expression_paths(&expression, when).unwrap_or_default()
+                {
+                    let Some(rest) = path.strip_prefix(&format!("{out}.")) else {
+                        continue;
+                    };
+                    let field = rest.split('.').next().unwrap();
+                    let description = match &shape {
+                        ReturnShape::Scalar(_) => shape.to_string(),
+                        ReturnShape::Object(keys) if !keys.contains(field) => shape.to_string(),
+                        _ => continue,
+                    };
+                    if seen.insert(field.to_string()) {
+                        report.push(Diag::error(&doc.meta.source, format!("method {target} returns {description}, but `{out}.{field}` reads field `{field}`; return an object with `{field}` or use `{out}`")));
+                    }
+                }
             }
         }
     }
