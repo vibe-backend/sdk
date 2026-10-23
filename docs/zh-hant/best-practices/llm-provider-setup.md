@@ -159,6 +159,30 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 - 本地測試私有 endpoint 編譯的 lock，可用 `vibe build`。Manifest 簽署和其他驗證檢查維持不變；CI 同 release build 拒絕 private-endpoint lock。 Dev manifest 的簽署內容包含 `build_mode: "dev"`，`vibe run` 只在開發環境接受 （可配合 `--db memory`）；release manifest 不接受私有 endpoint lock。
 - 更換 provider、endpoint host 或 model 屬 **major** 變更：所有 lock 重新編譯，涉及自然語言／安全的 lock 需要重新審批。只改 base URL 的 path 不屬 major，但 CI 確定性檢查仍須通過（§2A.8.7）。
 
+## Release host allowlist
+
+`vibe build --release` 只會把 LLM API key 同編譯 prompt 送到寫死喺 `RELEASE_LLM_HOSTS`（`src/llm.rs`）嘅 hostname。呢份清單唔會從環境變數、project 檔或者 `LLM_BASE_URL` 讀取。設定 `LLM_RELEASE_HOSTS` 或者任何其他變數都唔可以加 host。
+
+比對係 URL hostname 嘅 ASCII 大小寫不敏感完全相等。path 同 query 唔參與決定。冇 wildcard、子字串或者後綴匹配。`*.clinicone.me` 唔准。
+
+| Hostname | 角色 |
+| --- | --- |
+| `api.openai.com` | OpenAI |
+| `api.anthropic.com` | Anthropic |
+| `generativelanguage.googleapis.com` | Gemini |
+| `ai-proxy-sub2api.clinicone.me` | ClinicOne OpenAI 相容 proxy |
+
+Release URL 仲要通過以下檢查：
+
+- Scheme 必須係 `https`。純 `http` 會拒絕。
+- TLS 證書會驗證。無效證書唔會接受。
+- Allowlist 只比對 hostname。帶 userinfo（`user:pass@host`）會拒絕。
+- Port 只准 https 預設 443。非標準 port（例如 `:8443`）會拒絕。
+- Host 必須係 DNS 名稱。IP literal 會拒絕。
+- 唔會跟 redirect。Redirect 去任何其他 host，包括唔喺 allowlist 嘅 host，都會令 release build 失敗。
+
+**供應鏈風險。** `ai-proxy-sub2api.clinicone.me` 喺 release 信任邊界上。佢唔係 OpenAI、Anthropic 或者 Google 官方 endpoint。呢個 proxy 一旦被入侵，就會影響 release 編譯：API key 同源碼 prompt 都會經過佢。呢個條目只允許呢個精確 hostname。
+
 ## 規格缺口
 
 - CLI 名稱 `vibe` 及其版本在規格中屬暫定（§2A.8.8）。

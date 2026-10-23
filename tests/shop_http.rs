@@ -1373,6 +1373,7 @@ async fn release_build_refuses_a_non_allowlisted_llm_host() {
     assert!(out.contains("allowlisted host"), "{out}");
     assert!(out.contains("llm.attacker.example"), "{out}");
     assert!(!root.join("release.json").exists());
+    release_llm_host_matrix(&root);
     // The default endpoint (LLM_BASE_URL unset) is allowlisted.
     let config = vibe::llm::load_llm_config(
         &[
@@ -1386,6 +1387,76 @@ async fn release_build_refuses_a_non_allowlisted_llm_host() {
     .unwrap();
     assert_eq!(config.endpoint_host, "api.openai.com");
     vibe::llm::check_release_endpoint(&config).unwrap();
+}
+
+fn release_llm_host_matrix(root: &Path) {
+    let run = |url: &str| {
+        vibe_cli(
+            root,
+            &[
+                "build",
+                "--project",
+                ".",
+                "--release",
+                "--release-version",
+                "1.8.0",
+                "--commit",
+                "0123456789abcdef0123456789abcdef01234567",
+                "-o",
+                "release.json",
+            ],
+            &[
+                ("VIBE_LLM_API_KEY", "sk-release-compiler-key"),
+                ("LLM_MODEL", "gpt-5.1-2026-01-01"),
+                ("LLM_BASE_URL", url),
+                ("LLM_RELEASE_HOSTS", "*.clinicone.me"),
+            ],
+        )
+    };
+    let secret = "s3cret-userinfo";
+    let (ok, out) = run("https://ai-proxy-sub2api.clinicone.me/v1");
+    assert!(ok, "{out}");
+    assert!(root.join("release.json").exists());
+    fs::remove_file(root.join("release.json")).unwrap();
+    let (ok, out) = run("https://AI-PROXY-SUB2API.CLINICONE.ME:443/v1");
+    assert!(ok, "{out}");
+    fs::remove_file(root.join("release.json")).unwrap();
+
+    for url in [
+        "https://evil.clinicone.me/v1",
+        "https://ai-proxy-sub2api.clinicone.me.evil.com/v1",
+        "https://sub.ai-proxy-sub2api.clinicone.me/v1",
+        "https://llm.attacker.example/v1",
+        "http://ai-proxy-sub2api.clinicone.me/v1",
+        "https://ai-proxy-sub2api.clinicone.me:8443/v1",
+        "https://1.1.1.1/v1",
+        "https://[2606:4700:4700::1111]/v1",
+    ] {
+        let (ok, out) = run(url);
+        assert!(!ok, "{url}: {out}");
+        assert!(!root.join("release.json").exists(), "{url}: {out}");
+        assert!(!out.contains(secret), "{url}: {out}");
+        if url.starts_with("http://") {
+            assert!(out.contains("https"), "{url}: {out}");
+        }
+        if url.contains("8443") {
+            assert!(out.contains("non-standard port"), "{url}: {out}");
+        }
+        if url.contains("1.1.1.1") || url.contains("2606:") {
+            assert!(out.contains("IP literal"), "{url}: {out}");
+        }
+        if url.contains("evil.clinicone.me") && !url.contains(".evil.com") {
+            assert!(out.contains("allowlisted host"), "{url}: {out}");
+            assert!(out.contains("evil.clinicone.me"), "{url}: {out}");
+        }
+    }
+    let (ok, out) = run(&format!(
+        "https://user:{secret}@ai-proxy-sub2api.clinicone.me/v1"
+    ));
+    assert!(!ok, "{out}");
+    assert!(out.contains("userinfo"), "{out}");
+    assert!(!out.contains(secret), "{out}");
+    assert!(!root.join("release.json").exists());
 }
 
 #[tokio::test]

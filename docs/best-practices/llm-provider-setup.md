@@ -165,6 +165,30 @@ OPENAI_MODEL=qwen2.5-coder:32b-instruct-q8_0
 - For local testing of private-endpoint locks, use `vibe build`. Manifest signatures and other validation checks still apply. CI and release builds reject private-endpoint locks. Dev manifests are signed with `build_mode: "dev"` and `vibe run` accepts them only in development (including `--db memory`); release manifests cannot contain private-endpoint locks.
 - Changing provider, endpoint host or model is a **major** change: all locks recompile and natural/security-touching locks need re-approval. Changing only the base URL path is not major, but the CI determinism check must still pass (§2A.8.7).
 
+## Release host allowlist
+
+`vibe build --release` sends the LLM API key and the compile prompts only to hostnames hard-coded in `RELEASE_LLM_HOSTS` (`src/llm.rs`). The list is not read from the environment, a project file, or `LLM_BASE_URL`. Setting `LLM_RELEASE_HOSTS` or any other variable does not add a host.
+
+Comparison is ASCII case-insensitive equality on the URL hostname alone. The path and query are not part of the decision. There is no wildcard, substring, or suffix match. `*.clinicone.me` is not allowed.
+
+| Hostname | Role |
+| --- | --- |
+| `api.openai.com` | OpenAI |
+| `api.anthropic.com` | Anthropic |
+| `generativelanguage.googleapis.com` | Gemini |
+| `ai-proxy-sub2api.clinicone.me` | ClinicOne OpenAI-compatible proxy |
+
+A release URL must also pass these checks:
+
+- Scheme is `https`. Plain `http` is refused.
+- TLS certificates are verified. Invalid certificates are not accepted.
+- The allowlist compares the hostname only. Userinfo (`user:pass@host`) is refused.
+- The port is the https default (443). A non-standard port such as `:8443` is refused.
+- The host is a DNS name. IP literals are refused.
+- Redirects are not followed. A redirect to any other host, including a host that is not on the allowlist, fails the release build.
+
+**Supply-chain risk.** `ai-proxy-sub2api.clinicone.me` sits on the release trust boundary. It is not an official OpenAI, Anthropic, or Google endpoint. A compromise of that proxy affects release compilation: the API key and the source prompts are sent through it. This entry allows that exact hostname only.
+
 ## Spec gaps
 
 - The CLI name `vibe` and its version are provisional in the spec (§2A.8.8).

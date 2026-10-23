@@ -738,25 +738,116 @@ const FLOATING_ALIASES: &[&str] = &[
     "o4-mini",
 ];
 
-/// LLM hosts a release build may send a key to. The default endpoint
-/// (api.openai.com when LLM_BASE_URL is unset) is on the list.
+/// Exact DNS hostnames a release build may send the LLM API key and prompts to.
+///
+/// The match is ASCII case-insensitive equality on the URL hostname only.
+/// There is no wildcard, suffix, or substring match, and no environment
+/// variable can add a host. `ai-proxy-sub2api.clinicone.me` is a third-party
+/// proxy on the release supply-chain trust boundary: a compromise of that
+/// host can affect release compilation, and the API key and prompts are sent
+/// through it. No other `clinicone.me` name is allowed.
 pub const RELEASE_LLM_HOSTS: &[&str] = &[
     "api.openai.com",
     "api.anthropic.com",
     "generativelanguage.googleapis.com",
+    "ai-proxy-sub2api.clinicone.me",
 ];
 
-/// Release builds only talk to allowlisted hosts, over https.
+/// Release builds only talk to allowlisted hostnames, over verified https.
+///
+/// The allowlist compares the hostname, not the rest of the URL. Userinfo, a
+/// non-default port, and an IP literal are refused even when the hostname
+/// would otherwise match.
 pub fn check_release_endpoint(config: &LlmConfig) -> Result<(), String> {
-    let host = config.endpoint_host.to_ascii_lowercase();
-    if config.endpoint_private || !RELEASE_LLM_HOSTS.contains(&host.as_str()) {
-        return Err(format!(
-            "release builds only send the LLM key to an allowlisted host ({}); LLM_BASE_URL points at {}",
-            RELEASE_LLM_HOSTS.join(", "),
-            if host.is_empty() { "(none)" } else { &host }
-        ));
+    let host = release_url_host(&config.base_url)?;
+    if config.endpoint_private {
+        return Err(
+            "release builds refuse a private LLM endpoint; LLM_ALLOW_PRIVATE_HOST cannot widen the release allowlist"
+                .into(),
+        );
+    }
+    if !config.endpoint_host.eq_ignore_ascii_case(&host) {
+        return Err(release_host_error(&host));
     }
     Ok(())
+}
+
+/// Loads the release LLM config, or `Ok(None)` when the release environment
+/// has no `LLM_BASE_URL` / `OPENAI_BASE_URL` (structured projects need no LLM).
+/// A configured base URL that is not https on an exact allowlisted hostname
+/// aborts the release. Hosts cannot be added through the environment.
+pub fn load_release_llm_config(env: &HashMap<String, String>) -> Result<Option<LlmConfig>, String> {
+    match load_llm_config(env, true) {
+        Ok(config) => {
+            check_release_endpoint(&config)?;
+            Ok(Some(config))
+        }
+        Err(report) => {
+            if env_present(env, "LLM_BASE_URL") || env_present(env, "OPENAI_BASE_URL") {
+                Err(report.to_string())
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn release_host_exact(host: &str) -> bool {
+    // Slice contains is exact element equality, not a substring or suffix check.
+    RELEASE_LLM_HOSTS.contains(&host)
+}
+
+fn release_host_error(host: &str) -> String {
+    format!(
+        "release builds only send the LLM key to an allowlisted host ({}); LLM_BASE_URL points at {}",
+        RELEASE_LLM_HOSTS.join(", "),
+        if host.is_empty() { "(none)" } else { host }
+    )
+}
+
+/// Hostname of a release `LLM_BASE_URL`, or why that URL is refused.
+fn release_url_host(base: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(base).map_err(|_| {
+        "release builds require an https LLM_BASE_URL with an allowlisted hostname".to_string()
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(
+            "release builds require https for LLM_BASE_URL; http and other schemes are refused"
+                .into(),
+        );
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(
+            "release builds refuse userinfo in LLM_BASE_URL; the allowlist compares the hostname only"
+                .into(),
+        );
+    }
+    // `Url::port` is `Some` only for a non-default port. https default is 443.
+    if parsed.port().is_some() {
+        return Err(
+            "release builds refuse a non-standard port on LLM_BASE_URL; https port 443 only".into(),
+        );
+    }
+    let host = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain.to_ascii_lowercase(),
+        Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => {
+            return Err(
+                "release builds refuse an IP literal in LLM_BASE_URL; the allowlist is exact hostnames only"
+                    .into(),
+            );
+        }
+        None => return Err("LLM_BASE_URL is missing a host".into()),
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(
+            "release builds refuse an IP literal in LLM_BASE_URL; the allowlist is exact hostnames only"
+                .into(),
+        );
+    }
+    if !release_host_exact(&host) {
+        return Err(release_host_error(&host));
+    }
+    Ok(host)
 }
 
 pub fn default_base_url(provider: &str) -> &'static str {
@@ -1291,18 +1382,27 @@ pub fn describe_failure(
     mask_secrets(&format!("{lead}{hint}. URL: {shown_url}{code}"), api_key)
 }
 
+/// Shared LLM HTTP client: no redirects, and TLS certificates are verified.
+fn llm_http_builder(config: &LlmConfig) -> reqwest::ClientBuilder {
+    let mut builder = Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(config.timeout)
+        // A redirect could send the key and prompt to a host the release
+        // allowlist never checked. Do not follow any redirect.
+        .redirect(reqwest::redirect::Policy::none())
+        // rustls verifies the server certificate. Invalid certs stay refused.
+        .danger_accept_invalid_certs(false);
+    if !config.endpoint_private {
+        // A public endpoint must not resolve to a private address (DNS
+        // rebinding); every resolved address is checked before connecting.
+        builder = crate::netguard::guard_client(builder);
+    }
+    builder
+}
+
 impl HttpAdapter {
     pub fn new(config: LlmConfig) -> Result<Self, String> {
-        let mut builder = Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(config.timeout)
-            // A redirect could lead to a host the endpoint check never saw.
-            .redirect(reqwest::redirect::Policy::none());
-        if !config.endpoint_private {
-            // A public endpoint must not resolve to a private address (DNS
-            // rebinding); every resolved address is checked before connecting.
-            builder = crate::netguard::guard_client(builder);
-        }
+        let builder = llm_http_builder(&config);
         let client = builder.build().map_err(|err| {
             mask_secrets(
                 &format!("http client: {}", error_chain(&err, &config.api_key)),
@@ -1451,18 +1551,33 @@ impl HttpAdapter {
         for (key, value) in headers {
             builder = builder.header(key, value);
         }
-        let response = builder.send().await.map_err(|err| CallError {
-            message: mask_secrets(
-                &format!(
-                    "LLM request failed: {}",
-                    error_chain(&err, &self.config.api_key)
-                ),
-                &self.config.api_key,
-            ),
-            retryable: true,
-            retry_after: None,
+        let response = builder.send().await.map_err(|err| {
+            let redirect = err.is_redirect()
+                || err.to_string().to_ascii_lowercase().contains("redirect");
+            let detail = error_chain(&err, &self.config.api_key);
+            let message = if redirect {
+                format!(
+                    "LLM client refused a redirect; the request was not followed to another host: {detail}"
+                )
+            } else {
+                format!("LLM request failed: {detail}")
+            };
+            CallError {
+                message: mask_secrets(&message, &self.config.api_key),
+                retryable: !redirect,
+                retry_after: None,
+            }
         })?;
         let status = response.status();
+        if status.is_redirection() {
+            return Err(CallError {
+                message:
+                    "LLM client refused a redirect; the request was not followed to another host"
+                        .into(),
+                retryable: false,
+                retry_after: None,
+            });
+        }
         let retry_after = response
             .headers()
             .get(reqwest::header::RETRY_AFTER)
@@ -3113,6 +3228,346 @@ mod transport_policy_tests {
         assert!(!message.contains("test-key"));
         assert!(!message.contains("Bearer test-key"));
         assert!(!message.contains("BODY-MARKER-7f3a"));
+    }
+
+    fn release_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn release_cfg(base: &str, host: &str) -> LlmConfig {
+        LlmConfig {
+            provider: OPENAI.into(),
+            base_url: base.into(),
+            api_key: "sk-test-value".into(),
+            model: "gpt-5.1-2026-01-01".into(),
+            timeout: Duration::from_secs(5),
+            max_retries: 0,
+            seed: 0,
+            endpoint_host: host.into(),
+            endpoint_private: false,
+            send_sampling: false,
+            api_style: "chat".into(),
+        }
+    }
+
+    #[test]
+    fn release_allowlist_is_exact_hard_coded_hosts() {
+        assert_eq!(
+            RELEASE_LLM_HOSTS,
+            &[
+                "api.openai.com",
+                "api.anthropic.com",
+                "generativelanguage.googleapis.com",
+                "ai-proxy-sub2api.clinicone.me",
+            ]
+        );
+        for host in RELEASE_LLM_HOSTS {
+            assert!(!host.contains('*'), "{host}");
+            assert!(!host.starts_with('.'), "{host}");
+            assert_eq!(*host, host.to_ascii_lowercase());
+        }
+    }
+
+    #[test]
+    fn release_allows_exact_clinicone_proxy_and_official_hosts() {
+        for (provider, url, host) in [
+            (
+                "openai",
+                "https://ai-proxy-sub2api.clinicone.me/v1",
+                "ai-proxy-sub2api.clinicone.me",
+            ),
+            (
+                "openai",
+                "https://AI-PROXY-SUB2API.CLINICONE.ME/v1?unused=1",
+                "ai-proxy-sub2api.clinicone.me",
+            ),
+            (
+                "openai",
+                "https://ai-proxy-sub2api.clinicone.me:443/v1",
+                "ai-proxy-sub2api.clinicone.me",
+            ),
+            ("openai", "https://api.openai.com/v1", "api.openai.com"),
+            (
+                "anthropic",
+                "https://api.anthropic.com",
+                "api.anthropic.com",
+            ),
+            (
+                "gemini",
+                "https://generativelanguage.googleapis.com/v1beta",
+                "generativelanguage.googleapis.com",
+            ),
+        ] {
+            let model = if provider == "gemini" {
+                "gemini-2.5-pro"
+            } else if provider == "anthropic" {
+                "claude-sonnet-4-6"
+            } else {
+                "gpt-5.1-2026-01-01"
+            };
+            let config = load_release_llm_config(&release_env(&[
+                ("LLM_PROVIDER", provider),
+                ("LLM_BASE_URL", url),
+                ("LLM_API_KEY", "sk-test-value"),
+                ("LLM_MODEL", model),
+                ("LLM_RELEASE_HOSTS", "evil.clinicone.me"),
+                ("VIBE_RELEASE_LLM_HOSTS", "*.clinicone.me"),
+            ]))
+            .unwrap_or_else(|err| panic!("{url}: {err}"))
+            .unwrap_or_else(|| panic!("{url}: missing config"));
+            assert!(
+                config.endpoint_host.eq_ignore_ascii_case(host),
+                "{url} -> {}",
+                config.endpoint_host
+            );
+            check_release_endpoint(&config).unwrap_or_else(|err| panic!("{url}: {err}"));
+        }
+        let unset = load_release_llm_config(&HashMap::new()).unwrap();
+        assert!(unset.is_none());
+    }
+
+    #[test]
+    fn release_rejects_spoofed_http_userinfo_port_and_ip_hosts() {
+        let secret = "s3cret-userinfo";
+        let refused = [
+            "https://evil.clinicone.me/v1",
+            "https://ai-proxy-sub2api.clinicone.me.evil.com/v1",
+            "https://sub.ai-proxy-sub2api.clinicone.me/v1",
+            "https://notai-proxy-sub2api.clinicone.me/v1",
+            "https://clinicone.me/v1",
+            "https://llm.attacker.example/v1",
+            "https://api.openai.com.evil.com/v1",
+            "http://ai-proxy-sub2api.clinicone.me/v1",
+            "http://ai-proxy-sub2api.clinicone.me:443/v1",
+            &format!("https://user:{secret}@ai-proxy-sub2api.clinicone.me/v1"),
+            "https://ai-proxy-sub2api.clinicone.me:8443/v1",
+            "https://1.1.1.1/v1",
+            "https://[2606:4700:4700::1111]/v1",
+        ];
+        for url in refused {
+            let err = load_release_llm_config(&release_env(&[
+                ("LLM_BASE_URL", url),
+                ("LLM_API_KEY", "sk-test-value"),
+                ("LLM_MODEL", "gpt-5.1-2026-01-01"),
+                (
+                    "LLM_RELEASE_HOSTS",
+                    "ai-proxy-sub2api.clinicone.me,evil.clinicone.me",
+                ),
+                ("LLM_ALLOW_PRIVATE_HOST", "true"),
+            ]))
+            .expect_err(url);
+            assert!(!err.contains(secret), "{url}: {err}");
+            assert!(!err.contains('*'), "{url}: {err}");
+            if url.starts_with("http://") {
+                assert!(err.contains("https"), "http must fail closed: {url}: {err}");
+            }
+        }
+        let userinfo = format!("https://user:{secret}@ai-proxy-sub2api.clinicone.me/v1");
+        let err = check_release_endpoint(&release_cfg(&userinfo, "ai-proxy-sub2api.clinicone.me"))
+            .unwrap_err();
+        assert!(err.contains("userinfo"), "{err}");
+        assert!(!err.contains(secret), "{err}");
+        let err = check_release_endpoint(&release_cfg(
+            "https://ai-proxy-sub2api.clinicone.me:8443/v1",
+            "ai-proxy-sub2api.clinicone.me",
+        ))
+        .unwrap_err();
+        assert!(err.contains("non-standard port"), "{err}");
+        let err =
+            check_release_endpoint(&release_cfg("https://1.1.1.1/v1", "1.1.1.1")).unwrap_err();
+        assert!(err.contains("IP literal"), "{err}");
+        let err = check_release_endpoint(&release_cfg(
+            "http://ai-proxy-sub2api.clinicone.me/v1",
+            "ai-proxy-sub2api.clinicone.me",
+        ))
+        .unwrap_err();
+        assert!(err.contains("https"), "{err}");
+        let mut private = release_cfg(
+            "https://ai-proxy-sub2api.clinicone.me/v1",
+            "ai-proxy-sub2api.clinicone.me",
+        );
+        private.endpoint_private = true;
+        assert!(check_release_endpoint(&private)
+            .unwrap_err()
+            .contains("private"));
+        let err = check_release_endpoint(&release_cfg(
+            "https://evil.clinicone.me/v1",
+            "evil.clinicone.me",
+        ))
+        .unwrap_err();
+        assert!(err.contains("allowlisted host"), "{err}");
+        assert!(err.contains("evil.clinicone.me"), "{err}");
+        let err = check_release_endpoint(&release_cfg(
+            "https://ai-proxy-sub2api.clinicone.me.evil.com/v1",
+            "ai-proxy-sub2api.clinicone.me.evil.com",
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("ai-proxy-sub2api.clinicone.me.evil.com"),
+            "{err}"
+        );
+        assert!(check_release_endpoint(&release_cfg(
+            "https://ai-proxy-sub2api.clinicone.me/v1",
+            "ai-proxy-sub2api.clinicone.me",
+        ))
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn llm_client_does_not_follow_a_redirect_away() {
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let evil_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let evil_flag = evil_hits.clone();
+        let evil = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                evil_flag.fetch_add(1, Ordering::SeqCst);
+                async { "FOLLOWED" }
+            }),
+        );
+        let evil_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let evil_addr = evil_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(evil_listener, evil).await.unwrap() });
+
+        let proxy_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let proxy_flag = proxy_hits.clone();
+        let proxy = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                proxy_flag.fetch_add(1, Ordering::SeqCst);
+                let location = format!("http://{evil_addr}/v1/chat/completions");
+                async move {
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, location)],
+                        "redirect-away",
+                    )
+                }
+            }),
+        );
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(proxy_listener, proxy).await.unwrap() });
+
+        let mut config = release_cfg(&format!("http://{proxy_addr}/v1"), "127.0.0.1");
+        config.endpoint_private = true;
+        config.timeout = Duration::from_secs(2);
+        let adapter = HttpAdapter::new(config).unwrap();
+        let err = adapter
+            .compile(&LlmRequest {
+                source: String::new(),
+                purpose: String::new(),
+                system: "sys".into(),
+                input: "in".into(),
+                model: "gpt-5.1-2026-01-01".into(),
+                seed: 0,
+                timeout: Duration::from_secs(2),
+                budget: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            proxy_hits.load(Ordering::SeqCst) >= 1,
+            "redirecting host was not contacted: {err}"
+        );
+        assert_eq!(
+            evil_hits.load(Ordering::SeqCst),
+            0,
+            "followed redirect: {err}"
+        );
+        assert!(err.to_ascii_lowercase().contains("redirect"), "{err}");
+        assert!(!err.contains("FOLLOWED"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn llm_client_rejects_an_untrusted_tls_certificate() {
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+        );
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
+            sock.set_write_timeout(Some(Duration::from_secs(3))).ok();
+            let mut conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+            let mut buf = [0u8; 1024];
+            if tls.read(&mut buf).is_ok() {
+                let _ = tls.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 74\r\n\r\n{\"choices\":[{\"message\":{\"content\":\"LEAKED\"}}],\"model\":\"gpt-5.1-2026-01-01\"}",
+                );
+            }
+        });
+
+        let mut config = release_cfg(&format!("https://127.0.0.1:{port}/v1"), "127.0.0.1");
+        config.endpoint_private = true;
+        config.timeout = Duration::from_secs(3);
+        let url = config.base_url.clone();
+        // Inspect the raw client error. HttpAdapter masks `host:port` as if it
+        // were URL userinfo, which also hides the certificate failure text.
+        let raw = llm_http_builder(&config)
+            .build()
+            .unwrap()
+            .post(format!("{url}/chat/completions"))
+            .json(&json!({"model": "gpt-5.1-2026-01-01"}))
+            .send()
+            .await
+            .unwrap_err();
+        let mut chain = Vec::new();
+        let mut source = Some(&raw as &(dyn std::error::Error + 'static));
+        while let Some(err) = source {
+            chain.push(err.to_string());
+            source = err.source();
+        }
+        let raw_text = chain.join(": ");
+        let lower = raw_text.to_ascii_lowercase();
+        assert!(
+            lower.contains("certificate")
+                || lower.contains("unknownissuer")
+                || lower.contains("invalid peer"),
+            "{raw_text}"
+        );
+        assert!(!raw_text.contains("LEAKED"), "{raw_text}");
+        let adapter = HttpAdapter::new(config).unwrap();
+        let err = adapter
+            .compile(&LlmRequest {
+                source: String::new(),
+                purpose: String::new(),
+                system: "sys".into(),
+                input: "in".into(),
+                model: "gpt-5.1-2026-01-01".into(),
+                seed: 0,
+                timeout: Duration::from_secs(3),
+                budget: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(!err.contains("LEAKED"), "{err}");
     }
 }
 
