@@ -115,6 +115,16 @@ PR CI can run `LLM_PROVIDER=replay vibe build --check` without any key, URL or
 model and without LLM network access. Replay is for test/preview builds;
 release builds require a real provider. CI cannot record new responses.
 
+`vibe build --release` sends the key and prompts only to the hard-coded hosts
+`api.openai.com`, `api.anthropic.com`, `generativelanguage.googleapis.com`,
+and `ai-proxy-sub2api.clinicone.me`. The ClinicOne proxy is an exact hostname
+on the release supply-chain trust boundary: a compromise of that host can
+affect release compilation, and the API key and prompts go through it. Other
+`clinicone.me` names, `http`, userinfo, a non-standard port, an IP literal,
+and redirects off the allowlist are refused. The list cannot be extended
+through the environment. See
+[Release host allowlist](../best-practices/llm-provider-setup.md#release-host-allowlist).
+
 To include rendered locks in the GitHub step summary, build first (check only
 compiles in memory), then append the generated, untracked locks:
 

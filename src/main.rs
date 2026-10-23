@@ -306,12 +306,11 @@ async fn cmd_manifest(
             env.entry("LLM_API_KEY".into()).or_insert(key);
         }
         llm::resolve_api_key_file(&mut env)?;
-        // No LLM key (VIBE_LLM_API_KEY or LLM_API_KEY) is ever sent to a
-        // host outside the release allowlist.
-        if let Ok(config) = llm::load_llm_config(&env, true) {
-            llm::check_release_endpoint(&config)?;
-        }
-        let config = llm::load_llm_config(&env, true).ok();
+        // No LLM key (VIBE_LLM_API_KEY or LLM_API_KEY) is sent unless the
+        // base URL is https on an exact allowlisted hostname. A configured
+        // LLM_BASE_URL that fails that check aborts the release. Hosts are
+        // hard-coded; the environment cannot add one.
+        let config = llm::load_release_llm_config(&env)?;
         let adapter = match &config {
             Some(config) => Some(llm::adapter_for(config).map_err(|err| err.to_string())?),
             None => None,
