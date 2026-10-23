@@ -36,6 +36,54 @@ case ${1-} in
         sha_ok "$3" || fail 'SDK SHA must be 40 lowercase hex characters'
         printf 'sdk_version=%s\nsdk_sha=%s\n' "$version" "$3"
         ;;
+    sdk-commit)
+        # job.workflow_sha is the annotated tag object when a caller pins a tag.
+        # The commits API peels that object, so comparing those SHAs always fails.
+        # Resolve the named tag ourselves: a lightweight tag is its commit; an
+        # annotated tag matches when the workflow SHA is that tag object or the
+        # commit it points at. Any other object is rejected, including a different
+        # tag that merely peels to the same commit.
+        [ "$#" -eq 3 ] || fail 'sdk-commit needs version and workflow SHA'
+        version=$2
+        workflow_sha=$3
+        version_ok "$version" || fail 'invalid SDK version'
+        sha_ok "$workflow_sha" || fail 'SDK SHA must be 40 lowercase hex characters'
+        # Command substitution strips trailing newlines, so this has to be a literal.
+        newline='
+'
+        ref_meta=$(gh api "repos/vibe-backend/sdk/git/ref/tags/v$version" --jq '"\(.object.type) \(.object.sha)"') || fail 'SDK tag lookup failed'
+        case $ref_meta in
+            *"$newline"*|*"$carriage_return"*) fail 'SDK tag ref metadata is invalid' ;;
+        esac
+        ref_type=${ref_meta%% *}
+        ref_sha=${ref_meta#* }
+        [ "$ref_type $ref_sha" = "$ref_meta" ] || fail 'SDK tag ref metadata is invalid'
+        sha_ok "$ref_sha" || fail 'SDK tag ref SHA is invalid'
+        case $ref_type in
+            commit)
+                [ "$workflow_sha" = "$ref_sha" ] || fail 'SDK tag commit differs from reusable workflow commit'
+                printf 'sdk_commit=%s\n' "$ref_sha"
+                ;;
+            tag)
+                tag_meta=$(gh api "repos/vibe-backend/sdk/git/tags/$ref_sha" --jq '"\(.tag)\n\(.object.type)\n\(.object.sha)"') || fail 'SDK annotated tag lookup failed'
+                case $tag_meta in
+                    *"$carriage_return"*|*"$newline"*"$newline"*"$newline"*) fail 'annotated tag metadata is invalid' ;;
+                    *"$newline"*"$newline"*) ;;
+                    *) fail 'annotated tag metadata is invalid' ;;
+                esac
+                tag_name=${tag_meta%%"$newline"*}
+                rest=${tag_meta#*"$newline"}
+                target_type=${rest%%"$newline"*}
+                target_sha=${rest#*"$newline"}
+                [ "$tag_name" = "v$version" ] || fail 'annotated tag name differs from SDK release tag'
+                [ "$target_type" = commit ] || fail 'annotated tag must point at a commit'
+                sha_ok "$target_sha" || fail 'peeled SDK commit is invalid'
+                [ "$workflow_sha" = "$ref_sha" ] || [ "$workflow_sha" = "$target_sha" ] || fail 'SDK tag commit differs from reusable workflow commit'
+                printf 'sdk_commit=%s\n' "$target_sha"
+                ;;
+            *) fail 'SDK tag ref must be a commit or annotated tag' ;;
+        esac
+        ;;
     dry-run-ref)
         [ "$#" -eq 3 ] || fail 'dry-run-ref needs repository and SHA'
         [ "$2" = vibe-backend/sdk ] || fail 'dry-run SDK repository must be vibe-backend/sdk'

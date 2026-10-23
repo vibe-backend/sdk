@@ -174,13 +174,11 @@ jobs:
           SDK_SHA: ${{ job.workflow_sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          # workflow_sha is the annotated tag object for a tag pin, not the peeled commit.
           .vibe-sdk/scripts/ci/project-release.sh sdk-ref "$SDK_REF" "$SDK_SHA" > "$RUNNER_TEMP/sdk-outputs"
-          cat "$RUNNER_TEMP/sdk-outputs" >> "$GITHUB_OUTPUT"
           sdk_version=$(sed -n 's/^sdk_version=//p' "$RUNNER_TEMP/sdk-outputs")
-          tag_sha=$(gh api "repos/vibe-backend/sdk/commits/refs/tags/v$sdk_version" --jq .sha)
-          if [ "$tag_sha" != "$SDK_SHA" ]; then
-            echo '::error::SDK tag commit differs from reusable workflow commit'; exit 1
-          fi
+          .vibe-sdk/scripts/ci/project-release.sh sdk-commit "$sdk_version" "$SDK_SHA"
+          cat "$RUNNER_TEMP/sdk-outputs" >> "$GITHUB_OUTPUT"
       - name: Validate caller tag
         id: guard
         env:

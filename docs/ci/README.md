@@ -17,8 +17,10 @@ Locks are build output. They are not committed (`*.lock.md` is in
    never a branch or SHA; Dependabot can bump it. The reusable workflow is
    available from `v1.0.0-rc.5`, the first SDK release tag that contains it;
    select that release or later, with the SDK tag
-   version equal to the deployed runtime version. The workflow checks its tag's
-   commit against its own commit and installs the SDK and runtime through the
+   version equal to the deployed runtime version. The workflow checks that
+   release tag against the reusable workflow SHA. An annotated tag matches
+   when the SHA is the tag object or the commit it points at; a lightweight
+   tag must match the commit. It then installs the SDK and runtime through the
    unchanged checksum and SDK attestation checks.
    Its `build-and-sign` job uses the protected caller environment, validates
    the caller tag and explicit LLM model/key, builds a release manifest,
