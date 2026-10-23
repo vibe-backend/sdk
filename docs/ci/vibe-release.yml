@@ -14,7 +14,7 @@ jobs:
     # The reusable workflow is available from v1.0.0-rc.5, the first SDK release
     # tag that contains it.
     # Select that release or later; the SDK tag version must equal your runtime version.
-    uses: vibe-backend/sdk/.github/workflows/vibe-project-release.yml@v1.0.0-rc.5
+    uses: vibe-backend/sdk/.github/workflows/vibe-project-release.yml@v1.0.0-rc.6
     with:
       environment: release
       llm-model: gpt-4.1-2025-04-14

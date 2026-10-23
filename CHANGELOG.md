@@ -5,7 +5,15 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+## 1.0.0-rc.6
+
 - **Decision 190:** Check method return shapes and caller field reads during build repair and lock validation. No prompt change; future prompt changes wait for the next rc.
+
+- Project release checks accept an annotated SDK tag when the workflow SHA is the tag object or the commit it points at (#333). Lightweight tags still require an exact commit match.
+
+- Bump `rustls-webpki` to 0.103.16 and `webpki-roots` to 1.0.10 (RUSTSEC-2026-0382, RUSTSEC-2026-0381).
+
+- Version 1.0.0-rc.6; locks are stamped `1.0.0-rc.6` (run `vibe build`). Replay fixture keys include this version, so fixtures recorded for rc.5 miss until re-keyed; prompts are unchanged.
 
 ## 1.0.0-rc.5
 
