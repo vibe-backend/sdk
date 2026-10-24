@@ -165,6 +165,11 @@ fn project_with_after_failures_lock() -> std::path::PathBuf {
     let feature = dir.join("api/auth/v1");
     std::fs::create_dir_all(&feature).unwrap();
     std::fs::write(
+        dir.join("api/_project.md"),
+        "# project\n\n## Routes\n\n- prefix: (none)\n- default-slug: (none)\n",
+    )
+    .unwrap();
+    std::fs::write(
         feature.join("login.md"),
         "# login\n\n## Route\n\n- method: POST\n- path: /auth/v1/{slug}/login\n\n## Access\n\n- public: true\n- challenge: { type: captcha, when: after-failures, after-failures: 3 }\n",
     )

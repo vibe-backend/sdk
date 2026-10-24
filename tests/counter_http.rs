@@ -154,7 +154,9 @@ fn project_routes_and_artifact_serve_web_counter() {
 fn serve_counter(root: PathBuf, artifact: bool) {
     use std::io::{Read, Write};
     let implicit = !root.join("providers").exists();
-    let project_routes = root.join("api/_project.md").exists();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    let project_routes = manifest.get("route_prefix").is_some();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);

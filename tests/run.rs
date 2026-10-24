@@ -156,7 +156,7 @@ fn hello_serves_without_loading_llm_configuration() {
                     stream
                         .set_read_timeout(Some(std::time::Duration::from_secs(10)))
                         .unwrap();
-                    stream.write_all(b"GET /hello/v1/dev/hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+                    stream.write_all(b"GET /api/hello/v1/hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
                     let mut body = String::new();
                     stream.read_to_string(&mut body).unwrap();
                     return body;
@@ -237,7 +237,7 @@ fn prepared_hello_router_without_socket() {
             .await
             .unwrap();
             let mut request = axum::http::Request::builder()
-                .uri("/hello/v1/dev/hello")
+                .uri("/api/hello/v1/hello")
                 .body(axum::body::Body::empty())
                 .unwrap();
             request.extensions_mut().insert(axum::extract::ConnectInfo(
@@ -354,7 +354,7 @@ fn runtime_artifact_serves_hello() {
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(10)))
                     .unwrap();
-                stream.write_all(b"GET /hello/v1/dev/hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+                stream.write_all(b"GET /api/hello/v1/hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
                 let mut body = String::new();
                 stream.read_to_string(&mut body).unwrap();
                 return body;

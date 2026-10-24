@@ -1157,11 +1157,11 @@ fn check_feature_mode(doc: &LockDoc, file: &str, default_slug: Option<&str>, rep
     if let Some(default) = default_slug {
         let path = route.get("path").unwrap_or("");
         if path.contains("{slug}") {
-            report.push(Diag::error(file, format!("route uses {{slug}} but api/_project.md sets default-slug {default}; remove the {{slug}} segment (route {}) or remove default-slug", path.replace("/{slug}", ""))));
+            report.push(Diag::error(file, format!("route uses {{slug}} but default-slug is {default}; remove the {{slug}} segment (route {}) or set default-slug: (none) in api/_project.md", path.replace("/{slug}", ""))));
         }
         let tenant = find_section(&doc.sections, "Access").and_then(|s| s.get("tenant"));
         if tenant == Some("path.slug") || public && tenant != Some("default-slug") {
-            report.push(Diag::error(file, "api/_project.md sets default-slug; replace tenant: path.slug with tenant: default-slug (or remove default-slug)"));
+            report.push(Diag::error(file, "default-slug is set; replace tenant: path.slug with tenant: default-slug or set default-slug: (none) in api/_project.md"));
         }
     } else if public {
         let path = route.get("path").unwrap_or("");

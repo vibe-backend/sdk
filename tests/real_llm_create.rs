@@ -139,6 +139,11 @@ async fn real_model_create_zh_and_en() {
         write(root, ".gitignore", ".env\n.vibe/cache/\n");
         write(
             root,
+            "api/_project.md",
+            "# project\n\n## Routes\n\n- prefix: (none)\n- default-slug: (none)\n",
+        );
+        write(
+            root,
             "providers/main.md",
             include_str!("fixtures/shop/providers/main.md"),
         );

@@ -18,6 +18,12 @@ const NESTED: &str =
 
 fn project() -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!("vibe-repair-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(root.join("api")).unwrap();
+    fs::write(
+        root.join("api/_project.md"),
+        "# project\n\n## Routes\n\n- prefix: (none)\n- default-slug: (none)\n",
+    )
+    .unwrap();
     fs::create_dir_all(root.join("models/product")).unwrap();
     fs::create_dir_all(root.join("providers")).unwrap();
     fs::write(
