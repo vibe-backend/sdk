@@ -9,7 +9,14 @@ use std::{
 fn project() -> PathBuf {
     let root = std::env::temp_dir().join(format!("vibe-aux-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(root.join(".vibe")).unwrap();
+    fs::create_dir_all(root.join("api")).unwrap();
     fs::write(root.join(".gitignore"), ".env\n").unwrap();
+    // Multi-tenant slug files and `{slug}` routes opt out of the built-in defaults.
+    fs::write(
+        root.join("api/_project.md"),
+        "# project\n\n## Routes\n\n- prefix: (none)\n- default-slug: (none)\n",
+    )
+    .unwrap();
     root
 }
 fn build(root: &std::path::Path, args: &[&str]) -> Output {

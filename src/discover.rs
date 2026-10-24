@@ -146,7 +146,7 @@ fn collect_dir(
                             .split_whitespace()
                             .find(|word| word.starts_with('/') && word.contains("{slug}"))
                         {
-                            report.push(Diag::error(&rel, format!("route uses {{slug}} but api/_project.md sets default-slug {default}; remove the {{slug}} segment (route {}) or remove default-slug", route.replace("/{slug}", ""))));
+                            report.push(Diag::error(&rel, format!("route uses {{slug}} but default-slug is {default}; remove the {{slug}} segment (route {}) or set default-slug: (none) in api/_project.md", route.replace("/{slug}", ""))));
                         }
                     }
                 }

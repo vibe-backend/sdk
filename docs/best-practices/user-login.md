@@ -55,7 +55,7 @@ dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
   - { id: user/methods/sign-token, kind: method, hash: sha256:3b90...d4 }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 status: approved
 approval-mode: manual
 approved-by: [jack@example, mei@example]

@@ -325,7 +325,7 @@
 | 184 | 冇 `providers/`（或者冇任何 provider）嘅 project 用內建隱含 in-memory provider `main`；dev、`vibe run`、`vibe build --release` 都得；release build 同 runtime 啟動會出警告（資料只喺記憶體，重啟會冇）；production 照決定 91 拒絕 in-memory；有 provider source 嘅 project 行為不變（冇 `main` 照樣 `missing dependency main`）；allowlist 寫其他 provider 照舊驗證；manifest provenance 記 `implicit_memory_provider`。 | 已批准 | 2、5、10.1 |
 | 185 | 全域 LLM 設定用絕對非空 `$XDG_CONFIG_HOME/vibe/llm.env`，否則 `$HOME/.config/vibe/llm.env`；只准 LLM_PROVIDER、LLM_BASE_URL、LLM_MODEL、LLM_API_STYLE、LLM_API_KEY_FILE。優先次序 env > project .env > global，空值當缺少。Key 放獨立 0600 檔案，由 LLM_API_KEY_FILE 引用，相對路徑以設定目錄為準；兩個檔案都拒絕 group/world 權限並提示 chmod 600。CI、production、build --release 同 runtime 永遠唔讀。VIBE_DEBUG_LLM_CONFIG=1 只印名稱同來源。首次互動 vibe 只有 process env、project `.env` 同全域設定都冇任何 `LLM_*` 設定，先寫全域 `llm.env` 同獨立 key file（0600）；project `.env` 或 env 有部分 LLM 設定時，只問缺少嘅值並追加到 project `.env`（0600），同喺 `.gitignore` 加 `.env`，唔覆蓋現有檔案；private host opt-in 留喺 project。澄清決定 91：production 只由環境決定，唔睇 release manifest；VIBE_ENV 嘅 dev/development/local/test 係開發，ci 係 CI，其餘非空值係 production；unset/空值用 memory 係開發，否則 production。Release manifest 可喺 VIBE_ENV=development 用 memory（例如 Docker demo），production 仍拒絕所有 memory，包括隱含 main。 | 已確認 | 2A.8、2C.1、2C.4 |
 | 186 | Endpoint 改用平面檔案 `api/<def>/<ver>/<endpoint>.md`，可選同層 `<endpoint>.schema.md`，build 產生同層 `<endpoint>.lock.md`；路由由檔名推導，id 同 runtime 行為不變。舊 endpoint 資料夾係硬性 build error，每個舊檔都要列出確切新路徑；rc.5 breaking change，唔支援雙格式。 | 已確認 | 2A.1、2C.1 |
-| 187 | 可選 `api/_project.md` 用結構化 `## Routes` 設定 `prefix` 同 `default-slug`，唔經 LLM。prefix 必須以 `/` 開頭、冇尾斜線／空段，每段只准小寫英數開頭加英數或連字號，總長最多 64，首段唔可以係 `_internal` 或 `health`；空值／缺省維持原路由。default-slug 沿用 slugs.json 驗證，只限單租戶：其他 slug、路由 `{slug}` 或 public `tenant: path.slug` 都係 build error，要移除衝突或 default-slug；public 改用 `tenant: default-slug`。runtime 同明示 slug 用完全相同 tenant lookup、權限、角色同 tenant_id quota，憑證 tenant 必須相符。manifest 記錄 `route_prefix`／`default_slug` 並一同簽署；prefix 只喺 manifest 套用，slug mode 變更令 lock／cache 過期。prompt 只以 input data 傳入 project route rule，隨 rc.5 發佈。 | 已確認 | 2A.1、2C.1 |
+| 187 | 可選 `api/_project.md` 用結構化 `## Routes` 設定 `prefix` 同 `default-slug`，唔經 LLM。prefix 必須以 `/` 開頭、冇尾斜線／空段，每段只准小寫英數開頭加英數或連字號，總長最多 64，首段唔可以係 `_internal` 或 `health`；省略檔案、空檔、`# project` 或 `## Routes` 嘅 `(none)` 而冇 key 覆寫時預設 `prefix: /api` 同 `default-slug: dev`；`- prefix: (none)` 清走 prefix，`- default-slug: (none)` 先用 `{slug}` 同 `tenant: path.slug`。default-slug 沿用 slugs.json 驗證，只限單租戶：其他 slug、路由 `{slug}` 或 public `tenant: path.slug` 都係 build error，要移除衝突或設 `default-slug: (none)`；public 改用 `tenant: default-slug`。runtime 同明示 slug 用完全相同 tenant lookup、權限、角色同 tenant_id quota，憑證 tenant 必須相符。manifest 記錄 `route_prefix`／`default_slug` 並一同簽署；prefix 只喺 manifest 套用，slug mode 變更令 lock／cache 過期。prompt 只以 input data 傳入 project route rule，隨 rc.5 發佈。 | 已確認 | 2A.1、2C.1 |
 | 188 | 純自然語言可建立可執行 counter：Model dependency 傳正規化 table 名及 target store 資料；未知 model provider（例如將 store kind `memory` 當成隱式 provider `main`）係 build error，列出可用 provider 並交 repair retry；隱式 store 嘅 prompt input 明示 `provider: main`。method step 嘅 args shape 靜態已知（Transform in 或 inline map）時，必須提供 target method `Signature` 所有 required input，缺少即 build error，列出 item、target 同 field；`validate` 同樣檢查。query 用 parser 檢查 table、column（唔准 tenant_id）同 CRUD 權限，SELECT 對應 get／list，INSERT／UPDATE／DELETE 對應 create／update／delete。隱式 memory 只准決定 183 SQL，唔支援即 build／deploy error 並交 repair；明示 PostgreSQL 保留 memory warning。固定公開語句（anyone can、公開等）可取代 public／auth／public-writes frontmatter，明示 pin 優先，但 frontmatter 移除 auth 或設 public 同來源要求登入仍然衝突，fail-closed；公開語句 gate 忽略否定句。公開移除 auth，寫入先設 public-writes。平面檔名加 project rule 決定 route，明示 path 除外；prefix 只剝一次且驗證，default-slug／path.slug 錯誤交 repair。GET／POST 同 URL 用兩個 endpoint 檔明示同一路徑。無法表達嘅英文／中文限制必須 warning 引述來源句，唔當已執行。prompt 變更隨 rc.5。 | 已確認 | 2A.1、2C.1 |
 | 189 | LLM replay fixtures：`LLM_PROVIDER=replay` 唔需要 key、URL 或 model，永不連網；預設 project `fixtures/llm`，`VIBE_LLM_FIXTURES` 可覆寫。Key 係 VIBE_VERSION、十進制 LOCK_VERSION、system prompt、完整 input 各自以 8-byte big-endian UTF-8 byte length 前綴後串接嘅 SHA-256 小寫 hex；唔包含連線、model、seed 或時間。`VIBE_LLM_RECORD` 用真 provider 或 fake 記錄 raw response 同穩定排序 index（key/source/purpose），供人手 review；寫前及 build/check 掃描 API key、base URL、host，命中只報檔案同類別。Replay miss 收集來源同用途並提示 record 指令；未使用 fixtures 警告。CI 拒絕 record；release 拒絕 record/replay；replay 標記 test_build，runtime 拒絕 release test manifests。Locks 唔 commit。 | 已確認 | 2A.8、10.1 |
 | 190 | Method 回傳 shape 靜態檢查：Signature output 支援 scalar 同 inline object keys，最後 respond map 提供實際 keys；宣告同已知實際 shape 衝突喺 method 報錯。endpoint／method 呼叫 scalar 後讀欄位，或讀取已知 object 冇提供嘅欄位，build 同 validate 報 caller、target、field，並交 repair retry。未知／opaque／list 同未明 CRUD shape 跳過，唔猜測。Prompt 不變；日後 prompt 變更等下一個 rc。 | 已確認 | 2A.1、2C.1 |
@@ -369,7 +369,7 @@ project/
 - migration 檔名 `{seq}-{name}`：`seq` 係 4 位數字（`0001` 起，連續唔可以跳號），例如 `0003-add-user-phone.md`。lock 檔由編譯器產生，唔准手寫或者手改。
 - `_` 開頭嘅檔係保留檔，永遠唔會被路由；`_definition.md` 只可以放喺 `{definition}/`，`_version.md` 只可以放喺 `{version}/`。
 - version 名必須符合 `^v[1-9][0-9]*$`（例如 v1、v2、v10）。version 只存在於 api 層；models 同 method 唔分 version。
-- 預設 public 路由係 `/{definition}/{version}/{slug}/{feature}`，private 係 `/{definition}/{version}/{feature}`；`api/_project.md` 設定 default-slug 後 public 省略 `{slug}`，prefix 會加喺所有路由前面（例如 `/api/web/v1/counter`）。路由一定要包含 version，冇預設版本，亦唔會自動轉去最新版本。
+- 預設（冇 `api/_project.md`，或者 `## Routes` 冇 key 覆寫）public 同 private 路由都加 `/api`，public 用 `default-slug: dev` 而省略 `{slug}`（例如 `/api/web/v1/counter`）。`api/_project.md` 用 `- default-slug: (none)` 先恢復 public `/{definition}/{version}/{slug}/{feature}` 同 `tenant: path.slug`，用 `- prefix: (none)` 先唔加前綴。路由一定要包含 version，冇預設版本，亦唔會自動轉去最新版本。
 - 保留路徑：`/_internal/*`、`/health`。
 
 ## 2. 編譯流程同 source 寫法
@@ -525,7 +525,7 @@ source-type: natural               # natural | structured
 dependencies:                      # 所有依賴 source／lock 嘅 hash，按 id 排序
   - { id: user, kind: model, hash: sha256:<...> }
   - { id: main, kind: provider, hash: sha256:<...> }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 build-mode: release                # release | dev；dev lock 唔可以部署（決定 75）
 security-items:                    # 驗證器 deterministic 抽出，資訊性（決定 78）
   - { item: public, risk: high, reason: "公開登入入口" }
@@ -1140,7 +1140,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: migrations/main/0002-add-last-login, kind: migration, hash: sha256:2b8f...c3 }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items:
   - { item: migration-ddl, risk: high, reason: "加敏感電話欄位" }
 ---
@@ -2595,7 +2595,7 @@ Token 紀錄令到超過上限（兩個紀錄同一個交易，要 2 個空位�
 
 決定 179：檢查一律經 `vibe build`，包括每次 secret scan（有發現即失敗）、slug 同停用檔格式；破壞性 migration 喺 build 只警告，喺 PostgreSQL run 啟動時預設拒絕，改過已套用 SQL 亦拒絕（2C.3e）。
 
-決定 181：目前版本 `1.0.0-rc.6` 嘅 lock 戳記係 `1.0.0-rc.6`；兩個 binary 都跟決定 176 完全一致規則。
+決定 181：目前版本 `1.0.0-rc.7` 嘅 lock 戳記係 `1.0.0-rc.7`；兩個 binary 都跟決定 176 完全一致規則。
 由 rc.2 binary 建立嘅 lock 戳記係 `1.0.0-rc.2`，必須用版本相符嘅 binary 執行 `vibe build` 重建。
 
 - 過時：`source-hash` 同而家 source 正規化 hash 唔一致；或者任何 `dependencies` hash 唔一致。Release 入面 lock hash 同 dependency hash 喺同一個 release build 入面計同驗，唔用之前 build 或者磁碟上嘅值。
@@ -2741,7 +2741,7 @@ source: providers/main.md
 source-hash: sha256:9a1c...e2
 source-type: natural
 dependencies: []
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items: [{ item: provider-new, risk: high, reason: "新增主資料庫" }]
 ---
 ## Connection
@@ -2829,7 +2829,7 @@ source: pipelines/login-guard.md
 source-hash: sha256:51bd...07
 source-type: natural
 dependencies: []
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items: [{ item: rate-limit-new, risk: medium, reason: "登入防爆破" }]
 ---
 ## Parameters
@@ -2939,7 +2939,7 @@ dependencies:
   - { id: user/methods/register, kind: method, hash: sha256:c3e1...90 }
   - { id: users/_definition, kind: api, hash: sha256:11ab...3c }
   - { id: users/v2/_version, kind: api, hash: sha256:0d9e...51 }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items: [{ item: roles, risk: high, reason: "只限 admin 建立用戶" }]
 ---
 ## Route
@@ -3042,7 +3042,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 build-mode: release
 security-items:
   - { item: write-sql, risk: medium, reason: "建立用戶" }
@@ -3111,7 +3111,7 @@ dependencies:
   - { id: email-outbox/methods/enqueue, kind: method, hash: sha256:81aa...c2 }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 build-mode: release
 security-items:
   - { item: write-sql, risk: medium, reason: "寫邀請 token" }
@@ -3195,7 +3195,7 @@ dependencies:
   - { id: user/methods/invite, kind: method, hash: sha256:5b7d...e4 }
   - { id: users/_definition, kind: api, hash: sha256:11ab...3c }
   - { id: users/v2/_version, kind: api, hash: sha256:0d9e...51 }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 build-mode: release
 security-items: [{ item: roles, risk: high, reason: "只限 admin 寄邀請" }]
 ---
@@ -3682,7 +3682,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: migrations/main/0004-add-email-verification, kind: migration, hash: sha256:5e77...b1 }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items:
   - { item: public-writable-column, risk: high, reason: "last_login_at 畀 public 登入寫" }
 ---
@@ -3745,7 +3745,7 @@ source-hash: sha256:3b90...d4
 source-type: natural
 dependencies:
   - { id: user, kind: model, hash: sha256:aa41...0f }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items:
   - { item: sign-token, risk: high, reason: "唯一簽 token 入口" }
 ---
@@ -3808,7 +3808,7 @@ dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
   - { id: user/methods/sign-token, kind: method, hash: sha256:3b90...d4 }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items:
   - { item: write-sql, risk: medium, reason: "記錄最後登入時間" }
 ---
@@ -3911,7 +3911,7 @@ dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: login-guard, kind: pipeline, hash: sha256:51bd...07 }
   - { id: user/methods/login, kind: method, hash: sha256:e81f...2a }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items:
   - { item: public, risk: high, reason: "登入入口一定要公開" }
   - { item: auth-removed, risk: high, reason: "未登入先要登入" }
@@ -4202,7 +4202,7 @@ source-type: natural
 dependencies:
   - { id: email-outbox, kind: model, hash: sha256:4f10...9d }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items:
   - { item: write-sql, risk: medium, reason: "註冊信件排隊" }
 ---
@@ -4274,7 +4274,7 @@ dependencies:
   - { id: email-outbox/methods/enqueue, kind: method, hash: sha256:81aa...c2 }
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items:
   - { item: write-sql, risk: medium, reason: "建立未驗證用戶或者輪換驗證 token" }
 ---
@@ -4356,7 +4356,7 @@ source-type: natural
 dependencies:
   - { id: main, kind: provider, hash: sha256:9a1c...e2 }
   - { id: user, kind: model, hash: sha256:aa41...0f }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items:
   - { item: set-password, risk: high, reason: "用 email token 設定密碼" }
   - { item: confirm-verification, risk: high, reason: "訪客用 token 確認 email" }
@@ -4447,7 +4447,7 @@ source-type: natural
 dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: user/methods/self-register, kind: method, hash: sha256:d3c9...10 }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items:
   - { item: public, risk: high, reason: "訪客註冊入口" }
   - { item: auth-removed, risk: high, reason: "未有帳戶" }
@@ -4565,7 +4565,7 @@ source-type: natural
 dependencies:
   - { id: auth/_definition, kind: api, hash: sha256:77e0...aa }
   - { id: user/methods/complete-verification, kind: method, hash: sha256:9e02...7b }
-vibe-version: 1.0.0-rc.6
+vibe-version: 1.0.0-rc.7
 security-items:
   - { item: public, risk: high, reason: "email 連結入口" }
   - { item: auth-removed, risk: high, reason: "未有密碼" }

@@ -2010,11 +2010,11 @@ fn normalize_feature(
             .and_then(|s| s.get("path"))
             .is_some_and(|p| p.contains("{slug}"))
         {
-            return Err(vec![Diag::error(&source.rel, "route uses {slug} but api/_project.md sets default-slug; remove the {slug} segment")]);
+            return Err(vec![Diag::error(&source.rel, "route uses {slug} but default-slug is set; remove the {slug} segment or set default-slug: (none) in api/_project.md")]);
         }
         if find_section(&doc.sections, "Access").and_then(|s| s.get("tenant")) == Some("path.slug")
         {
-            return Err(vec![Diag::error(&source.rel, "api/_project.md sets default-slug; replace tenant: path.slug with tenant: default-slug")]);
+            return Err(vec![Diag::error(&source.rel, "default-slug is set; replace tenant: path.slug with tenant: default-slug or set default-slug: (none) in api/_project.md")]);
         }
     }
     if let Some(route) = find_section_mut(&mut doc.sections, "Route") {
@@ -3449,18 +3449,18 @@ mod prompt_tests {
             text: "Hello".into(),
             schema: None,
         };
-        let slug_hash = source.source_hash();
+        let default_hash = source.source_hash();
         assert!(llm_input(&source, &HashMap::new())
             .starts_with(crate::project::Routes::default().rule()));
         std::fs::write(
             root.join("api/_project.md"),
-            "## Routes\n- prefix: /api\n- default-slug: acme\n",
+            "## Routes\n- prefix: /api\n- default-slug: (none)\n",
         )
         .unwrap();
         let input = llm_input(&source, &HashMap::new());
-        assert!(input.starts_with("Project route rule: public routes use /{definition}/{version}/<endpoint> and tenant: default-slug"));
+        assert!(input.starts_with("Project route rule: public routes use /{definition}/{version}/{slug}/<endpoint> and tenant: path.slug"));
         assert!(!input.contains("/api"));
-        assert_ne!(source.source_hash(), slug_hash);
+        assert_ne!(source.source_hash(), default_hash);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3643,6 +3643,16 @@ mod prompt_tests {
         template.meta.source_type = SourceType::Structured;
         let mut source = feature("");
         source.id = "catalog/v1/new-thing".into();
+        // The cloned shop route still uses {slug}. Point the source at an opted-out
+        // project so the built-in default slug does not reject that route.
+        let root = std::env::temp_dir().join(format!("vibe-limits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("api")).unwrap();
+        std::fs::write(
+            root.join("api/_project.md"),
+            "# project\n\n## Routes\n\n- prefix: (none)\n- default-slug: (none)\n",
+        )
+        .unwrap();
+        source.abs = root.join("api/shop/v1/new-thing.md");
         for (front, version, definition, expected) in [
             (
                 "provider: pinned\ntimeout: 500ms\nbody: 64kb",
@@ -3685,6 +3695,7 @@ mod prompt_tests {
                 assert!(!super::frontmatter_security_check(&doc, &source).is_empty());
             }
         }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn dep_ids(input: &str) -> Vec<String> {

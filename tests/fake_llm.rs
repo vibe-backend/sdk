@@ -399,6 +399,11 @@ async fn compile_auth_feature_output(
         fs::create_dir_all(root.join(dir)).unwrap();
     }
     fs::write(
+        root.join("api/_project.md"),
+        "# project\n\n## Routes\n\n- prefix: (none)\n- default-slug: (none)\n",
+    )
+    .unwrap();
+    fs::write(
         root.join("providers/main.md"),
         include_str!("fixtures/shop/providers/main.md"),
     )

@@ -55,7 +55,7 @@ fn config() -> llm::LlmConfig {
     llm::load_llm_config(&env(), false).unwrap()
 }
 fn source() -> &'static str {
-    "---\npublic: true\nwrites: false\nauth: none\n---\n# Hello\nGET /hello/v1/{slug}/hello returns constant JSON {\"message\":\"hello world\"} with status 200.\n"
+    "---\npublic: true\nwrites: false\nauth: none\n---\n# Hello\nGET /hello/v1/hello returns constant JSON {\"message\":\"hello world\"} with status 200.\n"
 }
 fn answer() -> String {
     serde_json::json!({"definition":"hello","version":"v1","feature":"hello","source":source()})
@@ -486,7 +486,7 @@ async fn generation_confirmation_and_preservation() {
             assert_eq!(vibe::discover::discover(&p).unwrap().len(), 3);
             let compiler = FakeAdapter {
                 responder: |_| {
-                    Ok("## Route\n- method: GET\n- path: /hello/v1/{slug}/hello\n## Access\n- public: true\n- tenant: path.slug\n## Pipelines\n(none)\n## Limits\n- provider: main\n## Request\n(none)\n## Response\n- status: 200\n## Transform\n(none)\n## Steps\n### s1 respond\n- op: respond\n- value: { message: \"hello world\" }\n- source-lines: 7\n## Errors\n(none)\n".into())
+                    Ok("## Route\n- method: GET\n- path: /hello/v1/hello\n## Access\n- public: true\n- tenant: default-slug\n## Pipelines\n(none)\n## Limits\n- provider: main\n## Request\n(none)\n## Response\n- status: 200\n## Transform\n(none)\n## Steps\n### s1 respond\n- op: respond\n- value: { message: \"hello world\" }\n- source-lines: 7\n## Errors\n(none)\n".into())
                 },
             };
             vibe::compile::regenerate_project(&vibe::compile::CompileOptions {
@@ -528,7 +528,7 @@ async fn project_route_rule_is_sent_with_initial_and_repair_requests() {
         let p = root();
         fs::create_dir_all(p.join("api")).unwrap();
         let settings = default_slug.map_or_else(
-            || "## Routes\n- prefix: /api\n".to_string(),
+            || "## Routes\n- prefix: /api\n- default-slug: (none)\n".to_string(),
             |slug| format!("## Routes\n- prefix: /api\n- default-slug: {slug}\n"),
         );
         fs::write(p.join("api/_project.md"), settings).unwrap();
