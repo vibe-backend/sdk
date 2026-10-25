@@ -47,6 +47,10 @@ jobs:
         run: |
           shellcheck scripts/ci/project-release.sh tests/project_release.sh
           tests/project_release.sh
+      - name: Tag signer digest tests
+        run: |
+          shellcheck scripts/ci/tag-signer-digest.sh tests/tag_signer_digest.sh
+          tests/tag_signer_digest.sh
       - name: Shellcheck install script
         run: shellcheck scripts/vibe-install.sh
 

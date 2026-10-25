@@ -99,9 +99,12 @@ A development key next to a release manifest is ignored with a warning.
 
 The signer half is fixed in the binary: SAN and Build Signer URI name the SDK
 `vibe-project-release.yml` at the runtime's own version, and Build Signer Digest
-matches the SDK tag commit compiled in as `VIBE_SDK_COMMIT`. There is no runtime
+matches the SDK tag ref object compiled in as `VIBE_SDK_COMMIT` (the annotated
+tag object, or the commit when the tag is lightweight). That is the git object
+SHA of `refs/tags/v<version>`, which GitHub OIDC writes when a project calls
+the workflow at that tag. It is not the peeled commit. There is no runtime
 override. Current non-release builds without that commit refuse release manifests.
-SDK tag release builds embed this commit; an empty compile-time value is treated
+SDK tag release builds embed this object SHA; an empty compile-time value is treated
 like an absent value and still refuses release manifests. Use a clean build when
 changing it. Projects call the [reusable release workflow](ci/README.md) at the
 same SDK tag as the runtime. The project pin is never taken from artifact contents.

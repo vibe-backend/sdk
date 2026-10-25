@@ -5,6 +5,12 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+## 1.0.0-rc.8
+
+- SDK release builds embed the tag ref object SHA as `VIBE_SDK_COMMIT` (the annotated tag object, or the commit for a lightweight tag). That is the digest GitHub OIDC writes into the Fulcio certificate when a project calls `vibe-project-release.yml@v<version>`. Tag pushes still check that the peeled commit is on `main`. `github.sha` on a tag push is that peeled commit and is not the signer digest.
+
+- Version 1.0.0-rc.8; locks are stamped `1.0.0-rc.8` (run `vibe build`). Replay fixture keys include this version, so fixtures recorded for rc.7 miss until re-keyed; prompts are unchanged.
+
 ## 1.0.0-rc.7
 
 - **Breaking:** Omitted `api/_project.md` now defaults to `prefix: /api` and `default-slug: dev` (single-tenant `/api/<definition>/<version>/<endpoint>`, `tenant: default-slug`). An empty file, `# project`, or `## Routes` with `(none)` and no key overrides keep those defaults. Set `- prefix: (none)` for no prefix and `- default-slug: (none)` for multi-tenant `/{slug}` routes with `tenant: path.slug`. Omitting a key no longer clears it.

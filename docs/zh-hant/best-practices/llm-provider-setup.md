@@ -59,7 +59,7 @@ Fork PR 沒有 secrets，因此只執行 validator，不重新編譯（§2A.8.5�
 決定 180 更新決定 174：private endpoint 只記 `endpoint-private: true`，host 永遠唔以明文、hash 或任何衍生值記喺 build record、dev／release manifest provenance 或產生嘅 project／artifact 檔案；public host 照舊。舊 record／manifest 仍然 parse，舊 signed dev manifest 仍然驗簽；build 重寫時刪走 private host。唯一例外係 `.vibe/cache` key，cache 永遠唔 commit、唔打包；`vibe build -o <manifest-path>`／`--release` 只寫 manifest，runtime artifact loader 只讀 manifest 同 release signature bundle，唔讀 cache。互動設定可能寫 `LLM_BASE_URL` 入 `.env`，呢個用戶設定保持不變。
 
 ````markdown
-vibe-version: 1.0.0-rc.7
+vibe-version: 1.0.0-rc.8
 ````
 
 `model-snapshot` 是 **provider 回報**的 model id（`modelReported`），而非用戶輸入；若與 `LLM_MODEL` 不同（例如 provider 解析了別名）屬錯誤。`sent-params` 是 adapter 實際送出的參數集（Decision 58、§2A.8.6）。

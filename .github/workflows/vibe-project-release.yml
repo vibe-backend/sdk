@@ -230,6 +230,10 @@ jobs:
           unset KEY
           export LLM_API_KEY_FILE="$key_file"
           if [ -n "$BASE_URL" ]; then export LLM_BASE_URL="$BASE_URL"; fi
+          # Caller source commit. On the caller's tag push github.sha is the peeled
+          # commit, which the certificate records as the source repository digest.
+          # The SDK build signer digest is the called workflow's tag ref object,
+          # compiled into vibe-runtime, not this commit.
           vibe build --release --project "project-src/$PROJECT_PATH" --release-version "$VERSION" --commit "$GITHUB_SHA" -o dist/manifest.json
       - name: Remove LLM key file
         if: always()

@@ -43,6 +43,9 @@ case ${1-} in
         # annotated tag matches when the workflow SHA is that tag object or the
         # commit it points at. Any other object is rejected, including a different
         # tag that merely peels to the same commit.
+        # The printed peeled commit is only the tag's target. It is not the OIDC
+        # build_signer_digest and must not be compiled into VIBE_SDK_COMMIT.
+        # That digest is the tag ref object SHA, embedded by release.yml.
         [ "$#" -eq 3 ] || fail 'sdk-commit needs version and workflow SHA'
         version=$2
         workflow_sha=$3

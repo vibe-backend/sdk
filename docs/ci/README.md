@@ -12,7 +12,7 @@ Locks are build output. They are not committed (`*.lock.md` is in
    `VIBE_LLM_API_KEY_PREVIEW`.
 2. **Build once through the reusable workflow.** Copy [the caller example](vibe-release.yml)
    to your project's `.github/workflows/release.yml`. A `v*` tag push calls
-   `vibe-backend/sdk/.github/workflows/vibe-project-release.yml@v1.0.0-rc.7`.
+   `vibe-backend/sdk/.github/workflows/vibe-project-release.yml@v1.0.0-rc.8`.
    The SDK reference must be a release **tag**,
    never a branch or SHA; Dependabot can bump it. The reusable workflow is
    available from `v1.0.0-rc.5`, the first SDK release tag that contains it;
@@ -20,7 +20,12 @@ Locks are build output. They are not committed (`*.lock.md` is in
    version equal to the deployed runtime version. The workflow checks that
    release tag against the reusable workflow SHA. An annotated tag matches
    when the SHA is the tag object or the commit it points at; a lightweight
-   tag must match the commit. It then installs the SDK and runtime through the
+   tag must match the commit. The certificate build signer digest is a
+   different value: the tag ref's object SHA (the annotated tag object, or
+   the commit for a lightweight tag), compiled into the runtime as
+   `VIBE_SDK_COMMIT`. It is not the peeled commit. `github.sha` on the SDK's
+   own tag push is that peeled commit and is used only to check that the
+   commit is on `main`. It then installs the SDK and runtime through the
    unchanged checksum and SDK attestation checks.
    Its `build-and-sign` job uses the protected caller environment, validates
    the caller tag and explicit LLM model/key, builds a release manifest,

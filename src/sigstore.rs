@@ -214,9 +214,12 @@ impl Signer {
         check_commit(digest)?;
         Ok(Self { version: sdk_version.into(), identity: format!("https://github.com/vibe-backend/sdk/.github/workflows/vibe-project-release.yml@refs/tags/v{sdk_version}"), digest: digest.into() })
     }
-    /// SDK release workflow will set VIBE_SDK_COMMIT=${{ github.sha }} at build time
-    /// for tag builds. Other binaries refuse release manifests. Use a clean build
-    /// when changing the compile-time value; no runtime override exists.
+    /// Official SDK tag builds set `VIBE_SDK_COMMIT` to the git object SHA of
+    /// `refs/tags/v<version>`: the annotated tag object, or the commit for a
+    /// lightweight tag. That is the Fulcio `build_signer_digest` GitHub writes
+    /// when a caller pins `@v<version>`. A tag push's `github.sha` is the peeled
+    /// commit and is not this value. Other binaries refuse release manifests.
+    /// Use a clean build when changing the compile-time value; no runtime override exists.
     pub fn compiled() -> Result<Self, String> {
         match option_env!("VIBE_SDK_COMMIT").filter(|digest| !digest.is_empty()) {
             Some(digest) => Self::new(env!("CARGO_PKG_VERSION"), digest)
