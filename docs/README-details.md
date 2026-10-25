@@ -17,10 +17,11 @@ Write “Anyone can read the counter” to authorize a public endpoint; “公�
 methods they call. Explicit `public`, `auth` and `public-writes` frontmatter wins.
 Without clear public wording, endpoints stay private and require auth.
 
-The flat filename and project route rule determine the path. With
-`default-slug: demo`, `api/web/v1/counter.md` resolves to `/web/v1/counter`;
-`prefix: /api` adds `/api` at runtime. Without default-slug, public paths include
-`/{slug}`. Locks exclude the project prefix.
+The flat filename and project route rule determine the path. With the built-in
+defaults (`prefix: /api`, `default-slug: dev`), `api/web/v1/counter.md` resolves
+to `/api/web/v1/counter`. Set `default-slug: (none)` in `api/_project.md` when
+public paths should include `/{slug}`, and `prefix: (none)` when no prefix is
+wanted. Locks exclude the project prefix.
 
 GET and POST on one URL use two files with an explicit same-path sentence:
 
@@ -63,9 +64,9 @@ Release artifacts need `--expect-identity` / `VIBE_EXPECT_IDENTITY` and
 Install verified pre-release assets for either or both with the manager:
 
 ```sh
-./scripts/vibe-install.sh install --version v1.0.0-rc.6
-./scripts/vibe-install.sh install --version v1.0.0-rc.6 --runtime
-VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.6
+./scripts/vibe-install.sh install --version v1.0.0-rc.7
+./scripts/vibe-install.sh install --version v1.0.0-rc.7 --runtime
+VIBE_INSTALL_BINARY=runtime ./scripts/vibe-install.sh install --version v1.0.0-rc.7
 ```
 
 The default installs `vibe`; `--runtime` installs `vibe-runtime`. They coexist.
@@ -145,10 +146,10 @@ all release checks, ready for Sigstore signing. Options include `--project`,
 `-o`/`--output`, `--release-version`, and `--commit`.
 
 Run the project with `vibe run`, then curl the API. Use `--artifact` to run a build artifact.
-Locks record `vibe-version: 1.0.0-rc.6`: stable versions use major.minor and
+Locks record `vibe-version: 1.0.0-rc.7`: stable versions use major.minor and
 pre-releases use the full version, with an exact match required. Run
 `vibe build` to regenerate locks from another version or the old lock format.
-Locks built by an rc.5 binary are stamped `1.0.0-rc.5` and must be rebuilt with the matching binary using `vibe build`.
+Locks built by an rc.6 binary are stamped `1.0.0-rc.6` and must be rebuilt with the matching binary using `vibe build`.
 
 ## Status
 
@@ -215,7 +216,7 @@ Rebuild to generate the new sibling locks.
 
 ## Project route settings (decision 187)
 
-Optional `api/_project.md` is parsed deterministically and never compiled by the LLM:
+`api/_project.md` is optional and is parsed deterministically, never compiled by the LLM. When the file is omitted, empty, `# project`, or `## Routes` followed by `(none)` with no key overrides, routes use `prefix: /api` and `default-slug: dev`. A public `api/web/v1/counter.md` is then `/api/web/v1/counter`, with `tenant: default-slug`:
 
 ```markdown
 # project
@@ -223,14 +224,14 @@ Optional `api/_project.md` is parsed deterministically and never compiled by the
 ## Routes
 
 - prefix: /api
-- default-slug: acme
+- default-slug: dev
 ```
 
-With both settings, a public `api/web/v1/counter.md` route is `/api/web/v1/counter`, with `tenant: default-slug`. Without the file, public routes keep `/{definition}/{version}/{slug}/<endpoint>` and `tenant: path.slug`. Missing keys, empty values and `(none)` retain the defaults. Unknown sections or keys are errors. Underscore files are reserved; only `_project.md` is accepted directly under `api/`.
+Set `- prefix: (none)` for no prefix. Set `- default-slug: (none)` for multi-tenant routes (`/{definition}/{version}/{slug}/<endpoint>` and `tenant: path.slug`). Omitting a key keeps that default. An empty `prefix` value clears the prefix; an empty `default-slug` value keeps `dev`. A bare `(none)` under `## Routes` does not opt out. Unknown sections or keys are errors. Underscore files are reserved; only `_project.md` is accepted directly under `api/`.
 
 The prefix must start with `/`, have no trailing slash or empty segments, and total at most 64 bytes. Each segment matches `^[a-z0-9][a-z0-9-]*$`; the first cannot be `health` or `_internal`. It is applied only to manifest routes, never sent to the LLM or stored in locks. Changing only the prefix updates the manifest without recompiling features.
 
-`default-slug` uses the same validation as `slugs.json` and is single-tenant only. Remove other slugs from both `.vibe/slugs.json` and `slugs.example.json`, remove `{slug}` from routes, and use `tenant: default-slug` for public routes; conflicts fail the build. Changing slug mode invalidates compiled locks and caches. The compiler and interactive authoring prompts receive the project route rule as input data (rc.5). The signed manifest records optional `route_prefix` and `default_slug`; empty defaults are omitted for compatibility. Runtime and verification reject routes inconsistent with these fields.
+`default-slug` uses the same validation as `slugs.json` and is single-tenant only. Remove other slugs from both `.vibe/slugs.json` and `slugs.example.json`, remove `{slug}` from routes, and use `tenant: default-slug` for public routes; conflicts fail the build. Set `default-slug: (none)` to keep multi-tenant `{slug}` routes. Changing slug mode invalidates compiled locks and caches. The compiler and interactive authoring prompts receive the project route rule as input data (rc.5). The signed manifest records `route_prefix` and `default_slug`. An empty prefix and an absent default slug (the `(none)` opt-out) are omitted. Runtime and verification reject routes inconsistent with these fields.
 
 See [runtime configuration](runtime-config.md) for tenant permissions and development defaults.
 

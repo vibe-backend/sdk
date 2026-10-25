@@ -1,10 +1,19 @@
 //! Deterministic project routing settings; never compiled by an LLM.
 use std::{fs, path::Path};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Routes {
     pub prefix: String,
     pub default_slug: Option<String>,
+}
+
+impl Default for Routes {
+    fn default() -> Self {
+        Self {
+            prefix: "/api".to_string(),
+            default_slug: Some("dev".to_string()),
+        }
+    }
 }
 
 impl Routes {
@@ -42,7 +51,9 @@ impl Routes {
             match key {
                 "prefix" => settings.prefix = if value == "(none)" { "" } else { value }.into(),
                 "default-slug" => {
-                    if !value.is_empty() && value != "(none)" {
+                    if value == "(none)" {
+                        settings.default_slug = None;
+                    } else if !value.is_empty() {
                         settings.default_slug = Some(value.into());
                     }
                 }
@@ -96,7 +107,7 @@ impl Routes {
             let mut extra: Vec<_> = slugs.filter(|s| *s != default).cloned().collect();
             extra.sort();
             if !extra.is_empty() {
-                return Err(format!("api/_project.md: default-slug {default} conflicts with extra slugs {}; remove them or remove default-slug", extra.join(", ")));
+                return Err(format!("api/_project.md: default-slug {default} conflicts with extra slugs {}; remove them or set default-slug: (none)", extra.join(", ")));
             }
         }
         Ok(())
@@ -130,16 +141,24 @@ mod tests {
     use super::*;
     #[test]
     fn structured_routes_are_strict_and_optional() {
-        for text in [
-            "",
-            "# project",
-            "## Routes\n(none)",
-            "## Routes\n- prefix: (none)\n- default-slug: (none)",
-        ] {
+        for text in ["", "# project", "## Routes\n(none)"] {
             let routes = Routes::parse(text).unwrap();
-            assert!(routes.prefix.is_empty());
-            assert!(routes.default_slug.is_none());
+            assert_eq!(routes.prefix, "/api");
+            assert_eq!(routes.default_slug.as_deref(), Some("dev"));
         }
+        let opted_out =
+            Routes::parse("## Routes\n- prefix: (none)\n- default-slug: (none)").unwrap();
+        assert!(opted_out.prefix.is_empty());
+        assert!(opted_out.default_slug.is_none());
+        let prefix_only = Routes::parse("## Routes\n- prefix: (none)").unwrap();
+        assert!(prefix_only.prefix.is_empty());
+        assert_eq!(prefix_only.default_slug.as_deref(), Some("dev"));
+        let slug_only = Routes::parse("## Routes\n- default-slug: (none)").unwrap();
+        assert_eq!(slug_only.prefix, "/api");
+        assert!(slug_only.default_slug.is_none());
+        let overridden = Routes::parse("## Routes\n- prefix: /v2\n- default-slug: acme").unwrap();
+        assert_eq!(overridden.prefix, "/v2");
+        assert_eq!(overridden.default_slug.as_deref(), Some("acme"));
         for (text, key) in [
             ("## Unknown", "Unknown"),
             ("## Routes\n- typo: x", "typo"),

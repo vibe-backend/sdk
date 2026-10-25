@@ -144,7 +144,7 @@ fn dev_build_and_release_ignore_global() {
         vibe::scaffold::version_content("hello", "v1"),
     )
     .unwrap();
-    fs::write(project.join("api/hello/v1/hello.md"), "---\npublic: true\nwrites: false\nauth: none\n---\n# Hello\nGET /hello/v1/{slug}/hello returns constant JSON {\"message\":\"hello world\"} with status 200.\n").unwrap();
+    fs::write(project.join("api/hello/v1/hello.md"), "---\npublic: true\nwrites: false\nauth: none\n---\n# Hello\nGET /hello/v1/hello returns constant JSON {\"message\":\"hello world\"} with status 200.\n").unwrap();
     fs::write(project.join(".gitignore"), ".env\n.vibe/\n").unwrap();
     let config = root.join("config");
     write_initial(&config.join("vibe"), &values(), "sentinel-secret").unwrap();

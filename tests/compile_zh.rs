@@ -22,6 +22,12 @@ const INDEX: &str =
 
 fn fixture(structured: bool) -> PathBuf {
     let root = std::env::temp_dir().join(format!("vibe-compile-zh-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(root.join("api")).unwrap();
+    fs::write(
+        root.join("api/_project.md"),
+        "# project\n\n## Routes\n\n- prefix: (none)\n- default-slug: (none)\n",
+    )
+    .unwrap();
     for dir in ["providers", "models/product", "migrations/main"] {
         fs::create_dir_all(root.join(dir)).unwrap();
     }

@@ -187,14 +187,36 @@ fn invalid_settings_and_tenant_conflicts_are_build_errors() {
 }
 #[tokio::test]
 async fn prefix_only_and_default_only_preserve_route_modes() {
-    for (settings, path, default) in [
-        ("- prefix: /api", "/api/web/v1/acme/counter", false),
-        ("- default-slug: acme", "/web/v1/counter", true),
-        ("", "/web/v1/acme/counter", false),
+    for (settings, path, slug_in_path, omit_manifest_fields) in [
+        (
+            "- prefix: /api\n- default-slug: (none)",
+            "/api/web/v1/acme/counter",
+            true,
+            false,
+        ),
+        (
+            "- prefix: (none)\n- default-slug: acme",
+            "/web/v1/counter",
+            false,
+            false,
+        ),
+        ("", "/api/web/v1/counter", false, false),
+        (
+            "- prefix: (none)\n- default-slug: (none)",
+            "/web/v1/acme/counter",
+            true,
+            true,
+        ),
     ] {
         let root = fixture();
         if settings.is_empty() {
             fs::remove_file(root.join("api/_project.md")).unwrap();
+            // The built-in default slug is dev, so the example file cannot list acme.
+            fs::write(
+                root.join("slugs.example.json"),
+                r#"{"dev":{"tenant_id":"devtenant","public_access":true,"public_write":true}}"#,
+            )
+            .unwrap();
         } else {
             fs::write(
                 root.join("api/_project.md"),
@@ -202,7 +224,7 @@ async fn prefix_only_and_default_only_preserve_route_modes() {
             )
             .unwrap();
         }
-        if !default {
+        if slug_in_path {
             for name in ["counter", "increment-counter"] {
                 let file = root.join(format!("api/web/v1/{name}.md"));
                 let text = fs::read_to_string(&file)
@@ -214,6 +236,10 @@ async fn prefix_only_and_default_only_preserve_route_modes() {
         }
         let manifest = build(&root).unwrap();
         if settings.is_empty() {
+            assert_eq!(manifest.route_prefix, "/api");
+            assert_eq!(manifest.default_slug.as_deref(), Some("dev"));
+        }
+        if omit_manifest_fields {
             let json = serde_json::to_value(&manifest).unwrap();
             assert!(json.get("default_slug").is_none());
             assert!(json.get("route_prefix").is_none());
@@ -334,7 +360,11 @@ fn natural_locks_and_cache_track_mode_but_not_prefix() {
     let manifest: Manifest =
         serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest.routes[0].path, "/v2/web/v1/hello");
-    fs::write(root.join("api/_project.md"), "## Routes\n- prefix: /api\n").unwrap();
+    fs::write(
+        root.join("api/_project.md"),
+        "## Routes\n- prefix: /api\n- default-slug: (none)\n",
+    )
+    .unwrap();
     assert!(!compile(false).status.success());
     assert!(compile(true).status.success());
     let slug_lock = fs::read_to_string(&lock_path).unwrap();
