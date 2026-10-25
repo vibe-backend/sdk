@@ -16,7 +16,7 @@ Before the first `v*` tag. Items 1–2 are repository settings decided by the pr
 4. **No clobber** — Existing GitHub Releases are never overwritten (`gh release upload --clobber` removed).
 5. **Provenance** — Each matrix asset and `SHA256SUMS` are attested. Only the build/checksum jobs get `id-token`/`attestations`; the publishing job has `contents: write` only.
 6. **No unused container build** — The unused root `Dockerfile` / `.dockerignore` were removed; ship the release binaries from this workflow only.
-7. **Tag on main** — The workflow fails unless the tagged commit is reachable from `main`.
+7. **Tag on main** — The workflow fails unless the tagged commit (`^{commit}`, `github.sha` on a tag push) is reachable from `main`. The runtime's `VIBE_SDK_COMMIT` is the tag ref object SHA (annotated tag object, or the commit for a lightweight tag), not that peeled commit.
 
 ## Rate-limit capacity limits (#71, #73)
 

@@ -18,7 +18,9 @@ on:
       - "scripts/ci/release-assets.sh"
       - "tests/release_assets.sh"
       - "scripts/ci/check-*.sh"
+      - "scripts/ci/tag-signer-digest.sh"
       - "tests/tag_version.sh"
+      - "tests/tag_signer_digest.sh"
 
 permissions:
   contents: read
@@ -36,6 +38,10 @@ jobs:
     name: Tag commit is on main
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    outputs:
+      # Object SHA of refs/tags/v<version>, not the peeled commit. GitHub OIDC
+      # writes this into build_signer_digest when a caller pins @v<version>.
+      signer_digest: ${{ steps.signer.outputs.signer_digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -44,12 +50,17 @@ jobs:
       - name: Tag matches Cargo.toml version
         run: scripts/ci/check-tag-version.sh "$GITHUB_REF_NAME"
       - name: Require the tagged commit to be reachable from main
+        id: signer
         run: |
           git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::Tag $GITHUB_REF_NAME ($GITHUB_SHA) is not on main"
-            exit 1
-          fi
+          # GITHUB_SHA is the peeled commit on a tag push. The signer digest is
+          # the refs/tags/$GITHUB_REF_NAME object (annotated tag object, or the
+          # commit for a lightweight tag). actions/checkout in the build job
+          # does not fetch that tag object (fetch-depth 1, fetch-tags false),
+          # so resolve it here with ls-remote and pass it to build.
+          scripts/ci/tag-signer-digest.sh "$GITHUB_REF_NAME" origin/main origin "$GITHUB_SHA" > "$RUNNER_TEMP/tag-signer.txt"
+          grep '^signer_digest=' "$RUNNER_TEMP/tag-signer.txt" >> "$GITHUB_OUTPUT"
+          grep '^tagged_commit=' "$RUNNER_TEMP/tag-signer.txt"
 
   # #170: install script tests + shellcheck run on dry-run and tag paths.
   install-script:
@@ -64,9 +75,11 @@ jobs:
       - name: Install script tests
         run: python3 tests/install_manager.py
       - name: Shellcheck install script
-        run: shellcheck scripts/vibe-install.sh scripts/ci/check-runtime-binary.sh scripts/ci/check-runtime-features.sh scripts/ci/check-tag-version.sh tests/tag_version.sh
+        run: shellcheck scripts/vibe-install.sh scripts/ci/check-runtime-binary.sh scripts/ci/check-runtime-features.sh scripts/ci/check-tag-version.sh scripts/ci/tag-signer-digest.sh tests/tag_version.sh tests/tag_signer_digest.sh
       - name: Tag version tests
         run: tests/tag_version.sh
+      - name: Tag signer digest tests
+        run: tests/tag_signer_digest.sh
       - name: Release asset binding tests
         run: |
           shellcheck scripts/ci/release-assets.sh tests/release_assets.sh
@@ -124,9 +137,11 @@ jobs:
       - name: Build
         env:
           # Compile-time signer digest (decision 182, src/sigstore.rs Signer::compiled).
-          # Tag builds only: verify-tag enforces tag == Cargo.toml version, so the
-          # expected signer v<CARGO_PKG_VERSION> and digest match this release tag.
-          VIBE_SDK_COMMIT: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.sha || '' }}
+          # Tag builds only. This is the refs/tags/v<version> object SHA from
+          # verify-tag, which is what OIDC puts in build_signer_digest for
+          # @v<version>. github.sha is the peeled commit and is not used here.
+          # Dry-runs leave it empty.
+          VIBE_SDK_COMMIT: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.verify-tag.outputs.signer_digest || '' }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: |
