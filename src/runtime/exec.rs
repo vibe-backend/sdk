@@ -120,6 +120,11 @@ pub trait QueryExec: Send + Sync {
         tenant_id: &str,
         user_id: &str,
     ) -> Result<Option<Vec<String>>, ExecError>;
+
+    /// Sample-shop state. Only the memory executor has one.
+    fn shop_store(&self) -> Option<&super::shop::Store> {
+        None
+    }
 }
 
 /// Database roles a `query` step may run as.
@@ -190,6 +195,7 @@ pub struct MemoryExec {
     refresh_gate: tokio::sync::Mutex<()>,
     /// Optional query override for existing tests.
     query_stub: Mutex<Option<String>>,
+    shop: super::shop::Store,
 }
 
 impl MemoryExec {
@@ -355,6 +361,10 @@ impl QueryExec for MemoryExec {
             return Ok(None);
         };
         roles_from(row.get("roles")).map(Some)
+    }
+
+    fn shop_store(&self) -> Option<&super::shop::Store> {
+        Some(&self.shop)
     }
 
     async fn refresh_subject(

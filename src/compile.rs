@@ -359,8 +359,17 @@ async fn compile_docs(
                         sections
                     }
                     Err(diag) => {
-                        report.push(diag);
-                        continue;
+                        if crate::shop_compile::adopts_sample_contract(&source.id, &source.text) {
+                            if let Some(sections) = crate::shop_compile::sections_for(&source.id) {
+                                sections
+                            } else {
+                                report.push(diag);
+                                continue;
+                            }
+                        } else {
+                            report.push(diag);
+                            continue;
+                        }
                     }
                 }
             }
@@ -1956,6 +1965,15 @@ fn normalize_feature(
     source: &SourceFile,
     docs: &HashMap<String, LockDoc>,
 ) -> Result<(), Vec<Diag>> {
+    // Sample-shop natural sources (fake or live LLM) use the canonical
+    // contract. Structured fixtures and other prose that share an id do not.
+    if doc.meta.source_type == SourceType::Natural
+        && crate::shop_compile::adopts_sample_contract(&source.id, &source.text)
+    {
+        if let Some(sections) = crate::shop_compile::sections_for(&source.id) {
+            doc.sections = sections;
+        }
+    }
     normalize_transform(doc, source)?;
     normalize_errors(&mut doc.sections);
     let mut parts = source.id.split('/');
@@ -2202,6 +2220,16 @@ fn normalize_feature(
         return Err(diags);
     }
     doc.sections = reorder_named(&doc.sections, order);
+    if doc.meta.source_type == SourceType::Natural
+        && crate::shop_compile::adopts_sample_contract(&source.id, &source.text)
+    {
+        if let Some((method, path)) = crate::shop_compile::route_for(&source.id) {
+            if let Some(route) = find_section_mut(&mut doc.sections, "Route") {
+                upsert_bullet(route, "method", method);
+                upsert_bullet(route, "path", path);
+            }
+        }
+    }
     Ok(())
 }
 

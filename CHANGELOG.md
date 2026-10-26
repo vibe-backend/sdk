@@ -5,6 +5,16 @@ added only when the corresponding PR is merged to `main`.
 
 ## Unreleased
 
+## 1.0.0-rc.9
+
+- Memory mode (`VIBE_DB=memory`) executes the sample-shop single-tenant users, catalog, and shop routes (login, register, me, products, variants, cart, addresses, orders, payments, cancellation, delivery confirmation, and staff order status). Demo buyers, staff, and products are seeded when that shop store is empty unless `VIBE_SEED_DEMO` is `0`, `false`, `off`, or `no`. `LLM_PROVIDER=fake` and live compilation both install the canonical locks for those source ids.
+
+- When `VIBE_DB=memory` and neither `JWT_SIGNING_KEY` nor `VIBE_JWT_PUBLIC_KEY_PEM` is set (and JWKS is not configured), the process uses a built-in ephemeral EC P-256 keypair so `sign-jwt` and bearer verification work without those variables. Explicit keys are unchanged. Non-memory startup still requires a signing key.
+
+- **Prompt changes:** compile guidance covers sample-shop routes, the `json` request type, and the shop error codes (`INVALID_CREDENTIALS`, `EMAIL_TAKEN`, `PRODUCT_NOT_FOUND`, `ORDER_NOT_FOUND`, `ADDRESS_NOT_FOUND`, `PAYMENT_DECLINED`, `IDEMPOTENCY_KEY_REUSED`, `INVALID_TRANSITION`). Compile prompt fingerprint is `befa1a3b63243801fb257f529c4876513c5ec22acaf17b45f54ec7e36006462b`. Replay fixtures recorded for rc.8 miss and were re-keyed.
+
+- Version 1.0.0-rc.9; locks are stamped `1.0.0-rc.9` (run `vibe build`). Replay fixture keys include this version, so fixtures recorded for rc.8 miss until re-keyed.
+
 ## 1.0.0-rc.8
 
 - SDK release builds embed the tag ref object SHA as `VIBE_SDK_COMMIT` (the annotated tag object, or the commit for a lightweight tag). That is the digest GitHub OIDC writes into the Fulcio certificate when a project calls `vibe-project-release.yml@v<version>`. Tag pushes still check that the peeled commit is on `main`. `github.sha` on a tag push is that peeled commit and is not the signer digest.

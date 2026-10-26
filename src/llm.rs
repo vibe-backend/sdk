@@ -3733,10 +3733,11 @@ pub fn resolve_api_key_file(env: &mut HashMap<String, String>) -> Result<(), Str
 }
 
 /// Creates the network adapter or the deterministic, network-free test adapter.
-/// Fake supports constant-response GET features (default {"message":"hello world"})
-/// and the small natural-language counter fixture. The counter uses dependency
-/// table data and source public wording; other unsupported shapes fail.
-/// Translation returns its input unchanged; repair requests use the original input.
+/// Fake supports constant-response GET features (default {"message":"hello world"}),
+/// the sample-shop single-tenant routes, and the small natural-language counter
+/// fixture. The counter uses dependency table data and source public wording;
+/// other unsupported shapes fail. Translation returns its input unchanged;
+/// repair requests use the original input.
 pub fn adapter_for(config: &LlmConfig) -> Result<Box<dyn LlmAdapter>, String> {
     adapter_for_at(config, std::path::Path::new("."))
 }
@@ -3761,6 +3762,9 @@ fn fake_response(request: &LlmRequest) -> Result<String, String> {
     let input = &request.input;
     if !input.contains("KIND:") && request.system.to_ascii_lowercase().contains("translat") {
         return Ok(input.clone());
+    }
+    if let Some(lock) = crate::shop_compile::fake_lock(input) {
+        return Ok(lock);
     }
     let unsupported = || {
         "the fake LLM (LLM_PROVIDER=fake) only supports constant-response API features such as hello world".to_string()
@@ -3892,6 +3896,20 @@ mod fake_response_tests {
         assert!(super::fake_response(&request("delete hello"))
             .unwrap_err()
             .contains("the fake LLM (LLM_PROVIDER=fake) only supports"));
+        let shop = super::LlmRequest {
+            source: String::new(),
+            purpose: String::new(),
+            system: String::new(),
+            input: "KIND: api\nID: users/v1/login\n<<<SOURCE users\nPath: POST `/users/v1/login`\n<<<END SOURCE"
+                .into(),
+            model: "fake".into(),
+            seed: 0,
+            timeout: std::time::Duration::from_secs(1),
+            budget: None,
+        };
+        let lock = super::fake_response(&shop).unwrap();
+        assert!(lock.contains("- method: POST"));
+        assert!(lock.contains("- path: /users/v1/login"));
     }
 }
 

@@ -4,6 +4,7 @@ pub mod eckey;
 mod exec;
 mod http;
 pub mod jwks;
+mod jwt;
 mod limiter;
 pub mod memsql;
 pub mod migrate;
@@ -11,6 +12,7 @@ mod ops;
 pub mod refresh;
 pub mod replay;
 pub mod rsakey;
+pub(crate) mod shop;
 pub(crate) mod slugs;
 mod sql;
 
@@ -28,9 +30,10 @@ pub use http::{
     resolve_pepper, router, static_jwt_alg, ApiKeyFile, AppState, AuthConfig, RunEnv, SigningKey,
     Slug, StoredKey, REQUEST_TYPES,
 };
+pub use jwt::{ensure_dev_jwt, env_allows_dev_jwt};
 pub use ops::{
     custom_claim_problem, ec_signing_key_from_der, ec_signing_key_from_pem, load_signing_keys,
-    sub_source_problem,
+    load_signing_keys_with, sub_source_problem,
 };
 pub use sql::Stmt;
 
@@ -63,7 +66,7 @@ pub fn internal_metrics() -> String {
 }
 
 /// Platform error codes advertised to the compiler prompt.
-/// Backend-specific failures are handled separately to keep runtime changes prompt-neutral.
+/// Adding or renaming a code changes the compile prompt fingerprint.
 pub const RUNTIME_ERROR_CODES: &[&str] = &[
     "BAD_REQUEST",
     "CHALLENGE_FAILED",
@@ -83,6 +86,14 @@ pub const RUNTIME_ERROR_CODES: &[&str] = &[
     "TX_CONFLICT",
     "TX_TIMEOUT",
     "UNAUTHORIZED",
+    "ADDRESS_NOT_FOUND",
+    "EMAIL_TAKEN",
+    "IDEMPOTENCY_KEY_REUSED",
+    "INVALID_CREDENTIALS",
+    "INVALID_TRANSITION",
+    "ORDER_NOT_FOUND",
+    "PAYMENT_DECLINED",
+    "PRODUCT_NOT_FOUND",
     "UNIQUE_VIOLATION",
     "UNSUPPORTED_MEDIA_TYPE",
     "VALIDATION_FAILED",

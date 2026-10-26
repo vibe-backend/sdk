@@ -24,7 +24,7 @@ the installer uses it to check that the download is genuine):
 ```sh
 git clone https://github.com/vibe-backend/sdk.git
 cd sdk
-./scripts/vibe-install.sh install --version v1.0.0-rc.8
+./scripts/vibe-install.sh install --version v1.0.0-rc.9
 ```
 
 This installs the `vibe` command. On Windows, download the zip from
