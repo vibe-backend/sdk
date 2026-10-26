@@ -56,7 +56,7 @@ der = "0.7"
 sqlparser = { version = "0.52", features = ["visitor"] }
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = "0.14"
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(unix)'.dependencies]
