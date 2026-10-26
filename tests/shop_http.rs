@@ -2083,22 +2083,37 @@ async fn memory_dev_default_and_live_slug_reload() {
     fs::remove_dir_all(root).unwrap();
 }
 
-#[tokio::test]
-async fn missing_definition_suggests_scaffold() {
-    let root = copy_shop();
-    fs::remove_file(root.join("api/shop/_definition.md")).unwrap();
-    let error = regenerate_project(&CompileOptions {
+#[test]
+fn feature_without_definition_or_version_builds_and_validates() {
+    let root = std::env::temp_dir().join(format!("vibe-optional-api-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(root.join("api/web/v1")).unwrap();
+    fs::write(root.join(".gitignore"), ".env\n").unwrap();
+    fs::write(
+        root.join("api/web/v1/hello.md"),
+        "---\npublic: true\nauth: removed\n---\n# Hello\nA public GET endpoint returning {\"message\":\"hello world\"}.\n",
+    )
+    .unwrap();
+    assert!(!root.join("api/_project.md").exists());
+    assert!(!root.join("api/web/_definition.md").exists());
+    assert!(!root.join("api/web/v1/_version.md").exists());
+    assert_eq!(vibe::discover::discover(&root).unwrap().len(), 1);
+    let (ok, out) = vibe_cli(&root, &["build"], &[("LLM_PROVIDER", "fake")]);
+    assert!(ok, "{out}");
+    assert!(out.contains("validation ok"), "{out}");
+    let lock = fs::read_to_string(root.join("api/web/v1/hello.lock.md")).unwrap();
+    assert!(lock.contains("dependencies: []"), "{lock}");
+    assert!(!lock.contains("_definition"), "{lock}");
+    assert!(!lock.contains("_version"), "{lock}");
+    assert!(lock.contains("provider: main"), "{lock}");
+    assert!(lock.contains("timeout: 10s"), "{lock}");
+    assert!(lock.contains("body: 1MB"), "{lock}");
+    let report = vibe::validate::validate_project(&vibe::validate::ValidateOptions {
         root: &root,
-        llm: None,
-        llm_config: None,
-        check: false,
+        deploy: true,
+        dev: true,
     })
-    .await
-    .err()
-    .unwrap()
-    .to_string();
-    assert!(error.contains("api/shop/_definition.md"), "{error}");
-    assert!(error.contains("Run `vibe` (interactive)"), "{error}");
+    .unwrap_or_else(|err| panic!("{err}"));
+    assert!(!report.has_errors(), "{report}");
     fs::remove_dir_all(root).unwrap();
 }
 
