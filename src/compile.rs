@@ -1963,30 +1963,9 @@ fn normalize_feature(
     let version = parts.next().unwrap_or("");
     let def_id = format!("{definition}/_definition");
     let ver_id = format!("{definition}/{version}/_version");
-    let mut diags = Vec::new();
+    // Missing parents inherit nothing; limits and pipelines fall back below.
     let def = docs.get(&def_id);
     let ver = docs.get(&ver_id);
-    if def.is_none() {
-        diags.push(Diag::error(
-            &source.rel,
-            format!(
-                "missing api/{def_id}.md; expected minimal content:\n{}\nRun `vibe` (interactive) in the project directory to create them",
-                crate::scaffold::definition_content(definition)
-            ),
-        ));
-    }
-    if ver.is_none() {
-        diags.push(Diag::error(
-            &source.rel,
-            format!(
-                "missing api/{ver_id}.md; expected minimal content:\n{}\nRun `vibe` (interactive) in the project directory to create them",
-                crate::scaffold::version_content(definition, version)
-            ),
-        ));
-    }
-    if !diags.is_empty() {
-        return Err(diags);
-    }
     let front = source_frontmatter(&source.text);
     let public =
         find_section(&doc.sections, "Access").and_then(|s| s.get("public")) == Some("true");
@@ -2159,6 +2138,7 @@ fn normalize_feature(
     }
     let front = parse_source_frontmatter(&source.text)
         .map_err(|error| vec![Diag::error(&source.rel, error)])?;
+    let mut diags = Vec::new();
     for (key, value) in &front {
         if let Err(error) = crate::validate::check_limit_value(key, value) {
             diags.push(Diag::error(&source.rel, error));
@@ -2451,15 +2431,24 @@ pub(crate) fn dependencies(
             }
             Some(Scope::Version) => {
                 if let Some((definition, _)) = id.split_once('/') {
-                    ids.push((format!("{definition}/_definition"), Kind::Api));
+                    let def_id = format!("{definition}/_definition");
+                    if docs.contains_key(&def_id) {
+                        ids.push((def_id, Kind::Api));
+                    }
                 }
             }
             _ => {
                 let mut parts = id.split('/');
                 let definition = parts.next().unwrap_or("");
                 let version = parts.next().unwrap_or("");
-                ids.push((format!("{definition}/_definition"), Kind::Api));
-                ids.push((format!("{definition}/{version}/_version"), Kind::Api));
+                let def_id = format!("{definition}/_definition");
+                let ver_id = format!("{definition}/{version}/_version");
+                if docs.contains_key(&def_id) {
+                    ids.push((def_id, Kind::Api));
+                }
+                if docs.contains_key(&ver_id) {
+                    ids.push((ver_id, Kind::Api));
+                }
                 if let Some(limits) = find_section(&doc.sections, "Limits") {
                     if let Some(provider) = limits.get("provider") {
                         ids.push((provider.to_string(), Kind::Provider));
@@ -4743,6 +4732,75 @@ mod provider_dependency_tests {
         let error = dependencies("product", &docs, false).unwrap_err();
         assert!(error.to_string().contains("missing dependency main"));
         assert!(dependencies("product", &docs, true).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod optional_api_parent_tests {
+    use super::*;
+
+    fn api(id: &str, scope: Scope) -> (String, LockDoc) {
+        let doc = LockDoc {
+            meta: Meta::pending(Kind::Api, Some(scope), id, format!("api/{id}.md")),
+            sections: Vec::new(),
+        };
+        (doc.meta.id.clone(), doc)
+    }
+
+    fn dep_ids(deps: &[Dependency]) -> Vec<&str> {
+        deps.iter().map(|dep| dep.id.as_str()).collect()
+    }
+
+    #[test]
+    fn definition_and_version_dependencies_follow_the_files_that_exist() {
+        let (feature_id, feature) = api("web/v1/hello", Scope::Feature);
+        let (version_id, version) = api("web/v1/_version", Scope::Version);
+        let (definition_id, definition) = api("web/_definition", Scope::Definition);
+
+        let only_feature = HashMap::from([(feature_id.clone(), feature.clone())]);
+        assert!(dependencies(&feature_id, &only_feature, true)
+            .unwrap()
+            .is_empty());
+
+        let with_definition = HashMap::from([
+            (feature_id.clone(), feature.clone()),
+            (definition_id.clone(), definition.clone()),
+        ]);
+        assert_eq!(
+            dep_ids(&dependencies(&feature_id, &with_definition, true).unwrap()),
+            ["web/_definition"]
+        );
+
+        let with_version = HashMap::from([
+            (feature_id.clone(), feature.clone()),
+            (version_id.clone(), version.clone()),
+        ]);
+        assert_eq!(
+            dep_ids(&dependencies(&feature_id, &with_version, true).unwrap()),
+            ["web/v1/_version"]
+        );
+
+        let both = HashMap::from([
+            (feature_id.clone(), feature),
+            (definition_id.clone(), definition.clone()),
+            (version_id.clone(), version.clone()),
+        ]);
+        assert_eq!(
+            dep_ids(&dependencies("web/v1/hello", &both, true).unwrap()),
+            ["web/_definition", "web/v1/_version"]
+        );
+
+        let version_only = HashMap::from([(version_id.clone(), version.clone())]);
+        assert!(dependencies(&version_id, &version_only, true)
+            .unwrap()
+            .is_empty());
+
+        let version_and_definition =
+            HashMap::from([(version_id.clone(), version), (definition_id, definition)]);
+        assert_eq!(
+            dep_ids(&dependencies(&version_id, &version_and_definition, true).unwrap()),
+            ["web/_definition"]
+        );
     }
 }
 

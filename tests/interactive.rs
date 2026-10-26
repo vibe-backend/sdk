@@ -469,21 +469,17 @@ async fn generation_confirmation_and_preservation() {
         interactive::run(&p, &mut io, &config(), &fake)
             .await
             .unwrap();
+        assert!(!io.output.contains("_definition.md"));
+        assert!(!io.output.contains("_version.md"));
         if confirm == "y" {
-            assert_eq!(
-                fs::read_to_string(p.join("api/hello/_definition.md")).unwrap(),
-                vibe::scaffold::definition_content("hello")
-            );
-            assert_eq!(
-                fs::read_to_string(p.join("api/hello/v1/_version.md")).unwrap(),
-                vibe::scaffold::version_content("hello", "v1")
-            );
+            assert!(!p.join("api/hello/_definition.md").exists());
+            assert!(!p.join("api/hello/v1/_version.md").exists());
             assert!(!p.join("providers/main.md").exists());
             assert_eq!(
                 fs::read_to_string(p.join("api/hello/v1/hello.md")).unwrap(),
                 source()
             );
-            assert_eq!(vibe::discover::discover(&p).unwrap().len(), 3);
+            assert_eq!(vibe::discover::discover(&p).unwrap().len(), 1);
             let compiler = FakeAdapter {
                 responder: |_| {
                     Ok("## Route\n- method: GET\n- path: /hello/v1/hello\n## Access\n- public: true\n- tenant: default-slug\n## Pipelines\n(none)\n## Limits\n- provider: main\n## Request\n(none)\n## Response\n- status: 200\n## Transform\n(none)\n## Steps\n### s1 respond\n- op: respond\n- value: { message: \"hello world\" }\n- source-lines: 7\n## Errors\n(none)\n".into())

@@ -1,5 +1,5 @@
 //! Interactive source creation; terminal handling stays in the binary.
-use crate::{discover, llm, prompt_guide, scaffold};
+use crate::{discover, llm, prompt_guide};
 use std::{
     collections::HashMap,
     fs,
@@ -407,20 +407,10 @@ pub async fn run(
             }
         }
     };
-    let files = [
-        (
-            format!("api/{}/_definition.md", a.definition),
-            scaffold::definition_content(&a.definition),
-        ),
-        (
-            format!("api/{}/{}/_version.md", a.definition, a.version),
-            scaffold::version_content(&a.definition, &a.version),
-        ),
-        (
-            format!("api/{}/{}/{}.md", a.definition, a.version, a.feature),
-            format!("{}\n", a.source.trim_end_matches(['\r', '\n'])),
-        ),
-    ];
+    let files = [(
+        format!("api/{}/{}/{}.md", a.definition, a.version, a.feature),
+        format!("{}\n", a.source.trim_end_matches(['\r', '\n'])),
+    )];
     io.write("Files:");
     for (path, _) in &files {
         io.write(&if project.join(path).exists() {
