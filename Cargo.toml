@@ -52,7 +52,7 @@ unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
 x509-cert = "0.2"
-der = "0.7"
+der = "0.8"
 sqlparser = { version = "0.52", features = ["visitor"] }
 
 [dev-dependencies]
