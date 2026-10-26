@@ -65,7 +65,7 @@ Decision 174: provider, public endpoint host, model, seed and sent parameters ar
 Decision 180 modifies decision 174: private endpoints record only `endpoint-private: true`; the host is never recorded, in plaintext, hashed or derived, in build records, dev/release manifest provenance or generated project/artifact files. Public hosts retain their existing serialization. Old records/manifests still parse, and old signed dev manifests still verify; build writers remove legacy private hosts. The sole exception is `.vibe/cache` keys: this cache is never committed or packaged. `vibe build -o <manifest-path>` and `--release` write a manifest, and the runtime artifact loader reads only the manifest and release signature bundle, never the cache. Interactive setup may save `LLM_BASE_URL` in `.env`; that user configuration is unchanged.
 
 ````markdown
-vibe-version: 1.0.0-rc.8
+vibe-version: 1.0.0-rc.9
 ````
 
 `model-snapshot` is the **provider-reported** model id (`modelReported`), not the user input; if it differs from `LLM_MODEL` (e.g. the provider resolved an alias) it is an error. `sent-params` is the parameter set the adapter actually sent (Decision 58, §2A.8.6).

@@ -34,6 +34,8 @@ pub mod scan;
 pub mod secret;
 #[cfg(feature = "sdk")]
 pub mod security;
+#[cfg(feature = "sdk")]
+pub mod shop_compile;
 pub mod sign;
 pub mod sigstore;
 #[cfg(feature = "sdk")]

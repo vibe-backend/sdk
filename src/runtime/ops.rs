@@ -585,6 +585,17 @@ pub fn load_signing_keys(
     env: &dyn Fn(&str) -> Option<String>,
     default_kid: &str,
 ) -> Result<std::collections::HashMap<String, super::http::SigningKey>, String> {
+    load_signing_keys_with(manifest, env, default_kid, false)
+}
+
+/// Like [`load_signing_keys`]. When `memory_fallback` is set, a missing ES256
+/// key-ref uses the process dev key instead of refusing to start.
+pub fn load_signing_keys_with(
+    manifest: &crate::manifest::Manifest,
+    env: &dyn Fn(&str) -> Option<String>,
+    default_kid: &str,
+    memory_fallback: bool,
+) -> Result<std::collections::HashMap<String, super::http::SigningKey>, String> {
     let mut keys = std::collections::HashMap::new();
     for method in &manifest.methods {
         for step in method.steps.iter().filter(|s| s.op == "sign-jwt") {
@@ -592,14 +603,19 @@ pub fn load_signing_keys(
             if keys.contains_key(&key_ref) {
                 continue;
             }
-            let pem = env(&key_ref)
-                .filter(|v| !v.trim().is_empty())
-                .ok_or_else(|| {
-                    format!(
+            let alg_name = opt(step, "alg");
+            let pem = match env(&key_ref).filter(|v| !v.trim().is_empty()) {
+                Some(pem) => pem,
+                None if memory_fallback && matches!(alg_name, "ES256" | "") => {
+                    super::jwt::dev_private_pem().to_string()
+                }
+                None => {
+                    return Err(format!(
                         "{}: set {key_ref} to the private signing key PEM",
                         method.target
-                    )
-                })?;
+                    ))
+                }
+            };
             let (alg, key) = match opt(step, "alg") {
                 // Decision 139: ES256 when `alg` is omitted.
                 "ES256" | "" => (

@@ -4,7 +4,7 @@
 #
 # Usage: tag-signer-digest.sh <tag> <main-ref> <remote> [expected-commit]
 #
-# <tag> is the tag name (GITHUB_REF_NAME), such as v1.0.0-rc.8.
+# <tag> is the tag name (GITHUB_REF_NAME), such as v1.0.0-rc.9.
 # <main-ref> is a local ref that main was fetched into, such as origin/main.
 # <remote> is the git remote (or URL) that advertises refs/tags/<tag>.
 # <expected-commit>, when set, must be the peeled commit. On a tag push that

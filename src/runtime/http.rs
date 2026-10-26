@@ -537,9 +537,15 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
             None => state.slugs.get(&slug).cloned(),
         };
         let unknown = entry.is_none();
+        // Shop registration is a public write. The implicit dev slug is
+        // read-only; memory mode still accepts the sample-shop routes.
+        let shop_memory = state.exec.shop_store().is_some()
+            && super::shop::classify(&method, &found.route.path).is_some()
+            && super::shop::compiled_stub(&found.route.steps);
         match entry {
             Some(entry)
-                if entry.public_access && (!found.route.public_writes || entry.public_write) =>
+                if entry.public_access
+                    && (!found.route.public_writes || entry.public_write || shop_memory) =>
             {
                 Principal {
                     tenant_id: entry.tenant_id.clone(),
@@ -751,6 +757,46 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> HttpR
         .await
         {
             return finish(found.route, &state, started, fail(&request_id)).await;
+        }
+    }
+    if let Some(store) = state.exec.shop_store().filter(|_| {
+        super::shop::compiled_stub(&found.route.steps)
+            && super::shop::classify(&method, &found.route.path).is_some()
+    }) {
+        if let Some(action) = super::shop::classify(&method, &found.route.path) {
+            let reply = store
+                .handle(super::shop::Call {
+                    action,
+                    tenant_id: &principal.tenant_id,
+                    subject: &principal.subject,
+                    body: &body,
+                    query: &query,
+                    path: &found.params,
+                    headers: &headers,
+                    auth: &state.auth,
+                    staff: found.route.path.contains("/staff/"),
+                })
+                .await;
+            if let Some(fail) = reply.fail {
+                return finish(
+                    found.route,
+                    &state,
+                    started,
+                    fail_response(found.route, fail, &request_id),
+                )
+                .await;
+            }
+            let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::OK);
+            let mut extra = Vec::new();
+            if let Some(tag) = reply.etag {
+                extra.push(("etag".into(), tag));
+            }
+            let response = if status == StatusCode::NO_CONTENT {
+                empty_response(status, &request_id, &extra)
+            } else {
+                json_response(status, reply.body, &request_id, &extra)
+            };
+            return finish(found.route, &state, started, response).await;
         }
     }
     let mut query_values = BTreeMap::new();
@@ -1271,6 +1317,8 @@ fn check_type(field: &crate::manifest::ReqField, value: &Value) -> Result<(), Me
                 ));
             }
         }
+        // Nested objects and arrays, including null, stay opaque.
+        "json" => {}
         other => {
             // `vibe build` rejects unknown types; an old manifest fails closed.
             return Err(MethodFail::code(
@@ -1283,7 +1331,7 @@ fn check_type(field: &crate::manifest::ReqField, value: &Value) -> Result<(), Me
 }
 
 /// Request field types the runtime understands.
-pub const REQUEST_TYPES: [&str; 5] = ["string", "integer", "number", "boolean", "uuid"];
+pub const REQUEST_TYPES: [&str; 6] = ["string", "integer", "number", "boolean", "uuid", "json"];
 
 /// Only the canonical hyphenated form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
 /// (either case); braces, `urn:uuid:` and the 32-hex simple form are rejected.
@@ -2192,6 +2240,10 @@ fn public_message(fail: &MethodFail) -> String {
 fn platform_status(code: &str) -> StatusCode {
     match code {
         "VALIDATION_FAILED" | "WEAK_PASSWORD" => StatusCode::UNPROCESSABLE_ENTITY,
+        "INVALID_CREDENTIALS" => StatusCode::UNAUTHORIZED,
+        "EMAIL_TAKEN" | "IDEMPOTENCY_KEY_REUSED" | "INVALID_TRANSITION" => StatusCode::CONFLICT,
+        "PRODUCT_NOT_FOUND" | "ORDER_NOT_FOUND" | "ADDRESS_NOT_FOUND" => StatusCode::NOT_FOUND,
+        "PAYMENT_DECLINED" => StatusCode::PAYMENT_REQUIRED,
         "PRECONDITION_REQUIRED" => StatusCode::PRECONDITION_REQUIRED,
         "PRECONDITION_FAILED" => StatusCode::PRECONDITION_FAILED,
         "NOT_FOUND" => StatusCode::NOT_FOUND,

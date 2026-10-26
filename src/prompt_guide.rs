@@ -62,7 +62,7 @@ API FEATURE KEYS:
 - ## Access: public (true|false); for public also public-writes and tenant as specified by the input's Project route rule.
 - ## Pipelines: blocks `### auth` (mode: jwt|api-key, optional roles: [..]), `### -auth` with `- removed: true` for public endpoints or if the source explicitly removes auth, `### rate-limit` (per-minute: N, key: ip|tenant|input.email). Removing auth never adds JWT/token settings. Write `(none)` when the source says nothing.
 - ## Limits: computed by the compiler from frontmatter pins (provider, timeout, body) and inherited defaults; never derive limits from prose.
-- ## Request table header exactly `| field | type | rules | required |`; field is path.x, query.x, body.x or header.x; required yes|no.
+- ## Request table header exactly `| field | type | rules | required |`; field is path.x, query.x, body.x or header.x; required yes|no. type is string, integer, number, boolean, uuid, or json (any JSON value, including objects, arrays, and null).
 - ## Response: status.
 - ## Transform: optional in ({ k: req.body.x }) and out (expression).
 - ## Steps ops: method (target, args, out), validate (when, fail), respond (value, status). There is no transform step; request/response mapping goes in ## Transform.
@@ -110,6 +110,9 @@ pub fn guide(kind: Kind, scope: Option<Scope>) -> String {
             out.push_str(API_KEYS);
             out.push_str("Allowed runtime errors: ");
             out.push_str(&crate::runtime::RUNTIME_ERROR_CODES.join(", "));
+            out.push_str(
+                "\nSample-shop single-tenant routes under users/v1, catalog/v1, and shop/v1 (login, register, me, products, variants, cart, addresses, orders, payments, cancellation, delivery, and staff order status) use request type json for nested values. Their error codes include INVALID_CREDENTIALS, EMAIL_TAKEN, PRODUCT_NOT_FOUND, ORDER_NOT_FOUND, ADDRESS_NOT_FOUND, PAYMENT_DECLINED, IDEMPOTENCY_KEY_REUSED, and INVALID_TRANSITION. Write steps call record.create, record.update, or record.delete. The compiler installs the canonical lock for those source ids.\n",
+            );
             out.push_str("\nEXAMPLE CREATE FEATURE:\n");
             out.push_str(FEATURE_CREATE_EXAMPLE);
             out.push_str("\nEXAMPLE LIST FEATURE:\n");

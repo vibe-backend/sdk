@@ -477,8 +477,18 @@ pub async fn prepare(opts: &RunOptions) -> Result<Prepared, String> {
         }
     }
     // `sign-jwt` key-refs name environment variables holding private PEMs.
+    // Memory mode with neither JWT env var uses the ephemeral dev P-256 pair.
+    let env = |name: &str| std::env::var(name).ok();
+    let memory_jwt = memory
+        && crate::runtime::env_allows_dev_jwt(&env)
+        && auth.jwks.is_none()
+        && auth.alg == jsonwebtoken::Algorithm::ES256;
     auth.signing_keys =
-        crate::runtime::load_signing_keys(&manifest, &|name| std::env::var(name).ok(), &auth.kid)?;
+        crate::runtime::load_signing_keys_with(&manifest, &env, &auth.kid, memory_jwt)?;
+    if memory_jwt {
+        crate::runtime::ensure_dev_jwt(&mut auth)?;
+        eprintln!("warning: JWT_SIGNING_KEY and VIBE_JWT_PUBLIC_KEY_PEM are unset; memory mode is using the ephemeral dev EC P-256 keypair");
+    }
     if memory {
         for method in &manifest.methods {
             for step in method.steps.iter().filter(|s| s.op == "query") {
